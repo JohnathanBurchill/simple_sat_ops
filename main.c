@@ -129,11 +129,14 @@ int main(int argc, char **argv) {
     };
 
     /* Tracking loop */
-    int tracking = 0; // 1 if tracking, 0 if idle
-    while (1) {       // Infinite loop to continuously check satellite position
+    int tracking = 0;  // 1 if tracking, 0 if idle
+    time_t idle_start = 0;  // Time when the satellite was last tracked
+
+    while (1) {
         time_t now = time(NULL);
         double az, el;
         vector_t pos, vel;
+        double doppler_uplink, doppler_downlink;
         int ret;
 
         /* Propagate satellite position */
@@ -148,20 +151,38 @@ int main(int argc, char **argv) {
                 tracking = 1;
             }
 
+            /* Calculate Doppler shift */
+            vector_t obs_pos, obs_vel, relative_vel;
+            Calculate_User_PosVel((double)now, &observer, &obs_pos, &obs_vel);
+            Vec_Sub(&vel, &obs_vel, &relative_vel);
+            double relative_speed = Dot(&relative_vel, &pos) / pos.w;  // Radial velocity
+
+            doppler_uplink = VHF_UPLINK_FREQ * (1 + relative_speed / 299792.458);  // Speed of light in km/s
+            doppler_downlink = UHF_DOWNLINK_FREQ * (1 + relative_speed / 299792.458);
+
             /* Point rotator to Az/El */
             if ((ret = rot_set_position(rot, az, el)) != RIG_OK) {
                 fprintf(stderr, "Error setting rotor position: %s\n", rigerror(ret));
             }
 
-            /* Set rig frequencies */
-            if ((ret = rig_set_freq(rig, RIG_VFO_A, VHF_UPLINK_FREQ)) != RIG_OK ||
-                (ret = rig_set_freq(rig, RIG_VFO_B, UHF_DOWNLINK_FREQ)) != RIG_OK) {
+            /* Set rig frequencies with Doppler correction */
+            if ((ret = rig_set_freq(rig, RIG_VFO_A, (unsigned long)doppler_uplink)) != RIG_OK ||
+                (ret = rig_set_freq(rig, RIG_VFO_B, (unsigned long)doppler_downlink)) != RIG_OK) {
                 fprintf(stderr, "Error setting rig frequency: %s\n", rigerror(ret));
             }
+
+            idle_start = 0;  // Reset idle timer
         } else { // Satellite is below -5 degrees elevation
             if (tracking) {
                 printf("Satellite has set. Stopping tracking...\n");
                 tracking = 0;
+                idle_start = now;  // Start idle timer
+            }
+
+            /* Check if timeout has elapsed */
+            if (idle_start > 0 && difftime(now, idle_start) > 600) {  // 10-minute timeout
+                printf("Timeout reached. Exiting tracking loop.\n");
+                break;
             }
         }
 
