@@ -129,11 +129,12 @@ int main(int argc, char **argv) {
     };
 
     /* Tracking loop */
-    for (int i = 0; i < 10; i++) {
+    int tracking = 0; // 1 if tracking, 0 if idle
+    while (1) {       // Infinite loop to continuously check satellite position
         time_t now = time(NULL);
         double az, el;
         vector_t pos, vel;
-        int ret; // Declare ret for storing return values
+        int ret;
 
         /* Propagate satellite position */
         SGP4((double)((now - tle.epoch) * 1440.0 / 86400.0), &tle, &pos, &vel);
@@ -141,17 +142,30 @@ int main(int argc, char **argv) {
         /* Convert ECI to Az/El */
         eci_to_azel(&pos, &observer, now, &az, &el);
 
-        /* Point rotator to Az/El */
-        if ((ret = rot_set_position(rot, az, el)) != RIG_OK) {
-            fprintf(stderr, "Error setting rotor position: %s\n", rigerror(ret));
+        if (el > -5.0) { // Satellite is above -5 degrees elevation
+            if (!tracking) {
+                printf("Satellite is rising. Starting tracking...\n");
+                tracking = 1;
+            }
+
+            /* Point rotator to Az/El */
+            if ((ret = rot_set_position(rot, az, el)) != RIG_OK) {
+                fprintf(stderr, "Error setting rotor position: %s\n", rigerror(ret));
+            }
+
+            /* Set rig frequencies */
+            if ((ret = rig_set_freq(rig, RIG_VFO_A, VHF_UPLINK_FREQ)) != RIG_OK ||
+                (ret = rig_set_freq(rig, RIG_VFO_B, UHF_DOWNLINK_FREQ)) != RIG_OK) {
+                fprintf(stderr, "Error setting rig frequency: %s\n", rigerror(ret));
+            }
+        } else { // Satellite is below -5 degrees elevation
+            if (tracking) {
+                printf("Satellite has set. Stopping tracking...\n");
+                tracking = 0;
+            }
         }
 
-        /* Optionally set rig frequencies */
-        if ((ret = rig_set_freq(rig, RIG_VFO_A, VHF_UPLINK_FREQ)) != RIG_OK ||
-            (ret = rig_set_freq(rig, RIG_VFO_B, UHF_DOWNLINK_FREQ)) != RIG_OK) {
-            fprintf(stderr, "Error setting rig frequency: %s\n", rigerror(ret));
-        }
-
+        /* Sleep for a short interval (e.g., 1 second) */
         sleep(1);
     }
 
