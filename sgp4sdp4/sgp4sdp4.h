@@ -148,8 +148,6 @@ typedef struct
 
 
 /* Funtion prototypes produced by cproto */
-/* main.c */
-int main(void);
 /* sgp4sdp4.c */
 void SGP4(double tsince, tle_t *tle, vector_t *pos, vector_t *vel);
 void SDP4(double tsince, tle_t *tle, vector_t *pos, vector_t *vel);
