@@ -1,10 +1,12 @@
- #include <stdio.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <hamlib/rig.h>
 #include <hamlib/rotator.h>
 #include "sgp4sdp4.h"
+
+#define MAX_LINE_LENGTH 128
 
 /* RAO site observer location in Priddis, SW of Calgary */
 #define RAO_LATITUDE  50.8812  // Latitude in degrees
@@ -49,57 +51,81 @@ void eci_to_azel(vector_t *pos, geodetic_t *observer, time_t timestamp, double *
 }
 
 int main(int argc, char **argv) {
-    RIG *rig;
-    ROT *rot;
-    int ret;
-
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s \"TLE Line 1\" \"TLE Line 2\"\n", argv[0]);
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <TLE file>\n", argv[0]);
         return 1;
     }
+
+    /* Open TLE file */
+    FILE *tle_file = fopen(argv[1], "r");
+    if (!tle_file) {
+        perror("Error opening TLE file");
+        return 1;
+    }
+
+    char sat_name[MAX_LINE_LENGTH];
+    char line1[MAX_LINE_LENGTH];
+    char line2[MAX_LINE_LENGTH];
+
+    /* Read TLE file */
+    if (!fgets(sat_name, sizeof(sat_name), tle_file) ||
+        !fgets(line1, sizeof(line1), tle_file) ||
+        !fgets(line2, sizeof(line2), tle_file)) {
+        fprintf(stderr, "Error reading TLE data from file.\n");
+        fclose(tle_file);
+        return 1;
+    }
+
+    /* Remove trailing newlines */
+    sat_name[strcspn(sat_name, "\r\n")] = '\0';
+    line1[strcspn(line1, "\r\n")] = '\0';
+    line2[strcspn(line2, "\r\n")] = '\0';
+
+    fclose(tle_file);
 
     /* Parse TLE data */
     tle_t tle;
-    Convert_Satellite_Data(argv[1], &tle);
-    Convert_Satellite_Data(argv[2], &tle);
+    Convert_Satellite_Data(line1, &tle);
+    Convert_Satellite_Data(line2, &tle);
 
     /* Initialize Hamlib for rig and rotator */
-    rig = rig_init(RIG_MODEL_IC9700);
-    rot = rot_init(ROT_MODEL_GS232);
-
-    if (!rig || !rot) {
-        fprintf(stderr, "Failed to initialize rig or rotor.\n");
+    RIG *rig = rig_init(RIG_MODEL_IC9700);
+    if (!rig) {
+        fprintf(stderr, "Failed to initialize rig.\n");
         return 1;
     }
 
-    /* Set rig port */
-    strncpy(rig->state.rigport.pathname, "/dev/ttyUSB1", sizeof(rig->state.rigport.pathname) - 1);
-    rig->state.rigport.pathname[sizeof(rig->state.rigport.pathname) - 1] = '\0'; // Ensure null termination
-    if ((ret = rig_open(rig)) != RIG_OK) {
-        fprintf(stderr, "Error opening rig: %s\n", rigerror(ret));
+    ROT *rot = rot_init(ROT_MODEL_GS232A);
+    if (!rot) {
+        fprintf(stderr, "Failed to initialize rotator.\n");
         rig_cleanup(rig);
         return 1;
     }
 
-    /* Set rig port */
     strncpy(rig->state.rigport.pathname, "/dev/ttyUSB1", sizeof(rig->state.rigport.pathname) - 1);
-    rig->state.rigport.pathname[sizeof(rig->state.rigport.pathname) - 1] = '\0'; // Ensure null termination
-    if ((ret = rig_open(rig)) != RIG_OK) {
-        fprintf(stderr, "Error opening rig: %s\n", rigerror(ret));
+    rig->state.rigport.pathname[sizeof(rig->state.rigport.pathname) - 1] = '\0';
+
+    strncpy(rot->state.rotport.pathname, "/dev/ttyUSB0", sizeof(rot->state.rotport.pathname) - 1);
+    rot->state.rotport.pathname[sizeof(rot->state.rotport.pathname) - 1] = '\0';
+
+    if (rig_open(rig) != RIG_OK) {
+        fprintf(stderr, "Error opening rig.\n");
         rig_cleanup(rig);
         return 1;
     }
 
-    if ((ret = rig_open(rig)) != RIG_OK || (ret = rot_open(rot)) != RIG_OK) {
-        fprintf(stderr, "Error opening rig or rotator: %s\n", rigerror(ret));
+    if (rot_open(rot) != RIG_OK) {
+        fprintf(stderr, "Error opening rotator.\n");
+        rig_cleanup(rig);
+        rot_cleanup(rot);
         return 1;
     }
 
     /* Set up observer location */
     geodetic_t observer = {
-        .lat = RAO_LATITUDE * M_PI / 180.0, // Convert degrees to radians
-        .lon = RAO_LONGITUDE * M_PI / 180.0, // Convert degrees to radians
-        .alt = RAO_ALTITUDE / 1000.0 // Convert meters to kilometers
+        .lat = RAO_LATITUDE * M_PI / 180.0,
+        .lon = RAO_LONGITUDE * M_PI / 180.0,
+        .alt = RAO_ALTITUDE / 1000.0
     };
 
     /* Tracking loop */
@@ -107,6 +133,7 @@ int main(int argc, char **argv) {
         time_t now = time(NULL);
         double az, el;
         vector_t pos, vel;
+        int ret; // Declare ret for storing return values
 
         /* Propagate satellite position */
         SGP4((double)((now - tle.epoch) * 1440.0 / 86400.0), &tle, &pos, &vel);
@@ -125,7 +152,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Error setting rig frequency: %s\n", rigerror(ret));
         }
 
-        /* Sleep for 1 second */
         sleep(1);
     }
 
