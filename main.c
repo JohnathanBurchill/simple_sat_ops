@@ -1,3 +1,5 @@
+#include "state.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,8 +7,6 @@
 #include <hamlib/rig.h>
 #include <hamlib/rotator.h>
 #include "sgp4sdp4.h"
-
-#define MAX_LINE_LENGTH 128
 
 /* RAO site observer location in Priddis, SW of Calgary */
 #define RAO_LATITUDE  50.8812  // Latitude in degrees
@@ -50,101 +50,117 @@ void eci_to_azel(vector_t *pos, geodetic_t *observer, time_t timestamp, double *
     *el = asin(top_z / range_magnitude) * 180.0 / M_PI;
 }
 
-int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <TLE file>\n", argv[0]);
+void usage(FILE *dest, const char *name) 
+{
+    fprintf(dest, "usage: %s <tle_file>\n", name);
+    return;
+}
+
+int main(int argc, char **argv) 
+{
+    state_t state = {0};
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp("--without-rig", argv[i]) == 0) {
+            state.n_options++;
+            state.run_without_rig = 1;
+        }
+        else if (strcmp("--without-rotator", argv[i]) == 0) {
+            state.n_options++;
+            state.run_without_rotator = 1;
+        }
+        else if (strcmp("--without-hardware", argv[i]) == 0) {
+            state.n_options++;
+            state.run_without_rig = 1;
+            state.run_without_rotator = 1;
+        }
+        else if (strcmp("--help", argv[i]) == 0) {
+            usage(stdout, argv[0]);
+            return 0;
+        }
+        else if (strncmp("--", argv[i], 2) == 0) {
+            fprintf(stderr, "Unable to parse option '%s'\n", argv[i]);
+            return 1;
+        }
+
+    }
+    if (argc - state.n_options != 2) {
+        usage(stderr, argv[0]);
         return 1;
     }
 
     /* Open TLE file */
-    FILE *tle_file = fopen(argv[1], "r");
-    if (!tle_file) {
-        perror("Error opening TLE file");
-        return 1;
-    }
-
-    char sat_name[MAX_LINE_LENGTH];
-    char line1[MAX_LINE_LENGTH];
-    char line2[MAX_LINE_LENGTH];
-
-    /* Read TLE file */
-    if (!fgets(sat_name, sizeof(sat_name), tle_file) ||
-        !fgets(line1, sizeof(line1), tle_file) ||
-        !fgets(line2, sizeof(line2), tle_file)) {
-        fprintf(stderr, "Error reading TLE data from file.\n");
-        fclose(tle_file);
-        return 1;
-    }
-
-    /* Remove trailing newlines */
-    sat_name[strcspn(sat_name, "\r\n")] = '\0';
-    line1[strcspn(line1, "\r\n")] = '\0';
-    line2[strcspn(line2, "\r\n")] = '\0';
-
-    fclose(tle_file);
+    state.tle_filename = argv[1];
 
     /* Parse TLE data */
-    tle_t tle;
-    Convert_Satellite_Data(line1, &tle);
-    Convert_Satellite_Data(line2, &tle);
+    tle_t tle = {0};
+    Input_Tle_Set(state.tle_filename, &tle);
 
     /* Initialize Hamlib for rig and rotator */
+    rig_set_debug(RIG_DEBUG_NONE);
     RIG *rig = rig_init(RIG_MODEL_IC9700);
     if (!rig) {
-        fprintf(stderr, "Failed to initialize rig.\n");
+        fprintf(stderr, "Failed to initialize rig support.\n");
         return 1;
     }
-
     ROT *rot = rot_init(ROT_MODEL_GS232A);
     if (!rot) {
-        fprintf(stderr, "Failed to initialize rotator.\n");
-        rig_cleanup(rig);
+        fprintf(stderr, "Failed to initialize rotator support.\n");
         return 1;
     }
 
     strncpy(rig->state.rigport.pathname, "/dev/ttyUSB1", sizeof(rig->state.rigport.pathname) - 1);
     rig->state.rigport.pathname[sizeof(rig->state.rigport.pathname) - 1] = '\0';
+    if (rig_open(rig) != RIG_OK) {
+        fprintf(stderr, "Error opening rig. Is it plugged into USB and powered?.\n");
+        if (!state.run_without_rig) {
+            rig_cleanup(rig);
+            rot_cleanup(rot);
+            return 1;
+        }
+    }
+    state.have_rig = 1;
 
     strncpy(rot->state.rotport.pathname, "/dev/ttyUSB0", sizeof(rot->state.rotport.pathname) - 1);
     rot->state.rotport.pathname[sizeof(rot->state.rotport.pathname) - 1] = '\0';
-
-    if (rig_open(rig) != RIG_OK) {
-        fprintf(stderr, "Error opening rig.\n");
-        rig_cleanup(rig);
-        return 1;
+        if (rot_open(rot) != RIG_OK) {
+        fprintf(stderr, "Error opening rotator. Is it plugged into USB and powered?.\n");
+        if (!state.run_without_rotator) {
+            rig_cleanup(rig);
+            rot_cleanup(rot);
+            return 1;
+        }
     }
-
-    if (rot_open(rot) != RIG_OK) {
-        fprintf(stderr, "Error opening rotator.\n");
-        rig_cleanup(rig);
-        rot_cleanup(rot);
-        return 1;
-    }
+    state.have_rotator = 1;
 
     /* Set up observer location */
     geodetic_t observer = {
         .lat = RAO_LATITUDE * M_PI / 180.0,
         .lon = RAO_LONGITUDE * M_PI / 180.0,
-        .alt = RAO_ALTITUDE / 1000.0
+        .alt = RAO_ALTITUDE / 1000.0,
     };
 
     /* Tracking loop */
     int tracking = 0;  // 1 if tracking, 0 if idle
     time_t idle_start = 0;  // Time when the satellite was last tracked
+    struct timeval tv = {0};
+    double now = 0.0;
 
     while (1) {
-        time_t now = time(NULL);
+        gettimeofday(&tv, NULL);
+        now = tv.tv_sec + tv.tv_usec / 1e6;
         double az, el;
         vector_t pos, vel;
         double doppler_uplink, doppler_downlink;
         int ret;
 
         /* Propagate satellite position */
-        SGP4((double)((now - tle.epoch) * 1440.0 / 86400.0), &tle, &pos, &vel);
+        SGP4((now - tle.epoch) * 1440.0 / 86400.0, &tle, &pos, &vel);
 
         /* Convert ECI to Az/El */
         eci_to_azel(&pos, &observer, now, &az, &el);
 
+        printf("EL: %6.2f  Az: %6.2f\n", el, az);
         if (el > -5.0) { // Satellite is above -5 degrees elevation
             if (!tracking) {
                 printf("Satellite is rising. Starting tracking...\n");
@@ -161,14 +177,18 @@ int main(int argc, char **argv) {
             doppler_downlink = UHF_DOWNLINK_FREQ * (1 + relative_speed / 299792.458);
 
             /* Point rotator to Az/El */
-            if ((ret = rot_set_position(rot, az, el)) != RIG_OK) {
-                fprintf(stderr, "Error setting rotor position: %s\n", rigerror(ret));
+            if (state.have_rotator || !state.run_without_rotator) {
+                if ((ret = rot_set_position(rot, az, el)) != RIG_OK) {
+                    fprintf(stderr, "Error setting rotor position: %s\n", rigerror(ret));
+                }
             }
 
             /* Set rig frequencies with Doppler correction */
-            if ((ret = rig_set_freq(rig, RIG_VFO_A, (unsigned long)doppler_uplink)) != RIG_OK ||
-                (ret = rig_set_freq(rig, RIG_VFO_B, (unsigned long)doppler_downlink)) != RIG_OK) {
-                fprintf(stderr, "Error setting rig frequency: %s\n", rigerror(ret));
+            if (state.have_rig || !state.run_without_rig) {
+                if ((ret = rig_set_freq(rig, RIG_VFO_A, (unsigned long)doppler_uplink)) != RIG_OK ||
+                    (ret = rig_set_freq(rig, RIG_VFO_B, (unsigned long)doppler_downlink)) != RIG_OK) {
+                    fprintf(stderr, "Error setting rig frequency: %s\n", rigerror(ret));
+                }
             }
 
             idle_start = 0;  // Reset idle timer
@@ -191,10 +211,14 @@ int main(int argc, char **argv) {
     }
 
     /* Cleanup */
-    rig_close(rig);
-    rot_close(rot);
-    rig_cleanup(rig);
-    rot_cleanup(rot);
+    if (rig) {
+        rig_close(rig);
+        rig_cleanup(rig);
+    }
+    if (rot) {
+        rot_close(rot);
+        rot_cleanup(rot);
+    }
 
     return 0;
 }

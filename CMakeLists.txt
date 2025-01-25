@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.10)
 project(RigRotatorControl)
 
+#set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
+
 # Add the sgp4sdp4 subdirectory
 add_subdirectory(sgp4sdp4)
 
@@ -36,4 +39,4 @@ target_include_directories(rig_rotator_control PRIVATE
 )
 
 # Link the sgp4sdp4 library and Hamlib
-target_link_libraries(rig_rotator_control PRIVATE sgp4sdp4 ${HAMLIB_LIBRARY} m)
+target_link_libraries(rig_rotator_control PRIVATE sgp4sdp4 ${HAMLIB_LIBRARY} m curl)
