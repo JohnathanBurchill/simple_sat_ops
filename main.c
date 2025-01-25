@@ -66,7 +66,32 @@ void update_doppler_shifted_frequencies(state_t *state)
     return;
 }
 
-double minutes_until_visible(state_t *state, double delta_t_minutes)
+// Overwrites the current satellite position
+void predicted_max_elevation(state_t *state, double jul_utc_start, double delta_t_minutes)
+{
+    double jul_utc = jul_utc_start; 
+    // Sets prediction to start of pass
+    update_satellite_position(state, jul_utc);
+    double current_elevation = state->satellite.elevation;
+
+    double last_max_elevation = current_elevation;
+    double max_elevation = current_elevation;
+    while (current_elevation > -1.0) {
+        jul_utc += delta_t_minutes / 1440.0;
+        update_satellite_position(state, jul_utc);
+        current_elevation = state->satellite.elevation;
+        if (max_elevation < current_elevation) {
+            max_elevation = current_elevation;
+        }
+    }
+    if (state->predicted_max_elevation < last_max_elevation) {
+        state->predicted_max_elevation = last_max_elevation;
+    }
+
+    return;
+}
+
+void minutes_until_visible(state_t *state, double delta_t_minutes)
 {
     struct tm utc;
     struct timeval tv;
@@ -90,9 +115,9 @@ double minutes_until_visible(state_t *state, double delta_t_minutes)
             elevation = state->satellite.elevation;
         }
     }
-    double minutes_away = (jul_utc - jul_utc_start) * 1440.0;
+    state->predicted_minutes_until_visible = (jul_utc - jul_utc_start) * 1440.0;
 
-    return minutes_away;
+    return;
 }
 
 void init_window(void)
@@ -221,29 +246,49 @@ int main(int argc, char **argv)
     struct tm utc;
     struct timeval tv;
     double jul_utc = 0.0;
-    double minutes_away = 0.0;
 
     init_window();
 
-    while (1) {
-        
+    int running = 1;
+    char key = '\0';
+
+    int row = 4;
+    while (running) {
+        // Refresh time
         UTC_Calendar_Now(&utc, &tv);
         jul_utc = Julian_Date(&utc, &tv);
-        update_satellite_position(&state, jul_utc);
-        mvprintw(5, 0, "EL: %6.2f  Az: %6.2f", state.satellite.elevation, state.satellite.azimuth);
-        clrtoeol();
-        minutes_away = minutes_until_visible(&state, 1.0);
-        mvprintw(6, 0, "Minutes to next pass: ");
-        if (fabs(minutes_away) < 10.0) {
-            minutes_away = minutes_until_visible(&state, 0.1);
-            printw("%.1f", minutes_away);
-        } else {
-            printw("%.0f", minutes_away);
+
+        row = 4;
+        minutes_until_visible(&state, 1.0);
+        if (fabs(state.predicted_minutes_until_visible) < 10) {
+            minutes_until_visible(&state, 0.1);
         }
+        if (state.predicted_minutes_until_visible > 0) {
+            if (state.predicted_minutes_until_visible < 10) {
+                mvprintw(row, 0, "Next pass in %.1f minutes", state.predicted_minutes_until_visible);
+            } else {
+                mvprintw(row, 0, "Next pass in %.0f minutes", state.predicted_minutes_until_visible);
+            }
+            clrtoeol();
+            predicted_max_elevation(&state, jul_utc + state.predicted_minutes_until_visible / 1440.0, 0.1);
+            mvprintw(++row, 0, " Predicted max elevation: %6.1f degrees", state.predicted_max_elevation);
+            clrtoeol();
+        } else {
+            mvprintw(row, 0, "This pass started %.1f minutes ago", -state.predicted_minutes_until_visible);
+            clrtoeol();
+            mvprintw(++row, 0, " Predicted max elevation: %6.1f degrees", state.predicted_max_elevation);
+            clrtoeol();
+        }
+
+        // Refresh satellite position
+        update_satellite_position(&state, jul_utc);
+
+        row += 2;
+        mvprintw(row, 0, "Current location: EL: %6.2f  Az: %6.2f", state.satellite.elevation, state.satellite.azimuth);
         clrtoeol();
 
         // TODO check for passes that reach a minimum elevation
-        if (minutes_away < tracking_prep_time_minutes) { // Satellite is within 5 minutes of a pass
+        if (state.predicted_minutes_until_visible < tracking_prep_time_minutes) { // Satellite is within 5 minutes of a pass
             if (!tracking) {
                 tracking = 1;
             }
@@ -278,13 +323,23 @@ int main(int argc, char **argv)
                 break;
             }
         }
+
         if (tracking) {
-            mvprintw(3, 0, "TRACKING %s", state.tle.sat_name);
+            mvprintw(2, 0, "TRACKING %s", state.tle.sat_name);
         } else {
-            mvprintw(3, 0, "NOT tracking %s", state.tle.sat_name);
+            mvprintw(2, 0, "NOT tracking %s", state.tle.sat_name);
         }
         clrtoeol();
         refresh();
+
+        key = getch(); 
+        switch(key) {
+            case 'q':
+                running = 0;
+                break;
+            default:
+                break;
+        }
 
         /* Sleep for a short interval (e.g., 1 second) */
         sleep(1);

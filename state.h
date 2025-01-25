@@ -37,6 +37,8 @@ typedef struct state {
     double observer_satellite_relative_speed;
     double doppler_uplink_frequency;
     double doppler_downlink_frequency;
+    double predicted_minutes_until_visible;
+    double predicted_max_elevation;
 } state_t;
 
 #endif // STATE_H
