@@ -99,6 +99,7 @@ int main(int argc, char **argv)
 {
     state_t state = {0};
     int status = 0;
+    double tracking_prep_time_minutes = 5.0;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp("--no-rig", argv[i]) == 0) {
@@ -226,7 +227,8 @@ int main(int argc, char **argv)
         }
         printf(" minutes\n");
 
-        if (state.satellite.elevation > -5.0) { // Satellite is above -5 degrees elevation
+        // TODO check for passes that reach a minimum elevation
+        if (minutes_away < tracking_prep_time_minutes) { // Satellite is within 5 minutes of a pass
             if (!tracking) {
                 printf("Satellite is rising. Starting tracking...\n");
                 tracking = 1;
