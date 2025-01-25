@@ -486,8 +486,6 @@ int main(int argc, char **argv)
                 break;
         }
 
-        // TODO Import TLE every 6 hours?
-
         // Sleep for a short interval 
         usleep(250000);
 
