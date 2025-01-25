@@ -6,8 +6,8 @@
 #include <time.h>
 #include <hamlib/rig.h>
 #include <hamlib/rotator.h>
-
-#include "sgp4sdp4.h"
+#include <sgp4sdp4.h>
+#include <ncurses.h>
 
 /* RAO site observer location in Priddis, SW of Calgary */
 #define RAO_LATITUDE  50.8812  // Latitude in degrees
@@ -93,6 +93,17 @@ double minutes_until_visible(state_t *state, double delta_t_minutes)
     double minutes_away = (jul_utc - jul_utc_start) * 1440.0;
 
     return minutes_away;
+}
+
+void init_window(void)
+{
+    initscr(); cbreak(); noecho();
+    nonl();
+    timeout(0);
+    intrflush(stdscr, FALSE);
+    keypad(stdscr, TRUE);
+
+    return;
 }
 
 int main(int argc, char **argv) 
@@ -212,25 +223,28 @@ int main(int argc, char **argv)
     double jul_utc = 0.0;
     double minutes_away = 0.0;
 
+    init_window();
+
     while (1) {
         
         UTC_Calendar_Now(&utc, &tv);
         jul_utc = Julian_Date(&utc, &tv);
         update_satellite_position(&state, jul_utc);
-        printf("EL: %6.2f  Az: %6.2f next pass in ", state.satellite.elevation, state.satellite.azimuth);
-        minutes_away = minutes_until_visible(&state, 10.0);
+        mvprintw(5, 0, "EL: %6.2f  Az: %6.2f", state.satellite.elevation, state.satellite.azimuth);
+        clrtoeol();
+        minutes_away = minutes_until_visible(&state, 1.0);
+        mvprintw(6, 0, "Minutes to next pass: ");
         if (fabs(minutes_away) < 10.0) {
             minutes_away = minutes_until_visible(&state, 0.1);
-            printf("%.1f", minutes_away);
+            printw("%.1f", minutes_away);
         } else {
-            printf("%.0f", minutes_away);
+            printw("%.0f", minutes_away);
         }
-        printf(" minutes\n");
+        clrtoeol();
 
         // TODO check for passes that reach a minimum elevation
         if (minutes_away < tracking_prep_time_minutes) { // Satellite is within 5 minutes of a pass
             if (!tracking) {
-                printf("Satellite is rising. Starting tracking...\n");
                 tracking = 1;
             }
 
@@ -254,7 +268,6 @@ int main(int argc, char **argv)
             jul_idle_start = 0;  // Reset idle timer
         } else { // Satellite is below -5 degrees elevation
             if (tracking) {
-                printf("Satellite has set. Stopping tracking...\n");
                 tracking = 0;
                 jul_idle_start = jul_utc;  // Start idle timer
             }
@@ -265,10 +278,19 @@ int main(int argc, char **argv)
                 break;
             }
         }
+        if (tracking) {
+            mvprintw(3, 0, "TRACKING %s", state.tle.sat_name);
+        } else {
+            mvprintw(3, 0, "NOT tracking %s", state.tle.sat_name);
+        }
+        clrtoeol();
+        refresh();
 
         /* Sleep for a short interval (e.g., 1 second) */
         sleep(1);
     }
+
+    endwin();
 
     /* Cleanup */
     if (rig) {

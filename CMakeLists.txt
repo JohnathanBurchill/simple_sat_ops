@@ -7,6 +7,9 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
 # Add the sgp4sdp4 subdirectory
 add_subdirectory(sgp4sdp4)
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(NCURSES REQUIRED ncurses)
+
 # Locate Hamlib headers and library
 find_path(HAMLIB_INCLUDE_DIR hamlib/rig.h 
     PATHS 
@@ -39,4 +42,4 @@ target_include_directories(rig_rotator_control PRIVATE
 )
 
 # Link the sgp4sdp4 library and Hamlib
-target_link_libraries(rig_rotator_control PRIVATE sgp4sdp4 ${HAMLIB_LIBRARY} m curl)
+target_link_libraries(rig_rotator_control PRIVATE sgp4sdp4 ${HAMLIB_LIBRARY} ${NCURSES_LIBRARIES} m curl)
