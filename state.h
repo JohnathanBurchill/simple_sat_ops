@@ -9,6 +9,8 @@
 
 typedef struct ephemeres
 {
+    char *name;
+    tle_t tle;
     vector_t position;
     vector_t velocity;
     double speed_km_s;
@@ -26,8 +28,7 @@ typedef struct ephemeres
 typedef struct state {
     int n_options;
     int running;
-    char *tle_filename;
-    tle_t tle;
+    char *tles_filename;
     double jul_epoch;
     double minutes_since_epoch;
     ephemeres_t observer;

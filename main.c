@@ -19,22 +19,22 @@
 
 void usage(FILE *dest, const char *name) 
 {
-    fprintf(dest, "usage: %s <tle_file>\n", name);
+    fprintf(dest, "usage: %s <tles_file> <satellite_id>\n", name);
     return;
 }
 
 void update_satellite_position(state_t *state, double jul_utc)
 {
     // jul times are days
-    state->jul_epoch = Julian_Date_of_Epoch(state->tle.epoch);
+    state->jul_epoch = Julian_Date_of_Epoch(state->satellite.tle.epoch);
     state->minutes_since_epoch = (jul_utc - state->jul_epoch) * 1440.0;
 
     /* Propagate satellite position */
     /* Call NORAD routines according to deep-space flag */
     if(isFlagSet(DEEP_SPACE_EPHEM_FLAG)) {
-        SDP4(state->minutes_since_epoch, &state->tle, &state->satellite.position, &state->satellite.velocity);
+        SDP4(state->minutes_since_epoch, &state->satellite.tle, &state->satellite.position, &state->satellite.velocity);
     } else {
-        SGP4(state->minutes_since_epoch, &state->tle, &state->satellite.position, &state->satellite.velocity);
+        SGP4(state->minutes_since_epoch, &state->satellite.tle, &state->satellite.position, &state->satellite.velocity);
     }
 
     // pos and vel in km, km/s
@@ -159,7 +159,7 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
     mvprintw(row++, col, "%15s : %d %s %04d %02d:%02d:%02d UTC", "date", utc.tm_mday, months[utc.tm_mon-1], utc.tm_year, utc.tm_hour, utc.tm_min, utc.tm_sec);
 
     row++;
-    mvprintw(row++, col, "%15s : %s (%s)", "satellite", state->tle.sat_name, state->tle.idesg);
+    mvprintw(row++, col, "%15s : %s (%s)", "satellite", state->satellite.tle.sat_name, state->satellite.tle.idesg);
 
     minutes_until_visible(state, 1.0);
     if (fabs(state->predicted_minutes_until_visible) < 1) {
@@ -261,6 +261,49 @@ void report_status(state_t *state, int *print_row, int print_col)
     *print_row = row;
 }
 
+// Returns the first match on state->satellite.name
+int load_tle(state_t *state)
+{
+    FILE *file = fopen(state->tles_filename, "r");
+    if (file == NULL) {
+        fprintf(stderr, "Error opening %s\n", state->tles_filename);
+        return -1;
+    }
+    
+    // 2 69-character lines plus a nul terminator
+    char tle[139] = {0};
+    char name[128] = {0}; 
+    int found_satellite = 0;
+
+    while (fgets(name, 128, file)) {
+        // Remove newline
+        name[strlen(name) - 1] = '\0';
+        if (strncmp(state->satellite.name, name, strlen(state->satellite.name)) == 0) {
+            // Errors caught in TLE check
+            // Read 70 characters, including the newline
+            fgets(tle, 71, file);
+            // Read 69 characterers
+            fgets(tle + 69, 70, file);
+            tle[138] = '\0';
+            found_satellite = 1;
+            break;
+        }
+    }
+    if (!found_satellite) {
+        fprintf(stderr, "Satellite '%s' not found in %s\n", state->satellite.name, state->tles_filename);
+        return -2;
+    }
+
+    if (!Good_Elements(tle)) {
+        fprintf(stderr, "Invalid TLE\n");
+        return -3;
+    }
+    Convert_Satellite_Data(tle, &state->satellite.tle);
+
+    return 0;
+
+}
+
 int main(int argc, char **argv) 
 {
     state_t state = {0};
@@ -295,32 +338,22 @@ int main(int argc, char **argv)
         }
 
     }
-    if (argc - state.n_options != 2) {
+    if (argc - state.n_options != 3) {
         usage(stderr, argv[0]);
         return 1;
     }
 
     /* Open TLE file */
-    state.tle_filename = argv[1];
+    state.tles_filename = argv[1];
+    state.satellite.name = argv[2];
 
     /* Parse TLE data */
-    int tle_status = Input_Tle_Set(state.tle_filename, &state.tle);
+    int tle_status = load_tle(&state);
     if (tle_status) {
-        fprintf(stderr, "Unable to read TLE from %s: ", state.tle_filename);
-        switch (tle_status) {
-            case -1:
-                fprintf(stderr, "error opening file\n");
-                break;
-            case -2:
-                fprintf(stderr, "invalid TLE format\n");
-                break;
-            default:
-                fprintf(stderr, "unknown reason\n");
-        }
-        return tle_status;
+       return tle_status;
     }
     ClearFlag(ALL_FLAGS);
-    select_ephemeris(&state.tle);
+    select_ephemeris(&state.satellite.tle);
 
     /* Initialize Hamlib for rig and rotator */
     rig_set_debug(RIG_DEBUG_NONE);
