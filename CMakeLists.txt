@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
 project(RigRotatorControl)
 
-#set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
+#set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
 
 # Add the sgp4sdp4 subdirectory
 add_subdirectory(sgp4sdp4)

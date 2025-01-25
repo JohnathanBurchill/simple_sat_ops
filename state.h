@@ -4,6 +4,8 @@
 #define MAX_TLE_LINE_LENGTH 128
 
 #include <sgp4sdp4.h>
+#include <hamlib/rig.h>
+#include <hamlib/rotator.h>
 
 typedef struct ephemeres
 {
@@ -23,14 +25,11 @@ typedef struct ephemeres
 
 typedef struct state {
     int n_options;
+    int running;
     char *tle_filename;
     tle_t tle;
     double jul_epoch;
     double minutes_since_epoch;
-    int run_without_rig;
-    int run_without_rotator;
-    int have_rig;
-    int have_rotator;
     ephemeres_t observer;
     ephemeres_t satellite;
     vector_t observer_satellite_relative_velocity;
@@ -39,6 +38,17 @@ typedef struct state {
     double doppler_downlink_frequency;
     double predicted_minutes_until_visible;
     double predicted_max_elevation;
+    double predicted_pass_duration_minutes;
+    double predicted_minutes_above_0_degrees;
+    double predicted_minutes_above_30_degrees;
+    int tracking;
+    int in_pass;
+    RIG *rig;
+    ROT *rot;
+    int run_without_rig;
+    int run_without_rotator;
+    int have_rig;
+    int have_rotator;
 } state_t;
 
 #endif // STATE_H

@@ -1,4 +1,3 @@
-#include "sgp4sdp4/sgp4sdp4.h"
 #include "state.h"
 
 #include <stdio.h>
@@ -15,8 +14,8 @@
 #define RAO_ALTITUDE  1250.0   // Altitude in meters
 
 /* Satellite communication frequencies */
-#define VHF_UPLINK_FREQ   145800000ULL  /* Uplink: 145.800 MHz */
-#define UHF_DOWNLINK_FREQ 435300000ULL  /* Downlink: 435.300 MHz */
+#define VHF_UPLINK_FREQ   145800000.000
+#define UHF_DOWNLINK_FREQ 435300000.000
 
 void usage(FILE *dest, const char *name) 
 {
@@ -45,11 +44,12 @@ void update_satellite_position(state_t *state, double jul_utc)
     Calculate_LatLonAlt(jul_utc, &state->satellite.position, &state->satellite.position_geodetic);
     state->satellite.azimuth = Degrees(state->satellite.observation_set.x);
     state->satellite.elevation = Degrees(state->satellite.observation_set.y);
-    state->satellite.range_km = Degrees(state->satellite.observation_set.z);
-    state->satellite.range_rate_km_s = Degrees(state->satellite.observation_set.w);
+    state->satellite.range_km = state->satellite.observation_set.z;
+    state->satellite.range_rate_km_s = state->satellite.observation_set.w;
     state->satellite.latitude = Degrees(state->satellite.position_geodetic.lat);
     state->satellite.longitude = Degrees(state->satellite.position_geodetic.lon);
-    state->satellite.altitude_km = Degrees(state->satellite.position_geodetic.alt);
+    state->satellite.altitude_km = state->satellite.position_geodetic.alt;
+    state->satellite.speed_km_s = state->satellite.velocity.w;
     // Assumes ground station (not in a car, drone, balloon, plane, satellite, etc.)
     Calculate_User_PosVel(state->minutes_since_epoch, &state->observer.position_geodetic, &state->satellite.position, &state->observer.velocity);
 
@@ -67,55 +67,69 @@ void update_doppler_shifted_frequencies(state_t *state)
 }
 
 // Overwrites the current satellite position
-void predicted_max_elevation(state_t *state, double jul_utc_start, double delta_t_minutes)
+void update_pass_predictions(state_t *external_state, double jul_utc_start, double delta_t_minutes)
 {
+    state_t state = {0};
+    memcpy(&state, external_state, sizeof *external_state);
     double jul_utc = jul_utc_start; 
     // Sets prediction to start of pass
-    update_satellite_position(state, jul_utc);
-    double current_elevation = state->satellite.elevation;
+    update_satellite_position(&state, jul_utc);
+    double current_elevation = state.satellite.elevation;
 
-    double last_max_elevation = current_elevation;
     double max_elevation = current_elevation;
-    while (current_elevation > -1.0) {
-        jul_utc += delta_t_minutes / 1440.0;
-        update_satellite_position(state, jul_utc);
-        current_elevation = state->satellite.elevation;
+    double pass_duration = 0.0;
+    double minutes_above_0_degrees = 0.0;
+    double minutes_above_30_degrees = 0.0;
+    while (current_elevation > -5.0) {
+        pass_duration += delta_t_minutes;
+        if (current_elevation > 0.0) {
+            minutes_above_0_degrees += delta_t_minutes;
+        }
+        if (current_elevation > 30.0) {
+            minutes_above_30_degrees += delta_t_minutes;
+        }
+        update_satellite_position(&state, jul_utc + pass_duration / 1440.0);
+        current_elevation = state.satellite.elevation;
         if (max_elevation < current_elevation) {
             max_elevation = current_elevation;
         }
     }
-    if (state->predicted_max_elevation < last_max_elevation) {
-        state->predicted_max_elevation = last_max_elevation;
-    }
+    external_state->predicted_pass_duration_minutes = pass_duration;
+    external_state->predicted_minutes_above_0_degrees = minutes_above_0_degrees;
+    external_state->predicted_minutes_above_30_degrees = minutes_above_30_degrees;
+    external_state->predicted_max_elevation = max_elevation;
 
     return;
 }
 
-void minutes_until_visible(state_t *state, double delta_t_minutes)
+void minutes_until_visible(state_t *external_state, double delta_t_minutes)
 {
+    state_t state = {0};
+    memcpy(&state, external_state, sizeof *external_state);
     struct tm utc;
     struct timeval tv;
     UTC_Calendar_Now(&utc, &tv);
     double jul_utc_start = Julian_Date(&utc, &tv);
     double jul_utc = jul_utc_start; 
-    update_satellite_position(state, jul_utc);
-    double elevation = state->satellite.elevation;
+    update_satellite_position(&state, jul_utc);
+    double elevation = state.satellite.elevation;
     if (elevation < 0) {
         // How long until it becomes visible?
         while (elevation < 0) {
             jul_utc += delta_t_minutes / 1440.0;
-            update_satellite_position(state, jul_utc);
-            elevation = state->satellite.elevation;
+            update_satellite_position(&state, jul_utc);
+            elevation = state.satellite.elevation;
         }
     } else {
         // How long since it became visible?
         while (elevation > 0) {
             jul_utc -= delta_t_minutes / 1440.0;
-            update_satellite_position(state, jul_utc);
-            elevation = state->satellite.elevation;
+            update_satellite_position(&state, jul_utc);
+            elevation = state.satellite.elevation;
         }
     }
-    state->predicted_minutes_until_visible = (jul_utc - jul_utc_start) * 1440.0;
+
+    external_state->predicted_minutes_until_visible = (jul_utc - jul_utc_start) * 1440.0;
 
     return;
 }
@@ -131,9 +145,129 @@ void init_window(void)
     return;
 }
 
+void report_predictions(state_t *state, double jul_utc, int *print_row, int print_col) 
+{
+    if (print_row == NULL) {
+        return;
+    }
+    int row = *print_row;
+    int col = print_col;
+
+    struct tm utc;
+    UTC_Calendar_Now(&utc, NULL);
+    char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    mvprintw(row++, col, "%15s : %d %s %04d %02d:%02d:%02d UTC", "date", utc.tm_mday, months[utc.tm_mon-1], utc.tm_year, utc.tm_hour, utc.tm_min, utc.tm_sec);
+
+    row++;
+    mvprintw(row++, col, "%15s : %s (%s)", "satellite", state->tle.sat_name, state->tle.idesg);
+
+    minutes_until_visible(state, 1.0);
+    if (fabs(state->predicted_minutes_until_visible) < 1) {
+        minutes_until_visible(state, 1./120.0);
+    } else if (fabs(state->predicted_minutes_until_visible) < 10) {
+        minutes_until_visible(state, 0.1);
+    }
+    if (state->predicted_minutes_until_visible > 0) {
+        if (state->predicted_minutes_until_visible < 1) {
+            mvprintw(row++, col, "%15s : %.1f seconds", "next pass in", state->predicted_minutes_until_visible * 60.0);
+        } else if (state->predicted_minutes_until_visible < 10) {
+            mvprintw(row++, col, "%15s : %.1f minutes", "next pass in", state->predicted_minutes_until_visible);
+        } else {
+            mvprintw(row++, col, "%15s : %.0f minutes", "next pass in", state->predicted_minutes_until_visible);
+        }
+        clrtoeol();
+        update_pass_predictions(state, jul_utc + state->predicted_minutes_until_visible / 1440.0, 0.1);
+        mvprintw(row++, col, "%15s : %.1f minutes", "duration", state->predicted_minutes_above_0_degrees);
+        clrtoeol();
+        mvprintw(row++, col, "%15s : %.1f minutes", "el>30", state->predicted_minutes_above_30_degrees);
+        clrtoeol();
+    } else {
+        if (fabs(state->predicted_minutes_until_visible) < 1) {
+            mvprintw(row++, col, "%15s : %.1f seconds ago", "started", -state->predicted_minutes_until_visible * 60.0);
+        } else {
+            mvprintw(row++, col, "%15s : %.1f minutes ago", "started", -state->predicted_minutes_until_visible);
+        }
+        clrtoeol();
+    }
+    mvprintw(row++, col, "%15s : %.1f°", "max elevation", state->predicted_max_elevation);
+        clrtoeol();
+
+    *print_row = row;
+
+    return;
+}
+
+void report_status(state_t *state, int *print_row, int print_col)
+{
+    if (print_row == NULL) {
+        return;
+    }
+    int row = *print_row;
+    int col = print_col;
+
+    if (state->in_pass) {
+        mvprintw(row++, col, "%15s : %s", "status", "** IN PASS **");
+        if (state->tracking) {
+            printw(" (TRACKING)");
+        } else {
+            printw(" (NOT tracking)");
+        }
+    } else {
+        mvprintw(row++, col, "%15s : %s", "status", "** NOT in pass **");
+    }
+    clrtoeol();
+    if (state->have_rig) {
+        mvprintw(row++, col, "%15s : %s", "transceiver", state->rig->caps->model_name);
+        channel_t ch = {0};
+        rig_get_channel(state->rig, RIG_VFO_A, &ch, 0);
+        mvprintw(row++, col, "%15s : %.3f MHz", "VFO A", ch.freq);
+        rig_get_channel(state->rig, RIG_VFO_B, &ch, 0);
+        mvprintw(row++, col, "%15s : %.3f MHz", "VFO B", ch.freq);
+    } else {
+        mvprintw(row++, col, "%15s : %s", "transceiver", "* not initialized *");
+    }
+    if (state->have_rotator) {
+        mvprintw(row++, col, "%15s : %s", "rotator", state->rot->caps->model_name);
+        azimuth_t rot_az = 0.0;
+        elevation_t rot_el = 0.0;
+        rot_get_position(state->rot, &rot_az, &rot_el);
+        mvprintw(row++, col, "%15s : %.2f°", "elevation", (double)rot_el);
+        mvprintw(row++, col, "%15s : %.2f°", "azimuth", (double)rot_az);
+    } else {
+        mvprintw(row++, col, "%15s : %s", "rotator", "* not initialized *");
+    }
+
+    row++;
+    mvprintw(row++, col, "%15s : %.1f° N", "latitude", state->satellite.latitude);
+    mvprintw(row++, col, "%15s : %.1f° E", "longitude", state->satellite.longitude);
+    mvprintw(row++, col, "%15s : %.2f km", "altitude", state->satellite.altitude_km);
+    clrtoeol();
+    mvprintw(row++, col, "%15s : %.2f km/s", "speed", state->satellite.speed_km_s);
+    clrtoeol();
+    mvprintw(row++, col, "%15s : %.2f°", "elevation", state->satellite.elevation);
+    clrtoeol();
+    mvprintw(row++, col, "%15s : %.2f°", "azimuth", state->satellite.azimuth);
+    clrtoeol();
+    mvprintw(row++, col, "%15s : %.1f km", "range", state->satellite.range_km);
+    clrtoeol();
+    mvprintw(row++, col, "%15s : %.2f km/s", "range rate", state->satellite.range_rate_km_s);
+    clrtoeol();
+    row++;
+    mvprintw(row++, col, "%15s : %.3f MHz", "UPLINK on", state->doppler_uplink_frequency);
+    clrtoeol();
+    mvprintw(row++, col, "%15s : %.3f MHz", "DOWNLINK on", state->doppler_downlink_frequency);
+    clrtoeol();
+
+    *print_row = row;
+}
+
 int main(int argc, char **argv) 
 {
     state_t state = {0};
+    state.predicted_max_elevation = -180.0;
+    state.doppler_uplink_frequency = VHF_UPLINK_FREQ;
+    state.doppler_downlink_frequency = UHF_DOWNLINK_FREQ;
+
     int status = 0;
     double tracking_prep_time_minutes = 5.0;
 
@@ -190,37 +324,37 @@ int main(int argc, char **argv)
 
     /* Initialize Hamlib for rig and rotator */
     rig_set_debug(RIG_DEBUG_NONE);
-    RIG *rig = rig_init(RIG_MODEL_IC9700);
-    if (!rig) {
+    state.rig = rig_init(RIG_MODEL_IC9700);
+    if (!state.rig) {
         fprintf(stderr, "Failed to initialize rig support.\n");
         return 1;
     }
-    ROT *rot = rot_init(ROT_MODEL_GS232A);
-    if (!rot) {
+    state.rot = rot_init(ROT_MODEL_GS232A);
+    if (!state.rot) {
         fprintf(stderr, "Failed to initialize rotator support.\n");
         return 1;
     }
 
-    strncpy(rig->state.rigport.pathname, "/dev/ttyUSB1", sizeof(rig->state.rigport.pathname) - 1);
-    rig->state.rigport.pathname[sizeof(rig->state.rigport.pathname) - 1] = '\0';
-    if (rig_open(rig) != RIG_OK) {
+    strncpy(state.rig->state.rigport.pathname, "/dev/ttyUSB1", sizeof(state.rig->state.rigport.pathname) - 1);
+    state.rig->state.rigport.pathname[sizeof(state.rig->state.rigport.pathname) - 1] = '\0';
+    if (rig_open(state.rig) != RIG_OK) {
         fprintf(stderr, "Error opening rig. Is it plugged into USB and powered?.\n");
         if (!state.run_without_rig) {
-            rig_cleanup(rig);
-            rot_cleanup(rot);
+            rig_cleanup(state.rig);
+            rot_cleanup(state.rot);
             return 1;
         }
     } else {
         state.have_rig = 1;
     }
 
-    strncpy(rot->state.rotport.pathname, "/dev/ttyUSB0", sizeof(rot->state.rotport.pathname) - 1);
-    rot->state.rotport.pathname[sizeof(rot->state.rotport.pathname) - 1] = '\0';
-    if (rot_open(rot) != RIG_OK) {
+    strncpy(state.rot->state.rotport.pathname, "/dev/ttyUSB0", sizeof(state.rot->state.rotport.pathname) - 1);
+    state.rot->state.rotport.pathname[sizeof(state.rot->state.rotport.pathname) - 1] = '\0';
+    if (rot_open(state.rot) != RIG_OK) {
         fprintf(stderr, "Error opening rotator. Is it plugged into USB and powered?.\n");
         if (!state.run_without_rotator) {
-            rig_cleanup(rig);
-            rot_cleanup(rot);
+            rig_cleanup(state.rig);
+            rot_cleanup(state.rot);
             return 1;
         }
     } else {
@@ -237,7 +371,6 @@ int main(int argc, char **argv)
     geodetic_t satellite_geodetic = {0};
 
     /* Tracking loop */
-    int tracking = 0;  // 1 if tracking, 0 if idle
     double jul_idle_start = 0;  // Time when the satellite was last tracked
     double speed = 0.0;
     vector_t observer_set = {0};
@@ -249,112 +382,94 @@ int main(int argc, char **argv)
 
     init_window();
 
-    int running = 1;
     char key = '\0';
 
-    int row = 4;
-    while (running) {
+    int row = 0;
+    state.running = 1;
+    while (state.running) {
         // Refresh time
         UTC_Calendar_Now(&utc, &tv);
         jul_utc = Julian_Date(&utc, &tv);
 
-        row = 4;
-        minutes_until_visible(&state, 1.0);
-        if (fabs(state.predicted_minutes_until_visible) < 10) {
-            minutes_until_visible(&state, 0.1);
-        }
-        if (state.predicted_minutes_until_visible > 0) {
-            if (state.predicted_minutes_until_visible < 10) {
-                mvprintw(row, 0, "Next pass in %.1f minutes", state.predicted_minutes_until_visible);
-            } else {
-                mvprintw(row, 0, "Next pass in %.0f minutes", state.predicted_minutes_until_visible);
-            }
-            clrtoeol();
-            predicted_max_elevation(&state, jul_utc + state.predicted_minutes_until_visible / 1440.0, 0.1);
-            mvprintw(++row, 0, " Predicted max elevation: %6.1f degrees", state.predicted_max_elevation);
-            clrtoeol();
-        } else {
-            mvprintw(row, 0, "This pass started %.1f minutes ago", -state.predicted_minutes_until_visible);
-            clrtoeol();
-            mvprintw(++row, 0, " Predicted max elevation: %6.1f degrees", state.predicted_max_elevation);
-            clrtoeol();
-        }
-
         // Refresh satellite position
         update_satellite_position(&state, jul_utc);
 
-        row += 2;
-        mvprintw(row, 0, "Current location: EL: %6.2f  Az: %6.2f", state.satellite.elevation, state.satellite.azimuth);
-        clrtoeol();
+        /* Calculate Doppler shift */
+        update_doppler_shifted_frequencies(&state);
 
         // TODO check for passes that reach a minimum elevation
-        if (state.predicted_minutes_until_visible < tracking_prep_time_minutes) { // Satellite is within 5 minutes of a pass
-            if (!tracking) {
-                tracking = 1;
+        if (state.predicted_minutes_until_visible < tracking_prep_time_minutes) {
+            if (!state.in_pass) {
+                state.in_pass = 1;
+            }
+            if (state.have_rotator && !state.tracking) {
+                state.tracking = 1;
             }
 
-            /* Calculate Doppler shift */
-            update_doppler_shifted_frequencies(&state);
             /* Point rotator to Az/El */
             if (state.have_rotator && !state.run_without_rotator) {
-                if ((ret = rot_set_position(rot, state.satellite.azimuth, state.satellite.azimuth)) != RIG_OK) {
+                if ((ret = rot_set_position(state.rot, state.satellite.azimuth, state.satellite.azimuth)) != RIG_OK) {
                     fprintf(stderr, "Error setting rotor position: %s\n", rigerror(ret));
                 }
             }
 
             /* Set rig frequencies with Doppler correction */
             if (state.have_rig && !state.run_without_rig) {
-                if ((ret = rig_set_freq(rig, RIG_VFO_A, state.doppler_uplink_frequency)) != RIG_OK ||
-                    (ret = rig_set_freq(rig, RIG_VFO_B, state.doppler_downlink_frequency)) != RIG_OK) {
+                if ((ret = rig_set_freq(state.rig, RIG_VFO_A, state.doppler_uplink_frequency)) != RIG_OK ||
+                    (ret = rig_set_freq(state.rig, RIG_VFO_B, state.doppler_downlink_frequency)) != RIG_OK) {
                     fprintf(stderr, "Error setting rig frequency: %s\n", rigerror(ret));
                 }
             }
 
             jul_idle_start = 0;  // Reset idle timer
-        } else { // Satellite is below -5 degrees elevation
-            if (tracking) {
-                tracking = 0;
+        } else {
+            if (state.in_pass) {
+                state.in_pass = 0;
                 jul_idle_start = jul_utc;  // Start idle timer
             }
-
-            /* Check if timeout has elapsed */
-            if (jul_idle_start > 0 && ((jul_utc - jul_idle_start)*1440.0) > 10) {  // 10-minute timeout
-                printf("Timeout reached. Exiting tracking loop.\n");
-                break;
+            if (state.tracking) {
+                state.tracking = 0;
             }
         }
 
-        if (tracking) {
-            mvprintw(2, 0, "TRACKING %s", state.tle.sat_name);
-        } else {
-            mvprintw(2, 0, "NOT tracking %s", state.tle.sat_name);
-        }
-        clrtoeol();
+        // Update predictions
+        erase();
+        row = 1;
+        report_predictions(&state, jul_utc, &row, 0);
+
+        // Update status
+        row ++;
+        report_status(&state, &row, 0);
+
+        mvprintw(0, 0, "");
         refresh();
 
         key = getch(); 
         switch(key) {
             case 'q':
-                running = 0;
+                state.running = 0;
                 break;
             default:
                 break;
         }
 
-        /* Sleep for a short interval (e.g., 1 second) */
-        sleep(1);
+        // TODO Import TLE every 6 hours?
+
+        // Sleep for a short interval 
+        usleep(250000);
+
     }
 
     endwin();
 
     /* Cleanup */
-    if (rig) {
-        rig_close(rig);
-        rig_cleanup(rig);
+    if (state.rig) {
+        rig_close(state.rig);
+        rig_cleanup(state.rig);
     }
-    if (rot) {
-        rot_close(rot);
-        rot_cleanup(rot);
+    if (state.rot) {
+        rot_close(state.rot);
+        rot_cleanup(state.rot);
     }
 
     return 0;
