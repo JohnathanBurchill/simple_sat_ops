@@ -1,11 +1,12 @@
+#include "sgp4sdp4/sgp4sdp4.h"
 #include "state.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <hamlib/rig.h>
 #include <hamlib/rotator.h>
+
 #include "sgp4sdp4.h"
 
 /* RAO site observer location in Priddis, SW of Calgary */
@@ -17,59 +18,98 @@
 #define VHF_UPLINK_FREQ   145800000ULL  /* Uplink: 145.800 MHz */
 #define UHF_DOWNLINK_FREQ 435300000ULL  /* Downlink: 435.300 MHz */
 
-/* Convert satellite ECI position to Az/El for observer location */
-void eci_to_azel(vector_t *pos, geodetic_t *observer, time_t timestamp, double *az, double *el) {
-    vector_t obs_pos, obs_vel, range;
-    double range_magnitude, sin_lat, cos_lat, sin_lon, cos_lon;
-    double top_s, top_e, top_z;
-
-    /* Calculate observer's position and velocity */
-    Calculate_User_PosVel((double)timestamp, observer, &obs_pos, &obs_vel);
-
-    /* Relative position (range vector) */
-    Vec_Sub(pos, &obs_pos, &range);
-
-    /* Magnitude of the range vector */
-    Magnitude(&range);
-    range_magnitude = range.w;
-
-    /* Convert observer's latitude and longitude to radians */
-    sin_lat = sin(observer->lat);
-    cos_lat = cos(observer->lat);
-    sin_lon = sin(observer->lon);
-    cos_lon = cos(observer->lon);
-
-    /* Compute topocentric coordinates */
-    top_s = sin_lat * cos_lon * range.x + sin_lat * sin_lon * range.y - cos_lat * range.z;
-    top_e = -sin_lon * range.x + cos_lon * range.y;
-    top_z = cos_lat * cos_lon * range.x + cos_lat * sin_lon * range.y + sin_lat * range.z;
-
-    /* Azimuth and elevation */
-    *az = atan2(top_e, -top_s) * 180.0 / M_PI;
-    if (*az < 0) *az += 360.0;
-    *el = asin(top_z / range_magnitude) * 180.0 / M_PI;
-}
-
 void usage(FILE *dest, const char *name) 
 {
     fprintf(dest, "usage: %s <tle_file>\n", name);
     return;
 }
 
+void update_satellite_position(state_t *state, double jul_utc)
+{
+    // jul times are days
+    state->jul_epoch = Julian_Date_of_Epoch(state->tle.epoch);
+    state->minutes_since_epoch = (jul_utc - state->jul_epoch) * 1440.0;
+
+    /* Propagate satellite position */
+    /* Call NORAD routines according to deep-space flag */
+    if(isFlagSet(DEEP_SPACE_EPHEM_FLAG)) {
+        SDP4(state->minutes_since_epoch, &state->tle, &state->satellite.position, &state->satellite.velocity);
+    } else {
+        SGP4(state->minutes_since_epoch, &state->tle, &state->satellite.position, &state->satellite.velocity);
+    }
+
+    // pos and vel in km, km/s
+    Convert_Sat_State(&state->satellite.position, &state->satellite.velocity);
+    Magnitude(&state->satellite.velocity);
+    Calculate_Obs(jul_utc, &state->satellite.position, &state->satellite.velocity, &state->observer.position_geodetic, &state->satellite.observation_set);
+    Calculate_LatLonAlt(jul_utc, &state->satellite.position, &state->satellite.position_geodetic);
+    state->satellite.azimuth = Degrees(state->satellite.observation_set.x);
+    state->satellite.elevation = Degrees(state->satellite.observation_set.y);
+    state->satellite.range_km = Degrees(state->satellite.observation_set.z);
+    state->satellite.range_rate_km_s = Degrees(state->satellite.observation_set.w);
+    state->satellite.latitude = Degrees(state->satellite.position_geodetic.lat);
+    state->satellite.longitude = Degrees(state->satellite.position_geodetic.lon);
+    state->satellite.altitude_km = Degrees(state->satellite.position_geodetic.alt);
+    // Assumes ground station (not in a car, drone, balloon, plane, satellite, etc.)
+    Calculate_User_PosVel(state->minutes_since_epoch, &state->observer.position_geodetic, &state->satellite.position, &state->observer.velocity);
+
+    return;
+}
+
+void update_doppler_shifted_frequencies(state_t *state)
+{
+    Vec_Sub(&state->satellite.velocity, &state->observer.velocity, &state->observer_satellite_relative_velocity);
+    state->observer_satellite_relative_speed = Dot(&state->observer_satellite_relative_velocity, &state->satellite.position) / state->satellite.position.w;  // Radial velocity
+    state->doppler_uplink_frequency = VHF_UPLINK_FREQ * (1 + state->observer_satellite_relative_speed / 299792.458);  // Speed of light in km/s
+    state->doppler_downlink_frequency = UHF_DOWNLINK_FREQ * (1 + state->observer_satellite_relative_speed / 299792.458);
+
+    return;
+}
+
+double minutes_until_visible(state_t *state, double delta_t_minutes)
+{
+    struct tm utc;
+    struct timeval tv;
+    UTC_Calendar_Now(&utc, &tv);
+    double jul_utc_start = Julian_Date(&utc, &tv);
+    double jul_utc = jul_utc_start; 
+    update_satellite_position(state, jul_utc);
+    double elevation = state->satellite.elevation;
+    if (elevation < 0) {
+        // How long until it becomes visible?
+        while (elevation < 0) {
+            jul_utc += delta_t_minutes / 1440.0;
+            update_satellite_position(state, jul_utc);
+            elevation = state->satellite.elevation;
+        }
+    } else {
+        // How long since it became visible?
+        while (elevation > 0) {
+            jul_utc -= delta_t_minutes / 1440.0;
+            update_satellite_position(state, jul_utc);
+            elevation = state->satellite.elevation;
+        }
+    }
+    double minutes_away = (jul_utc - jul_utc_start) * 1440.0;
+
+    return minutes_away;
+}
+
 int main(int argc, char **argv) 
 {
     state_t state = {0};
+    int status = 0;
 
     for (int i = 0; i < argc; i++) {
-        if (strcmp("--without-rig", argv[i]) == 0) {
+        if (strcmp("--no-rig", argv[i]) == 0) {
             state.n_options++;
             state.run_without_rig = 1;
         }
-        else if (strcmp("--without-rotator", argv[i]) == 0) {
+        else if (strcmp("--no-rotator", argv[i]) == 0) {
             state.n_options++;
             state.run_without_rotator = 1;
         }
-        else if (strcmp("--without-hardware", argv[i]) == 0) {
+        else if (strcmp("--no-hardware", argv[i]) == 0) {
             state.n_options++;
             state.run_without_rig = 1;
             state.run_without_rotator = 1;
@@ -93,8 +133,23 @@ int main(int argc, char **argv)
     state.tle_filename = argv[1];
 
     /* Parse TLE data */
-    tle_t tle = {0};
-    Input_Tle_Set(state.tle_filename, &tle);
+    int tle_status = Input_Tle_Set(state.tle_filename, &state.tle);
+    if (tle_status) {
+        fprintf(stderr, "Unable to read TLE from %s: ", state.tle_filename);
+        switch (tle_status) {
+            case -1:
+                fprintf(stderr, "error opening file\n");
+                break;
+            case -2:
+                fprintf(stderr, "invalid TLE format\n");
+                break;
+            default:
+                fprintf(stderr, "unknown reason\n");
+        }
+        return tle_status;
+    }
+    ClearFlag(ALL_FLAGS);
+    select_ephemeris(&state.tle);
 
     /* Initialize Hamlib for rig and rotator */
     rig_set_debug(RIG_DEBUG_NONE);
@@ -118,89 +173,92 @@ int main(int argc, char **argv)
             rot_cleanup(rot);
             return 1;
         }
+    } else {
+        state.have_rig = 1;
     }
-    state.have_rig = 1;
 
     strncpy(rot->state.rotport.pathname, "/dev/ttyUSB0", sizeof(rot->state.rotport.pathname) - 1);
     rot->state.rotport.pathname[sizeof(rot->state.rotport.pathname) - 1] = '\0';
-        if (rot_open(rot) != RIG_OK) {
+    if (rot_open(rot) != RIG_OK) {
         fprintf(stderr, "Error opening rotator. Is it plugged into USB and powered?.\n");
         if (!state.run_without_rotator) {
             rig_cleanup(rig);
             rot_cleanup(rot);
             return 1;
         }
+    } else {
+        state.have_rotator = 1;
     }
-    state.have_rotator = 1;
 
     /* Set up observer location */
-    geodetic_t observer = {
+    geodetic_t observer_geodetic = {
         .lat = RAO_LATITUDE * M_PI / 180.0,
         .lon = RAO_LONGITUDE * M_PI / 180.0,
         .alt = RAO_ALTITUDE / 1000.0,
     };
 
+    geodetic_t satellite_geodetic = {0};
+
     /* Tracking loop */
     int tracking = 0;  // 1 if tracking, 0 if idle
-    time_t idle_start = 0;  // Time when the satellite was last tracked
-    struct timeval tv = {0};
-    double now = 0.0;
+    double jul_idle_start = 0;  // Time when the satellite was last tracked
+    double speed = 0.0;
+    vector_t observer_set = {0};
+
+    int ret = 0;
+    struct tm utc;
+    struct timeval tv;
+    double jul_utc = 0.0;
+    double minutes_away = 0.0;
 
     while (1) {
-        gettimeofday(&tv, NULL);
-        now = tv.tv_sec + tv.tv_usec / 1e6;
-        double az, el;
-        vector_t pos, vel;
-        double doppler_uplink, doppler_downlink;
-        int ret;
+        
+        UTC_Calendar_Now(&utc, &tv);
+        jul_utc = Julian_Date(&utc, &tv);
+        update_satellite_position(&state, jul_utc);
+        printf("EL: %6.2f  Az: %6.2f next pass in ", state.satellite.elevation, state.satellite.azimuth);
+        minutes_away = minutes_until_visible(&state, 10.0);
+        if (fabs(minutes_away) < 10.0) {
+            minutes_away = minutes_until_visible(&state, 0.1);
+            printf("%.1f", minutes_away);
+        } else {
+            printf("%.0f", minutes_away);
+        }
+        printf(" minutes\n");
 
-        /* Propagate satellite position */
-        SGP4((now - tle.epoch) * 1440.0 / 86400.0, &tle, &pos, &vel);
-
-        /* Convert ECI to Az/El */
-        eci_to_azel(&pos, &observer, now, &az, &el);
-
-        printf("EL: %6.2f  Az: %6.2f\n", el, az);
-        if (el > -5.0) { // Satellite is above -5 degrees elevation
+        if (state.satellite.elevation > -5.0) { // Satellite is above -5 degrees elevation
             if (!tracking) {
                 printf("Satellite is rising. Starting tracking...\n");
                 tracking = 1;
             }
 
             /* Calculate Doppler shift */
-            vector_t obs_pos, obs_vel, relative_vel;
-            Calculate_User_PosVel((double)now, &observer, &obs_pos, &obs_vel);
-            Vec_Sub(&vel, &obs_vel, &relative_vel);
-            double relative_speed = Dot(&relative_vel, &pos) / pos.w;  // Radial velocity
-
-            doppler_uplink = VHF_UPLINK_FREQ * (1 + relative_speed / 299792.458);  // Speed of light in km/s
-            doppler_downlink = UHF_DOWNLINK_FREQ * (1 + relative_speed / 299792.458);
-
+            update_doppler_shifted_frequencies(&state);
             /* Point rotator to Az/El */
-            if (state.have_rotator || !state.run_without_rotator) {
-                if ((ret = rot_set_position(rot, az, el)) != RIG_OK) {
+            if (state.have_rotator && !state.run_without_rotator) {
+                if ((ret = rot_set_position(rot, state.satellite.azimuth, state.satellite.azimuth)) != RIG_OK) {
                     fprintf(stderr, "Error setting rotor position: %s\n", rigerror(ret));
                 }
             }
 
             /* Set rig frequencies with Doppler correction */
-            if (state.have_rig || !state.run_without_rig) {
-                if ((ret = rig_set_freq(rig, RIG_VFO_A, (unsigned long)doppler_uplink)) != RIG_OK ||
-                    (ret = rig_set_freq(rig, RIG_VFO_B, (unsigned long)doppler_downlink)) != RIG_OK) {
+            if (state.have_rig && !state.run_without_rig) {
+                if ((ret = rig_set_freq(rig, RIG_VFO_A, state.doppler_uplink_frequency)) != RIG_OK ||
+                    (ret = rig_set_freq(rig, RIG_VFO_B, state.doppler_downlink_frequency)) != RIG_OK) {
                     fprintf(stderr, "Error setting rig frequency: %s\n", rigerror(ret));
                 }
             }
 
-            idle_start = 0;  // Reset idle timer
+            jul_idle_start = 0;  // Reset idle timer
         } else { // Satellite is below -5 degrees elevation
             if (tracking) {
                 printf("Satellite has set. Stopping tracking...\n");
                 tracking = 0;
-                idle_start = now;  // Start idle timer
+                jul_idle_start = jul_utc;  // Start idle timer
             }
 
             /* Check if timeout has elapsed */
-            if (idle_start > 0 && difftime(now, idle_start) > 600) {  // 10-minute timeout
+            if (jul_idle_start > 0 && ((jul_utc - jul_idle_start)*1440.0) > 10) {  // 10-minute timeout
                 printf("Timeout reached. Exiting tracking loop.\n");
                 break;
             }
