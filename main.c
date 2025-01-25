@@ -371,7 +371,7 @@ int main(int argc, char **argv)
     strncpy(state.rig->state.rigport.pathname, "/dev/ttyUSB1", sizeof(state.rig->state.rigport.pathname) - 1);
     state.rig->state.rigport.pathname[sizeof(state.rig->state.rigport.pathname) - 1] = '\0';
     if (rig_open(state.rig) != RIG_OK) {
-        fprintf(stderr, "Error opening rig. Is it plugged into USB and powered?.\n");
+        fprintf(stderr, "Error opening rig. Is it plugged into USB and powered?\n");
         if (!state.run_without_rig) {
             rig_cleanup(state.rig);
             rot_cleanup(state.rot);
@@ -384,7 +384,7 @@ int main(int argc, char **argv)
     strncpy(state.rot->state.rotport.pathname, "/dev/ttyUSB0", sizeof(state.rot->state.rotport.pathname) - 1);
     state.rot->state.rotport.pathname[sizeof(state.rot->state.rotport.pathname) - 1] = '\0';
     if (rot_open(state.rot) != RIG_OK) {
-        fprintf(stderr, "Error opening rotator. Is it plugged into USB and powered?.\n");
+        fprintf(stderr, "Error opening rotator. Is it plugged into USB and powered?\n");
         if (!state.run_without_rotator) {
             rig_cleanup(state.rig);
             rot_cleanup(state.rot);
