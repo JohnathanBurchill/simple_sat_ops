@@ -285,6 +285,7 @@ int load_tle(state_t *state)
             // Read 69 characterers
             fgets(tle + 69, 70, file);
             tle[138] = '\0';
+            snprintf(state->satellite.tle.sat_name, sizeof(state->satellite.tle.sat_name), "%s", name);
             found_satellite = 1;
             break;
         }
