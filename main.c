@@ -310,6 +310,8 @@ int load_tle(state_t *state)
             break;
         }
     }
+    fclose(file);
+
     if (!found_satellite) {
         fprintf(stderr, "Satellite '%s' not found in %s\n", state->satellite.name, state->tles_filename);
         return -2;
