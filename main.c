@@ -127,9 +127,9 @@ void report_status(state_t *state, int *print_row, int print_col)
         mvprintw(row++, col, "%15s : %s", "transceiver", state->rig->caps->model_name);
         channel_t ch = {0};
         rig_get_channel(state->rig, RIG_VFO_A, &ch, 0);
-        mvprintw(row++, col, "%15s : %.3f MHz", "VFO A", ch.freq);
+        mvprintw(row++, col, "%15s : %.1f MHz", "VFO A", ch.freq);
         rig_get_channel(state->rig, RIG_VFO_B, &ch, 0);
-        mvprintw(row++, col, "%15s : %.3f MHz", "VFO B", ch.freq);
+        mvprintw(row++, col, "%15s : %.1f MHz", "VFO B", ch.freq);
     } else {
         mvprintw(row++, col, "%15s : %s", "transceiver", "* not initialized *");
     }
@@ -160,9 +160,9 @@ void report_status(state_t *state, int *print_row, int print_col)
     mvprintw(row++, col, "%15s : %.2f km/s", "range rate", state->satellite.range_rate_km_s);
     clrtoeol();
     row++;
-    mvprintw(row++, col, "%15s : %.3f MHz", "UPLINK on", state->doppler_uplink_frequency);
+    mvprintw(row++, col, "%15s : %.1f MHz", "UPLINK on", state->doppler_uplink_frequency);
     clrtoeol();
-    mvprintw(row++, col, "%15s : %.3f MHz", "DOWNLINK on", state->doppler_downlink_frequency);
+    mvprintw(row++, col, "%15s : %.1f MHz", "DOWNLINK on", state->doppler_downlink_frequency);
     clrtoeol();
 
     *print_row = row;
