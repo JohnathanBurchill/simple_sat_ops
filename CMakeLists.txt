@@ -18,7 +18,7 @@
 #
 
 cmake_minimum_required(VERSION 3.10)
-project(RigRotatorControl)
+project(simple_sat_ops)
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
 #set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
@@ -52,13 +52,13 @@ if (NOT HAMLIB_INCLUDE_DIR OR NOT HAMLIB_LIBRARY)
 endif()
 
 # Add the main executable
-add_executable(rig_rotator_control main.c)
+add_executable(simple_sat_ops main.c)
 
 # Include directories for sgp4sdp4 and Hamlib
-target_include_directories(rig_rotator_control PRIVATE
+target_include_directories(simple_sat_ops PRIVATE
     ${CMAKE_SOURCE_DIR}/sgp4sdp4
     ${HAMLIB_INCLUDE_DIR}
 )
 
 # Link the sgp4sdp4 library and Hamlib
-target_link_libraries(rig_rotator_control PRIVATE sgp4sdp4 ${HAMLIB_LIBRARY} ${NCURSES_LIBRARIES} m curl)
+target_link_libraries(simple_sat_ops PRIVATE sgp4sdp4 ${HAMLIB_LIBRARY} ${NCURSES_LIBRARIES} m curl)
