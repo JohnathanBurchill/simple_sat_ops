@@ -70,3 +70,11 @@ target_include_directories(next_in_queue PRIVATE
     ${HAMLIB_INCLUDE_DIR}
 )
 target_link_libraries(next_in_queue PRIVATE sgp4sdp4 ${HAMLIB_LIBRARY} ${NCURSES_LIBRARIES} m)
+
+# Lifetime tool
+add_executable(lifetime lifetime.c prediction.c)
+target_include_directories(lifetime PRIVATE
+    ${CMAKE_SOURCE_DIR}/sgp4sdp4
+    ${HAMLIB_INCLUDE_DIR}
+)
+target_link_libraries(lifetime PRIVATE sgp4sdp4 ${HAMLIB_LIBRARY} m)
