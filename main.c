@@ -177,6 +177,9 @@ int main(int argc, char **argv)
 
     int status = 0;
     double tracking_prep_time_minutes = 5.0;
+    double site_latitude = RAO_LATITUDE;
+    double site_longitude = RAO_LONGITUDE;
+    double site_altitude = RAO_ALTITUDE;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp("--no-rig", argv[i]) == 0) {
@@ -191,6 +194,30 @@ int main(int argc, char **argv)
             state.n_options++;
             state.run_without_rig = 1;
             state.run_without_rotator = 1;
+        }
+        else if (strncmp("--lat=", argv[i], 6) == 0) {
+            state.n_options++; 
+            if (strlen(argv[i]) < 7) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            site_latitude = atof(argv[i] + 6);
+        }
+        else if (strncmp("--lon=", argv[i], 6) == 0) {
+            state.n_options++; 
+            if (strlen(argv[i]) < 7) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            site_longitude = atof(argv[i] + 6);
+        }
+        else if (strncmp("--alt=", argv[i], 6) == 0) {
+            state.n_options++; 
+            if (strlen(argv[i]) < 7) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            site_altitude = atof(argv[i] + 6);
         }
         else if (strcmp("--help", argv[i]) == 0) {
             usage(stdout, argv[0]);
@@ -259,9 +286,9 @@ int main(int argc, char **argv)
     }
 
     /* Set up observer location */
-    state.observer.position_geodetic.lat = RAO_LATITUDE * M_PI / 180.0;
-    state.observer.position_geodetic.lon = RAO_LONGITUDE* M_PI / 180.0;
-    state.observer.position_geodetic.alt = RAO_ALTITUDE / 1000.0;
+    state.observer.position_geodetic.lat = site_latitude * M_PI / 180.0;
+    state.observer.position_geodetic.lon = site_longitude * M_PI / 180.0;
+    state.observer.position_geodetic.alt = site_altitude / 1000.0;
 
     /* Tracking loop */
     double jul_idle_start = 0;  // Time when the satellite was last tracked

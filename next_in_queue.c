@@ -30,7 +30,10 @@ typedef struct
 {
     double min_altitude_km;
     double max_altitude_km;
+    double min_minutes;
     double max_minutes;
+    double min_elevation;
+    double max_elevation;
 } criteria_t;
 
 // Returns the first match on state->satellite.name
@@ -114,24 +117,65 @@ int next_in_queue(state_t *external_state, double jul_utc_start, double delta_t_
     return 0;
 }
 
+void usage(FILE *dest, const char *name) 
+{
+    fprintf(dest, "usage: %s <tles_file> <min_alt_km> <max_alt_km>\n", name);
+    return;
+}
+
 int main(int argc, char **argv)
 {
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s <file.tle> <min_alt_km> <max_alt_km>\n", argv[0]);
-        return EXIT_FAILURE;
-    }
+    double site_latitude = RAO_LATITUDE;
+    double site_longitude = RAO_LONGITUDE;
+    double site_altitude = RAO_ALTITUDE;
 
     int status = 0;
     state_t state = {0};
+
+    for (int i = 0; i < argc; i++) {
+        if (strncmp("--lat=", argv[i], 6) == 0) {
+            state.n_options++; 
+            if (strlen(argv[i]) < 7) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            site_latitude = atof(argv[i] + 6);
+        } else if (strncmp("--lon=", argv[i], 6) == 0) {
+            state.n_options++; 
+            if (strlen(argv[i]) < 7) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            site_longitude = atof(argv[i] + 6);
+        } else if (strncmp("--alt=", argv[i], 6) == 0) {
+            state.n_options++; 
+            if (strlen(argv[i]) < 7) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            site_altitude = atof(argv[i] + 6);
+        } else if (strcmp("--help", argv[i]) == 0) {
+            usage(stdout, argv[0]);
+            return 0;
+        } else if (strncmp("--", argv[i], 2) == 0) {
+            fprintf(stderr, "Unable to parse option '%s'\n", argv[i]);
+            return 1;
+        }
+    }
+
+    if (argc - state.n_options != 4) {
+        usage(stderr, argv[0]);
+        return EXIT_FAILURE;
+    }
 
     state.tles_filename = argv[1];
     double min_altitude_km = atof(argv[2]);
     double max_altitude_km = atof(argv[3]);
 
     /* Set up observer location */
-    state.observer.position_geodetic.lat = RAO_LATITUDE * M_PI / 180.0;
-    state.observer.position_geodetic.lon = RAO_LONGITUDE* M_PI / 180.0;
-    state.observer.position_geodetic.alt = RAO_ALTITUDE / 1000.0;
+    state.observer.position_geodetic.lat = site_latitude * M_PI / 180.0;
+    state.observer.position_geodetic.lon = site_longitude * M_PI / 180.0;
+    state.observer.position_geodetic.alt = site_altitude / 1000.0;
 
     struct tm utc;
     struct timeval tv;
