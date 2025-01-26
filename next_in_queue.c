@@ -34,7 +34,7 @@ typedef struct
 } criteria_t;
 
 // Returns the first match on state->satellite.name
-int next_in_queue(state_t *external_state, double jul_utc_start, double delta_t_minutes, criteria_t *criteria, char **next_name, double *minutes_away)
+int next_in_queue(state_t *external_state, double jul_utc_start, double delta_t_minutes, criteria_t *criteria, char **next_name, double *minutes_away, int *count, int *number_checked)
 {
     FILE *file = fopen(external_state->tles_filename, "r");
     if (file == NULL) {
@@ -54,8 +54,8 @@ int next_in_queue(state_t *external_state, double jul_utc_start, double delta_t_
     
     // TODO load into memory for speed
     // Check every TLE
-    int count = 0;
-    int number_checked = 0;
+    int internal_count = 0;
+    int internal_number_checked = 0;
     while (fgets(name, 128, file)) {
         // Remove newline
         name[strlen(name) - 1] = '\0';
@@ -82,7 +82,7 @@ int next_in_queue(state_t *external_state, double jul_utc_start, double delta_t_
                 next_up_minutes_away = state.predicted_minutes_until_visible;
                 snprintf(next_up_name, sizeof(next_up_name), "%s", name);
             }
-            number_checked++;
+            internal_number_checked++;
             double m = state.predicted_minutes_until_visible;
             if (m > 1440.0) {
                 printf("%s: %.0f days\n", name, m / 1440.0);
@@ -93,7 +93,7 @@ int next_in_queue(state_t *external_state, double jul_utc_start, double delta_t_
             }
         }
 
-        count++;
+        internal_count++;
 
     }
     fclose(file);
@@ -104,8 +104,14 @@ int next_in_queue(state_t *external_state, double jul_utc_start, double delta_t_
     if (minutes_away) {
         *minutes_away = next_up_minutes_away;
     }
+    if (count) {
+        *count = internal_count;
+    }
+    if (number_checked) {
+        *number_checked = internal_number_checked;
+    }
 
-    return count;
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -142,8 +148,11 @@ int main(int argc, char **argv)
         .max_minutes = 1440.0,
     };
 
-    int number_checked = next_in_queue(&state, jul_utc, 1.0, &criteria,  &next_in_queue_name, &next_in_queue_minutes_away);
-    if (number_checked > 0) {
+    int count = 0;
+    int number_checked = 0;
+    status = next_in_queue(&state, jul_utc, 1.0, &criteria,  &next_in_queue_name, &next_in_queue_minutes_away, &count, &number_checked);
+    if (status == 0) {
+        printf("\nChecked %d of %d satellites\n", number_checked, count);
         int n = strlen(next_in_queue_name);
         while(n > 0 && isspace(next_in_queue_name[n - 1])) {
             n--;
