@@ -19,6 +19,7 @@
 */
 
 #include "state.h"
+#include "prediction.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -28,129 +29,15 @@
 #include <sgp4sdp4.h>
 #include <ncurses.h>
 
-/* RAO site observer location in Priddis, SW of Calgary */
-#define RAO_LATITUDE  50.8812  // Latitude in degrees
-#define RAO_LONGITUDE -114.2914 // Longitude in degrees
-#define RAO_ALTITUDE  1250.0   // Altitude in meters
-
 /* Satellite communication frequencies */
 #define VHF_UPLINK_FREQ   145800000.000
 #define UHF_DOWNLINK_FREQ 435300000.000
 
+#define MAX_MINUTES_TO_PREDICT ((7 * 1440))
+
 void usage(FILE *dest, const char *name) 
 {
     fprintf(dest, "usage: %s <tles_file> <satellite_id>\n", name);
-    return;
-}
-
-void update_satellite_position(state_t *state, double jul_utc)
-{
-    // jul times are days
-    state->jul_epoch = Julian_Date_of_Epoch(state->satellite.tle.epoch);
-    state->minutes_since_epoch = (jul_utc - state->jul_epoch) * 1440.0;
-
-    /* Propagate satellite position */
-    /* Call NORAD routines according to deep-space flag */
-    if(isFlagSet(DEEP_SPACE_EPHEM_FLAG)) {
-        SDP4(state->minutes_since_epoch, &state->satellite.tle, &state->satellite.position, &state->satellite.velocity);
-    } else {
-        SGP4(state->minutes_since_epoch, &state->satellite.tle, &state->satellite.position, &state->satellite.velocity);
-    }
-
-    // pos and vel in km, km/s
-    Convert_Sat_State(&state->satellite.position, &state->satellite.velocity);
-    Magnitude(&state->satellite.velocity);
-    Calculate_Obs(jul_utc, &state->satellite.position, &state->satellite.velocity, &state->observer.position_geodetic, &state->satellite.observation_set);
-    Calculate_LatLonAlt(jul_utc, &state->satellite.position, &state->satellite.position_geodetic);
-    state->satellite.azimuth = Degrees(state->satellite.observation_set.x);
-    state->satellite.elevation = Degrees(state->satellite.observation_set.y);
-    state->satellite.range_km = state->satellite.observation_set.z;
-    state->satellite.range_rate_km_s = state->satellite.observation_set.w;
-    state->satellite.latitude = Degrees(state->satellite.position_geodetic.lat);
-    state->satellite.longitude = Degrees(state->satellite.position_geodetic.lon);
-    state->satellite.altitude_km = state->satellite.position_geodetic.alt;
-    state->satellite.speed_km_s = state->satellite.velocity.w;
-    // Assumes ground station (not in a car, drone, balloon, plane, satellite, etc.)
-    Calculate_User_PosVel(state->minutes_since_epoch, &state->observer.position_geodetic, &state->satellite.position, &state->observer.velocity);
-
-    return;
-}
-
-void update_doppler_shifted_frequencies(state_t *state)
-{
-    Vec_Sub(&state->satellite.velocity, &state->observer.velocity, &state->observer_satellite_relative_velocity);
-    state->observer_satellite_relative_speed = Dot(&state->observer_satellite_relative_velocity, &state->satellite.position) / state->satellite.position.w;  // Radial velocity
-    state->doppler_uplink_frequency = VHF_UPLINK_FREQ * (1 + state->observer_satellite_relative_speed / 299792.458);  // Speed of light in km/s
-    state->doppler_downlink_frequency = UHF_DOWNLINK_FREQ * (1 + state->observer_satellite_relative_speed / 299792.458);
-
-    return;
-}
-
-// Overwrites the current satellite position
-void update_pass_predictions(state_t *external_state, double jul_utc_start, double delta_t_minutes)
-{
-    state_t state = {0};
-    memcpy(&state, external_state, sizeof *external_state);
-    double jul_utc = jul_utc_start; 
-    // Sets prediction to start of pass
-    update_satellite_position(&state, jul_utc);
-    double current_elevation = state.satellite.elevation;
-
-    double max_elevation = current_elevation;
-    double pass_duration = 0.0;
-    double minutes_above_0_degrees = 0.0;
-    double minutes_above_30_degrees = 0.0;
-    while (current_elevation > -5.0) {
-        pass_duration += delta_t_minutes;
-        if (current_elevation > 0.0) {
-            minutes_above_0_degrees += delta_t_minutes;
-        }
-        if (current_elevation > 30.0) {
-            minutes_above_30_degrees += delta_t_minutes;
-        }
-        update_satellite_position(&state, jul_utc + pass_duration / 1440.0);
-        current_elevation = state.satellite.elevation;
-        if (max_elevation < current_elevation) {
-            max_elevation = current_elevation;
-        }
-    }
-    external_state->predicted_pass_duration_minutes = pass_duration;
-    external_state->predicted_minutes_above_0_degrees = minutes_above_0_degrees;
-    external_state->predicted_minutes_above_30_degrees = minutes_above_30_degrees;
-    external_state->predicted_max_elevation = max_elevation;
-
-    return;
-}
-
-void minutes_until_visible(state_t *external_state, double delta_t_minutes)
-{
-    state_t state = {0};
-    memcpy(&state, external_state, sizeof *external_state);
-    struct tm utc;
-    struct timeval tv;
-    UTC_Calendar_Now(&utc, &tv);
-    double jul_utc_start = Julian_Date(&utc, &tv);
-    double jul_utc = jul_utc_start; 
-    update_satellite_position(&state, jul_utc);
-    double elevation = state.satellite.elevation;
-    if (elevation < 0) {
-        // How long until it becomes visible?
-        while (elevation < 0) {
-            jul_utc += delta_t_minutes / 1440.0;
-            update_satellite_position(&state, jul_utc);
-            elevation = state.satellite.elevation;
-        }
-    } else {
-        // How long since it became visible?
-        while (elevation > 0) {
-            jul_utc -= delta_t_minutes / 1440.0;
-            update_satellite_position(&state, jul_utc);
-            elevation = state.satellite.elevation;
-        }
-    }
-
-    external_state->predicted_minutes_until_visible = (jul_utc - jul_utc_start) * 1440.0;
-
     return;
 }
 
@@ -181,11 +68,11 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
     row++;
     mvprintw(row++, col, "%15s : %s (%s)", "satellite", state->satellite.tle.sat_name, state->satellite.tle.idesg);
 
-    minutes_until_visible(state, 1.0);
+    minutes_until_visible(state, 1.0, MAX_MINUTES_TO_PREDICT);
     if (fabs(state->predicted_minutes_until_visible) < 1) {
-        minutes_until_visible(state, 1./120.0);
+        minutes_until_visible(state, 1./120.0, 2.0);
     } else if (fabs(state->predicted_minutes_until_visible) < 10) {
-        minutes_until_visible(state, 0.1);
+        minutes_until_visible(state, 0.1, 20.0);
     }
     if (state->predicted_minutes_until_visible > 0) {
         if (state->predicted_minutes_until_visible < 1) {
@@ -281,52 +168,6 @@ void report_status(state_t *state, int *print_row, int print_col)
     *print_row = row;
 }
 
-// Returns the first match on state->satellite.name
-int load_tle(state_t *state)
-{
-    FILE *file = fopen(state->tles_filename, "r");
-    if (file == NULL) {
-        fprintf(stderr, "Error opening %s\n", state->tles_filename);
-        return -1;
-    }
-    
-    // 2 69-character lines plus a nul terminator
-    char tle[139] = {0};
-    char name[128] = {0}; 
-    int found_satellite = 0;
-
-    while (fgets(name, 128, file)) {
-        // Remove newline
-        name[strlen(name) - 1] = '\0';
-        if (strncmp(state->satellite.name, name, strlen(state->satellite.name)) == 0) {
-            // Errors caught in TLE check
-            // Read 70 characters, including the newline
-            fgets(tle, 71, file);
-            // Read 69 characterers
-            fgets(tle + 69, 70, file);
-            tle[138] = '\0';
-            snprintf(state->satellite.tle.sat_name, sizeof(state->satellite.tle.sat_name), "%s", name);
-            found_satellite = 1;
-            break;
-        }
-    }
-    fclose(file);
-
-    if (!found_satellite) {
-        fprintf(stderr, "Satellite '%s' not found in %s\n", state->satellite.name, state->tles_filename);
-        return -2;
-    }
-
-    if (!Good_Elements(tle)) {
-        fprintf(stderr, "Invalid TLE\n");
-        return -3;
-    }
-    Convert_Satellite_Data(tle, &state->satellite.tle);
-
-    return 0;
-
-}
-
 int main(int argc, char **argv) 
 {
     state_t state = {0};
@@ -418,18 +259,12 @@ int main(int argc, char **argv)
     }
 
     /* Set up observer location */
-    geodetic_t observer_geodetic = {
-        .lat = RAO_LATITUDE * M_PI / 180.0,
-        .lon = RAO_LONGITUDE * M_PI / 180.0,
-        .alt = RAO_ALTITUDE / 1000.0,
-    };
-
-    geodetic_t satellite_geodetic = {0};
+    state.observer.position_geodetic.lat = RAO_LATITUDE * M_PI / 180.0;
+    state.observer.position_geodetic.lon = RAO_LONGITUDE* M_PI / 180.0;
+    state.observer.position_geodetic.alt = RAO_ALTITUDE / 1000.0;
 
     /* Tracking loop */
     double jul_idle_start = 0;  // Time when the satellite was last tracked
-    double speed = 0.0;
-    vector_t observer_set = {0};
 
     int ret = 0;
     struct tm utc;
@@ -442,16 +277,20 @@ int main(int argc, char **argv)
 
     int row = 0;
     state.running = 1;
+
+    // Queue info 
+    
+    char *next_in_queue_name = NULL;
+    double next_in_queue_minutes_away = -1e10; 
+
     while (state.running) {
-        // Refresh time
+        // Refresh
         UTC_Calendar_Now(&utc, &tv);
         jul_utc = Julian_Date(&utc, &tv);
-
-        // Refresh satellite position
         update_satellite_position(&state, jul_utc);
 
         /* Calculate Doppler shift */
-        update_doppler_shifted_frequencies(&state);
+        update_doppler_shifted_frequencies(&state, VHF_UPLINK_FREQ, UHF_DOWNLINK_FREQ);
 
         // TODO check for passes that reach a minimum elevation
         if (state.predicted_minutes_until_visible < tracking_prep_time_minutes) {
@@ -497,6 +336,16 @@ int main(int argc, char **argv)
         row ++;
         report_status(&state, &row, 0);
 
+        if (next_in_queue_minutes_away > 0) {
+            int n = strlen(next_in_queue_name);
+            while (n > 0 && isspace(next_in_queue_name[n-1])) {
+                n--;
+            }
+            next_in_queue_name[n] = '\0';
+            row++;
+            mvprintw(row++, 0, "%15s : %s (%.0f minutes)", "Next in queue", next_in_queue_name, next_in_queue_minutes_away);
+        }
+
         mvprintw(0, 0, "");
         refresh();
 
@@ -512,6 +361,10 @@ int main(int argc, char **argv)
         // Sleep for a short interval 
         usleep(250000);
 
+    }
+
+    if (next_in_queue_name) {
+        free(next_in_queue_name);
     }
 
     endwin();

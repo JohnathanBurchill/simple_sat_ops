@@ -52,7 +52,7 @@ if (NOT HAMLIB_INCLUDE_DIR OR NOT HAMLIB_LIBRARY)
 endif()
 
 # Add the main executable
-add_executable(simple_sat_ops main.c)
+add_executable(simple_sat_ops main.c prediction.c)
 
 # Include directories for sgp4sdp4 and Hamlib
 target_include_directories(simple_sat_ops PRIVATE
@@ -62,3 +62,11 @@ target_include_directories(simple_sat_ops PRIVATE
 
 # Link the sgp4sdp4 library and Hamlib
 target_link_libraries(simple_sat_ops PRIVATE sgp4sdp4 ${HAMLIB_LIBRARY} ${NCURSES_LIBRARIES} m curl)
+
+# Next in queue tool
+add_executable(next_in_queue next_in_queue.c prediction.c)
+target_include_directories(next_in_queue PRIVATE
+    ${CMAKE_SOURCE_DIR}/sgp4sdp4
+    ${HAMLIB_INCLUDE_DIR}
+)
+target_link_libraries(next_in_queue PRIVATE sgp4sdp4 ${HAMLIB_LIBRARY} ${NCURSES_LIBRARIES} m)
