@@ -86,15 +86,21 @@ void update_pass_predictions(state_t *external_state, double jul_utc_start, doub
     double pass_duration = 0.0;
     double minutes_above_0_degrees = 0.0;
     double minutes_above_30_degrees = 0.0;
+    int ascended = 0;
     while (current_elevation > -5.0) {
+        update_satellite_position(&state, jul_utc + pass_duration / 1440.0);
         pass_duration += delta_t_minutes;
         if (current_elevation > 0.0) {
             minutes_above_0_degrees += delta_t_minutes;
+            if (!ascended) {
+                ascended = 1;
+                external_state->predicted_ascension_jul_utc = jul_utc + pass_duration / 1440.0;
+                external_state->predicted_ascension_azimuth = state.satellite.azimuth;
+            }
         }
         if (current_elevation > 30.0) {
             minutes_above_30_degrees += delta_t_minutes;
         }
-        update_satellite_position(&state, jul_utc + pass_duration / 1440.0);
         current_elevation = state.satellite.elevation;
         if (max_elevation < current_elevation) {
             max_elevation = current_elevation;

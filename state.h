@@ -62,6 +62,8 @@ typedef struct state {
     double predicted_pass_duration_minutes;
     double predicted_minutes_above_0_degrees;
     double predicted_minutes_above_30_degrees;
+    double predicted_ascension_azimuth;
+    double predicted_ascension_jul_utc;
     int tracking;
     int in_pass;
     RIG *rig;

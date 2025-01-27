@@ -48,13 +48,24 @@ double lifetime(state_t *state, double jul_utc_start, double delta_t_minutes, do
     update_satellite_position(state, jul_utc);
     double years = 0.0;
 
+    char filename[FILENAME_MAX] = {0};
+    snprintf(filename, FILENAME_MAX, "/tmp/lifetime_%s.dat", state->satellite.name);
+    FILE *file = fopen(filename, "w");
+    if (file == NULL) {
+        fprintf(stderr, "Unable to open %s for writing\n", filename);
+        return -1;
+    }
+
     while (years < max_years && state->satellite.altitude_km > min_alt_km) {
         update_satellite_position(state, jul_utc);
-        printf("%.6f %6.2f\n", jul_utc, state->satellite.altitude_km);
+        fprintf(file, "%.6f %6.2f\n", years, state->satellite.altitude_km);
         jul_utc += delta_t_minutes / 1440.0;
         // Approx, sufficient for this problem
         years = (jul_utc - jul_utc_start) / 365.25;
     }
+
+    fflush(file);
+    fclose(file);
 
     return years;
 }
@@ -104,7 +115,7 @@ int main(int argc, char **argv)
     UTC_Calendar_Now(&utc, &tv);
     double jul_utc = Julian_Date(&utc, &tv);
 
-    double years = lifetime(&state, jul_utc, 1440., max_years, min_alt_km);
+    double years = lifetime(&state, jul_utc, 1.0, max_years, min_alt_km);
     printf("Years above %.1f km: %.3f\n", min_alt_km, years);
 
     return 0;
