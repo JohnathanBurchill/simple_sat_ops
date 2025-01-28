@@ -381,7 +381,6 @@ int main(int argc, char **argv)
     int count = 0;
     int number_checked = 0;
     status = find_overflights(&state, jul_utc, 1.0, &criteria, &count, &number_checked);
-    printf("Found %lu upcoming passes from a total of %d satellites\n", n_passes, count);
 
     if (n_passes > 0) {
         // Sort the list
@@ -395,14 +394,22 @@ int main(int argc, char **argv)
             max_passes = n_passes;
         }
         if (list_all) {
-            printf("%26s  %8s %8s %9s %9s\n", "Name", "in (min)", "dur (min)", "azi (deg)", "ele (deg)");
+            if (!reverse) {
+                printf("Found %lu upcoming passes from a total of %d satellites\n", n_passes, count);
+                printf("%26s  %8s %8s %9s %9s\n", "Name", "in (min)", "dur (min)", "azi (deg)", "ele (deg)");
+            }
             for (int i = 0; i < max_passes; i++) {
                 p = &passes[i];
                 printf("%26s  %8.1f %9.1f %9.1f %9.1f\n", p->name, p->minutes_away, p->pass_duration, p->ascension_azimuth, p->max_elevation);
             }
+            if (reverse) {
+                printf("%26s  %8s %8s %9s %9s\n", "Name", "in (min)", "dur (min)", "azi (deg)", "ele (deg)");
+                printf("Found %lu upcoming passes from a total of %d satellites\n", n_passes, count);
+            }
         } else {
+            printf("Searched %d satellites\n", count);
             p = &passes[0];
-                printf("%26s in %.1f minutes at azimuth %.1f deg. for %.1f minutes reaching elevation %.1f deg.\n", p->name, p->minutes_away, p->ascension_azimuth, p->pass_duration, p->max_elevation);
+            printf("%26s in %.1f minutes at azimuth %.1f deg. for %.1f minutes reaching elevation %.1f deg.\n", p->name, p->minutes_away, p->ascension_azimuth, p->pass_duration, p->max_elevation);
             // printf("%s in %.2f minutes\n", p->name, p->minutes_away);
             // printf("%15s : %.2f° N\n", "latitude", state.satellite.latitude);
             // printf("%15s : %.2f° E\n", "longitude", state.satellite.longitude);
