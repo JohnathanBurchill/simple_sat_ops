@@ -48,6 +48,7 @@ typedef struct ephemeres
 typedef struct state {
     int n_options;
     int running;
+    int verbose_level;
     char *tles_filename;
     double jul_epoch;
     double minutes_since_epoch;
@@ -57,6 +58,8 @@ typedef struct state {
     double observer_satellite_relative_speed;
     double doppler_uplink_frequency;
     double doppler_downlink_frequency;
+    double rig_vfo_a_frequency;
+    double rig_vfo_b_frequency;
     double predicted_minutes_until_visible;
     double predicted_max_elevation;
     double predicted_pass_duration_minutes;

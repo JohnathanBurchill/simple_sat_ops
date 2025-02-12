@@ -1,22 +1,22 @@
 /*
 
-    Simple Satellite Operations  main.c
+   Simple Satellite Operations  main.c
 
-    Copyright (C) 2025  Johnathan K Burchill
+   Copyright (C) 2025  Johnathan K Burchill
 
-    This program is free software: you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
 
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
 
-    You should have received a copy of the GNU General Public License
-    along with this program.  If not, see <https://www.gnu.org/licenses/>.
-*/
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+   */
 
 #include "state.h"
 #include "prediction.h"
@@ -97,7 +97,7 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
         clrtoeol();
     }
     mvprintw(row++, col, "%15s : %.1f°", "max elevation", state->predicted_max_elevation);
-        clrtoeol();
+    clrtoeol();
 
     *print_row = row;
 
@@ -124,12 +124,12 @@ void report_status(state_t *state, int *print_row, int print_col)
     }
     clrtoeol();
     if (state->have_rig) {
+        rig_get_freq(state->rig, RIG_VFO_A, (freq_t *)&state->rig_vfo_a_frequency);
+        rig_get_freq(state->rig, RIG_VFO_B, (freq_t *)&state->rig_vfo_b_frequency);
+
         mvprintw(row++, col, "%15s : %s", "transceiver", state->rig->caps->model_name);
-        channel_t ch = {0};
-        rig_get_channel(state->rig, RIG_VFO_A, &ch, 0);
-        mvprintw(row++, col, "%15s : %.1f MHz", "VFO A", ch.freq);
-        rig_get_channel(state->rig, RIG_VFO_B, &ch, 0);
-        mvprintw(row++, col, "%15s : %.1f MHz", "VFO B", ch.freq);
+        mvprintw(row++, col, "%15s : %.1f Hz", "VFO A", state->rig_vfo_a_frequency);
+        mvprintw(row++, col, "%15s : %.1f Hz", "VFO B", state->rig_vfo_b_frequency);
     } else {
         mvprintw(row++, col, "%15s : %s", "transceiver", "* not initialized *");
     }
@@ -160,9 +160,9 @@ void report_status(state_t *state, int *print_row, int print_col)
     mvprintw(row++, col, "%15s : %.2f km/s", "range rate", state->satellite.range_rate_km_s);
     clrtoeol();
     row++;
-    mvprintw(row++, col, "%15s : %.1f MHz", "UPLINK on", state->doppler_uplink_frequency);
+    mvprintw(row++, col, "%15s : %.1f Hz", "UPLINK on", state->doppler_uplink_frequency);
     clrtoeol();
-    mvprintw(row++, col, "%15s : %.1f MHz", "DOWNLINK on", state->doppler_downlink_frequency);
+    mvprintw(row++, col, "%15s : %.1f Hz", "DOWNLINK on", state->doppler_downlink_frequency);
     clrtoeol();
 
     *print_row = row;
@@ -170,6 +170,8 @@ void report_status(state_t *state, int *print_row, int print_col)
 
 int main(int argc, char **argv) 
 {
+
+    int ret = 0;
     state_t state = {0};
     state.predicted_max_elevation = -180.0;
     state.doppler_uplink_frequency = VHF_UPLINK_FREQ;
@@ -181,49 +183,53 @@ int main(int argc, char **argv)
     double site_longitude = RAO_LONGITUDE;
     double site_altitude = RAO_ALTITUDE;
 
+
     for (int i = 0; i < argc; i++) {
-        if (strcmp("--no-rig", argv[i]) == 0) {
+        if (strncmp("--verbose=", argv[i], 10) == 0) {
+            state.n_options++; 
+            if (strlen(argv[i]) < 11) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state.verbose_level = atoi(argv[i] + 10);
+        } else if (strcmp("--no-rig", argv[i]) == 0) {
             state.n_options++;
             state.run_without_rig = 1;
-        }
-        else if (strcmp("--no-rotator", argv[i]) == 0) {
+        } else if (strcmp("--no-rig", argv[i]) == 0) {
+            state.n_options++;
+            state.run_without_rig = 1;
+        } else if (strcmp("--no-rotator", argv[i]) == 0) {
             state.n_options++;
             state.run_without_rotator = 1;
-        }
-        else if (strcmp("--no-hardware", argv[i]) == 0) {
+        } else if (strcmp("--no-hardware", argv[i]) == 0) {
             state.n_options++;
             state.run_without_rig = 1;
             state.run_without_rotator = 1;
-        }
-        else if (strncmp("--lat=", argv[i], 6) == 0) {
+        } else if (strncmp("--lat=", argv[i], 6) == 0) {
             state.n_options++; 
             if (strlen(argv[i]) < 7) {
                 fprintf(stderr, "Unable to parse %s\n", argv[i]);
                 return EXIT_FAILURE;
             }
             site_latitude = atof(argv[i] + 6);
-        }
-        else if (strncmp("--lon=", argv[i], 6) == 0) {
+        } else if (strncmp("--lon=", argv[i], 6) == 0) {
             state.n_options++; 
             if (strlen(argv[i]) < 7) {
                 fprintf(stderr, "Unable to parse %s\n", argv[i]);
                 return EXIT_FAILURE;
             }
             site_longitude = atof(argv[i] + 6);
-        }
-        else if (strncmp("--alt=", argv[i], 6) == 0) {
+        } else if (strncmp("--alt=", argv[i], 6) == 0) {
             state.n_options++; 
             if (strlen(argv[i]) < 7) {
                 fprintf(stderr, "Unable to parse %s\n", argv[i]);
                 return EXIT_FAILURE;
             }
             site_altitude = atof(argv[i] + 6);
-        }
-        else if (strcmp("--help", argv[i]) == 0) {
+        } else if (strcmp("--help", argv[i]) == 0) {
             usage(stdout, argv[0]);
             return 0;
-        }
-        else if (strncmp("--", argv[i], 2) == 0) {
+        } else if (strncmp("--", argv[i], 2) == 0) {
             fprintf(stderr, "Unable to parse option '%s'\n", argv[i]);
             return 1;
         }
@@ -241,48 +247,56 @@ int main(int argc, char **argv)
     /* Parse TLE data */
     int tle_status = load_tle(&state);
     if (tle_status) {
-       return tle_status;
+        return tle_status;
     }
     ClearFlag(ALL_FLAGS);
     select_ephemeris(&state.satellite.tle);
 
-    /* Initialize Hamlib for rig and rotator */
-    rig_set_debug(RIG_DEBUG_NONE);
-    state.rig = rig_init(RIG_MODEL_IC9700);
-    if (!state.rig) {
-        fprintf(stderr, "Failed to initialize rig support.\n");
-        return 1;
-    }
-    state.rot = rot_init(ROT_MODEL_SPID_ROT2PROG);
-    if (!state.rot) {
-        fprintf(stderr, "Failed to initialize rotator support.\n");
-        return 1;
-    }
 
-    strncpy(state.rig->state.rigport.pathname, "/dev/ttyUSB1", sizeof(state.rig->state.rigport.pathname) - 1);
-    state.rig->state.rigport.pathname[sizeof(state.rig->state.rigport.pathname) - 1] = '\0';
-    if (rig_open(state.rig) != RIG_OK) {
-        fprintf(stderr, "Error opening rig. Is it plugged into USB and powered?\n");
-        if (!state.run_without_rig) {
-            rig_cleanup(state.rig);
-            rot_cleanup(state.rot);
+    if (!state.run_without_rig) {
+        rig_set_debug(state.verbose_level);
+        state.rig = rig_init(RIG_MODEL_IC9700);
+        if (!state.rig) {
+            fprintf(stderr, "Failed to initialize rig support.\n");
             return 1;
         }
-    } else {
-        state.have_rig = 1;
-    }
-
-    strncpy(state.rot->state.rotport.pathname, "/dev/ttyUSB0", sizeof(state.rot->state.rotport.pathname) - 1);
-    state.rot->state.rotport.pathname[sizeof(state.rot->state.rotport.pathname) - 1] = '\0';
-    if (rot_open(state.rot) != RIG_OK) {
-        fprintf(stderr, "Error opening rotator. Is it plugged into USB and powered?\n");
-        if (!state.run_without_rotator) {
-            rig_cleanup(state.rig);
-            rot_cleanup(state.rot);
+        ret = rig_set_conf(state.rig, rig_token_lookup(state.rig, "rig_pathname"), "/dev/ttyUSB1");
+        if (ret != RIG_OK) {
+            printf("Error setting pathname\n");
             return 1;
         }
-    } else {
-        state.have_rotator = 1;
+        ret = rig_set_conf(state.rig, rig_token_lookup(state.rig, "serial_speed"), "9600");
+        if (ret != RIG_OK) {
+            printf("Error setting serial speed\n");
+            return 1;
+        }
+        if (rig_open(state.rig) != RIG_OK) {
+            fprintf(stderr, "Error opening rig. Is it plugged into USB and powered?\n");
+            if (!state.run_without_rig) {
+                rig_cleanup(state.rig);
+                rot_cleanup(state.rot);
+                return 1;
+            }
+        } else {
+            state.have_rig = 1;
+        }
+    }
+    if (!state.run_without_rotator) {
+        state.rot = rot_init(ROT_MODEL_SPID_ROT2PROG);
+        if (!state.rot) {
+            fprintf(stderr, "Failed to initialize rotator support.\n");
+            return 1;
+        }
+        if (rot_open(state.rot) != RIG_OK) {
+            fprintf(stderr, "error opening rotator. is it plugged into usb and powered?\n");
+            if (!state.run_without_rotator) {
+                rig_cleanup(state.rig);
+                rot_cleanup(state.rot);
+                return 1;
+            }
+        } else {
+            state.have_rotator = 1;
+        }
     }
 
     /* Set up observer location */
@@ -293,7 +307,6 @@ int main(int argc, char **argv)
     /* Tracking loop */
     double jul_idle_start = 0;  // Time when the satellite was last tracked
 
-    int ret = 0;
     struct tm utc;
     struct timeval tv;
     double jul_utc = 0.0;
@@ -306,7 +319,7 @@ int main(int argc, char **argv)
     state.running = 1;
 
     // Queue info 
-    
+
     char *next_in_queue_name = NULL;
     double next_in_queue_minutes_away = -1e10; 
 
@@ -337,9 +350,15 @@ int main(int argc, char **argv)
 
             /* Set rig frequencies with Doppler correction */
             if (state.have_rig && !state.run_without_rig) {
-                if ((ret = rig_set_freq(state.rig, RIG_VFO_A, state.doppler_uplink_frequency)) != RIG_OK ||
-                    (ret = rig_set_freq(state.rig, RIG_VFO_B, state.doppler_downlink_frequency)) != RIG_OK) {
-                    fprintf(stderr, "Error setting rig frequency: %s\n", rigerror(ret));
+                rig_set_vfo(state.rig, RIG_VFO_A);
+                ret = rig_set_freq(state.rig, RIG_VFO_A, state.doppler_uplink_frequency);
+                if (ret != RIG_OK) {
+                    fprintf(stderr, "Error setting uplink frequency on VFO A: %s\n", rigerror(ret));
+                }
+                rig_set_vfo(state.rig, RIG_VFO_B);
+                ret = rig_set_freq(state.rig, RIG_VFO_B, state.doppler_downlink_frequency);
+                if (ret != RIG_OK) {
+                    fprintf(stderr, "Error setting downlink frequency on VFO B: %s\n", rigerror(ret));
                 }
             }
 
