@@ -36,7 +36,7 @@ find_path(HAMLIB_INCLUDE_DIR hamlib/rig.h
     /usr/include
 )
 
-find_library(HAMLIB_LIBRARY libhamlib.dylib 
+find_library(HAMLIB_LIBRARY hamlib
     PATHS 
     /usr/local/lib 
     /usr/lib
@@ -61,7 +61,7 @@ target_include_directories(simple_sat_ops PRIVATE
 )
 
 # Link the sgp4sdp4 library and Hamlib
-target_link_libraries(simple_sat_ops PRIVATE sgp4sdp4 ${HAMLIB_LIBRARY} ${NCURSES_LIBRARIES} m curl)
+target_link_libraries(simple_sat_ops PRIVATE sgp4sdp4 ${HAMLIB_LIBRARY} ${NCURSES_LIBRARIES} m) 
 
 # Next in queue tool
 add_executable(next_in_queue next_in_queue.c prediction.c)
