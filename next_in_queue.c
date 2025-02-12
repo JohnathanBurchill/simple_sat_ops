@@ -187,9 +187,9 @@ int find_overflights(state_t *external_state, double jul_utc_start, double delta
                 n_passes++;
                 memset(&passes[n_passes - 1], 0, sizeof *passes);
                 pass_t *p = &passes[n_passes - 1];
-                (void)strlcpy(p->name, name, sizeof(p->name));
+                (void)strncpy(p->name, name, sizeof(p->name));
 
-                (void)strlcpy(p->tle, name, sizeof(p->tle));
+                (void)strncpy(p->tle, name, sizeof(p->tle));
 
                 // Refine estimate:
                 if (state.predicted_minutes_until_visible < 10.0 && delta_t_minutes > 1.0/60.) {
