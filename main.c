@@ -253,7 +253,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "Failed to initialize rig support.\n");
         return 1;
     }
-    state.rot = rot_init(ROT_MODEL_GS232A);
+    state.rot = rot_init(ROT_MODEL_SPID_ROT2PROG);
     if (!state.rot) {
         fprintf(stderr, "Failed to initialize rotator support.\n");
         return 1;
@@ -373,7 +373,7 @@ int main(int argc, char **argv)
             mvprintw(row++, 0, "%15s : %s (%.0f minutes)", "Next in queue", next_in_queue_name, next_in_queue_minutes_away);
         }
 
-        mvprintw(0, 0, "");
+        mvprintw(0, 0, "%s", "");
         refresh();
 
         key = getch(); 
