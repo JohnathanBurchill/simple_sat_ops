@@ -23,9 +23,9 @@
 #include "state.h"
 
 /* RAO site observer location in Priddis, SW of Calgary */
-#define RAO_LATITUDE  50.8812  // Latitude in degrees
-#define RAO_LONGITUDE -114.2914 // Longitude in degrees
-#define RAO_ALTITUDE  1250.0   // Altitude in meters
+#define RAO_LATITUDE  50.8688  // Latitude in degrees
+#define RAO_LONGITUDE -114.2910 // Longitude in degrees
+#define RAO_ALTITUDE  1279.0   // Altitude in meters
 
 void update_satellite_position(state_t *state, double jul_utc);
 void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, double downlink_freq);
