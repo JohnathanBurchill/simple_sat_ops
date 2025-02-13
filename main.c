@@ -28,7 +28,8 @@
 #include <ncurses.h>
 
 // Satellite communication defaults
-#define UPLINK_FREQ_MHZ   145.150100
+#define UPLINK_FREQ_MHZ   145.150000
+// #define UPLINK_FREQ_MHZ 436.150000
 #define DOWNLINK_FREQ_MHZ 436.150000
 
 // Update the radio's frequencies when the change 
@@ -52,6 +53,8 @@ void init_window(void)
     keypad(stdscr, TRUE);
     start_color();
     init_pair(1, COLOR_RED, COLOR_BLACK);
+    init_pair(2, COLOR_YELLOW, COLOR_BLACK);
+    init_pair(3, COLOR_GREEN, COLOR_BLACK);
 
     return;
 }
@@ -82,7 +85,10 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
     }
     if (state->predicted_minutes_until_visible > 0) {
         if (state->predicted_minutes_until_visible < 1) {
-            mvprintw(row++, col, "%15s : %.1f seconds", "next pass in", state->predicted_minutes_until_visible * 60.0);
+            mvprintw(row++, col, "%15s : ", "next pass in");
+            attron(COLOR_PAIR(2));
+            printw("%.1f seconds", state->predicted_minutes_until_visible * 60.0);
+            attroff(COLOR_PAIR(2));
         } else if (state->predicted_minutes_until_visible < 10) {
             mvprintw(row++, col, "%15s : %.1f minutes", "next pass in", state->predicted_minutes_until_visible);
         } else {
@@ -95,11 +101,18 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
         mvprintw(row++, col, "%15s : %.1f minutes", "el>30", state->predicted_minutes_above_30_degrees);
         clrtoeol();
     } else {
+        mvprintw(row++, col, "%15s : ", "elapsed time");
+        attron(COLOR_PAIR(3));
         if (fabs(state->predicted_minutes_until_visible) < 1) {
-            mvprintw(row++, col, "%15s : %.1f seconds ago", "started", -state->predicted_minutes_until_visible * 60.0);
+            printw("%.1f seconds", -state->predicted_minutes_until_visible * 60.0);
         } else {
-            mvprintw(row++, col, "%15s : %.1f minutes ago", "started", -state->predicted_minutes_until_visible);
+            printw("%.1f minutes", -state->predicted_minutes_until_visible);
         }
+        attroff(COLOR_PAIR(3));
+        clrtoeol();
+        mvprintw(row++, col, "%15s : %.1f minutes", "duration", state->predicted_minutes_above_0_degrees);
+        clrtoeol();
+        mvprintw(row++, col, "%15s : %.1f minutes", "el>30", state->predicted_minutes_above_30_degrees);
         clrtoeol();
     }
     mvprintw(row++, col, "%15s : %.1f deg", "max elevation", state->predicted_max_elevation);
@@ -139,9 +152,9 @@ void report_status(state_t *state, int *print_row, int print_col)
     if (state->have_rig) {
         mvprintw(row++, col, "%15s : %s", "transceiver", state->rig->caps->model_name);
         clrtoeol();
-        mvprintw(row++, col, "%15s : %.6f Hz", "VFO Main", state->rig_vfo_main_frequency / 1e6);
+        mvprintw(row++, col, "%15s : %.6f MHz", "VFO Main", state->rig_vfo_main_frequency / 1e6);
         clrtoeol();
-        mvprintw(row++, col, "%15s : %.6f Hz", "VFO Sub", state->rig_vfo_sub_frequency / 1e6);
+        mvprintw(row++, col, "%15s : %.6f MHz", "VFO Sub", state->rig_vfo_sub_frequency / 1e6);
         clrtoeol();
     } else {
         mvprintw(row++, col, "%15s : %s", "transceiver", "* not initialized *");
@@ -191,6 +204,15 @@ void report_position(state_t *state, int *print_row, int print_col)
     clrtoeol();
 
     *print_row = row;
+}
+
+int set_sat_mode(RIG *rig, int sat_mode) 
+{
+    int ret = rig_set_func(rig, RIG_VFO_CURR, RIG_FUNC_SATMODE, sat_mode);
+    if (ret != RIG_OK) {
+        fprintf(stderr, "Failed to enable SATMODE: %s\n", rigerror(ret));
+    }
+    return ret;
 }
 
 int main(int argc, char **argv) 
@@ -417,11 +439,7 @@ int main(int argc, char **argv)
             }
         } else {
             state.have_rig = 1;
-            int sat_mode = 1;
-            int ret = rig_set_func(state.rig, RIG_VFO_CURR, RIG_FUNC_SATMODE, sat_mode);
-            if (ret != RIG_OK) {
-                fprintf(stderr, "Failed to enable SATMODE: %s\n", rigerror(ret));
-            }
+            set_sat_mode(state.rig, 1);
             rig_get_freq(state.rig, RIG_VFO_MAIN, (freq_t *)&state.rig_vfo_main_frequency);
             rig_get_freq(state.rig, RIG_VFO_SUB, (freq_t *)&state.rig_vfo_sub_frequency);
         }
@@ -529,7 +547,7 @@ int main(int argc, char **argv)
         // Update status
         row ++;
         report_status(&state, &row, 0);
-        row = 3;
+        row = 5;
         int col = 50;
         report_position(&state, &row, col);
 
@@ -574,6 +592,7 @@ int main(int argc, char **argv)
 
     /* Cleanup */
     if (state.rig) {
+        set_sat_mode(state.rig, 0);
         rig_close(state.rig);
         rig_cleanup(state.rig);
     }
