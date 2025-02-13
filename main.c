@@ -28,8 +28,8 @@
 #include <ncurses.h>
 
 // Satellite communication defaults
-#define VHF_UPLINK_FREQ_MHZ   145.800000
-#define UHF_DOWNLINK_FREQ_MHZ 435.300000
+#define UPLINK_FREQ_MHZ   436.150000
+#define DOWNLINK_FREQ_MHZ 436.150000
 
 // Update the radio's frequencies when the change 
 // associated with Doppler shift exceeds this amount
@@ -214,8 +214,8 @@ int main(int argc, char **argv)
     int with_constellations = 0;
     int auto_sat = 0;
 
-    double nominal_uplink_frequency = VHF_UPLINK_FREQ_MHZ * 1e6;
-    double nominal_downlink_frequency = UHF_DOWNLINK_FREQ_MHZ * 1e6;
+    double nominal_uplink_frequency = UPLINK_FREQ_MHZ * 1e6;
+    double nominal_downlink_frequency = DOWNLINK_FREQ_MHZ * 1e6;
 
     state.run_with_rig = 1;
     state.run_with_rotator = 0;
