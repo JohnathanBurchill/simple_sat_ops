@@ -21,6 +21,7 @@
 #include "state.h"
 #include "prediction.h"
 
+#include <hamlib/rotator.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -149,12 +150,12 @@ void report_status(state_t *state, int *print_row, int print_col)
         mvprintw(row++, col, "%15s : %s", "status", "** NOT in pass **");
     }
     clrtoeol();
-    if (state->have_rig) {
-        mvprintw(row++, col, "%15s : %s", "transceiver", state->rig->caps->model_name);
+    if (state->have_radio) {
+        mvprintw(row++, col, "%15s : %s", "transceiver", state->radio->caps->model_name);
         clrtoeol();
-        mvprintw(row++, col, "%15s : %.6f MHz", "VFO Main", state->rig_vfo_main_frequency / 1e6);
+        mvprintw(row++, col, "%15s : %.6f MHz", "VFO Main", state->radio_vfo_main_frequency / 1e6);
         clrtoeol();
-        mvprintw(row++, col, "%15s : %.6f MHz", "VFO Sub", state->rig_vfo_sub_frequency / 1e6);
+        mvprintw(row++, col, "%15s : %.6f MHz", "VFO Sub", state->radio_vfo_sub_frequency / 1e6);
         clrtoeol();
     } else {
         mvprintw(row++, col, "%15s : %s", "transceiver", "* not initialized *");
@@ -206,9 +207,9 @@ void report_position(state_t *state, int *print_row, int print_col)
     *print_row = row;
 }
 
-int set_sat_mode(RIG *rig, int sat_mode) 
+int set_sat_mode(RIG *radio, int sat_mode) 
 {
-    int ret = rig_set_func(rig, RIG_VFO_CURR, RIG_FUNC_SATMODE, sat_mode);
+    int ret = rig_set_func(radio, RIG_VFO_CURR, RIG_FUNC_SATMODE, sat_mode);
     if (ret != RIG_OK) {
         fprintf(stderr, "Failed to enable SATMODE: %s\n", rigerror(ret));
     }
@@ -239,7 +240,7 @@ int main(int argc, char **argv)
     double nominal_uplink_frequency = UPLINK_FREQ_MHZ * 1e6;
     double nominal_downlink_frequency = DOWNLINK_FREQ_MHZ * 1e6;
 
-    state.run_with_rig = 1;
+    state.run_with_radio = 0;
     state.run_with_rotator = 0;
 
     for (int i = 0; i < argc; i++) {
@@ -250,15 +251,15 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
             state.verbose_level = atoi(argv[i] + 10);
-        } else if (strcmp("--with-rig", argv[i]) == 0) {
+        } else if (strcmp("--with-radio", argv[i]) == 0) {
             state.n_options++;
-            state.run_with_rig = 1;
+            state.run_with_radio = 1;
         } else if (strcmp("--with-rotator", argv[i]) == 0) {
             state.n_options++;
             state.run_with_rotator = 1;
         } else if (strcmp("--with-hardware", argv[i]) == 0) {
             state.n_options++;
-            state.run_with_rig = 1;
+            state.run_with_radio = 1;
             state.run_with_rotator = 1;
         } else if (strncmp("--uplink-freq-mhz=", argv[i], 18) == 0) {
             state.n_options++; 
@@ -408,40 +409,40 @@ int main(int argc, char **argv)
     select_ephemeris(&state.satellite.tle);
 
 
-    if (state.run_with_rig) {
+    if (state.run_with_radio) {
         rig_set_debug(state.verbose_level);
-        state.rig = rig_init(RIG_MODEL_IC9700);
-        if (!state.rig) {
-            fprintf(stderr, "Failed to initialize rig support.\n");
+        state.radio = rig_init(RIG_MODEL_IC9700);
+        if (!state.radio) {
+            fprintf(stderr, "Failed to initialize radio support.\n");
             return 1;
         }
-        ret = rig_set_conf(state.rig, rig_token_lookup(state.rig, "rig_pathname"), "/dev/ttyUSB1");
+        ret = rig_set_conf(state.radio, rig_token_lookup(state.radio, "rig_pathname"), "/dev/ttyUSB1");
         if (ret != RIG_OK) {
             printf("Error setting pathname\n");
             return 1;
         }
-        ret = rig_set_conf(state.rig, rig_token_lookup(state.rig, "serial_speed"), "9600");
+        ret = rig_set_conf(state.radio, rig_token_lookup(state.radio, "serial_speed"), "9600");
         if (ret != RIG_OK) {
             printf("Error setting serial speed\n");
             return 1;
         }
-        ret = rig_set_conf(state.rig, rig_token_lookup(state.rig, "no_xchg"), "1");
+        ret = rig_set_conf(state.radio, rig_token_lookup(state.radio, "no_xchg"), "1");
         if (ret != RIG_OK) {
             printf("Error setting no_xchg = 1\n");
             return 1;
         }
-        if (rig_open(state.rig) != RIG_OK) {
-            fprintf(stderr, "Error opening rig. Is it plugged into USB and powered?\n");
-            if (state.run_with_rig) {
-                rig_cleanup(state.rig);
+        if (rig_open(state.radio) != RIG_OK) {
+            fprintf(stderr, "Error opening radio. Is it plugged into USB and powered?\n");
+            if (state.run_with_radio) {
+                rig_cleanup(state.radio);
                 rot_cleanup(state.rot);
                 return 1;
             }
         } else {
-            state.have_rig = 1;
-            set_sat_mode(state.rig, 1);
-            rig_get_freq(state.rig, RIG_VFO_MAIN, (freq_t *)&state.rig_vfo_main_frequency);
-            rig_get_freq(state.rig, RIG_VFO_SUB, (freq_t *)&state.rig_vfo_sub_frequency);
+            state.have_radio = 1;
+            set_sat_mode(state.radio, 1);
+            rig_get_freq(state.radio, RIG_VFO_MAIN, (freq_t *)&state.radio_vfo_main_frequency);
+            rig_get_freq(state.radio, RIG_VFO_SUB, (freq_t *)&state.radio_vfo_sub_frequency);
         }
     }
     if (state.run_with_rotator) {
@@ -453,7 +454,7 @@ int main(int argc, char **argv)
         if (rot_open(state.rot) != RIG_OK) {
             fprintf(stderr, "error opening rotator. is it plugged into usb and powered?\n");
             if (state.run_with_rotator) {
-                rig_cleanup(state.rig);
+                rig_cleanup(state.radio);
                 rot_cleanup(state.rot);
                 return 1;
             }
@@ -510,21 +511,21 @@ int main(int argc, char **argv)
                 }
             }
 
-            /* Set rig frequencies with Doppler correction*/
-            if (state.have_rig && state.run_with_rig && ((doppler_delta_uplink > doppler_max_delta) || (doppler_delta_downlink > doppler_max_delta))) {
-                ret = rig_set_freq(state.rig, RIG_VFO_MAIN, state.doppler_uplink_frequency);
+            /* Set radio frequencies with Doppler correction*/
+            if (state.have_radio && state.run_with_radio && ((doppler_delta_uplink > doppler_max_delta) || (doppler_delta_downlink > doppler_max_delta))) {
+                ret = rig_set_freq(state.radio, RIG_VFO_MAIN, state.doppler_uplink_frequency);
                 if (ret != RIG_OK) {
                     fprintf(stderr, "Error setting uplink frequency on VFO Main: %s\n", rigerror(ret));
                 }
-                ret = rig_set_freq(state.rig, RIG_VFO_SUB, state.doppler_downlink_frequency);
+                ret = rig_set_freq(state.radio, RIG_VFO_SUB, state.doppler_downlink_frequency);
                 if (ret != RIG_OK) {
                     fprintf(stderr, "Error setting downlink frequency on VFO Sub: %s\n", rigerror(ret));
                 }
                 current_uplink_frequency = state.doppler_uplink_frequency;
                 current_downlink_frequency = state.doppler_downlink_frequency;
-                rig_get_freq(state.rig, RIG_VFO_MAIN, (freq_t *)&state.rig_vfo_main_frequency);
-                rig_get_freq(state.rig, RIG_VFO_SUB, (freq_t *)&state.rig_vfo_sub_frequency);
-                mvprintw(0, 0, "%s: current up: %f current doppler: %f", "Read frequencies", current_uplink_frequency, state.rig_vfo_main_frequency);
+                rig_get_freq(state.radio, RIG_VFO_MAIN, (freq_t *)&state.radio_vfo_main_frequency);
+                rig_get_freq(state.radio, RIG_VFO_SUB, (freq_t *)&state.radio_vfo_sub_frequency);
+                mvprintw(0, 0, "%s: current up: %f current doppler: %f", "Read frequencies", current_uplink_frequency, state.radio_vfo_main_frequency);
                 clrtoeol();
             }
 
@@ -591,13 +592,18 @@ int main(int argc, char **argv)
     endwin();
 
     /* Cleanup */
-    if (state.rig) {
-        set_sat_mode(state.rig, 0);
-        rig_close(state.rig);
-        rig_cleanup(state.rig);
+    if (state.radio) {
+        if (state.have_radio) {
+            set_sat_mode(state.radio, 0);
+            rig_close(state.radio);
+        }
+        rig_cleanup(state.radio);
     }
     if (state.rot) {
-        rot_close(state.rot);
+        if (state.have_rotator) {
+            rot_set_position(state.rot, 0, 0);
+            rot_close(state.rot);
+        }
         rot_cleanup(state.rot);
     }
 
