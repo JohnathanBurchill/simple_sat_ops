@@ -67,10 +67,9 @@ void update_satellite_position(state_t *state, double jul_utc)
 
 void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, double downlink_freq)
 {
-    Vec_Sub(&state->satellite.velocity, &state->observer.velocity, &state->observer_satellite_relative_velocity);
-    state->observer_satellite_relative_speed = Dot(&state->observer_satellite_relative_velocity, &state->satellite.position) / state->satellite.position.w;  // Radial velocity
-    state->doppler_uplink_frequency = uplink_freq * (1 + state->observer_satellite_relative_speed / 299792.458);  // Speed of light in km/s
-    state->doppler_downlink_frequency = downlink_freq * (1 + state->observer_satellite_relative_speed / 299792.458);
+    double doppler_factor = 1.0 - state->satellite.range_rate_km_s / 299792.458;
+    state->doppler_uplink_frequency = uplink_freq * doppler_factor; // Speed of light in km/s
+    state->doppler_downlink_frequency = downlink_freq * doppler_factor;
 
     return;
 }

@@ -54,8 +54,6 @@ typedef struct state {
     double minutes_since_epoch;
     ephemeres_t observer;
     ephemeres_t satellite;
-    vector_t observer_satellite_relative_velocity;
-    double observer_satellite_relative_speed;
     double doppler_uplink_frequency;
     double doppler_downlink_frequency;
     double rig_vfo_main_frequency;
