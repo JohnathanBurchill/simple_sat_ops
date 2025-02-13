@@ -51,6 +51,8 @@ void init_window(void)
     timeout(0);
     intrflush(stdscr, FALSE);
     keypad(stdscr, TRUE);
+    start_color();
+    init_pair(1, COLOR_RED, COLOR_BLACK);
 
     return;
 }
@@ -67,9 +69,11 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
     UTC_Calendar_Now(&utc, NULL);
     char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
     mvprintw(row++, col, "%15s : %d %s %04d %02d:%02d:%02d UTC", "date", utc.tm_mday, months[utc.tm_mon-1], utc.tm_year, utc.tm_hour, utc.tm_min, utc.tm_sec);
+    clrtoeol();
 
     row++;
     mvprintw(row++, col, "%15s : %s (%s)", "satellite", state->satellite.tle.sat_name, state->satellite.tle.idesg);
+    clrtoeol();
 
     minutes_until_visible(state, 1.0, MAX_MINUTES_TO_PREDICT);
     if (fabs(state->predicted_minutes_until_visible) < 1) {
@@ -99,7 +103,7 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
         }
         clrtoeol();
     }
-    mvprintw(row++, col, "%15s : %.1f°", "max elevation", state->predicted_max_elevation);
+    mvprintw(row++, col, "%15s : %.1f deg", "max elevation", state->predicted_max_elevation);
     clrtoeol();
 
     *print_row = row;
@@ -125,7 +129,9 @@ void report_status(state_t *state, int *print_row, int print_col)
         if (state->tracking) {
             printw(" (TRACKING)");
         } else {
+            attron(COLOR_PAIR(1));
             printw(" (NOT tracking)");
+            attroff(COLOR_PAIR(1));
         }
     } else {
         mvprintw(row++, col, "%15s : %s", "status", "** NOT in pass **");
@@ -136,20 +142,28 @@ void report_status(state_t *state, int *print_row, int print_col)
         rig_get_freq(state->rig, RIG_VFO_B, (freq_t *)&state->rig_vfo_b_frequency);
 
         mvprintw(row++, col, "%15s : %s", "transceiver", state->rig->caps->model_name);
+        clrtoeol();
         mvprintw(row++, col, "%15s : %.1f Hz", "VFO A", state->rig_vfo_a_frequency);
+        clrtoeol();
         mvprintw(row++, col, "%15s : %.1f Hz", "VFO B", state->rig_vfo_b_frequency);
+        clrtoeol();
     } else {
         mvprintw(row++, col, "%15s : %s", "transceiver", "* not initialized *");
+        clrtoeol();
     }
     if (state->have_rotator) {
         mvprintw(row++, col, "%15s : %s", "rotator", state->rot->caps->model_name);
+        clrtoeol();
         azimuth_t rot_az = 0.0;
         elevation_t rot_el = 0.0;
         rot_get_position(state->rot, &rot_az, &rot_el);
-        mvprintw(row++, col, "%15s : %.2f°", "elevation", (double)rot_el);
-        mvprintw(row++, col, "%15s : %.2f°", "azimuth", (double)rot_az);
+        mvprintw(row++, col, "%15s : %.2f deg", "elevation", (double)rot_el);
+        clrtoeol();
+        mvprintw(row++, col, "%15s : %.2f deg", "azimuth", (double)rot_az);
+        clrtoeol();
     } else {
         mvprintw(row++, col, "%15s : %s", "rotator", "* not initialized *");
+        clrtoeol();
     }
 
     *print_row = row;
@@ -163,15 +177,17 @@ void report_position(state_t *state, int *print_row, int print_col)
     int row = *print_row;
     int col = print_col;
 
-    mvprintw(row++, col, "%15s : %.1f° N", "latitude", state->satellite.latitude);
-    mvprintw(row++, col, "%15s : %.1f° E", "longitude", state->satellite.longitude);
+    mvprintw(row++, col, "%15s : %.2f deg", "elevation", state->satellite.elevation);
+    clrtoeol();
+    mvprintw(row++, col, "%15s : %.2f deg", "azimuth", state->satellite.azimuth);
+    clrtoeol();
     mvprintw(row++, col, "%15s : %.2f km", "altitude", state->satellite.altitude_km);
     clrtoeol();
+    mvprintw(row++, col, "%15s : %.1f deg N", "latitude", state->satellite.latitude);
+    clrtoeol();
+    mvprintw(row++, col, "%15s : %.1f deg E", "longitude", state->satellite.longitude);
+    clrtoeol();
     mvprintw(row++, col, "%15s : %.2f km/s", "speed", state->satellite.speed_km_s);
-    clrtoeol();
-    mvprintw(row++, col, "%15s : %.2f°", "elevation", state->satellite.elevation);
-    clrtoeol();
-    mvprintw(row++, col, "%15s : %.2f°", "azimuth", state->satellite.azimuth);
     clrtoeol();
     mvprintw(row++, col, "%15s : %.1f km", "range", state->satellite.range_km);
     clrtoeol();
@@ -393,8 +409,6 @@ int main(int argc, char **argv)
             int ret = rig_set_func(state.rig, RIG_VFO_CURR, RIG_FUNC_SATMODE, sat_mode);
             if (ret != RIG_OK) {
                 fprintf(stderr, "Failed to enable SATMODE: %s\n", rigerror(ret));
-            } else {
-                printf("SATMODE %s!\n", sat_mode == 1 ? "enabled" : "disabled");
             }
         }
     }
@@ -499,9 +513,11 @@ int main(int argc, char **argv)
             next_in_queue_name[n] = '\0';
             row++;
             mvprintw(row++, 0, "%15s : %s (%.0f minutes)", "Next in queue", next_in_queue_name, next_in_queue_minutes_away);
+            clrtoeol();
         }
 
         mvprintw(0, 0, "%s", "");
+        clrtoeol();
         refresh();
 
         key = getch(); 
