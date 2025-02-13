@@ -88,7 +88,7 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
         if (state->predicted_minutes_until_visible < 1) {
             mvprintw(row++, col, "%15s : ", "next pass in");
             attron(COLOR_PAIR(2));
-            printw("%.1f seconds", state->predicted_minutes_until_visible * 60.0);
+            printw("%.0f seconds", state->predicted_minutes_until_visible * 60.0);
             attroff(COLOR_PAIR(2));
         } else if (state->predicted_minutes_until_visible < 10) {
             mvprintw(row++, col, "%15s : %.1f minutes", "next pass in", state->predicted_minutes_until_visible);
@@ -105,7 +105,7 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
         mvprintw(row++, col, "%15s : ", "elapsed time");
         attron(COLOR_PAIR(3));
         if (fabs(state->predicted_minutes_until_visible) < 1) {
-            printw("%.1f seconds", -state->predicted_minutes_until_visible * 60.0);
+            printw("%.0f seconds", -state->predicted_minutes_until_visible * 60.0);
         } else {
             printw("%.1f minutes", -state->predicted_minutes_until_visible);
         }
