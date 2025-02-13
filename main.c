@@ -78,6 +78,20 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
     mvprintw(row++, col, "%15s   %s (%s)", "satellite", state->satellite.tle.sat_name, state->satellite.tle.idesg);
     clrtoeol();
 
+    if (state->in_pass) {
+        mvprintw(row++, col, "%15s   %s", "status", "** IN PASS **");
+        if (state->tracking) {
+            printw(" (TRACKING)");
+        } else {
+            attron(COLOR_PAIR(1));
+            printw(" (NOT tracking)");
+            attroff(COLOR_PAIR(1));
+        }
+    } else {
+        mvprintw(row++, col, "%15s   %s", "status", "** NOT in pass **");
+    }
+    clrtoeol();
+
     minutes_until_visible(state, 1.0, MAX_MINUTES_TO_PREDICT);
     if (fabs(state->predicted_minutes_until_visible) < 1) {
         minutes_until_visible(state, 1./120.0, 2.0);
@@ -132,31 +146,18 @@ void report_status(state_t *state, int *print_row, int print_col)
     int row = *print_row;
     int col = print_col;
 
-    mvprintw(row++, col, "%15s   %.3f MHz", "UPLINK", state->doppler_uplink_frequency / 1e6);
-    clrtoeol();
-    mvprintw(row++, col, "%15s   %.3f MHz", "DOWNLINK", state->doppler_downlink_frequency / 1e6);
-    clrtoeol();
-
-    if (state->in_pass) {
-        mvprintw(row++, col, "%15s   %s", "status", "** IN PASS **");
-        if (state->tracking) {
-            printw(" (TRACKING)");
-        } else {
-            attron(COLOR_PAIR(1));
-            printw(" (NOT tracking)");
-            attroff(COLOR_PAIR(1));
-        }
-    } else {
-        mvprintw(row++, col, "%15s   %s", "status", "** NOT in pass **");
-    }
-    clrtoeol();
     if (state->have_radio) {
         mvprintw(row++, col, "%15s   %s", "transceiver", state->radio->caps->model_name);
         clrtoeol();
+        mvprintw(row++, col, "%15s   %.3f MHz", "UPLINK", state->doppler_uplink_frequency / 1e6);
+        clrtoeol();
         mvprintw(row++, col, "%15s   %.6f MHz", "VFO Main", state->radio_vfo_main_frequency / 1e6);
+        clrtoeol();
+        mvprintw(row++, col, "%15s   %.3f MHz", "DOWNLINK", state->doppler_downlink_frequency / 1e6);
         clrtoeol();
         mvprintw(row++, col, "%15s   %.6f MHz", "VFO Sub", state->radio_vfo_sub_frequency / 1e6);
         clrtoeol();
+        row++;
     } else {
         mvprintw(row++, col, "%15s   %s", "transceiver", "* not initialized *");
         clrtoeol();
