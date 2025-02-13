@@ -1,6 +1,6 @@
 model: IC-9700
 rig_pathname: "Path name to the device file of the rig"
-	Default: /dev/rig, Value: /dev/ttyS0
+	Default: /dev/rig, Value: /dev/ttyUSB1
 	String.
 write_delay: "Delay in ms between each byte sent out"
 	Default: 0, Value: 0
@@ -111,7 +111,7 @@ client: "Knows about WSJTX and GPREDICT as of 20240702"
 	Default: 0, Value: UNKNOWN
 	Check button.
 serial_speed: "Serial port baud rate"
-	Default: 0, Value: 38400
+	Default: 0, Value: 9600
 	Range: 300..115200, step 1.0
 data_bits: "Serial port data bits"
 	Default: 8, Value: 8
