@@ -25,16 +25,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <hamlib/rig.h>
-#include <hamlib/rotator.h>
-#include <sgp4sdp4.h>
 #include <ncurses.h>
 
-/* Satellite communication frequencies */
-#define VHF_UPLINK_FREQ   145800000.000
-#define UHF_DOWNLINK_FREQ 435300000.000
-// #define UHF_DOWNLINK_FREQ   145800000.000
-// #define VHF_UPLINK_FREQ   435300000.000
+// Satellite communication defaults
+#define VHF_UPLINK_FREQ_MHZ   145.800000
+#define UHF_DOWNLINK_FREQ_MHZ 435.300000
+
+// Update the radio's frequencies when the change 
+// associated with Doppler shift exceeds this amount
+#define DOPPLER_SHIFT_RESOLUTION_KHZ 2.0 
 
 #define MAX_MINUTES_TO_PREDICT ((7 * 1440))
 
@@ -138,14 +137,11 @@ void report_status(state_t *state, int *print_row, int print_col)
     }
     clrtoeol();
     if (state->have_rig) {
-        rig_get_freq(state->rig, RIG_VFO_A, (freq_t *)&state->rig_vfo_a_frequency);
-        rig_get_freq(state->rig, RIG_VFO_B, (freq_t *)&state->rig_vfo_b_frequency);
-
         mvprintw(row++, col, "%15s : %s", "transceiver", state->rig->caps->model_name);
         clrtoeol();
-        mvprintw(row++, col, "%15s : %.1f Hz", "VFO A", state->rig_vfo_a_frequency);
+        mvprintw(row++, col, "%15s : %.7f Hz", "VFO Main", state->rig_vfo_main_frequency / 1e6);
         clrtoeol();
-        mvprintw(row++, col, "%15s : %.1f Hz", "VFO B", state->rig_vfo_b_frequency);
+        mvprintw(row++, col, "%15s : %.7f Hz", "VFO Sub", state->rig_vfo_sub_frequency / 1e6);
         clrtoeol();
     } else {
         mvprintw(row++, col, "%15s : %s", "transceiver", "* not initialized *");
@@ -203,9 +199,7 @@ int main(int argc, char **argv)
     int ret = 0;
     state_t state = {0};
     state.predicted_max_elevation = -180.0;
-    state.doppler_uplink_frequency = VHF_UPLINK_FREQ;
-    state.doppler_downlink_frequency = UHF_DOWNLINK_FREQ;
-
+    
     int status = 0;
     double tracking_prep_time_minutes = 5.0;
     double site_latitude = RAO_LATITUDE;
@@ -220,6 +214,12 @@ int main(int argc, char **argv)
     int with_constellations = 0;
     int auto_sat = 0;
 
+    double nominal_uplink_frequency = VHF_UPLINK_FREQ_MHZ * 1e6;
+    double nominal_downlink_frequency = UHF_DOWNLINK_FREQ_MHZ * 1e6;
+
+    state.run_with_rig = 1;
+    state.run_with_rotator = 0;
+
     for (int i = 0; i < argc; i++) {
         if (strncmp("--verbose=", argv[i], 10) == 0) {
             state.n_options++; 
@@ -228,19 +228,30 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
             state.verbose_level = atoi(argv[i] + 10);
-        } else if (strcmp("--no-rig", argv[i]) == 0) {
+        } else if (strcmp("--with-rig", argv[i]) == 0) {
             state.n_options++;
-            state.run_without_rig = 1;
-        } else if (strcmp("--no-rig", argv[i]) == 0) {
+            state.run_with_rig = 1;
+        } else if (strcmp("--with-rotator", argv[i]) == 0) {
             state.n_options++;
-            state.run_without_rig = 1;
-        } else if (strcmp("--no-rotator", argv[i]) == 0) {
+            state.run_with_rotator = 1;
+        } else if (strcmp("--with-hardware", argv[i]) == 0) {
             state.n_options++;
-            state.run_without_rotator = 1;
-        } else if (strcmp("--no-hardware", argv[i]) == 0) {
-            state.n_options++;
-            state.run_without_rig = 1;
-            state.run_without_rotator = 1;
+            state.run_with_rig = 1;
+            state.run_with_rotator = 1;
+        } else if (strncmp("--uplink-freq-mhz=", argv[i], 18) == 0) {
+            state.n_options++; 
+            if (strlen(argv[i]) < 19) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            nominal_uplink_frequency = atof(argv[i] + 18) * 1e6;
+        } else if (strncmp("--downlink-freq-mhz=", argv[i], 20) == 0) {
+            state.n_options++; 
+            if (strlen(argv[i]) < 21) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            nominal_downlink_frequency = atof(argv[i] + 20) * 1e6;
         } else if (strncmp("--lat=", argv[i], 6) == 0) {
             state.n_options++; 
             if (strlen(argv[i]) < 7) {
@@ -321,12 +332,13 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Set up observer location */
+    state.doppler_uplink_frequency = nominal_uplink_frequency;
+    state.doppler_downlink_frequency = nominal_downlink_frequency;
+
     state.observer.position_geodetic.lat = site_latitude * M_PI / 180.0;
     state.observer.position_geodetic.lon = site_longitude * M_PI / 180.0;
     state.observer.position_geodetic.alt = site_altitude / 1000.0;
 
-    /* Open TLE file */
     state.tles_filename = argv[1];
     state.satellite.name = argv[2];
 
@@ -374,7 +386,7 @@ int main(int argc, char **argv)
     select_ephemeris(&state.satellite.tle);
 
 
-    if (!state.run_without_rig) {
+    if (state.run_with_rig) {
         rig_set_debug(state.verbose_level);
         state.rig = rig_init(RIG_MODEL_IC9700);
         if (!state.rig) {
@@ -398,7 +410,7 @@ int main(int argc, char **argv)
         }
         if (rig_open(state.rig) != RIG_OK) {
             fprintf(stderr, "Error opening rig. Is it plugged into USB and powered?\n");
-            if (!state.run_without_rig) {
+            if (state.run_with_rig) {
                 rig_cleanup(state.rig);
                 rot_cleanup(state.rot);
                 return 1;
@@ -410,9 +422,11 @@ int main(int argc, char **argv)
             if (ret != RIG_OK) {
                 fprintf(stderr, "Failed to enable SATMODE: %s\n", rigerror(ret));
             }
+            rig_get_freq(state.rig, RIG_VFO_MAIN, (freq_t *)&state.rig_vfo_main_frequency);
+            rig_get_freq(state.rig, RIG_VFO_SUB, (freq_t *)&state.rig_vfo_sub_frequency);
         }
     }
-    if (!state.run_without_rotator) {
+    if (state.run_with_rotator) {
         state.rot = rot_init(ROT_MODEL_SPID_ROT2PROG);
         if (!state.rot) {
             fprintf(stderr, "Failed to initialize rotator support.\n");
@@ -420,7 +434,7 @@ int main(int argc, char **argv)
         }
         if (rot_open(state.rot) != RIG_OK) {
             fprintf(stderr, "error opening rotator. is it plugged into usb and powered?\n");
-            if (!state.run_without_rotator) {
+            if (state.run_with_rotator) {
                 rig_cleanup(state.rig);
                 rot_cleanup(state.rot);
                 return 1;
@@ -445,6 +459,12 @@ int main(int argc, char **argv)
     char *next_in_queue_name = NULL;
     double next_in_queue_minutes_away = -1e10; 
 
+    double current_uplink_frequency = nominal_uplink_frequency;
+    double current_downlink_frequency = nominal_downlink_frequency;
+    double doppler_delta_uplink = 0.0;
+    double doppler_delta_downlink = 0.0;
+    double doppler_max_delta = DOPPLER_SHIFT_RESOLUTION_KHZ * 1000.0;
+
     while (state.running) {
         // Refresh
         UTC_Calendar_Now(&utc, &tv);
@@ -452,7 +472,9 @@ int main(int argc, char **argv)
         update_satellite_position(&state, jul_utc);
 
         /* Calculate Doppler shift */
-        update_doppler_shifted_frequencies(&state, VHF_UPLINK_FREQ, UHF_DOWNLINK_FREQ);
+        update_doppler_shifted_frequencies(&state, nominal_uplink_frequency, nominal_downlink_frequency);
+        doppler_delta_uplink = fabs(state.doppler_uplink_frequency - current_uplink_frequency);
+        doppler_delta_downlink = fabs(state.doppler_downlink_frequency - current_downlink_frequency);
 
         // TODO check for passes that reach a minimum elevation
         if (state.predicted_minutes_until_visible < tracking_prep_time_minutes) {
@@ -464,22 +486,28 @@ int main(int argc, char **argv)
             }
 
             /* Point rotator to Az/El */
-            if (state.have_rotator && !state.run_without_rotator) {
+            if (state.have_rotator && state.run_with_rotator) {
                 if ((ret = rot_set_position(state.rot, state.satellite.azimuth, state.satellite.azimuth)) != RIG_OK) {
                     fprintf(stderr, "Error setting rotor position: %s\n", rigerror(ret));
                 }
             }
 
-            /* Set rig frequencies with Doppler correction */
-            if (state.have_rig && !state.run_without_rig) {
+            /* Set rig frequencies with Doppler correction*/
+            if (state.have_rig && state.run_with_rig && ((doppler_delta_uplink > doppler_max_delta) || (doppler_delta_downlink > doppler_max_delta))) {
                 ret = rig_set_freq(state.rig, RIG_VFO_MAIN, state.doppler_uplink_frequency);
                 if (ret != RIG_OK) {
-                    fprintf(stderr, "Error setting uplink frequency on VFO A: %s\n", rigerror(ret));
+                    fprintf(stderr, "Error setting uplink frequency on VFO Main: %s\n", rigerror(ret));
                 }
                 ret = rig_set_freq(state.rig, RIG_VFO_SUB, state.doppler_downlink_frequency);
                 if (ret != RIG_OK) {
-                    fprintf(stderr, "Error setting downlink frequency on VFO B: %s\n", rigerror(ret));
+                    fprintf(stderr, "Error setting downlink frequency on VFO Sub: %s\n", rigerror(ret));
                 }
+                current_uplink_frequency = state.doppler_uplink_frequency;
+                current_downlink_frequency = state.doppler_downlink_frequency;
+                rig_get_freq(state.rig, RIG_VFO_MAIN, (freq_t *)&state.rig_vfo_main_frequency);
+                rig_get_freq(state.rig, RIG_VFO_SUB, (freq_t *)&state.rig_vfo_sub_frequency);
+                mvprintw(0, 0, "%s: current up: %f current doppler: %f", "Read frequencies", current_uplink_frequency, state.rig_vfo_main_frequency);
+                clrtoeol();
             }
 
             jul_idle_start = 0;  // Reset idle timer
