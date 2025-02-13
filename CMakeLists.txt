@@ -78,3 +78,5 @@ target_include_directories(lifetime PRIVATE
     ${HAMLIB_INCLUDE_DIR}
 )
 target_link_libraries(lifetime PRIVATE sgp4sdp4 ${HAMLIB_LIBRARY} m)
+
+install(TARGETS simple_sat_ops next_in_queue lifetime DESTINATION $ENV{HOME}/bin)
