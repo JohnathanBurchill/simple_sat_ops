@@ -71,11 +71,11 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
     struct tm utc;
     UTC_Calendar_Now(&utc, NULL);
     char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-    mvprintw(row++, col, "%15s : %d %s %04d %02d:%02d:%02d UTC", "date", utc.tm_mday, months[utc.tm_mon-1], utc.tm_year, utc.tm_hour, utc.tm_min, utc.tm_sec);
+    mvprintw(row++, col, "%15s   %d %s %04d %02d:%02d:%02d UTC", "date", utc.tm_mday, months[utc.tm_mon-1], utc.tm_year, utc.tm_hour, utc.tm_min, utc.tm_sec);
     clrtoeol();
 
     row++;
-    mvprintw(row++, col, "%15s : %s (%s)", "satellite", state->satellite.tle.sat_name, state->satellite.tle.idesg);
+    mvprintw(row++, col, "%15s   %s (%s)", "satellite", state->satellite.tle.sat_name, state->satellite.tle.idesg);
     clrtoeol();
 
     minutes_until_visible(state, 1.0, MAX_MINUTES_TO_PREDICT);
@@ -86,23 +86,23 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
     }
     if (state->predicted_minutes_until_visible > 0) {
         if (state->predicted_minutes_until_visible < 1) {
-            mvprintw(row++, col, "%15s : ", "next pass in");
+            mvprintw(row++, col, "%15s   ", "next pass in");
             attron(COLOR_PAIR(2));
             printw("%.0f seconds", state->predicted_minutes_until_visible * 60.0);
             attroff(COLOR_PAIR(2));
         } else if (state->predicted_minutes_until_visible < 10) {
-            mvprintw(row++, col, "%15s : %.1f minutes", "next pass in", state->predicted_minutes_until_visible);
+            mvprintw(row++, col, "%15s   %.1f minutes", "next pass in", state->predicted_minutes_until_visible);
         } else {
-            mvprintw(row++, col, "%15s : %.0f minutes", "next pass in", state->predicted_minutes_until_visible);
+            mvprintw(row++, col, "%15s   %.0f minutes", "next pass in", state->predicted_minutes_until_visible);
         }
         clrtoeol();
         update_pass_predictions(state, jul_utc + state->predicted_minutes_until_visible / 1440.0, 0.1);
-        mvprintw(row++, col, "%15s : %.1f minutes", "duration", state->predicted_minutes_above_0_degrees);
+        mvprintw(row++, col, "%15s   %.1f minutes", "duration", state->predicted_minutes_above_0_degrees);
         clrtoeol();
-        mvprintw(row++, col, "%15s : %.1f minutes", "el>30", state->predicted_minutes_above_30_degrees);
+        mvprintw(row++, col, "%15s   %.1f minutes", "el>30", state->predicted_minutes_above_30_degrees);
         clrtoeol();
     } else {
-        mvprintw(row++, col, "%15s : ", "elapsed time");
+        mvprintw(row++, col, "%15s   ", "elapsed time");
         attron(COLOR_PAIR(3));
         if (fabs(state->predicted_minutes_until_visible) < 1) {
             printw("%.0f seconds", -state->predicted_minutes_until_visible * 60.0);
@@ -111,12 +111,12 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
         }
         attroff(COLOR_PAIR(3));
         clrtoeol();
-        mvprintw(row++, col, "%15s : %.1f minutes", "duration", state->predicted_minutes_above_0_degrees);
+        mvprintw(row++, col, "%15s   %.1f minutes", "duration", state->predicted_minutes_above_0_degrees);
         clrtoeol();
-        mvprintw(row++, col, "%15s : %.1f minutes", "el>30", state->predicted_minutes_above_30_degrees);
+        mvprintw(row++, col, "%15s   %.1f minutes", "el>30", state->predicted_minutes_above_30_degrees);
         clrtoeol();
     }
-    mvprintw(row++, col, "%15s : %.1f deg", "max elevation", state->predicted_max_elevation);
+    mvprintw(row++, col, "%15s   %.1f deg", "max elevation", state->predicted_max_elevation);
     clrtoeol();
 
     *print_row = row;
@@ -132,13 +132,13 @@ void report_status(state_t *state, int *print_row, int print_col)
     int row = *print_row;
     int col = print_col;
 
-    mvprintw(row++, col, "%15s : %.3f MHz", "UPLINK", state->doppler_uplink_frequency / 1e6);
+    mvprintw(row++, col, "%15s   %.3f MHz", "UPLINK", state->doppler_uplink_frequency / 1e6);
     clrtoeol();
-    mvprintw(row++, col, "%15s : %.3f MHz", "DOWNLINK", state->doppler_downlink_frequency / 1e6);
+    mvprintw(row++, col, "%15s   %.3f MHz", "DOWNLINK", state->doppler_downlink_frequency / 1e6);
     clrtoeol();
 
     if (state->in_pass) {
-        mvprintw(row++, col, "%15s : %s", "status", "** IN PASS **");
+        mvprintw(row++, col, "%15s   %s", "status", "** IN PASS **");
         if (state->tracking) {
             printw(" (TRACKING)");
         } else {
@@ -147,32 +147,32 @@ void report_status(state_t *state, int *print_row, int print_col)
             attroff(COLOR_PAIR(1));
         }
     } else {
-        mvprintw(row++, col, "%15s : %s", "status", "** NOT in pass **");
+        mvprintw(row++, col, "%15s   %s", "status", "** NOT in pass **");
     }
     clrtoeol();
     if (state->have_radio) {
-        mvprintw(row++, col, "%15s : %s", "transceiver", state->radio->caps->model_name);
+        mvprintw(row++, col, "%15s   %s", "transceiver", state->radio->caps->model_name);
         clrtoeol();
-        mvprintw(row++, col, "%15s : %.6f MHz", "VFO Main", state->radio_vfo_main_frequency / 1e6);
+        mvprintw(row++, col, "%15s   %.6f MHz", "VFO Main", state->radio_vfo_main_frequency / 1e6);
         clrtoeol();
-        mvprintw(row++, col, "%15s : %.6f MHz", "VFO Sub", state->radio_vfo_sub_frequency / 1e6);
+        mvprintw(row++, col, "%15s   %.6f MHz", "VFO Sub", state->radio_vfo_sub_frequency / 1e6);
         clrtoeol();
     } else {
-        mvprintw(row++, col, "%15s : %s", "transceiver", "* not initialized *");
+        mvprintw(row++, col, "%15s   %s", "transceiver", "* not initialized *");
         clrtoeol();
     }
     if (state->have_rotator) {
-        mvprintw(row++, col, "%15s : %s", "rotator", state->rot->caps->model_name);
+        mvprintw(row++, col, "%15s   %s", "rotator", state->rot->caps->model_name);
         clrtoeol();
         azimuth_t rot_az = 0.0;
         elevation_t rot_el = 0.0;
         rot_get_position(state->rot, &rot_az, &rot_el);
-        mvprintw(row++, col, "%15s : %.2f deg", "elevation", (double)rot_el);
+        mvprintw(row++, col, "%15s   %.2f deg", "elevation", (double)rot_el);
         clrtoeol();
-        mvprintw(row++, col, "%15s : %.2f deg", "azimuth", (double)rot_az);
+        mvprintw(row++, col, "%15s   %.2f deg", "azimuth", (double)rot_az);
         clrtoeol();
     } else {
-        mvprintw(row++, col, "%15s : %s", "rotator", "* not initialized *");
+        mvprintw(row++, col, "%15s   %s", "rotator", "* not initialized *");
         clrtoeol();
     }
 
@@ -187,21 +187,21 @@ void report_position(state_t *state, int *print_row, int print_col)
     int row = *print_row;
     int col = print_col;
 
-    mvprintw(row++, col, "%15s : %.2f deg", "elevation", state->satellite.elevation);
+    mvprintw(row++, col, "%15s   %.2f deg", "elevation", state->satellite.elevation);
     clrtoeol();
-    mvprintw(row++, col, "%15s : %.2f deg", "azimuth", state->satellite.azimuth);
+    mvprintw(row++, col, "%15s   %.2f deg", "azimuth", state->satellite.azimuth);
     clrtoeol();
-    mvprintw(row++, col, "%15s : %.2f km", "altitude", state->satellite.altitude_km);
+    mvprintw(row++, col, "%15s   %.2f km", "altitude", state->satellite.altitude_km);
     clrtoeol();
-    mvprintw(row++, col, "%15s : %.1f deg N", "latitude", state->satellite.latitude);
+    mvprintw(row++, col, "%15s   %.1f deg N", "latitude", state->satellite.latitude);
     clrtoeol();
-    mvprintw(row++, col, "%15s : %.1f deg E", "longitude", state->satellite.longitude);
+    mvprintw(row++, col, "%15s   %.1f deg E", "longitude", state->satellite.longitude);
     clrtoeol();
-    mvprintw(row++, col, "%15s : %.2f km/s", "speed", state->satellite.speed_km_s);
+    mvprintw(row++, col, "%15s   %.2f km/s", "speed", state->satellite.speed_km_s);
     clrtoeol();
-    mvprintw(row++, col, "%15s : %.1f km", "range", state->satellite.range_km);
+    mvprintw(row++, col, "%15s   %.1f km", "range", state->satellite.range_km);
     clrtoeol();
-    mvprintw(row++, col, "%15s : %.2f km/s", "range rate", state->satellite.range_rate_km_s);
+    mvprintw(row++, col, "%15s   %.2f km/s", "range rate", state->satellite.range_rate_km_s);
     clrtoeol();
 
     *print_row = row;
@@ -559,7 +559,7 @@ int main(int argc, char **argv)
             }
             next_in_queue_name[n] = '\0';
             row++;
-            mvprintw(row++, 0, "%15s : %s (%.0f minutes)", "Next in queue", next_in_queue_name, next_in_queue_minutes_away);
+            mvprintw(row++, 0, "%15s   %s (%.0f minutes)", "Next in queue", next_in_queue_name, next_in_queue_minutes_away);
             clrtoeol();
         }
 
