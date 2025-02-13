@@ -403,8 +403,8 @@ int find_passes(state_t *external_state, double jul_utc_start, double delta_t_mi
 const pass_t *get_pass(int index)
 {
     const pass_t *p = NULL;
-    if (index < n_passes) {
-        p = &passes[index];
+    if (index >= 0 && index < n_passes) {
+        p = &(passes[index]);
     }
 
     return p;
