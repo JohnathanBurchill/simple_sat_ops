@@ -370,7 +370,7 @@ int main(int argc, char **argv)
     UTC_Calendar_Now(&utc, &tv);
     double jul_utc = Julian_Date(&utc, &tv);
 
-    if (strcmp(state.satellite.name, "auto") == 0) {
+    if (strcmp(state.satellite.name, "next") == 0) {
         auto_sat = 1;
         criteria_t criteria = {
             .min_altitude_km = min_altitude_km,
