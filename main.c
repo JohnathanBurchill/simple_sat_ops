@@ -28,7 +28,7 @@
 #include <ncurses.h>
 
 // Satellite communication defaults
-#define UPLINK_FREQ_MHZ   436.150000
+#define UPLINK_FREQ_MHZ   145.150100
 #define DOWNLINK_FREQ_MHZ 436.150000
 
 // Update the radio's frequencies when the change 
@@ -139,9 +139,9 @@ void report_status(state_t *state, int *print_row, int print_col)
     if (state->have_rig) {
         mvprintw(row++, col, "%15s : %s", "transceiver", state->rig->caps->model_name);
         clrtoeol();
-        mvprintw(row++, col, "%15s : %.7f Hz", "VFO Main", state->rig_vfo_main_frequency / 1e6);
+        mvprintw(row++, col, "%15s : %.6f Hz", "VFO Main", state->rig_vfo_main_frequency / 1e6);
         clrtoeol();
-        mvprintw(row++, col, "%15s : %.7f Hz", "VFO Sub", state->rig_vfo_sub_frequency / 1e6);
+        mvprintw(row++, col, "%15s : %.6f Hz", "VFO Sub", state->rig_vfo_sub_frequency / 1e6);
         clrtoeol();
     } else {
         mvprintw(row++, col, "%15s : %s", "transceiver", "* not initialized *");
