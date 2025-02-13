@@ -27,7 +27,10 @@
 #include <hamlib/rotator.h>
 #include <sgp4sdp4.h>
 #include <ncurses.h>
+#include <regex.h>
 
+static pass_t *passes = NULL;
+static size_t n_passes = 0;
 
 void update_satellite_position(state_t *state, double jul_utc)
 {
@@ -161,6 +164,7 @@ int load_tle(state_t *state)
     char tle[139] = {0};
     char name[128] = {0}; 
     int found_satellite = 0;
+    char *ptr = NULL;
 
     while (fgets(name, 128, file)) {
         // Remove newline
@@ -168,9 +172,15 @@ int load_tle(state_t *state)
         if (strncmp(state->satellite.name, name, strlen(state->satellite.name)) == 0) {
             // Errors caught in TLE check
             // Read 70 characters, including the newline
-            fgets(tle, 71, file);
+            ptr = fgets(tle, 71, file);
+            if (ptr == NULL) {
+                break;
+            }
             // Read 69 characterers
-            fgets(tle + 69, 70, file);
+            ptr = fgets(tle + 69, 70, file);
+            if (ptr == NULL) {
+                break;
+            }
             tle[138] = '\0';
             snprintf(state->satellite.tle.sat_name, sizeof(state->satellite.tle.sat_name), "%s", name);
             found_satellite = 1;
@@ -192,5 +202,223 @@ int load_tle(state_t *state)
 
     return 0;
 
+}
+
+// Sort to give soonest pass first
+int pass_sort_soonest_first(const void *a, const void *b)
+{
+    pass_t *p1 = (pass_t *)a;
+    pass_t *p2 = (pass_t *)b;
+
+    if (p1->minutes_away < p2->minutes_away) {
+        return -1;
+    } else if (p1->minutes_away > p2->minutes_away) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+int pass_sort_latest_first(const void *a, const void *b)
+{
+    return -pass_sort_soonest_first(a, b);
+}
+
+
+// Returns the first match on state->satellite.name
+int find_passes(state_t *external_state, double jul_utc_start, double delta_t_minutes, criteria_t *criteria, int *count, int *number_checked, int reverse_order)
+{
+    FILE *file = fopen(external_state->tles_filename, "r");
+    if (file == NULL) {
+        fprintf(stderr, "Error opening %s\n", external_state->tles_filename);
+        return -1;
+    }
+    
+    // 2 69-character lines plus a nul terminator
+    char tle[160] = {0};
+    char name[26] = {0}; 
+    int found_satellite = 0;
+    char next_up_name[26] = {0};
+    double next_up_minutes_away = 1e10;
+
+    state_t state = {0};
+    memcpy(&state, external_state, sizeof *external_state);
+    
+    // Check every TLE
+    int internal_count = 0;
+    int internal_number_checked = 0;
+    int ignore_tle = 0;
+    regex_t pattern = {0};
+    if (criteria->regex != NULL) {
+        printf("regex: '%s'\n", criteria->regex);
+        int flags = REG_EXTENDED;
+        if (criteria->regex_ignore_case) {
+            flags |= REG_ICASE;
+        }
+        int res = regcomp(&pattern, criteria->regex, REG_EXTENDED);
+        if (res) {
+            fprintf(stderr, "Error compiling regex\n");
+            return -6;
+        }
+    }
+
+    char *constellations[] = {
+        "COSMOS", 
+        "CENTISPACE", 
+        "FLOCK 4", 
+        "GAOFEN-", 
+        "GEESAT-", 
+        "GLOBALSTAR",
+        "GONETS-",
+        "HAWK-", 
+        "ICEYE-",
+        "IRIDIUM",
+        "JILIN-",
+        "LEMUR-",
+        "NUSAT-",
+        "ONEWEB-",
+        "QIANFAN-",
+        "SITRO-AIS",
+        "STARLINK", 
+        "YAOGAN",
+    };
+    int n_constellations = sizeof constellations / sizeof(char *);
+    int skip_this = 0;
+    char *ptr = NULL;
+
+    while (fgets(name, 26, file)) {
+        skip_this = 0;
+        // Remove newline
+        name[strlen(name) - 1] = '\0';
+        // Errors caught in TLE check
+        // Read 70 characters, including the newline
+        ptr = fgets(tle, 71, file);
+        if (ptr == NULL) {
+            break;
+        }
+        // Read remaining characterers
+        ptr = fgets(tle + 69, 71, file);
+        if (ptr == NULL) {
+            break;
+        }
+        tle[138] = '\0';
+        // Calculate minutes away
+        if (!Good_Elements(tle)) {
+            fprintf(stderr, "Invalid TLE\n");
+            fclose(file);
+            return -3;
+        }
+
+        internal_count++;
+
+        // Remove trailing whitespace
+        int n = strlen(name);
+        while(n > 0 && isspace(name[n - 1])) {
+            n--;
+        }
+        name[n] = '\0';
+        // Filter with regex
+        if (!criteria->with_constellations) { 
+            for (int i = 0; i < n_constellations; i++) {
+                if (strncmp(constellations[i], name, strlen(constellations[i])) == 0) {
+                    skip_this = 1;
+                    break;
+                }
+            }
+            if (skip_this) {
+                continue;
+            }
+        }
+        if (criteria->regex != NULL && (regexec(&pattern, name, 0, NULL, 0) == REG_NOMATCH)) {
+            continue;
+        }
+
+        Convert_Satellite_Data(tle, &state.satellite.tle);
+        ClearFlag(ALL_FLAGS);
+        select_ephemeris(&state.satellite.tle);
+        update_satellite_position(&state, jul_utc_start);
+
+        // TODO filter on perigee / apogee instead of current altitude?
+        if (state.satellite.altitude_km >= criteria->min_altitude_km && state.satellite.altitude_km <= criteria->max_altitude_km) {
+            minutes_until_visible(&state, delta_t_minutes, criteria->max_minutes);
+            if (state.predicted_minutes_until_visible > 0 && next_up_minutes_away > state.predicted_minutes_until_visible) {
+                next_up_minutes_away = state.predicted_minutes_until_visible;
+                snprintf(next_up_name, sizeof(next_up_name), "%s", name);
+            }
+            internal_number_checked++;
+            if (state.predicted_minutes_until_visible >= 0 && state.predicted_minutes_until_visible < criteria->max_minutes) {
+                update_pass_predictions(&state, jul_utc_start + state.predicted_minutes_until_visible / 1440.0, 0.25);
+                if (state.predicted_minutes_above_0_degrees <= 0.0 || state.predicted_max_elevation > criteria->max_elevation || state.predicted_max_elevation < criteria->min_elevation) {
+                    continue;
+                }
+                // Store this pass
+                void *mem = realloc(passes, sizeof *passes * (n_passes + 1));
+                if (mem == NULL) {
+                    printf("Unable to allocate memory for the pass info.\n");
+                    regfree(&pattern);
+                    return -4;
+                }
+                passes = mem;
+                n_passes++;
+                memset(&passes[n_passes - 1], 0, sizeof *passes);
+                pass_t *p = &passes[n_passes - 1];
+                (void)strncpy(p->name, name, sizeof(p->name));
+
+                (void)strncpy(p->tle, name, sizeof(p->tle));
+
+                // Refine estimate:
+                if (state.predicted_minutes_until_visible < 10.0 && delta_t_minutes > 1.0/60.) {
+                    minutes_until_visible(&state, 1.0 / 60.0, criteria->max_minutes);
+                }
+                p->minutes_away = state.predicted_minutes_until_visible;
+                p->pass_duration = state.predicted_pass_duration_minutes;
+                p->ascension_jul_utc = state.predicted_ascension_jul_utc;
+                p->ascension_azimuth = state.predicted_ascension_azimuth;
+                p->max_elevation = state.predicted_max_elevation;
+            }
+        }
+    }
+    fclose(file);
+    regfree(&pattern);
+
+    if (count) {
+        *count = internal_count;
+    }
+    if (number_checked) {
+        *number_checked = internal_number_checked;
+    }
+
+    if (n_passes > 0) {
+        // Sort the list
+        if (reverse_order) {
+            qsort(passes, n_passes, sizeof *passes, pass_sort_latest_first);
+        } else {
+            qsort(passes, n_passes, sizeof *passes, pass_sort_soonest_first);
+        }
+    }
+
+    return 0;
+}
+
+const pass_t *get_pass(int index)
+{
+    const pass_t *p = NULL;
+    if (index < n_passes) {
+        p = &passes[index];
+    }
+
+    return p;
+}
+
+const size_t number_of_passes(void)
+{
+    return n_passes;
+}
+
+void free_passes(void)
+{
+    free(passes);
+    passes = NULL;
+    n_passes = 0;
 }
 

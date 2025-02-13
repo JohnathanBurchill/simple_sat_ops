@@ -26,18 +26,6 @@
 #include <time.h>
 #include <sgp4sdp4.h>
 
-typedef struct
-{
-    double min_altitude_km;
-    double max_altitude_km;
-    double min_minutes;
-    double max_minutes;
-    double min_elevation;
-    double max_elevation;
-} criteria_t;
-
-
-
 // Returns the first match on state->satellite.name
 double lifetime(state_t *state, double jul_utc_start, double delta_t_minutes, double max_years, double min_alt_km)
 {
