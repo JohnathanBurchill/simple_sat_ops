@@ -19,5 +19,12 @@ Prints upcoming overpasses of satellites from a file of TLEs.
 
 ## lifetime 
 
-Estimates the lifetime of a satellite from TLE alone. Inaccurate!
+Estimates the lifetime of a satellite from TLE the alone. Inaccurate: this is
+a toy "what if?" calculation. In SGP4SDP4, orbit decay is apparently modelled
+empirically based on measurement of the rate of change of the mean anomaly and
+its rate of change. See the sgp4sdp4 source code and related references for
+details.
+
+
+![A snippet of SGP4SDP4 source](figs/tmp.png)
 
