@@ -26,5 +26,5 @@ its rate of change. See the sgp4sdp4 source code and related references for
 details.
 
 
-![A snippet of SGP4SDP4 source](figs/tmp.png)
+![A snippet of SGP4SDP4 source](figs/drag.png)
 
