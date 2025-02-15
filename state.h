@@ -21,11 +21,15 @@
 #ifndef STATE_H
 #define STATE_H
 
+#include "sgp4sdp4/sgp4sdp4.h"
+
+#include <stdint.h>
+#include <termios.h>
+
 #define MAX_TLE_LINE_LENGTH 128
 
-#include <hamlib/rig.h>
-#include <hamlib/rotator.h>
-#include "sgp4sdp4/sgp4sdp4.h"
+#define RADIO_MAX_MODEL_NAME_LEN 64
+#define RADIO_MAX_DEVICE_FILENAME_LEN 1024
 
 typedef struct ephemeres
 {
@@ -45,7 +49,28 @@ typedef struct ephemeres
     vector_t observation_set;
 } ephemeres_t;
 
-typedef struct state {
+typedef struct radio 
+{
+    char model_name[RADIO_MAX_MODEL_NAME_LEN];
+    char *device_filename;
+    uint32_t serial_speed;
+    uint8_t connected;
+    int fd;
+    struct termios tty;
+} radio_t;
+
+typedef struct antenna_rotator 
+{
+    char model_name[RADIO_MAX_MODEL_NAME_LEN];
+    char *device_filename;
+    uint32_t serial_speed;
+    uint8_t connected;
+    int fd;
+    struct termios tty;
+} antenna_rotator_t;
+
+typedef struct state 
+{
     int n_options;
     int running;
     int verbose_level;
@@ -54,6 +79,8 @@ typedef struct state {
     double minutes_since_epoch;
     ephemeres_t observer;
     ephemeres_t satellite;
+    radio_t radio;
+    antenna_rotator_t antenna_rotator;
     double doppler_uplink_frequency;
     double doppler_downlink_frequency;
     double radio_vfo_main_frequency;
@@ -67,12 +94,18 @@ typedef struct state {
     double predicted_ascension_jul_utc;
     int tracking;
     int in_pass;
-    RIG *radio;
-    ROT *rot;
     int run_with_radio;
     int run_with_rotator;
     int have_radio;
     int have_rotator;
 } state_t;
+
+
+void radio_connect(radio_t *radio);
+void radio_disconnect(radio_t *radio);
+int radio_set_satellite_mode(radio_t *radio, int sat_mode);
+
+int antenna_rotator_get_position(antenna_rotator_t *antenna_rotator, double *azimuth_degrees, double *elevation_degrees);
+int antenna_rotator_set_position(antenna_rotator_t *antenna_rotator, double azimuth_degrees, double elevation_degrees);
 
 #endif // STATE_H

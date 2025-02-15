@@ -26,7 +26,7 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
-#include <sgp4sdp4.h>
+#include "sgp4sdp4/sgp4sdp4.h"
 
 void usage(FILE *dest, const char *name) 
 {
