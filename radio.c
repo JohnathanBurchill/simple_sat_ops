@@ -67,7 +67,7 @@ void radio_disconnect(radio_t *radio)
     return;
 }
 
-int radio_send_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subsubcmd, uint8_t *data, int len, uint32_t *return_value)
+int radio_send_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subsubcmd, uint8_t *data, int len, uint32_t *return_value, uint8_t reverse_value)
 {
     uint8_t telemetry[RADIO_MAX_COMMAND_LEN] = {0};
     size_t offset = 0;
@@ -164,22 +164,25 @@ int radio_send_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subs
     }
 
     if (return_value != NULL) { 
-        printf("offset: %lu\n", offset);
-        uint8_t byte = radio->result[offset++];
+        // printf("offset: %lu\n", offset);
+        int32_t index = reverse_value ? radio->result_len - 2 : offset;
+        int8_t increment = reverse_value ? -1 : 1;
+        uint8_t byte = radio->result[index];
+        index += increment;
         // Debugging
-        fprintf(stderr, "Response:"); 
+        // fprintf(stderr, "Response:"); 
         // Get value
         int32_t value = 0;
-        while (byte != 0xFD && offset < radio->result_len) {
-            fprintf(stderr, " %02X", byte);
-
+        while (index >= offset-1 && index != radio->result_len) {
+            // fprintf(stderr, " %02X", byte);
             value *= 10;
             value += byte >> 4;
             value *= 10;
             value += (byte & 0b1111);
-            byte = radio->result[offset++];
+            byte = radio->result[index];
+            index += increment;
         }
-        fprintf(stderr, "\n");
+        // fprintf(stderr, "\n");
         *return_value = value;
     }
 

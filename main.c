@@ -439,20 +439,30 @@ int main(int argc, char **argv)
         state.have_radio = 1;
         // Read the transceiver ID
         uint32_t id = 0;
-        radio_result = radio_send_command(&state.radio, 0x19, 0x00, -1, NULL, 0, &id);
+        radio_result = radio_send_command(&state.radio, 0x19, 0x00, -1, NULL, 0, &id, 0);
         if (radio_result != RADIO_OK) {
             fprintf(stderr, "Unexpected reply from radio while getting transceiver ID\n");
             return EXIT_FAILURE;
         }
         printf("Transceiver ID: %d\n", id);
+
         // Read the operating mode
         uint32_t mode = 0;
-        radio_send_command(&state.radio, 0x04, -1, -1, NULL, 0, &mode);
+        radio_send_command(&state.radio, 0x04, -1, -1, NULL, 0, &mode, 0);
         if (radio_result != RADIO_OK) {
             fprintf(stderr, "Unexpected reply from radio while getting operating mode\n");
             return EXIT_FAILURE;
         }
         printf("Operating mode: %u\n", mode);
+        
+        // Read the operating frequency
+        uint32_t frequency = 0;
+        radio_send_command(&state.radio, 0x03, -1, -1, NULL, 0, &frequency, 1);
+        if (radio_result != RADIO_OK) {
+            fprintf(stderr, "Unexpected reply from radio while getting operating frequency\n");
+            return EXIT_FAILURE;
+        }
+        printf("Operating frequency: %u\n", frequency);
 
         radio_set_satellite_mode(&state.radio, 1);
         // rig_get_freq(&state.radio, RIG_VFO_MAIN, (freq_t *)&state.radio_vfo_main_frequency);
