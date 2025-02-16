@@ -30,6 +30,7 @@
 #include <termios.h>
 
 #define MAX_TLE_LINE_LENGTH 128
+#define TRACKING_PREP_TIME_MINUTES 5.0
 
 typedef struct ephemeres
 {
@@ -61,10 +62,6 @@ typedef struct state
     ephemeres_t satellite;
     radio_t radio;
     antenna_rotator_t antenna_rotator;
-    double doppler_uplink_frequency;
-    double doppler_downlink_frequency;
-    double radio_vfo_main_frequency;
-    double radio_vfo_sub_frequency;
     double predicted_minutes_until_visible;
     double predicted_max_elevation;
     double predicted_pass_duration_minutes;
@@ -73,11 +70,13 @@ typedef struct state
     double predicted_ascension_azimuth;
     double predicted_ascension_jul_utc;
     int tracking;
+    double tracking_prep_time_minutes;
     int in_pass;
     int run_with_radio;
     int run_with_rotator;
     int have_radio;
     int have_rotator;
+    int auto_sat;
 } state_t;
 
 

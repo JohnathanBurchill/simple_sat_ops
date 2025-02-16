@@ -25,7 +25,7 @@
 #include <time.h>
 #include <hamlib/rig.h>
 #include <hamlib/rotator.h>
-#include <sgp4sdp4.h>
+#include "sgp4sdp4/sgp4sdp4.h"
 #include <ncurses.h>
 #include <regex.h>
 
@@ -68,8 +68,8 @@ void update_satellite_position(state_t *state, double jul_utc)
 void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, double downlink_freq)
 {
     double doppler_factor = 1.0 - state->satellite.range_rate_km_s / 299792.458;
-    state->doppler_uplink_frequency = uplink_freq * doppler_factor; // Speed of light in km/s
-    state->doppler_downlink_frequency = downlink_freq * doppler_factor;
+    state->radio.doppler_uplink_frequency = uplink_freq * doppler_factor; // Speed of light in km/s
+    state->radio.doppler_downlink_frequency = downlink_freq * doppler_factor;
 
     return;
 }

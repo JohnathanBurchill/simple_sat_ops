@@ -7,8 +7,93 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <termios.h>
+#include <math.h>
 
 #include <err.h>
+
+int radio_init(radio_t *radio)
+{
+    int radio_result = RADIO_OK;
+
+    // Blocking serial connection
+    radio_connect(radio);
+    if (!radio->connected) {
+        fprintf(stderr, "Error opening radio. Is it plugged into USB and powered?\n");
+        return RADIO_OPEN;
+    }
+
+    // Read the transceiver ID
+    uint64_t id = 0;
+    radio_result = radio_command(radio, 0x19, 0x00, -1, NULL, 0, &id, 0);
+    if (radio_result != RADIO_OK) {
+        fprintf(stderr, "Unexpected reply from radio while getting transceiver ID\n");
+        return EXIT_FAILURE;
+    }
+    radio->transceiver_id = id;
+
+    radio_result = radio_set_satellite_mode(radio, 1);
+    if (radio_result != RADIO_OK) {
+        return radio_result;
+    }
+
+    // Read the operating mode
+    uint64_t mode = 0;
+    radio_result = radio_command(radio, 0x04, -1, -1, NULL, 0, &mode, 0);
+    if (radio_result != RADIO_OK) {
+        fprintf(stderr, "Unexpected reply from radio while getting operating mode\n");
+        return EXIT_FAILURE;
+    }
+    radio->operating_mode = mode;
+
+    // Page 7-1 of the 9700 Basic manual
+    // Main is downlink
+    radio_result = radio_set_vfo(radio, VFOA); 
+    if (radio_result != RADIO_OK) {
+        fprintf(stderr, "Unexpected reply from radio while setting VFO mode\n");
+        return radio_result;
+    }
+    radio_result = radio_set_vfo(radio, VFOMain); 
+    if (radio_result != RADIO_OK) {
+        fprintf(stderr, "Unexpected reply from radio while setting VFO to Main\n");
+        return radio_result;
+    }
+    radio_result = radio_set_frequency(radio, radio->nominal_uplink_frequency);
+    if (radio_result != RADIO_OK) {
+        fprintf(stderr, "Unexpected reply from radio while setting Main (uplink) frequency\n");
+        return radio_result;
+    }
+    // Sub is uplink
+    radio_result = radio_set_vfo(radio, VFOSub); 
+    if (radio_result != RADIO_OK) {
+        fprintf(stderr, "Unexpected reply from radio while setting VFO to Sub\n");
+        return radio_result;
+    }
+    radio_result = radio_set_frequency(radio, radio->nominal_downlink_frequency);
+    if (radio_result != RADIO_OK) {
+        fprintf(stderr, "Unexpected reply from radio while setting Sub (downlink) frequency\n");
+        return radio_result;
+    }
+
+    // If the above work, will assume setting VFOs works
+    double f = 0.0;
+    radio_result = radio_set_vfo(radio, VFOMain); 
+    f = radio_get_frequency(radio);
+    if (f < 0) {
+        fprintf(stderr, "Unexpected reply from radio while getting Main (uplink) frequency\n");
+        return RADIO_GET_FREQUENCY;
+    }
+    radio->vfo_main_actual_frequency = f;
+
+    radio_result = radio_set_vfo(radio, VFOSub); 
+    f = radio_get_frequency(radio);
+    if (f < 0) {
+        fprintf(stderr, "Unexpected reply from radio while getting Sub (uplink) frequency\n");
+        return RADIO_GET_FREQUENCY;
+    }
+    radio->vfo_sub_actual_frequency = f;
+    
+    return RADIO_OK;
+}
 
 void radio_connect(radio_t *radio)
 {
@@ -68,7 +153,7 @@ void radio_disconnect(radio_t *radio)
     return;
 }
 
-int radio_send_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subsubcmd, uint8_t *data, int len, uint64_t *value, uint8_t reverse_value)
+int radio_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subsubcmd, uint8_t *send_data, int len, uint64_t *received_value, uint8_t reverse_value)
 {
     uint8_t telemetry[RADIO_MAX_COMMAND_LEN] = {0};
     size_t offset = 0;
@@ -83,15 +168,15 @@ int radio_send_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subs
     if (subsubcmd >= 0) {
         telemetry[offset++] = (uint8_t)subsubcmd;
     }
-    if (data != NULL && len > 0) {
+    if (send_data != NULL && len > 0) {
         // Binary coded decimal 0 to 9
         if(reverse_value) {
             for (int i = len-1; i >= 0; --i) {
-                telemetry[offset++] = data[i];
+                telemetry[offset++] = send_data[i];
             }
         } else {
             for (int i = 0; i < len; ++i) {
-                telemetry[offset++] = data[i];
+                telemetry[offset++] = send_data[i];
             }
         }
     }
@@ -160,7 +245,7 @@ int radio_send_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subs
        }
     }
 
-    if (value != NULL) { 
+    if (received_value != NULL) { 
         // printf("offset: %lu\n", offset);
         int32_t index = reverse_value ? radio->result_len - 2 : offset;
         int8_t increment = reverse_value ? -1 : 1;
@@ -180,7 +265,7 @@ int radio_send_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subs
             index += increment;
         }
         // fprintf(stderr, "\n");
-        *value = val;
+        *received_value = val;
     }
 
     return RADIO_OK;
@@ -189,23 +274,18 @@ int radio_send_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subs
 int radio_set_vfo(radio_t *radio, int vfo)
 {
     int radio_result = 0;
-    uint8_t data[1];
-    data[0] = vfo;
-    uint64_t value = 5;
-    radio_result = radio_send_command(radio, 0x16, 0x5A, -1, data, 1, &value, 0);
+    radio_result = radio_command(radio, 0x07, vfo, -1, NULL, 0, NULL, 0);
     if (radio_result != RADIO_OK) {
-        fprintf(stderr, "Unexpected reply from radio while setting VFO\n");
         return radio_result;
     }
     return RADIO_OK;
-
 }
 
 double radio_get_frequency(radio_t *radio)
 {
     // Read the operating frequency
     uint64_t frequency = 0;
-    int radio_result = radio_send_command(radio, 0x03, -1, -1, NULL, 0, &frequency, 1);
+    int radio_result = radio_command(radio, 0x03, -1, -1, NULL, 0, &frequency, 1);
     if (radio_result != RADIO_OK) {
         return -1.0;
     }
@@ -213,14 +293,30 @@ double radio_get_frequency(radio_t *radio)
     return (double)frequency;
 }
 
+int radio_set_frequency(radio_t *radio, double frequency)
+{
+    uint64_t new_frequency = (uint64_t)round(frequency);
+    uint8_t new_freq[5] = {0};
+    // BCD
+    for (int i = 0; i < 5; ++i) {
+        new_freq[i] |= ((new_frequency % 10) & 0b1111);
+        new_frequency /= 10;
+        new_freq[i] |= (((new_frequency % 10) & 0b1111) << 4);
+        new_frequency /= 10;
+    }
+    int radio_result = radio_command(radio, 0x05, -1, -1, new_freq, 5, NULL, 0);
+    if (radio_result != RADIO_OK) {
+        return RADIO_SET_FREQUENCY;
+    }
+    return RADIO_OK;
+}
+
 int radio_get_satellite_mode(radio_t *radio)
 {
     int radio_result = 0;
-    uint8_t data[1];
     uint64_t value = 0;
-    radio_result = radio_send_command(radio, 0x16, 0x5A, -1, NULL, 0, &value, 0);
+    radio_result = radio_command(radio, 0x16, 0x5A, -1, NULL, 0, &value, 0);
     if (radio_result != RADIO_OK) {
-        fprintf(stderr, "Unexpected reply from radio while getting satellite mode\n");
         return -1;
     }
     return (int)value;
@@ -231,11 +327,34 @@ int radio_set_satellite_mode(radio_t *radio, int sat_mode)
     int radio_result = 0;
     uint8_t data[1];
     data[0] = sat_mode;
-    radio_result = radio_send_command(radio, 0x16, 0x5A, -1, data, 1, NULL, 0);
+    radio_result = radio_command(radio, 0x16, 0x5A, -1, data, 1, NULL, 0);
     if (radio_result != RADIO_OK) {
-        fprintf(stderr, "Unexpected reply from radio while setting satellite mode\n");
+        return radio_result;
+    }
+    radio->satellite_mode = sat_mode;
+    return RADIO_OK;
+}
+
+// Band: 0 main, 1 sub
+int radio_get_band_selection(radio_t *radio, int band)
+{
+    int radio_result = 0;
+    uint64_t value = 0;
+    radio_result = radio_command(radio, 0x07, 0xD2, band, NULL, 0, &value, 0);
+    if (radio_result != RADIO_OK) {
+        return -1;
+    }
+    return (int)value;
+}
+
+int radio_set_band_selection(radio_t *radio, int band)
+{
+    int radio_result = 0;
+    uint8_t data[1];
+    data[0] = 1;
+    radio_result = radio_command(radio, 0x16, 0x5A, band, data, 1, NULL, 0);
+    if (radio_result != RADIO_OK) {
         return radio_result;
     }
     return RADIO_OK;
 }
-

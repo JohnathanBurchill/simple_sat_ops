@@ -32,8 +32,9 @@
 #include <termios.h>
 
 // Satellite communication defaults
-#define UPLINK_FREQ_MHZ   145.150000
 // #define UPLINK_FREQ_MHZ 436.150000
+// #define DOWNLINK_FREQ_MHZ 145.250000
+#define UPLINK_FREQ_MHZ   145.150000
 #define DOWNLINK_FREQ_MHZ 436.150000
 
 // Update the radio's frequencies when the change 
@@ -150,13 +151,13 @@ void report_status(state_t *state, int *print_row, int print_col)
     int col = print_col;
 
     if (state->have_radio) {
-        mvprintw(row++, col, "%15s   %.3f MHz", "UPLINK", state->doppler_uplink_frequency / 1e6);
+        mvprintw(row++, col, "%15s   %.3f MHz", "UPLINK", state->radio.doppler_uplink_frequency / 1e6);
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.6f MHz", "VFO Main", state->radio_vfo_main_frequency / 1e6);
+        mvprintw(row++, col, "%15s   %.6f MHz", "VFO Main", state->radio.vfo_main_actual_frequency / 1e6);
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.3f MHz", "DOWNLINK", state->doppler_downlink_frequency / 1e6);
+        mvprintw(row++, col, "%15s   %.3f MHz", "DOWNLINK", state->radio.doppler_downlink_frequency / 1e6);
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.6f MHz", "VFO Sub", state->radio_vfo_sub_frequency / 1e6);
+        mvprintw(row++, col, "%15s   %.6f MHz", "VFO Sub", state->radio.vfo_sub_actual_frequency / 1e6);
         clrtoeol();
         row++;
     } else {
@@ -207,6 +208,8 @@ void report_position(state_t *state, int *print_row, int print_col)
     *print_row = row;
 }
 
+int apply_args(state_t *state, int argc, char **argv, double jul_utc);
+
 int main(int argc, char **argv) 
 {
 
@@ -215,196 +218,12 @@ int main(int argc, char **argv)
     state.predicted_max_elevation = -180.0;
     
     int status = 0;
-    double tracking_prep_time_minutes = 5.0;
-    double site_latitude = RAO_LATITUDE;
-    double site_longitude = RAO_LONGITUDE;
-    double site_altitude = RAO_ALTITUDE;
-    double min_altitude_km = 0.0;
-    double max_altitude_km = 1000.0;
-    double min_minutes_away = 0.0;
-    double max_minutes_away = 120.0;
-    double min_elevation = 0.0;
-    double max_elevation = 90.0;
-    int with_constellations = 0;
-    int auto_sat = 0;
-
-    double nominal_uplink_frequency = UPLINK_FREQ_MHZ * 1e6;
-    double nominal_downlink_frequency = DOWNLINK_FREQ_MHZ * 1e6;
-
-    state.run_with_radio = 0;
-    state.run_with_rotator = 0;
-    state.radio.device_filename = "/dev/ttyUSB1";
-    state.radio.serial_speed = 9600;
-
-    for (int i = 0; i < argc; i++) {
-
-        if (strncmp("--verbose=", argv[i], 10) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 11) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            state.verbose_level = atoi(argv[i] + 10);
-        } else if (strcmp("--with-radio", argv[i]) == 0) {
-            state.n_options++;
-            state.run_with_radio = 1;
-        } else if (strcmp("--with-rotator", argv[i]) == 0) {
-            state.n_options++;
-            state.run_with_rotator = 1;
-        } else if (strcmp("--with-hardware", argv[i]) == 0) {
-            state.n_options++;
-            state.run_with_radio = 1;
-            state.run_with_rotator = 1;
-        } else if (strncmp("--radio-device=", argv[i], 15) == 0) {
-            state.n_options++;
-            if (strlen(argv[i]) < 16) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]); 
-                return EXIT_FAILURE;
-            } 
-            state.radio.device_filename = argv[i] + 15;
-        } else if (strncmp("--radio-serial-speed=", argv[i], 21) == 0) {
-            state.n_options++;
-            if (strlen(argv[i]) < 22) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]); 
-                return EXIT_FAILURE;
-            } 
-            state.radio.serial_speed = atoi(argv[i] + 21);
-        } else if (strncmp("--uplink-freq-mhz=", argv[i], 18) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 19) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            nominal_uplink_frequency = atof(argv[i] + 18) * 1e6;
-        } else if (strncmp("--downlink-freq-mhz=", argv[i], 20) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 21) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            nominal_downlink_frequency = atof(argv[i] + 20) * 1e6;
-        } else if (strncmp("--lat=", argv[i], 6) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 7) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            site_latitude = atof(argv[i] + 6);
-        } else if (strncmp("--lon=", argv[i], 6) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 7) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            site_longitude = atof(argv[i] + 6);
-        } else if (strncmp("--alt=", argv[i], 6) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 7) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            site_altitude = atof(argv[i] + 6);
-        } else if (strcmp("--include-constellations", argv[i]) == 0) {
-            state.n_options++;
-            with_constellations = 1;
-        } else if (strncmp("--min-altitude-km=", argv[i], 18) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 19) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            min_altitude_km = atof(argv[i] + 18);
-        } else if (strncmp("--max-altitude-km=", argv[i], 18) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 19) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            max_altitude_km = atof(argv[i] + 18);
-        } else if (strncmp("--min-elevation=", argv[i], 16) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 17) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            state.n_options++; 
-            if (strlen(argv[i]) < 17) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            max_elevation = atof(argv[i] + 16);
-        } else if (strncmp("--min-minutes=", argv[i], 14) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 15) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            min_minutes_away = atof(argv[i] + 14);
-        } else if (strncmp("--max-minutes=", argv[i], 14) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 15) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            max_minutes_away = atof(argv[i] + 14);
-        } else if (strcmp("--help", argv[i]) == 0) {
-            usage(stdout, argv[0]);
-            return 0;
-        } else if (strncmp("--", argv[i], 2) == 0) {
-            fprintf(stderr, "Unable to parse option '%s'\n", argv[i]);
-            return 1;
-        }
-
-    }
-    if (argc - state.n_options != 3) {
-        usage(stderr, argv[0]);
-        return 1;
-    }
-
-    state.doppler_uplink_frequency = nominal_uplink_frequency;
-    state.doppler_downlink_frequency = nominal_downlink_frequency;
-
-    state.observer.position_geodetic.lat = site_latitude * M_PI / 180.0;
-    state.observer.position_geodetic.lon = site_longitude * M_PI / 180.0;
-    state.observer.position_geodetic.alt = site_altitude / 1000.0;
-
-    state.tles_filename = argv[1];
-    state.satellite.name = argv[2];
 
     struct tm utc;
     struct timeval tv;
     UTC_Calendar_Now(&utc, &tv);
     double jul_utc = Julian_Date(&utc, &tv);
-
-    if (strcmp(state.satellite.name, "next") == 0) {
-        auto_sat = 1;
-        criteria_t criteria = {
-            .min_altitude_km = min_altitude_km,
-            .max_altitude_km = max_altitude_km,
-            .min_minutes = min_minutes_away,
-            .max_minutes = max_minutes_away,
-            .min_elevation = min_elevation,
-            .max_elevation = max_elevation,
-            .regex = NULL,
-            .regex_ignore_case = 0,
-            .with_constellations = with_constellations,
-        };
-        state_t state_tmp = {0};
-        state_tmp.tles_filename = state.tles_filename;
-        state_tmp.observer.position_geodetic.lat = state.observer.position_geodetic.lat;
-        state_tmp.observer.position_geodetic.lon = state.observer.position_geodetic.lon;
-        state_tmp.observer.position_geodetic.alt = state.observer.position_geodetic.alt;
-        status = find_passes(&state_tmp, jul_utc, 1.0, &criteria, NULL, NULL, 0);
-        const size_t n = number_of_passes();
-        if (n == 0) {
-            fprintf(stderr, "Unable to automatically find next in queue.\n");
-            return 1;
-        }
-
-        const pass_t *p = get_pass(0);
-        state.satellite.name = strdup(p->name);
-        printf("Satellite: %s\n", state.satellite.name);
-    }
+    apply_args(&state, argc, argv, jul_utc);
 
     /* Parse TLE data */
     int tle_status = load_tle(&state);
@@ -417,86 +236,15 @@ int main(int argc, char **argv)
     int radio_result = 0;
 
     if (state.run_with_radio) {
-        // Blocking serial connection
-        radio_connect(&state.radio);
-        if (!state.radio.connected) {
-            fprintf(stderr, "Error opening radio. Is it plugged into USB and powered?\n");
-            if (state.run_with_radio) {
-                return EXIT_FAILURE;
-            }
+        state.radio.is_required = 1;
+        int radio_init_result = radio_init(&state.radio);
+        if (radio_init_result != RADIO_OK) {
+            fprintf(stderr, "Error initializing radio\n");
+            return EXIT_FAILURE;
         }
-        printf("Connected to the radio\n");
         state.have_radio = 1;
-        // Read the transceiver ID
-        uint64_t id = 0;
-        radio_result = radio_send_command(&state.radio, 0x19, 0x00, -1, NULL, 0, &id, 0);
-        if (radio_result != RADIO_OK) {
-            fprintf(stderr, "Unexpected reply from radio while getting transceiver ID\n");
-            return EXIT_FAILURE;
-        }
-        printf("Transceiver ID: %ld\n", id);
-
-        radio_set_satellite_mode(&state.radio, 0);
-        radio_result = radio_set_vfo(&state.radio, VFOA); 
-        if (radio_result != RADIO_OK) {
-            fprintf(stderr, "Unexpected reply from radio while setting VFO to VFOA\n");
-            return EXIT_FAILURE;
-        }
-        printf("Selected VFOA\n");
-
-        double f = radio_get_frequency(&state.radio);
-        if (f < 0) {
-            fprintf(stderr, "Unexpected reply from radio while getting operating frequency ID\n");
-            return EXIT_FAILURE;
-        }
-        printf("Operating frequency: %.6f MHz\n", f / 1e6);
-
-        // Read the operating mode
-        uint64_t mode = 0;
-        radio_result = radio_send_command(&state.radio, 0x04, -1, -1, NULL, 0, &mode, 0);
-        if (radio_result != RADIO_OK) {
-            fprintf(stderr, "Unexpected reply from radio while getting operating mode\n");
-            return EXIT_FAILURE;
-        }
-        printf("Operating mode: %lu\n", mode);
-
-        // Set the operating frequency
-        // uint64_t new_frequency = 145150000;
-        uint64_t new_frequency = 145500000;
-        uint8_t new_freq[5] = {0};
-        // BCD
-        for (int i = 0; i < 5; ++i) {
-            new_freq[i] |= ((new_frequency % 10) & 0b1111);
-            new_frequency /= 10;
-            new_freq[i] |= (((new_frequency % 10) & 0b1111) << 4);
-            new_frequency /= 10;
-        }
-        radio_result = radio_send_command(&state.radio, 0x05, -1, -1, new_freq, 5, NULL, 0);
-        if (radio_result != RADIO_OK) {
-            fprintf(stderr, "Unexpected reply from radio while setting operating frequency\n");
-            return EXIT_FAILURE;
-        }
-
-        f = radio_get_frequency(&state.radio);
-        if (f < 0) {
-            fprintf(stderr, "Unexpected reply from radio while getting operating frequency ID\n");
-            return EXIT_FAILURE;
-        }
-        printf("Operating frequency: %.6f MHz\n", f / 1e6);
-
-        int satmode = radio_get_satellite_mode(&state.radio);
-        printf("Radio satellite mode: %d\n", satmode);
-        radio_set_satellite_mode(&state.radio, 0);
-        printf("Set satellite mode.\n");
-        satmode = radio_get_satellite_mode(&state.radio);
-        printf("Radio satellite mode: %d\n", satmode);
-
-        // rig_get_freq(&state.radio, RIG_VFO_MAIN, (freq_t *)&state.radio_vfo_main_frequency);
-        // rig_get_freq(&state.radio, RIG_VFO_SUB, (freq_t *)&state.radio_vfo_sub_frequency);
-        
-        radio_disconnect(&state.radio);
-        return 0;
     }
+
     if (state.run_with_rotator) {
         // state.rot = rot_init(ROT_MODEL_SPID_ROT2PROG);
         // if (!state.rot) {
@@ -530,8 +278,8 @@ int main(int argc, char **argv)
     char *next_in_queue_name = NULL;
     double next_in_queue_minutes_away = -1e10; 
 
-    double current_uplink_frequency = nominal_uplink_frequency;
-    double current_downlink_frequency = nominal_downlink_frequency;
+    double current_uplink_frequency = state.radio.nominal_uplink_frequency;
+    double current_downlink_frequency = state.radio.nominal_downlink_frequency;
     double doppler_delta_uplink = 0.0;
     double doppler_delta_downlink = 0.0;
     double doppler_max_delta = DOPPLER_SHIFT_RESOLUTION_KHZ * 1000.0;
@@ -543,12 +291,12 @@ int main(int argc, char **argv)
         update_satellite_position(&state, jul_utc);
 
         /* Calculate Doppler shift */
-        update_doppler_shifted_frequencies(&state, nominal_uplink_frequency, nominal_downlink_frequency);
-        doppler_delta_uplink = fabs(state.doppler_uplink_frequency - current_uplink_frequency);
-        doppler_delta_downlink = fabs(state.doppler_downlink_frequency - current_downlink_frequency);
+        update_doppler_shifted_frequencies(&state, state.radio.nominal_uplink_frequency, state.radio.nominal_downlink_frequency);
+        doppler_delta_uplink = fabs(state.radio.doppler_uplink_frequency - current_uplink_frequency);
+        doppler_delta_downlink = fabs(state.radio.doppler_downlink_frequency - current_downlink_frequency);
 
         // TODO check for passes that reach a minimum elevation
-        if (state.predicted_minutes_until_visible < tracking_prep_time_minutes) {
+        if (state.predicted_minutes_until_visible < state.tracking_prep_time_minutes) {
             if (!state.in_pass) {
                 state.in_pass = 1;
             }
@@ -565,20 +313,21 @@ int main(int argc, char **argv)
 
             /* Set radio frequencies with Doppler correction*/
             if (state.have_radio && state.run_with_radio && ((doppler_delta_uplink > doppler_max_delta) || (doppler_delta_downlink > doppler_max_delta))) {
-                // ret = rig_set_freq(state.radio, RIG_VFO_MAIN, state.doppler_uplink_frequency);
-                // if (ret != RIG_OK) {
-                //     fprintf(stderr, "Error setting uplink frequency on VFO Main: %s\n", rigerror(ret));
-                // }
-                // ret = rig_set_freq(state.radio, RIG_VFO_SUB, state.doppler_downlink_frequency);
-                // if (ret != RIG_OK) {
-                //     fprintf(stderr, "Error setting downlink frequency on VFO Sub: %s\n", rigerror(ret));
-                // }
-                // current_uplink_frequency = state.doppler_uplink_frequency;
-                // current_downlink_frequency = state.doppler_downlink_frequency;
-                // rig_get_freq(state.radio, RIG_VFO_MAIN, (freq_t *)&state.radio_vfo_main_frequency);
-                // rig_get_freq(state.radio, RIG_VFO_SUB, (freq_t *)&state.radio_vfo_sub_frequency);
-                // mvprintw(0, 0, "%s: current up: %f current doppler: %f", "Read frequencies", current_uplink_frequency, state.radio_vfo_main_frequency);
-                // clrtoeol();
+                current_uplink_frequency = state.radio.doppler_uplink_frequency;
+                current_downlink_frequency = state.radio.doppler_downlink_frequency;
+                radio_set_vfo(&state.radio, VFOMain);
+                ret = radio_set_frequency(&state.radio, state.radio.doppler_uplink_frequency);
+                if (ret != RADIO_OK) {
+                    fprintf(stderr, "Error setting uplink frequency on VFO Main\n");
+                }
+                state.radio.vfo_main_actual_frequency = radio_get_frequency(&state.radio);
+                radio_set_vfo(&state.radio, VFOSub);
+                ret = radio_set_frequency(&state.radio, state.radio.doppler_downlink_frequency);
+                if (ret != RADIO_OK) {
+                    fprintf(stderr, "Error setting downlink frequency on VFO Sub\n");
+                }
+                state.radio.vfo_sub_actual_frequency = radio_get_frequency(&state.radio);
+                clrtoeol();
             }
 
             jul_idle_start = 0;  // Reset idle timer
@@ -637,7 +386,7 @@ int main(int argc, char **argv)
         free(next_in_queue_name);
     }
 
-    if (auto_sat) {
+    if (state.auto_sat) {
         free_passes();
     }
 
@@ -645,7 +394,7 @@ int main(int argc, char **argv)
 
     /* Cleanup */
     if (state.radio.connected) {
-        // set_sat_mode(state.radio, 0);
+        radio_set_satellite_mode(&state.radio, 0);
         radio_disconnect(&state.radio);
     }
     if (state.antenna_rotator.connected) {
@@ -659,3 +408,193 @@ int main(int argc, char **argv)
     return 0;
 }
 
+
+int apply_args(state_t *state, int argc, char **argv, double jul_utc)
+{
+    double site_latitude = RAO_LATITUDE;
+    double site_longitude = RAO_LONGITUDE;
+    double site_altitude = RAO_ALTITUDE;
+    double min_altitude_km = 0.0;
+    double max_altitude_km = 1000.0;
+    double min_minutes_away = 0.0;
+    double max_minutes_away = 120.0;
+    double min_elevation = 0.0;
+    double max_elevation = 90.0;
+    int with_constellations = 0;
+    state->tracking_prep_time_minutes = TRACKING_PREP_TIME_MINUTES;
+
+    state->radio.nominal_uplink_frequency = UPLINK_FREQ_MHZ * 1e6;
+    state->radio.nominal_downlink_frequency = DOWNLINK_FREQ_MHZ * 1e6;
+
+    state->run_with_radio = 0;
+    state->run_with_rotator = 0;
+    state->radio.device_filename = "/dev/ttyUSB1";
+    state->radio.serial_speed = 9600;
+
+    for (int i = 0; i < argc; i++) {
+
+        if (strncmp("--verbose=", argv[i], 10) == 0) {
+            state->n_options++; 
+            if (strlen(argv[i]) < 11) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state->verbose_level = atoi(argv[i] + 10);
+        } else if (strcmp("--with-radio", argv[i]) == 0) {
+            state->n_options++;
+            state->run_with_radio = 1;
+        } else if (strcmp("--with-rotator", argv[i]) == 0) {
+            state->n_options++;
+            state->run_with_rotator = 1;
+        } else if (strcmp("--with-hardware", argv[i]) == 0) {
+            state->n_options++;
+            state->run_with_radio = 1;
+            state->run_with_rotator = 1;
+        } else if (strncmp("--radio-device=", argv[i], 15) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 16) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]); 
+                return EXIT_FAILURE;
+            } 
+            state->radio.device_filename = argv[i] + 15;
+        } else if (strncmp("--radio-serial-speed=", argv[i], 21) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 22) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]); 
+                return EXIT_FAILURE;
+            } 
+            state->radio.serial_speed = atoi(argv[i] + 21);
+        } else if (strncmp("--uplink-freq-mhz=", argv[i], 18) == 0) {
+            state->n_options++; 
+            if (strlen(argv[i]) < 19) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state->radio.nominal_uplink_frequency = atof(argv[i] + 18) * 1e6;
+        } else if (strncmp("--downlink-freq-mhz=", argv[i], 20) == 0) {
+            state->n_options++; 
+            if (strlen(argv[i]) < 21) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state->radio.nominal_downlink_frequency = atof(argv[i] + 20) * 1e6;
+        } else if (strncmp("--lat=", argv[i], 6) == 0) {
+            state->n_options++; 
+            if (strlen(argv[i]) < 7) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            site_latitude = atof(argv[i] + 6);
+        } else if (strncmp("--lon=", argv[i], 6) == 0) {
+            state->n_options++; 
+            if (strlen(argv[i]) < 7) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            site_longitude = atof(argv[i] + 6);
+        } else if (strncmp("--alt=", argv[i], 6) == 0) {
+            state->n_options++; 
+            if (strlen(argv[i]) < 7) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            site_altitude = atof(argv[i] + 6);
+        } else if (strcmp("--include-constellations", argv[i]) == 0) {
+            state->n_options++;
+            with_constellations = 1;
+        } else if (strncmp("--min-altitude-km=", argv[i], 18) == 0) {
+            state->n_options++; 
+            if (strlen(argv[i]) < 19) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            min_altitude_km = atof(argv[i] + 18);
+        } else if (strncmp("--max-altitude-km=", argv[i], 18) == 0) {
+            state->n_options++; 
+            if (strlen(argv[i]) < 19) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            max_altitude_km = atof(argv[i] + 18);
+        } else if (strncmp("--min-elevation=", argv[i], 16) == 0) {
+            state->n_options++; 
+            if (strlen(argv[i]) < 17) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state->n_options++; 
+            if (strlen(argv[i]) < 17) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            max_elevation = atof(argv[i] + 16);
+        } else if (strncmp("--min-minutes=", argv[i], 14) == 0) {
+            state->n_options++; 
+            if (strlen(argv[i]) < 15) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            min_minutes_away = atof(argv[i] + 14);
+        } else if (strncmp("--max-minutes=", argv[i], 14) == 0) {
+            state->n_options++; 
+            if (strlen(argv[i]) < 15) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            max_minutes_away = atof(argv[i] + 14);
+        } else if (strcmp("--help", argv[i]) == 0) {
+            usage(stdout, argv[0]);
+            return 2;
+        } else if (strncmp("--", argv[i], 2) == 0) {
+            fprintf(stderr, "Unable to parse option '%s'\n", argv[i]);
+            return 3;
+        }
+
+    }
+    if (argc - state->n_options != 3) {
+        usage(stderr, argv[0]);
+        return 1;
+    }
+
+    state->radio.doppler_uplink_frequency = state->radio.nominal_uplink_frequency;
+    state->radio.doppler_downlink_frequency = state->radio.nominal_downlink_frequency;
+
+    state->observer.position_geodetic.lat = site_latitude * M_PI / 180.0;
+    state->observer.position_geodetic.lon = site_longitude * M_PI / 180.0;
+    state->observer.position_geodetic.alt = site_altitude / 1000.0;
+
+    state->tles_filename = argv[1];
+    state->satellite.name = argv[2];
+
+    if (strcmp(state->satellite.name, "next") == 0) {
+        state->auto_sat = 1;
+        criteria_t criteria = {
+            .min_altitude_km = min_altitude_km,
+            .max_altitude_km = max_altitude_km,
+            .min_minutes = min_minutes_away,
+            .max_minutes = max_minutes_away,
+            .min_elevation = min_elevation,
+            .max_elevation = max_elevation,
+            .regex = NULL,
+            .regex_ignore_case = 0,
+            .with_constellations = with_constellations,
+        };
+        state_t state_tmp = {0};
+        state_tmp.tles_filename = state->tles_filename;
+        state_tmp.observer.position_geodetic.lat = state->observer.position_geodetic.lat;
+        state_tmp.observer.position_geodetic.lon = state->observer.position_geodetic.lon;
+        state_tmp.observer.position_geodetic.alt = state->observer.position_geodetic.alt;
+        find_passes(&state_tmp, jul_utc, 1.0, &criteria, NULL, NULL, 0);
+        const size_t n = number_of_passes();
+        if (n == 0) {
+            fprintf(stderr, "Unable to automatically find next in queue.\n");
+            return 1;
+        }
+
+        const pass_t *p = get_pass(0);
+        state->satellite.name = strdup(p->name);
+        printf("Satellite: %s\n", state->satellite.name);
+    }
+
+    return 0;
+}
