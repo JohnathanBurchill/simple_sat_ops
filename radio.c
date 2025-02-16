@@ -67,7 +67,7 @@ void radio_disconnect(radio_t *radio)
     return;
 }
 
-int radio_send_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subsubcmd, uint8_t *data, int len, uint32_t *return_value, uint8_t reverse_value)
+int radio_send_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subsubcmd, uint8_t *data, int len, uint64_t *return_value, uint8_t reverse_value)
 {
     uint8_t telemetry[RADIO_MAX_COMMAND_LEN] = {0};
     size_t offset = 0;
@@ -90,11 +90,11 @@ int radio_send_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subs
     }
     telemetry[offset++] = 0xFD;
     // For debugging
-    fprintf(stderr, "Command:");
-    for (int i = 0; i < offset; ++i) {
-        fprintf(stderr, " %02X", telemetry[i]);
-    }
-    fprintf(stderr, "\n");
+    // fprintf(stderr, "Command:");
+    // for (int i = 0; i < offset; ++i) {
+    //     fprintf(stderr, " %02X", telemetry[i]);
+    // }
+    // fprintf(stderr, "\n");
 
     ssize_t bytes_sent = write(radio->fd, telemetry, offset); 
     if (bytes_sent != offset) {
@@ -118,11 +118,11 @@ int radio_send_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subs
     }
     radio->result_len = offset;
     // Debugging
-    fprintf(stderr, "Radio response:");
-    for (int i = 0; i < radio->result_len; ++i) {
-        fprintf(stderr, " %x", radio->result[i]);
-    }
-    fprintf(stderr, "\n");
+    // fprintf(stderr, "Radio response:");
+    // for (int i = 0; i < radio->result_len; ++i) {
+    //     fprintf(stderr, " %x", radio->result[i]);
+    // }
+    // fprintf(stderr, "\n");
 
     if (radio->result_len < 6 || ((uint32_t*)radio->result)[0] != 0xA2E0FEFE) {
         return RADIO_BAD_RESPONSE;
@@ -172,7 +172,7 @@ int radio_send_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subs
         // Debugging
         // fprintf(stderr, "Response:"); 
         // Get value
-        int32_t value = 0;
+        int64_t value = 0;
         while (index >= offset-1 && index != radio->result_len) {
             // fprintf(stderr, " %02X", byte);
             value *= 10;
