@@ -39,7 +39,7 @@
 
 // Update the radio's frequencies when the change 
 // associated with Doppler shift exceeds this amount
-#define DOPPLER_SHIFT_RESOLUTION_KHZ 2.0 
+#define DOPPLER_SHIFT_RESOLUTION_KHZ 0.1 
 
 #define MAX_MINUTES_TO_PREDICT ((7 * 1440))
 
@@ -151,11 +151,11 @@ void report_status(state_t *state, int *print_row, int print_col)
     int col = print_col;
 
     if (state->have_radio) {
-        mvprintw(row++, col, "%15s   %.3f MHz", "UPLINK", state->radio.doppler_uplink_frequency / 1e6);
+        mvprintw(row++, col, "%15s   %.6f MHz", "UPLINK", state->radio.doppler_uplink_frequency / 1e6);
         clrtoeol();
         mvprintw(row++, col, "%15s   %.6f MHz", "VFO Main", state->radio.vfo_main_actual_frequency / 1e6);
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.3f MHz", "DOWNLINK", state->radio.doppler_downlink_frequency / 1e6);
+        mvprintw(row++, col, "%15s   %.6f MHz", "DOWNLINK", state->radio.doppler_downlink_frequency / 1e6);
         clrtoeol();
         mvprintw(row++, col, "%15s   %.6f MHz", "VFO Sub", state->radio.vfo_sub_actual_frequency / 1e6);
         clrtoeol();
@@ -416,7 +416,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     double site_altitude = RAO_ALTITUDE;
     double min_altitude_km = 0.0;
     double max_altitude_km = 1000.0;
-    double min_minutes_away = 0.0;
+    double min_minutes_away = 20.0 / 60.0;
     double max_minutes_away = 120.0;
     double min_elevation = 0.0;
     double max_elevation = 90.0;
