@@ -32,8 +32,6 @@
 #include <termios.h>
 
 // Satellite communication defaults
-// #define UPLINK_FREQ_MHZ 436.150000
-// #define DOWNLINK_FREQ_MHZ 145.250000
 #define UPLINK_FREQ_MHZ   145.150000
 #define DOWNLINK_FREQ_MHZ 436.150000
 
