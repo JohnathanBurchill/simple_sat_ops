@@ -31,6 +31,7 @@ pkg_check_modules(NCURSES REQUIRED ncurses)
 
 # Add the main executable
 add_executable(simple_sat_ops main.c prediction.c radio.c rotator.c)
+# target_compile_definitions(simple_sat_ops PUBLIC -DQOL)
 
 # Include directories for sgp4sdp4 and Hamlib
 target_include_directories(simple_sat_ops PRIVATE

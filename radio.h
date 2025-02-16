@@ -15,6 +15,13 @@ enum RADIO_STATUS {
     RADIO_DATA,
 };
 
+enum RADIO_VFO {
+    VFOA = 0,
+    VFOB = 1,
+    VFOMain = 0xD0,
+    VFOSub = 0xD1,
+};
+
 typedef struct radio 
 {
     char *device_filename;
@@ -30,6 +37,9 @@ typedef struct radio
 void radio_connect(radio_t *radio);
 void radio_disconnect(radio_t *radio);
 int radio_send_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subsubcmd, uint8_t *data, int len, uint64_t *return_value, uint8_t reverse_value);
+int radio_set_vfo(radio_t *radio, int vfo);
+double radio_get_frequency(radio_t *radio);
+int radio_get_satellite_mode(radio_t *radio);
 int radio_set_satellite_mode(radio_t *radio, int sat_mode);
 
 

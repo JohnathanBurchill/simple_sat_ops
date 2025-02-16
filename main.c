@@ -18,6 +18,7 @@
    along with this program.  If not, see <https://www.gnu.org/licenses/>.
    */
 
+#include "radio.h"
 #include "state.h"
 #include "prediction.h"
 
@@ -204,17 +205,6 @@ void report_position(state_t *state, int *print_row, int print_col)
     clrtoeol();
 
     *print_row = row;
-}
-
-int radio_set_satellite_mode(radio_t *radio, int sat_mode)
-{
-    int ret = 0;
-    printf("TODO: implement set sat mode\n");
-    // int ret = rig_set_func(radio, RIG_VFO_CURR, RIG_FUNC_SATMODE, sat_mode);
-    // if (ret != RIG_OK) {
-    //     fprintf(stderr, "Failed to enable SATMODE: %s\n", rigerror(ret));
-    // }
-    return ret;
 }
 
 int main(int argc, char **argv) 
@@ -446,25 +436,61 @@ int main(int argc, char **argv)
         }
         printf("Transceiver ID: %ld\n", id);
 
+        radio_set_satellite_mode(&state.radio, 0);
+        radio_result = radio_set_vfo(&state.radio, VFOA); 
+        if (radio_result != RADIO_OK) {
+            fprintf(stderr, "Unexpected reply from radio while setting VFO to VFOA\n");
+            return EXIT_FAILURE;
+        }
+        printf("Selected VFOA\n");
+
+        double f = radio_get_frequency(&state.radio);
+        if (f < 0) {
+            fprintf(stderr, "Unexpected reply from radio while getting operating frequency ID\n");
+            return EXIT_FAILURE;
+        }
+        printf("Operating frequency: %.6f MHz\n", f / 1e6);
+
         // Read the operating mode
         uint64_t mode = 0;
-        radio_send_command(&state.radio, 0x04, -1, -1, NULL, 0, &mode, 0);
+        radio_result = radio_send_command(&state.radio, 0x04, -1, -1, NULL, 0, &mode, 0);
         if (radio_result != RADIO_OK) {
             fprintf(stderr, "Unexpected reply from radio while getting operating mode\n");
             return EXIT_FAILURE;
         }
         printf("Operating mode: %lu\n", mode);
-        
-        // Read the operating frequency
-        uint64_t frequency = 0;
-        radio_send_command(&state.radio, 0x03, -1, -1, NULL, 0, &frequency, 1);
+
+        // Set the operating frequency
+        // uint64_t new_frequency = 145150000;
+        uint64_t new_frequency = 145500000;
+        uint8_t new_freq[5] = {0};
+        // BCD
+        for (int i = 0; i < 5; ++i) {
+            new_freq[i] |= ((new_frequency % 10) & 0b1111);
+            new_frequency /= 10;
+            new_freq[i] |= (((new_frequency % 10) & 0b1111) << 4);
+            new_frequency /= 10;
+        }
+        radio_result = radio_send_command(&state.radio, 0x05, -1, -1, new_freq, 5, NULL, 0);
         if (radio_result != RADIO_OK) {
-            fprintf(stderr, "Unexpected reply from radio while getting operating frequency\n");
+            fprintf(stderr, "Unexpected reply from radio while setting operating frequency\n");
             return EXIT_FAILURE;
         }
-        printf("Operating frequency: %.6f MHz\n", (double)frequency / 1e6);
 
-        radio_set_satellite_mode(&state.radio, 1);
+        f = radio_get_frequency(&state.radio);
+        if (f < 0) {
+            fprintf(stderr, "Unexpected reply from radio while getting operating frequency ID\n");
+            return EXIT_FAILURE;
+        }
+        printf("Operating frequency: %.6f MHz\n", f / 1e6);
+
+        int satmode = radio_get_satellite_mode(&state.radio);
+        printf("Radio satellite mode: %d\n", satmode);
+        radio_set_satellite_mode(&state.radio, 0);
+        printf("Set satellite mode.\n");
+        satmode = radio_get_satellite_mode(&state.radio);
+        printf("Radio satellite mode: %d\n", satmode);
+
         // rig_get_freq(&state.radio, RIG_VFO_MAIN, (freq_t *)&state.radio_vfo_main_frequency);
         // rig_get_freq(&state.radio, RIG_VFO_SUB, (freq_t *)&state.radio_vfo_sub_frequency);
         
