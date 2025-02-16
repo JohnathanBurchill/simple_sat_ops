@@ -30,7 +30,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(NCURSES REQUIRED ncurses)
 
 # Add the main executable
-add_executable(simple_sat_ops main.c prediction.c)
+add_executable(simple_sat_ops main.c prediction.c radio.c rotator.c)
 
 # Include directories for sgp4sdp4 and Hamlib
 target_include_directories(simple_sat_ops PRIVATE

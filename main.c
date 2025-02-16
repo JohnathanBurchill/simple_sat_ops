@@ -149,8 +149,6 @@ void report_status(state_t *state, int *print_row, int print_col)
     int col = print_col;
 
     if (state->have_radio) {
-        mvprintw(row++, col, "%15s   %s", "transceiver", state->radio.model_name);
-        clrtoeol();
         mvprintw(row++, col, "%15s   %.3f MHz", "UPLINK", state->doppler_uplink_frequency / 1e6);
         clrtoeol();
         mvprintw(row++, col, "%15s   %.6f MHz", "VFO Main", state->radio_vfo_main_frequency / 1e6);
@@ -165,8 +163,6 @@ void report_status(state_t *state, int *print_row, int print_col)
         clrtoeol();
     }
     if (state->have_rotator) {
-        mvprintw(row++, col, "%15s   %s", "rotator", state->antenna_rotator.model_name);
-        clrtoeol();
         double azimuth = 0.0;
         double elevation = 0.0;
         // antenna_rotator_get_position(state->antenna_rotator, &azimuth, &elevation);
@@ -341,8 +337,6 @@ int main(int argc, char **argv)
                 fprintf(stderr, "Unable to parse %s\n", argv[i]);
                 return EXIT_FAILURE;
             }
-            min_elevation = atof(argv[i] + 16);
-        } else if (strncmp("--max-elevation=", argv[i], 16) == 0) {
             state.n_options++; 
             if (strlen(argv[i]) < 17) {
                 fprintf(stderr, "Unable to parse %s\n", argv[i]);
@@ -430,21 +424,40 @@ int main(int argc, char **argv)
     ClearFlag(ALL_FLAGS);
     select_ephemeris(&state.satellite.tle);
 
+    int radio_result = 0;
 
     if (state.run_with_radio) {
+        // Blocking serial connection
         radio_connect(&state.radio);
         if (!state.radio.connected) {
             fprintf(stderr, "Error opening radio. Is it plugged into USB and powered?\n");
             if (state.run_with_radio) {
                 return EXIT_FAILURE;
             }
-        } else {
-            state.have_radio = 1;
-            radio_set_satellite_mode(&state.radio, 1);
-            // rig_get_freq(&state.radio, RIG_VFO_MAIN, (freq_t *)&state.radio_vfo_main_frequency);
-            // rig_get_freq(&state.radio, RIG_VFO_SUB, (freq_t *)&state.radio_vfo_sub_frequency);
         }
         printf("Connected to the radio\n");
+        state.have_radio = 1;
+        // Read the transceiver ID
+        uint32_t id = 0;
+        radio_result = radio_send_command(&state.radio, 0x19, 0x00, -1, NULL, 0, &id);
+        if (radio_result != RADIO_OK) {
+            fprintf(stderr, "Unexpected reply from radio while getting transceiver ID\n");
+            return EXIT_FAILURE;
+        }
+        printf("Transceiver ID: %d\n", id);
+        // Read the operating mode
+        uint32_t mode = 0;
+        radio_send_command(&state.radio, 0x04, -1, -1, NULL, 0, &mode);
+        if (radio_result != RADIO_OK) {
+            fprintf(stderr, "Unexpected reply from radio while getting operating mode\n");
+            return EXIT_FAILURE;
+        }
+        printf("Operating mode: %u\n", mode);
+
+        radio_set_satellite_mode(&state.radio, 1);
+        // rig_get_freq(&state.radio, RIG_VFO_MAIN, (freq_t *)&state.radio_vfo_main_frequency);
+        // rig_get_freq(&state.radio, RIG_VFO_SUB, (freq_t *)&state.radio_vfo_sub_frequency);
+        
         radio_disconnect(&state.radio);
         return 0;
     }
@@ -607,70 +620,6 @@ int main(int argc, char **argv)
         // rot_cleanup(state.rot);
     }
 
-    return 0;
-}
-
-void radio_connect(radio_t *radio)
-{
-    radio->connected = 0;
-    radio->fd = open(radio->device_filename, O_RDWR | O_NOCTTY | O_SYNC | O_NONBLOCK);
-    if (radio->fd == -1) {
-        perror("Error opening serial port");
-        return;
-    }
-
-    fcntl(radio->fd, F_SETFL, O_NONBLOCK);
-
-    memset(&radio->tty, 0, sizeof(radio->tty));
-    if (tcgetattr(radio->fd, &radio->tty) != 0) {
-        perror("Error getting serial port attributes");
-        close(radio->fd);
-        return;
-    }
-
-    cfsetospeed(&radio->tty, radio->serial_speed);
-    cfsetispeed(&radio->tty, radio->serial_speed);
-
-    radio->tty.c_cflag = (radio->tty.c_cflag & ~CSIZE) | CS8;
-    radio->tty.c_iflag &= ~IGNPAR;
-    radio->tty.c_lflag = 0;
-    radio->tty.c_oflag = 0;
-    radio->tty.c_cc[VMIN] = 0;
-    radio->tty.c_cc[VTIME] = 0;
-
-    radio->tty.c_iflag &= ~(IXON | IXOFF | IXANY);
-    radio->tty.c_cflag != (CLOCAL | CREAD);
-    radio->tty.c_cflag &= ~(PARENB | PARODD);
-    radio->tty.c_cflag &= ~CSTOPB;
-    radio->tty.c_cflag &= ~CRTSCTS;
-
-    if (tcsetattr(radio->fd, TCSANOW, &radio->tty) != 0) {
-        perror("Error setting serial port attributes");
-        close(radio->fd);
-        return;
-    }
-
-    radio->connected = 1;
-
-    return;
-}
-
-void radio_disconnect(radio_t *radio)
-{
-    if (radio->connected) {
-        close(radio->fd);
-    }
-
-    return;
-}
-
-int antenna_rotator_get_position(antenna_rotator_t *antenna_rotator, double *azimuth_degrees, double *elevation_degrees)
-{
-    return 0;
-}
-
-int antenna_rotator_set_position(antenna_rotator_t *antenna_rotator, double azimuth_degrees, double elevation_degrees)
-{
     return 0;
 }
 

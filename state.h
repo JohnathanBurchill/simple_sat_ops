@@ -23,13 +23,13 @@
 
 #include "sgp4sdp4/sgp4sdp4.h"
 
+#include "radio.h"
+#include "rotator.h"
+
 #include <stdint.h>
 #include <termios.h>
 
 #define MAX_TLE_LINE_LENGTH 128
-
-#define RADIO_MAX_MODEL_NAME_LEN 64
-#define RADIO_MAX_DEVICE_FILENAME_LEN 1024
 
 typedef struct ephemeres
 {
@@ -48,26 +48,6 @@ typedef struct ephemeres
     double altitude_km;
     vector_t observation_set;
 } ephemeres_t;
-
-typedef struct radio 
-{
-    char model_name[RADIO_MAX_MODEL_NAME_LEN];
-    char *device_filename;
-    uint32_t serial_speed;
-    uint8_t connected;
-    int fd;
-    struct termios tty;
-} radio_t;
-
-typedef struct antenna_rotator 
-{
-    char model_name[RADIO_MAX_MODEL_NAME_LEN];
-    char *device_filename;
-    uint32_t serial_speed;
-    uint8_t connected;
-    int fd;
-    struct termios tty;
-} antenna_rotator_t;
 
 typedef struct state 
 {
@@ -100,12 +80,5 @@ typedef struct state
     int have_rotator;
 } state_t;
 
-
-void radio_connect(radio_t *radio);
-void radio_disconnect(radio_t *radio);
-int radio_set_satellite_mode(radio_t *radio, int sat_mode);
-
-int antenna_rotator_get_position(antenna_rotator_t *antenna_rotator, double *azimuth_degrees, double *elevation_degrees);
-int antenna_rotator_set_position(antenna_rotator_t *antenna_rotator, double azimuth_degrees, double elevation_degrees);
 
 #endif // STATE_H
