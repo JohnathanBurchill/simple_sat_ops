@@ -113,7 +113,7 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
         if (state->predicted_minutes_until_visible < 1) {
             mvprintw(row++, col, "%15s   ", "next pass in");
             attron(COLOR_PAIR(2));
-            printw("%.0f seconds", state->predicted_minutes_until_visible * 60.0);
+            printw("%.0f seconds", floor(state->predicted_minutes_until_visible * 60.0));
             attroff(COLOR_PAIR(2));
         } else if (state->predicted_minutes_until_visible < 10) {
             mvprintw(row++, col, "%15s   %.1f minutes", "next pass in", state->predicted_minutes_until_visible);
@@ -130,7 +130,7 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
         mvprintw(row++, col, "%15s   ", "elapsed time");
         attron(COLOR_PAIR(3));
         if (fabs(state->predicted_minutes_until_visible) < 1) {
-            printw("%.0f seconds", -state->predicted_minutes_until_visible * 60.0);
+            printw("%.0f seconds", floor(-state->predicted_minutes_until_visible * 60.0));
         } else {
             printw("%.1f minutes", -state->predicted_minutes_until_visible);
         }
@@ -493,8 +493,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     double site_altitude = RAO_ALTITUDE;
     double min_altitude_km = 0.0;
     double max_altitude_km = 1000.0;
-    double min_minutes_away = 20.0 / 60.0;
-    double max_minutes_away = 120.0;
+    double min_minutes_away = 30.0 / 60.0;
+    double max_minutes_away = 30.0;
     double min_elevation = 0.0;
     double max_elevation = 90.0;
     int with_constellations = 0;
@@ -664,7 +664,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         state_tmp.observer.position_geodetic.lat = state->observer.position_geodetic.lat;
         state_tmp.observer.position_geodetic.lon = state->observer.position_geodetic.lon;
         state_tmp.observer.position_geodetic.alt = state->observer.position_geodetic.alt;
-        find_passes(&state_tmp, jul_utc, 1.0, &criteria, NULL, NULL, 0);
+        find_passes(&state_tmp, jul_utc, 0.1, &criteria, NULL, NULL, 0);
         const size_t n = number_of_passes();
         if (n == 0) {
             fprintf(stderr, "Unable to automatically find next in queue.\n");
