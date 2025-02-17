@@ -134,6 +134,9 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
         } else {
             printw("%.1f minutes", -state->predicted_minutes_until_visible);
         }
+        if (state->predicted_max_elevation == -180.0) {
+            update_pass_predictions(state, jul_utc - state->predicted_minutes_until_visible / 1440.0, 0.1);
+        }
         attroff(COLOR_PAIR(3));
         clrtoeol();
         mvprintw(row++, col, "%15s   %.1f minutes", "duration", state->predicted_minutes_above_0_degrees);
@@ -199,9 +202,9 @@ void report_position(state_t *state, int *print_row, int print_col)
     int row = *print_row;
     int col = print_col;
 
-    mvprintw(row++, col, "%15s   %.2f deg", "elevation", state->satellite.elevation);
-    clrtoeol();
     mvprintw(row++, col, "%15s   %.2f deg", "azimuth", state->satellite.azimuth);
+    clrtoeol();
+    mvprintw(row++, col, "%15s   %.2f deg", "elevation", state->satellite.elevation);
     clrtoeol();
     mvprintw(row++, col, "%15s   %.2f km", "altitude", state->satellite.altitude_km);
     clrtoeol();
@@ -281,6 +284,7 @@ int main(int argc, char **argv)
     char key = '\0';
 
     int row = 0;
+    int col = 2;
     state.running = 1;
 
     // Queue info 
@@ -305,9 +309,11 @@ int main(int argc, char **argv)
     int keyboard_unlocked = 0;
     int keyboard_info_row = 20;
 
-    mvprintw(keyboard_info_row++, 3, "%s", "T - slew antenna to Target");
+    mvprintw(keyboard_info_row++, 3, "%s", "T - Track satellite");
     clrtoeol();
-    mvprintw(keyboard_info_row++, 3, "%s", "s - slew antenna to Target");
+    mvprintw(keyboard_info_row++, 3, "%s", "s - Stop tracking satellite");
+    clrtoeol();
+    mvprintw(keyboard_info_row++, 3, "%s", "r - Reset to az=0 el=0");
     clrtoeol();
     mvprintw(keyboard_info_row++, 3, "%s", "q - quit");
     clrtoeol();
@@ -382,13 +388,14 @@ int main(int argc, char **argv)
 
         // Update predictions
         row = 1;
-        report_predictions(&state, jul_utc, &row, 0);
+        col = 1;
+        report_predictions(&state, jul_utc, &row, col);
 
         // Update status
         row ++;
-        report_status(&state, &row, 0);
+        report_status(&state, &row, col);
         row = 5;
-        int col = 50;
+        col = 50;
         report_position(&state, &row, col);
 
         if (next_in_queue_minutes_away > 0) {
