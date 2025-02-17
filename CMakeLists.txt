@@ -20,8 +20,8 @@
 cmake_minimum_required(VERSION 3.10)
 project(simple_sat_ops)
 
-#set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
+#set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
 
 # Add the sgp4sdp4 subdirectory
 add_subdirectory(sgp4sdp4)
@@ -30,7 +30,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(NCURSES REQUIRED ncurses)
 
 # Add the main executable
-add_executable(simple_sat_ops main.c prediction.c radio.c rotator.c)
+add_executable(simple_sat_ops main.c prediction.c radio.c antenna_rotator.c)
 # target_compile_definitions(simple_sat_ops PUBLIC -DQOL)
 
 # Include directories for sgp4sdp4 and Hamlib

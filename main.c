@@ -18,6 +18,7 @@
    along with this program.  If not, see <https://www.gnu.org/licenses/>.
    */
 
+#include "antenna_rotator.h"
 #include "radio.h"
 #include "state.h"
 #include "prediction.h"
@@ -39,7 +40,14 @@
 // associated with Doppler shift exceeds this amount
 #define DOPPLER_SHIFT_RESOLUTION_KHZ 0.1 
 
+// Antenna rotator max angle from target 
+#define MAX_DELTA_AZIMUTH_DEGREES 3.0
+#define MAX_DELTA_ELEVATION_DEGREES 3.0
+
 #define MAX_MINUTES_TO_PREDICT ((7 * 1440))
+
+#define UPDATE_INTERVAL_MICROSEC 500000
+#define KEYBOARD_UNLOCK_DURATION_TICKS (1000000 / UPDATE_INTERVAL_MICROSEC * 5)
 
 void usage(FILE *dest, const char *name) 
 {
@@ -58,6 +66,7 @@ void init_window(void)
     init_pair(1, COLOR_RED, COLOR_BLACK);
     init_pair(2, COLOR_YELLOW, COLOR_BLACK);
     init_pair(3, COLOR_GREEN, COLOR_BLACK);
+    curs_set(0);
 
     return;
 }
@@ -162,16 +171,20 @@ void report_status(state_t *state, int *print_row, int print_col)
         mvprintw(row++, col, "%15s   %s", "transceiver", "* not initialized *");
         clrtoeol();
     }
-    if (state->have_rotator) {
+    if (state->have_antenna_rotator) {
         double azimuth = 0.0;
         double elevation = 0.0;
-        // antenna_rotator_get_position(state->antenna_rotator, &azimuth, &elevation);
-        mvprintw(row++, col, "%15s   %.2f deg", "elevation", elevation);
+        antenna_rotator_command(&state->antenna_rotator, ANTENNA_ROTATOR_STATUS, &azimuth, &elevation);
+        mvprintw(row++, col, "%15s   %.1f deg", "target azimuth", state->antenna_rotator.target_azimuth);
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.2f deg", "azimuth", azimuth);
+        mvprintw(row++, col, "%15s   %.1f deg", "azimuth", azimuth);
+        clrtoeol();
+        mvprintw(row++, col, "%15s   %.1f deg", "target elevation", state->antenna_rotator.target_elevation);
+        clrtoeol();
+        mvprintw(row++, col, "%15s   %.1f deg", "elevation", elevation);
         clrtoeol();
     } else {
-        mvprintw(row++, col, "%15s   %s", "rotator", "* not initialized *");
+        mvprintw(row++, col, "%15s   %s", "antenna rotator", "* not initialized *");
         clrtoeol();
     }
 
@@ -232,33 +245,32 @@ int main(int argc, char **argv)
     select_ephemeris(&state.satellite.tle);
 
     int radio_result = 0;
-
     if (state.run_with_radio) {
         state.radio.is_required = 1;
-        int radio_init_result = radio_init(&state.radio);
-        if (radio_init_result != RADIO_OK) {
+        radio_result = radio_init(&state.radio);
+        if (radio_result != RADIO_OK) {
             fprintf(stderr, "Error initializing radio\n");
             return EXIT_FAILURE;
         }
         state.have_radio = 1;
     }
 
-    if (state.run_with_rotator) {
-        // state.rot = rot_init(ROT_MODEL_SPID_ROT2PROG);
-        // if (!state.rot) {
-        //     fprintf(stderr, "Failed to initialize rotator support.\n");
-        //     return 1;
-        // }
-        // if (rot_open(state.rot) != RIG_OK) {
-        //     fprintf(stderr, "error opening rotator. is it plugged into usb and powered?\n");
-        //     if (state.run_with_rotator) {
-        //         rig_cleanup(state.radio);
-        //         rot_cleanup(state.rot);
-        //         return 1;
-        //     }
-        // } else {
-        //     state.have_rotator = 1;
-        // }
+    int antenna_rotator_result = 0;
+    if (state.run_with_antenna_rotator) {
+        state.antenna_rotator.is_required = 1;
+        antenna_rotator_result = antenna_rotator_init(&state.antenna_rotator);
+        if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
+            fprintf(stderr, "Error initializing antenna rotator\n");
+            return EXIT_FAILURE;
+        }
+        // Check that we can control the antenna position
+        antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_STATUS, NULL, NULL);
+        if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
+            fprintf(stderr, "Error commanding the antenna rotator\n");
+            state.have_antenna_rotator = 0;
+        } else {
+            state.have_antenna_rotator = 1;
+        }
     }
 
     /* Tracking loop */
@@ -282,6 +294,24 @@ int main(int argc, char **argv)
     double doppler_delta_downlink = 0.0;
     double doppler_max_delta = DOPPLER_SHIFT_RESOLUTION_KHZ * 1000.0;
 
+    double azimuth = 0.0;
+    double elevation = 0.0;
+    double delta_az = 0.0;
+    double delta_el = 0.0;
+
+    int antenna_should_be_controlled = state.run_with_antenna_rotator && state.have_antenna_rotator;
+    int antenna_is_under_control = antenna_should_be_controlled;
+
+    int keyboard_unlocked = 0;
+    int keyboard_info_row = 20;
+
+    mvprintw(keyboard_info_row++, 3, "%s", "T - slew antenna to Target");
+    clrtoeol();
+    mvprintw(keyboard_info_row++, 3, "%s", "s - slew antenna to Target");
+    clrtoeol();
+    mvprintw(keyboard_info_row++, 3, "%s", "q - quit");
+    clrtoeol();
+
     while (state.running) {
         // Refresh
         UTC_Calendar_Now(&utc, &tv);
@@ -298,15 +328,26 @@ int main(int argc, char **argv)
             if (!state.in_pass) {
                 state.in_pass = 1;
             }
-            if (state.have_rotator && !state.tracking) {
+            if (antenna_should_be_controlled && !state.tracking) {
                 state.tracking = 1;
             }
 
-            /* Point rotator to Az/El */
-            if (state.have_rotator && state.run_with_rotator) {
-                // if ((ret = rot_set_position(state.rot, state.satellite.azimuth, state.satellite.azimuth)) != RIG_OK) {
-                //     fprintf(stderr, "Error setting rotor position: %s\n", rigerror(ret));
-                // }
+            // Point antenna at satellite
+            // TODO remove lag bias by anticipating direction
+            if (state.tracking && antenna_is_under_control) {
+                delta_az = state.satellite.azimuth - state.antenna_rotator.target_azimuth;
+                delta_el = state.satellite.elevation - state.antenna_rotator.target_elevation;
+
+                if (fabs(delta_az) >= MAX_DELTA_AZIMUTH_DEGREES || fabs(delta_el) >= MAX_DELTA_ELEVATION_DEGREES) {
+                    state.antenna_rotator.target_azimuth = state.satellite.azimuth;
+                    state.antenna_rotator.target_elevation = state.satellite.elevation;
+                    azimuth = state.antenna_rotator.target_azimuth;
+                    elevation = state.antenna_rotator.target_elevation;
+                    antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_SET, &azimuth, &elevation);
+                    if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
+                        fprintf(stderr, "Error setting antenna rotator position\n");
+                    }
+                }
             }
 
             /* Set radio frequencies with Doppler correction*/
@@ -340,7 +381,6 @@ int main(int argc, char **argv)
         }
 
         // Update predictions
-        erase();
         row = 1;
         report_predictions(&state, jul_utc, &row, 0);
 
@@ -362,21 +402,53 @@ int main(int argc, char **argv)
             clrtoeol();
         }
 
-        mvprintw(0, 0, "%s", "");
+        clrtoeol();
+
+        key = getch(); 
+        if (key == 'K') {
+            keyboard_unlocked = KEYBOARD_UNLOCK_DURATION_TICKS;
+        } else if (keyboard_unlocked) {
+            switch(key) {
+                case 'q':
+                    state.running = 0;
+                    keyboard_unlocked = 0;
+                    break;
+                case 'T':
+                    antenna_is_under_control = antenna_should_be_controlled;
+                    keyboard_unlocked = 0;
+                    break;
+                case 's':
+                    antenna_is_under_control = 0;
+                    keyboard_unlocked = 0;
+                    break;
+                case 'r':
+                    antenna_is_under_control = 0;
+                    state.antenna_rotator.target_azimuth = 0.0;
+                    state.antenna_rotator.target_elevation = 0.0;
+                    azimuth = state.antenna_rotator.target_azimuth;
+                    elevation = state.antenna_rotator.target_elevation;
+                    antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_SET, &azimuth, &elevation);
+                    if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
+                        fprintf(stderr, "Error setting antenna rotator position\n");
+                    }
+                    keyboard_unlocked = 0;
+                    break;
+                default:
+                    break;
+            }
+        }
+        if (keyboard_unlocked > 0) {
+            --keyboard_unlocked;
+        }
+
+        mvprintw(keyboard_info_row, 3, "%s : %s", "Keyboard", keyboard_unlocked ? "unlocked" : "LOCKED");
         clrtoeol();
         refresh();
 
-        key = getch(); 
-        switch(key) {
-            case 'q':
-                state.running = 0;
-                break;
-            default:
-                break;
-        }
-
         // Sleep for a short interval 
-        usleep(250000);
+        if (state.running) {
+            usleep(UPDATE_INTERVAL_MICROSEC);
+        }
 
     }
 
@@ -425,9 +497,12 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->radio.nominal_downlink_frequency = DOWNLINK_FREQ_MHZ * 1e6;
 
     state->run_with_radio = 0;
-    state->run_with_rotator = 0;
     state->radio.device_filename = "/dev/ttyUSB1";
     state->radio.serial_speed = 9600;
+
+    state->run_with_antenna_rotator = 0;
+    state->antenna_rotator.device_filename = "/dev/ttyUSB0";
+    state->antenna_rotator.serial_speed = 960;
 
     for (int i = 0; i < argc; i++) {
 
@@ -443,11 +518,11 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             state->run_with_radio = 1;
         } else if (strcmp("--with-rotator", argv[i]) == 0) {
             state->n_options++;
-            state->run_with_rotator = 1;
+            state->run_with_antenna_rotator = 1;
         } else if (strcmp("--with-hardware", argv[i]) == 0) {
             state->n_options++;
             state->run_with_radio = 1;
-            state->run_with_rotator = 1;
+            state->run_with_antenna_rotator = 1;
         } else if (strncmp("--radio-device=", argv[i], 15) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 16) {

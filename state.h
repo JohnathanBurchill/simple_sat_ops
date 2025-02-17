@@ -24,7 +24,7 @@
 #include "sgp4sdp4/sgp4sdp4.h"
 
 #include "radio.h"
-#include "rotator.h"
+#include "antenna_rotator.h"
 
 #include <stdint.h>
 #include <termios.h>
@@ -73,9 +73,9 @@ typedef struct state
     double tracking_prep_time_minutes;
     int in_pass;
     int run_with_radio;
-    int run_with_rotator;
+    int run_with_antenna_rotator;
     int have_radio;
-    int have_rotator;
+    int have_antenna_rotator;
     int auto_sat;
 } state_t;
 

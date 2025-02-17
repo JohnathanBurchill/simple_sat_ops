@@ -148,6 +148,7 @@ void radio_disconnect(radio_t *radio)
 {
     if (radio->connected) {
         close(radio->fd);
+        radio->connected = 0;
     }
 
     return;
