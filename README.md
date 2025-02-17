@@ -7,7 +7,7 @@ ground station.
 
 Custom drivers control the SPIG Rot2Prog antenna rotator and Icom IC-9700
 transceiver for satellite communications over UHF and VHF. It works for us,
-your mileage my vary.
+your mileage may vary.
 
 ![A radio demo gif](demo/simple_sat_ops_demo_radio_only_20250217.gif)
 
