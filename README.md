@@ -6,7 +6,7 @@ ground station.
 ## simple_sat_ops
 <untested>
 
-Uses Hamlib to control antenna rotator and transceiver for satellite
+Custom drivers control the SPIG Rot2Prog antenna rotator and Icom IC-9700 transceiver for satellite
 communications over UHF and VHF.
 
 ![A radio demo gif](demo/simple_sat_ops_demo_with_radio_20250213.gif)
