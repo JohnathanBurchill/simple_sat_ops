@@ -44,6 +44,7 @@
 #define MAX_DELTA_AZIMUTH_DEGREES 3.0
 #define MAX_DELTA_ELEVATION_DEGREES 3.0
 
+#define WARN_DAYS_SINCE_EPOCH 1.0
 #define MAX_MINUTES_TO_PREDICT ((7 * 1440))
 
 #define UPDATE_INTERVAL_MICROSEC 500000
@@ -87,6 +88,14 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
 
     row++;
     mvprintw(row++, col, "%15s   %s (%s)", "satellite", state->satellite.tle.sat_name, state->satellite.tle.idesg);
+    clrtoeol();
+    if (state->minutes_since_epoch/1440.0 >= WARN_DAYS_SINCE_EPOCH) {
+        attron(COLOR_PAIR(2));
+    } 
+    mvprintw(row++, col, "%15s   %0.1f days", "epoch age", state->minutes_since_epoch / 1440.0);
+    if (state->minutes_since_epoch/1440.0 >= WARN_DAYS_SINCE_EPOCH) {
+        attroff(COLOR_PAIR(2));
+    } 
     clrtoeol();
 
     if (state->in_pass) {
