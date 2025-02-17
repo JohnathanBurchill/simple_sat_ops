@@ -32,16 +32,16 @@ transceiver for satellite communications over UHF and VHF.
 
 ## next_in_queue
 
-Prints upcoming overpasses of satellites from a file of TLEs using a SGP4SDP4
+Prints upcoming overpasses of satellites from a file of TLEs using a `sgp4sdp4`
 library.
 
 ![A demo without hardware gif](demo/simple_sat_ops_demo_no_hardware_20250127.gif)
 
 ## lifetime 
 
-Estimates the lifetime of a satellite from TLE the alone. 
+Estimates the lifetime of a satellite from a TLE. 
 
-**This is inaccurate** The calculation is a toy 'what if?'. In SGP4SDP4, orbit
+**This is inaccurate** The calculation is a toy 'what if?'. In `sgp4sdp4`, orbit
 decay is apparently modelled empirically based on measurement of the rate of
 change of the mean anomaly and its rate of change. See the sgp4sdp4 source
 code and related references for details.
