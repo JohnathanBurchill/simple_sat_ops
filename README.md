@@ -8,12 +8,13 @@ The aim is twofold: 1) demonstrate reliable and fast operation through a
 simple terminal interface, and 2) learn by doing. The software suits needs;
 your mileage may vary. 
 
-Based on the [sgp4sdp4 C library](https://github.com/KJ7LNW/sgp4sdp4). Many
-thanks to [@KJ7LNW](https://github.com/KJ7LNW) for making this available.
+Directly based on the [sgp4sdp4 library](https://github.com/KJ7LNW/sgp4sdp4)
+ported to C by Neoklis Kyriazis from other sources. Thank you
+[@KJ7LNW](https://github.com/KJ7LNW) for making this available on github.
 
-**CAUTION**: the sgp4sdp4 change log date is from 2001. We have not verified
-that this version of sgp4sdp4 is consistent with that recommended by [Valado
-et al.
+**CAUTION**: the original sgp4sdp4 COPYING file is dated 2001. We have not
+checked whether this version of sgp4sdp4 is still consistent with that
+recommended by [Valado et al.
 2006](https://celestrak.org/publications/AIAA/2006-6753/AIAA-2006-6753-Rev3.pdf).
 
 Thanks go to the University of Calgary [Rothney Astrophysical
@@ -38,11 +39,12 @@ library.
 
 ## lifetime 
 
-Estimates the lifetime of a satellite from TLE the alone. Inaccurate: this is
-a toy "what if?" calculation. In SGP4SDP4, orbit decay is apparently modelled
-empirically based on measurement of the rate of change of the mean anomaly and
-its rate of change. See the sgp4sdp4 source code and related references for
-details.
+Estimates the lifetime of a satellite from TLE the alone. 
+
+**This is inaccurate** The calculation is a toy 'what if?'. In SGP4SDP4, orbit
+decay is apparently modelled empirically based on measurement of the rate of
+change of the mean anomaly and its rate of change. See the sgp4sdp4 source
+code and related references for details.
 
 # Installation
 
@@ -65,5 +67,5 @@ gcc -o next_in_queue next_in_queue.c prediction.c -lsgp4sdp4
 gcc -o lifetime lifetime.c prediction.c -lsgp4sdp4
 ```
 
-If you don't know what `libsgp4sdp4` is, look it up 🙂.
-
+The ```sgp4sdp4``` library needs to be compiled separately and installed in a
+suitable location.
