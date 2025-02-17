@@ -23,8 +23,6 @@
 
 #include <string.h>
 #include <time.h>
-#include <hamlib/rig.h>
-#include <hamlib/rotator.h>
 #include "sgp4sdp4/sgp4sdp4.h"
 #include <ncurses.h>
 #include <regex.h>
