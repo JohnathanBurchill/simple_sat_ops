@@ -23,9 +23,6 @@ project(simple_sat_ops)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
 #set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
 
-# Add the sgp4sdp4 subdirectory
-add_subdirectory(sgp4sdp4)
-
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NCURSES REQUIRED ncurses)
 
@@ -33,27 +30,15 @@ pkg_check_modules(NCURSES REQUIRED ncurses)
 add_executable(simple_sat_ops main.c prediction.c radio.c antenna_rotator.c)
 # target_compile_definitions(simple_sat_ops PUBLIC -DQOL)
 
-# Include directories for sgp4sdp4 and Hamlib
-target_include_directories(simple_sat_ops PRIVATE
-    ${CMAKE_SOURCE_DIR}/sgp4sdp4
-)
-
-# Link the sgp4sdp4 library and Hamlib
+# Link the sgp4sdp4 library
 target_link_libraries(simple_sat_ops PRIVATE sgp4sdp4 ${NCURSES_LIBRARIES} m) 
 
 # Next in queue tool
 add_executable(next_in_queue next_in_queue.c prediction.c)
-target_include_directories(next_in_queue PRIVATE
-    ${CMAKE_SOURCE_DIR}/sgp4sdp4
-    ${HAMLIB_INCLUDE_DIR}
-)
-target_link_libraries(next_in_queue PRIVATE sgp4sdp4 ${NCURSES_LIBRARIES} m)
+target_link_libraries(next_in_queue PRIVATE sgp4sdp4 m)
 
 # Lifetime tool
 add_executable(lifetime lifetime.c prediction.c)
-target_include_directories(lifetime PRIVATE
-    ${CMAKE_SOURCE_DIR}/sgp4sdp4
-)
 target_link_libraries(lifetime PRIVATE sgp4sdp4 m)
 
 install(TARGETS simple_sat_ops next_in_queue lifetime DESTINATION $ENV{HOME}/bin)

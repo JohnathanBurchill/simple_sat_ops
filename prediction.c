@@ -23,7 +23,7 @@
 
 #include <string.h>
 #include <time.h>
-#include "sgp4sdp4/sgp4sdp4.h"
+#include <sgp4sdp4.h>
 #include <ncurses.h>
 #include <regex.h>
 

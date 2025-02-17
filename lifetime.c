@@ -24,7 +24,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-#include "sgp4sdp4/sgp4sdp4.h"
+#include <sgp4sdp4.h>
 
 // Returns the first match on state->satellite.name
 double lifetime(state_t *state, double jul_utc_start, double delta_t_minutes, double max_years, double min_alt_km)

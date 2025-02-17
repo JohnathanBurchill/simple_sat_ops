@@ -21,13 +21,13 @@
 #ifndef STATE_H
 #define STATE_H
 
-#include "sgp4sdp4/sgp4sdp4.h"
-
 #include "radio.h"
 #include "antenna_rotator.h"
 
 #include <stdint.h>
 #include <termios.h>
+#include <sgp4sdp4.h>
+
 
 #define MAX_TLE_LINE_LENGTH 128
 #define TRACKING_PREP_TIME_MINUTES 5.0
