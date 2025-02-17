@@ -4,3 +4,9 @@ TLEs
 TODO.md
 plot.gp
 demo/*.mov
+.gdb_history
+messages.txt
+scope.txt
+radio_docs
+rotator_docs
+.DS_Store

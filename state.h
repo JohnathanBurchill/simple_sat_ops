@@ -21,11 +21,16 @@
 #ifndef STATE_H
 #define STATE_H
 
-#define MAX_TLE_LINE_LENGTH 128
+#include "sgp4sdp4/sgp4sdp4.h"
 
-#include <sgp4sdp4.h>
-#include <hamlib/rig.h>
-#include <hamlib/rotator.h>
+#include "radio.h"
+#include "antenna_rotator.h"
+
+#include <stdint.h>
+#include <termios.h>
+
+#define MAX_TLE_LINE_LENGTH 128
+#define TRACKING_PREP_TIME_MINUTES 5.0
 
 typedef struct ephemeres
 {
@@ -45,18 +50,18 @@ typedef struct ephemeres
     vector_t observation_set;
 } ephemeres_t;
 
-typedef struct state {
+typedef struct state 
+{
     int n_options;
     int running;
+    int verbose_level;
     char *tles_filename;
     double jul_epoch;
     double minutes_since_epoch;
     ephemeres_t observer;
     ephemeres_t satellite;
-    vector_t observer_satellite_relative_velocity;
-    double observer_satellite_relative_speed;
-    double doppler_uplink_frequency;
-    double doppler_downlink_frequency;
+    radio_t radio;
+    antenna_rotator_t antenna_rotator;
     double predicted_minutes_until_visible;
     double predicted_max_elevation;
     double predicted_pass_duration_minutes;
@@ -65,13 +70,14 @@ typedef struct state {
     double predicted_ascension_azimuth;
     double predicted_ascension_jul_utc;
     int tracking;
+    double tracking_prep_time_minutes;
     int in_pass;
-    RIG *rig;
-    ROT *rot;
-    int run_without_rig;
-    int run_without_rotator;
-    int have_rig;
-    int have_rotator;
+    int run_with_radio;
+    int run_with_antenna_rotator;
+    int have_radio;
+    int have_antenna_rotator;
+    int auto_sat;
 } state_t;
+
 
 #endif // STATE_H
