@@ -246,7 +246,10 @@ int main(int argc, char **argv)
     struct timeval tv;
     UTC_Calendar_Now(&utc, &tv);
     double jul_utc = Julian_Date(&utc, &tv);
-    apply_args(&state, argc, argv, jul_utc);
+    status = apply_args(&state, argc, argv, jul_utc);
+    if (status != 0) {
+        return status;
+    }
 
     /* Parse TLE data */
     int tle_status = load_tle(&state);
