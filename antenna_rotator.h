@@ -53,6 +53,7 @@ typedef struct antenna_rotator
     double target_elevation;
     double azimuth;
     double elevation;
+    int fixed_target;
 } antenna_rotator_t;
 
 int antenna_rotator_init(antenna_rotator_t *antenna_rotator);

@@ -28,6 +28,7 @@
 #include <termios.h>
 #include <string.h>
 #include <math.h>
+#include <ncurses.h>
 
 int antenna_rotator_init(antenna_rotator_t *antenna_rotator)
 {
@@ -69,8 +70,8 @@ void antenna_rotator_connect(antenna_rotator_t *antenna_rotator)
     antenna_rotator->tty.c_lflag = 0;
     antenna_rotator->tty.c_oflag = 0;
     antenna_rotator->tty.c_cc[VMIN] = 0;
-    // Wait up to 0.2 s
-    antenna_rotator->tty.c_cc[VTIME] = 2;
+    // Wait up to 0.5 s
+    antenna_rotator->tty.c_cc[VTIME] = 5;
 
     antenna_rotator->tty.c_cflag |= (CLOCAL | CREAD);
     antenna_rotator->tty.c_cflag &= ~(PARENB | PARODD);
@@ -102,7 +103,7 @@ void antenna_rotator_disconnect(antenna_rotator_t *antenna_rotator)
 
 int antenna_rotator_command(antenna_rotator_t *antenna_rotator, antenna_rotator_command_t cmd, double *azimuth, double *elevation)
 {
-    uint8_t telemetry[AR_CMD_LEN] = {'W', '0', '0', '0', 0x0, '0', '0', '0', '0', 0x0, (uint8_t)cmd, ' '};
+    uint8_t telemetry[AR_CMD_LEN] = {'W', '0', '0', '0', '0', 0x0, '0', '0', '0', '0', 0x0, (uint8_t)cmd, ' '};
 
     char az[5], el[5];
 
@@ -114,10 +115,14 @@ int antenna_rotator_command(antenna_rotator_t *antenna_rotator, antenna_rotator_
         snprintf(el, 5, "%04.0f", 10 * (360.0 + *elevation));
         for (int i = 0; i < 4; ++i) {
             telemetry[i + 1] = az[i];
-            telemetry[i + 5] = el[i];
+            telemetry[i + 6] = el[i];
         }
     }
     printcmd("Antenna rotator command:", telemetry, AR_CMD_LEN);
+    mvprintw(0, 0, "%s", "Ant cmd: ");
+    for (int i = 0; i < AR_CMD_LEN; ++i) {
+        printw(" %0X", telemetry[i]);
+    }
 
     ssize_t bytes_sent = write(antenna_rotator->fd, telemetry, AR_CMD_LEN); 
     if (bytes_sent != AR_CMD_LEN) {
@@ -142,6 +147,10 @@ int antenna_rotator_command(antenna_rotator_t *antenna_rotator, antenna_rotator_
         }
     }
     printcmd("Antenna rotator response", response, offset);
+    printw(", %s", "Ant rsp: ");
+    for (int i = 0; i < AR_RESPONSE_LEN; ++i) {
+        printw(" %0X", response[i]);
+    }
 
     if (offset != AR_RESPONSE_LEN) {
         return ANTENNA_ROTATOR_BAD_RESPONSE;

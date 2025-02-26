@@ -281,7 +281,8 @@ int main(int argc, char **argv)
         // Check that we can control the antenna position
         antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_STATUS, NULL, NULL);
         if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
-            fprintf(stderr, "Error commanding the antenna rotator\n");
+            fprintf(stderr, "Error commanding the antenna rotator: response %d\n", antenna_rotator_result);
+            fprintf(stderr, "Check that the SPID Rot2ProG is in 'A' mode\n");
             state.have_antenna_rotator = 0;
         } else {
             state.have_antenna_rotator = 1;
@@ -347,10 +348,12 @@ int main(int argc, char **argv)
                 state.in_pass = 1;
             }
             if (antenna_should_be_controlled && !state.tracking) {
-                state.tracking = 1;
+                if (!state.antenna_rotator.fixed_target) {
+                    state.tracking = 1;
+                }
             }
 
-            // Point antenna at satellite
+            // Point antenna at satellite or fixed target
             // TODO remove lag bias by anticipating direction
             if (state.tracking && antenna_is_under_control) {
                 delta_az = state.satellite.azimuth - state.antenna_rotator.target_azimuth;
@@ -517,11 +520,12 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
 
     state->run_with_radio = 0;
     state->radio.device_filename = "/dev/ttyUSB1";
-    state->radio.serial_speed = 9600;
+    state->radio.serial_speed = 115200;
 
     state->run_with_antenna_rotator = 0;
     state->antenna_rotator.device_filename = "/dev/ttyUSB0";
-    state->antenna_rotator.serial_speed = 960;
+    state->antenna_rotator.serial_speed = 600;
+    state->antenna_rotator.fixed_target = 0;
 
     for (int i = 0; i < argc; i++) {
 
@@ -570,6 +574,22 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 return EXIT_FAILURE;
             }
             state->radio.nominal_downlink_frequency = atof(argv[i] + 20) * 1e6;
+        } else if (strncmp("--rotator-target-elevation=", argv[i], 27) == 0) {
+            state->n_options++; 
+            if (strlen(argv[i]) < 28) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state->antenna_rotator.target_elevation = atof(argv[i] + 27);
+            state->antenna_rotator.fixed_target = 1;
+        } else if (strncmp("--rotator-target-azimuth=", argv[i], 25) == 0) {
+            state->n_options++; 
+            if (strlen(argv[i]) < 26) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state->antenna_rotator.target_azimuth = atof(argv[i] + 25);
+            state->antenna_rotator.fixed_target = 1;
         } else if (strncmp("--lat=", argv[i], 6) == 0) {
             state->n_options++; 
             if (strlen(argv[i]) < 7) {
