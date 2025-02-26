@@ -67,6 +67,7 @@ typedef struct radio
     double vfo_main_actual_frequency;
     double vfo_sub_actual_frequency;
     int doppler_correction_enabled;
+    int waterfall_enabled;
 } radio_t;
 
 int radio_init(radio_t *radio);
@@ -80,6 +81,7 @@ int radio_get_satellite_mode(radio_t *radio);
 int radio_set_satellite_mode(radio_t *radio, int sat_mode);
 int radio_get_band_selection(radio_t *radio, int band);
 int radio_set_band_selection(radio_t *radio, int band);
+int radio_set_waterfall_status(radio_t *radio, int enabled);
 
 
 #endif // !RADIO_H

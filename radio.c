@@ -379,3 +379,17 @@ int radio_set_band_selection(radio_t *radio, int band)
     }
     return RADIO_OK;
 }
+
+int radio_set_waterfall_status(radio_t *radio, int enabled)
+{
+    int radio_result = 0;
+    uint8_t data[1];
+    data[0] = enabled;
+    radio_result = radio_command(radio, 0x27, 0x10, -1, data, 1, NULL, 0);
+    if (radio_result != RADIO_OK) {
+        return radio_result;
+    }
+    radio->waterfall_enabled = enabled;
+    return RADIO_OK;
+}
+

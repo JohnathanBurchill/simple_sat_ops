@@ -474,6 +474,10 @@ int main(int argc, char **argv)
                     }
                     keyboard_unlocked = 0;
                     break;
+                case 'w':
+                    radio_set_waterfall_status(&state.radio, !state.radio.waterfall_enabled);
+                    keyboard_unlocked = 0;
+                    break;
                 default:
                     break;
             }
@@ -542,6 +546,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->run_with_radio = 0;
     state->radio.device_filename = "/dev/ttyUSB1";
     state->radio.serial_speed = 115200;
+    state->radio.waterfall_enabled = 0;
 
     state->run_with_antenna_rotator = 0;
     state->antenna_rotator.device_filename = "/dev/ttyUSB0";
