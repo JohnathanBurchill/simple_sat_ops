@@ -111,11 +111,19 @@ int antenna_rotator_command(antenna_rotator_t *antenna_rotator, antenna_rotator_
         if (azimuth == NULL || elevation == NULL) {
             return ANTENNA_ROTATOR_ARGS;
         }
-        snprintf(az, 5, "%04.0f", 10 * (360.0 + *azimuth));
-        snprintf(el, 5, "%04.0f", 10 * (360.0 + *elevation));
+        snprintf(az, 5, "%04.0f", (360.0 + *azimuth));
+        snprintf(el, 5, "%04.0f", (360.0 + *elevation));
         for (int i = 0; i < 4; ++i) {
             telemetry[i + 1] = az[i];
             telemetry[i + 6] = el[i];
+        }
+        mvprintw(2, 0, "%s", "az: ");
+        for (int i = 0; i < 4; ++i) {
+            printw(" %0X", az[i]);
+        }
+        printw(", %s", "el: ");
+        for (int i = 0; i < 4; ++i) {
+            printw(" %0X", el[i]);
         }
     }
     printcmd("Antenna rotator command:", telemetry, AR_CMD_LEN);
@@ -128,6 +136,12 @@ int antenna_rotator_command(antenna_rotator_t *antenna_rotator, antenna_rotator_
     if (bytes_sent != AR_CMD_LEN) {
         return ANTENNA_ROTATOR_BAD_RESPONSE;
     }
+
+    // Rot2ProG does not respond to a set command
+    if (cmd == ANTENNA_ROTATOR_SET) {
+        return ANTENNA_ROTATOR_OK;
+    }
+
     uint8_t response[AR_RESPONSE_LEN] = {0};
     ssize_t bytes_received = -1;
     int remaining_buffer = AR_RESPONSE_LEN;

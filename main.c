@@ -41,8 +41,8 @@
 #define DOPPLER_SHIFT_RESOLUTION_KHZ 0.1 
 
 // Antenna rotator max angle from target 
-#define MAX_DELTA_AZIMUTH_DEGREES 3.0
-#define MAX_DELTA_ELEVATION_DEGREES 3.0
+#define MAX_DELTA_AZIMUTH_DEGREES 1.0
+#define MAX_DELTA_ELEVATION_DEGREES 1.0
 
 #define WARN_DAYS_SINCE_EPOCH 1.0
 #define MAX_MINUTES_TO_PREDICT ((7 * 1440))
@@ -278,15 +278,16 @@ int main(int argc, char **argv)
             fprintf(stderr, "Error initializing antenna rotator\n");
             return EXIT_FAILURE;
         }
+        state.have_antenna_rotator = 1;
         // Check that we can control the antenna position
-        antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_STATUS, NULL, NULL);
-        if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
-            fprintf(stderr, "Error commanding the antenna rotator: response %d\n", antenna_rotator_result);
-            fprintf(stderr, "Check that the SPID Rot2ProG is in 'A' mode\n");
-            state.have_antenna_rotator = 0;
-        } else {
-            state.have_antenna_rotator = 1;
-        }
+        // antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_STATUS, NULL, NULL);
+        // if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
+        //     fprintf(stderr, "Error commanding the antenna rotator: response %d\n", antenna_rotator_result);
+        //     fprintf(stderr, "Check that the SPID Rot2ProG is in 'A' mode\n");
+        //     state.have_antenna_rotator = 0;
+        // } else {
+        //     state.have_antenna_rotator = 1;
+        // }
     }
 
     /* Tracking loop */
@@ -437,10 +438,26 @@ int main(int argc, char **argv)
                     break;
                 case 'T':
                     antenna_is_under_control = antenna_should_be_controlled;
+                    if (state.antenna_rotator.fixed_target) {
+                        azimuth = state.antenna_rotator.target_azimuth;
+                        elevation = state.antenna_rotator.target_elevation;
+                        antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_SET, &azimuth, &elevation);
+                        if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
+                            fprintf(stderr, "Error setting antenna rotator position\n");
+                        }
+                    }
                     keyboard_unlocked = 0;
                     break;
                 case 's':
                     antenna_is_under_control = 0;
+                    if (state.antenna_rotator.fixed_target) {
+                        azimuth = 0;
+                        elevation = 0;
+                        antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_STOP, &azimuth, &elevation);
+                        if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
+                            fprintf(stderr, "Error stopping the antenna rotator\n");
+                        }
+                    }
                     keyboard_unlocked = 0;
                     break;
                 case 'r':
