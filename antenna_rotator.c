@@ -28,7 +28,6 @@
 #include <termios.h>
 #include <string.h>
 #include <math.h>
-#include <ncurses.h>
 
 int antenna_rotator_init(antenna_rotator_t *antenna_rotator)
 {
@@ -117,20 +116,8 @@ int antenna_rotator_command(antenna_rotator_t *antenna_rotator, antenna_rotator_
             telemetry[i + 1] = az[i];
             telemetry[i + 6] = el[i];
         }
-        mvprintw(2, 0, "%s", "az: ");
-        for (int i = 0; i < 4; ++i) {
-            printw(" %0X", az[i]);
-        }
-        printw(", %s", "el: ");
-        for (int i = 0; i < 4; ++i) {
-            printw(" %0X", el[i]);
-        }
     }
     printcmd("Antenna rotator command:", telemetry, AR_CMD_LEN);
-    mvprintw(0, 0, "%s", "Ant cmd: ");
-    for (int i = 0; i < AR_CMD_LEN; ++i) {
-        printw(" %0X", telemetry[i]);
-    }
 
     ssize_t bytes_sent = write(antenna_rotator->fd, telemetry, AR_CMD_LEN); 
     if (bytes_sent != AR_CMD_LEN) {
@@ -161,10 +148,6 @@ int antenna_rotator_command(antenna_rotator_t *antenna_rotator, antenna_rotator_
         }
     }
     printcmd("Antenna rotator response", response, offset);
-    printw(", %s", "Ant rsp: ");
-    for (int i = 0; i < AR_RESPONSE_LEN; ++i) {
-        printw(" %0X", response[i]);
-    }
 
     if (offset != AR_RESPONSE_LEN) {
         return ANTENNA_ROTATOR_BAD_RESPONSE;
