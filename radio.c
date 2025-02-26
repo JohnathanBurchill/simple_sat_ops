@@ -141,7 +141,7 @@ void radio_connect(radio_t *radio)
     radio->tty.c_iflag &= ~IGNPAR;
     radio->tty.c_lflag = 0;
     radio->tty.c_oflag = 0;
-    // Read at least 1 byte
+    // Do not block for bytes
     radio->tty.c_cc[VMIN] = 0;
     // Wait up to 0.1 s
     radio->tty.c_cc[VTIME] = 1;
