@@ -339,12 +339,14 @@ int main(int argc, char **argv)
         update_satellite_position(&state, jul_utc);
 
         /* Calculate Doppler shift */
-        update_doppler_shifted_frequencies(&state, state.radio.nominal_uplink_frequency, state.radio.nominal_downlink_frequency);
-        doppler_delta_uplink = fabs(state.radio.doppler_uplink_frequency - current_uplink_frequency);
-        doppler_delta_downlink = fabs(state.radio.doppler_downlink_frequency - current_downlink_frequency);
+        if (state.radio.doppler_correction_enabled) {
+            update_doppler_shifted_frequencies(&state, state.radio.nominal_uplink_frequency, state.radio.nominal_downlink_frequency);
+            doppler_delta_uplink = fabs(state.radio.doppler_uplink_frequency - current_uplink_frequency);
+            doppler_delta_downlink = fabs(state.radio.doppler_downlink_frequency - current_downlink_frequency);
+        }
 
         // TODO check for passes that reach a minimum elevation
-        if (state.predicted_minutes_until_visible < state.tracking_prep_time_minutes) {
+        if (state.satellite_tracking && state.predicted_minutes_until_visible < state.tracking_prep_time_minutes) {
             if (!state.in_pass) {
                 state.in_pass = 1;
             }
@@ -531,9 +533,11 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     double max_elevation = 90.0;
     int with_constellations = 0;
     state->tracking_prep_time_minutes = TRACKING_PREP_TIME_MINUTES;
+    state->satellite_tracking = 1;
 
     state->radio.nominal_uplink_frequency = UPLINK_FREQ_MHZ * 1e6;
     state->radio.nominal_downlink_frequency = DOWNLINK_FREQ_MHZ * 1e6;
+    state->radio.doppler_correction_enabled = 1;
 
     state->run_with_radio = 0;
     state->radio.device_filename = "/dev/ttyUSB1";
@@ -553,6 +557,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 return EXIT_FAILURE;
             }
             state->verbose_level = atoi(argv[i] + 10);
+        } else if (strcmp("--no-tracking", argv[i]) == 0) {
+            state->n_options++;
+            state->satellite_tracking = 0;
         } else if (strcmp("--with-radio", argv[i]) == 0) {
             state->n_options++;
             state->run_with_radio = 1;
@@ -591,6 +598,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 return EXIT_FAILURE;
             }
             state->radio.nominal_downlink_frequency = atof(argv[i] + 20) * 1e6;
+        } else if (strcmp("--no-doppler-correction", argv[i]) == 0) {
+            state->n_options++;
+            state->radio.doppler_correction_enabled = 0;
         } else if (strncmp("--rotator-target-elevation=", argv[i], 27) == 0) {
             state->n_options++; 
             if (strlen(argv[i]) < 28) {

@@ -60,6 +60,7 @@ typedef struct state
     double minutes_since_epoch;
     ephemeres_t observer;
     ephemeres_t satellite;
+    int satellite_tracking;
     radio_t radio;
     antenna_rotator_t antenna_rotator;
     double predicted_minutes_until_visible;

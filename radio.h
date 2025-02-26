@@ -66,6 +66,7 @@ typedef struct radio
     double doppler_downlink_frequency;
     double vfo_main_actual_frequency;
     double vfo_sub_actual_frequency;
+    int doppler_correction_enabled;
 } radio_t;
 
 int radio_init(radio_t *radio);
