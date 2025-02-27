@@ -422,8 +422,9 @@ int main(int argc, char **argv)
                         antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_SET, &azimuth, &elevation);
                         if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
                             fprintf(stderr, "Error setting antenna rotator position\n");
+                        } else {
+                            antenna_is_moving = 1;
                         }
-                        antenna_is_moving = 1;
                     }
                 }
             }
@@ -493,6 +494,7 @@ int main(int argc, char **argv)
                     keyboard_unlocked = 0;
                     break;
                 case 'T':
+                    state.satellite_tracking = 1;
                     antenna_is_under_control = antenna_should_be_controlled;
                     if (state.antenna_rotator.fixed_target) {
                         azimuth = state.antenna_rotator.target_azimuth;
@@ -500,11 +502,14 @@ int main(int argc, char **argv)
                         antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_SET, &azimuth, &elevation);
                         if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
                             fprintf(stderr, "Error setting antenna rotator position\n");
+                        } else {
+                            antenna_is_moving = 1;
                         }
                     }
                     keyboard_unlocked = 0;
                     break;
                 case 's':
+                    state.satellite_tracking = 0;
                     antenna_is_under_control = 0;
                     if (!state.antenna_rotator.fixed_target) {
                         // dummy values
@@ -519,6 +524,7 @@ int main(int argc, char **argv)
                     keyboard_unlocked = 0;
                     break;
                 case 'r':
+                    state.satellite_tracking = 0;
                     antenna_is_under_control = 0;
                     state.antenna_rotator.target_azimuth = 0.0;
                     state.antenna_rotator.target_elevation = 0.0;
@@ -527,8 +533,9 @@ int main(int argc, char **argv)
                     antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_SET, &azimuth, &elevation);
                     if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
                         fprintf(stderr, "Error setting antenna rotator position\n");
+                    } else {
+                        antenna_is_moving = 1;
                     }
-                    antenna_is_moving = 1;
                     keyboard_unlocked = 0;
                     break;
                 case 'w':
@@ -623,9 +630,6 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 return EXIT_FAILURE;
             }
             state->verbose_level = atoi(argv[i] + 10);
-        } else if (strcmp("--no-tracking", argv[i]) == 0) {
-            state->n_options++;
-            state->satellite_tracking = 0;
         } else if (strcmp("--with-radio", argv[i]) == 0) {
             state->n_options++;
             state->run_with_radio = 1;
