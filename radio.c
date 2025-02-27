@@ -380,14 +380,38 @@ int radio_set_band_selection(radio_t *radio, int band)
     return RADIO_OK;
 }
 
-int radio_set_waterfall_status(radio_t *radio, int enabled)
+int radio_toggle_waterfall(radio_t *radio)
 {
     int radio_result = 0;
     uint8_t data[1];
-    data[0] = enabled;
-    radio_result = radio_command(radio, 0x27, 0x10, -1, data, 1, NULL, 0);
+    uint8_t enabled = !radio->waterfall_enabled;
+    uint64_t scope_status = 0;
+    radio_result = radio_command(radio, 0x27, 0x10, -1, NULL, 0, &scope_status, 0);
     if (radio_result != RADIO_OK) {
+        fprintf(stderr, "Unable to get scope status\n");
         return radio_result;
+    }
+    if (scope_status != enabled) {
+        data[0] = enabled;
+        radio_result = radio_command(radio, 0x27, 0x10, -1, data, 1, NULL, 0);
+        if (radio_result != RADIO_OK) {
+            fprintf(stderr, "Unable to set scope status\n");
+            return radio_result;
+        }
+    }
+    uint64_t waveform_data_status = 0;
+    radio_result = radio_command(radio, 0x27, 0x11, -1, NULL, 0, &waveform_data_status, 0);
+    if (radio_result != RADIO_OK) {
+        fprintf(stderr, "Unable to get waveform data status\n");
+        return radio_result;
+    }
+    if (waveform_data_status != enabled) {
+        data[0] = enabled;
+        radio_result = radio_command(radio, 0x27, 0x11, -1, data, 1, NULL, 0);
+        if (radio_result != RADIO_OK) {
+            fprintf(stderr, "Unable to set waveform data status\n");
+            return radio_result;
+        }
     }
     radio->waterfall_enabled = enabled;
     return RADIO_OK;

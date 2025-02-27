@@ -44,7 +44,7 @@ typedef enum {
 typedef struct antenna_rotator 
 {
     char *device_filename;
-    uint32_t serial_speed;
+    speed_t serial_speed;
     uint8_t connected;
     int fd;
     struct termios tty;

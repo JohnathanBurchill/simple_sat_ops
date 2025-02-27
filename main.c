@@ -169,6 +169,36 @@ void report_status(state_t *state, int *print_row, int print_col)
     int row = *print_row;
     int col = print_col;
 
+    // Check if we have waterfall data
+    if (state->radio.waterfall_enabled) {
+        mvprintw(0, 0, "%s", "Waterfall");
+        // Read the waterfall data
+        int radio_result = radio_command(&state->radio, 0x27, 0x00, -1, NULL, 0, NULL, 0);
+        // state->radio.result[0] = '\0';
+        // ssize_t bytes_received = -1;
+        // int remaining_buffer = RADIO_MAX_COMMAND_RESULT_LEN;
+        // size_t offset = 0;
+        // while (bytes_received != 0) {
+        //     bytes_received = read(state->radio.fd, state->radio.result + offset, remaining_buffer);
+        //     if (bytes_received == -1) {
+        //         break;
+        //     }
+        //     offset += bytes_received;
+        //     remaining_buffer -= bytes_received;
+        //     if (remaining_buffer <= 0) {
+        //         break;
+        //     }
+        // }
+        // state->radio.result_len = offset;
+        printw(" %d bytes received:", state->radio.result_len);
+        for (int i = 0; i < state->radio.result_len && i < 50; ++i) {
+            printw(" %d", state->radio.result[i]);
+        }
+    } else {
+        mvprintw(0, 0, "%s", "");
+    }
+    clrtoeol();
+
     if (state->have_radio) {
         mvprintw(row++, col, "%15s   %.6f MHz", "UPLINK", state->radio.doppler_uplink_frequency / 1e6);
         clrtoeol();
@@ -475,7 +505,10 @@ int main(int argc, char **argv)
                     keyboard_unlocked = 0;
                     break;
                 case 'w':
-                    radio_set_waterfall_status(&state.radio, !state.radio.waterfall_enabled);
+                    radio_result = radio_toggle_waterfall(&state.radio);
+                    if (radio_result != RADIO_OK) {
+                        fprintf(stderr, "Waterfall error: %d\n", radio_result);
+                    }
                     keyboard_unlocked = 0;
                     break;
                 default:
@@ -545,12 +578,13 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
 
     state->run_with_radio = 0;
     state->radio.device_filename = "/dev/ttyUSB1";
-    state->radio.serial_speed = 115200;
+    //state->radio.serial_speed = 115200;
+    state->radio.serial_speed = B9600;
     state->radio.waterfall_enabled = 0;
 
     state->run_with_antenna_rotator = 0;
     state->antenna_rotator.device_filename = "/dev/ttyUSB0";
-    state->antenna_rotator.serial_speed = 600;
+    state->antenna_rotator.serial_speed = B600;
     state->antenna_rotator.fixed_target = 0;
 
     for (int i = 0; i < argc; i++) {

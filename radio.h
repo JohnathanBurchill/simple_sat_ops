@@ -49,7 +49,7 @@ enum RADIO_VFO {
 typedef struct radio 
 {
     char *device_filename;
-    uint32_t serial_speed;
+    speed_t serial_speed;
     uint8_t connected;
     int fd;
     struct termios tty;
@@ -81,7 +81,7 @@ int radio_get_satellite_mode(radio_t *radio);
 int radio_set_satellite_mode(radio_t *radio, int sat_mode);
 int radio_get_band_selection(radio_t *radio, int band);
 int radio_set_band_selection(radio_t *radio, int band);
-int radio_set_waterfall_status(radio_t *radio, int enabled);
+int radio_toggle_waterfall(radio_t *radio);
 
 
 #endif // !RADIO_H
