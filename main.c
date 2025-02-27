@@ -578,7 +578,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
 
     state->run_with_radio = 0;
     state->radio.device_filename = "/dev/ttyUSB1";
-    //state->radio.serial_speed = 115200;
+    // state->radio.serial_speed = B115200;
     state->radio.serial_speed = B9600;
     state->radio.waterfall_enabled = 0;
 
