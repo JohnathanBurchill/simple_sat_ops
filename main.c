@@ -349,6 +349,7 @@ int main(int argc, char **argv)
 
     int antenna_should_be_controlled = state.run_with_antenna_rotator && state.have_antenna_rotator;
     int antenna_is_under_control = antenna_should_be_controlled;
+    int antenna_is_moving = 0;
 
     int keyboard_unlocked = 0;
     int keyboard_info_row = 20;
@@ -389,31 +390,40 @@ int main(int argc, char **argv)
             // Point antenna at satellite or fixed target
             // TODO remove lag bias by anticipating direction
             if (state.tracking && antenna_is_under_control) {
-                delta_az = state.satellite.azimuth - state.antenna_rotator.target_azimuth;
-                if (state.satellite.elevation >= 0) {
-                    delta_el = state.satellite.elevation - state.antenna_rotator.target_elevation;
-                } else {
-                    delta_el = 0.0;
+                // check if antenna reached its target 
+                if (antenna_is_moving) {
+                    if (state.antenna_rotator.azimuth == state.antenna_rotator.target_azimuth && state.antenna_rotator.elevation == state.antenna_rotator.target_elevation) {
+                        antenna_is_moving = 0;
+                    }
                 }
+                if (!antenna_is_moving) {
+                    delta_az = state.satellite.azimuth - state.antenna_rotator.target_azimuth;
+                    if (state.satellite.elevation >= 0) {
+                        delta_el = state.satellite.elevation - state.antenna_rotator.target_elevation;
+                    } else {
+                        delta_el = 0.0;
+                    }
 
-                if (fabs(delta_az) >= MAX_DELTA_AZIMUTH_DEGREES || fabs(delta_el) >= MAX_DELTA_ELEVATION_DEGREES) {
-                    state.antenna_rotator.target_azimuth = state.satellite.azimuth;
-                    state.antenna_rotator.target_elevation = state.satellite.elevation;
-                    if (state.antenna_rotator.target_elevation < 0.0) {
-                        state.antenna_rotator.target_elevation = 0.0;
-                    } else if (state.antenna_rotator.target_elevation > 90.0) {
-                        state.antenna_rotator.target_elevation = 90.0;
-                    }
-                    if (state.antenna_rotator.target_azimuth < -180.0) {
-                        state.antenna_rotator.target_azimuth = 180.0;
-                    } else if (state.antenna_rotator.target_azimuth > 540.0) {
-                        state.antenna_rotator.target_azimuth = 540.0;
-                    }
-                    azimuth = state.antenna_rotator.target_azimuth;
-                    elevation = state.antenna_rotator.target_elevation;
-                    antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_SET, &azimuth, &elevation);
-                    if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
-                        fprintf(stderr, "Error setting antenna rotator position\n");
+                    if (fabs(delta_az) >= MAX_DELTA_AZIMUTH_DEGREES || fabs(delta_el) >= MAX_DELTA_ELEVATION_DEGREES) {
+                        state.antenna_rotator.target_azimuth = state.satellite.azimuth;
+                        state.antenna_rotator.target_elevation = state.satellite.elevation;
+                        if (state.antenna_rotator.target_elevation < 0.0) {
+                            state.antenna_rotator.target_elevation = 0.0;
+                        } else if (state.antenna_rotator.target_elevation > 90.0) {
+                            state.antenna_rotator.target_elevation = 90.0;
+                        }
+                        if (state.antenna_rotator.target_azimuth < -180.0) {
+                            state.antenna_rotator.target_azimuth = 180.0;
+                        } else if (state.antenna_rotator.target_azimuth > 540.0) {
+                            state.antenna_rotator.target_azimuth = 540.0;
+                        }
+                        azimuth = state.antenna_rotator.target_azimuth;
+                        elevation = state.antenna_rotator.target_elevation;
+                        antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_SET, &azimuth, &elevation);
+                        if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
+                            fprintf(stderr, "Error setting antenna rotator position\n");
+                        }
+                        antenna_is_moving = 1;
                     }
                 }
             }
@@ -496,7 +506,8 @@ int main(int argc, char **argv)
                     break;
                 case 's':
                     antenna_is_under_control = 0;
-                    if (state.antenna_rotator.fixed_target) {
+                    if (!state.antenna_rotator.fixed_target) {
+                        // dummy values
                         azimuth = 0;
                         elevation = 0;
                         antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_STOP, &azimuth, &elevation);
@@ -504,6 +515,7 @@ int main(int argc, char **argv)
                             fprintf(stderr, "Error stopping the antenna rotator\n");
                         }
                     }
+                    antenna_is_moving = 0;
                     keyboard_unlocked = 0;
                     break;
                 case 'r':
@@ -516,6 +528,7 @@ int main(int argc, char **argv)
                     if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
                         fprintf(stderr, "Error setting antenna rotator position\n");
                     }
+                    antenna_is_moving = 1;
                     keyboard_unlocked = 0;
                     break;
                 case 'w':
@@ -584,7 +597,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     double max_elevation = 90.0;
     int with_constellations = 0;
     state->tracking_prep_time_minutes = TRACKING_PREP_TIME_MINUTES;
-    state->satellite_tracking = 1;
+    state->satellite_tracking = 0;
 
     state->radio.nominal_uplink_frequency = UPLINK_FREQ_MHZ * 1e6;
     state->radio.nominal_downlink_frequency = DOWNLINK_FREQ_MHZ * 1e6;
