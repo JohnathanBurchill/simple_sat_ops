@@ -390,11 +390,25 @@ int main(int argc, char **argv)
             // TODO remove lag bias by anticipating direction
             if (state.tracking && antenna_is_under_control) {
                 delta_az = state.satellite.azimuth - state.antenna_rotator.target_azimuth;
-                delta_el = state.satellite.elevation - state.antenna_rotator.target_elevation;
+                if (state.satellite.elevation >= 0) {
+                    delta_el = state.satellite.elevation - state.antenna_rotator.target_elevation;
+                } else {
+                    delta_el = 0.0;
+                }
 
                 if (fabs(delta_az) >= MAX_DELTA_AZIMUTH_DEGREES || fabs(delta_el) >= MAX_DELTA_ELEVATION_DEGREES) {
                     state.antenna_rotator.target_azimuth = state.satellite.azimuth;
                     state.antenna_rotator.target_elevation = state.satellite.elevation;
+                    if (state.antenna_rotator.target_elevation < 0.0) {
+                        state.antenna_rotator.target_elevation = 0.0;
+                    } else if (state.antenna_rotator.target_elevation > 90.0) {
+                        state.antenna_rotator.target_elevation = 90.0;
+                    }
+                    if (state.antenna_rotator.target_azimuth < -180.0) {
+                        state.antenna_rotator.target_azimuth = 180.0;
+                    } else if (state.antenna_rotator.target_azimuth > 540.0) {
+                        state.antenna_rotator.target_azimuth = 540.0;
+                    }
                     azimuth = state.antenna_rotator.target_azimuth;
                     elevation = state.antenna_rotator.target_elevation;
                     antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_SET, &azimuth, &elevation);
@@ -647,6 +661,11 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 return EXIT_FAILURE;
             }
             state->antenna_rotator.target_elevation = atof(argv[i] + 27);
+            if (state->antenna_rotator.target_elevation < 0.0) {
+                state->antenna_rotator.target_elevation = 0.0;
+            } else if (state->antenna_rotator.target_elevation > 90.0) {
+                state->antenna_rotator.target_elevation = 90.0;
+            }
             state->antenna_rotator.fixed_target = 1;
         } else if (strncmp("--rotator-target-azimuth=", argv[i], 25) == 0) {
             state->n_options++; 
@@ -656,6 +675,11 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             }
             state->antenna_rotator.target_azimuth = atof(argv[i] + 25);
             state->antenna_rotator.fixed_target = 1;
+            if (state->antenna_rotator.target_azimuth < -180.0) {
+                state->antenna_rotator.target_azimuth = 180.0;
+            } else if (state->antenna_rotator.target_azimuth > 540.0) {
+                state->antenna_rotator.target_azimuth = 540.0;
+            }
         } else if (strncmp("--lat=", argv[i], 6) == 0) {
             state->n_options++; 
             if (strlen(argv[i]) < 7) {
