@@ -54,6 +54,8 @@ int main(int argc, char **argv)
     int with_constellations = 1;
     int reverse = 0;
 
+    int minutes_offset = 0;
+
     for (int i = 0; i < argc; i++) {
         if (strncmp("--lat=", argv[i], 6) == 0) {
             state.n_options++; 
@@ -83,6 +85,13 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
             site_altitude = atof(argv[i] + 6);
+        } else if (strncmp("--minutes-offset=", argv[i], 17) == 0) {
+            state.n_options++; 
+            if (strlen(argv[i]) < 18) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            minutes_offset = atoi(argv[i] + 17);
         } else if (strcmp("--list", argv[i]) == 0) {
             state.n_options++;
             list_all = 1;
@@ -157,8 +166,11 @@ int main(int argc, char **argv)
     struct timeval tv;
     UTC_Calendar_Now(&utc, &tv);
     double jul_utc = Julian_Date(&utc, &tv);
+    jul_utc += minutes_offset / 1440.0;
+    struct tm utc_ref;
+    Date_Time(jul_utc, &utc_ref);
 
-    printf("Checking %s for upcoming satellite passes within the next %.1f minutes\n", state.tles_filename, max_minutes_away);
+    printf("Checking %s for upcoming satellite passes within %.1f minutes from %04d-%02d-%02d %02d:%02d:%02d UTC\n", state.tles_filename, max_minutes_away, utc_ref.tm_year + 1900, utc_ref.tm_mon + 1, utc_ref.tm_mday, utc_ref.tm_hour, utc_ref.tm_min, utc_ref.tm_sec);
     criteria_t criteria = {
         .min_altitude_km = min_altitude_km,
         .max_altitude_km = max_altitude_km,
@@ -234,16 +246,7 @@ int main(int argc, char **argv)
         } else {
             printf("Searched %d satellites\n", count);
             p = get_pass(0);
-            printf("%26s in %.1f minutes at azimuth %.1f deg. for %.1f minutes reaching elevation %.1f deg.\n", p->name, p->minutes_away, p->ascension_azimuth, p->pass_duration, p->max_elevation);
-            // printf("%s in %.2f minutes\n", p->name, p->minutes_away);
-            // printf("%15s : %.2f° N\n", "latitude", state.satellite.latitude);
-            // printf("%15s : %.2f° E\n", "longitude", state.satellite.longitude);
-            // printf("%15s : %.3f km\n", "altitude", state.satellite.altitude_km);
-            // printf("%15s : %.3f km/s\n", "speed", state.satellite.speed_km_s);
-            // printf("%15s : %.2f°\n", "elevation", state.satellite.elevation);
-            // printf("%15s : %.2f°\n", "azimuth", state.satellite.azimuth);
-            // printf("%15s : %.2f km\n", "range", state.satellite.range_km);
-            // printf("%15s : %.2f km/s\n", "range rate", state.satellite.range_rate_km_s);
+            printf("%26s in %.1f minutes from %04d-%02d-%02d %02d:%02d:%02d UTC at azimuth %.1f deg. for %.1f minutes reaching elevation %.1f deg.\n", p->name, p->minutes_away, utc_ref.tm_year + 1900, utc_ref.tm_mon + 1, utc_ref.tm_mday, utc_ref.tm_hour, utc_ref.tm_min, utc_ref.tm_sec, p->ascension_azimuth, p->pass_duration, p->max_elevation);
         }
     }
 

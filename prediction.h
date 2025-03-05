@@ -56,7 +56,7 @@ typedef struct
 void update_satellite_position(state_t *state, double jul_utc);
 void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, double downlink_freq);
 void update_pass_predictions(state_t *external_state, double jul_utc_start, double delta_t_minutes);
-void minutes_until_visible(state_t *external_state, double delta_t_minutes, double max_minutes);
+void minutes_until_visible(state_t *external_state, double jul_utc_start, double delta_t_minutes, double max_minutes);
 int load_tle(state_t *state);
 int find_passes(state_t *external_state, double jul_utc_start, double delta_t_minutes, criteria_t *criteria, int *count, int *number_checked, int reverse_order);
 const pass_t *get_pass(int index);

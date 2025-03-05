@@ -56,6 +56,7 @@ typedef struct state
     int running;
     int verbose_level;
     char *tles_filename;
+    double jul_utc_start;
     double jul_epoch;
     double minutes_since_epoch;
     ephemeres_t observer;

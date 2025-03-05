@@ -121,14 +121,16 @@ void update_pass_predictions(state_t *external_state, double jul_utc_start, doub
     return;
 }
 
-void minutes_until_visible(state_t *external_state, double delta_t_minutes, double max_minutes)
+void minutes_until_visible(state_t *external_state, double jul_utc_start, double delta_t_minutes, double max_minutes)
 {
     state_t state = {0};
     memcpy(&state, external_state, sizeof *external_state);
-    struct tm utc;
-    struct timeval tv;
-    UTC_Calendar_Now(&utc, &tv);
-    double jul_utc_start = Julian_Date(&utc, &tv);
+    if (jul_utc_start == 0.0) {
+        struct tm utc;
+        struct timeval tv;
+        UTC_Calendar_Now(&utc, &tv);
+        jul_utc_start = Julian_Date(&utc, &tv);
+    }
     double jul_utc = jul_utc_start; 
     double max_jul_utc = jul_utc_start + max_minutes / 1440.0;
     update_satellite_position(&state, jul_utc);
@@ -344,7 +346,7 @@ int find_passes(state_t *external_state, double jul_utc_start, double delta_t_mi
 
         // TODO filter on perigee / apogee instead of current altitude?
         if (state.satellite.altitude_km >= criteria->min_altitude_km && state.satellite.altitude_km <= criteria->max_altitude_km) {
-            minutes_until_visible(&state, delta_t_minutes, criteria->max_minutes);
+            minutes_until_visible(&state, jul_utc_start, delta_t_minutes, criteria->max_minutes);
             if (state.predicted_minutes_until_visible > 0 && next_up_minutes_away > state.predicted_minutes_until_visible) {
                 next_up_minutes_away = state.predicted_minutes_until_visible;
                 snprintf(next_up_name, sizeof(next_up_name), "%s", name);
@@ -372,7 +374,7 @@ int find_passes(state_t *external_state, double jul_utc_start, double delta_t_mi
 
                 // Refine estimate:
                 if (state.predicted_minutes_until_visible < 10.0 && delta_t_minutes > 1.0/60.) {
-                    minutes_until_visible(&state, 1.0 / 60.0, criteria->max_minutes);
+                    minutes_until_visible(&state, jul_utc_start, 1.0 / 60.0, criteria->max_minutes);
                 }
                 p->minutes_away = state.predicted_minutes_until_visible;
                 p->pass_duration = state.predicted_pass_duration_minutes;

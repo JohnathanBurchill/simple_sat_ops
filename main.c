@@ -112,11 +112,11 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
     }
     clrtoeol();
 
-    minutes_until_visible(state, 1.0, MAX_MINUTES_TO_PREDICT);
+    minutes_until_visible(state, jul_utc, 1.0, MAX_MINUTES_TO_PREDICT);
     if (fabs(state->predicted_minutes_until_visible) < 1) {
-        minutes_until_visible(state, 1./120.0, 2.0);
+        minutes_until_visible(state, jul_utc, 1./120.0, 2.0);
     } else if (fabs(state->predicted_minutes_until_visible) < 10) {
-        minutes_until_visible(state, 0.1, 20.0);
+        minutes_until_visible(state, jul_utc, 0.1, 20.0);
     }
     if (state->predicted_minutes_until_visible > 0) {
         if (state->predicted_minutes_until_visible < 1) {
