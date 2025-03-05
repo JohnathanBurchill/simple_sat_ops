@@ -81,8 +81,10 @@ void update_pass_predictions(state_t *external_state, double jul_utc_start, doub
     // Sets prediction to start of pass
     update_satellite_position(&state, jul_utc);
     double current_elevation = state.satellite.elevation;
+    double current_altitude = state.satellite.altitude_km;
 
     double max_elevation = current_elevation;
+    double max_altitude = current_altitude;
     double pass_duration = 0.0;
     double minutes_above_0_degrees = 0.0;
     double minutes_above_30_degrees = 0.0;
@@ -90,6 +92,7 @@ void update_pass_predictions(state_t *external_state, double jul_utc_start, doub
     while (current_elevation > -5.0) {
         update_satellite_position(&state, jul_utc + pass_duration / 1440.0);
         pass_duration += delta_t_minutes;
+        current_altitude = state.satellite.altitude_km;
         if (current_elevation > 0.0) {
             minutes_above_0_degrees += delta_t_minutes;
             if (!ascended) {
@@ -97,9 +100,12 @@ void update_pass_predictions(state_t *external_state, double jul_utc_start, doub
                 external_state->predicted_ascension_jul_utc = jul_utc + pass_duration / 1440.0;
                 external_state->predicted_ascension_azimuth = state.satellite.azimuth;
             }
-        }
-        if (current_elevation > 30.0) {
-            minutes_above_30_degrees += delta_t_minutes;
+            if (max_altitude < current_altitude) {
+                max_altitude = current_altitude;
+            }
+            if (current_elevation > 30.0) {
+                minutes_above_30_degrees += delta_t_minutes;
+            }
         }
         current_elevation = state.satellite.elevation;
         if (max_elevation < current_elevation) {
@@ -110,6 +116,7 @@ void update_pass_predictions(state_t *external_state, double jul_utc_start, doub
     external_state->predicted_minutes_above_0_degrees = minutes_above_0_degrees;
     external_state->predicted_minutes_above_30_degrees = minutes_above_30_degrees;
     external_state->predicted_max_elevation = max_elevation;
+    external_state->predicted_max_altitude = max_altitude;
 
     return;
 }
@@ -372,6 +379,7 @@ int find_passes(state_t *external_state, double jul_utc_start, double delta_t_mi
                 p->ascension_jul_utc = state.predicted_ascension_jul_utc;
                 p->ascension_azimuth = state.predicted_ascension_azimuth;
                 p->max_elevation = state.predicted_max_elevation;
+                p->max_altitude = state.predicted_max_altitude;
             }
         }
     }

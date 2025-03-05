@@ -65,6 +65,7 @@ typedef struct state
     antenna_rotator_t antenna_rotator;
     double predicted_minutes_until_visible;
     double predicted_max_elevation;
+    double predicted_max_altitude;
     double predicted_pass_duration_minutes;
     double predicted_minutes_above_0_degrees;
     double predicted_minutes_above_30_degrees;

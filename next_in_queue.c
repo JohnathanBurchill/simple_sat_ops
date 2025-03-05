@@ -191,11 +191,11 @@ int main(int argc, char **argv)
         if (list_all) {
             if (!reverse) {
                 printf("Found %lu upcoming passes from a total of %d satellites\n", n_passes, count);
-                printf("%26s  %8s %8s %9s %9s %9s %9s %9s %25s %9s\n", "Name", "in (min)", "dur (min)", "azi (deg)", "ele (deg)", "up (MHz)", "down (MHz)", "bcn (MHz)", "mode", "status");
+                printf("%26s  %8s %8s %8s %9s %9s %9s %9s %9s %25s %9s\n", "Name", "in (min)", "dur (min)", "alt (km)", "azi (deg)", "ele (deg)", "up (MHz)", "down (MHz)", "bcn (MHz)", "mode", "status");
             }
             for (int i = 0; i < max_passes; i++) {
                 p = get_pass(i);
-                printf("%26s  %8.1f %9.1f %9.1f %9.1f", p->name, p->minutes_away, p->pass_duration, p->ascension_azimuth, p->max_elevation);
+                printf("%26s  %8.1f %9.1f %7.1f %9.1f %9.1f", p->name, p->minutes_away, p->pass_duration, p->max_altitude, p->ascension_azimuth, p->max_elevation);
                 for (int s = 0; s < n_entries; ++s) {
                     if (strcmp(p->name, sat_info[s].name) == 0) {
                         if (strlen(sat_info[s].f_uplink_mhz) > 0) {
@@ -228,7 +228,7 @@ int main(int argc, char **argv)
                 printf("\n");
             }
             if (reverse) {
-                printf("%26s  %8s %8s %9s %9s %9s %9s %9s %25s %9s\n", "Name", "in (min)", "dur (min)", "azi (deg)", "ele (deg)", "up (MHz)", "down (MHz)", "bcn (MHz)", "mode", "status");
+                printf("%26s  %8s %8s %8s %9s %9s %9s %9s %9s %25s %9s\n", "Name", "in (min)", "dur (min)", "alt (km)", "azi (deg)", "ele (deg)", "up (MHz)", "down (MHz)", "bcn (MHz)", "mode", "status");
                 printf("Found %lu upcoming passes from a total of %d satellites\n", n_passes, count);
             }
         } else {

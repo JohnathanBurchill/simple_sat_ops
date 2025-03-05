@@ -20,8 +20,8 @@
 cmake_minimum_required(VERSION 3.10)
 project(simple_sat_ops)
 
-#set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
+#set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NCURSES REQUIRED ncurses)
@@ -42,4 +42,6 @@ add_executable(lifetime lifetime.c prediction.c)
 target_link_libraries(lifetime PRIVATE sgp4sdp4 m)
 
 install(TARGETS simple_sat_ops next_in_queue lifetime DESTINATION $ENV{HOME}/bin)
+
+install(PROGRAMS upcoming_amateur_satellite_passes.sh DESTINATION $ENV{HOME}/bin)
 

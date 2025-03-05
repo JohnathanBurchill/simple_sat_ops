@@ -40,6 +40,7 @@ typedef struct
 {
     double minutes_away;
     double max_elevation;
+    double max_altitude;
     double ascension_jul_utc;
     double ascension_azimuth;
     double pass_duration;
