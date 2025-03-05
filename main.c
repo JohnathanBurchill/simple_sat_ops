@@ -217,6 +217,9 @@ void report_status(state_t *state, int *print_row, int print_col)
         double azimuth = 0.0;
         double elevation = 0.0;
         antenna_rotator_command(&state->antenna_rotator, ANTENNA_ROTATOR_STATUS, &azimuth, &elevation);
+        if (azimuth < 0) {
+            azimuth += 360.0;
+        }
         mvprintw(row++, col, "%15s   %.1f deg", "target azimuth", state->antenna_rotator.target_azimuth);
         clrtoeol();
         mvprintw(row++, col, "%15s   %.1f deg", "azimuth", azimuth);
@@ -363,6 +366,12 @@ int main(int argc, char **argv)
     mvprintw(keyboard_info_row++, 3, "%s", "q - quit");
     clrtoeol();
 
+    double current_az = 0;
+    double current_el = 0;
+    double last_az = 0;
+    double last_el = 0;
+
+
     while (state.running) {
         // Refresh
         UTC_Calendar_Now(&utc, &tv);
@@ -377,6 +386,16 @@ int main(int argc, char **argv)
         }
 
         // TODO check for passes that reach a minimum elevation
+        current_az = state.antenna_rotator.azimuth;
+        current_el = state.antenna_rotator.elevation;
+        // check if antenna reached its target 
+        if (antenna_is_moving) {
+            if (fabs(current_az - last_az) == 0 && fabs(current_el - last_el) == 0) {
+                antenna_is_moving = 0;
+            }
+            last_az = current_az;
+            last_el = current_el;
+        }
         if (state.satellite_tracking && state.predicted_minutes_until_visible < state.tracking_prep_time_minutes) {
             if (!state.in_pass) {
                 state.in_pass = 1;
@@ -390,12 +409,6 @@ int main(int argc, char **argv)
             // Point antenna at satellite or fixed target
             // TODO remove lag bias by anticipating direction
             if (state.tracking && antenna_is_under_control) {
-                // check if antenna reached its target 
-                if (antenna_is_moving) {
-                    if (state.antenna_rotator.azimuth == state.antenna_rotator.target_azimuth && state.antenna_rotator.elevation == state.antenna_rotator.target_elevation) {
-                        antenna_is_moving = 0;
-                    }
-                }
                 if (!antenna_is_moving) {
                     delta_az = state.satellite.azimuth - state.antenna_rotator.target_azimuth;
                     if (state.satellite.elevation >= 0) {
@@ -555,6 +568,14 @@ int main(int argc, char **argv)
 
         mvprintw(keyboard_info_row, 3, "%s : %s", "Keyboard", keyboard_unlocked ? "unlocked" : "LOCKED");
         clrtoeol();
+        if (antenna_is_moving) {
+            mvprintw(keyboard_info_row + 2, 0, "%s", "Antenna moving");
+            clrtoeol();
+        } else {
+            mvprintw(keyboard_info_row + 2, 0, "%s", "Antenna stationary");
+            clrtoeol();
+        }
+
         refresh();
 
         // Sleep for a short interval 
@@ -612,8 +633,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
 
     state->run_with_radio = 0;
     state->radio.device_filename = "/dev/ttyUSB1";
-    // state->radio.serial_speed = B115200;
-    state->radio.serial_speed = B9600;
+    state->radio.serial_speed = B115200;
+    // state->radio.serial_speed = B9600;
     state->radio.waterfall_enabled = 0;
 
     state->run_with_antenna_rotator = 0;
