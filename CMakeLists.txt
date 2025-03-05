@@ -20,8 +20,8 @@
 cmake_minimum_required(VERSION 3.10)
 project(simple_sat_ops)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
-#set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
+#set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NCURSES REQUIRED ncurses)
@@ -34,7 +34,7 @@ add_executable(simple_sat_ops main.c prediction.c radio.c antenna_rotator.c)
 target_link_libraries(simple_sat_ops PRIVATE sgp4sdp4 ${NCURSES_LIBRARIES} m) 
 
 # Next in queue tool
-add_executable(next_in_queue next_in_queue.c prediction.c)
+add_executable(next_in_queue next_in_queue.c prediction.c satellite_status.c)
 target_link_libraries(next_in_queue PRIVATE sgp4sdp4 m)
 
 # Lifetime tool
@@ -42,3 +42,4 @@ add_executable(lifetime lifetime.c prediction.c)
 target_link_libraries(lifetime PRIVATE sgp4sdp4 m)
 
 install(TARGETS simple_sat_ops next_in_queue lifetime DESTINATION $ENV{HOME}/bin)
+

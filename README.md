@@ -23,6 +23,8 @@ Observatory](https://science.ucalgary.ca/rothney-observatory) staff and the
 Feb 2025) for logistics and technical support while testing this software on
 the FrontierSat ground station equipment.
 
+Satellite radio data as of 4 March 2025 courtesy [JE9PEL](http://www.ne.jp/asahi/hamradio/je9pel/satslist.csv).
+
 ## simple_sat_ops
 
 Custom drivers control the SPIG Rot2Prog antenna rotator and Icom IC-9700

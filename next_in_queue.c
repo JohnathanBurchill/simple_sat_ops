@@ -20,6 +20,7 @@
 
 #include "state.h"
 #include "prediction.h"
+#include "satellite_status.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -175,6 +176,13 @@ int main(int argc, char **argv)
     status = find_passes(&state, jul_utc, 1.0, &criteria, &count, &number_checked, reverse);
     const size_t n_passes = number_of_passes();
 
+    // satellite info
+    satellite_status_t *sat_info = NULL;
+    int n_entries = 0;
+    char *radios_file = "satellites/active_radios.txt"; 
+    status = parse_satellite_status_file(radios_file, &sat_info, &n_entries);
+
+
     if (n_passes > 0) {
         const pass_t *p = NULL;
         if (max_passes == -1) {
@@ -183,14 +191,44 @@ int main(int argc, char **argv)
         if (list_all) {
             if (!reverse) {
                 printf("Found %lu upcoming passes from a total of %d satellites\n", n_passes, count);
-                printf("%26s  %8s %8s %9s %9s\n", "Name", "in (min)", "dur (min)", "azi (deg)", "ele (deg)");
+                printf("%26s  %8s %8s %9s %9s %9s %9s %9s %25s %9s\n", "Name", "in (min)", "dur (min)", "azi (deg)", "ele (deg)", "up (MHz)", "down (MHz)", "bcn (MHz)", "mode", "status");
             }
             for (int i = 0; i < max_passes; i++) {
                 p = get_pass(i);
-                printf("%26s  %8.1f %9.1f %9.1f %9.1f\n", p->name, p->minutes_away, p->pass_duration, p->ascension_azimuth, p->max_elevation);
+                printf("%26s  %8.1f %9.1f %9.1f %9.1f", p->name, p->minutes_away, p->pass_duration, p->ascension_azimuth, p->max_elevation);
+                for (int s = 0; s < n_entries; ++s) {
+                    if (strcmp(p->name, sat_info[s].name) == 0) {
+                        if (strlen(sat_info[s].f_uplink_mhz) > 0) {
+                            printf(" %9s", sat_info[s].f_uplink_mhz);
+                        } else {
+                            printf(" %9s", "-");
+                        }
+                        if (strlen(sat_info[s].f_downlink_mhz) > 0) {
+                            printf(" %9s", sat_info[s].f_downlink_mhz);
+                        } else {
+                            printf(" %9s", "-");
+                        }
+                        if (strlen(sat_info[s].f_beacon_mhz) > 0) {
+                            printf(" %9s", sat_info[s].f_beacon_mhz);
+                        } else {
+                            printf(" %9s", "-");
+                        }
+                        if (strlen(sat_info[s].mode) > 0) {
+                            printf(" %25s", sat_info[s].mode);
+                        } else {
+                            printf(" %25s", "-");
+                        }
+                        if (strlen(sat_info[s].status) > 0) {
+                            printf(" %9s", sat_info[s].status);
+                        } else {
+                            printf(" %9s", "-");
+                        }
+                    }
+                }
+                printf("\n");
             }
             if (reverse) {
-                printf("%26s  %8s %8s %9s %9s\n", "Name", "in (min)", "dur (min)", "azi (deg)", "ele (deg)");
+                printf("%26s  %8s %8s %9s %9s %9s %9s %9s %25s %9s\n", "Name", "in (min)", "dur (min)", "azi (deg)", "ele (deg)", "up (MHz)", "down (MHz)", "bcn (MHz)", "mode", "status");
                 printf("Found %lu upcoming passes from a total of %d satellites\n", n_passes, count);
             }
         } else {
