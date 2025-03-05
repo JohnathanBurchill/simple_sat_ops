@@ -56,6 +56,12 @@ int radio_init(radio_t *radio)
         return radio_result;
     }
 
+    radio_result = radio_set_mode(radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
+    if (radio_result != RADIO_OK) {
+        fprintf(stderr, "Unable to set radio mode to FM\n");
+        return radio_result;
+    }
+
     // Read the operating mode
     uint64_t mode = 0;
     radio_result = radio_command(radio, 0x04, -1, -1, NULL, 0, &mode, 0);
@@ -355,6 +361,20 @@ int radio_set_satellite_mode(radio_t *radio, int sat_mode)
     radio->satellite_mode = sat_mode;
     return RADIO_OK;
 }
+
+int radio_set_mode(radio_t *radio, int mode, int filter)
+{
+    int radio_result = 0;
+    uint8_t data[2] = {0};
+    data[0] = mode;
+    data[1] = filter;
+    radio_result = radio_command(radio, 0x06, -1, -1, data, 2, NULL, 0);
+    if (radio_result != RADIO_OK) {
+        return radio_result;
+    }
+    return RADIO_OK;
+}
+
 
 // Band: 0 main, 1 sub
 int radio_get_band_selection(radio_t *radio, int band)

@@ -46,6 +46,25 @@ enum RADIO_VFO {
     VFOSub = 0xD1,
 };
 
+enum RADIO_MODE {
+    RADIO_MODE_LSB = 0x00,
+    RADIO_MODE_USB = 0x01,
+    RADIO_MODE_AM = 0x02,
+    RADIO_MODE_CW = 0x03,
+    RADIO_MODE_RTTY = 0x04,
+    RADIO_MODE_FM = 0x05,
+    RADIO_MODE_CW_R = 0x07,
+    RADIO_MODE_RTTY_R = 0x08,
+    RADIO_MODE_DV = 0x17,
+    RADIO_MODE_DD = 0x22,
+};
+
+enum RADIO_FILTER {
+    RADIO_FILTER_FIL1 = 0x01,
+    RADIO_FILTER_FIL2 = 0x02,
+    RADIO_FILTER_FIL3 = 0x03,
+};
+
 typedef struct radio 
 {
     char *device_filename;
@@ -68,6 +87,8 @@ typedef struct radio
     double vfo_sub_actual_frequency;
     int doppler_correction_enabled;
     int waterfall_enabled;
+    int mode;
+    int filter;
 } radio_t;
 
 int radio_init(radio_t *radio);
@@ -79,6 +100,7 @@ double radio_get_frequency(radio_t *radio);
 int radio_set_frequency(radio_t *radio, double frequency);
 int radio_get_satellite_mode(radio_t *radio);
 int radio_set_satellite_mode(radio_t *radio, int sat_mode);
+int radio_set_mode(radio_t *radio, int mode, int filter);
 int radio_get_band_selection(radio_t *radio, int band);
 int radio_set_band_selection(radio_t *radio, int band);
 int radio_toggle_waterfall(radio_t *radio);
