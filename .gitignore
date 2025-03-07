@@ -12,3 +12,4 @@ rotator_docs
 .DS_Store
 *.predictions
 wav/*.wav
+*.raw

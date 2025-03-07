@@ -82,6 +82,7 @@ typedef struct state
     int antenna_is_under_control;
     int antenna_is_moving;
     int auto_sat;
+    char *audio_output_file;
 } state_t;
 
 

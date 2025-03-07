@@ -27,11 +27,11 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(NCURSES REQUIRED ncurses)
 
 # Add the main executable
-add_executable(simple_sat_ops main.c prediction.c radio.c antenna_rotator.c)
+add_executable(simple_sat_ops main.c prediction.c radio.c antenna_rotator.c audio.c)
 # target_compile_definitions(simple_sat_ops PUBLIC -DQOL)
 
 # Link the sgp4sdp4 library
-target_link_libraries(simple_sat_ops PRIVATE sgp4sdp4 ${NCURSES_LIBRARIES} m) 
+target_link_libraries(simple_sat_ops PRIVATE sgp4sdp4 ${NCURSES_LIBRARIES} m asound) 
 
 # Next in queue tool
 add_executable(next_in_queue next_in_queue.c prediction.c satellite_status.c)

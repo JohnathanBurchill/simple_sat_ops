@@ -19,6 +19,7 @@
    */
 
 #include "antenna_rotator.h"
+#include "audio.h"
 #include "radio.h"
 #include "state.h"
 #include "prediction.h"
@@ -557,6 +558,12 @@ int main(int argc, char **argv)
                     enable_wildrose_mode(&state);
                     keyboard_unlocked = 0;
                     break;
+                case 'A':
+                    // record audio
+                    // TODO get audio using SDL3 in a separate thread
+                    status = capture_audio(&state, AUDIO_DEVICE_SUB);
+                    keyboard_unlocked = 0;
+                    break;
                 default:
                     break;
             }
@@ -641,6 +648,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->antenna_rotator.serial_speed = B600;
     state->antenna_rotator.fixed_target = 0;
 
+    state->audio_output_file = "session_pcm_audio.raw";
+
     for (int i = 0; i < argc; i++) {
 
         if (strncmp("--verbose=", argv[i], 10) == 0) {
@@ -667,6 +676,13 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 return EXIT_FAILURE;
             } 
             state->radio.device_filename = argv[i] + 15;
+        } else if (strncmp("--radio-audio-output-file=", argv[i], 26) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 27) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]); 
+                return EXIT_FAILURE;
+            } 
+            state->audio_output_file = argv[i] + 26;
         } else if (strncmp("--radio-serial-speed=", argv[i], 21) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 22) {
