@@ -11,3 +11,4 @@ radio_docs
 rotator_docs
 .DS_Store
 *.predictions
+wav/*.wav

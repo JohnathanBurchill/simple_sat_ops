@@ -79,6 +79,8 @@ typedef struct state
     int run_with_antenna_rotator;
     int have_radio;
     int have_antenna_rotator;
+    int antenna_is_under_control;
+    int antenna_is_moving;
     int auto_sat;
 } state_t;
 

@@ -50,6 +50,9 @@
 #define UPDATE_INTERVAL_MICROSEC 500000
 #define KEYBOARD_UNLOCK_DURATION_TICKS (1000000 / UPDATE_INTERVAL_MICROSEC * 5)
 
+void stop_tracking(state_t *state);
+void enable_wildrose_mode(state_t *state);
+
 void usage(FILE *dest, const char *name) 
 {
     fprintf(dest, "usage: %s <tles_file> <satellite_id>\n", name);
@@ -200,11 +203,11 @@ void report_status(state_t *state, int *print_row, int print_col)
     clrtoeol();
 
     if (state->have_radio) {
-        mvprintw(row++, col, "%15s   %.6f MHz", "UPLINK", state->radio.doppler_uplink_frequency / 1e6);
+        mvprintw(row++, col, "%15s   %.6f MHz", "DOWNLINK", state->radio.doppler_correction_enabled ? state->radio.doppler_downlink_frequency / 1e6 : state->radio.nominal_downlink_frequency / 1e6);
         clrtoeol();
         mvprintw(row++, col, "%15s   %.6f MHz", "VFO Main", state->radio.vfo_main_actual_frequency / 1e6);
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.6f MHz", "DOWNLINK", state->radio.doppler_downlink_frequency / 1e6);
+        mvprintw(row++, col, "%15s   %.6f MHz", "UPLINK", state->radio.doppler_correction_enabled ? state->radio.doppler_uplink_frequency / 1e6 : state->radio.nominal_uplink_frequency / 1e6);
         clrtoeol();
         mvprintw(row++, col, "%15s   %.6f MHz", "VFO Sub", state->radio.vfo_sub_actual_frequency / 1e6);
         clrtoeol();
@@ -351,7 +354,7 @@ int main(int argc, char **argv)
     double delta_el = 0.0;
 
     int antenna_should_be_controlled = state.run_with_antenna_rotator && state.have_antenna_rotator;
-    int antenna_is_under_control = antenna_should_be_controlled;
+    state.antenna_is_under_control = antenna_should_be_controlled;
     int antenna_is_moving = 0;
 
     int keyboard_unlocked = 0;
@@ -408,7 +411,7 @@ int main(int argc, char **argv)
 
             // Point antenna at satellite or fixed target
             // TODO remove lag bias by anticipating direction
-            if (state.tracking && antenna_is_under_control) {
+            if (state.tracking && state.antenna_is_under_control) {
                 if (!antenna_is_moving) {
                     delta_az = state.satellite.azimuth - state.antenna_rotator.target_azimuth;
                     if (state.satellite.elevation >= 0) {
@@ -508,7 +511,8 @@ int main(int argc, char **argv)
                     break;
                 case 'T':
                     state.satellite_tracking = 1;
-                    antenna_is_under_control = antenna_should_be_controlled;
+                    state.radio.doppler_correction_enabled = 1;
+                    state.antenna_is_under_control = antenna_should_be_controlled;
                     if (state.antenna_rotator.fixed_target) {
                         azimuth = state.antenna_rotator.target_azimuth;
                         elevation = state.antenna_rotator.target_elevation;
@@ -522,23 +526,12 @@ int main(int argc, char **argv)
                     keyboard_unlocked = 0;
                     break;
                 case 's':
-                    state.satellite_tracking = 0;
-                    antenna_is_under_control = 0;
-                    if (!state.antenna_rotator.fixed_target) {
-                        // dummy values
-                        azimuth = 0;
-                        elevation = 0;
-                        antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_STOP, &azimuth, &elevation);
-                        if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
-                            fprintf(stderr, "Error stopping the antenna rotator\n");
-                        }
-                    }
-                    antenna_is_moving = 0;
+                    stop_tracking(&state);
                     keyboard_unlocked = 0;
                     break;
                 case 'r':
                     state.satellite_tracking = 0;
-                    antenna_is_under_control = 0;
+                    state.antenna_is_under_control = 0;
                     state.antenna_rotator.target_azimuth = 0.0;
                     state.antenna_rotator.target_elevation = 0.0;
                     azimuth = state.antenna_rotator.target_azimuth;
@@ -556,6 +549,12 @@ int main(int argc, char **argv)
                     if (radio_result != RADIO_OK) {
                         fprintf(stderr, "Waterfall error: %d\n", radio_result);
                     }
+                    keyboard_unlocked = 0;
+                    break;
+                case '*':
+                    // Wildrose reference station, CW, 432.325 MHz
+                    stop_tracking(&state);
+                    enable_wildrose_mode(&state);
                     keyboard_unlocked = 0;
                     break;
                 default:
@@ -837,4 +836,51 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     }
 
     return 0;
+}
+
+void stop_tracking(state_t *state)
+{
+    int antenna_rotator_result = 0;
+    double azimuth = 0.0;
+    double elevation = 0.0;
+
+    state->satellite_tracking = 0;
+    state->radio.doppler_correction_enabled = 1;
+    state->antenna_is_under_control = 0;
+    if (state->run_with_antenna_rotator && !state->antenna_rotator.fixed_target) {
+        // dummy values
+        antenna_rotator_result = antenna_rotator_command(&state->antenna_rotator, ANTENNA_ROTATOR_STOP, &azimuth, &elevation);
+        if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
+            fprintf(stderr, "Error stopping the antenna rotator\n");
+        }
+    }
+    state->antenna_is_moving = 0;
+
+    return;
+}
+
+void enable_wildrose_mode(state_t *state)
+{
+    int radio_result = 0;
+    state->radio.nominal_downlink_frequency = 432.325 * 1e6;
+    state->radio.doppler_correction_enabled = 0;
+    if (state->have_radio) {
+        radio_result = radio_set_vfo(&state->radio, VFOMain);
+        if (radio_result != RADIO_OK) {
+            fprintf(stderr, "Error setting radio VFO to VFOMain");
+            return;
+        }
+        radio_result = radio_set_mode(&state->radio, RADIO_MODE_CW, RADIO_FILTER_FIL1);
+        if (radio_result != RADIO_OK) {
+            fprintf(stderr, "Error setting radio to CW mode\n");
+            return;
+        }
+        radio_result = radio_set_frequency(&state->radio, state->radio.nominal_downlink_frequency);
+        if (radio_result != RADIO_OK) {
+            fprintf(stderr, "Error setting radio to CW mode\n");
+            return;
+        }
+    }
+
+    return;
 }
