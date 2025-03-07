@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <termios.h>
 #include <sgp4sdp4.h>
+#include <alsa/asoundlib.h>
 
 
 #define MAX_TLE_LINE_LENGTH 128
@@ -82,7 +83,15 @@ typedef struct state
     int antenna_is_under_control;
     int antenna_is_moving;
     int auto_sat;
-    char *audio_output_file;
+    snd_pcm_t *pcm_handle;
+    snd_pcm_uframes_t audio_frames;
+    pthread_t audio_thread;
+    int audio_device;
+    char *audio_output_file_basename;
+    char audio_output_filename[FILENAME_MAX];
+    FILE *audio_file;
+    char *audio_buffer;
+    volatile int recording_audio;
 } state_t;
 
 

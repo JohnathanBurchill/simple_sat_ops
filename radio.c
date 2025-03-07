@@ -45,25 +45,25 @@ int radio_init(radio_t *radio)
     // Force turning off the waterfall data as a safety measure 
     uint8_t data[1] = {0};
     radio_result = radio_command(radio, 0x27, 0x10, -1, data, 1, NULL, 0);
-    // if (radio_result != RADIO_OK) {
-    //     fprintf(stderr, "Unable to set waveform data status\n");
-    //     return radio_result;
-    // }
+    if (radio_result != RADIO_OK) {
+        fprintf(stderr, "Unable to set waveform data status\n");
+        return radio_result;
+    }
 
+    // Read the transceiver ID
+    uint64_t id = 0;
+    radio_result = radio_command(radio, 0x19, 0x00, -1, NULL, 0, &id, 0);
+    if (radio_result != RADIO_OK) {
+        fprintf(stderr, "Unexpected reply from radio while getting transceiver ID\n");
+        return EXIT_FAILURE;
+    }
+    radio->transceiver_id = id;
+    
     radio_result = radio_set_satellite_mode(radio, 1);
     if (radio_result != RADIO_OK) {
         fprintf(stderr, "Error enabling satellite mode\n");
         return radio_result;
     }
-
-    // Read the operating mode
-    // uint64_t mode = 0;
-    // radio_result = radio_command(radio, 0x04, -1, -1, NULL, 0, &mode, 0);
-    // if (radio_result != RADIO_OK) {
-    //     fprintf(stderr, "Unexpected reply from radio while getting operating mode\n");
-    //     return EXIT_FAILURE;
-    // }
-    // radio->operating_mode = mode;
 
     // Page 7-1 of the 9700 Basic manual
     // Main is downlink
@@ -77,11 +77,11 @@ int radio_init(radio_t *radio)
         fprintf(stderr, "Unexpected reply from radio while setting VFO to Main\n");
         return radio_result;
     }
-    // radio_result = radio_set_mode(radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
-    // if (radio_result != RADIO_OK) {
-    //     fprintf(stderr, "Unable to set radio mode to FM\n");
-    //     return radio_result;
-    // }
+    radio_result = radio_set_mode(radio, RADIO_MODE_FM, RADIO_FILTER_FIL2);
+    if (radio_result != RADIO_OK) {
+        fprintf(stderr, "Unable to set radio mode to FM\n");
+        return radio_result;
+    }
     radio_result = radio_set_frequency(radio, radio->nominal_downlink_frequency);
     if (radio_result != RADIO_OK) {
         fprintf(stderr, "Unexpected reply from radio while setting Main (downlink) frequency\n");
@@ -93,27 +93,19 @@ int radio_init(radio_t *radio)
         fprintf(stderr, "Unexpected reply from radio while setting VFO to Sub\n");
         return radio_result;
     }
-    // radio_result = radio_set_mode(radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
-    // if (radio_result != RADIO_OK) {
-    //     fprintf(stderr, "Unable to set radio mode to FM\n");
-    //     return radio_result;
-    // }
+    radio_result = radio_set_mode(radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
+    if (radio_result != RADIO_OK) {
+        fprintf(stderr, "Unable to set radio mode to FM\n");
+        return radio_result;
+    }
     radio_result = radio_set_frequency(radio, radio->nominal_uplink_frequency);
     if (radio_result != RADIO_OK) {
         fprintf(stderr, "Unexpected reply from radio while setting Sub (uplink) frequency\n");
         return radio_result;
     }
 
-    // If the above work, will assume setting VFOs works
     double f = 0.0;
-    radio_result = radio_set_vfo(radio, VFOMain); 
-    f = radio_get_frequency(radio);
-    if (f < 0) {
-        fprintf(stderr, "Unexpected reply from radio while getting Main (uplink) frequency\n");
-        return RADIO_GET_FREQUENCY;
-    }
-    radio->vfo_main_actual_frequency = f;
-
+    // Setting the VFO selects the active VFO on the radio's display too
     radio_result = radio_set_vfo(radio, VFOSub); 
     f = radio_get_frequency(radio);
     if (f < 0) {
@@ -122,16 +114,14 @@ int radio_init(radio_t *radio)
     }
     radio->vfo_sub_actual_frequency = f;
 
-    // Read the transceiver ID
-    uint64_t id = 0;
-    radio_result = radio_command(radio, 0x19, 0x00, -1, NULL, 0, &id, 0);
-    if (radio_result != RADIO_OK) {
-        fprintf(stderr, "Unexpected reply from radio while getting transceiver ID\n");
-        return EXIT_FAILURE;
+    radio_result = radio_set_vfo(radio, VFOMain); 
+    f = radio_get_frequency(radio);
+    if (f < 0) {
+        fprintf(stderr, "Unexpected reply from radio while getting Main (uplink) frequency\n");
+        return RADIO_GET_FREQUENCY;
     }
-    radio->transceiver_id = id;
+    radio->vfo_main_actual_frequency = f;
 
-    
     return RADIO_OK;
 }
 
@@ -440,19 +430,11 @@ int radio_toggle_waterfall(radio_t *radio)
         fprintf(stderr, "Unable to set scope to Main VFO, %d\n", radio_result);
         return radio_result;
     }
-    uint64_t waveform_data_status = 0;
-    radio_result = radio_command(radio, 0x27, 0x11, -1, NULL, 0, &waveform_data_status, 0);
+    data[0] = enabled;
+    radio_result = radio_command(radio, 0x27, 0x11, -1, data, 1, NULL, 0);
     if (radio_result != RADIO_OK) {
-        fprintf(stderr, "Unable to get waveform data status, %d, %ld\n", radio_result, waveform_data_status);
+        fprintf(stderr, "Unable to set waveform data status\n");
         return radio_result;
-    }
-    if (waveform_data_status != enabled) {
-        data[0] = enabled;
-        radio_result = radio_command(radio, 0x27, 0x11, -1, data, 1, NULL, 0);
-        if (radio_result != RADIO_OK) {
-            fprintf(stderr, "Unable to set waveform data status\n");
-            return radio_result;
-        }
     }
     radio->waterfall_enabled = enabled;
     return RADIO_OK;

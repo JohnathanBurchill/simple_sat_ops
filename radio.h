@@ -79,6 +79,9 @@ typedef struct radio
     uint8_t is_required;
     uint8_t satellite_mode;
     uint8_t operating_mode;
+    double satellite_uplink_frequency;
+    double satellite_downlink_frequency;
+    double reference_downlink_frequency;
     double nominal_uplink_frequency;
     double nominal_downlink_frequency;
     double doppler_uplink_frequency;

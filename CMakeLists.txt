@@ -20,8 +20,9 @@
 cmake_minimum_required(VERSION 3.10)
 project(simple_sat_ops)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
-#set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
+#set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
+#set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g -fsanitize=address")
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NCURSES REQUIRED ncurses)
@@ -31,7 +32,7 @@ add_executable(simple_sat_ops main.c prediction.c radio.c antenna_rotator.c audi
 # target_compile_definitions(simple_sat_ops PUBLIC -DQOL)
 
 # Link the sgp4sdp4 library
-target_link_libraries(simple_sat_ops PRIVATE sgp4sdp4 ${NCURSES_LIBRARIES} m asound) 
+target_link_libraries(simple_sat_ops PRIVATE sgp4sdp4 ${NCURSES_LIBRARIES} m asound pthread) 
 
 # Next in queue tool
 add_executable(next_in_queue next_in_queue.c prediction.c satellite_status.c)

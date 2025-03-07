@@ -18,6 +18,8 @@
    along with this program.  If not, see <https://www.gnu.org/licenses/>.
    */
 
+#define _GNU_SOURCE
+
 #include "antenna_rotator.h"
 #include "audio.h"
 #include "radio.h"
@@ -32,10 +34,12 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <termios.h>
+#include <pthread.h>
 
 // Satellite communication defaults
 #define UPLINK_FREQ_MHZ   145.150000
 #define DOWNLINK_FREQ_MHZ 436.150000
+#define REFERENCE_DOWNLINK_FREQ_MHZ 432.325000
 
 // Update the radio's frequencies when the change 
 // associated with Doppler shift exceeds this amount
@@ -297,14 +301,30 @@ int main(int argc, char **argv)
     select_ephemeris(&state.satellite.tle);
 
     int radio_result = 0;
-    if (state.run_with_radio) {
+    if (state.run_with_radio) { 
         state.radio.is_required = 1;
+        state.radio.nominal_downlink_frequency = state.radio.satellite_downlink_frequency;
+        state.radio.nominal_uplink_frequency = state.radio.satellite_uplink_frequency;
         radio_result = radio_init(&state.radio);
         if (radio_result != RADIO_OK) {
             fprintf(stderr, "Error initializing radio\n");
             return EXIT_FAILURE;
         }
         state.have_radio = 1;
+        // Record audio
+        state.recording_audio = 1;
+        status = init_audio_capture(&state);
+        if (status != AUDIO_OK) {
+            endwin();
+            fprintf(stderr, "Unable to initialize audio capture\n");
+            return 1;
+        }
+        int thread_status = pthread_create(&state.audio_thread, NULL, capture_audio, &state);
+        if (thread_status != 0) {
+            endwin();
+            fprintf(stderr, "Unable to create an audio recording thread\n");
+            return 1;
+        }
     }
 
     int antenna_rotator_result = 0;
@@ -375,7 +395,7 @@ int main(int argc, char **argv)
     double last_az = 0;
     double last_el = 0;
 
-
+    
     while (state.running) {
         // Refresh
         UTC_Calendar_Now(&utc, &tv);
@@ -451,15 +471,15 @@ int main(int argc, char **argv)
                 current_uplink_frequency = state.radio.doppler_uplink_frequency;
                 current_downlink_frequency = state.radio.doppler_downlink_frequency;
                 radio_set_vfo(&state.radio, VFOMain);
-                ret = radio_set_frequency(&state.radio, state.radio.doppler_uplink_frequency);
+                ret = radio_set_frequency(&state.radio, state.radio.doppler_downlink_frequency);
                 if (ret != RADIO_OK) {
-                    fprintf(stderr, "Error setting uplink frequency on VFO Main\n");
+                    fprintf(stderr, "Error setting downlink frequency on VFO Main\n");
                 }
                 state.radio.vfo_main_actual_frequency = radio_get_frequency(&state.radio);
                 radio_set_vfo(&state.radio, VFOSub);
-                ret = radio_set_frequency(&state.radio, state.radio.doppler_downlink_frequency);
+                ret = radio_set_frequency(&state.radio, state.radio.doppler_uplink_frequency);
                 if (ret != RADIO_OK) {
-                    fprintf(stderr, "Error setting downlink frequency on VFO Sub\n");
+                    fprintf(stderr, "Error setting uplink frequency on VFO Sub\n");
                 }
                 state.radio.vfo_sub_actual_frequency = radio_get_frequency(&state.radio);
                 clrtoeol();
@@ -512,7 +532,13 @@ int main(int argc, char **argv)
                     break;
                 case 'T':
                     state.satellite_tracking = 1;
+		    state.radio.nominal_downlink_frequency = state.radio.satellite_downlink_frequency;
+		    state.radio.nominal_uplink_frequency = state.radio.satellite_uplink_frequency;
                     state.radio.doppler_correction_enabled = 1;
+		    radio_set_vfo(&state.radio, VFOMain);
+		    radio_set_mode(&state.radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
+		    radio_set_vfo(&state.radio, VFOSub);
+		    radio_set_mode(&state.radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
                     state.antenna_is_under_control = antenna_should_be_controlled;
                     if (state.antenna_rotator.fixed_target) {
                         azimuth = state.antenna_rotator.target_azimuth;
@@ -558,12 +584,6 @@ int main(int argc, char **argv)
                     enable_wildrose_mode(&state);
                     keyboard_unlocked = 0;
                     break;
-                case 'A':
-                    // record audio
-                    // TODO get audio using SDL3 in a separate thread
-                    status = capture_audio(&state, AUDIO_DEVICE_SUB);
-                    keyboard_unlocked = 0;
-                    break;
                 default:
                     break;
             }
@@ -591,6 +611,16 @@ int main(int argc, char **argv)
 
     }
 
+    endwin();
+
+    // stop audio capture
+    if (state.recording_audio == 1) {
+        state.recording_audio = 0;
+        // Wait for thread to finish
+        pthread_join(state.audio_thread, NULL);
+        audio_capture_cleanup(&state);
+    }
+
     if (next_in_queue_name) {
         free(next_in_queue_name);
     }
@@ -599,10 +629,16 @@ int main(int argc, char **argv)
         free_passes();
     }
 
-    endwin();
-
     /* Cleanup */
     if (state.radio.connected) {
+	// Turn off waterfall output to USB
+	uint8_t data[1] = {0};
+	radio_result = radio_command(&state.radio, 0x27, 0x10, -1, data, 1, NULL, 0);
+	if (radio_result != RADIO_OK) {
+	    fprintf(stderr, "Unable to set waveform data status\n");
+	    return radio_result;
+	}
+
         radio_set_satellite_mode(&state.radio, 0);
         radio_disconnect(&state.radio);
     }
@@ -633,8 +669,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->tracking_prep_time_minutes = TRACKING_PREP_TIME_MINUTES;
     state->satellite_tracking = 0;
 
-    state->radio.nominal_uplink_frequency = UPLINK_FREQ_MHZ * 1e6;
-    state->radio.nominal_downlink_frequency = DOWNLINK_FREQ_MHZ * 1e6;
+    state->radio.satellite_uplink_frequency = UPLINK_FREQ_MHZ * 1e6;
+    state->radio.satellite_downlink_frequency = DOWNLINK_FREQ_MHZ * 1e6;
+    state->radio.reference_downlink_frequency = REFERENCE_DOWNLINK_FREQ_MHZ * 1e6;
     state->radio.doppler_correction_enabled = 1;
 
     state->run_with_radio = 0;
@@ -648,7 +685,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->antenna_rotator.serial_speed = B600;
     state->antenna_rotator.fixed_target = 0;
 
-    state->audio_output_file = "session_pcm_audio.raw";
+    state->audio_output_file_basename = "session_pcm_audio";
+    state->audio_device = AUDIO_DEVICE_MAIN;
 
     for (int i = 0; i < argc; i++) {
 
@@ -682,7 +720,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 fprintf(stderr, "Unable to parse %s\n", argv[i]); 
                 return EXIT_FAILURE;
             } 
-            state->audio_output_file = argv[i] + 26;
+            state->audio_output_file_basename = argv[i] + 26;
         } else if (strncmp("--radio-serial-speed=", argv[i], 21) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 22) {
@@ -696,14 +734,14 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 fprintf(stderr, "Unable to parse %s\n", argv[i]);
                 return EXIT_FAILURE;
             }
-            state->radio.nominal_uplink_frequency = atof(argv[i] + 18) * 1e6;
+            state->radio.satellite_uplink_frequency = atof(argv[i] + 18) * 1e6;
         } else if (strncmp("--downlink-freq-mhz=", argv[i], 20) == 0) {
             state->n_options++; 
             if (strlen(argv[i]) < 21) {
                 fprintf(stderr, "Unable to parse %s\n", argv[i]);
                 return EXIT_FAILURE;
             }
-            state->radio.nominal_downlink_frequency = atof(argv[i] + 20) * 1e6;
+            state->radio.satellite_downlink_frequency = atof(argv[i] + 20) * 1e6;
         } else if (strcmp("--no-doppler-correction", argv[i]) == 0) {
             state->n_options++;
             state->radio.doppler_correction_enabled = 0;
@@ -878,7 +916,7 @@ void stop_tracking(state_t *state)
 void enable_wildrose_mode(state_t *state)
 {
     int radio_result = 0;
-    state->radio.nominal_downlink_frequency = 432.325 * 1e6;
+    state->radio.nominal_downlink_frequency = state->radio.reference_downlink_frequency;
     state->radio.doppler_correction_enabled = 0;
     if (state->have_radio) {
         radio_result = radio_set_vfo(&state->radio, VFOMain);
