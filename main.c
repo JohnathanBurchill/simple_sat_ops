@@ -43,7 +43,7 @@
 
 // Update the radio's frequencies when the change 
 // associated with Doppler shift exceeds this amount
-#define DOPPLER_SHIFT_RESOLUTION_KHZ 0.1 
+#define DOPPLER_SHIFT_RESOLUTION_KHZ 1.0
 
 // Antenna rotator max angle from target 
 #define MAX_DELTA_AZIMUTH_DEGREES 1.0
@@ -669,6 +669,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->tracking_prep_time_minutes = TRACKING_PREP_TIME_MINUTES;
     state->satellite_tracking = 0;
 
+    state->radio.satellite_uplink_mode = RADIO_MODE_FM;
+    state->radio.satellite_downlink_mode = RADIO_MODE_FM;
     state->radio.satellite_uplink_frequency = UPLINK_FREQ_MHZ * 1e6;
     state->radio.satellite_downlink_frequency = DOWNLINK_FREQ_MHZ * 1e6;
     state->radio.reference_downlink_frequency = REFERENCE_DOWNLINK_FREQ_MHZ * 1e6;
@@ -686,7 +688,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->antenna_rotator.fixed_target = 0;
 
     state->audio_output_file_basename = "session_pcm_audio";
-    state->audio_device = AUDIO_DEVICE_MAIN;
+    // state->audio_device = AUDIO_DEVICE_MAIN;
+    state->audio_device = AUDIO_DEVICE_SUB;
 
     for (int i = 0; i < argc; i++) {
 
@@ -728,6 +731,48 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 return EXIT_FAILURE;
             } 
             state->radio.serial_speed = atoi(argv[i] + 21);
+        } else if (strncmp("--uplink-mode=", argv[i], 14) == 0) {
+            state->n_options++; 
+            if (strlen(argv[i]) < 15) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            char *mode = argv[i] + 14;
+            if (strcmp("CW", mode) == 0) {
+                state->radio.satellite_uplink_mode = RADIO_MODE_CW;
+            } else if (strcmp("FM", mode) == 0) {
+                state->radio.satellite_uplink_mode = RADIO_MODE_FM;
+            } else if (strcmp("AM", mode) == 0) {
+                state->radio.satellite_uplink_mode = RADIO_MODE_AM;
+            } else if (strcmp("LSB", mode) == 0) {
+                state->radio.satellite_uplink_mode = RADIO_MODE_LSB;
+            } else if (strcmp("USB", mode) == 0) {
+                state->radio.satellite_uplink_mode = RADIO_MODE_USB;
+            } else {
+                fprintf(stderr, "Unreconized radio mode: %s\n", mode);
+                return EXIT_FAILURE;
+            }
+        } else if (strncmp("--downlink-mode=", argv[i], 16) == 0) {
+            state->n_options++; 
+            if (strlen(argv[i]) < 17) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            char *mode = argv[i] + 16;
+            if (strcmp("CW", mode) == 0) {
+                state->radio.satellite_uplink_mode = RADIO_MODE_CW;
+            } else if (strcmp("FM", mode) == 0) {
+                state->radio.satellite_uplink_mode = RADIO_MODE_FM;
+            } else if (strcmp("AM", mode) == 0) {
+                state->radio.satellite_uplink_mode = RADIO_MODE_AM;
+            } else if (strcmp("LSB", mode) == 0) {
+                state->radio.satellite_uplink_mode = RADIO_MODE_LSB;
+            } else if (strcmp("USB", mode) == 0) {
+                state->radio.satellite_uplink_mode = RADIO_MODE_USB;
+            } else {
+                fprintf(stderr, "Unreconized radio mode: %s\n", mode);
+                return EXIT_FAILURE;
+            }
         } else if (strncmp("--uplink-freq-mhz=", argv[i], 18) == 0) {
             state->n_options++; 
             if (strlen(argv[i]) < 19) {

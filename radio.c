@@ -77,9 +77,9 @@ int radio_init(radio_t *radio)
         fprintf(stderr, "Unexpected reply from radio while setting VFO to Main\n");
         return radio_result;
     }
-    radio_result = radio_set_mode(radio, RADIO_MODE_FM, RADIO_FILTER_FIL2);
+    radio_result = radio_set_mode(radio, radio->satellite_downlink_mode, RADIO_FILTER_FIL2);
     if (radio_result != RADIO_OK) {
-        fprintf(stderr, "Unable to set radio mode to FM\n");
+        fprintf(stderr, "Unable to set radio mode on VFO Main\n");
         return radio_result;
     }
     radio_result = radio_set_frequency(radio, radio->nominal_downlink_frequency);
@@ -93,9 +93,9 @@ int radio_init(radio_t *radio)
         fprintf(stderr, "Unexpected reply from radio while setting VFO to Sub\n");
         return radio_result;
     }
-    radio_result = radio_set_mode(radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
+    radio_result = radio_set_mode(radio, radio->satellite_uplink_mode, RADIO_FILTER_FIL2);
     if (radio_result != RADIO_OK) {
-        fprintf(stderr, "Unable to set radio mode to FM\n");
+        fprintf(stderr, "Unable to set radio mode on VFO Sub\n");
         return radio_result;
     }
     radio_result = radio_set_frequency(radio, radio->nominal_uplink_frequency);
