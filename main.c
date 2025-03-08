@@ -319,7 +319,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "Unable to initialize audio capture\n");
             return 1;
         }
-        int thread_status = pthread_create(&state.audio_thread, NULL, capture_audio, &state);
+        int thread_status = pthread_create(&state.audio_thread_main, NULL, capture_audio, &state);
         if (thread_status != 0) {
             endwin();
             fprintf(stderr, "Unable to create an audio recording thread\n");
@@ -617,7 +617,8 @@ int main(int argc, char **argv)
     if (state.recording_audio == 1) {
         state.recording_audio = 0;
         // Wait for thread to finish
-        pthread_join(state.audio_thread, NULL);
+        pthread_join(state.audio_thread_main, NULL);
+        pthread_join(state.audio_thread_sub, NULL);
         audio_capture_cleanup(&state);
     }
 
@@ -687,9 +688,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->antenna_rotator.serial_speed = B600;
     state->antenna_rotator.fixed_target = 0;
 
-    state->audio_output_file_basename = "session_pcm_audio";
+    state->audio_output_file_basename = "session/session_pcm_audio";
     // state->audio_device = AUDIO_DEVICE_MAIN;
-    state->audio_device = AUDIO_DEVICE_SUB;
 
     for (int i = 0; i < argc; i++) {
 

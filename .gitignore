@@ -13,3 +13,4 @@ rotator_docs
 *.predictions
 wav/*.wav
 *.raw
+session

@@ -83,14 +83,18 @@ typedef struct state
     int antenna_is_under_control;
     int antenna_is_moving;
     int auto_sat;
-    snd_pcm_t *pcm_handle;
+    snd_pcm_t *pcm_handle_main;
+    snd_pcm_t *pcm_handle_sub;
     snd_pcm_uframes_t audio_frames;
-    pthread_t audio_thread;
-    int audio_device;
+    pthread_t audio_thread_main;
+    pthread_t audio_thread_sub;
     char *audio_output_file_basename;
-    char audio_output_filename[FILENAME_MAX];
-    FILE *audio_file;
-    char *audio_buffer;
+    char audio_output_filename_main[FILENAME_MAX];
+    char audio_output_filename_sub[FILENAME_MAX];
+    FILE *audio_file_main;
+    FILE *audio_file_sub;
+    char *audio_buffer_main;
+    char *audio_buffer_sub;
     volatile int recording_audio;
 } state_t;
 
