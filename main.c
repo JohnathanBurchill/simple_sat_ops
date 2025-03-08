@@ -447,15 +447,15 @@ int main(int argc, char **argv)
                     if (fabs(delta_az) >= MAX_DELTA_AZIMUTH_DEGREES || fabs(delta_el) >= MAX_DELTA_ELEVATION_DEGREES) {
                         state.antenna_rotator.target_azimuth = state.satellite.azimuth;
                         state.antenna_rotator.target_elevation = state.satellite.elevation;
-                        if (state.antenna_rotator.target_elevation < 0.0) {
-                            state.antenna_rotator.target_elevation = 0.0;
-                        } else if (state.antenna_rotator.target_elevation > 90.0) {
-                            state.antenna_rotator.target_elevation = 90.0;
+                        if (state.antenna_rotator.target_elevation < ANTENNA_ROTATOR_MINIMUM_ELEVATION) {
+                            state.antenna_rotator.target_elevation = ANTENNA_ROTATOR_MINIMUM_ELEVATION;
+                        } else if (state.antenna_rotator.target_elevation > ANTENNA_ROTATOR_MAXIMUM_ELEVATION) {
+                            state.antenna_rotator.target_elevation = ANTENNA_ROTATOR_MAXIMUM_ELEVATION;
                         }
-                        if (state.antenna_rotator.target_azimuth < -180.0) {
-                            state.antenna_rotator.target_azimuth = 180.0;
-                        } else if (state.antenna_rotator.target_azimuth > 540.0) {
-                            state.antenna_rotator.target_azimuth = 540.0;
+                        if (state.antenna_rotator.target_azimuth < ANTENNA_ROTATOR_MINIMUM_AZIMUTH) {
+                            state.antenna_rotator.target_azimuth = ANTENNA_ROTATOR_MINIMUM_AZIMUTH;
+                        } else if (state.antenna_rotator.target_azimuth > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
+                            state.antenna_rotator.target_azimuth = ANTENNA_ROTATOR_MAXIMUM_AZIMUTH;
                         }
                         azimuth = state.antenna_rotator.target_azimuth;
                         elevation = state.antenna_rotator.target_elevation;
