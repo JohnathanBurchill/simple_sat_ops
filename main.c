@@ -55,8 +55,10 @@
 #define UPDATE_INTERVAL_MICROSEC 500000
 #define KEYBOARD_UNLOCK_DURATION_TICKS (1000000 / UPDATE_INTERVAL_MICROSEC * 5)
 
+void start_tracking(state_t *state);
 void stop_tracking(state_t *state);
 void enable_wildrose_mode(state_t *state);
+int point_to_stationary_target(state_t *state, double azimuth, double elevation);
 
 void usage(FILE *dest, const char *name) 
 {
@@ -319,11 +321,13 @@ int main(int argc, char **argv)
             fprintf(stderr, "Unable to initialize audio capture\n");
             return 1;
         }
-        int thread_status = pthread_create(&state.audio_thread_main, NULL, capture_audio, &state);
-        if (thread_status != 0) {
-            endwin();
-            fprintf(stderr, "Unable to create an audio recording thread\n");
-            return 1;
+        if (state.audio_record) {
+            int thread_status = pthread_create(&state.audio_thread_main, NULL, capture_audio, &state);
+            if (thread_status != 0) {
+                endwin();
+                fprintf(stderr, "Unable to create an audio recording thread\n");
+                return 1;
+            }
         }
     }
 
@@ -374,9 +378,8 @@ int main(int argc, char **argv)
     double delta_az = 0.0;
     double delta_el = 0.0;
 
-    int antenna_should_be_controlled = state.run_with_antenna_rotator && state.have_antenna_rotator;
-    state.antenna_is_under_control = antenna_should_be_controlled;
-    int antenna_is_moving = 0;
+    state.antenna_should_be_controlled = state.run_with_antenna_rotator && state.have_antenna_rotator;
+    state.antenna_is_under_control = state.antenna_should_be_controlled;
 
     int keyboard_unlocked = 0;
     int keyboard_info_row = 20;
@@ -413,9 +416,9 @@ int main(int argc, char **argv)
         current_az = state.antenna_rotator.azimuth;
         current_el = state.antenna_rotator.elevation;
         // check if antenna reached its target 
-        if (antenna_is_moving) {
+        if (state.antenna_is_moving) {
             if (fabs(current_az - last_az) == 0 && fabs(current_el - last_el) == 0) {
-                antenna_is_moving = 0;
+                state.antenna_is_moving = 0;
             }
             last_az = current_az;
             last_el = current_el;
@@ -424,7 +427,7 @@ int main(int argc, char **argv)
             if (!state.in_pass) {
                 state.in_pass = 1;
             }
-            if (antenna_should_be_controlled && !state.tracking) {
+            if (state.antenna_should_be_controlled && !state.tracking) {
                 if (!state.antenna_rotator.fixed_target) {
                     state.tracking = 1;
                 }
@@ -433,7 +436,7 @@ int main(int argc, char **argv)
             // Point antenna at satellite or fixed target
             // TODO remove lag bias by anticipating direction
             if (state.tracking && state.antenna_is_under_control) {
-                if (!antenna_is_moving) {
+                if (!state.antenna_is_moving) {
                     delta_az = state.satellite.azimuth - state.antenna_rotator.target_azimuth;
                     if (state.satellite.elevation >= 0) {
                         delta_el = state.satellite.elevation - state.antenna_rotator.target_elevation;
@@ -460,7 +463,7 @@ int main(int argc, char **argv)
                         if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
                             fprintf(stderr, "Error setting antenna rotator position\n");
                         } else {
-                            antenna_is_moving = 1;
+                            state.antenna_is_moving = 1;
                         }
                     }
                 }
@@ -531,25 +534,7 @@ int main(int argc, char **argv)
                     keyboard_unlocked = 0;
                     break;
                 case 'T':
-                    state.satellite_tracking = 1;
-		    state.radio.nominal_downlink_frequency = state.radio.satellite_downlink_frequency;
-		    state.radio.nominal_uplink_frequency = state.radio.satellite_uplink_frequency;
-                    state.radio.doppler_correction_enabled = 1;
-		    radio_set_vfo(&state.radio, VFOMain);
-		    radio_set_mode(&state.radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
-		    radio_set_vfo(&state.radio, VFOSub);
-		    radio_set_mode(&state.radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
-                    state.antenna_is_under_control = antenna_should_be_controlled;
-                    if (state.antenna_rotator.fixed_target) {
-                        azimuth = state.antenna_rotator.target_azimuth;
-                        elevation = state.antenna_rotator.target_elevation;
-                        antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_SET, &azimuth, &elevation);
-                        if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
-                            fprintf(stderr, "Error setting antenna rotator position\n");
-                        } else {
-                            antenna_is_moving = 1;
-                        }
-                    }
+                    start_tracking(&state);
                     keyboard_unlocked = 0;
                     break;
                 case 's':
@@ -557,25 +542,36 @@ int main(int argc, char **argv)
                     keyboard_unlocked = 0;
                     break;
                 case 'r':
+                    stop_tracking(&state);
+                    point_to_stationary_target(&state, 0.0, 0.0);
+                    keyboard_unlocked = 0;
+                    break;
+                case '[':
+                    // Decrease azimuth 5 degrees
                     state.satellite_tracking = 0;
                     state.antenna_is_under_control = 0;
-                    state.antenna_rotator.target_azimuth = 0.0;
-                    state.antenna_rotator.target_elevation = 0.0;
-                    azimuth = state.antenna_rotator.target_azimuth;
-                    elevation = state.antenna_rotator.target_elevation;
-                    antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_SET, &azimuth, &elevation);
-                    if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
-                        fprintf(stderr, "Error setting antenna rotator position\n");
-                    } else {
-                        antenna_is_moving = 1;
+                    antenna_rotator_result = antenna_rotator_increase_azimuth(&state.antenna_rotator, -5.0);
+                    if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
+                        state.antenna_is_moving = 1;
+                    }
+                    keyboard_unlocked = 0;
+                    break;
+                case ']':
+                    // Increase azimuth 5 degrees
+                    state.satellite_tracking = 0;
+                    state.antenna_is_under_control = 0;
+                    antenna_rotator_result = antenna_rotator_increase_azimuth(&state.antenna_rotator, 5.0);
+                    if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
+                        state.antenna_is_moving = 1;
                     }
                     keyboard_unlocked = 0;
                     break;
                 case 'w':
-                    radio_result = radio_toggle_waterfall(&state.radio);
-                    if (radio_result != RADIO_OK) {
-                        fprintf(stderr, "Waterfall error: %d\n", radio_result);
-                    }
+                    // Broken: waterfall data messes with responses to other commands 
+                    // radio_result = radio_toggle_waterfall(&state.radio);
+                    // if (radio_result != RADIO_OK) {
+                    //     fprintf(stderr, "Waterfall error: %d\n", radio_result);
+                    // }
                     keyboard_unlocked = 0;
                     break;
                 case '*':
@@ -594,7 +590,7 @@ int main(int argc, char **argv)
 
         mvprintw(keyboard_info_row, 3, "%s : %s", "Keyboard", keyboard_unlocked ? "unlocked" : "LOCKED");
         clrtoeol();
-        if (antenna_is_moving) {
+        if (state.antenna_is_moving) {
             mvprintw(keyboard_info_row + 2, 0, "%s", "Antenna moving");
             clrtoeol();
         } else {
@@ -614,9 +610,9 @@ int main(int argc, char **argv)
     endwin();
 
     // stop audio capture
-    if (state.recording_audio == 1) {
+    if (state.audio_record == 1 && state.recording_audio == 1) {
         state.recording_audio = 0;
-        // Wait for thread to finish
+        // Wait for threads to finish
         pthread_join(state.audio_thread_main, NULL);
         pthread_join(state.audio_thread_sub, NULL);
         audio_capture_cleanup(&state);
@@ -688,6 +684,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->antenna_rotator.serial_speed = B600;
     state->antenna_rotator.fixed_target = 0;
 
+    // Default to recording audio
+    state->audio_record = 1;
     state->audio_output_file_basename = "session/session_pcm_audio";
     // state->audio_device = AUDIO_DEVICE_MAIN;
 
@@ -717,6 +715,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 return EXIT_FAILURE;
             } 
             state->radio.device_filename = argv[i] + 15;
+        } else if (strcmp("--without-audio", argv[i]) == 0) {
+            state->n_options++;
+            state->audio_record = 0;
         } else if (strncmp("--radio-audio-output-file=", argv[i], 26) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 27) {
@@ -937,6 +938,36 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     return 0;
 }
 
+void start_tracking(state_t *state)
+{
+    int antenna_rotator_result = 0;
+    double azimuth = 0.0;
+    double elevation = 0.0;
+
+    state->satellite_tracking = 1;
+    state->radio.nominal_downlink_frequency = state->radio.satellite_downlink_frequency;
+    state->radio.nominal_uplink_frequency = state->radio.satellite_uplink_frequency;
+    state->radio.doppler_correction_enabled = 1;
+
+    radio_set_vfo(&state->radio, VFOMain);
+    radio_set_mode(&state->radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
+    radio_set_vfo(&state->radio, VFOSub);
+    radio_set_mode(&state->radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
+    state->antenna_is_under_control = state->antenna_should_be_controlled;
+    if (state->antenna_rotator.fixed_target) {
+        azimuth = state->antenna_rotator.target_azimuth;
+        elevation = state->antenna_rotator.target_elevation;
+        antenna_rotator_result = antenna_rotator_command(&state->antenna_rotator, ANTENNA_ROTATOR_SET, &azimuth, &elevation);
+        if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
+            fprintf(stderr, "Error setting antenna rotator position\n");
+        } else {
+            state->antenna_is_moving = 1;
+        }
+    }
+
+    return;
+}
+
 void stop_tracking(state_t *state)
 {
     int antenna_rotator_result = 0;
@@ -946,7 +977,7 @@ void stop_tracking(state_t *state)
     state->satellite_tracking = 0;
     state->radio.doppler_correction_enabled = 1;
     state->antenna_is_under_control = 0;
-    if (state->run_with_antenna_rotator && !state->antenna_rotator.fixed_target) {
+    if (state->run_with_antenna_rotator) {
         // dummy values
         antenna_rotator_result = antenna_rotator_command(&state->antenna_rotator, ANTENNA_ROTATOR_STOP, &azimuth, &elevation);
         if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
@@ -983,3 +1014,14 @@ void enable_wildrose_mode(state_t *state)
 
     return;
 }
+
+int point_to_stationary_target(state_t *state, double azimuth, double elevation)
+{
+    state->satellite_tracking = 0;
+    state->antenna_is_under_control = 0;
+    int antenna_rotator_status = antenna_rotator_point_to_target(&state->antenna_rotator, azimuth, elevation);
+
+    return antenna_rotator_status;
+
+}
+

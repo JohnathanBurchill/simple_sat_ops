@@ -164,3 +164,44 @@ int antenna_rotator_command(antenna_rotator_t *antenna_rotator, antenna_rotator_
     return ANTENNA_ROTATOR_OK;
 }
 
+int antenna_rotator_increase_azimuth(antenna_rotator_t *antenna_rotator, double angle)
+{
+    double current_azimuth = antenna_rotator->target_azimuth;
+    double new_azimuth = current_azimuth + angle;
+    if (new_azimuth < ANTENNA_ROTATOR_MINIMUM_AZIMUTH || new_azimuth > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
+        return ANTENNA_ROTATOR_AZIMUTH_LIMIT;
+    }
+
+    antenna_rotator->target_azimuth = new_azimuth;
+    double azimuth = antenna_rotator->target_azimuth;
+    double elevation = antenna_rotator->target_elevation;
+    int antenna_rotator_result = antenna_rotator_command(antenna_rotator, ANTENNA_ROTATOR_SET, &azimuth, &elevation);
+    if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
+        fprintf(stderr, "Error setting antenna rotator position\n");
+        return ANTENNA_ROTATOR_BAD_RESPONSE;
+    }
+
+    return ANTENNA_ROTATOR_OK;
+}
+
+int antenna_rotator_point_to_target(antenna_rotator_t *antenna_rotator, double azimuth, double elevation)
+{
+    if (azimuth < ANTENNA_ROTATOR_MINIMUM_AZIMUTH || azimuth > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
+        return ANTENNA_ROTATOR_AZIMUTH_LIMIT;
+    }
+    if (elevation < ANTENNA_ROTATOR_MINIMUM_ELEVATION || elevation > ANTENNA_ROTATOR_MAXIMUM_ELEVATION) {
+        return ANTENNA_ROTATOR_ELEVATION_LIMIT;
+    }
+
+    antenna_rotator->target_azimuth = azimuth;
+    antenna_rotator->target_elevation = elevation;
+    double cmd_azimuth = antenna_rotator->target_azimuth;
+    double cmd_elevation = antenna_rotator->target_elevation;
+    int antenna_rotator_result = antenna_rotator_command(antenna_rotator, ANTENNA_ROTATOR_SET, &cmd_azimuth, &cmd_elevation);
+    if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
+        return ANTENNA_ROTATOR_BAD_RESPONSE;
+    }
+
+    return ANTENNA_ROTATOR_OK;
+}
+

@@ -27,12 +27,19 @@
 #define AR_CMD_LEN 13
 #define AR_RESPONSE_LEN 12
 
+#define ANTENNA_ROTATOR_MINIMUM_AZIMUTH -179 
+#define ANTENNA_ROTATOR_MAXIMUM_AZIMUTH 539
+#define ANTENNA_ROTATOR_MINIMUM_ELEVATION -5
+#define ANTENNA_ROTATOR_MAXIMUM_ELEVATION 89
+
 enum ANTENNA_ROTATOR_STATUS {
     ANTENNA_ROTATOR_OK = 0,
     ANTENNA_ROTATOR_BAD_RESPONSE,
     ANTENNA_ROTATOR_ERROR,
     ANTENNA_ROTATOR_OPEN,
     ANTENNA_ROTATOR_ARGS,
+    ANTENNA_ROTATOR_AZIMUTH_LIMIT,
+    ANTENNA_ROTATOR_ELEVATION_LIMIT,
 };
 
 typedef enum {
@@ -59,5 +66,7 @@ typedef struct antenna_rotator
 int antenna_rotator_init(antenna_rotator_t *antenna_rotator);
 void antenna_rotator_connect(antenna_rotator_t *antenna_rotator);
 int antenna_rotator_command(antenna_rotator_t *antenna_rotator, antenna_rotator_command_t cmd, double *azimuth, double *elevation);
+int antenna_rotator_increase_azimuth(antenna_rotator_t *antenna_rotator, double angle);
+int antenna_rotator_point_to_target(antenna_rotator_t *antenna_rotator, double azimuth, double elevation);
 
 #endif // ANTENNA_ROTATOR_H

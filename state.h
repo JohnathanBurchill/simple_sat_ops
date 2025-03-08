@@ -81,6 +81,7 @@ typedef struct state
     int have_radio;
     int have_antenna_rotator;
     int antenna_is_under_control;
+    int antenna_should_be_controlled;
     int antenna_is_moving;
     int auto_sat;
     snd_pcm_t *pcm_handle_main;
@@ -96,6 +97,7 @@ typedef struct state
     char *audio_buffer_main;
     char *audio_buffer_sub;
     volatile int recording_audio;
+    int audio_record;
 } state_t;
 
 
