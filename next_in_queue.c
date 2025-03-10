@@ -236,7 +236,15 @@ int main(int argc, char **argv)
             }
             for (int i = 0; i < max_passes; i++) {
                 p = get_pass(i);
-                printf("%26s  %8.1f %9.1f %7.1f %9.1f %9.1f", p->name, p->minutes_away, p->pass_duration, p->max_altitude, p->ascension_azimuth, p->max_elevation);
+                printf("%26s  ", p->name);
+                if (p->minutes_away < 120.0) {
+                    printf("%8.1f m ", p->minutes_away);
+                } else if (p->minutes_away < 2880.0) {
+                    printf("%8.1f h ", p->minutes_away / 60.0);
+                } else {
+                    printf("%8.1f d ", p->minutes_away / 1440.0);
+                }
+                printf("%9.1f %7.1f %9.1f %9.1f", p->pass_duration, p->max_altitude, p->ascension_azimuth, p->max_elevation);
                 if (show_radio_info == 1) {
                     for (int s = 0; s < n_entries; ++s) {
                         if (strcmp(p->name, sat_info[s].name) == 0) {
@@ -272,7 +280,11 @@ int main(int argc, char **argv)
             }
             if (reverse) {
                 printf("%26s  %8s %8s %8s %9s %9s %9s %9s %9s %25s %9s\n", "Name", "in (min)", "dur (min)", "alt (km)", "azi (deg)", "ele (deg)", "up (MHz)", "down (MHz)", "bcn (MHz)", "mode", "status");
-                printf("Found %lu upcoming passes from a total of %d satellites\n", n_passes, count);
+                if (satellite_name != NULL) {
+                    printf("Found %lu upcoming passes for %s\n", n_passes, satellite_name);
+                } else {
+                    printf("Found %lu upcoming passes from a total of %d satellites\n", n_passes, count);
+                }
             }
         } else {
             printf("Searched %d satellites\n", count);
