@@ -50,7 +50,7 @@ int parse_satellite_status_file(char *filename, satellite_status_t **status_list
         s = *status_list + entries;
         ap = line_buffer;
         for (int i = 0; i < 8; ++i) {
-            while (*ap != ';' && *ap != '\0') ++ap;
+            while (*ap != ';' && *ap != '\n' && *ap != '\0') ++ap;
             *ap = '\0';
             ++ap;
         }
