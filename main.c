@@ -122,11 +122,11 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
     }
     clrtoeol();
 
-    minutes_until_visible(state, jul_utc, 1.0, MAX_MINUTES_TO_PREDICT);
+    minutes_until_visible(state, jul_utc, jul_utc + MAX_MINUTES_TO_PREDICT / 1440.0, 1.0);
     if (fabs(state->predicted_minutes_until_visible) < 1) {
-        minutes_until_visible(state, jul_utc, 1./120.0, 2.0);
+        minutes_until_visible(state, jul_utc, jul_utc + 2.0 / 1440.0, 1./120.0);
     } else if (fabs(state->predicted_minutes_until_visible) < 10) {
-        minutes_until_visible(state, jul_utc, 0.1, 20.0);
+        minutes_until_visible(state, jul_utc, jul_utc + 20.0 / 1440.0, 0.1);
     }
     if (state->predicted_minutes_until_visible > 0) {
         if (state->predicted_minutes_until_visible < 1) {
@@ -923,7 +923,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         state_tmp.observer.position_geodetic.lat = state->observer.position_geodetic.lat;
         state_tmp.observer.position_geodetic.lon = state->observer.position_geodetic.lon;
         state_tmp.observer.position_geodetic.alt = state->observer.position_geodetic.alt;
-        find_passes(&state_tmp, jul_utc, 0.5, &criteria, NULL, NULL, 0);
+        find_passes(&state_tmp, jul_utc, 0.5, &criteria, NULL, NULL, 0, 0);
         const size_t n = number_of_passes();
         if (n == 0) {
             fprintf(stderr, "Unable to automatically find next in queue.\n");

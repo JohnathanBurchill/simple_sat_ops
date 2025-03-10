@@ -121,7 +121,7 @@ void update_pass_predictions(state_t *external_state, double jul_utc_start, doub
     return;
 }
 
-void minutes_until_visible(state_t *external_state, double jul_utc_start, double delta_t_minutes, double max_minutes)
+void minutes_until_visible(state_t *external_state, double jul_utc_start, double jul_utc_stop, double delta_t_minutes)
 {
     state_t state = {0};
     memcpy(&state, external_state, sizeof *external_state);
@@ -132,26 +132,28 @@ void minutes_until_visible(state_t *external_state, double jul_utc_start, double
         jul_utc_start = Julian_Date(&utc, &tv);
     }
     double jul_utc = jul_utc_start; 
-    double max_jul_utc = jul_utc_start + max_minutes / 1440.0;
     update_satellite_position(&state, jul_utc);
     double elevation = state.satellite.elevation;
     if (elevation < 0) {
         // How long until it becomes visible?
-        while (elevation < 0 && jul_utc < max_jul_utc) {
+        while (elevation < 0 && jul_utc < jul_utc_stop) {
             jul_utc += delta_t_minutes / 1440.0;
             update_satellite_position(&state, jul_utc);
             elevation = state.satellite.elevation;
         }
     } else {
         // How long since it became visible?
-        while (elevation > 0 && jul_utc < max_jul_utc) {
+        while (elevation > 0 && jul_utc < jul_utc_stop) {
             jul_utc -= delta_t_minutes / 1440.0;
             update_satellite_position(&state, jul_utc);
             elevation = state.satellite.elevation;
         }
     }
-
-    external_state->predicted_minutes_until_visible = (jul_utc - jul_utc_start) * 1440.0;
+    if (jul_utc > 0 && jul_utc < jul_utc_stop) {
+        external_state->predicted_minutes_until_visible = (jul_utc - jul_utc_start) * 1440.0;
+    } else {
+        external_state->predicted_minutes_until_visible = -9999.0;
+    }
 
     return;
 }
@@ -232,7 +234,7 @@ int pass_sort_latest_first(const void *a, const void *b)
 
 
 // Returns the first match on state->satellite.name
-int find_passes(state_t *external_state, double jul_utc_start, double delta_t_minutes, criteria_t *criteria, int *count, int *number_checked, int reverse_order)
+int find_passes(state_t *external_state, double jul_utc_start, double delta_t_minutes, criteria_t *criteria, int *count, int *number_checked, int reverse_order, int find_all)
 {
     FILE *file = fopen(external_state->tles_filename, "r");
     if (file == NULL) {
@@ -244,8 +246,6 @@ int find_passes(state_t *external_state, double jul_utc_start, double delta_t_mi
     char tle[160] = {0};
     char name[26] = {0}; 
     int found_satellite = 0;
-    char next_up_name[26] = {0};
-    double next_up_minutes_away = 1e10;
 
     state_t state = {0};
     memcpy(&state, external_state, sizeof *external_state);
@@ -346,14 +346,13 @@ int find_passes(state_t *external_state, double jul_utc_start, double delta_t_mi
 
         // TODO filter on perigee / apogee instead of current altitude?
         if (state.satellite.altitude_km >= criteria->min_altitude_km && state.satellite.altitude_km <= criteria->max_altitude_km) {
-            minutes_until_visible(&state, jul_utc_start, delta_t_minutes, criteria->max_minutes);
-            if (state.predicted_minutes_until_visible > 0 && next_up_minutes_away > state.predicted_minutes_until_visible) {
-                next_up_minutes_away = state.predicted_minutes_until_visible;
-                snprintf(next_up_name, sizeof(next_up_name), "%s", name);
-            }
             internal_number_checked++;
-            if (state.predicted_minutes_until_visible >= 0 && state.predicted_minutes_until_visible < criteria->max_minutes) {
-                update_pass_predictions(&state, jul_utc_start + state.predicted_minutes_until_visible / 1440.0, 0.25);
+            double utc_offset_minutes = 0;
+            double minutes_until_visible = 0;
+            double jul_utc_stop = jul_utc_start + criteria->max_minutes / 1400.0;
+            while (get_next_pass(&state, jul_utc_start + utc_offset_minutes / 1440.0, jul_utc_stop, delta_t_minutes)) {
+                minutes_until_visible = state.predicted_minutes_until_visible + utc_offset_minutes;
+                utc_offset_minutes += state.predicted_minutes_until_visible + 60;
                 if (state.predicted_minutes_above_0_degrees <= 0.0 || state.predicted_max_elevation > criteria->max_elevation || state.predicted_max_elevation < criteria->min_elevation) {
                     continue;
                 }
@@ -369,19 +368,16 @@ int find_passes(state_t *external_state, double jul_utc_start, double delta_t_mi
                 memset(&passes[n_passes - 1], 0, sizeof *passes);
                 pass_t *p = &passes[n_passes - 1];
                 (void)strncpy(p->name, name, sizeof(p->name));
-
                 (void)strncpy(p->tle, name, sizeof(p->tle));
-
-                // Refine estimate:
-                if (state.predicted_minutes_until_visible < 10.0 && delta_t_minutes > 1.0/60.) {
-                    minutes_until_visible(&state, jul_utc_start, 1.0 / 60.0, criteria->max_minutes);
-                }
-                p->minutes_away = state.predicted_minutes_until_visible;
+                p->minutes_away = minutes_until_visible;
                 p->pass_duration = state.predicted_pass_duration_minutes;
                 p->ascension_jul_utc = state.predicted_ascension_jul_utc;
                 p->ascension_azimuth = state.predicted_ascension_azimuth;
                 p->max_elevation = state.predicted_max_elevation;
                 p->max_altitude = state.predicted_max_altitude;
+                if (find_all == 0) {
+                    break;
+                }
             }
         }
     }
@@ -429,3 +425,18 @@ void free_passes(void)
     n_passes = 0;
 }
 
+int get_next_pass(state_t *state, double jul_utc_start, double jul_utc_stop, double delta_t_minutes)
+{
+    int got_pass = 0;
+    minutes_until_visible(state, jul_utc_start, jul_utc_stop, delta_t_minutes);
+    if (state->predicted_minutes_until_visible >= 0) {
+        // Refine estimate:
+        if (state->predicted_minutes_until_visible < 10.0 && delta_t_minutes > 1.0/60.) {
+            minutes_until_visible(state, jul_utc_start, jul_utc_stop, 1.0 / 60.0);
+        }
+        update_pass_predictions(state, jul_utc_start + state->predicted_minutes_until_visible / 1440.0, 0.25);
+        got_pass = 1;
+    }
+
+    return got_pass;
+}

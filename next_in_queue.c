@@ -31,7 +31,7 @@
 
 void usage(FILE *dest, const char *name) 
 {
-    fprintf(dest, "usage: %s <tles_file> <min_alt_km> <max_alt_km>\n", name);
+    fprintf(dest, "usage: %s <tles_file> <min_alt_km> <max_alt_km> [sat_name] [options...]\n", name);
     return;
 }
 
@@ -148,7 +148,8 @@ int main(int argc, char **argv)
         }
     }
 
-    if (argc - state.n_options != 4) {
+    int n_args = argc - state.n_options;
+    if (n_args < 4 || n_args > 5) {
         usage(stderr, argv[0]);
         return EXIT_FAILURE;
     }
@@ -156,6 +157,14 @@ int main(int argc, char **argv)
     state.tles_filename = argv[1];
     double min_altitude_km = atof(argv[2]);
     double max_altitude_km = atof(argv[3]);
+    char *satellite_name = NULL;
+    if (n_args == 5) {
+        // Checking for a specific satellite 
+        // Increase the timespan to 1 week
+        satellite_name = argv[4]; 
+        max_minutes_away = 1440 * 7;
+        regex = satellite_name;
+    }
 
     /* Set up observer location */
     state.observer.position_geodetic.lat = site_latitude * M_PI / 180.0;
@@ -170,7 +179,21 @@ int main(int argc, char **argv)
     struct tm utc_ref;
     Date_Time(jul_utc, &utc_ref);
 
-    printf("Checking %s for upcoming satellite passes within %.1f minutes from %04d-%02d-%02d %02d:%02d:%02d UTC\n", state.tles_filename, max_minutes_away, utc_ref.tm_year + 1900, utc_ref.tm_mon + 1, utc_ref.tm_mday, utc_ref.tm_hour, utc_ref.tm_min, utc_ref.tm_sec);
+    printf("Checking %s for upcoming ", state.tles_filename);
+    if (satellite_name != NULL) {
+        printf("%s", satellite_name);
+    } else {
+        printf("satellite");
+    }
+    printf(" passes within ");
+    if (max_minutes_away < 120) {
+        printf("%.0f minutes", max_minutes_away);
+    } else if (max_minutes_away < 2880) {
+        printf("%.1f hours", max_minutes_away / 60.0);
+    } else {
+        printf("%.1f days", max_minutes_away / 1440.0);
+    }
+    printf(" from %04d-%02d-%02d %02d:%02d:%02d UTC\n", utc_ref.tm_year + 1900, utc_ref.tm_mon + 1, utc_ref.tm_mday, utc_ref.tm_hour, utc_ref.tm_min, utc_ref.tm_sec);
     criteria_t criteria = {
         .min_altitude_km = min_altitude_km,
         .max_altitude_km = max_altitude_km,
@@ -185,7 +208,7 @@ int main(int argc, char **argv)
 
     int count = 0;
     int number_checked = 0;
-    status = find_passes(&state, jul_utc, 1.0, &criteria, &count, &number_checked, reverse);
+    status = find_passes(&state, jul_utc, 1.0, &criteria, &count, &number_checked, reverse, satellite_name != NULL ? 1 : 0);
     const size_t n_passes = number_of_passes();
 
     // satellite info
@@ -200,9 +223,11 @@ int main(int argc, char **argv)
         if (max_passes == -1) {
             max_passes = n_passes;
         }
-        if (list_all) {
+        if (list_all || satellite_name != NULL) {
             if (!reverse) {
-                printf("Found %lu upcoming passes from a total of %d satellites\n", n_passes, count);
+                if (satellite_name == NULL) {
+                    printf("Found %lu upcoming passes from a total of %d satellites\n", n_passes, count);
+                }
                 printf("%26s  %8s %8s %8s %9s %9s %9s %9s %9s %25s %9s\n", "Name", "in (min)", "dur (min)", "alt (km)", "azi (deg)", "ele (deg)", "up (MHz)", "down (MHz)", "bcn (MHz)", "mode", "status");
             }
             for (int i = 0; i < max_passes; i++) {
@@ -248,6 +273,8 @@ int main(int argc, char **argv)
             p = get_pass(0);
             printf("%26s in %.1f minutes from %04d-%02d-%02d %02d:%02d:%02d UTC at azimuth %.1f deg. for %.1f minutes reaching elevation %.1f deg.\n", p->name, p->minutes_away, utc_ref.tm_year + 1900, utc_ref.tm_mon + 1, utc_ref.tm_mday, utc_ref.tm_hour, utc_ref.tm_min, utc_ref.tm_sec, p->ascension_azimuth, p->pass_duration, p->max_elevation);
         }
+    } else {
+        printf("No passes found\n");
     }
 
     free_passes();
