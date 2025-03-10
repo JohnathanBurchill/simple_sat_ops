@@ -44,5 +44,6 @@ target_link_libraries(lifetime PRIVATE sgp4sdp4 m)
 
 install(TARGETS simple_sat_ops next_in_queue lifetime DESTINATION $ENV{HOME}/bin)
 
-install(PROGRAMS upcoming_amateur_satellite_passes.sh DESTINATION $ENV{HOME}/bin)
+install(PROGRAMS scripts/upcoming_amateur_satellite_passes.sh DESTINATION $ENV{HOME}/bin)
+install(PROGRAMS scripts/pcm2wav.sh DESTINATION $ENV{HOME}/bin)
 
