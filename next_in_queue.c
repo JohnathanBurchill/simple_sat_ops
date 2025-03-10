@@ -44,6 +44,7 @@ int main(int argc, char **argv)
     int status = 0;
     int list_all = 0;
     int max_passes = -1;
+    int show_radio_info = 0;
     double min_minutes_away = 0.0;
     double max_minutes_away = 1440.0;
     double min_elevation = 0.0;
@@ -139,6 +140,9 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
             regex = argv[i] + 8;
+        } else if (strcmp("--show-radio-info", argv[i]) == 0) {
+            state.n_options++;
+            show_radio_info = 1;
         } else if (strcmp("--help", argv[i]) == 0) {
             usage(stdout, argv[0]);
             return 0;
@@ -233,32 +237,34 @@ int main(int argc, char **argv)
             for (int i = 0; i < max_passes; i++) {
                 p = get_pass(i);
                 printf("%26s  %8.1f %9.1f %7.1f %9.1f %9.1f", p->name, p->minutes_away, p->pass_duration, p->max_altitude, p->ascension_azimuth, p->max_elevation);
-                for (int s = 0; s < n_entries; ++s) {
-                    if (strcmp(p->name, sat_info[s].name) == 0) {
-                        if (strlen(sat_info[s].f_uplink_mhz) > 0) {
-                            printf(" %9s", sat_info[s].f_uplink_mhz);
-                        } else {
-                            printf(" %9s", "-");
-                        }
-                        if (strlen(sat_info[s].f_downlink_mhz) > 0) {
-                            printf(" %9s", sat_info[s].f_downlink_mhz);
-                        } else {
-                            printf(" %9s", "-");
-                        }
-                        if (strlen(sat_info[s].f_beacon_mhz) > 0) {
-                            printf(" %9s", sat_info[s].f_beacon_mhz);
-                        } else {
-                            printf(" %9s", "-");
-                        }
-                        if (strlen(sat_info[s].mode) > 0) {
-                            printf(" %25s", sat_info[s].mode);
-                        } else {
-                            printf(" %25s", "-");
-                        }
-                        if (strlen(sat_info[s].status) > 0) {
-                            printf(" %9s", sat_info[s].status);
-                        } else {
-                            printf(" %9s", "-");
+                if (show_radio_info == 1) {
+                    for (int s = 0; s < n_entries; ++s) {
+                        if (strcmp(p->name, sat_info[s].name) == 0) {
+                            if (strlen(sat_info[s].f_uplink_mhz) > 0) {
+                                printf(" %9s", sat_info[s].f_uplink_mhz);
+                            } else {
+                                printf(" %9s", "-");
+                            }
+                            if (strlen(sat_info[s].f_downlink_mhz) > 0) {
+                                printf(" %9s", sat_info[s].f_downlink_mhz);
+                            } else {
+                                printf(" %9s", "-");
+                            }
+                            if (strlen(sat_info[s].f_beacon_mhz) > 0) {
+                                printf(" %9s", sat_info[s].f_beacon_mhz);
+                            } else {
+                                printf(" %9s", "-");
+                            }
+                            if (strlen(sat_info[s].mode) > 0) {
+                                printf(" %25s", sat_info[s].mode);
+                            } else {
+                                printf(" %25s", "-");
+                            }
+                            if (strlen(sat_info[s].status) > 0) {
+                                printf(" %9s", sat_info[s].status);
+                            } else {
+                                printf(" %9s", "-");
+                            }
                         }
                     }
                 }
