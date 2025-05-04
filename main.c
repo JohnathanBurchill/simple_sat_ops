@@ -59,6 +59,7 @@ void start_tracking(state_t *state);
 void stop_tracking(state_t *state);
 void enable_wildrose_mode(state_t *state);
 int point_to_stationary_target(state_t *state, double azimuth, double elevation);
+void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, double downlink_freq);
 
 void usage(FILE *dest, const char *name) 
 {
@@ -97,20 +98,20 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
     clrtoeol();
 
     row++;
-    mvprintw(row++, col, "%15s   %s (%s)", "satellite", state->satellite.tle.sat_name, state->satellite.tle.idesg);
+    mvprintw(row++, col, "%15s   %s (%s)", "satellite", state->prediction.satellite_ephem.tle.sat_name, state->prediction.satellite_ephem.tle.idesg);
     clrtoeol();
-    if (state->minutes_since_epoch/1440.0 >= WARN_DAYS_SINCE_EPOCH) {
+    if (state->prediction.minutes_since_epoch/1440.0 >= WARN_DAYS_SINCE_EPOCH) {
         attron(COLOR_PAIR(2));
     } 
-    mvprintw(row++, col, "%15s   %0.1f days", "epoch age", state->minutes_since_epoch / 1440.0);
-    if (state->minutes_since_epoch/1440.0 >= WARN_DAYS_SINCE_EPOCH) {
+    mvprintw(row++, col, "%15s   %0.1f days", "epoch age", state->prediction.minutes_since_epoch / 1440.0);
+    if (state->prediction.minutes_since_epoch/1440.0 >= WARN_DAYS_SINCE_EPOCH) {
         attroff(COLOR_PAIR(2));
     } 
     clrtoeol();
 
     if (state->in_pass) {
         mvprintw(row++, col, "%15s   %s", "status", "** IN PASS **");
-        if (state->tracking) {
+        if (state->antenna_rotator.tracking) {
             printw(" (TRACKING)");
         } else {
             attron(COLOR_PAIR(1));
@@ -122,48 +123,48 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
     }
     clrtoeol();
 
-    minutes_until_visible(state, jul_utc, jul_utc + MAX_MINUTES_TO_PREDICT / 1440.0, 1.0);
-    if (fabs(state->predicted_minutes_until_visible) < 1) {
-        minutes_until_visible(state, jul_utc, jul_utc + 2.0 / 1440.0, 1./120.0);
-    } else if (fabs(state->predicted_minutes_until_visible) < 10) {
-        minutes_until_visible(state, jul_utc, jul_utc + 20.0 / 1440.0, 0.1);
+    minutes_until_visible(&state->prediction, jul_utc, jul_utc + MAX_MINUTES_TO_PREDICT / 1440.0, 1.0);
+    if (fabs(state->prediction.predicted_minutes_until_visible) < 1) {
+        minutes_until_visible(&state->prediction, jul_utc, jul_utc + 2.0 / 1440.0, 1./120.0);
+    } else if (fabs(state->prediction.predicted_minutes_until_visible) < 10) {
+        minutes_until_visible(&state->prediction, jul_utc, jul_utc + 20.0 / 1440.0, 0.1);
     }
-    if (state->predicted_minutes_until_visible > 0) {
-        if (state->predicted_minutes_until_visible < 1) {
+    if (state->prediction.predicted_minutes_until_visible > 0) {
+        if (state->prediction.predicted_minutes_until_visible < 1) {
             mvprintw(row++, col, "%15s   ", "next pass in");
             attron(COLOR_PAIR(2));
-            printw("%.0f seconds", floor(state->predicted_minutes_until_visible * 60.0));
+            printw("%.0f seconds", floor(state->prediction.predicted_minutes_until_visible * 60.0));
             attroff(COLOR_PAIR(2));
-        } else if (state->predicted_minutes_until_visible < 10) {
-            mvprintw(row++, col, "%15s   %.1f minutes", "next pass in", state->predicted_minutes_until_visible);
+        } else if (state->prediction.predicted_minutes_until_visible < 10) {
+            mvprintw(row++, col, "%15s   %.1f minutes", "next pass in", state->prediction.predicted_minutes_until_visible);
         } else {
-            mvprintw(row++, col, "%15s   %.0f minutes", "next pass in", state->predicted_minutes_until_visible);
+            mvprintw(row++, col, "%15s   %.0f minutes", "next pass in", state->prediction.predicted_minutes_until_visible);
         }
         clrtoeol();
-        update_pass_predictions(state, jul_utc + state->predicted_minutes_until_visible / 1440.0, 0.1);
-        mvprintw(row++, col, "%15s   %.1f minutes", "duration", state->predicted_minutes_above_0_degrees);
+        update_pass_predictions(&state->prediction, jul_utc + state->prediction.predicted_minutes_until_visible / 1440.0, 0.1);
+        mvprintw(row++, col, "%15s   %.1f minutes", "duration", state->prediction.predicted_minutes_above_0_degrees);
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.1f minutes", "el>30", state->predicted_minutes_above_30_degrees);
+        mvprintw(row++, col, "%15s   %.1f minutes", "el>30", state->prediction.predicted_minutes_above_30_degrees);
         clrtoeol();
     } else {
         mvprintw(row++, col, "%15s   ", "elapsed time");
         attron(COLOR_PAIR(3));
-        if (fabs(state->predicted_minutes_until_visible) < 1) {
-            printw("%.0f seconds", floor(-state->predicted_minutes_until_visible * 60.0));
+        if (fabs(state->prediction.predicted_minutes_until_visible) < 1) {
+            printw("%.0f seconds", floor(-state->prediction.predicted_minutes_until_visible * 60.0));
         } else {
-            printw("%.1f minutes", -state->predicted_minutes_until_visible);
+            printw("%.1f minutes", -state->prediction.predicted_minutes_until_visible);
         }
-        if (state->predicted_max_elevation == -180.0) {
-            update_pass_predictions(state, jul_utc - state->predicted_minutes_until_visible / 1440.0, 0.1);
+        if (state->prediction.predicted_max_elevation == -180.0) {
+            update_pass_predictions(&state->prediction, jul_utc - state->prediction.predicted_minutes_until_visible / 1440.0, 0.1);
         }
         attroff(COLOR_PAIR(3));
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.1f minutes", "duration", state->predicted_minutes_above_0_degrees);
+        mvprintw(row++, col, "%15s   %.1f minutes", "duration", state->prediction.predicted_minutes_above_0_degrees);
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.1f minutes", "el>30", state->predicted_minutes_above_30_degrees);
+        mvprintw(row++, col, "%15s   %.1f minutes", "el>30", state->prediction.predicted_minutes_above_30_degrees);
         clrtoeol();
     }
-    mvprintw(row++, col, "%15s   %.1f deg", "max elevation", state->predicted_max_elevation);
+    mvprintw(row++, col, "%15s   %.1f deg", "max elevation", state->prediction.predicted_max_elevation);
     clrtoeol();
 
     *print_row = row;
@@ -254,21 +255,21 @@ void report_position(state_t *state, int *print_row, int print_col)
     int row = *print_row;
     int col = print_col;
 
-    mvprintw(row++, col, "%15s   %.2f deg", "azimuth", state->satellite.azimuth);
+    mvprintw(row++, col, "%15s   %.2f deg", "azimuth", state->prediction.satellite_ephem.azimuth);
     clrtoeol();
-    mvprintw(row++, col, "%15s   %.2f deg", "elevation", state->satellite.elevation);
+    mvprintw(row++, col, "%15s   %.2f deg", "elevation", state->prediction.satellite_ephem.elevation);
     clrtoeol();
-    mvprintw(row++, col, "%15s   %.2f km", "altitude", state->satellite.altitude_km);
+    mvprintw(row++, col, "%15s   %.2f km", "altitude", state->prediction.satellite_ephem.altitude_km);
     clrtoeol();
-    mvprintw(row++, col, "%15s   %.1f deg N", "latitude", state->satellite.latitude);
+    mvprintw(row++, col, "%15s   %.1f deg N", "latitude", state->prediction.satellite_ephem.latitude);
     clrtoeol();
-    mvprintw(row++, col, "%15s   %.1f deg E", "longitude", state->satellite.longitude);
+    mvprintw(row++, col, "%15s   %.1f deg E", "longitude", state->prediction.satellite_ephem.longitude);
     clrtoeol();
-    mvprintw(row++, col, "%15s   %.2f km/s", "speed", state->satellite.speed_km_s);
+    mvprintw(row++, col, "%15s   %.2f km/s", "speed", state->prediction.satellite_ephem.speed_km_s);
     clrtoeol();
-    mvprintw(row++, col, "%15s   %.1f km", "range", state->satellite.range_km);
+    mvprintw(row++, col, "%15s   %.1f km", "range", state->prediction.satellite_ephem.range_km);
     clrtoeol();
-    mvprintw(row++, col, "%15s   %.2f km/s", "range rate", state->satellite.range_rate_km_s);
+    mvprintw(row++, col, "%15s   %.2f km/s", "range rate", state->prediction.satellite_ephem.range_rate_km_s);
     clrtoeol();
 
     *print_row = row;
@@ -281,7 +282,7 @@ int main(int argc, char **argv)
 
     int ret = 0;
     state_t state = {0};
-    state.predicted_max_elevation = -180.0;
+    state.prediction.predicted_max_elevation = -180.0;
     
     int status = 0;
 
@@ -295,12 +296,12 @@ int main(int argc, char **argv)
     }
 
     /* Parse TLE data */
-    int tle_status = load_tle(&state);
+    int tle_status = load_tle(&state.prediction);
     if (tle_status) {
         return tle_status;
     }
     ClearFlag(ALL_FLAGS);
-    select_ephemeris(&state.satellite.tle);
+    select_ephemeris(&state.prediction.satellite_ephem.tle);
 
     int radio_result = 0;
     if (state.run_with_radio) { 
@@ -314,15 +315,15 @@ int main(int argc, char **argv)
         }
         state.have_radio = 1;
         // Record audio
-        state.recording_audio = 1;
-        status = init_audio_capture(&state);
+        state.audio.recording_audio = 1;
+        status = init_audio_capture(&state.audio);
         if (status != AUDIO_OK) {
             endwin();
             fprintf(stderr, "Unable to initialize audio capture\n");
             return 1;
         }
-        if (state.audio_record) {
-            int thread_status = pthread_create(&state.audio_thread_main, NULL, capture_audio, &state);
+        if (state.audio.audio_record) {
+            int thread_status = pthread_create(&state.audio.audio_thread_main, NULL, capture_audio, &state);
             if (thread_status != 0) {
                 endwin();
                 fprintf(stderr, "Unable to create an audio recording thread\n");
@@ -378,8 +379,8 @@ int main(int argc, char **argv)
     double delta_az = 0.0;
     double delta_el = 0.0;
 
-    state.antenna_should_be_controlled = state.run_with_antenna_rotator && state.have_antenna_rotator;
-    state.antenna_is_under_control = state.antenna_should_be_controlled;
+    state.antenna_rotator.antenna_should_be_controlled = state.run_with_antenna_rotator && state.have_antenna_rotator;
+    state.antenna_rotator.antenna_is_under_control = state.antenna_rotator.antenna_should_be_controlled;
 
     int keyboard_unlocked = 0;
     int keyboard_info_row = 20;
@@ -403,7 +404,7 @@ int main(int argc, char **argv)
         // Refresh
         UTC_Calendar_Now(&utc, &tv);
         jul_utc = Julian_Date(&utc, &tv);
-        update_satellite_position(&state, jul_utc);
+        update_satellite_position(&state.prediction, jul_utc);
 
         /* Calculate Doppler shift */
         if (state.radio.doppler_correction_enabled) {
@@ -416,37 +417,37 @@ int main(int argc, char **argv)
         current_az = state.antenna_rotator.azimuth;
         current_el = state.antenna_rotator.elevation;
         // check if antenna reached its target 
-        if (state.antenna_is_moving) {
+        if (state.antenna_rotator.antenna_is_moving) {
             if (fabs(current_az - last_az) == 0 && fabs(current_el - last_el) == 0) {
-                state.antenna_is_moving = 0;
+                state.antenna_rotator.antenna_is_moving = 0;
             }
             last_az = current_az;
             last_el = current_el;
         }
-        if (state.satellite_tracking && state.predicted_minutes_until_visible < state.tracking_prep_time_minutes) {
+        if (state.satellite_tracking && state.prediction.predicted_minutes_until_visible < state.antenna_rotator.tracking_prep_time_minutes) {
             if (!state.in_pass) {
                 state.in_pass = 1;
             }
-            if (state.antenna_should_be_controlled && !state.tracking) {
+            if (state.antenna_rotator.antenna_should_be_controlled && !state.antenna_rotator.tracking) {
                 if (!state.antenna_rotator.fixed_target) {
-                    state.tracking = 1;
+                    state.antenna_rotator.tracking = 1;
                 }
             }
 
             // Point antenna at satellite or fixed target
             // TODO remove lag bias by anticipating direction
-            if (state.tracking && state.antenna_is_under_control) {
-                if (!state.antenna_is_moving) {
-                    delta_az = state.satellite.azimuth - state.antenna_rotator.target_azimuth;
-                    if (state.satellite.elevation >= 0) {
-                        delta_el = state.satellite.elevation - state.antenna_rotator.target_elevation;
+            if (state.antenna_rotator.tracking && state.antenna_rotator.antenna_is_under_control) {
+                if (!state.antenna_rotator.antenna_is_moving) {
+                    delta_az = state.prediction.satellite_ephem.azimuth - state.antenna_rotator.target_azimuth;
+                    if (state.prediction.satellite_ephem.elevation >= 0) {
+                        delta_el = state.prediction.satellite_ephem.elevation - state.antenna_rotator.target_elevation;
                     } else {
                         delta_el = 0.0;
                     }
 
                     if (fabs(delta_az) >= MAX_DELTA_AZIMUTH_DEGREES || fabs(delta_el) >= MAX_DELTA_ELEVATION_DEGREES) {
-                        state.antenna_rotator.target_azimuth = state.satellite.azimuth;
-                        state.antenna_rotator.target_elevation = state.satellite.elevation;
+                        state.antenna_rotator.target_azimuth = state.prediction.satellite_ephem.azimuth;
+                        state.antenna_rotator.target_elevation = state.prediction.satellite_ephem.elevation;
                         if (state.antenna_rotator.target_elevation < ANTENNA_ROTATOR_MINIMUM_ELEVATION) {
                             state.antenna_rotator.target_elevation = ANTENNA_ROTATOR_MINIMUM_ELEVATION;
                         } else if (state.antenna_rotator.target_elevation > ANTENNA_ROTATOR_MAXIMUM_ELEVATION) {
@@ -463,7 +464,7 @@ int main(int argc, char **argv)
                         if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
                             fprintf(stderr, "Error setting antenna rotator position\n");
                         } else {
-                            state.antenna_is_moving = 1;
+                            state.antenna_rotator.antenna_is_moving = 1;
                         }
                     }
                 }
@@ -494,8 +495,8 @@ int main(int argc, char **argv)
                 state.in_pass = 0;
                 jul_idle_start = jul_utc;  // Start idle timer
             }
-            if (state.tracking) {
-                state.tracking = 0;
+            if (state.antenna_rotator.tracking) {
+                state.antenna_rotator.tracking = 0;
             }
         }
 
@@ -549,20 +550,20 @@ int main(int argc, char **argv)
                 case '[':
                     // Decrease azimuth 5 degrees
                     state.satellite_tracking = 0;
-                    state.antenna_is_under_control = 0;
+                    state.antenna_rotator.antenna_is_under_control = 0;
                     antenna_rotator_result = antenna_rotator_increase_azimuth(&state.antenna_rotator, -5.0);
                     if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                        state.antenna_is_moving = 1;
+                        state.antenna_rotator.antenna_is_moving = 1;
                     }
                     keyboard_unlocked = 0;
                     break;
                 case ']':
                     // Increase azimuth 5 degrees
                     state.satellite_tracking = 0;
-                    state.antenna_is_under_control = 0;
+                    state.antenna_rotator.antenna_is_under_control = 0;
                     antenna_rotator_result = antenna_rotator_increase_azimuth(&state.antenna_rotator, 5.0);
                     if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                        state.antenna_is_moving = 1;
+                        state.antenna_rotator.antenna_is_moving = 1;
                     }
                     keyboard_unlocked = 0;
                     break;
@@ -590,7 +591,7 @@ int main(int argc, char **argv)
 
         mvprintw(keyboard_info_row, 3, "%s : %s", "Keyboard", keyboard_unlocked ? "unlocked" : "LOCKED");
         clrtoeol();
-        if (state.antenna_is_moving) {
+        if (state.antenna_rotator.antenna_is_moving) {
             mvprintw(keyboard_info_row + 2, 0, "%s", "Antenna moving");
             clrtoeol();
         } else {
@@ -610,19 +611,19 @@ int main(int argc, char **argv)
     endwin();
 
     // stop audio capture
-    if (state.audio_record == 1 && state.recording_audio == 1) {
-        state.recording_audio = 0;
+    if (state.audio.audio_record == 1 && state.audio.recording_audio == 1) {
+        state.audio.recording_audio = 0;
         // Wait for threads to finish
-        pthread_join(state.audio_thread_main, NULL);
-        pthread_join(state.audio_thread_sub, NULL);
-        audio_capture_cleanup(&state);
+        pthread_join(state.audio.audio_thread_main, NULL);
+        pthread_join(state.audio.audio_thread_sub, NULL);
+        audio_capture_cleanup(&state.audio);
     }
 
     if (next_in_queue_name) {
         free(next_in_queue_name);
     }
 
-    if (state.auto_sat) {
+    if (state.prediction.auto_sat) {
         free_passes();
     }
 
@@ -663,7 +664,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     double min_elevation = 0.0;
     double max_elevation = 90.0;
     int with_constellations = 0;
-    state->tracking_prep_time_minutes = TRACKING_PREP_TIME_MINUTES;
+    state->antenna_rotator.tracking_prep_time_minutes = TRACKING_PREP_TIME_MINUTES;
     state->satellite_tracking = 0;
 
     state->radio.satellite_uplink_mode = RADIO_MODE_FM;
@@ -685,9 +686,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->antenna_rotator.fixed_target = 0;
 
     // Default to recording audio
-    state->audio_record = 1;
-    state->audio_output_file_basename = "session/session_pcm_audio";
-    // state->audio_device = AUDIO_DEVICE_MAIN;
+    state->audio.audio_record = 1;
+    state->audio.audio_output_file_basename = "session/session_pcm_audio";
+    // state->audio.audio_device = AUDIO_DEVICE_MAIN;
 
     for (int i = 0; i < argc; i++) {
 
@@ -717,14 +718,14 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             state->radio.device_filename = argv[i] + 15;
         } else if (strcmp("--without-audio", argv[i]) == 0) {
             state->n_options++;
-            state->audio_record = 0;
+            state->audio.audio_record = 0;
         } else if (strncmp("--radio-audio-output-file=", argv[i], 26) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 27) {
                 fprintf(stderr, "Unable to parse %s\n", argv[i]); 
                 return EXIT_FAILURE;
             } 
-            state->audio_output_file_basename = argv[i] + 26;
+            state->audio.audio_output_file_basename = argv[i] + 26;
         } else if (strncmp("--radio-serial-speed=", argv[i], 21) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 22) {
@@ -898,15 +899,15 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->radio.doppler_uplink_frequency = state->radio.nominal_uplink_frequency;
     state->radio.doppler_downlink_frequency = state->radio.nominal_downlink_frequency;
 
-    state->observer.position_geodetic.lat = site_latitude * M_PI / 180.0;
-    state->observer.position_geodetic.lon = site_longitude * M_PI / 180.0;
-    state->observer.position_geodetic.alt = site_altitude / 1000.0;
+    state->prediction.observer_ephem.position_geodetic.lat = site_latitude * M_PI / 180.0;
+    state->prediction.observer_ephem.position_geodetic.lon = site_longitude * M_PI / 180.0;
+    state->prediction.observer_ephem.position_geodetic.alt = site_altitude / 1000.0;
 
-    state->tles_filename = argv[1];
-    state->satellite.name = argv[2];
+    state->prediction.tles_filename = argv[1];
+    state->prediction.satellite_ephem.name = argv[2];
 
-    if (strcmp(state->satellite.name, "next") == 0) {
-        state->auto_sat = 1;
+    if (strcmp(state->prediction.satellite_ephem.name, "next") == 0) {
+        state->prediction.auto_sat = 1;
         criteria_t criteria = {
             .min_altitude_km = min_altitude_km,
             .max_altitude_km = max_altitude_km,
@@ -918,12 +919,12 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             .regex_ignore_case = 0,
             .with_constellations = with_constellations,
         };
-        state_t state_tmp = {0};
-        state_tmp.tles_filename = state->tles_filename;
-        state_tmp.observer.position_geodetic.lat = state->observer.position_geodetic.lat;
-        state_tmp.observer.position_geodetic.lon = state->observer.position_geodetic.lon;
-        state_tmp.observer.position_geodetic.alt = state->observer.position_geodetic.alt;
-        find_passes(&state_tmp, jul_utc, 0.5, &criteria, NULL, NULL, 0, 0);
+        prediction_t prediction_tmp = {0};
+        prediction_tmp.tles_filename = state->prediction.tles_filename;
+        prediction_tmp.observer_ephem.position_geodetic.lat = state->prediction.observer_ephem.position_geodetic.lat;
+        prediction_tmp.observer_ephem.position_geodetic.lon = state->prediction.observer_ephem.position_geodetic.lon;
+        prediction_tmp.observer_ephem.position_geodetic.alt = state->prediction.observer_ephem.position_geodetic.alt;
+        find_passes(&prediction_tmp, jul_utc, 0.5, &criteria, NULL, NULL, 0, 0);
         const size_t n = number_of_passes();
         if (n == 0) {
             fprintf(stderr, "Unable to automatically find next in queue.\n");
@@ -931,8 +932,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         }
 
         const pass_t *p = get_pass(0);
-        state->satellite.name = strdup(p->name);
-        printf("Satellite: %s\n", state->satellite.name);
+        state->prediction.satellite_ephem.name = strdup(p->name);
+        printf("Satellite: %s\n", state->prediction.satellite_ephem.name);
     }
 
     return 0;
@@ -953,7 +954,7 @@ void start_tracking(state_t *state)
     radio_set_mode(&state->radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
     radio_set_vfo(&state->radio, VFOSub);
     radio_set_mode(&state->radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
-    state->antenna_is_under_control = state->antenna_should_be_controlled;
+    state->antenna_rotator.antenna_is_under_control = state->antenna_rotator.antenna_should_be_controlled;
     if (state->antenna_rotator.fixed_target) {
         azimuth = state->antenna_rotator.target_azimuth;
         elevation = state->antenna_rotator.target_elevation;
@@ -961,7 +962,7 @@ void start_tracking(state_t *state)
         if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
             fprintf(stderr, "Error setting antenna rotator position\n");
         } else {
-            state->antenna_is_moving = 1;
+            state->antenna_rotator.antenna_is_moving = 1;
         }
     }
 
@@ -976,7 +977,7 @@ void stop_tracking(state_t *state)
 
     state->satellite_tracking = 0;
     state->radio.doppler_correction_enabled = 1;
-    state->antenna_is_under_control = 0;
+    state->antenna_rotator.antenna_is_under_control = 0;
     if (state->run_with_antenna_rotator) {
         // dummy values
         antenna_rotator_result = antenna_rotator_command(&state->antenna_rotator, ANTENNA_ROTATOR_STOP, &azimuth, &elevation);
@@ -984,7 +985,7 @@ void stop_tracking(state_t *state)
             fprintf(stderr, "Error stopping the antenna rotator\n");
         }
     }
-    state->antenna_is_moving = 0;
+    state->antenna_rotator.antenna_is_moving = 0;
 
     return;
 }
@@ -1018,10 +1019,19 @@ void enable_wildrose_mode(state_t *state)
 int point_to_stationary_target(state_t *state, double azimuth, double elevation)
 {
     state->satellite_tracking = 0;
-    state->antenna_is_under_control = 0;
+    state->antenna_rotator.antenna_is_under_control = 0;
     int antenna_rotator_status = antenna_rotator_point_to_target(&state->antenna_rotator, azimuth, elevation);
 
     return antenna_rotator_status;
 
+}
+
+void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, double downlink_freq)
+{
+    double doppler_factor = 1.0 - state->prediction.satellite_ephem.range_rate_km_s / 299792.458;
+    state->radio.doppler_uplink_frequency = uplink_freq * doppler_factor; // Speed of light in km/s
+    state->radio.doppler_downlink_frequency = downlink_freq * doppler_factor;
+
+    return;
 }
 

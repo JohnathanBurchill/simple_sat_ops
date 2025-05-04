@@ -6,6 +6,8 @@ enum TELEMETRY_RETURN_CODES {
 };
 
 typedef struct telemetry {
+    int decode_enabled;
+    int encode_enabled;
     int decoding;
     int encoding;
 } telemetry_t;

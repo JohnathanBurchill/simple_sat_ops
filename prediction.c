@@ -19,7 +19,6 @@
 */
 
 #include "prediction.h"
-#include "state.h"
 
 #include <string.h>
 #include <time.h>
@@ -30,58 +29,49 @@
 static pass_t *passes = NULL;
 static size_t n_passes = 0;
 
-void update_satellite_position(state_t *state, double jul_utc)
+void update_satellite_position(prediction_t *prediction, double jul_utc)
 {
     // jul times are days
-    state->jul_epoch = Julian_Date_of_Epoch(state->satellite.tle.epoch);
-    state->minutes_since_epoch = (jul_utc - state->jul_epoch) * 1440.0;
+    prediction->jul_epoch = Julian_Date_of_Epoch(prediction->satellite_ephem.tle.epoch);
+    prediction->minutes_since_epoch = (jul_utc - prediction->jul_epoch) * 1440.0;
 
     /* Propagate satellite position */
     /* Call NORAD routines according to deep-space flag */
     if(isFlagSet(DEEP_SPACE_EPHEM_FLAG)) {
-        SDP4(state->minutes_since_epoch, &state->satellite.tle, &state->satellite.position, &state->satellite.velocity);
+        SDP4(prediction->minutes_since_epoch, &prediction->satellite_ephem.tle, &prediction->satellite_ephem.position, &prediction->satellite_ephem.velocity);
     } else {
-        SGP4(state->minutes_since_epoch, &state->satellite.tle, &state->satellite.position, &state->satellite.velocity);
+        SGP4(prediction->minutes_since_epoch, &prediction->satellite_ephem.tle, &prediction->satellite_ephem.position, &prediction->satellite_ephem.velocity);
     }
 
     // pos and vel in km, km/s
-    Convert_Sat_State(&state->satellite.position, &state->satellite.velocity);
-    Magnitude(&state->satellite.velocity);
-    Calculate_Obs(jul_utc, &state->satellite.position, &state->satellite.velocity, &state->observer.position_geodetic, &state->satellite.observation_set);
-    Calculate_LatLonAlt(jul_utc, &state->satellite.position, &state->satellite.position_geodetic);
-    state->satellite.azimuth = Degrees(state->satellite.observation_set.x);
-    state->satellite.elevation = Degrees(state->satellite.observation_set.y);
-    state->satellite.range_km = state->satellite.observation_set.z;
-    state->satellite.range_rate_km_s = state->satellite.observation_set.w;
-    state->satellite.latitude = Degrees(state->satellite.position_geodetic.lat);
-    state->satellite.longitude = Degrees(state->satellite.position_geodetic.lon);
-    state->satellite.altitude_km = state->satellite.position_geodetic.alt;
-    state->satellite.speed_km_s = state->satellite.velocity.w;
+    Convert_Sat_State(&prediction->satellite_ephem.position, &prediction->satellite_ephem.velocity);
+    Magnitude(&prediction->satellite_ephem.velocity);
+    Calculate_Obs(jul_utc, &prediction->satellite_ephem.position, &prediction->satellite_ephem.velocity, &prediction->observer_ephem.position_geodetic, &prediction->satellite_ephem.observation_set);
+    Calculate_LatLonAlt(jul_utc, &prediction->satellite_ephem.position, &prediction->satellite_ephem.position_geodetic);
+    prediction->satellite_ephem.azimuth = Degrees(prediction->satellite_ephem.observation_set.x);
+    prediction->satellite_ephem.elevation = Degrees(prediction->satellite_ephem.observation_set.y);
+    prediction->satellite_ephem.range_km = prediction->satellite_ephem.observation_set.z;
+    prediction->satellite_ephem.range_rate_km_s = prediction->satellite_ephem.observation_set.w;
+    prediction->satellite_ephem.latitude = Degrees(prediction->satellite_ephem.position_geodetic.lat);
+    prediction->satellite_ephem.longitude = Degrees(prediction->satellite_ephem.position_geodetic.lon);
+    prediction->satellite_ephem.altitude_km = prediction->satellite_ephem.position_geodetic.alt;
+    prediction->satellite_ephem.speed_km_s = prediction->satellite_ephem.velocity.w;
     // Assumes ground station (not in a car, drone, balloon, plane, satellite, etc.)
-    Calculate_User_PosVel(state->minutes_since_epoch, &state->observer.position_geodetic, &state->satellite.position, &state->observer.velocity);
-
-    return;
-}
-
-void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, double downlink_freq)
-{
-    double doppler_factor = 1.0 - state->satellite.range_rate_km_s / 299792.458;
-    state->radio.doppler_uplink_frequency = uplink_freq * doppler_factor; // Speed of light in km/s
-    state->radio.doppler_downlink_frequency = downlink_freq * doppler_factor;
+    Calculate_User_PosVel(prediction->minutes_since_epoch, &prediction->observer_ephem.position_geodetic, &prediction->satellite_ephem.position, &prediction->observer_ephem.velocity);
 
     return;
 }
 
 // Overwrites the current satellite position
-void update_pass_predictions(state_t *external_state, double jul_utc_start, double delta_t_minutes)
+void update_pass_predictions(prediction_t *external_prediction, double jul_utc_start, double delta_t_minutes)
 {
-    state_t state = {0};
-    memcpy(&state, external_state, sizeof *external_state);
+    prediction_t prediction = {0};
+    memcpy(&prediction, external_prediction, sizeof *external_prediction);
     double jul_utc = jul_utc_start; 
     // Sets prediction to start of pass
-    update_satellite_position(&state, jul_utc);
-    double current_elevation = state.satellite.elevation;
-    double current_altitude = state.satellite.altitude_km;
+    update_satellite_position(&prediction, jul_utc);
+    double current_elevation = prediction.satellite_ephem.elevation;
+    double current_altitude = prediction.satellite_ephem.altitude_km;
 
     double max_elevation = current_elevation;
     double max_altitude = current_altitude;
@@ -90,15 +80,15 @@ void update_pass_predictions(state_t *external_state, double jul_utc_start, doub
     double minutes_above_30_degrees = 0.0;
     int ascended = 0;
     while (current_elevation > -5.0) {
-        update_satellite_position(&state, jul_utc + pass_duration / 1440.0);
+        update_satellite_position(&prediction, jul_utc + pass_duration / 1440.0);
         pass_duration += delta_t_minutes;
-        current_altitude = state.satellite.altitude_km;
+        current_altitude = prediction.satellite_ephem.altitude_km;
         if (current_elevation > 0.0) {
             minutes_above_0_degrees += delta_t_minutes;
             if (!ascended) {
                 ascended = 1;
-                external_state->predicted_ascension_jul_utc = jul_utc + pass_duration / 1440.0;
-                external_state->predicted_ascension_azimuth = state.satellite.azimuth;
+                external_prediction->predicted_ascension_jul_utc = jul_utc + pass_duration / 1440.0;
+                external_prediction->predicted_ascension_azimuth = prediction.satellite_ephem.azimuth;
             }
             if (max_altitude < current_altitude) {
                 max_altitude = current_altitude;
@@ -107,24 +97,24 @@ void update_pass_predictions(state_t *external_state, double jul_utc_start, doub
                 minutes_above_30_degrees += delta_t_minutes;
             }
         }
-        current_elevation = state.satellite.elevation;
+        current_elevation = prediction.satellite_ephem.elevation;
         if (max_elevation < current_elevation) {
             max_elevation = current_elevation;
         }
     }
-    external_state->predicted_pass_duration_minutes = pass_duration;
-    external_state->predicted_minutes_above_0_degrees = minutes_above_0_degrees;
-    external_state->predicted_minutes_above_30_degrees = minutes_above_30_degrees;
-    external_state->predicted_max_elevation = max_elevation;
-    external_state->predicted_max_altitude = max_altitude;
+    external_prediction->predicted_pass_duration_minutes = pass_duration;
+    external_prediction->predicted_minutes_above_0_degrees = minutes_above_0_degrees;
+    external_prediction->predicted_minutes_above_30_degrees = minutes_above_30_degrees;
+    external_prediction->predicted_max_elevation = max_elevation;
+    external_prediction->predicted_max_altitude = max_altitude;
 
     return;
 }
 
-void minutes_until_visible(state_t *external_state, double jul_utc_start, double jul_utc_stop, double delta_t_minutes)
+void minutes_until_visible(prediction_t *external_prediction, double jul_utc_start, double jul_utc_stop, double delta_t_minutes)
 {
-    state_t state = {0};
-    memcpy(&state, external_state, sizeof *external_state);
+    prediction_t prediction = {0};
+    memcpy(&prediction, external_prediction, sizeof *external_prediction);
     if (jul_utc_start == 0.0) {
         struct tm utc;
         struct timeval tv;
@@ -132,39 +122,39 @@ void minutes_until_visible(state_t *external_state, double jul_utc_start, double
         jul_utc_start = Julian_Date(&utc, &tv);
     }
     double jul_utc = jul_utc_start; 
-    update_satellite_position(&state, jul_utc);
-    double elevation = state.satellite.elevation;
+    update_satellite_position(&prediction, jul_utc);
+    double elevation = prediction.satellite_ephem.elevation;
     if (elevation < 0) {
         // How long until it becomes visible?
         while (elevation < 0 && jul_utc < jul_utc_stop) {
             jul_utc += delta_t_minutes / 1440.0;
-            update_satellite_position(&state, jul_utc);
-            elevation = state.satellite.elevation;
+            update_satellite_position(&prediction, jul_utc);
+            elevation = prediction.satellite_ephem.elevation;
         }
     } else {
         // How long since it became visible?
         while (elevation > 0 && jul_utc < jul_utc_stop) {
             jul_utc -= delta_t_minutes / 1440.0;
-            update_satellite_position(&state, jul_utc);
-            elevation = state.satellite.elevation;
+            update_satellite_position(&prediction, jul_utc);
+            elevation = prediction.satellite_ephem.elevation;
         }
     }
     if (jul_utc > 0 && jul_utc < jul_utc_stop) {
-        external_state->predicted_minutes_until_visible = (jul_utc - jul_utc_start) * 1440.0;
+        external_prediction->predicted_minutes_until_visible = (jul_utc - jul_utc_start) * 1440.0;
     } else {
-        external_state->predicted_minutes_until_visible = -9999.0;
+        external_prediction->predicted_minutes_until_visible = -9999.0;
     }
 
     return;
 }
 
 
-// Returns the first match on state->satellite.name
-int load_tle(state_t *state)
+// Returns the first match on prediction->satellite_ephem.name
+int load_tle(prediction_t *prediction)
 {
-    FILE *file = fopen(state->tles_filename, "r");
+    FILE *file = fopen(prediction->tles_filename, "r");
     if (file == NULL) {
-        fprintf(stderr, "Error opening %s\n", state->tles_filename);
+        fprintf(stderr, "Error opening %s\n", prediction->tles_filename);
         return -1;
     }
     
@@ -177,7 +167,7 @@ int load_tle(state_t *state)
     while (fgets(name, 128, file)) {
         // Remove newline
         name[strlen(name) - 1] = '\0';
-        if (strncmp(state->satellite.name, name, strlen(state->satellite.name)) == 0) {
+        if (strncmp(prediction->satellite_ephem.name, name, strlen(prediction->satellite_ephem.name)) == 0) {
             // Errors caught in TLE check
             // Read 70 characters, including the newline
             ptr = fgets(tle, 71, file);
@@ -190,7 +180,7 @@ int load_tle(state_t *state)
                 break;
             }
             tle[138] = '\0';
-            snprintf(state->satellite.tle.sat_name, sizeof(state->satellite.tle.sat_name), "%s", name);
+            snprintf(prediction->satellite_ephem.tle.sat_name, sizeof(prediction->satellite_ephem.tle.sat_name), "%s", name);
             found_satellite = 1;
             break;
         }
@@ -198,7 +188,7 @@ int load_tle(state_t *state)
     fclose(file);
 
     if (!found_satellite) {
-        fprintf(stderr, "Satellite '%s' not found in %s\n", state->satellite.name, state->tles_filename);
+        fprintf(stderr, "Satellite '%s' not found in %s\n", prediction->satellite_ephem.name, prediction->tles_filename);
         return -2;
     }
 
@@ -206,7 +196,7 @@ int load_tle(state_t *state)
         fprintf(stderr, "Invalid TLE\n");
         return -3;
     }
-    Convert_Satellite_Data(tle, &state->satellite.tle);
+    Convert_Satellite_Data(tle, &prediction->satellite_ephem.tle);
 
     return 0;
 
@@ -233,12 +223,12 @@ int pass_sort_latest_first(const void *a, const void *b)
 }
 
 
-// Returns the first match on state->satellite.name
-int find_passes(state_t *external_state, double jul_utc_start, double delta_t_minutes, criteria_t *criteria, int *count, int *number_checked, int reverse_order, int find_all)
+// Returns the first match on prediction->satellite_ephem.name
+int find_passes(prediction_t *external_prediction, double jul_utc_start, double delta_t_minutes, criteria_t *criteria, int *count, int *number_checked, int reverse_order, int find_all)
 {
-    FILE *file = fopen(external_state->tles_filename, "r");
+    FILE *file = fopen(external_prediction->tles_filename, "r");
     if (file == NULL) {
-        fprintf(stderr, "Error opening %s\n", external_state->tles_filename);
+        fprintf(stderr, "Error opening %s\n", external_prediction->tles_filename);
         return -1;
     }
     
@@ -247,8 +237,8 @@ int find_passes(state_t *external_state, double jul_utc_start, double delta_t_mi
     char name[26] = {0}; 
     int found_satellite = 0;
 
-    state_t state = {0};
-    memcpy(&state, external_state, sizeof *external_state);
+    prediction_t prediction = {0};
+    memcpy(&prediction, external_prediction, sizeof *external_prediction);
     
     // Check every TLE
     int internal_count = 0;
@@ -339,21 +329,21 @@ int find_passes(state_t *external_state, double jul_utc_start, double delta_t_mi
             continue;
         }
 
-        Convert_Satellite_Data(tle, &state.satellite.tle);
+        Convert_Satellite_Data(tle, &prediction.satellite_ephem.tle);
         ClearFlag(ALL_FLAGS);
-        select_ephemeris(&state.satellite.tle);
-        update_satellite_position(&state, jul_utc_start);
+        select_ephemeris(&prediction.satellite_ephem.tle);
+        update_satellite_position(&prediction, jul_utc_start);
 
         // TODO filter on perigee / apogee instead of current altitude?
-        if (state.satellite.altitude_km >= criteria->min_altitude_km && state.satellite.altitude_km <= criteria->max_altitude_km) {
+        if (prediction.satellite_ephem.altitude_km >= criteria->min_altitude_km && prediction.satellite_ephem.altitude_km <= criteria->max_altitude_km) {
             internal_number_checked++;
             double utc_offset_minutes = 0;
             double minutes_until_visible = 0;
             double jul_utc_stop = jul_utc_start + criteria->max_minutes / 1400.0;
-            while (get_next_pass(&state, jul_utc_start + utc_offset_minutes / 1440.0, jul_utc_stop, delta_t_minutes)) {
-                minutes_until_visible = state.predicted_minutes_until_visible + utc_offset_minutes;
-                utc_offset_minutes += state.predicted_minutes_until_visible + 60;
-                if (state.predicted_minutes_above_0_degrees <= 0.0 || state.predicted_max_elevation > criteria->max_elevation || state.predicted_max_elevation < criteria->min_elevation) {
+            while (get_next_pass(&prediction, jul_utc_start + utc_offset_minutes / 1440.0, jul_utc_stop, delta_t_minutes)) {
+                minutes_until_visible = prediction.predicted_minutes_until_visible + utc_offset_minutes;
+                utc_offset_minutes += prediction.predicted_minutes_until_visible + 60;
+                if (prediction.predicted_minutes_above_0_degrees <= 0.0 || prediction.predicted_max_elevation > criteria->max_elevation || prediction.predicted_max_elevation < criteria->min_elevation) {
                     continue;
                 }
                 // Store this pass
@@ -370,11 +360,11 @@ int find_passes(state_t *external_state, double jul_utc_start, double delta_t_mi
                 (void)strncpy(p->name, name, sizeof(p->name));
                 (void)strncpy(p->tle, name, sizeof(p->tle));
                 p->minutes_away = minutes_until_visible;
-                p->pass_duration = state.predicted_pass_duration_minutes;
-                p->ascension_jul_utc = state.predicted_ascension_jul_utc;
-                p->ascension_azimuth = state.predicted_ascension_azimuth;
-                p->max_elevation = state.predicted_max_elevation;
-                p->max_altitude = state.predicted_max_altitude;
+                p->pass_duration = prediction.predicted_pass_duration_minutes;
+                p->ascension_jul_utc = prediction.predicted_ascension_jul_utc;
+                p->ascension_azimuth = prediction.predicted_ascension_azimuth;
+                p->max_elevation = prediction.predicted_max_elevation;
+                p->max_altitude = prediction.predicted_max_altitude;
                 if (find_all == 0) {
                     break;
                 }
@@ -425,16 +415,16 @@ void free_passes(void)
     n_passes = 0;
 }
 
-int get_next_pass(state_t *state, double jul_utc_start, double jul_utc_stop, double delta_t_minutes)
+int get_next_pass(prediction_t *prediction, double jul_utc_start, double jul_utc_stop, double delta_t_minutes)
 {
     int got_pass = 0;
-    minutes_until_visible(state, jul_utc_start, jul_utc_stop, delta_t_minutes);
-    if (state->predicted_minutes_until_visible >= 0) {
+    minutes_until_visible(prediction, jul_utc_start, jul_utc_stop, delta_t_minutes);
+    if (prediction->predicted_minutes_until_visible >= 0) {
         // Refine estimate:
-        if (state->predicted_minutes_until_visible < 10.0 && delta_t_minutes > 1.0/60.) {
-            minutes_until_visible(state, jul_utc_start, jul_utc_stop, 1.0 / 60.0);
+        if (prediction->predicted_minutes_until_visible < 10.0 && delta_t_minutes > 1.0/60.) {
+            minutes_until_visible(prediction, jul_utc_start, jul_utc_stop, 1.0 / 60.0);
         }
-        update_pass_predictions(state, jul_utc_start + state->predicted_minutes_until_visible / 1440.0, 0.25);
+        update_pass_predictions(prediction, jul_utc_start + prediction->predicted_minutes_until_visible / 1440.0, 0.25);
         got_pass = 1;
     }
 

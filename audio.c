@@ -7,7 +7,7 @@
 
 static int result_status = 0;
 
-int init_audio_capture(state_t *state)
+int init_audio_capture(audio_t *state)
 {
     snd_pcm_hw_params_t *params_main;
     snd_pcm_hw_params_t *params_sub;
@@ -65,7 +65,7 @@ int init_audio_capture(state_t *state)
 
 }
 
-void audio_capture_cleanup(state_t *state)
+void audio_capture_cleanup(audio_t *state)
 {
     fclose(state->audio_file_main);
     snd_pcm_drain(state->pcm_handle_main);
@@ -85,7 +85,7 @@ void *capture_audio(void *data)
         return &result_status;
     }
 
-    state_t *state = (state_t*)data;
+    audio_t *state = (audio_t*)data;
 
     int buffer_size = state->audio_frames * AUDIO_CHANNELS * 2; // 2 bytes per sample
     state->audio_buffer_main = malloc(buffer_size);

@@ -61,6 +61,11 @@ typedef struct antenna_rotator
     double azimuth;
     double elevation;
     int fixed_target;
+    int tracking;
+    double tracking_prep_time_minutes;
+    int antenna_is_under_control;
+    int antenna_should_be_controlled;
+    int antenna_is_moving;
 } antenna_rotator_t;
 
 int antenna_rotator_init(antenna_rotator_t *antenna_rotator);

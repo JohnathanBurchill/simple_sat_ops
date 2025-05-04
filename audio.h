@@ -1,7 +1,7 @@
 #ifndef AUDIO_H
 #define AUDIO_H
 
-#include "state.h"
+#include <alsa/asoundlib.h>
 
 #define AUDIO_DEVICE_NAME_MAIN "hw:3,0"
 #define AUDIO_DEVICE_NAME_SUB "hw:4,0"
@@ -23,8 +23,25 @@ enum audio_errors {
     AUDIO_FILE_OPEN,
 };
 
-int init_audio_capture(state_t *state);
-void audio_capture_cleanup(state_t *state);
+typedef struct audio {
+    snd_pcm_t *pcm_handle_main;
+    snd_pcm_t *pcm_handle_sub;
+    snd_pcm_uframes_t audio_frames;
+    pthread_t audio_thread_main;
+    pthread_t audio_thread_sub;
+    char *audio_output_file_basename;
+    char audio_output_filename_main[FILENAME_MAX];
+    char audio_output_filename_sub[FILENAME_MAX];
+    FILE *audio_file_main;
+    FILE *audio_file_sub;
+    char *audio_buffer_main;
+    char *audio_buffer_sub;
+    volatile int recording_audio;
+    int audio_record;
+} audio_t;
+
+int init_audio_capture(audio_t *state);
+void audio_capture_cleanup(audio_t *state);
 void *capture_audio(void *data);
 
 
