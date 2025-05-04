@@ -247,7 +247,7 @@ int main(int argc, char **argv)
                     printf("%8.1f d ", p->minutes_away / 1440.0);
                 }
                 printf("%9.1f %7.1f %9.1f %9.1f", p->pass_duration, p->max_altitude, p->ascension_azimuth, p->max_elevation);
-                if (show_radio_info == 1) {
+                if (satellite_name == NULL && show_radio_info == 1) {
                     print_radio_info(p->name, sat_info, n_entries);
                 }
                 printf("\n");
