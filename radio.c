@@ -214,6 +214,10 @@ int radio_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subsubcmd
     telemetry[offset++] = 0xFD;
     printcmd("Radio command:", telemetry, offset);
 
+    // Clear the transmit and receive buffers 
+    // (if this command has priority?)
+    tcflush(radio->fd, TCIOFLUSH);
+    // Send the command
     ssize_t bytes_sent = write(radio->fd, telemetry, offset); 
     if (bytes_sent != offset) {
         return RADIO_BAD_RESPONSE;
