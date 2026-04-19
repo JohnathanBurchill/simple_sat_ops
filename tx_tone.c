@@ -43,24 +43,89 @@ static void on_signal(int sig)
     _exit(130);
 }
 
-static void usage(FILE *dest, const char *name)
+static void usage(FILE *dest, const char *name, int full)
 {
     fprintf(dest,
         "usage: %s --audio-device=<alsa> [options]\n"
         "\n"
-        "Required:\n"
-        "  --audio-device=<name>       ALSA PCM device, e.g. hw:3,0 (run `aplay -l`)\n"
+        "Key the IC-9700 on a simplex UHF carrier and play a sine tone through\n"
+        "the radio's TX chain. Uplink bring-up tool; does no modulation yet.\n"
         "\n"
-        "Options:\n"
-        "  --radio-device=<path>       CI-V serial device (default /dev/ttyUSB1)\n"
-        "  --radio-serial-speed=<bps>  Serial speed integer (default 115200)\n"
-        "  --freq-hz=<hz>              UHF simplex carrier (default %.0f = %.6f MHz)\n"
-        "  --tone-hz=<hz>              Tone frequency (default 1000)\n"
-        "  --duration-s=<seconds>      Tone duration (default 3.0)\n"
-        "  --amplitude=<0..1>          Amplitude into S16 full-scale (default 0.3)\n"
-        "  --no-ptt                    Skip CI-V PTT; play audio only\n"
-        "  --help                      This message\n",
+        "Required:\n"
+        "  --audio-device=<name>        ALSA PCM device (e.g. hw:3,0)\n"
+        "\n"
+        "Radio transport:\n"
+        "  --radio-device=<path>        CI-V tty (default /dev/ttyUSB1)\n"
+        "  --radio-serial-speed=<bps>   Serial speed integer (default 115200;\n"
+        "                               ignored on CDC-ACM / native-USB)\n"
+        "\n"
+        "Carrier and tone:\n"
+        "  --freq-hz=<hz>               UHF simplex carrier (default %.0f\n"
+        "                               = %.6f MHz, FRONTIERSAT_CARRIER_HZ)\n"
+        "  --tone-hz=<hz>               Tone frequency (default 1000)\n"
+        "  --duration-s=<seconds>       Tone duration (default 3.0)\n"
+        "  --amplitude=<0..1>           Amplitude into S16 full-scale (default 0.3)\n"
+        "\n"
+        "Behaviour flags:\n"
+        "  --no-ptt                     Skip CI-V PTT; play audio only (bench test)\n"
+        "  --help                       Short help (this message)\n"
+        "  --help-full                  Detailed help with setup and verification\n",
         name, FRONTIERSAT_CARRIER_HZ, FRONTIERSAT_CARRIER_HZ / 1e6);
+
+    if (!full) return;
+
+    fprintf(dest,
+        "\n"
+        "TRANSPORT SETUPS\n"
+        "\n"
+        "Both are supported transparently; only device paths differ.\n"
+        "\n"
+        "  A. External USB-to-serial + external USB soundcard (SignaLink etc.)\n"
+        "       --radio-device=/dev/ttyUSB1  --audio-device=hw:3,0\n"
+        "       The serial speed must match the 9700's CI-V menu setting.\n"
+        "       Audio goes over the soundcard's line-out into the 9700's MIC\n"
+        "       or ACC/DATA jack.\n"
+        "\n"
+        "  B. IC-9700 native USB (CI-V on CDC-ACM, MOD on USB Audio Class)\n"
+        "       --radio-device=/dev/ttyACM0  --audio-device=hw:<9700-card>,0\n"
+        "       Baud is ignored by CDC-ACM. Audio is carried by the 9700's\n"
+        "       built-in USB CODEC; no external soundcard needed.\n"
+        "\n"
+        "Run `aplay -l` on the target to enumerate ALSA cards and pick the right\n"
+        "hw:N,M string for --audio-device.\n"
+        "\n"
+        "RADIO CONFIGURATION AT STARTUP\n"
+        "\n"
+        "simple_sat_ops owns the radio. tx_tone configures it fully every run:\n"
+        "  - satellite mode OFF (simplex, single active VFO)\n"
+        "  - Sub parked on 145.150 MHz (VHF) to avoid same-band collisions\n"
+        "  - Main = VFO A, FM, FIL1, tuned to --freq-hz\n"
+        "  - PTT asserted via CI-V 0x1C 0x00 (unless --no-ptt)\n"
+        "  - On exit (clean or signal) PTT is released before disconnect.\n"
+        "\n"
+        "VERIFICATION SEQUENCE\n"
+        "\n"
+        "  1. Bench audio, no radio:\n"
+        "       %s --no-ptt --audio-device=hw:Loopback,0 --duration-s=2\n"
+        "     Confirms NCO + ALSA playback via snd-aloop.\n"
+        "\n"
+        "  2. PTT only, dummy load, no audio:\n"
+        "       %s --audio-device=hw:3,0 --duration-s=0.5 --amplitude=0\n"
+        "     Radio keys TX briefly then releases. Confirms CI-V PTT.\n"
+        "\n"
+        "  3. Full end-to-end on a dummy load, monitor on a 2nd receiver:\n"
+        "       %s --audio-device=hw:3,0 --duration-s=5 --amplitude=0.3\n"
+        "\n"
+        "CAVEATS\n"
+        "\n"
+        "  - Plain FM mode; audio goes through the 9700's mic EQ. When we move\n"
+        "    to 9600 bps packet we will switch to PKT-FM (data mode) for flat\n"
+        "    modulation; tx_tone does not set that today.\n"
+        "  - The modulation input source (MIC / ACC / USB / DATA) is a front-\n"
+        "    panel menu setting and must be aligned with whichever jack carries\n"
+        "    the audio cable. Not configured via CI-V here.\n"
+        "  - SIGINT / SIGTERM handler releases PTT before exit, so ^C is safe.\n",
+        name, name, name);
 }
 
 int main(int argc, char **argv)
@@ -98,18 +163,21 @@ int main(int argc, char **argv)
         } else if (strcmp("--no-ptt", argv[i]) == 0) {
             g_no_ptt = 1;
         } else if (strcmp("--help", argv[i]) == 0) {
-            usage(stdout, argv[0]);
+            usage(stdout, argv[0], 0);
+            return 0;
+        } else if (strcmp("--help-full", argv[i]) == 0) {
+            usage(stdout, argv[0], 1);
             return 0;
         } else {
             fprintf(stderr, "Unable to parse option '%s'\n", argv[i]);
-            usage(stderr, argv[0]);
+            usage(stderr, argv[0], 0);
             return EXIT_FAILURE;
         }
     }
 
     if (audio_device == NULL) {
         fprintf(stderr, "error: --audio-device is required. Run `aplay -l` on the target to list devices.\n");
-        usage(stderr, argv[0]);
+        usage(stderr, argv[0], 0);
         return EXIT_FAILURE;
     }
 

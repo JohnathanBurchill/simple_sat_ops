@@ -60,10 +60,117 @@ void stop_tracking(state_t *state);
 void enable_wildrose_mode(state_t *state);
 int point_to_stationary_target(state_t *state, double azimuth, double elevation);
 
-void usage(FILE *dest, const char *name) 
+void usage(FILE *dest, const char *name, int full)
 {
-    fprintf(dest, "usage: %s <tles_file> <satellite_id>\n", name);
-    return;
+    fprintf(dest,
+        "usage: %s <tles_file> <satellite_id> [options]\n"
+        "\n"
+        "Live satellite tracker for the FrontierSat ground station. Predicts\n"
+        "passes, drives the SPID rotator, and (with --with-radio) tunes the\n"
+        "IC-9700 onto the simplex UHF carrier with Doppler correction.\n"
+        "\n"
+        "Positional arguments:\n"
+        "  <tles_file>                  Path to a TLE file (2 or 3-line format)\n"
+        "  <satellite_id>               Name prefix to match in the TLE, or `next`\n"
+        "                               to auto-select the next visible pass\n"
+        "\n"
+        "Hardware toggles (all opt-in; no hardware is the default):\n"
+        "  --with-radio                 Initialise and command the IC-9700\n"
+        "  --with-rotator               Initialise and command the SPID Rot2Prog\n"
+        "  --with-hardware              Shortcut: enables both of the above\n"
+        "\n"
+        "Radio transport (see --help-full for the two supported setups):\n"
+        "  --radio-device=<path>        CI-V tty (default /dev/ttyUSB1)\n"
+        "  --radio-serial-speed=<bps>   Serial speed (default 115200;\n"
+        "                               ignored on CDC-ACM / native-USB)\n"
+        "\n"
+        "Carrier and modes:\n"
+        "  --uplink-freq-mhz=<mhz>      Uplink nominal (default %.6f)\n"
+        "  --downlink-freq-mhz=<mhz>    Downlink / simplex carrier nominal\n"
+        "                               (default %.6f)\n"
+        "  --uplink-mode=<mode>         FM|USB|LSB|CW|AM (default FM)\n"
+        "  --downlink-mode=<mode>       FM|USB|LSB|CW|AM (default FM)\n"
+        "  --no-doppler-correction      Disable runtime Doppler retuning\n"
+        "\n"
+        "Rotator overrides:\n"
+        "  --rotator-target-azimuth=<deg>    Park on a fixed azimuth\n"
+        "  --rotator-target-elevation=<deg>  Park on a fixed elevation\n"
+        "\n"
+        "Observer location (default RAO Priddis):\n"
+        "  --lat=<deg>                  Geodetic latitude\n"
+        "  --lon=<deg>                  Geodetic longitude (east positive)\n"
+        "  --alt=<m>                    Altitude above ellipsoid, metres\n"
+        "\n"
+        "Pass filter (used when <satellite_id> = `next`):\n"
+        "  --include-constellations     Include Starlink/OneWeb-style swarms\n"
+        "  --min-altitude-km=<km>       Minimum orbital altitude (default 0)\n"
+        "  --max-altitude-km=<km>       Maximum orbital altitude (default 1000)\n"
+        "  --min-elevation=<deg>        Minimum peak elevation (default 0)\n"
+        "  --min-minutes=<n>            Minimum minutes until AOS (default 1)\n"
+        "  --max-minutes=<n>            Maximum minutes until AOS (default 90)\n"
+        "\n"
+        "Recording:\n"
+        "  --without-audio              Skip ALSA capture thread\n"
+        "  --radio-audio-output-file=<basename>\n"
+        "                               Capture file basename\n"
+        "                               (default session/session_pcm_audio)\n"
+        "\n"
+        "Other:\n"
+        "  --verbose=<level>            Verbosity integer\n"
+        "  --help                       Short help (this message)\n"
+        "  --help-full                  Detailed help with keyboard, transports,\n"
+        "                               and operational notes\n",
+        name,
+        UPLINK_FREQ_MHZ, DOWNLINK_FREQ_MHZ);
+
+    if (!full) return;
+
+    fprintf(dest,
+        "\n"
+        "KEYBOARD (locked by default, press K to unlock for ~5 s)\n"
+        "\n"
+        "  K         Unlock keyboard for ~5 seconds\n"
+        "  T         Start tracking the current satellite\n"
+        "  s         Stop tracking\n"
+        "  r         Reset rotator to az=0, el=0\n"
+        "  [         Nudge antenna azimuth -5 deg\n"
+        "  ]         Nudge antenna azimuth +5 deg\n"
+        "  *         Enable Wildrose reference mode (432.325 MHz CW)\n"
+        "  q         Quit\n"
+        "\n"
+        "RADIO TRANSPORT SETUPS\n"
+        "\n"
+        "  A. External USB-to-serial + external USB soundcard (SignaLink etc.)\n"
+        "       --radio-device=/dev/ttyUSB1\n"
+        "       Serial speed must match the 9700's CI-V menu setting.\n"
+        "\n"
+        "  B. IC-9700 native USB (CI-V on CDC-ACM)\n"
+        "       --radio-device=/dev/ttyACM0\n"
+        "       Baud is ignored by CDC-ACM.\n"
+        "\n"
+        "RADIO STARTUP STATE (when --with-radio)\n"
+        "\n"
+        "simple_sat_ops assumes exclusive ownership of the IC-9700 and configures\n"
+        "it fully on each run:\n"
+        "  - satellite mode OFF (simplex, single active VFO)\n"
+        "  - Sub parked on 145.150 MHz to avoid same-band collisions\n"
+        "  - Main = VFO A, FM, FIL1, tuned to --downlink-freq-mhz\n"
+        "  - Doppler correction retunes Main only while in-pass\n"
+        "\n"
+        "EXAMPLES\n"
+        "\n"
+        "  # Dry-run prediction (no hardware, TLEs from local file)\n"
+        "  %s TLEs/amateur.tle 'ISS (ZARYA)'\n"
+        "\n"
+        "  # Auto-pick the next 10-45 min visible pass above 10 deg\n"
+        "  %s TLEs/amateur.tle next --min-elevation=10 --min-minutes=10 --max-minutes=45\n"
+        "\n"
+        "  # Full live operation at RAO (external transport)\n"
+        "  %s TLEs/amateur.tle next --with-hardware\n"
+        "\n"
+        "  # Live operation on 9700 native USB (just change the device path)\n"
+        "  %s TLEs/amateur.tle next --with-hardware --radio-device=/dev/ttyACM0\n",
+        name, name, name, name);
 }
 
 void init_window(void)
@@ -873,7 +980,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             }
             max_minutes_away = atof(argv[i] + 14);
         } else if (strcmp("--help", argv[i]) == 0) {
-            usage(stdout, argv[0]);
+            usage(stdout, argv[0], 0);
+            return 2;
+        } else if (strcmp("--help-full", argv[i]) == 0) {
+            usage(stdout, argv[0], 1);
             return 2;
         } else if (strncmp("--", argv[i], 2) == 0) {
             fprintf(stderr, "Unable to parse option '%s'\n", argv[i]);
@@ -882,7 +992,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
 
     }
     if (argc - state->n_options != 3) {
-        usage(stderr, argv[0]);
+        usage(stderr, argv[0], 0);
         return 1;
     }
 
