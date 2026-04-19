@@ -28,7 +28,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(NCURSES REQUIRED ncurses)
 
 # Add the main executable
-add_executable(simple_sat_ops main.c prediction.c radio.c antenna_rotator.c audio.c)
+add_executable(simple_sat_ops main.c prediction.c radio.c antenna_rotator.c audio.c telemetry.c)
 # target_compile_definitions(simple_sat_ops PUBLIC -DQOL)
 
 # Link the sgp4sdp4 library

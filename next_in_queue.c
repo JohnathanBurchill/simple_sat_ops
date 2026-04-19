@@ -221,7 +221,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    state.tles_filename = argv[1];
+    state.prediction.tles_filename = argv[1];
     double min_altitude_km = atof(argv[2]);
     double max_altitude_km = atof(argv[3]);
     char *satellite_name = NULL;
@@ -234,9 +234,9 @@ int main(int argc, char **argv)
     }
 
     /* Set up observer location */
-    state.observer.position_geodetic.lat = site_latitude * M_PI / 180.0;
-    state.observer.position_geodetic.lon = site_longitude * M_PI / 180.0;
-    state.observer.position_geodetic.alt = site_altitude / 1000.0;
+    state.prediction.observer_ephem.position_geodetic.lat = site_latitude * M_PI / 180.0;
+    state.prediction.observer_ephem.position_geodetic.lon = site_longitude * M_PI / 180.0;
+    state.prediction.observer_ephem.position_geodetic.alt = site_altitude / 1000.0;
 
     struct tm utc;
     struct timeval tv;
@@ -246,7 +246,7 @@ int main(int argc, char **argv)
     struct tm utc_ref;
     Date_Time(jul_utc, &utc_ref);
 
-    printf("Checking %s for upcoming ", state.tles_filename);
+    printf("Checking %s for upcoming ", state.prediction.tles_filename);
     if (satellite_name != NULL) {
         printf("%s", satellite_name);
     } else {
@@ -275,7 +275,7 @@ int main(int argc, char **argv)
 
     int count = 0;
     int number_checked = 0;
-    status = find_passes(&state, jul_utc, 1.0, &criteria, &count, &number_checked, reverse, satellite_name != NULL ? 1 : 0);
+    status = find_passes(&state.prediction, jul_utc, 1.0, &criteria, &count, &number_checked, reverse, satellite_name != NULL ? 1 : 0);
     const size_t n_passes = number_of_passes();
 
     // satellite info
@@ -308,7 +308,7 @@ int main(int argc, char **argv)
                     printf("%8.1f d ", p->minutes_away / 1440.0);
                 }
                 printf("%9.1f %7.1f %9.1f %9.1f", p->pass_duration, p->max_altitude, p->ascension_azimuth, p->max_elevation);
-                if (show_radio_info == 1) {
+                if (satellite_name == NULL && show_radio_info == 1) {
                     print_radio_info(p->name, sat_info, n_entries);
                 }
                 printf("\n");
