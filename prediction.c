@@ -194,8 +194,7 @@ int load_tle(prediction_t *prediction)
             if (l2 > 69) l2 = 69;
             memset(tle, 0, sizeof(tle));
             memcpy(tle, line1, l1);
-            tle[69] = '\n';
-            memcpy(tle + 70, line2, l2);
+            memcpy(tle + 69, line2, l2);
             snprintf(prediction->satellite_ephem.tle.sat_name, sizeof(prediction->satellite_ephem.tle.sat_name), "%s", name);
             found_satellite = 1;
             break;
@@ -313,8 +312,7 @@ int find_passes(prediction_t *external_prediction, double jul_utc_start, double 
         if (l2 > 69) l2 = 69;
         memset(tle, 0, sizeof(tle));
         memcpy(tle, line1, l1);
-        tle[69] = '\n';
-        memcpy(tle + 70, line2, l2);
+        memcpy(tle + 69, line2, l2);
         // Calculate minutes away
         if (!Good_Elements(tle)) {
             fprintf(stderr, "Invalid TLE\n");
