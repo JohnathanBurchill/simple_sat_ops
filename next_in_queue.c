@@ -47,7 +47,7 @@ void usage(FILE *dest, const char *name, int full)
         "  --reverse                    Sort latest-first\n"
         "  --max-passes=<n>             Limit output to n passes\n"
         "  --show-radio-info            Annotate with amateur-radio info\n"
-        "                               from satellites/active_radios.txt\n"
+        "                               from active_radios.txt next to the TLE\n"
         "\n"
         "Pass filter:\n"
         "  --min-minutes=<n>            Minimum minutes until AOS (default 0)\n"
@@ -88,8 +88,9 @@ void usage(FILE *dest, const char *name, int full)
         "\n"
         "NOTES\n"
         "  - The tool never opens the radio or rotator; safe to run on any host.\n"
-        "  - `satellites/active_radios.txt` is a community-maintained CSV used by\n"
-        "    --show-radio-info; missing satellites are simply omitted.\n",
+        "  - `active_radios.txt` (looked for in the same directory as the TLE)\n"
+        "    is a community-maintained CSV used by --show-radio-info;\n"
+        "    missing satellites are simply omitted.\n",
         name, name, name);
 }
 
@@ -281,7 +282,14 @@ int main(int argc, char **argv)
     // satellite info
     satellite_status_t *sat_info = NULL;
     int n_entries = 0;
-    char *radios_file = "satellites/active_radios.txt"; 
+    char radios_file[FILENAME_MAX];
+    const char *slash = strrchr(state.prediction.tles_filename, '/');
+    if (slash != NULL) {
+        int dir_len = (int)(slash - state.prediction.tles_filename);
+        snprintf(radios_file, sizeof(radios_file), "%.*s/active_radios.txt", dir_len, state.prediction.tles_filename);
+    } else {
+        snprintf(radios_file, sizeof(radios_file), "active_radios.txt");
+    }
     status = parse_satellite_status_file(radios_file, &sat_info, &n_entries);
 
 
