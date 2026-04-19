@@ -328,20 +328,27 @@ int find_passes(prediction_t *external_prediction, double jul_utc_start, double 
             n--;
         }
         name[n] = '\0';
-        // Filter with regex
-        if (!criteria->with_constellations) { 
-            for (int i = 0; i < n_constellations; i++) {
-                if (strncmp(constellations[i], name, strlen(constellations[i])) == 0) {
-                    skip_this = 1;
-                    break;
-                }
-            }
-            if (skip_this) {
+        // Literal prefix match on the satellite name overrides regex and
+        // constellation filtering — the user asked for this sat specifically.
+        if (criteria->name_prefix != NULL) {
+            if (strncmp(name, criteria->name_prefix, strlen(criteria->name_prefix)) != 0) {
                 continue;
             }
-        }
-        if (criteria->regex != NULL && (regexec(&pattern, name, 0, NULL, 0) == REG_NOMATCH)) {
-            continue;
+        } else {
+            if (!criteria->with_constellations) {
+                for (int i = 0; i < n_constellations; i++) {
+                    if (strncmp(constellations[i], name, strlen(constellations[i])) == 0) {
+                        skip_this = 1;
+                        break;
+                    }
+                }
+                if (skip_this) {
+                    continue;
+                }
+            }
+            if (criteria->regex != NULL && (regexec(&pattern, name, 0, NULL, 0) == REG_NOMATCH)) {
+                continue;
+            }
         }
 
         Convert_Satellite_Data(tle, &prediction.satellite_ephem.tle);

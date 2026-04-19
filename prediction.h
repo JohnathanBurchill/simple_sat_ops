@@ -34,6 +34,9 @@ typedef struct criteria
     char *regex;
     int regex_ignore_case;
     int with_constellations;
+    // If non-NULL, only satellites whose names start with this string
+    // are considered, bypassing the constellation filter.
+    const char *name_prefix;
 } criteria_t;
 
 typedef struct pass

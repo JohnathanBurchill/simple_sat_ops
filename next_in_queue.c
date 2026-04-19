@@ -227,11 +227,10 @@ int main(int argc, char **argv)
     double max_altitude_km = atof(argv[3]);
     char *satellite_name = NULL;
     if (n_args == 5) {
-        // Checking for a specific satellite 
+        // Checking for a specific satellite
         // Increase the timespan to 1 week
-        satellite_name = argv[4]; 
+        satellite_name = argv[4];
         max_minutes_away = 1440 * 7;
-        regex = satellite_name;
     }
 
     /* Set up observer location */
@@ -272,6 +271,7 @@ int main(int argc, char **argv)
         .regex = regex,
         .regex_ignore_case = regex_ignore_case,
         .with_constellations = with_constellations,
+        .name_prefix = satellite_name,
     };
 
     int count = 0;
