@@ -32,7 +32,7 @@
 void usage(FILE *dest, const char *name, int full)
 {
     fprintf(dest,
-        "usage: %s <tles_file> <min_alt_km> <max_alt_km> [options]\n"
+        "usage: %s <tles_file> <min_alt_km> <max_alt_km> [<satellite_name>] [options]\n"
         "\n"
         "Scan a TLE file for upcoming passes over the ground station and report\n"
         "the soonest (or every) match. Read-only; no hardware commands.\n"
@@ -41,6 +41,12 @@ void usage(FILE *dest, const char *name, int full)
         "  <tles_file>                  Path to a TLE file (2 or 3-line format)\n"
         "  <min_alt_km>                 Minimum orbital altitude, km\n"
         "  <max_alt_km>                 Maximum orbital altitude, km\n"
+        "  <satellite_name>             Optional. Literal, case-sensitive name\n"
+        "                               prefix (e.g. 'ISS (ZARYA)'). Must appear\n"
+        "                               before any --options. Bypasses the\n"
+        "                               constellation filter and extends the\n"
+        "                               search window to one week. For regex\n"
+        "                               matching use --regex= instead.\n"
         "\n"
         "Output:\n"
         "  --list                       Print all matching passes (default: one)\n"
@@ -86,12 +92,15 @@ void usage(FILE *dest, const char *name, int full)
         "  %s TLEs/amateur.tle 300 500 --list \\\n"
         "      --regex='ISS|ZARYA' --ignore-case --show-radio-info\n"
         "\n"
+        "  # Passes for a specific satellite over the next week\n"
+        "  %s TLEs/active.tle 0 2000 'ISS (ZARYA)' --list\n"
+        "\n"
         "NOTES\n"
         "  - The tool never opens the radio or rotator; safe to run on any host.\n"
         "  - `active_radios.txt` (looked for in the same directory as the TLE)\n"
         "    is a community-maintained CSV used by --show-radio-info;\n"
         "    missing satellites are simply omitted.\n",
-        name, name, name);
+        name, name, name, name);
 }
 
 void print_radio_info(const char *name, satellite_status_t *sat_info, int n_entries);
