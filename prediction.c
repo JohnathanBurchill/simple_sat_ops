@@ -29,6 +29,21 @@
 static pass_t *passes = NULL;
 static size_t n_passes = 0;
 
+// Reads a line from f, trims trailing \r and/or \n, NUL-terminates.
+// Returns 1 on success, 0 on EOF/error. Callers must size buf large
+// enough to hold the longest expected line + terminator.
+static int read_tle_line(char *buf, size_t size, FILE *f)
+{
+    if (fgets(buf, (int)size, f) == NULL) {
+        return 0;
+    }
+    size_t n = strlen(buf);
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {
+        buf[--n] = '\0';
+    }
+    return 1;
+}
+
 void update_satellite_position(prediction_t *prediction, double jul_utc)
 {
     // jul times are days
@@ -157,29 +172,30 @@ int load_tle(prediction_t *prediction)
         fprintf(stderr, "Error opening %s\n", prediction->tles_filename);
         return -1;
     }
-    
-    // 2 69-character lines plus a nul terminator
-    char tle[139] = {0};
-    char name[128] = {0}; 
-    int found_satellite = 0;
-    char *ptr = NULL;
 
-    while (fgets(name, 128, file)) {
-        // Remove newline
-        name[strlen(name) - 1] = '\0';
+    // sgp4sdp4 expects two 69-char TLE lines joined by \n, NUL-terminated
+    char tle[139] = {0};
+    char name[128] = {0};
+    char line1[80] = {0};
+    char line2[80] = {0};
+    int found_satellite = 0;
+
+    while (read_tle_line(name, sizeof(name), file)) {
         if (strncmp(prediction->satellite_ephem.name, name, strlen(prediction->satellite_ephem.name)) == 0) {
-            // Errors caught in TLE check
-            // Read 70 characters, including the newline
-            ptr = fgets(tle, 71, file);
-            if (ptr == NULL) {
+            if (!read_tle_line(line1, sizeof(line1), file)) {
                 break;
             }
-            // Read 69 characterers
-            ptr = fgets(tle + 69, 70, file);
-            if (ptr == NULL) {
+            if (!read_tle_line(line2, sizeof(line2), file)) {
                 break;
             }
-            tle[138] = '\0';
+            size_t l1 = strlen(line1);
+            size_t l2 = strlen(line2);
+            if (l1 > 69) l1 = 69;
+            if (l2 > 69) l2 = 69;
+            memset(tle, 0, sizeof(tle));
+            memcpy(tle, line1, l1);
+            tle[69] = '\n';
+            memcpy(tle + 70, line2, l2);
             snprintf(prediction->satellite_ephem.tle.sat_name, sizeof(prediction->satellite_ephem.tle.sat_name), "%s", name);
             found_satellite = 1;
             break;
@@ -232,9 +248,11 @@ int find_passes(prediction_t *external_prediction, double jul_utc_start, double 
         return -1;
     }
     
-    // 2 69-character lines plus a nul terminator
+    // sgp4sdp4 expects two 69-char TLE lines joined by \n, NUL-terminated
     char tle[160] = {0};
-    char name[26] = {0}; 
+    char name[128] = {0};
+    char line1[80] = {0};
+    char line2[80] = {0};
     int found_satellite = 0;
 
     prediction_t prediction = {0};
@@ -280,24 +298,23 @@ int find_passes(prediction_t *external_prediction, double jul_utc_start, double 
     };
     int n_constellations = sizeof constellations / sizeof(char *);
     int skip_this = 0;
-    char *ptr = NULL;
 
-    while (fgets(name, 26, file)) {
+    while (read_tle_line(name, sizeof(name), file)) {
         skip_this = 0;
-        // Remove newline
-        name[strlen(name) - 1] = '\0';
-        // Errors caught in TLE check
-        // Read 70 characters, including the newline
-        ptr = fgets(tle, 71, file);
-        if (ptr == NULL) {
+        if (!read_tle_line(line1, sizeof(line1), file)) {
             break;
         }
-        // Read remaining characterers
-        ptr = fgets(tle + 69, 71, file);
-        if (ptr == NULL) {
+        if (!read_tle_line(line2, sizeof(line2), file)) {
             break;
         }
-        tle[138] = '\0';
+        size_t l1 = strlen(line1);
+        size_t l2 = strlen(line2);
+        if (l1 > 69) l1 = 69;
+        if (l2 > 69) l2 = 69;
+        memset(tle, 0, sizeof(tle));
+        memcpy(tle, line1, l1);
+        tle[69] = '\n';
+        memcpy(tle + 70, line2, l2);
         // Calculate minutes away
         if (!Good_Elements(tle)) {
             fprintf(stderr, "Invalid TLE\n");
