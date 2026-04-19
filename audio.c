@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <alsa/asoundlib.h>
+#include <math.h>
 #include <time.h>
 
 static int result_status = 0;
@@ -124,4 +125,92 @@ void *capture_audio(void *data)
 
     result_status = AUDIO_OK;
     return &result_status;
+}
+
+int audio_playback_open(snd_pcm_t **handle, const char *device,
+                        unsigned int rate_hz, unsigned int channels)
+{
+    if (handle == NULL || device == NULL) {
+        return AUDIO_ARGS;
+    }
+    if (snd_pcm_open(handle, device, SND_PCM_STREAM_PLAYBACK, 0) < 0) {
+        return AUDIO_DEVICE_OPEN;
+    }
+
+    snd_pcm_hw_params_t *params = NULL;
+    snd_pcm_hw_params_malloc(&params);
+    snd_pcm_hw_params_any(*handle, params);
+    snd_pcm_hw_params_set_access(*handle, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(*handle, params, AUDIO_FORMAT);
+    snd_pcm_hw_params_set_channels(*handle, params, channels);
+    unsigned int rate = rate_hz;
+    int dir = 0;
+    snd_pcm_hw_params_set_rate_near(*handle, params, &rate, &dir);
+    snd_pcm_uframes_t period = AUDIO_PLAYBACK_FRAMES_PER_CHUNK;
+    snd_pcm_hw_params_set_period_size_near(*handle, params, &period, &dir);
+    int apply = snd_pcm_hw_params(*handle, params);
+    snd_pcm_hw_params_free(params);
+    if (apply < 0) {
+        snd_pcm_close(*handle);
+        *handle = NULL;
+        return AUDIO_DEVICE_OPEN;
+    }
+    return AUDIO_OK;
+}
+
+int audio_play_tone(snd_pcm_t *handle, double freq_hz, double amplitude,
+                    double duration_s, unsigned int rate_hz, unsigned int channels)
+{
+    if (handle == NULL || channels == 0 || rate_hz == 0) {
+        return AUDIO_ARGS;
+    }
+    if (amplitude < 0.0) amplitude = 0.0;
+    if (amplitude > 1.0) amplitude = 1.0;
+
+    const snd_pcm_uframes_t frames_per_chunk = AUDIO_PLAYBACK_FRAMES_PER_CHUNK;
+    int16_t *buf = malloc(frames_per_chunk * channels * sizeof(int16_t));
+    if (buf == NULL) {
+        return AUDIO_MEMORY;
+    }
+
+    double phase = 0.0;
+    const double phase_inc = 2.0 * M_PI * freq_hz / (double)rate_hz;
+    const int16_t scale = (int16_t)(amplitude * 32767.0);
+    const uint64_t total_frames = (uint64_t)(duration_s * (double)rate_hz);
+    uint64_t frames_sent = 0;
+
+    while (frames_sent < total_frames) {
+        snd_pcm_uframes_t n = frames_per_chunk;
+        if (n > total_frames - frames_sent) {
+            n = (snd_pcm_uframes_t)(total_frames - frames_sent);
+        }
+        for (snd_pcm_uframes_t i = 0; i < n; i++) {
+            int16_t sample = (int16_t)((double)scale * sin(phase));
+            phase += phase_inc;
+            if (phase >= 2.0 * M_PI) phase -= 2.0 * M_PI;
+            for (unsigned int c = 0; c < channels; c++) {
+                buf[i * channels + c] = sample;
+            }
+        }
+        snd_pcm_sframes_t written = snd_pcm_writei(handle, buf, n);
+        if (written == -EPIPE) {
+            snd_pcm_prepare(handle);
+            continue;
+        }
+        if (written < 0) {
+            free(buf);
+            return AUDIO_DEVICE_OPEN;
+        }
+        frames_sent += (uint64_t)written;
+    }
+
+    free(buf);
+    return AUDIO_OK;
+}
+
+void audio_playback_close(snd_pcm_t *handle)
+{
+    if (handle == NULL) return;
+    snd_pcm_drain(handle);
+    snd_pcm_close(handle);
 }

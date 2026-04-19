@@ -28,6 +28,12 @@
 #define RADIO_MAX_COMMAND_LEN 128
 #define RADIO_MAX_COMMAND_RESULT_LEN 1024
 
+#define FRONTIERSAT_CARRIER_HZ 436150000.0
+
+/* simple_sat_ops owns this radio. Sub is never used on-air; park it on an
+   unused VHF freq so Main (UHF) never collides with Sub on the same band. */
+#define RADIO_SUB_PARK_HZ 145150000.0
+
 enum RADIO_STATUS {
     RADIO_OK = 0,
     RADIO_BAD_RESPONSE,
@@ -86,6 +92,7 @@ typedef struct radio
     double reference_downlink_frequency;
     double nominal_uplink_frequency;
     double nominal_downlink_frequency;
+    double sub_park_frequency;
     double doppler_uplink_frequency;
     double doppler_downlink_frequency;
     double vfo_main_actual_frequency;
@@ -106,6 +113,7 @@ int radio_set_frequency(radio_t *radio, double frequency);
 int radio_get_satellite_mode(radio_t *radio);
 int radio_set_satellite_mode(radio_t *radio, int sat_mode);
 int radio_set_mode(radio_t *radio, int mode, int filter);
+int radio_ptt(radio_t *radio, int on);
 int radio_get_band_selection(radio_t *radio, int band);
 int radio_set_band_selection(radio_t *radio, int band);
 int radio_toggle_waterfall(radio_t *radio);

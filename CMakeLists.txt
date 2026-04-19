@@ -42,7 +42,11 @@ target_link_libraries(next_in_queue PRIVATE sgp4sdp4 m)
 add_executable(lifetime lifetime.c prediction.c)
 target_link_libraries(lifetime PRIVATE sgp4sdp4 m)
 
-install(TARGETS simple_sat_ops next_in_queue lifetime DESTINATION $ENV{HOME}/bin)
+# TX test tone tool
+add_executable(tx_tone tx_tone.c radio.c audio.c)
+target_link_libraries(tx_tone PRIVATE m asound)
+
+install(TARGETS simple_sat_ops next_in_queue lifetime tx_tone DESTINATION $ENV{HOME}/bin)
 
 install(PROGRAMS scripts/upcoming_amateur_satellite_passes.sh DESTINATION $ENV{HOME}/bin)
 install(PROGRAMS scripts/pcm2wav.sh DESTINATION $ENV{HOME}/bin)

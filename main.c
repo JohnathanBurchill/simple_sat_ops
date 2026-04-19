@@ -210,13 +210,9 @@ void report_status(state_t *state, int *print_row, int print_col)
     clrtoeol();
 
     if (state->have_radio) {
-        mvprintw(row++, col, "%15s   %.6f MHz", "DOWNLINK", state->radio.doppler_correction_enabled ? state->radio.doppler_downlink_frequency / 1e6 : state->radio.nominal_downlink_frequency / 1e6);
+        mvprintw(row++, col, "%15s   %.6f MHz", "CARRIER", state->radio.doppler_correction_enabled ? state->radio.doppler_downlink_frequency / 1e6 : state->radio.nominal_downlink_frequency / 1e6);
         clrtoeol();
         mvprintw(row++, col, "%15s   %.6f MHz", "VFO Main", state->radio.vfo_main_actual_frequency / 1e6);
-        clrtoeol();
-        mvprintw(row++, col, "%15s   %.6f MHz", "UPLINK", state->radio.doppler_correction_enabled ? state->radio.doppler_uplink_frequency / 1e6 : state->radio.nominal_uplink_frequency / 1e6);
-        clrtoeol();
-        mvprintw(row++, col, "%15s   %.6f MHz", "VFO Sub", state->radio.vfo_sub_actual_frequency / 1e6);
         clrtoeol();
         row++;
     } else {
@@ -469,22 +465,16 @@ int main(int argc, char **argv)
                 }
             }
 
-            /* Set radio frequencies with Doppler correction*/
-            if (state.have_radio && state.run_with_radio && ((doppler_delta_uplink > doppler_max_delta) || (doppler_delta_downlink > doppler_max_delta))) {
-                current_uplink_frequency = state.radio.doppler_uplink_frequency;
+            // Simplex UHF: Doppler-tune Main only. Sub stays parked; never
+            // retune it here or we risk a same-band collision on the 9700.
+            if (state.have_radio && state.run_with_radio && doppler_delta_downlink > doppler_max_delta) {
                 current_downlink_frequency = state.radio.doppler_downlink_frequency;
-                radio_set_vfo(&state.radio, VFOMain);
+                current_uplink_frequency = state.radio.doppler_downlink_frequency;
                 ret = radio_set_frequency(&state.radio, state.radio.doppler_downlink_frequency);
                 if (ret != RADIO_OK) {
-                    fprintf(stderr, "Error setting downlink frequency on VFO Main\n");
+                    fprintf(stderr, "Error setting carrier frequency on VFO Main\n");
                 }
                 state.radio.vfo_main_actual_frequency = radio_get_frequency(&state.radio);
-                radio_set_vfo(&state.radio, VFOSub);
-                ret = radio_set_frequency(&state.radio, state.radio.doppler_uplink_frequency);
-                if (ret != RADIO_OK) {
-                    fprintf(stderr, "Error setting uplink frequency on VFO Sub\n");
-                }
-                state.radio.vfo_sub_actual_frequency = radio_get_frequency(&state.radio);
                 clrtoeol();
             }
 
@@ -671,6 +661,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->radio.satellite_uplink_frequency = UPLINK_FREQ_MHZ * 1e6;
     state->radio.satellite_downlink_frequency = DOWNLINK_FREQ_MHZ * 1e6;
     state->radio.reference_downlink_frequency = REFERENCE_DOWNLINK_FREQ_MHZ * 1e6;
+    state->radio.sub_park_frequency = RADIO_SUB_PARK_HZ;
     state->radio.doppler_correction_enabled = 1;
 
     state->run_with_radio = 0;
@@ -946,12 +937,11 @@ void start_tracking(state_t *state)
 
     state->satellite_tracking = 1;
     state->radio.nominal_downlink_frequency = state->radio.satellite_downlink_frequency;
-    state->radio.nominal_uplink_frequency = state->radio.satellite_uplink_frequency;
     state->radio.doppler_correction_enabled = 1;
 
+    // Simplex UHF: only Main is used on-air. Sub remains parked where
+    // radio_init left it; do not touch it here or we risk a same-band clash.
     radio_set_vfo(&state->radio, VFOMain);
-    radio_set_mode(&state->radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
-    radio_set_vfo(&state->radio, VFOSub);
     radio_set_mode(&state->radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
     state->antenna_is_under_control = state->antenna_should_be_controlled;
     if (state->antenna_rotator.fixed_target) {

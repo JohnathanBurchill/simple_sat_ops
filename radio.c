@@ -31,93 +31,75 @@
 
 #include <err.h>
 
+// Initialise the IC-9700 for simplex UHF ownership.
+//
+// simple_sat_ops assumes it is the sole user of this radio, so we start
+// from a known-good simplex state every time:
+//   - satellite mode OFF  (no split Main/Sub tracking pair)
+//   - Sub parked on a benign VHF freq so same-band-on-both collisions are
+//     impossible when Main tunes UHF
+//   - Main selected, VFO A, FM / FIL1, tuned to radio->nominal_downlink_frequency
+//
+// If sub_park_frequency is 0, RADIO_SUB_PARK_HZ is used.
 int radio_init(radio_t *radio)
 {
-    int radio_result = RADIO_OK;
+    int rc = RADIO_OK;
 
-    // Blocking serial connection
     radio_connect(radio);
     if (!radio->connected) {
         fprintf(stderr, "Error opening radio. Is it plugged into USB and powered?\n");
         return RADIO_OPEN;
     }
 
-    // Force turning off the waterfall data as a safety measure 
-    uint8_t data[1] = {0};
-    radio_result = radio_command(radio, 0x27, 0x10, -1, data, 1, NULL, 0);
-    if (radio_result != RADIO_OK) {
-        fprintf(stderr, "Unable to set waveform data status\n");
-        return radio_result;
+    // Safety: disable any scope/waterfall streaming so CI-V replies are
+    // not interleaved with scope frames.
+    uint8_t zero[1] = {0};
+    rc = radio_command(radio, 0x27, 0x10, -1, zero, 1, NULL, 0);
+    if (rc != RADIO_OK) {
+        fprintf(stderr, "Unable to disable scope output\n");
+        return rc;
     }
 
-    // Read the transceiver ID
     uint64_t id = 0;
-    radio_result = radio_command(radio, 0x19, 0x00, -1, NULL, 0, &id, 0);
-    if (radio_result != RADIO_OK) {
+    rc = radio_command(radio, 0x19, 0x00, -1, NULL, 0, &id, 0);
+    if (rc != RADIO_OK) {
         fprintf(stderr, "Unexpected reply from radio while getting transceiver ID\n");
-        return EXIT_FAILURE;
+        return rc;
     }
     radio->transceiver_id = id;
-    
-    radio_result = radio_set_satellite_mode(radio, 1);
-    if (radio_result != RADIO_OK) {
-        fprintf(stderr, "Error enabling satellite mode\n");
-        return radio_result;
+
+    rc = radio_set_satellite_mode(radio, 0);
+    if (rc != RADIO_OK) {
+        fprintf(stderr, "Error disabling satellite mode\n");
+        return rc;
     }
 
-    // Page 7-1 of the 9700 Basic manual
-    // Main is downlink
-    radio_result = radio_set_vfo(radio, VFOA); 
-    if (radio_result != RADIO_OK) {
-        fprintf(stderr, "Unexpected reply from radio while setting VFO mode\n");
-        return radio_result;
-    }
-    radio_result = radio_set_vfo(radio, VFOMain); 
-    if (radio_result != RADIO_OK) {
-        fprintf(stderr, "Unexpected reply from radio while setting VFO to Main\n");
-        return radio_result;
-    }
-    radio_result = radio_set_mode(radio, radio->satellite_downlink_mode, RADIO_FILTER_FIL2);
-    if (radio_result != RADIO_OK) {
-        fprintf(stderr, "Unable to set radio mode on VFO Main\n");
-        return radio_result;
-    }
-    radio_result = radio_set_frequency(radio, radio->nominal_downlink_frequency);
-    if (radio_result != RADIO_OK) {
-        fprintf(stderr, "Unexpected reply from radio while setting Main (downlink) frequency\n");
-        return radio_result;
-    }
-    // Sub is uplink
-    radio_result = radio_set_vfo(radio, VFOSub); 
-    if (radio_result != RADIO_OK) {
-        fprintf(stderr, "Unexpected reply from radio while setting VFO to Sub\n");
-        return radio_result;
-    }
-    radio_result = radio_set_mode(radio, radio->satellite_uplink_mode, RADIO_FILTER_FIL2);
-    if (radio_result != RADIO_OK) {
-        fprintf(stderr, "Unable to set radio mode on VFO Sub\n");
-        return radio_result;
-    }
-    radio_result = radio_set_frequency(radio, radio->nominal_uplink_frequency);
-    if (radio_result != RADIO_OK) {
-        fprintf(stderr, "Unexpected reply from radio while setting Sub (uplink) frequency\n");
-        return radio_result;
-    }
+    // Park Sub on VHF, out of the way of Main's UHF carrier.
+    double sub_park = radio->sub_park_frequency > 0.0
+                      ? radio->sub_park_frequency
+                      : RADIO_SUB_PARK_HZ;
+    rc = radio_set_vfo(radio, VFOSub);
+    if (rc != RADIO_OK) { fprintf(stderr, "Error selecting Sub band\n"); return rc; }
+    rc = radio_set_vfo(radio, VFOA);
+    if (rc != RADIO_OK) { fprintf(stderr, "Error selecting VFO A on Sub\n"); return rc; }
+    rc = radio_set_mode(radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
+    if (rc != RADIO_OK) { fprintf(stderr, "Error setting Sub mode\n"); return rc; }
+    rc = radio_set_frequency(radio, sub_park);
+    if (rc != RADIO_OK) { fprintf(stderr, "Error parking Sub frequency\n"); return rc; }
 
-    double f = 0.0;
-    // Setting the VFO selects the active VFO on the radio's display too
-    radio_result = radio_set_vfo(radio, VFOSub); 
-    f = radio_get_frequency(radio);
+    // Main: the only VFO simple_sat_ops uses on-air.
+    rc = radio_set_vfo(radio, VFOMain);
+    if (rc != RADIO_OK) { fprintf(stderr, "Error selecting Main band\n"); return rc; }
+    rc = radio_set_vfo(radio, VFOA);
+    if (rc != RADIO_OK) { fprintf(stderr, "Error selecting VFO A on Main\n"); return rc; }
+    rc = radio_set_mode(radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
+    if (rc != RADIO_OK) { fprintf(stderr, "Error setting Main mode\n"); return rc; }
+    rc = radio_set_frequency(radio, radio->nominal_downlink_frequency);
+    if (rc != RADIO_OK) { fprintf(stderr, "Error setting Main (carrier) frequency\n"); return rc; }
+
+    double f = radio_get_frequency(radio);
     if (f < 0) {
-        fprintf(stderr, "Unexpected reply from radio while getting Sub (uplink) frequency\n");
-        return RADIO_GET_FREQUENCY;
-    }
-    radio->vfo_sub_actual_frequency = f;
-
-    radio_result = radio_set_vfo(radio, VFOMain); 
-    f = radio_get_frequency(radio);
-    if (f < 0) {
-        fprintf(stderr, "Unexpected reply from radio while getting Main (uplink) frequency\n");
+        fprintf(stderr, "Error reading Main frequency\n");
         return RADIO_GET_FREQUENCY;
     }
     radio->vfo_main_actual_frequency = f;
@@ -377,6 +359,13 @@ int radio_set_mode(radio_t *radio, int mode, int filter)
         return radio_result;
     }
     return RADIO_OK;
+}
+
+int radio_ptt(radio_t *radio, int on)
+{
+    uint8_t data[1];
+    data[0] = on ? 1 : 0;
+    return radio_command(radio, 0x1C, 0x00, -1, data, 1, NULL, 0);
 }
 
 
