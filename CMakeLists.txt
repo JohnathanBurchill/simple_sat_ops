@@ -26,13 +26,14 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NCURSES REQUIRED ncurses)
+pkg_check_modules(OPENSSL REQUIRED libcrypto)
 
 # Add the main executable
 add_executable(simple_sat_ops main.c prediction.c radio.c antenna_rotator.c audio.c telemetry.c)
 # target_compile_definitions(simple_sat_ops PUBLIC -DQOL)
 
 # Link the sgp4sdp4 library
-target_link_libraries(simple_sat_ops PRIVATE sgp4sdp4 ${NCURSES_LIBRARIES} m asound pthread) 
+target_link_libraries(simple_sat_ops PRIVATE sgp4sdp4 ${NCURSES_LIBRARIES} m asound pthread)
 
 # Next in queue tool
 add_executable(next_in_queue next_in_queue.c prediction.c satellite_status.c)
@@ -46,7 +47,12 @@ target_link_libraries(lifetime PRIVATE sgp4sdp4 m)
 add_executable(tx_tone tx_tone.c radio.c audio.c)
 target_link_libraries(tx_tone PRIVATE m asound)
 
-install(TARGETS simple_sat_ops next_in_queue lifetime tx_tone DESTINATION $ENV{HOME}/bin)
+# Uplink test tool: builds CSP + AX100 frame, optionally modulates to WAV
+add_executable(uplink_test uplink_test.c csp.c golay24.c ax100.c hmac_keyfile.c modem.c)
+target_include_directories(uplink_test PRIVATE ${OPENSSL_INCLUDE_DIRS})
+target_link_libraries(uplink_test PRIVATE ${OPENSSL_LIBRARIES} m)
+
+install(TARGETS simple_sat_ops next_in_queue lifetime tx_tone uplink_test DESTINATION $ENV{HOME}/bin)
 
 install(PROGRAMS scripts/upcoming_amateur_satellite_passes.sh DESTINATION $ENV{HOME}/bin)
 install(PROGRAMS scripts/pcm2wav.sh DESTINATION $ENV{HOME}/bin)
