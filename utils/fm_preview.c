@@ -54,6 +54,13 @@ static void usage(FILE *out, const char *argv0)
         "Options:\n"
         "  --carrier=<Hz>       Audio carrier (default 1000)\n"
         "  --deviation=<Hz>     Peak frequency deviation (default 500)\n"
+        "  --time-stretch=<N>   Stretch output duration by integer factor N\n"
+        "                       while keeping the carrier pitch unchanged\n"
+        "                       (default 1, no stretch). Each input baseband\n"
+        "                       sample drives N output samples of cosine at\n"
+        "                       the instantaneous frequency, so the carrier\n"
+        "                       stays at `carrier` Hz and the bit pattern\n"
+        "                       plays N× slower. For bit-by-bit aural inspection.\n"
         "  --help               This message\n",
         argv0);
 }
@@ -64,6 +71,7 @@ int main(int argc, char **argv)
     const char *out_path = NULL;
     double carrier = 1000.0;
     double deviation = 500.0;
+    int stretch = 1;
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
@@ -72,6 +80,7 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--out="))       out_path  = a + 6;
         else if (starts_with(a, "--carrier="))   carrier   = atof(a + 10);
         else if (starts_with(a, "--deviation=")) deviation = atof(a + 12);
+        else if (starts_with(a, "--time-stretch=")) stretch   = atoi(a + 15);
         else {
             fprintf(stderr, "unknown option: %s\n", a);
             usage(stderr, argv[0]);
@@ -85,6 +94,10 @@ int main(int argc, char **argv)
     }
     if (!(carrier > 0.0) || !(deviation >= 0.0)) {
         fprintf(stderr, "--carrier must be > 0, --deviation must be >= 0\n");
+        return 1;
+    }
+    if (stretch < 1) {
+        fprintf(stderr, "--stretch must be >= 1\n");
         return 1;
     }
 
@@ -107,33 +120,38 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    int16_t *out = (int16_t *)malloc(n * sizeof(int16_t));
+    size_t n_out = n * (size_t)stretch;
+    int16_t *out = (int16_t *)malloc(n_out * sizeof(int16_t));
     if (out == NULL) {
-        fprintf(stderr, "fm_preview: out of memory for %zu samples\n", n);
+        fprintf(stderr, "fm_preview: out of memory for %zu samples\n", n_out);
         free(bb);
         return 1;
     }
 
     double phase = 0.0;
     double two_pi_over_fs = 2.0 * M_PI / (double)samp_rate;
+    size_t o = 0;
     for (size_t i = 0; i < n; ++i) {
         double x = (double)bb[i] / 32768.0;
         double inst_freq = carrier + deviation * x;
-        phase += two_pi_over_fs * inst_freq;
-        double y = cos(phase);
-        long v = lrint(y * 32767.0);
-        if (v > 32767)      v = 32767;
-        else if (v < -32768) v = -32768;
-        out[i] = (int16_t)v;
+        double step = two_pi_over_fs * inst_freq;
+        for (int k = 0; k < stretch; ++k) {
+            phase += step;
+            double y = cos(phase);
+            long v = lrint(y * 32767.0);
+            if (v > 32767)      v = 32767;
+            else if (v < -32768) v = -32768;
+            out[o++] = (int16_t)v;
+        }
     }
 
-    int rc = pcm16_write_wav(out_path, out, n, samp_rate);
+    int rc = pcm16_write_wav(out_path, out, n_out, samp_rate);
     free(out);
     free(bb);
     if (rc != 0) return 1;
 
     fprintf(stderr,
-            "fm_preview: wrote %s (%zu samples @ %d Hz, carrier=%.1f, deviation=%.1f)\n",
-            out_path, n, samp_rate, carrier, deviation);
+            "fm_preview: wrote %s (%zu samples @ %d Hz, carrier=%.1f, deviation=%.1f, stretch=%d)\n",
+            out_path, n_out, samp_rate, carrier, deviation, stretch);
     return 0;
 }
