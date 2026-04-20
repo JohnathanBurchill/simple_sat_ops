@@ -56,7 +56,12 @@ next_in_queue 0 2000 --tle=TLEs/amateur.tle \
   --list --regex='ISS|ZARYA' --ignore-case
 ```
 
-**Annotate with radio info (looks for `active_radios.txt` next to the TLE):**
+**Annotate with radio info.** `--show-radio-info` reads an
+`active_radios.txt` file sitting **next to whichever TLE is in use** —
+so with the default TLE that means
+`~/.local/state/simple_sat_ops/active_radios.txt`; with
+`--tle=TLEs/amateur.tle` it's `TLEs/active_radios.txt`. If the file
+isn't there, missing annotations are just omitted.
 ```bash
 next_in_queue 0 2000 --list --show-radio-info
 ```
