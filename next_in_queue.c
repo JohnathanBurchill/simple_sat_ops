@@ -64,7 +64,8 @@ void usage(FILE *dest, const char *name, int full)
         "  --min-elevation=<deg>        Minimum peak elevation (default 0)\n"
         "  --max-elevation=<deg>        Maximum peak elevation (default 90)\n"
         "  --minutes-offset=<n>         Advance `now` by n minutes for planning\n"
-        "  --no-constellations          Exclude Starlink/OneWeb-style swarms\n"
+        "  --all-satellites             Include Starlink/OneWeb-style swarms\n"
+        "                               (default: constellations are excluded)\n"
         "  --regex=<pattern>            Only satellites whose names match\n"
         "  --ignore-case                Case-insensitive regex match\n"
         "\n"
@@ -126,7 +127,7 @@ int main(int argc, char **argv)
     state_t state = {0};
     char *regex = NULL;
     int regex_ignore_case = 0;
-    int with_constellations = 1;
+    int with_constellations = 0;
     int reverse = 0;
 
     int minutes_offset = 0;
@@ -173,9 +174,9 @@ int main(int argc, char **argv)
         } else if (strcmp("--reverse", argv[i]) == 0) {
             state.n_options++;
             reverse = 1;
-        } else if (strcmp("--no-constellations", argv[i]) == 0) {
+        } else if (strcmp("--all-satellites", argv[i]) == 0) {
             state.n_options++;
-            with_constellations = 0;
+            with_constellations = 1;
         } else if (strncmp("--min-elevation=", argv[i], 16) == 0) {
             state.n_options++; 
             if (strlen(argv[i]) < 17) {
