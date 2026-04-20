@@ -56,6 +56,13 @@ next_in_queue 0 2000 --tle=TLEs/amateur.tle \
   --list --regex='ISS|ZARYA' --ignore-case
 ```
 
+**Constellation swarms** (Starlink / OneWeb / Flock / Iridium / etc.)
+are filtered out by default — they'd otherwise flood the list with
+hundreds of look-alike entries. Pass `--all-satellites` to include them:
+```bash
+next_in_queue 0 2000 --list --all-satellites
+```
+
 **Annotate with radio info.** `--show-radio-info` reads an
 `active_radios.txt` file sitting **next to whichever TLE is in use** —
 so with the default TLE that means
