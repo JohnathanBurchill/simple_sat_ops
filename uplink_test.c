@@ -39,13 +39,14 @@
 static void usage(FILE *out, const char *argv0)
 {
     fprintf(out,
-        "usage: %s --payload-hex=<HEX> [options]\n"
+        "usage: %s (--payload-hex=<HEX> | --payload-ascii=<STR>) [options]\n"
         "\n"
         "Composes a CSP v1 packet, AX100-frames it with HMAC, and writes\n"
         "either the framed byte sequence or a modulated 48 kHz/16-bit WAV.\n"
         "\n"
-        "Required:\n"
-        "  --payload-hex=<HEX>      Payload bytes as uppercase/lowercase hex\n"
+        "Required (exactly one):\n"
+        "  --payload-hex=<HEX>      Payload as upper/lowercase hex\n"
+        "  --payload-ascii=<STR>    Payload as literal ASCII bytes (no NUL)\n"
         "\n"
         "Options:\n"
         "  --keyfile=<path>         HMAC keyfile (default: $HOME/%s)\n"
@@ -111,6 +112,7 @@ static int starts_with(const char *s, const char *prefix)
 int main(int argc, char **argv)
 {
     const char *payload_hex = NULL;
+    const char *payload_ascii = NULL;
     const char *keyfile_path = NULL;
     const char *out_wav = NULL;
     int use_hmac = 1;
@@ -129,8 +131,9 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
         if (strcmp(a, "--help") == 0) { usage(stdout, argv[0]); return 0; }
-        else if (starts_with(a, "--payload-hex="))   payload_hex  = a + 14;
-        else if (starts_with(a, "--keyfile="))       keyfile_path = a + 10;
+        else if (starts_with(a, "--payload-hex="))   payload_hex   = a + 14;
+        else if (starts_with(a, "--payload-ascii=")) payload_ascii = a + 16;
+        else if (starts_with(a, "--keyfile="))       keyfile_path  = a + 10;
         else if (strcmp(a, "--no-hmac") == 0)        use_hmac = 0;
         else if (starts_with(a, "--src="))     csp_hdr.src   = (uint8_t)atoi(a + 6);
         else if (starts_with(a, "--dst="))     csp_hdr.dst   = (uint8_t)atoi(a + 6);
@@ -152,15 +155,27 @@ int main(int argc, char **argv)
         }
     }
 
-    if (payload_hex == NULL) {
-        fprintf(stderr, "missing --payload-hex\n");
+    if ((payload_hex == NULL) == (payload_ascii == NULL)) {
+        fprintf(stderr, "pass exactly one of --payload-hex or --payload-ascii\n");
         usage(stderr, argv[0]);
         return 1;
     }
 
     uint8_t payload[2048];
-    ssize_t payload_len = parse_payload_hex(payload_hex, payload, sizeof(payload));
-    if (payload_len < 0) return 1;
+    ssize_t payload_len;
+    if (payload_hex != NULL) {
+        payload_len = parse_payload_hex(payload_hex, payload, sizeof(payload));
+        if (payload_len < 0) return 1;
+    } else {
+        size_t n = strlen(payload_ascii);
+        if (n > sizeof(payload)) {
+            fprintf(stderr, "payload ascii: %zu bytes exceeds cap %zu\n",
+                    n, sizeof(payload));
+            return 1;
+        }
+        memcpy(payload, payload_ascii, n);
+        payload_len = (ssize_t)n;
+    }
 
     uint8_t hmac_key[128];
     ssize_t hmac_key_len = 0;
