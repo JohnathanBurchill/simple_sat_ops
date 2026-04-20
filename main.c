@@ -439,15 +439,20 @@ int main(int argc, char **argv)
                 }
             }
         }
-        // Record audio
-        state.audio.recording_audio = 1;
-        status = init_audio_capture(&state.audio);
-        if (status != AUDIO_OK) {
-            endwin();
-            fprintf(stderr, "Unable to initialize audio capture\n");
-            return 1;
-        }
+        // Optional ALSA capture. Gated on audio_record so --without-audio
+        // actually skips the init call; the device names in audio.h
+        // (hw:3,0 / hw:4,0) are system-specific and will fail to open on
+        // most boxes, which we shouldn't turn into a hard abort when the
+        // operator explicitly said they don't want recording.
         if (state.audio.audio_record) {
+            state.audio.recording_audio = 1;
+            status = init_audio_capture(&state.audio);
+            if (status != AUDIO_OK) {
+                endwin();
+                fprintf(stderr, "Unable to initialize audio capture "
+                        "(pass --without-audio to skip)\n");
+                return 1;
+            }
             int thread_status = pthread_create(&state.audio.audio_thread_main, NULL, capture_audio, &state);
             if (thread_status != 0) {
                 endwin();
