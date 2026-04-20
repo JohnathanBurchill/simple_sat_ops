@@ -47,6 +47,10 @@ typedef struct state
     radio_t radio;
     int run_with_radio;
     int have_radio;
+    // Apply the IC-9700 FM+DATA+USB-MOD uplink-prep sequence after radio_init.
+    int prepare_uplink;
+    // Requested USB MOD level 0..255, or -1 to leave untouched.
+    int uplink_mod_level;
     // Antenna control
     antenna_rotator_t antenna_rotator;
     int run_with_antenna_rotator;

@@ -365,6 +365,62 @@ int radio_set_mode(radio_t *radio, int mode, int filter)
     return RADIO_OK;
 }
 
+// CI-V `1A 06 <on> <filter>`: data-mode flag + filter for the currently
+// selected operating mode. Filter byte must be 0x00 when disabling.
+// On IC-9700 in FM, this is what bypasses pre-emphasis and widens TX audio
+// for 9600 bps packet / G3RUH use.
+int radio_set_data_mode(radio_t *radio, int on, int filter)
+{
+    uint8_t data[2];
+    data[0] = on ? 0x01 : 0x00;
+    data[1] = on ? (uint8_t)filter : 0x00;
+    return radio_command(radio, 0x1A, 0x06, -1, data, 2, NULL, 0);
+}
+
+// CI-V `1A 05 01 16 <src>`: menu item 0x0116 "DATA MOD" (SET > Connectors >
+// MOD Input > DATA MOD). Selects which audio source feeds the modulator
+// while DATA mode is on.
+int radio_set_data_mod_source(radio_t *radio, int source)
+{
+    uint8_t data[3];
+    data[0] = 0x01;
+    data[1] = 0x16;
+    data[2] = (uint8_t)source;
+    return radio_command(radio, 0x1A, 0x05, -1, data, 3, NULL, 0);
+}
+
+// CI-V `1A 05 01 13 <BCD4>`: menu item 0x0113 "USB MOD Level". Value is a
+// 2-byte packed-BCD percentage 0000..0255, carrying 0..100% in steps of
+// ~0.4 percent. Tune empirically to meet the AX100's expected TX deviation.
+int radio_set_usb_mod_level(radio_t *radio, int level_0_to_255)
+{
+    if (level_0_to_255 < 0)   level_0_to_255 = 0;
+    if (level_0_to_255 > 255) level_0_to_255 = 255;
+    int hundreds = level_0_to_255 / 100;
+    int ones     = level_0_to_255 % 100;
+    uint8_t data[4];
+    data[0] = 0x01;
+    data[1] = 0x13;
+    data[2] = (uint8_t)(((hundreds / 10) << 4) | (hundreds % 10));
+    data[3] = (uint8_t)(((ones / 10)     << 4) | (ones     % 10));
+    return radio_command(radio, 0x1A, 0x05, -1, data, 4, NULL, 0);
+}
+
+// Convenience: put the IC-9700 in the full configuration needed for an
+// AX100 uplink. FM operating mode + DATA on + Data Mod source = USB.
+// Does not touch USB MOD Level — call radio_set_usb_mod_level() separately
+// when you know the target deviation for your station.
+int radio_uplink_prep(radio_t *radio)
+{
+    int rc = radio_set_mode(radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
+    if (rc != RADIO_OK) return rc;
+    rc = radio_set_data_mode(radio, 1, RADIO_FILTER_FIL1);
+    if (rc != RADIO_OK) return rc;
+    rc = radio_set_data_mod_source(radio, RADIO_DATA_MOD_SRC_USB);
+    if (rc != RADIO_OK) return rc;
+    return RADIO_OK;
+}
+
 int radio_ptt(radio_t *radio, int on)
 {
     uint8_t data[1];

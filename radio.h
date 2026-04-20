@@ -71,6 +71,16 @@ enum RADIO_FILTER {
     RADIO_FILTER_FIL3 = 0x03,
 };
 
+// CI-V `1A 05 01 16 <src>` — SET > Connectors > MOD Input > DATA MOD
+enum RADIO_DATA_MOD_SRC {
+    RADIO_DATA_MOD_SRC_MIC     = 0x00,
+    RADIO_DATA_MOD_SRC_ACC     = 0x01,
+    RADIO_DATA_MOD_SRC_MIC_ACC = 0x02,
+    RADIO_DATA_MOD_SRC_USB     = 0x03,
+    RADIO_DATA_MOD_SRC_MIC_USB = 0x04,
+    RADIO_DATA_MOD_SRC_LAN     = 0x05,
+};
+
 typedef struct radio 
 {
     char *device_filename;
@@ -113,6 +123,10 @@ int radio_set_frequency(radio_t *radio, double frequency);
 int radio_get_satellite_mode(radio_t *radio);
 int radio_set_satellite_mode(radio_t *radio, int sat_mode);
 int radio_set_mode(radio_t *radio, int mode, int filter);
+int radio_set_data_mode(radio_t *radio, int on, int filter);
+int radio_set_data_mod_source(radio_t *radio, int source);
+int radio_set_usb_mod_level(radio_t *radio, int level_0_to_255);
+int radio_uplink_prep(radio_t *radio);
 int radio_ptt(radio_t *radio, int on);
 int radio_get_band_selection(radio_t *radio, int band);
 int radio_set_band_selection(radio_t *radio, int band);

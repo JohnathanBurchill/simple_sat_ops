@@ -79,6 +79,11 @@ void usage(FILE *dest, const char *name, int full)
         "  --with-radio                 Initialise and command the IC-9700\n"
         "  --with-rotator               Initialise and command the SPID Rot2Prog\n"
         "  --with-hardware              Shortcut: enables both of the above\n"
+        "  --uplink-ready               After radio init, put the 9700 into\n"
+        "                               FM + DATA-on + Data Mod Source = USB\n"
+        "                               (required config for AX100 uplink)\n"
+        "  --uplink-mod-level=<0..255>  Also set USB MOD Level via CI-V\n"
+        "                               (empirical; tune to AX100 deviation)\n"
         "\n"
         "Radio transport (see --help-full for the two supported setups):\n"
         "  --radio-device=<path>        CI-V tty (default /dev/ttyUSB1)\n"
@@ -417,6 +422,20 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
         state.have_radio = 1;
+        if (state.prepare_uplink) {
+            radio_result = radio_uplink_prep(&state.radio);
+            if (radio_result != RADIO_OK) {
+                fprintf(stderr, "Error configuring radio for uplink (--uplink-ready)\n");
+                return EXIT_FAILURE;
+            }
+            if (state.uplink_mod_level >= 0) {
+                radio_result = radio_set_usb_mod_level(&state.radio, state.uplink_mod_level);
+                if (radio_result != RADIO_OK) {
+                    fprintf(stderr, "Error setting USB MOD level\n");
+                    return EXIT_FAILURE;
+                }
+            }
+        }
         // Record audio
         state.audio.recording_audio = 1;
         status = init_audio_capture(&state.audio);
@@ -773,6 +792,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->radio.doppler_correction_enabled = 1;
 
     state->run_with_radio = 0;
+    state->prepare_uplink = 0;
+    state->uplink_mod_level = -1;
     state->radio.device_filename = "/dev/ttyUSB1";
     state->radio.serial_speed = B115200;
     // state->radio.serial_speed = B9600;
@@ -807,6 +828,21 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             state->n_options++;
             state->run_with_radio = 1;
             state->run_with_antenna_rotator = 1;
+        } else if (strcmp("--uplink-ready", argv[i]) == 0) {
+            state->n_options++;
+            state->prepare_uplink = 1;
+        } else if (strncmp("--uplink-mod-level=", argv[i], 19) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 20) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state->uplink_mod_level = atoi(argv[i] + 19);
+            if (state->uplink_mod_level < 0 || state->uplink_mod_level > 255) {
+                fprintf(stderr, "--uplink-mod-level must be in 0..255\n");
+                return EXIT_FAILURE;
+            }
+            state->prepare_uplink = 1;
         } else if (strncmp("--radio-device=", argv[i], 15) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 16) {
