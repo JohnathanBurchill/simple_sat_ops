@@ -135,6 +135,13 @@ These never change session-to-session; do them at the front panel once:
   USB so sso can control the radio.
 - `SET > Connectors > CI-V > USB Port Function` must match
   `--radio-serial-speed` (or be on CDC-ACM, which ignores baud).
+- **Dualwatch ON** (so both Main and Sub are addressable via CI-V). The
+  `[M/S]` key toggles which band is *active*; the touchscreen's
+  `DUAL WATCH` label (or a long-press on `[M/S]`) toggles the feature
+  itself. If Dualwatch is off, `0x07 0xD1 (Select Sub)` NGs and sso
+  will log a warning + skip the Sub-park step (init still completes).
+- Recommended starting VFO state: FM, UHF band on Main, frequency set
+  anywhere in 435–438 MHz. sso will override mode/frequency on init.
 
 Everything else (FM-DATA mode, DATA MOD source = USB, USB MOD Level)
 is CI-V-reachable and handled by `--uplink-ready`.

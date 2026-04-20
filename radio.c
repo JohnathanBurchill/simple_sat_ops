@@ -74,18 +74,27 @@ int radio_init(radio_t *radio)
         return rc;
     }
 
-    // Park Sub on VHF, out of the way of Main's UHF carrier.
+    // Park Sub on VHF, out of the way of Main's UHF carrier. Best-effort:
+    // the 9700 NGs 0x07 0xD1 if Dualwatch is off, which we don't want to
+    // block init on. Worst case the operator parks Sub manually. Skip the
+    // rest of the Sub block if we can't enter it; do NOT fall through into
+    // set_mode / set_frequency because those would land on Main.
     double sub_park = radio->sub_park_frequency > 0.0
                       ? radio->sub_park_frequency
                       : RADIO_SUB_PARK_HZ;
     rc = radio_set_vfo(radio, VFOSub);
-    if (rc != RADIO_OK) { fprintf(stderr, "Error selecting Sub band\n"); return rc; }
-    rc = radio_set_vfo(radio, VFOA);
-    if (rc != RADIO_OK) { fprintf(stderr, "Error selecting VFO A on Sub\n"); return rc; }
-    rc = radio_set_mode(radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
-    if (rc != RADIO_OK) { fprintf(stderr, "Error setting Sub mode\n"); return rc; }
-    rc = radio_set_frequency(radio, sub_park);
-    if (rc != RADIO_OK) { fprintf(stderr, "Error parking Sub frequency\n"); return rc; }
+    if (rc != RADIO_OK) {
+        fprintf(stderr,
+                "Warning: could not select Sub band (Dualwatch off?); "
+                "skipping Sub-park. Main VFO will still be configured.\n");
+    } else {
+        rc = radio_set_vfo(radio, VFOA);
+        if (rc != RADIO_OK) { fprintf(stderr, "Error selecting VFO A on Sub\n"); return rc; }
+        rc = radio_set_mode(radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
+        if (rc != RADIO_OK) { fprintf(stderr, "Error setting Sub mode\n"); return rc; }
+        rc = radio_set_frequency(radio, sub_park);
+        if (rc != RADIO_OK) { fprintf(stderr, "Error parking Sub frequency\n"); return rc; }
+    }
 
     // Main: the only VFO simple_sat_ops uses on-air.
     rc = radio_set_vfo(radio, VFOMain);
