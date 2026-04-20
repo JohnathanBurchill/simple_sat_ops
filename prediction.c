@@ -20,11 +20,27 @@
 
 #include "prediction.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sgp4sdp4.h>
 #include <ncurses.h>
 #include <regex.h>
+
+int tle_default_path(char *out_path, size_t out_cap)
+{
+    const char *home = getenv("HOME");
+    if (home == NULL || home[0] == '\0') {
+        return -1;
+    }
+    int n = snprintf(out_path, out_cap,
+                     "%s/.local/state/simple_sat_ops/active.tle", home);
+    if (n < 0 || (size_t)n >= out_cap) {
+        return -1;
+    }
+    return 0;
+}
 
 static pass_t *passes = NULL;
 static size_t n_passes = 0;

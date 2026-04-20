@@ -32,13 +32,12 @@
 void usage(FILE *dest, const char *name, int full)
 {
     fprintf(dest,
-        "usage: %s <tles_file> <min_alt_km> <max_alt_km> [<satellite_name>] [options]\n"
+        "usage: %s <min_alt_km> <max_alt_km> [<satellite_name>] [options]\n"
         "\n"
         "Scan a TLE file for upcoming passes over the ground station and report\n"
         "the soonest (or every) match. Read-only; no hardware commands.\n"
         "\n"
         "Positional arguments:\n"
-        "  <tles_file>                  Path to a TLE file (2 or 3-line format)\n"
         "  <min_alt_km>                 Minimum orbital altitude, km\n"
         "  <max_alt_km>                 Maximum orbital altitude, km\n"
         "  <satellite_name>             Optional. Literal, case-sensitive name\n"
@@ -47,6 +46,10 @@ void usage(FILE *dest, const char *name, int full)
         "                               constellation filter and extends the\n"
         "                               search window to one week. For regex\n"
         "                               matching use --regex= instead.\n"
+        "\n"
+        "TLE source:\n"
+        "  --tle=<path>                 Path to a TLE file (2 or 3-line format).\n"
+        "                               Default: $HOME/.local/state/simple_sat_ops/active.tle\n"
         "\n"
         "Output:\n"
         "  --list                       Print all matching passes (default: one)\n"
@@ -81,19 +84,20 @@ void usage(FILE *dest, const char *name, int full)
         "\n"
         "EXAMPLES\n"
         "\n"
-        "  # Next amateur satellite pass from today's TLEs, any altitude\n"
-        "  %s TLEs/amateur.tle 0 2000\n"
+        "  # Next satellite pass (uses default TLE at ~/.local/state/simple_sat_ops/active.tle)\n"
+        "  %s 0 2000\n"
         "\n"
         "  # All passes in the next 3 hours above 30 deg elevation\n"
-        "  %s TLEs/amateur.tle 0 2000 --list \\\n"
+        "  %s 0 2000 --list \\\n"
         "      --max-minutes=180 --min-elevation=30\n"
         "\n"
-        "  # ISS-class only, with amateur-radio info annotation\n"
-        "  %s TLEs/amateur.tle 300 500 --list \\\n"
+        "  # ISS-class only with a specific TLE file, with amateur-radio info annotation\n"
+        "  %s 300 500 --list \\\n"
+        "      --tle=TLEs/amateur.tle \\\n"
         "      --regex='ISS|ZARYA' --ignore-case --show-radio-info\n"
         "\n"
         "  # Passes for a specific satellite over the next week\n"
-        "  %s TLEs/active.tle 0 2000 'ISS (ZARYA)' --list\n"
+        "  %s 0 2000 'ISS (ZARYA)' --list\n"
         "\n"
         "NOTES\n"
         "  - The tool never opens the radio or rotator; safe to run on any host.\n"
@@ -213,6 +217,13 @@ int main(int argc, char **argv)
         } else if (strcmp("--show-radio-info", argv[i]) == 0) {
             state.n_options++;
             show_radio_info = 1;
+        } else if (strncmp("--tle=", argv[i], 6) == 0) {
+            state.n_options++;
+            if (strlen(argv[i]) < 7) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state.prediction.tles_filename = argv[i] + 6;
         } else if (strcmp("--help", argv[i]) == 0) {
             usage(stdout, argv[0], 0);
             return 0;
@@ -226,19 +237,26 @@ int main(int argc, char **argv)
     }
 
     int n_args = argc - state.n_options;
-    if (n_args < 4 || n_args > 5) {
+    if (n_args < 3 || n_args > 4) {
         usage(stderr, argv[0], 0);
         return EXIT_FAILURE;
     }
 
-    state.prediction.tles_filename = argv[1];
-    double min_altitude_km = atof(argv[2]);
-    double max_altitude_km = atof(argv[3]);
+    if (state.prediction.tles_filename == NULL) {
+        static char default_tle[1024];
+        if (tle_default_path(default_tle, sizeof(default_tle)) != 0) {
+            fprintf(stderr, "HOME unset or path too long; pass --tle=<path>\n");
+            return EXIT_FAILURE;
+        }
+        state.prediction.tles_filename = default_tle;
+    }
+    double min_altitude_km = atof(argv[1]);
+    double max_altitude_km = atof(argv[2]);
     char *satellite_name = NULL;
-    if (n_args == 5) {
+    if (n_args == 4) {
         // Checking for a specific satellite
         // Increase the timespan to 1 week
-        satellite_name = argv[4];
+        satellite_name = argv[3];
         max_minutes_away = 1440 * 7;
     }
 

@@ -34,35 +34,39 @@ pre-installed to `/usr/local/`, plus `libncurses-dev`, `libasound2-dev`,
 
 ## Pass prediction (no hardware)
 
-**Next ISS pass from the local amateur TLE:**
+By default every tool reads from
+`~/.local/state/simple_sat_ops/active.tle`. Override with `--tle=<path>`
+per invocation to point at a specific file (e.g. `TLEs/amateur.tle`).
+
+**Next ISS pass (default TLE):**
 ```bash
-next_in_queue TLEs/amateur.tle 0 2000 "ISS (ZARYA)"
+next_in_queue 0 2000 "ISS (ZARYA)"
 ```
 The positional `<satellite_name>` is a literal, case-sensitive **prefix**
 match. Drop it to scan every satellite.
 
 **All passes in the next 3 hours above 30° elevation:**
 ```bash
-next_in_queue TLEs/amateur.tle 0 2000 --list \
-  --max-minutes=180 --min-elevation=30
+next_in_queue 0 2000 --list --max-minutes=180 --min-elevation=30
 ```
 
-**Filter by regex (escape special characters):**
+**Filter by regex against a specific TLE:**
 ```bash
-next_in_queue TLEs/amateur.tle 0 2000 \
+next_in_queue 0 2000 --tle=TLEs/amateur.tle \
   --list --regex='ISS|ZARYA' --ignore-case
 ```
 
 **Annotate with radio info (looks for `active_radios.txt` next to the TLE):**
 ```bash
-next_in_queue TLEs/amateur.tle 0 2000 --list --show-radio-info
+next_in_queue 0 2000 --list --show-radio-info
 ```
 
 ### TLE source
 
-Grab a fresh Celestrak catalog any time:
+Grab a fresh Celestrak catalog and drop it into the default location:
 ```bash
-wget -O TLEs/active.tle \
+mkdir -p ~/.local/state/simple_sat_ops
+wget -O ~/.local/state/simple_sat_ops/active.tle \
   "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle"
 ```
 Celestrak serves CRLF-terminated files; sso's parser handles that.
@@ -73,7 +77,7 @@ Celestrak serves CRLF-terminated files; sso's parser handles that.
 
 ```bash
 # Full setup: IC-9700 over native USB, SPID rotator, auto-select next pass
-simple_sat_ops TLEs/amateur.tle next --with-hardware \
+simple_sat_ops next --with-hardware \
   --radio-device=/dev/ttyACM0 --min-elevation=10
 ```
 
@@ -128,7 +132,7 @@ is CI-V-reachable and handled by `--uplink-ready`.
 ```bash
 # Configures FM + DATA-on + DATA MOD = USB at startup.
 # Add --uplink-mod-level=<0..255> to also set USB MOD Level.
-simple_sat_ops TLEs/amateur.tle next --with-radio \
+simple_sat_ops next --with-radio \
   --uplink-ready --uplink-mod-level=128
 ```
 
@@ -169,7 +173,7 @@ uplink_test --payload-hex=70696e67 --out=/tmp/ping.wav
 aplay -l  # look for "IC-9700" or similar; note hw:X,0
 
 # 3. Keep the radio in FM-DATA USB, push audio, key PTT
-simple_sat_ops TLEs/amateur.tle "ISS (ZARYA)" --with-radio --uplink-ready &
+simple_sat_ops "ISS (ZARYA)" --with-radio --uplink-ready &
 # ... trigger PTT via radio button or second CI-V call ...
 aplay -D plughw:X,0 /tmp/ping.wav
 ```

@@ -64,16 +64,19 @@ void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, doub
 void usage(FILE *dest, const char *name, int full)
 {
     fprintf(dest,
-        "usage: %s <tles_file> <satellite_id> [options]\n"
+        "usage: %s <satellite_id> [options]\n"
         "\n"
         "Live satellite tracker for the FrontierSat ground station. Predicts\n"
         "passes, drives the SPID rotator, and (with --with-radio) tunes the\n"
         "IC-9700 onto the simplex UHF carrier with Doppler correction.\n"
         "\n"
         "Positional arguments:\n"
-        "  <tles_file>                  Path to a TLE file (2 or 3-line format)\n"
         "  <satellite_id>               Name prefix to match in the TLE, or `next`\n"
         "                               to auto-select the next visible pass\n"
+        "\n"
+        "TLE source:\n"
+        "  --tle=<path>                 Path to a TLE file (2 or 3-line format).\n"
+        "                               Default: $HOME/.local/state/simple_sat_ops/active.tle\n"
         "\n"
         "Hardware toggles (all opt-in; no hardware is the default):\n"
         "  --with-radio                 Initialise and command the IC-9700\n"
@@ -165,17 +168,17 @@ void usage(FILE *dest, const char *name, int full)
         "\n"
         "EXAMPLES\n"
         "\n"
-        "  # Dry-run prediction (no hardware, TLEs from local file)\n"
-        "  %s TLEs/amateur.tle 'ISS (ZARYA)'\n"
+        "  # Dry-run prediction (uses default TLE at ~/.local/state/simple_sat_ops/active.tle)\n"
+        "  %s 'ISS (ZARYA)'\n"
         "\n"
         "  # Auto-pick the next 10-45 min visible pass above 10 deg\n"
-        "  %s TLEs/amateur.tle next --min-elevation=10 --min-minutes=10 --max-minutes=45\n"
+        "  %s next --min-elevation=10 --min-minutes=10 --max-minutes=45\n"
         "\n"
-        "  # Full live operation at RAO (external transport)\n"
-        "  %s TLEs/amateur.tle next --with-hardware\n"
+        "  # Explicit TLE file\n"
+        "  %s next --tle=TLEs/amateur.tle --with-hardware\n"
         "\n"
         "  # Live operation on 9700 native USB (just change the device path)\n"
-        "  %s TLEs/amateur.tle next --with-hardware --radio-device=/dev/ttyACM0\n",
+        "  %s next --with-hardware --radio-device=/dev/ttyACM0\n",
         name, name, name, name);
 }
 
@@ -828,6 +831,13 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             state->n_options++;
             state->run_with_radio = 1;
             state->run_with_antenna_rotator = 1;
+        } else if (strncmp("--tle=", argv[i], 6) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 7) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state->prediction.tles_filename = argv[i] + 6;
         } else if (strcmp("--uplink-ready", argv[i]) == 0) {
             state->n_options++;
             state->prepare_uplink = 1;
@@ -1028,7 +1038,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         }
 
     }
-    if (argc - state->n_options != 3) {
+    if (argc - state->n_options != 2) {
         usage(stderr, argv[0], 0);
         return 1;
     }
@@ -1040,8 +1050,15 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->prediction.observer_ephem.position_geodetic.lon = site_longitude * M_PI / 180.0;
     state->prediction.observer_ephem.position_geodetic.alt = site_altitude / 1000.0;
 
-    state->prediction.tles_filename = argv[1];
-    state->prediction.satellite_ephem.name = argv[2];
+    if (state->prediction.tles_filename == NULL) {
+        static char default_tle[1024];
+        if (tle_default_path(default_tle, sizeof(default_tle)) != 0) {
+            fprintf(stderr, "HOME unset or path too long; pass --tle=<path>\n");
+            return EXIT_FAILURE;
+        }
+        state->prediction.tles_filename = default_tle;
+    }
+    state->prediction.satellite_ephem.name = argv[1];
 
     if (strcmp(state->prediction.satellite_ephem.name, "next") == 0) {
         state->prediction.auto_sat = 1;
