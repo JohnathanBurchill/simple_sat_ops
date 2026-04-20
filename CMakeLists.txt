@@ -57,7 +57,12 @@ add_executable(fm_preview utils/fm_preview.c utils/wav_read.c modem.c)
 target_include_directories(fm_preview PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(fm_preview PRIVATE m)
 
-install(TARGETS simple_sat_ops next_in_queue lifetime tx_tone uplink_test fm_preview DESTINATION $ENV{HOME}/bin)
+# Single-shot frame transmitter: CSP+AX100 -> PCM -> CI-V PTT + ALSA playback
+add_executable(tx_frame utils/tx_frame.c csp.c golay24.c ax100.c hmac_keyfile.c modem.c radio.c)
+target_include_directories(tx_frame PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
+target_link_libraries(tx_frame PRIVATE ${OPENSSL_LIBRARIES} m asound)
+
+install(TARGETS simple_sat_ops next_in_queue lifetime tx_tone uplink_test fm_preview tx_frame DESTINATION $ENV{HOME}/bin)
 
 install(PROGRAMS scripts/upcoming_amateur_satellite_passes.sh DESTINATION $ENV{HOME}/bin)
 install(PROGRAMS scripts/pcm2wav.sh DESTINATION $ENV{HOME}/bin)
