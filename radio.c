@@ -168,6 +168,11 @@ void radio_disconnect(radio_t *radio)
 
 int radio_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t subsubcmd, uint8_t *send_data, int len, uint64_t *received_value, uint8_t reverse_value)
 {
+    // Refuse I/O on an unconnected radio: fd may be zero-initialized (= stdin),
+    // which would cause read() to block the UI thread waiting for keyboard input.
+    if (!radio->connected) {
+        return RADIO_BAD_RESPONSE;
+    }
     uint8_t telemetry[RADIO_MAX_COMMAND_LEN] = {0};
     size_t offset = 0;
     telemetry[offset++] = 0xFE;
