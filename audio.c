@@ -20,13 +20,19 @@ int init_audio_capture(audio_t *state)
     // Open the PCM devices for recording. Sub is skipped when it'd be the
     // same device as Main — ALSA exclusive capture won't share hardware.
     state->pcm_handle_sub = NULL;
-    if (snd_pcm_open(&state->pcm_handle_main, AUDIO_DEVICE_NAME_MAIN, SND_PCM_STREAM_CAPTURE, 0) < 0) {
+    int rc = snd_pcm_open(&state->pcm_handle_main, AUDIO_DEVICE_NAME_MAIN, SND_PCM_STREAM_CAPTURE, 0);
+    if (rc < 0) {
+        fprintf(stderr, "audio: snd_pcm_open(%s, CAPTURE) failed: %s\n",
+                AUDIO_DEVICE_NAME_MAIN, snd_strerror(rc));
         result_status = AUDIO_DEVICE_OPEN;
         return AUDIO_DEVICE_OPEN;
     }
     int have_sub = strcmp(AUDIO_DEVICE_NAME_SUB, AUDIO_DEVICE_NAME_MAIN) != 0;
     if (have_sub) {
-        if (snd_pcm_open(&state->pcm_handle_sub, AUDIO_DEVICE_NAME_SUB, SND_PCM_STREAM_CAPTURE, 0) < 0) {
+        rc = snd_pcm_open(&state->pcm_handle_sub, AUDIO_DEVICE_NAME_SUB, SND_PCM_STREAM_CAPTURE, 0);
+        if (rc < 0) {
+            fprintf(stderr, "audio: snd_pcm_open(%s, CAPTURE) failed: %s\n",
+                    AUDIO_DEVICE_NAME_SUB, snd_strerror(rc));
             result_status = AUDIO_DEVICE_OPEN;
             return AUDIO_DEVICE_OPEN;
         }
@@ -35,11 +41,31 @@ int init_audio_capture(audio_t *state)
     snd_pcm_hw_params_malloc(&params_main);
     snd_pcm_hw_params_any(state->pcm_handle_main, params_main);
     snd_pcm_hw_params_set_access(state->pcm_handle_main, params_main, SND_PCM_ACCESS_RW_INTERLEAVED);
-    snd_pcm_hw_params_set_format(state->pcm_handle_main, params_main, AUDIO_FORMAT);
-    snd_pcm_hw_params_set_channels(state->pcm_handle_main, params_main, AUDIO_CHANNELS);
-    snd_pcm_hw_params_set_rate_near(state->pcm_handle_main, params_main, &rate, &dir);
+    if ((rc = snd_pcm_hw_params_set_format(state->pcm_handle_main, params_main, AUDIO_FORMAT)) < 0) {
+        fprintf(stderr, "audio: set_format S16_LE on %s failed: %s\n",
+                AUDIO_DEVICE_NAME_MAIN, snd_strerror(rc));
+        snd_pcm_hw_params_free(params_main);
+        return AUDIO_DEVICE_OPEN;
+    }
+    if ((rc = snd_pcm_hw_params_set_channels(state->pcm_handle_main, params_main, AUDIO_CHANNELS)) < 0) {
+        fprintf(stderr, "audio: set_channels(%d) on %s failed: %s\n",
+                AUDIO_CHANNELS, AUDIO_DEVICE_NAME_MAIN, snd_strerror(rc));
+        snd_pcm_hw_params_free(params_main);
+        return AUDIO_DEVICE_OPEN;
+    }
+    if ((rc = snd_pcm_hw_params_set_rate_near(state->pcm_handle_main, params_main, &rate, &dir)) < 0) {
+        fprintf(stderr, "audio: set_rate_near(%u) on %s failed: %s\n",
+                rate, AUDIO_DEVICE_NAME_MAIN, snd_strerror(rc));
+        snd_pcm_hw_params_free(params_main);
+        return AUDIO_DEVICE_OPEN;
+    }
     snd_pcm_hw_params_set_period_size_near(state->pcm_handle_main, params_main, &state->audio_frames, &dir);
-    snd_pcm_hw_params(state->pcm_handle_main, params_main);
+    if ((rc = snd_pcm_hw_params(state->pcm_handle_main, params_main)) < 0) {
+        fprintf(stderr, "audio: hw_params apply on %s failed: %s\n",
+                AUDIO_DEVICE_NAME_MAIN, snd_strerror(rc));
+        snd_pcm_hw_params_free(params_main);
+        return AUDIO_DEVICE_OPEN;
+    }
     snd_pcm_hw_params_free(params_main);
 
     if (have_sub) {
