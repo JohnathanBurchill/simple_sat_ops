@@ -3,8 +3,8 @@
 
 #include <alsa/asoundlib.h>
 
-#define AUDIO_DEVICE_NAME_MAIN "hw:3,0"
-#define AUDIO_DEVICE_NAME_SUB "hw:4,0"
+#define AUDIO_DEVICE_NAME_MAIN "plughw:1,0"
+#define AUDIO_DEVICE_NAME_SUB "plughw:1,0"
 #define AUDIO_RATE_HZ 48000
 #define AUDIO_CHANNELS 2
 #define AUDIO_FORMAT SND_PCM_FORMAT_S16_LE
