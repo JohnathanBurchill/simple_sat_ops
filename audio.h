@@ -3,8 +3,11 @@
 
 #include <alsa/asoundlib.h>
 
-#define AUDIO_DEVICE_NAME_MAIN "plughw:1,0"
-#define AUDIO_DEVICE_NAME_SUB "plughw:1,0"
+// RX capture path — IC-9700 native USB CODEC at card 4 on the RAO box.
+// The SignaLink (card 1) is the TX-side audio+PTT device and is not used
+// for capture.
+#define AUDIO_DEVICE_NAME_MAIN "plughw:4,0"
+#define AUDIO_DEVICE_NAME_SUB "plughw:4,0"
 #define AUDIO_RATE_HZ 48000
 #define AUDIO_CHANNELS 2
 #define AUDIO_FORMAT SND_PCM_FORMAT_S16_LE
