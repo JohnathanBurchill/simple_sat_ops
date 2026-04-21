@@ -38,11 +38,30 @@
 #include "radio.h"
 
 #include <alsa/asoundlib.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
+
+// File-scope pointer so the signal handler can reach the open radio.
+// Only touched via async-signal-safe write() — do not deref fields that
+// could change; only read fd/connected which are stable post-connect.
+static radio_t *g_radio_for_sigint = NULL;
+
+static void on_sigint(int sig)
+{
+    (void)sig;
+    // CI-V PTT off: FE FE A2 E0 1C 00 00 FD (transmit off)
+    static const uint8_t ptt_off_cmd[] = {
+        0xFE, 0xFE, 0xA2, 0xE0, 0x1C, 0x00, 0x00, 0xFD,
+    };
+    if (g_radio_for_sigint != NULL && g_radio_for_sigint->connected) {
+        (void)!write(g_radio_for_sigint->fd, ptt_off_cmd, sizeof(ptt_off_cmd));
+    }
+    _exit(130);  // 128 + SIGINT
+}
 
 static int starts_with(const char *s, const char *prefix)
 {
@@ -274,6 +293,17 @@ int main(int argc, char **argv)
         free(samples);
         return 1;
     }
+
+    // Arm a SIGINT handler that writes PTT-off directly to the radio fd
+    // so Ctrl-C during TX doesn't leave the radio keyed. Handler calls
+    // _exit() — any ALSA cleanup is left to the kernel.
+    g_radio_for_sigint = &radio;
+    struct sigaction sa = {0};
+    sa.sa_handler = on_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  // no SA_RESTART: want ALSA blocking calls to return EINTR
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
     fprintf(stderr, "tx_frame: PTT on\n");
     rc = radio_ptt(&radio, 1);
