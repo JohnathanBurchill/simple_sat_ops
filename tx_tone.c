@@ -21,19 +21,33 @@
 #include "radio.h"
 #include "audio.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <termios.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 static radio_t g_radio = {0};
 static int g_no_ptt = 0;
+static pid_t g_record_pid = 0;
+
+static void stop_recorder(void)
+{
+    if (g_record_pid <= 0) return;
+    kill(g_record_pid, SIGINT);
+    int status = 0;
+    waitpid(g_record_pid, &status, 0);
+    g_record_pid = 0;
+}
 
 static void on_signal(int sig)
 {
     (void)sig;
+    stop_recorder();
     if (g_radio.connected) {
         if (!g_no_ptt) {
             radio_ptt(&g_radio, 0);
@@ -69,6 +83,8 @@ static void usage(FILE *dest, const char *name, int full)
         "\n"
         "Behaviour flags:\n"
         "  --no-ptt                     Skip CI-V PTT; play audio only (bench test)\n"
+        "  --record=<wav>               Capture the USB CODEC to <wav> during TX\n"
+        "                               (needs radio MONI on for useful content)\n"
         "  --help                       Short help (this message)\n"
         "  --help-full                  Detailed help with setup and verification\n",
         name, FRONTIERSAT_CARRIER_HZ, FRONTIERSAT_CARRIER_HZ / 1e6);
@@ -119,6 +135,16 @@ static void usage(FILE *dest, const char *name, int full)
         "  3. Full end-to-end on a dummy load, monitor on a 2nd receiver:\n"
         "       %s --duration-s=5 --amplitude=0.3\n"
         "\n"
+        "RECORDING THE TX\n"
+        "\n"
+        "  --record=<wav> forks `arecord` against the same USB CODEC for the\n"
+        "  duration of the TX. To hear anything in the resulting WAV you need\n"
+        "  to turn the radio's monitor function on (MONI key / MONITOR LEVEL\n"
+        "  set non-zero) so the transmitted audio is looped back onto the USB\n"
+        "  AF output. Otherwise the receiver is muted during TX and the WAV\n"
+        "  will be silence. Output format: 48 kHz S16_LE stereo WAV,\n"
+        "  byte-compatible with uplink_test --out=.\n"
+        "\n"
         "CAVEATS\n"
         "\n"
         "  - FM-DATA mode (flat TX audio, no mic EQ) — same path AX100 frames\n"
@@ -130,11 +156,48 @@ static void usage(FILE *dest, const char *name, int full)
         name, name, name);
 }
 
+// Spawn `arecord` capturing the USB CODEC to a WAV file. Child PID is
+// stashed in g_record_pid so on_signal() / the main flow can SIGINT it.
+// The sample format matches AUDIO_RATE_HZ / AUDIO_CHANNELS / S16_LE so
+// the captured WAV is byte-comparable with uplink_test --out=.
+static int start_recorder(const char *device, const char *out_path)
+{
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "error: fork() for arecord failed: %s\n", strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        char rate_str[16], chan_str[8];
+        snprintf(rate_str, sizeof rate_str, "%u", AUDIO_RATE_HZ);
+        snprintf(chan_str, sizeof chan_str, "%u", AUDIO_CHANNELS);
+        char *argv_rec[] = {
+            "arecord",
+            "-q",
+            "-D", (char *)device,
+            "-f", "S16_LE",
+            "-r", rate_str,
+            "-c", chan_str,
+            "-t", "wav",
+            (char *)out_path,
+            NULL,
+        };
+        execvp("arecord", argv_rec);
+        fprintf(stderr, "error: execvp(arecord) failed: %s\n", strerror(errno));
+        _exit(127);
+    }
+    g_record_pid = pid;
+    // Give arecord a beat to open the device before we start TX.
+    usleep(200000);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *radio_device = "/dev/ttyUSB1";
     speed_t radio_speed = B115200;
     const char *audio_device = "plughw:4,0";
+    const char *record_path = NULL;
     double freq_hz = FRONTIERSAT_CARRIER_HZ;
     double tone_hz = 1000.0;
     double duration_s = 3.0;
@@ -164,6 +227,9 @@ int main(int argc, char **argv)
             amplitude = atof(argv[i] + 12);
         } else if (strcmp("--no-ptt", argv[i]) == 0) {
             g_no_ptt = 1;
+        } else if (strncmp("--record=", argv[i], 9) == 0) {
+            if (strlen(argv[i]) < 10) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
+            record_path = argv[i] + 9;
         } else if (strcmp("--help", argv[i]) == 0) {
             usage(stdout, argv[0], 0);
             return 0;
@@ -212,10 +278,19 @@ int main(int argc, char **argv)
         goto fail_radio;
     }
 
+    if (record_path != NULL) {
+        fprintf(stderr, "tx_tone: recording %s <- %s\n", record_path, audio_device);
+        if (start_recorder(audio_device, record_path) != 0) {
+            audio_playback_close(playback);
+            goto fail_radio;
+        }
+    }
+
     if (!g_no_ptt) {
         rc = radio_ptt(&g_radio, 1);
         if (rc != RADIO_OK) {
             fprintf(stderr, "error: PTT on (rc=%d)\n", rc);
+            stop_recorder();
             audio_playback_close(playback);
             goto fail_radio;
         }
@@ -226,8 +301,11 @@ int main(int argc, char **argv)
     audio_playback_close(playback);
 
     if (!g_no_ptt) {
+        // Tail: capture the receiver's post-TX recovery before stopping.
+        usleep(200000);
         radio_ptt(&g_radio, 0);
     }
+    stop_recorder();
     radio_disconnect(&g_radio);
 
     if (arc != AUDIO_OK) {
@@ -237,6 +315,7 @@ int main(int argc, char **argv)
     return 0;
 
 fail_radio:
+    stop_recorder();
     if (!g_no_ptt && g_radio.connected) {
         radio_ptt(&g_radio, 0);
     }
