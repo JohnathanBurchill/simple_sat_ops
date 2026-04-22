@@ -46,13 +46,14 @@ static void on_signal(int sig)
 static void usage(FILE *dest, const char *name, int full)
 {
     fprintf(dest,
-        "usage: %s --audio-device=<alsa> [options]\n"
+        "usage: %s [options]\n"
         "\n"
         "Key the IC-9700 on a simplex UHF carrier and play a sine tone through\n"
         "the radio's TX chain. Uplink bring-up tool; does no modulation yet.\n"
         "\n"
-        "Required:\n"
-        "  --audio-device=<name>        ALSA PCM device (e.g. hw:3,0)\n"
+        "Audio:\n"
+        "  --audio-device=<name>        ALSA PCM device (default plughw:4,0,\n"
+        "                               IC-9700 native USB CODEC)\n"
         "\n"
         "Radio transport:\n"
         "  --radio-device=<path>        CI-V tty (default /dev/ttyUSB1)\n"
@@ -112,11 +113,11 @@ static void usage(FILE *dest, const char *name, int full)
         "     Confirms NCO + ALSA playback via snd-aloop.\n"
         "\n"
         "  2. PTT only, dummy load, no audio:\n"
-        "       %s --audio-device=hw:3,0 --duration-s=0.5 --amplitude=0\n"
+        "       %s --duration-s=0.5 --amplitude=0\n"
         "     Radio keys TX briefly then releases. Confirms CI-V PTT.\n"
         "\n"
         "  3. Full end-to-end on a dummy load, monitor on a 2nd receiver:\n"
-        "       %s --audio-device=hw:3,0 --duration-s=5 --amplitude=0.3\n"
+        "       %s --duration-s=5 --amplitude=0.3\n"
         "\n"
         "CAVEATS\n"
         "\n"
@@ -133,7 +134,7 @@ int main(int argc, char **argv)
 {
     const char *radio_device = "/dev/ttyUSB1";
     speed_t radio_speed = B115200;
-    const char *audio_device = NULL;
+    const char *audio_device = "plughw:4,0";
     double freq_hz = FRONTIERSAT_CARRIER_HZ;
     double tone_hz = 1000.0;
     double duration_s = 3.0;
@@ -174,12 +175,6 @@ int main(int argc, char **argv)
             usage(stderr, argv[0], 0);
             return EXIT_FAILURE;
         }
-    }
-
-    if (audio_device == NULL) {
-        fprintf(stderr, "error: --audio-device is required. Run `aplay -l` on the target to list devices.\n");
-        usage(stderr, argv[0], 0);
-        return EXIT_FAILURE;
     }
 
     struct sigaction sa = {0};
