@@ -38,17 +38,65 @@
 #include "radio.h"
 
 #include <alsa/asoundlib.h>
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 // File-scope pointer so the signal handler can reach the open radio.
 // Only touched via async-signal-safe write() — do not deref fields that
 // could change; only read fd/connected which are stable post-connect.
 static radio_t *g_radio_for_sigint = NULL;
+static pid_t g_record_pid = 0;
+
+static void stop_recorder(void)
+{
+    if (g_record_pid <= 0) return;
+    kill(g_record_pid, SIGINT);
+    int status = 0;
+    waitpid(g_record_pid, &status, 0);
+    g_record_pid = 0;
+}
+
+// Fork arecord against the USB CODEC into a WAV file. Format matches
+// the tx_frame baseband (mono S16_LE at the modem sample rate) so the
+// captured file lines up with uplink_test --out= for decoder diffing.
+static int start_recorder(const char *device, const char *out_path,
+                          unsigned int rate_hz)
+{
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "error: fork() for arecord failed: %s\n", strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        char rate_str[16];
+        snprintf(rate_str, sizeof rate_str, "%u", rate_hz);
+        char *argv_rec[] = {
+            "arecord",
+            "-q",
+            "-D", (char *)device,
+            "-f", "S16_LE",
+            "-r", rate_str,
+            "-c", "1",
+            "-t", "wav",
+            (char *)out_path,
+            NULL,
+        };
+        execvp("arecord", argv_rec);
+        fprintf(stderr, "error: execvp(arecord) failed: %s\n", strerror(errno));
+        _exit(127);
+    }
+    g_record_pid = pid;
+    // Give arecord a beat to open the device before we start TX.
+    usleep(200000);
+    return 0;
+}
 
 static void on_sigint(int sig)
 {
@@ -60,6 +108,8 @@ static void on_sigint(int sig)
     if (g_radio_for_sigint != NULL && g_radio_for_sigint->connected) {
         (void)!write(g_radio_for_sigint->fd, ptt_off_cmd, sizeof(ptt_off_cmd));
     }
+    // Clean up the recorder child before we bail so its WAV is flushed.
+    stop_recorder();
     _exit(130);  // 128 + SIGINT
 }
 
@@ -105,10 +155,11 @@ static void usage(FILE *out, const char *argv0)
     fprintf(out,
         "usage: %s (--payload-hex=<HEX> | --payload-ascii=<STR>) [options]\n"
         "\n"
-        "Builds a CSP+AX100 frame, keys PTT via CI-V, streams the\n"
-        "modulated baseband to an ALSA playback device, then unkeys.\n"
-        "Expects the radio to already be in FM-DATA + correct MOD source\n"
-        "(run `simple_sat_ops ... --uplink-ready` once to configure that).\n"
+        "Builds a CSP+AX100 frame, initializes the radio to FM-DATA on the\n"
+        "FrontierSat UHF carrier, keys PTT via CI-V, streams the modulated\n"
+        "baseband to an ALSA playback device, then unkeys. The DATA MOD\n"
+        "source is NOT touched — set it on the front panel to match the\n"
+        "audio cabling (USB for the 9700's native USB CODEC).\n"
         "\n"
         "Required (exactly one):\n"
         "  --payload-hex=<HEX>         Payload as hex\n"
@@ -128,16 +179,19 @@ static void usage(FILE *out, const char *argv0)
         "Radio (CI-V for PTT):\n"
         "  --radio-device=<path>       CI-V tty (default /dev/ttyUSB1)\n"
         "  --radio-serial-speed=<bps>  Serial speed (default 115200)\n"
+        "  --freq-hz=<hz>              UHF simplex carrier (default %.0f)\n"
         "\n"
         "Audio (ALSA playback):\n"
         "  --audio-device=<device>     ALSA device (default plughw:4,0)\n"
         "  --pre-ms=<ms>               Delay after PTT on before audio starts (200)\n"
         "  --post-ms=<ms>              Delay after audio ends before PTT off (200)\n"
+        "  --record=<wav>              Capture the USB CODEC to <wav> during TX\n"
+        "                              (needs radio MONI on for useful content)\n"
         "\n"
         "Safety / dry-run:\n"
         "  --dry-run                   Build the frame, print size, do not TX\n"
         "  --help                      This message\n",
-        argv0, HMAC_KEYFILE_DEFAULT_RELPATH);
+        argv0, HMAC_KEYFILE_DEFAULT_RELPATH, FRONTIERSAT_CARRIER_HZ);
 }
 
 int main(int argc, char **argv)
@@ -147,6 +201,8 @@ int main(int argc, char **argv)
     const char *keyfile_path = NULL;
     const char *radio_device = "/dev/ttyUSB1";
     const char *audio_device = "plughw:4,0";
+    const char *record_path = NULL;
+    double freq_hz = FRONTIERSAT_CARRIER_HZ;
     speed_t radio_speed = B115200;
     int use_hmac = 1;
     int dry_run = 0;
@@ -185,6 +241,8 @@ int main(int argc, char **argv)
             else { fprintf(stderr, "unsupported baud: %d\n", bps); return 1; }
         }
         else if (starts_with(a, "--audio-device="))     audio_device = a + 15;
+        else if (starts_with(a, "--freq-hz="))          freq_hz      = atof(a + 10);
+        else if (starts_with(a, "--record="))           record_path  = a + 9;
         else if (starts_with(a, "--pre-ms="))           pre_ms       = atoi(a + 9);
         else if (starts_with(a, "--post-ms="))          post_ms      = atoi(a + 10);
         else if (strcmp(a, "--dry-run") == 0)           dry_run = 1;
@@ -286,12 +344,22 @@ int main(int argc, char **argv)
     radio_t radio = {0};
     radio.device_filename = (char *)radio_device;
     radio.serial_speed = radio_speed;
-    radio_connect(&radio);
-    if (!radio.connected) {
-        fprintf(stderr, "radio_connect(%s) failed\n", radio_device);
+    radio.nominal_downlink_frequency = freq_hz;
+    radio.sub_park_frequency = RADIO_SUB_PARK_HZ;
+    rc = radio_init(&radio);
+    if (rc != RADIO_OK) {
+        fprintf(stderr, "radio_init(%s) failed (rc=%d)\n", radio_device, rc);
+        if (radio.connected) radio_disconnect(&radio);
         snd_pcm_close(pcm);
         free(samples);
         return 1;
+    }
+    // radio_init leaves Main in plain FM (CI-V 0x06 clears the DATA flag).
+    // Restore DATA so the modulator uses the flat audio path AX100 needs.
+    rc = radio_set_data_mode(&radio, 1, RADIO_FILTER_FIL1);
+    if (rc != RADIO_OK) {
+        fprintf(stderr, "warning: could not re-enable DATA mode (rc=%d); "
+                "radio will transmit in voice FM.\n", rc);
     }
 
     // Arm a SIGINT handler that writes PTT-off directly to the radio fd
@@ -305,10 +373,21 @@ int main(int argc, char **argv)
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    if (record_path != NULL) {
+        fprintf(stderr, "tx_frame: recording %s <- %s\n", record_path, audio_device);
+        if (start_recorder(audio_device, record_path, (unsigned)mp.samp_rate) != 0) {
+            snd_pcm_close(pcm);
+            radio_disconnect(&radio);
+            free(samples);
+            return 1;
+        }
+    }
+
     fprintf(stderr, "tx_frame: PTT on\n");
     rc = radio_ptt(&radio, 1);
     if (rc != RADIO_OK) {
         fprintf(stderr, "radio_ptt(1) failed: %d\n", rc);
+        stop_recorder();
         snd_pcm_close(pcm);
         radio_disconnect(&radio);
         free(samples);
@@ -335,6 +414,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "tx_frame: PTT off\n");
     radio_ptt(&radio, 0);
 
+    stop_recorder();
     snd_pcm_close(pcm);
     radio_disconnect(&radio);
     free(samples);
