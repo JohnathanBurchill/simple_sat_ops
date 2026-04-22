@@ -199,3 +199,130 @@ int pcm16_write_wav(const char *path,
     }
     return 0;
 }
+
+// AX100 attached sync marker. Must match AX100_ASM_* in ax100.h — duplicated
+// here so modem.c doesn't have to pull ax100.h (keeps it a pure DSP module).
+#define ASM_BIG_ENDIAN_U32  0x930B51DEu
+
+// Given a bit stream (MSB-first), find the offset in bits at which the
+// 32-bit pattern `needle` first matches within `max_ham` bit errors.
+// Returns the bit offset, or (size_t)-1 if not found.
+static size_t find_u32_pattern(const uint8_t *bits, size_t n_bits,
+                               uint32_t needle, int max_ham)
+{
+    if (n_bits < 32) return (size_t)-1;
+    uint32_t window = 0;
+    // Pre-load first 32 bits.
+    for (int i = 0; i < 32; ++i) {
+        window = (window << 1) | (bits[i] & 1u);
+    }
+    if ((int)__builtin_popcount(window ^ needle) <= max_ham) {
+        return 0;
+    }
+    for (size_t i = 32; i < n_bits; ++i) {
+        window = (window << 1) | (bits[i] & 1u);
+        if ((int)__builtin_popcount(window ^ needle) <= max_ham) {
+            return i - 31;
+        }
+    }
+    return (size_t)-1;
+}
+
+int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
+                        const modem_params_t *p,
+                        int invert_polarity,
+                        int sync_max_ham,
+                        uint8_t *out_bits, size_t *n_bits_out,
+                        size_t *sync_bit_offset)
+{
+    if (samples == NULL || p == NULL || out_bits == NULL || n_bits_out == NULL) {
+        return -1;
+    }
+    if (p->samp_rate <= 0 || p->bit_rate <= 0 ||
+        p->samp_rate % p->bit_rate != 0) {
+        return -1;
+    }
+    int sps = p->samp_rate / p->bit_rate;
+    if (sps <= 0 || n_samples < (size_t)sps * 32u) {
+        return -1;
+    }
+
+    // DC-block: 1-pole HPF, y[n] = x[n] - x[n-1] + α·y[n-1].
+    // α close to 1 → narrow low-cut. 0.995 at 48 kHz ≈ 40 Hz -3dB.
+    float *dc_blocked = (float *)malloc(n_samples * sizeof(float));
+    if (dc_blocked == NULL) return -1;
+    const float alpha = 0.995f;
+    float prev_x = 0.0f, prev_y = 0.0f;
+    for (size_t i = 0; i < n_samples; ++i) {
+        float x = (float)samples[i];
+        float y = x - prev_x + alpha * prev_y;
+        dc_blocked[i] = y;
+        prev_x = x;
+        prev_y = y;
+    }
+
+    // Pre-slice into per-sample bits for each of the `sps` possible mid-bit
+    // phase offsets. The actual bit stream is every sps-th sample starting
+    // at (phase + sps/2) for phase in [0, sps).
+    size_t max_bits = n_samples / (size_t)sps;
+    uint8_t *tmp_bits = (uint8_t *)malloc(max_bits);
+    if (tmp_bits == NULL) {
+        free(dc_blocked);
+        return -1;
+    }
+
+    size_t best_sync = (size_t)-1;
+    int best_phase = -1;
+    for (int phase = 0; phase < sps; ++phase) {
+        size_t mid_offset = (size_t)phase + (size_t)sps / 2u;
+        size_t n_bits = 0;
+        for (size_t i = mid_offset; i < n_samples; i += (size_t)sps) {
+            int bit;
+            if (invert_polarity) {
+                bit = (dc_blocked[i] < 0.0f) ? 1 : 0;
+            } else {
+                bit = (dc_blocked[i] > 0.0f) ? 1 : 0;
+            }
+            tmp_bits[n_bits++] = (uint8_t)bit;
+        }
+        size_t off = find_u32_pattern(tmp_bits, n_bits,
+                                      ASM_BIG_ENDIAN_U32, sync_max_ham);
+        if (off != (size_t)-1) {
+            // Copy the tail starting at the ASM.
+            size_t copy_bits = n_bits - off;
+            memcpy(out_bits, tmp_bits + off, copy_bits);
+            *n_bits_out = copy_bits;
+            best_sync = off;
+            best_phase = phase;
+            break;
+        }
+    }
+
+    free(tmp_bits);
+    free(dc_blocked);
+
+    if (best_phase < 0) {
+        if (sync_bit_offset) *sync_bit_offset = (size_t)-1;
+        return -1;
+    }
+    if (sync_bit_offset) *sync_bit_offset = best_sync;
+    return 0;
+}
+
+size_t modem_bits_to_bytes(const uint8_t *bits, size_t n_bits, uint8_t *out)
+{
+    size_t n_bytes = (n_bits + 7) / 8;
+    for (size_t i = 0; i < n_bytes; ++i) {
+        uint8_t b = 0;
+        for (int k = 0; k < 8; ++k) {
+            size_t bit_idx = i * 8 + (size_t)k;
+            if (bit_idx < n_bits) {
+                b = (uint8_t)((b << 1) | (bits[bit_idx] & 1u));
+            } else {
+                b <<= 1;
+            }
+        }
+        out[i] = b;
+    }
+    return n_bytes;
+}

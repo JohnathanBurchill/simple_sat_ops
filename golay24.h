@@ -31,4 +31,14 @@
 // Output layout: (12-bit parity << 12) | (12-bit data).
 uint32_t golay24_encode(uint16_t data12);
 
+// Decodes a 24-bit Golay codeword back to its 12-bit data value, correcting
+// up to 3 bit errors. Implementation is a brute-force minimum-Hamming-
+// distance search over all 4096 codewords — trivial for this code size and
+// easy to convince yourself is correct. On success returns 0, writes the
+// recovered 12-bit data to *out_data12, and (if non-NULL) writes the number
+// of bit errors (0..3) to *out_errors_corrected. Returns -1 if the closest
+// codeword differs by > 3 bits (uncorrectable).
+int golay24_decode(uint32_t word24, uint16_t *out_data12,
+                   int *out_errors_corrected);
+
 #endif // GOLAY24_H

@@ -22,6 +22,8 @@
 #include "golay24.h"
 
 #include <string.h>
+#include "golay24.h"
+
 #include <openssl/evp.h>
 
 // CCSDS RX scrambler 256-byte precomputed XOR table.
@@ -226,4 +228,75 @@ ssize_t ax100_frame(const uint8_t *packet, size_t packet_len,
     p += opts->tailfill;
 
     return (ssize_t)(p - out_buf);
+}
+
+ssize_t ax100_unframe(const uint8_t *bytes, size_t n_bytes,
+                      const ax100_opts_t *opts,
+                      uint8_t *out_packet, size_t out_packet_cap,
+                      int *out_golay_errors,
+                      int *out_hmac_ok)
+{
+    if (bytes == NULL || opts == NULL || out_packet == NULL) return -1;
+    if (out_hmac_ok) *out_hmac_ok = -1;
+    if (out_golay_errors) *out_golay_errors = 0;
+
+    size_t off = 0;
+
+    if (opts->syncword) {
+        if (n_bytes < 4) return -1;
+        if (bytes[0] != AX100_ASM_0 || bytes[1] != AX100_ASM_1 ||
+            bytes[2] != AX100_ASM_2 || bytes[3] != AX100_ASM_3) {
+            return -1;
+        }
+        off += 4;
+    }
+
+    size_t inner_len = 0;
+    if (opts->len_field) {
+        if (n_bytes - off < 3) return -1;
+        uint32_t g = ((uint32_t)bytes[off    ] << 16)
+                   | ((uint32_t)bytes[off + 1] <<  8)
+                   |  (uint32_t)bytes[off + 2];
+        off += 3;
+        uint16_t decoded = 0;
+        int errs = 0;
+        if (golay24_decode(g, &decoded, &errs) != 0) {
+            if (out_golay_errors) *out_golay_errors = errs;
+            return -1;
+        }
+        if (out_golay_errors) *out_golay_errors = errs;
+        inner_len = (size_t)decoded;
+    } else {
+        // No length field — use whatever bytes remain. (Not a supported
+        // wire format in this codebase; included for symmetry with encoder.)
+        inner_len = n_bytes - off;
+    }
+
+    if (inner_len > n_bytes - off) return -1;
+    if (inner_len > out_packet_cap + 4u) return -1;
+
+    // Copy inner (scrambled + optional HMAC trailer) into out_packet staging.
+    memcpy(out_packet, bytes + off, inner_len);
+
+    if (opts->randomize) {
+        for (size_t i = 0; i < inner_len; ++i) {
+            out_packet[i] ^= CCSDS_SCRAMBLER_TABLE[i % sizeof(CCSDS_SCRAMBLER_TABLE)];
+        }
+    }
+
+    size_t packet_len = inner_len;
+    if (opts->hmac_key != NULL) {
+        if (inner_len < 4) return -1;
+        uint8_t expected[4];
+        if (ax100_hmac(opts->hmac_key, opts->hmac_key_len,
+                       out_packet, inner_len - 4, expected) != 0) {
+            return -1;
+        }
+        int match = (memcmp(expected, out_packet + inner_len - 4, 4) == 0);
+        if (out_hmac_ok) *out_hmac_ok = match ? 1 : 0;
+        packet_len = inner_len - 4;
+    }
+
+    if (packet_len > out_packet_cap) return -1;
+    return (ssize_t)packet_len;
 }

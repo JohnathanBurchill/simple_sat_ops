@@ -60,4 +60,8 @@ ssize_t csp_v1_encode(const csp_v1_header_t *hdr,
                       const uint8_t *payload, size_t payload_len,
                       uint8_t *out_buf, size_t out_buf_size);
 
+// Parse the 4-byte big-endian CSP v1 header. Always fills out_hdr if bytes
+// is non-NULL. Returns 0 on success, -1 on bad args.
+int csp_v1_decode(const uint8_t bytes[4], csp_v1_header_t *out_hdr);
+
 #endif // CSP_H

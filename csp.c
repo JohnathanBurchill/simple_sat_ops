@@ -59,3 +59,21 @@ ssize_t csp_v1_encode(const csp_v1_header_t *hdr,
 
     return (ssize_t)(4 + payload_len);
 }
+
+int csp_v1_decode(const uint8_t bytes[4], csp_v1_header_t *out_hdr)
+{
+    if (bytes == NULL || out_hdr == NULL) {
+        return -1;
+    }
+    uint32_t h = ((uint32_t)bytes[0] << 24)
+               | ((uint32_t)bytes[1] << 16)
+               | ((uint32_t)bytes[2] <<  8)
+               |  (uint32_t)bytes[3];
+    out_hdr->prio  = (uint8_t)((h >> 30) & 0x03);
+    out_hdr->src   = (uint8_t)((h >> 25) & 0x1F);
+    out_hdr->dst   = (uint8_t)((h >> 20) & 0x1F);
+    out_hdr->dport = (uint8_t)((h >> 14) & 0x3F);
+    out_hdr->sport = (uint8_t)((h >>  8) & 0x3F);
+    out_hdr->flags = (uint8_t)( h        & 0xFF);
+    return 0;
+}

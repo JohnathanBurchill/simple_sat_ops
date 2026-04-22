@@ -76,4 +76,28 @@ ssize_t ax100_frame(const uint8_t *packet, size_t packet_len,
                     const ax100_opts_t *opts,
                     uint8_t *out_buf, size_t out_buf_size);
 
+// Reverse of ax100_frame. Input `bytes` must start AT the 4-byte ASM sync
+// word — the decoder's timing-recovery stage finds that in the bit stream
+// and byte-aligns the remainder.
+//
+// Honors the same ax100_opts_t used on the encode side: if opts->len_field
+// is set, the 3-byte Golay24-encoded length is consumed; if opts->randomize,
+// the payload is descrambled; if opts->hmac_key, the trailing 4-byte HMAC
+// is verified.
+//
+// Writes the inner CSP packet (with HMAC trailer stripped, if applicable)
+// to out_packet. On success returns the inner packet length.
+// *out_golay_errors (optional) gets 0..3 on success, or the uncorrectable
+// bit count (>3) on failure.
+// *out_hmac_ok (optional) is 1 if the HMAC matched, 0 if it did not, or
+// -1 if HMAC verification wasn't attempted (no key supplied).
+//
+// Returns -1 on any fatal error (missing ASM, uncorrectable Golay, not
+// enough bytes to satisfy the decoded length, invalid args).
+ssize_t ax100_unframe(const uint8_t *bytes, size_t n_bytes,
+                      const ax100_opts_t *opts,
+                      uint8_t *out_packet, size_t out_packet_cap,
+                      int *out_golay_errors,
+                      int *out_hmac_ok);
+
 #endif // AX100_H

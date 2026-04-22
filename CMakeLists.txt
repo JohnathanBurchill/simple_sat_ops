@@ -62,7 +62,13 @@ add_executable(tx_frame utils/tx_frame.c csp.c golay24.c ax100.c hmac_keyfile.c 
 target_include_directories(tx_frame PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
 target_link_libraries(tx_frame PRIVATE ${OPENSSL_LIBRARIES} m asound)
 
-install(TARGETS simple_sat_ops next_in_queue lifetime tx_tone uplink_test fm_preview tx_frame DESTINATION $ENV{HOME}/bin)
+# Offline AX100 frame decoder: WAV/RAW -> demod -> ax100_unframe -> CSP
+add_executable(rx_decode utils/rx_decode.c utils/wav_read.c
+               modem.c ax100.c golay24.c csp.c hmac_keyfile.c)
+target_include_directories(rx_decode PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
+target_link_libraries(rx_decode PRIVATE ${OPENSSL_LIBRARIES} m)
+
+install(TARGETS simple_sat_ops next_in_queue lifetime tx_tone uplink_test fm_preview tx_frame rx_decode DESTINATION $ENV{HOME}/bin)
 
 install(PROGRAMS scripts/upcoming_amateur_satellite_passes.sh DESTINATION $ENV{HOME}/bin)
 install(PROGRAMS scripts/pcm2wav.sh DESTINATION $ENV{HOME}/bin)
