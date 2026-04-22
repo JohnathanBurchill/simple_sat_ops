@@ -69,6 +69,10 @@ echo "== remote run: $REMOTE : $REMOTE_DIR =="
 #   6) echo the two filenames so we can pick them up
 ssh "$REMOTE" bash <<REMOTE_EOF
 set -euo pipefail
+# Non-interactive ssh shells don't source .bashrc / .profile, so
+# \$HOME/bin isn't on PATH by default even though tx_frame / rx_decode
+# are installed there.
+export PATH="\$HOME/bin:\$PATH"
 mkdir -p $REMOTE_DIR
 cd $REMOTE_DIR
 RTL_FILE="rtl_UT=\$(date -u '+%Y%m%dT%H%M%S').raw"
@@ -107,7 +111,7 @@ process_one() {
     ffmpeg -y -loglevel error -f s16le -ar 48000 -ac "$channels" -i "$raw" \
         -lavfi "showspectrumpic=s=1600x300:scale=log" "${base}_spec.png"
     echo ">> rx_decode ${raw}"
-    if ssh "$REMOTE" "cd $REMOTE_DIR && rx_decode --raw -v '$raw'" \
+    if ssh "$REMOTE" "export PATH=\$HOME/bin:\$PATH && cd $REMOTE_DIR && rx_decode --raw -v '$raw'" \
         > "${base}_decode.txt" 2>&1
     then
         echo "   decode OK (see ${base}_decode.txt)"
