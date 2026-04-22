@@ -346,32 +346,15 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    snd_pcm_t *pcm = NULL;
-    int rc = snd_pcm_open(&pcm, audio_device, SND_PCM_STREAM_PLAYBACK, 0);
-    if (rc < 0) {
-        fprintf(stderr, "snd_pcm_open(%s, PLAYBACK): %s\n", audio_device, snd_strerror(rc));
-        free(samples);
-        return 1;
-    }
-    rc = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
-                            1, (unsigned)mp.samp_rate, 1, 500000);
-    if (rc < 0) {
-        fprintf(stderr, "snd_pcm_set_params: %s\n", snd_strerror(rc));
-        snd_pcm_close(pcm);
-        free(samples);
-        return 1;
-    }
-
     radio_t radio = {0};
     radio.device_filename = (char *)radio_device;
     radio.serial_speed = radio_speed;
     radio.nominal_downlink_frequency = freq_hz;
     radio.sub_park_frequency = RADIO_SUB_PARK_HZ;
-    rc = radio_init(&radio);
+    int rc = radio_init(&radio);
     if (rc != RADIO_OK) {
         fprintf(stderr, "radio_init(%s) failed (rc=%d)\n", radio_device, rc);
         if (radio.connected) radio_disconnect(&radio);
-        snd_pcm_close(pcm);
         free(samples);
         return 1;
     }
@@ -401,16 +384,39 @@ int main(int argc, char **argv)
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    // Start the recorder before opening playback so arecord gets a clean
+    // device. Opening playback first on the PCM2901 seems to perturb the
+    // capture stream (level glitches mid-recording); reversing the order
+    // lets capture stabilize on its own then adapt to playback cleanly.
     if (record_path != NULL) {
         fprintf(stderr, "tx_frame: recording %s <- %s (warmup %d ms)\n",
                 record_path, audio_device, record_warmup_ms);
         if (start_recorder(audio_device, record_path,
                            (unsigned)mp.samp_rate, record_warmup_ms) != 0) {
-            snd_pcm_close(pcm);
             radio_disconnect(&radio);
             free(samples);
             return 1;
         }
+    }
+
+    snd_pcm_t *pcm = NULL;
+    rc = snd_pcm_open(&pcm, audio_device, SND_PCM_STREAM_PLAYBACK, 0);
+    if (rc < 0) {
+        fprintf(stderr, "snd_pcm_open(%s, PLAYBACK): %s\n", audio_device, snd_strerror(rc));
+        stop_recorder();
+        radio_disconnect(&radio);
+        free(samples);
+        return 1;
+    }
+    rc = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
+                            1, (unsigned)mp.samp_rate, 1, 500000);
+    if (rc < 0) {
+        fprintf(stderr, "snd_pcm_set_params: %s\n", snd_strerror(rc));
+        snd_pcm_close(pcm);
+        stop_recorder();
+        radio_disconnect(&radio);
+        free(samples);
+        return 1;
     }
 
     fprintf(stderr, "tx_frame: PTT on\n");

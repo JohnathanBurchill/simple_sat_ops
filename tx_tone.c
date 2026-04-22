@@ -302,20 +302,24 @@ int main(int argc, char **argv)
     fprintf(stderr, "tx_tone: %.6f MHz FM simplex, tone %.1f Hz, %.2f s, amp %.2f, audio %s, ptt %s\n",
             freq_hz / 1e6, tone_hz, duration_s, amplitude, audio_device, g_no_ptt ? "off" : "on");
 
-    snd_pcm_t *playback = NULL;
-    int arc = audio_playback_open(&playback, audio_device, AUDIO_RATE_HZ, AUDIO_CHANNELS);
-    if (arc != AUDIO_OK || playback == NULL) {
-        fprintf(stderr, "error: cannot open ALSA playback device '%s' (rc=%d)\n", audio_device, arc);
-        goto fail_radio;
-    }
-
+    // Start the recorder first so arecord owns the device at open time.
+    // Opening playback afterwards won't reset the capture clock the way
+    // the reverse order can (PCM2901 behaves oddly with playback-first
+    // opens, producing level glitches mid-capture).
     if (record_path != NULL) {
         fprintf(stderr, "tx_tone: recording %s <- %s (warmup %d ms)\n",
                 record_path, audio_device, record_warmup_ms);
         if (start_recorder(audio_device, record_path, record_warmup_ms) != 0) {
-            audio_playback_close(playback);
             goto fail_radio;
         }
+    }
+
+    snd_pcm_t *playback = NULL;
+    int arc = audio_playback_open(&playback, audio_device, AUDIO_RATE_HZ, AUDIO_CHANNELS);
+    if (arc != AUDIO_OK || playback == NULL) {
+        fprintf(stderr, "error: cannot open ALSA playback device '%s' (rc=%d)\n", audio_device, arc);
+        stop_recorder();
+        goto fail_radio;
     }
 
     if (!g_no_ptt) {
