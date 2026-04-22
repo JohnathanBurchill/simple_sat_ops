@@ -26,7 +26,11 @@ set -euo pipefail
 
 PAYLOAD="HELLO"
 REMOTE="va6rao@rao"
-REMOTE_DIR='$HOME/rxtest'
+# Relative path (resolves to the remote user's home) — avoids the scp
+# "No such file or directory" you get when scp is passed a literal
+# "$HOME/..." (scp/sftp does not perform shell variable expansion on
+# remote paths). Pass an absolute path via --remote-dir= if preferred.
+REMOTE_DIR="rxtest"
 DURATION=10
 UPLINK_MOD_LEVEL=50
 MONI_LEVEL=80
