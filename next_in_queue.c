@@ -490,28 +490,31 @@ int main(int argc, char **argv)
                 if (satellite_name == NULL) {
                     printf("Found %lu upcoming passes from a total of %d satellites\n", n_passes, count);
                 }
-                printf("%26s  %11s %8s %8s %8s %9s %9s %9s %9s %9s %25s %9s\n", "Name", "AOS local", "in (min)", "dur (min)", "alt (km)", "azi (deg)", "ele (deg)", "up (MHz)", "down (MHz)", "bcn (MHz)", "mode", "status");
+                printf("%26s  %11s %9s %9s %9s %9s %9s %10s %10s %10s %25s %9s\n", "Name", "AOS local", "in", "dur (min)", "alt (km)", "azi (deg)", "ele (deg)", "up (MHz)", "down (MHz)", "bcn (MHz)", "mode", "status");
             }
             for (int i = 0; i < max_passes; i++) {
                 p = get_pass(i);
                 char aos_local[32];
                 format_local_aos(p->ascension_jul_utc, aos_local, sizeof(aos_local));
-                printf("%26s  %11s ", p->name, aos_local);
+                char t_until[16];
                 if (p->minutes_away < 120.0) {
-                    printf("%8.1f m ", p->minutes_away);
+                    snprintf(t_until, sizeof t_until, "%.1f m", p->minutes_away);
                 } else if (p->minutes_away < 2880.0) {
-                    printf("%8.1f h ", p->minutes_away / 60.0);
+                    snprintf(t_until, sizeof t_until, "%.1f h", p->minutes_away / 60.0);
                 } else {
-                    printf("%8.1f d ", p->minutes_away / 1440.0);
+                    snprintf(t_until, sizeof t_until, "%.1f d", p->minutes_away / 1440.0);
                 }
-                printf("%9.1f %7.1f %9.1f %9.1f", p->pass_duration, p->max_altitude, p->ascension_azimuth, p->max_elevation);
+                printf("%26s  %11s %9s %9.1f %9.1f %9.1f %9.1f",
+                       p->name, aos_local, t_until,
+                       p->pass_duration, p->max_altitude,
+                       p->ascension_azimuth, p->max_elevation);
                 if (satellite_name == NULL && show_radio_info == 1) {
                     print_radio_info(p->name, sat_info, n_entries);
                 }
                 printf("\n");
             }
             if (reverse) {
-                printf("%26s  %11s %8s %8s %8s %9s %9s %9s %9s %9s %25s %9s\n", "Name", "AOS local", "in (min)", "dur (min)", "alt (km)", "azi (deg)", "ele (deg)", "up (MHz)", "down (MHz)", "bcn (MHz)", "mode", "status");
+                printf("%26s  %11s %9s %9s %9s %9s %9s %10s %10s %10s %25s %9s\n", "Name", "AOS local", "in", "dur (min)", "alt (km)", "azi (deg)", "ele (deg)", "up (MHz)", "down (MHz)", "bcn (MHz)", "mode", "status");
                 if (satellite_name != NULL) {
                     printf("Found %lu upcoming passes for %s\n", n_passes, satellite_name);
                 } else {
@@ -538,19 +541,19 @@ void print_radio_info(const char *name, satellite_status_t *sat_info, int n_entr
     for (int s = 0; s < n_entries; ++s) {
         if (strcmp(name, sat_info[s].name) == 0) {
             if (strlen(sat_info[s].f_uplink_mhz) > 0) {
-                printf(" %9s", sat_info[s].f_uplink_mhz);
+                printf(" %10s", sat_info[s].f_uplink_mhz);
             } else {
-                printf(" %9s", "-");
+                printf(" %10s", "-");
             }
             if (strlen(sat_info[s].f_downlink_mhz) > 0) {
-                printf(" %9s", sat_info[s].f_downlink_mhz);
+                printf(" %10s", sat_info[s].f_downlink_mhz);
             } else {
-                printf(" %9s", "-");
+                printf(" %10s", "-");
             }
             if (strlen(sat_info[s].f_beacon_mhz) > 0) {
-                printf(" %9s", sat_info[s].f_beacon_mhz);
+                printf(" %10s", sat_info[s].f_beacon_mhz);
             } else {
-                printf(" %9s", "-");
+                printf(" %10s", "-");
             }
             if (strlen(sat_info[s].mode) > 0) {
                 printf(" %25s", sat_info[s].mode);
