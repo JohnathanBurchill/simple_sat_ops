@@ -94,6 +94,8 @@ static void usage(FILE *dest, const char *name, int full)
         "                               before TX audio (default 600)\n"
         "  --moni-level=<0..100>        MONI loopback gain, %% (CI-V 14 07; MONI\n"
         "                               itself stays a front-panel toggle)\n"
+        "  --uplink-mod-level=<0..100>  USB MOD level, %% (CI-V 1A 05 01 13;\n"
+        "                               how loud your PCM is on the modulator)\n"
         "  --help                       Short help (this message)\n"
         "  --help-full                  Detailed help with setup and verification\n",
         name, FRONTIERSAT_CARRIER_HZ, FRONTIERSAT_CARRIER_HZ / 1e6);
@@ -245,6 +247,7 @@ int main(int argc, char **argv)
     double duration_s = 3.0;
     double amplitude = 0.3;
     int moni_level_pct = -1;  // < 0 = don't touch
+    int uplink_mod_level = -1;  // < 0 = don't touch (% 0..100)
     int record_warmup_ms = 600;
 
     for (int i = 1; i < argc; i++) {
@@ -283,6 +286,13 @@ int main(int argc, char **argv)
                 fprintf(stderr, "--moni-level must be 0..100 (%%)\n");
                 return EXIT_FAILURE;
             }
+        } else if (strncmp("--uplink-mod-level=", argv[i], 19) == 0) {
+            if (strlen(argv[i]) < 20) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
+            uplink_mod_level = atoi(argv[i] + 19);
+            if (uplink_mod_level < 0 || uplink_mod_level > 100) {
+                fprintf(stderr, "--uplink-mod-level must be 0..100 (%%)\n");
+                return EXIT_FAILURE;
+            }
         } else if (strncmp("--record-warmup-ms=", argv[i], 19) == 0) {
             if (strlen(argv[i]) < 20) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
             record_warmup_ms = atoi(argv[i] + 19);
@@ -317,12 +327,21 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     // radio_init leaves Main in plain FM (CI-V 0x06 clears the DATA flag).
-    // Restore DATA so the TX audio path matches the AX100 uplink chain —
-    // same modulator bandwidth / no pre-emphasis as a real frame.
-    rc = radio_set_data_mode(&g_radio, 1, RADIO_FILTER_FIL1);
+    // radio_uplink_prep sets FM + DATA on + DATA MOD source = USB so audio
+    // from our playback actually reaches the modulator. Without DATA MOD
+    // forced to USB, a front-panel misconfig causes a clean carrier with
+    // no deviation — the TX spectrum shows an unmodulated CW line.
+    rc = radio_uplink_prep(&g_radio);
     if (rc != RADIO_OK) {
-        fprintf(stderr, "warning: could not re-enable DATA mode (rc=%d); "
-                "radio will transmit in voice FM.\n", rc);
+        fprintf(stderr, "warning: radio_uplink_prep failed (rc=%d); "
+                "check MODE/DATA/DATA-MOD on the front panel.\n", rc);
+    }
+    if (uplink_mod_level >= 0) {
+        int raw = (int)((uplink_mod_level * 255 + 50) / 100);
+        rc = radio_set_usb_mod_level(&g_radio, raw);
+        if (rc != RADIO_OK) {
+            fprintf(stderr, "warning: could not set USB MOD level (rc=%d)\n", rc);
+        }
     }
     if (moni_level_pct >= 0) {
         // Percent -> 0..255 scale (IC-9700 monitor-level range). MONI
