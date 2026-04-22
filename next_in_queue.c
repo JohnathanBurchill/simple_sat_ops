@@ -142,6 +142,7 @@ int main(int argc, char **argv)
     int show_radio_info = 0;
     double min_minutes_away = 0.0;
     double max_minutes_away = 1440.0;
+    int max_minutes_user_set = 0;
     double min_elevation = 0.0;
     double max_elevation = 90.0;
     state_t state = {0};
@@ -223,12 +224,13 @@ int main(int argc, char **argv)
             }
             min_minutes_away = atof(argv[i] + 14);
         } else if (strncmp("--max-minutes=", argv[i], 14) == 0) {
-            state.n_options++; 
+            state.n_options++;
             if (strlen(argv[i]) < 15) {
                 fprintf(stderr, "Unable to parse %s\n", argv[i]);
                 return EXIT_FAILURE;
             }
             max_minutes_away = atof(argv[i] + 14);
+            max_minutes_user_set = 1;
         } else if (strcmp("--ignore-case", argv[i]) == 0) {
             state.n_options++;
             regex_ignore_case = 1;
@@ -319,8 +321,11 @@ int main(int argc, char **argv)
         max_altitude_km = atof(argv[2]);
         if (n_pos == 3) satellite_name = argv[3];
     }
-    if (satellite_name != NULL) {
+    if (satellite_name != NULL && !max_minutes_user_set) {
         max_minutes_away = 1440 * 7;  // one week when filtering to a specific sat
+    }
+    if (trajectory_id != NULL && !max_minutes_user_set) {
+        max_minutes_away = 1440 * 14;  // two weeks for trajectory planning
     }
 
     if (trajectory_id == NULL && state.prediction.tles_filename == NULL) {
@@ -404,7 +409,8 @@ int main(int argc, char **argv)
 
     int count = 0;
     int number_checked = 0;
-    status = find_passes(&state.prediction, jul_utc, 1.0, &criteria, &count, &number_checked, reverse, satellite_name != NULL ? 1 : 0);
+    int find_all = (satellite_name != NULL || trajectory_id != NULL) ? 1 : 0;
+    status = find_passes(&state.prediction, jul_utc, 1.0, &criteria, &count, &number_checked, reverse, find_all);
     const size_t n_passes = number_of_passes();
 
     // Satellite radio-info annotation. Only loaded if the user asked for
