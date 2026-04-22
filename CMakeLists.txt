@@ -36,7 +36,7 @@ add_executable(simple_sat_ops main.c prediction.c radio.c antenna_rotator.c audi
 target_link_libraries(simple_sat_ops PRIVATE sgp4sdp4 ${NCURSES_LIBRARIES} m asound pthread)
 
 # Next in queue tool
-add_executable(next_in_queue next_in_queue.c prediction.c satellite_status.c)
+add_executable(next_in_queue next_in_queue.c prediction.c satellite_status.c oem.c)
 target_link_libraries(next_in_queue PRIVATE sgp4sdp4 m)
 
 # Lifetime tool

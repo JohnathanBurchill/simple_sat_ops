@@ -83,6 +83,34 @@ wget -O ~/.local/state/simple_sat_ops/active.tle \
 ```
 Celestrak serves CRLF-terminated files; sso's parser handles that.
 
+### SSM trajectory source (for FrontierSat)
+
+Once an object is propagated and uploaded via
+[`space_safety_manager`](../space_safety_manager), `next_in_queue` can
+plan passes directly against that trajectory — no TLE needed.
+
+```bash
+# List available trajectories (JSON)
+ssm trajectories
+
+# Plan passes using one (note: no positional min/max altitudes)
+next_in_queue --trajectory-id=<uuid> --list
+
+# Specific receive-only window
+next_in_queue --trajectory-id=<uuid> --list \
+  --max-minutes=180 --min-elevation=20
+```
+
+Gotchas:
+- `ssm` must be on `PATH` (installed to `$HOME/bin/ssm` by its build).
+- The trajectory has a finite time window (defaults to 3 h when
+  created by `ssm propagate ... --duration 3`). `--max-minutes` is
+  clamped to that window with a warning on stderr.
+- The OEM from SSM is interpolated (cubic Hermite) for pass searches.
+  Accuracy inside the window is sub-kilometre against the SSM
+  propagation; there's no extrapolation beyond it.
+- Not compatible with `--tle=` — they're mutually exclusive sources.
+
 ---
 
 ## Live tracking (with hardware)

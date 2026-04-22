@@ -51,6 +51,10 @@ typedef struct pass
     char tle[160];
 } pass_t;
 
+// Forward decl: when non-NULL on prediction_t, state comes from a
+// pre-propagated ephemeris (ITRF Cartesian), not from SGP4/TLE.
+struct oem_table;
+
 typedef struct prediction
 {
     ephemeres_t observer_ephem;
@@ -68,6 +72,9 @@ typedef struct prediction
     double predicted_minutes_above_30_degrees;
     double predicted_ascension_azimuth;
     double predicted_ascension_jul_utc;
+    // Alternative state source. When non-NULL, update_satellite_position
+    // interpolates from this table instead of running SGP4.
+    struct oem_table *oem;
 } prediction_t;
 
 /* RAO site observer location in Priddis, SW of Calgary */

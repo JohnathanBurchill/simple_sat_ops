@@ -19,7 +19,9 @@
 */
 
 #include "prediction.h"
+#include "oem.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +29,110 @@
 #include <sgp4sdp4.h>
 #include <ncurses.h>
 #include <regex.h>
+
+// WGS84 ellipsoid constants — used for ITRF <-> geodetic conversions on
+// the OEM state path. Values match standard WGS84; minor disagreement
+// with sgp4sdp4's Earth model is below our pass-prediction tolerance.
+#define WGS84_A   6378.137            // km, semi-major axis
+#define WGS84_F   (1.0 / 298.257223563)
+#define WGS84_E2  (2.0 * WGS84_F - WGS84_F * WGS84_F)
+
+static void geodetic_to_ecef(double lat_rad, double lon_rad, double alt_km,
+                             double out[3])
+{
+    double sl = sin(lat_rad), cl = cos(lat_rad);
+    double so = sin(lon_rad), co = cos(lon_rad);
+    double N = WGS84_A / sqrt(1.0 - WGS84_E2 * sl * sl);
+    out[0] = (N + alt_km) * cl * co;
+    out[1] = (N + alt_km) * cl * so;
+    out[2] = (N * (1.0 - WGS84_E2) + alt_km) * sl;
+}
+
+// Rotate an ITRF vector anchored at the observer origin into the local
+// East-North-Up frame at the observer's geodetic latitude/longitude.
+static void ecef_delta_to_enu(double obs_lat_rad, double obs_lon_rad,
+                              const double d[3], double enu[3])
+{
+    double sl = sin(obs_lat_rad), cl = cos(obs_lat_rad);
+    double so = sin(obs_lon_rad), co = cos(obs_lon_rad);
+    enu[0] = -so * d[0] + co * d[1];
+    enu[1] = -sl * co * d[0] - sl * so * d[1] + cl * d[2];
+    enu[2] =  cl * co * d[0] + cl * so * d[1] + sl * d[2];
+}
+
+// Bowring's closed-form ECEF -> geodetic (WGS84), accurate to < 1 mm for
+// altitudes we care about.
+static void ecef_to_geodetic(const double r[3],
+                             double *lat_rad, double *lon_rad, double *alt_km)
+{
+    double x = r[0], y = r[1], z = r[2];
+    double p = sqrt(x * x + y * y);
+    double b = WGS84_A * (1.0 - WGS84_F);
+    double ep2 = (WGS84_A * WGS84_A - b * b) / (b * b);
+    double theta = atan2(z * WGS84_A, p * b);
+    double st = sin(theta), ct = cos(theta);
+    double lat = atan2(z + ep2 * b * st * st * st,
+                       p - WGS84_E2 * WGS84_A * ct * ct * ct);
+    double sl = sin(lat);
+    double N = WGS84_A / sqrt(1.0 - WGS84_E2 * sl * sl);
+    *lat_rad = lat;
+    *lon_rad = atan2(y, x);
+    *alt_km = p / cos(lat) - N;
+}
+
+// Populate prediction->satellite_ephem from an OEM sample. Out-of-window
+// is signalled with elevation = -90° so the pass-finder's above-horizon
+// walks terminate naturally.
+static void fill_ephem_from_oem(prediction_t *prediction, double jul_utc)
+{
+    double r[3], v[3];
+    if (oem_sample_at(prediction->oem, jul_utc, r, v) != 0) {
+        prediction->satellite_ephem.azimuth = 0.0;
+        prediction->satellite_ephem.elevation = -90.0;
+        prediction->satellite_ephem.range_km = 0.0;
+        prediction->satellite_ephem.range_rate_km_s = 0.0;
+        prediction->satellite_ephem.altitude_km = 0.0;
+        prediction->satellite_ephem.speed_km_s = 0.0;
+        return;
+    }
+
+    double obs[3];
+    geodetic_to_ecef(prediction->observer_ephem.position_geodetic.lat,
+                     prediction->observer_ephem.position_geodetic.lon,
+                     prediction->observer_ephem.position_geodetic.alt,
+                     obs);
+    double rng[3] = { r[0] - obs[0], r[1] - obs[1], r[2] - obs[2] };
+    double range_km = sqrt(rng[0]*rng[0] + rng[1]*rng[1] + rng[2]*rng[2]);
+
+    double enu[3];
+    ecef_delta_to_enu(prediction->observer_ephem.position_geodetic.lat,
+                      prediction->observer_ephem.position_geodetic.lon,
+                      rng, enu);
+
+    double az_rad = atan2(enu[0], enu[1]);
+    if (az_rad < 0.0) az_rad += 2.0 * M_PI;
+    double horiz = sqrt(enu[0]*enu[0] + enu[1]*enu[1]);
+    double el_rad = atan2(enu[2], horiz);
+
+    // Range-rate: sat moves in ECEF with v; observer is stationary.
+    double rrate = 0.0;
+    if (range_km > 0.0) {
+        rrate = (v[0] * rng[0] + v[1] * rng[1] + v[2] * rng[2]) / range_km;
+    }
+
+    double sat_lat, sat_lon, sat_alt;
+    ecef_to_geodetic(r, &sat_lat, &sat_lon, &sat_alt);
+
+    ephemeres_t *se = &prediction->satellite_ephem;
+    se->azimuth = Degrees(az_rad);
+    se->elevation = Degrees(el_rad);
+    se->range_km = range_km;
+    se->range_rate_km_s = rrate;
+    se->latitude = Degrees(sat_lat);
+    se->longitude = Degrees(sat_lon);
+    se->altitude_km = sat_alt;
+    se->speed_km_s = sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+}
 
 int tle_default_path(char *out_path, size_t out_cap)
 {
@@ -62,6 +168,13 @@ static int read_tle_line(char *buf, size_t size, FILE *f)
 
 void update_satellite_position(prediction_t *prediction, double jul_utc)
 {
+    // OEM-backed trajectory: interpolate ITRF state and derive az/el
+    // directly; skip the TLE/SGP4 machinery.
+    if (prediction->oem != NULL) {
+        fill_ephem_from_oem(prediction, jul_utc);
+        return;
+    }
+
     // jul times are days
     prediction->jul_epoch = Julian_Date_of_Epoch(prediction->satellite_ephem.tle.epoch);
     prediction->minutes_since_epoch = (jul_utc - prediction->jul_epoch) * 1440.0;
@@ -254,9 +367,80 @@ int pass_sort_latest_first(const void *a, const void *b)
 }
 
 
+// Append a pass_t to the passes list using the prediction's computed
+// pass metrics. Returns 0 on success, -4 on OOM.
+static int append_pass(const char *name, double minutes_until_visible,
+                       const prediction_t *prediction)
+{
+    void *mem = realloc(passes, sizeof *passes * (n_passes + 1));
+    if (mem == NULL) {
+        printf("Unable to allocate memory for the pass info.\n");
+        return -4;
+    }
+    passes = mem;
+    n_passes++;
+    memset(&passes[n_passes - 1], 0, sizeof *passes);
+    pass_t *p = &passes[n_passes - 1];
+    (void)strncpy(p->name, name, sizeof(p->name) - 1);
+    (void)strncpy(p->tle,  name, sizeof(p->tle)  - 1);
+    p->minutes_away        = minutes_until_visible;
+    p->pass_duration       = prediction->predicted_pass_duration_minutes;
+    p->ascension_jul_utc   = prediction->predicted_ascension_jul_utc;
+    p->ascension_azimuth   = prediction->predicted_ascension_azimuth;
+    p->max_elevation       = prediction->predicted_max_elevation;
+    p->max_altitude        = prediction->predicted_max_altitude;
+    return 0;
+}
+
 // Returns the first match on prediction->satellite_ephem.name
 int find_passes(prediction_t *external_prediction, double jul_utc_start, double delta_t_minutes, criteria_t *criteria, int *count, int *number_checked, int reverse_order, int find_all)
 {
+    // OEM trajectory path: single satellite, no file loop, no regex /
+    // constellation filtering (the operator chose this specific trajectory).
+    if (external_prediction->oem != NULL) {
+        prediction_t prediction = {0};
+        memcpy(&prediction, external_prediction, sizeof *external_prediction);
+        int internal_number_checked = 0;
+        const char *name = external_prediction->oem->object_name;
+        if (name == NULL || name[0] == '\0') name = "UNKNOWN";
+
+        double jul_utc_stop = jul_utc_start + criteria->max_minutes / 1440.0;
+        if (jul_utc_stop > external_prediction->oem->stop_jul_utc) {
+            jul_utc_stop = external_prediction->oem->stop_jul_utc;
+        }
+
+        update_satellite_position(&prediction, jul_utc_start);
+        if (prediction.satellite_ephem.altitude_km >= criteria->min_altitude_km &&
+            prediction.satellite_ephem.altitude_km <= criteria->max_altitude_km) {
+            internal_number_checked = 1;
+            double utc_offset_minutes = 0;
+            double minutes_until_visible = 0;
+            while (get_next_pass(&prediction,
+                                 jul_utc_start + utc_offset_minutes / 1440.0,
+                                 jul_utc_stop, delta_t_minutes)) {
+                minutes_until_visible = prediction.predicted_minutes_until_visible
+                                      + utc_offset_minutes;
+                utc_offset_minutes += prediction.predicted_minutes_until_visible + 60;
+                if (prediction.predicted_minutes_above_0_degrees <= 0.0 ||
+                    prediction.predicted_max_elevation > criteria->max_elevation ||
+                    prediction.predicted_max_elevation < criteria->min_elevation) {
+                    continue;
+                }
+                int rc = append_pass(name, minutes_until_visible, &prediction);
+                if (rc != 0) return rc;
+                if (find_all == 0) break;
+            }
+        }
+
+        if (count) *count = 1;
+        if (number_checked) *number_checked = internal_number_checked;
+        if (n_passes > 0) {
+            qsort(passes, n_passes, sizeof *passes,
+                  reverse_order ? pass_sort_latest_first : pass_sort_soonest_first);
+        }
+        return 0;
+    }
+
     FILE *file = fopen(external_prediction->tles_filename, "r");
     if (file == NULL) {
         fprintf(stderr, "Error opening %s\n", external_prediction->tles_filename);
@@ -384,25 +568,12 @@ int find_passes(prediction_t *external_prediction, double jul_utc_start, double 
                 if (prediction.predicted_minutes_above_0_degrees <= 0.0 || prediction.predicted_max_elevation > criteria->max_elevation || prediction.predicted_max_elevation < criteria->min_elevation) {
                     continue;
                 }
-                // Store this pass
-                void *mem = realloc(passes, sizeof *passes * (n_passes + 1));
-                if (mem == NULL) {
-                    printf("Unable to allocate memory for the pass info.\n");
+                int rc = append_pass(name, minutes_until_visible, &prediction);
+                if (rc != 0) {
                     regfree(&pattern);
-                    return -4;
+                    fclose(file);
+                    return rc;
                 }
-                passes = mem;
-                n_passes++;
-                memset(&passes[n_passes - 1], 0, sizeof *passes);
-                pass_t *p = &passes[n_passes - 1];
-                (void)strncpy(p->name, name, sizeof(p->name));
-                (void)strncpy(p->tle, name, sizeof(p->tle));
-                p->minutes_away = minutes_until_visible;
-                p->pass_duration = prediction.predicted_pass_duration_minutes;
-                p->ascension_jul_utc = prediction.predicted_ascension_jul_utc;
-                p->ascension_azimuth = prediction.predicted_ascension_azimuth;
-                p->max_elevation = prediction.predicted_max_elevation;
-                p->max_altitude = prediction.predicted_max_altitude;
                 if (find_all == 0) {
                     break;
                 }

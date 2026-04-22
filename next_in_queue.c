@@ -20,6 +20,7 @@
 
 #include "state.h"
 #include "prediction.h"
+#include "oem.h"
 #include "satellite_status.h"
 
 #include <stdio.h>
@@ -32,12 +33,16 @@
 void usage(FILE *dest, const char *name, int full)
 {
     fprintf(dest,
-        "usage: %s <min_alt_km> <max_alt_km> [<satellite_name>] [options]\n"
+        "usage:\n"
+        "  %s <min_alt_km> <max_alt_km> [<satellite_name>] [options]\n"
+        "  %s --tle=<path> [<satellite_name>] [options]\n"
+        "  %s --trajectory-id=<id> [options]\n"
         "\n"
-        "Scan a TLE file for upcoming passes over the ground station and report\n"
-        "the soonest (or every) match. Read-only; no hardware commands.\n"
+        "Scan a TLE file (or a propagated SSM trajectory) for upcoming passes\n"
+        "over the ground station and report the soonest (or every) match.\n"
+        "Read-only; no hardware commands.\n"
         "\n"
-        "Positional arguments:\n"
+        "Positional arguments (default-TLE form only):\n"
         "  <min_alt_km>                 Minimum orbital altitude, km\n"
         "  <max_alt_km>                 Maximum orbital altitude, km\n"
         "  <satellite_name>             Optional. Literal, case-sensitive name\n"
@@ -47,9 +52,16 @@ void usage(FILE *dest, const char *name, int full)
         "                               search window to one week. For regex\n"
         "                               matching use --regex= instead.\n"
         "\n"
-        "TLE source:\n"
+        "Trajectory source (pick one; default = implicit TLE catalog):\n"
         "  --tle=<path>                 Path to a TLE file (2 or 3-line format).\n"
         "                               Default: $HOME/.local/state/simple_sat_ops/active.tle\n"
+        "                               With this flag, positional alt limits\n"
+        "                               become optional — use --min-altitude-km=\n"
+        "                               / --max-altitude-km= flags if needed.\n"
+        "  --trajectory-id=<id>         Fetch propagated ephemeris from `ssm\n"
+        "                               trajectory <id>` and plan passes against\n"
+        "                               it. Mutually exclusive with --tle=.\n"
+        "                               Run `ssm trajectories` to list IDs.\n"
         "\n"
         "Output:\n"
         "  --list                       Print all matching passes (default: one)\n"
@@ -59,6 +71,8 @@ void usage(FILE *dest, const char *name, int full)
         "                               from active_radios.txt next to the TLE\n"
         "\n"
         "Pass filter:\n"
+        "  --min-altitude-km=<km>       Minimum orbital altitude (default 0)\n"
+        "  --max-altitude-km=<km>       Maximum orbital altitude (default unlimited)\n"
         "  --min-minutes=<n>            Minimum minutes until AOS (default 0)\n"
         "  --max-minutes=<n>            Maximum minutes until AOS (default 1440)\n"
         "  --min-elevation=<deg>        Minimum peak elevation (default 0)\n"
@@ -77,7 +91,7 @@ void usage(FILE *dest, const char *name, int full)
         "Other:\n"
         "  --help                       Short help (this message)\n"
         "  --help-full                  Detailed help with examples\n",
-        name);
+        name, name, name);
 
     if (!full) return;
 
@@ -100,12 +114,18 @@ void usage(FILE *dest, const char *name, int full)
         "  # Passes for a specific satellite over the next week\n"
         "  %s 0 2000 'ISS (ZARYA)' --list\n"
         "\n"
+        "  # Passes against a SSM-propagated trajectory (FrontierSat-style)\n"
+        "  %s --trajectory-id=$(ssm trajectories | jq -r '.[0].id') --list\n"
+        "\n"
         "NOTES\n"
         "  - The tool never opens the radio or rotator; safe to run on any host.\n"
         "  - `active_radios.txt` (looked for in the same directory as the TLE)\n"
         "    is a community-maintained CSV used by --show-radio-info;\n"
-        "    missing satellites are simply omitted.\n",
-        name, name, name, name);
+        "    missing satellites are simply omitted.\n"
+        "  - `--trajectory-id` needs `ssm` on PATH. The trajectory's window\n"
+        "    (from `ssm trajectory-meta <id>`) caps how far ahead passes can\n"
+        "    be predicted; `--max-minutes` is clamped if it exceeds the window.\n",
+        name, name, name, name, name);
 }
 
 void print_radio_info(const char *name, satellite_status_t *sat_info, int n_entries);
@@ -129,6 +149,10 @@ int main(int argc, char **argv)
     int regex_ignore_case = 0;
     int with_constellations = 0;
     int reverse = 0;
+    int tle_explicit = 0;
+    const char *trajectory_id = NULL;
+    double min_altitude_km = 0.0;
+    double max_altitude_km = 100000.0;
 
     int minutes_offset = 0;
 
@@ -225,6 +249,28 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
             state.prediction.tles_filename = argv[i] + 6;
+            tle_explicit = 1;
+        } else if (strncmp("--trajectory-id=", argv[i], 16) == 0) {
+            state.n_options++;
+            if (strlen(argv[i]) < 17) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            trajectory_id = argv[i] + 16;
+        } else if (strncmp("--min-altitude-km=", argv[i], 18) == 0) {
+            state.n_options++;
+            if (strlen(argv[i]) < 19) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            min_altitude_km = atof(argv[i] + 18);
+        } else if (strncmp("--max-altitude-km=", argv[i], 18) == 0) {
+            state.n_options++;
+            if (strlen(argv[i]) < 19) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            max_altitude_km = atof(argv[i] + 18);
         } else if (strcmp("--help", argv[i]) == 0) {
             usage(stdout, argv[0], 0);
             return 0;
@@ -237,13 +283,47 @@ int main(int argc, char **argv)
         }
     }
 
-    int n_args = argc - state.n_options;
-    if (n_args < 3 || n_args > 4) {
-        usage(stderr, argv[0], 0);
+    if (trajectory_id != NULL && tle_explicit) {
+        fprintf(stderr, "--tle= and --trajectory-id= are mutually exclusive\n");
         return EXIT_FAILURE;
     }
 
-    if (state.prediction.tles_filename == NULL) {
+    int n_args = argc - state.n_options;
+    int n_pos = n_args - 1;
+    char *satellite_name = NULL;
+
+    if (trajectory_id != NULL) {
+        // OEM path: no positionals (trajectory is implicit).
+        if (n_pos != 0) {
+            fprintf(stderr,
+                    "--trajectory-id= does not accept positional arguments; "
+                    "use --min-altitude-km= / --max-altitude-km= for altitude filtering.\n");
+            return EXIT_FAILURE;
+        }
+    } else if (tle_explicit) {
+        // Explicit --tle=: 0 or 1 positional (optional <satellite_name>).
+        if (n_pos > 1) {
+            fprintf(stderr,
+                    "with --tle=, pass at most one positional (<satellite_name>). "
+                    "Use --min-altitude-km= / --max-altitude-km= for altitude filtering.\n");
+            return EXIT_FAILURE;
+        }
+        if (n_pos == 1) satellite_name = argv[1];
+    } else {
+        // Implicit default TLE: require 2 or 3 positionals.
+        if (n_pos != 2 && n_pos != 3) {
+            usage(stderr, argv[0], 0);
+            return EXIT_FAILURE;
+        }
+        min_altitude_km = atof(argv[1]);
+        max_altitude_km = atof(argv[2]);
+        if (n_pos == 3) satellite_name = argv[3];
+    }
+    if (satellite_name != NULL) {
+        max_minutes_away = 1440 * 7;  // one week when filtering to a specific sat
+    }
+
+    if (trajectory_id == NULL && state.prediction.tles_filename == NULL) {
         static char default_tle[1024];
         if (tle_default_path(default_tle, sizeof(default_tle)) != 0) {
             fprintf(stderr, "HOME unset or path too long; pass --tle=<path>\n");
@@ -251,14 +331,24 @@ int main(int argc, char **argv)
         }
         state.prediction.tles_filename = default_tle;
     }
-    double min_altitude_km = atof(argv[1]);
-    double max_altitude_km = atof(argv[2]);
-    char *satellite_name = NULL;
-    if (n_args == 4) {
-        // Checking for a specific satellite
-        // Increase the timespan to 1 week
-        satellite_name = argv[3];
-        max_minutes_away = 1440 * 7;
+
+    // Load OEM if --trajectory-id was given. Table lives on the stack and
+    // is attached to prediction; freed at exit.
+    oem_table_t oem = {0};
+    if (trajectory_id != NULL) {
+        if (oem_load_from_ssm(trajectory_id, &oem) != 0) {
+            return EXIT_FAILURE;
+        }
+        state.prediction.oem = &oem;
+        state.prediction.satellite_ephem.name = oem.object_name[0]
+                                              ? oem.object_name : (char *)"UNKNOWN";
+        double window_min = (oem.stop_jul_utc - oem.start_jul_utc) * 1440.0;
+        if (max_minutes_away > window_min) {
+            fprintf(stderr,
+                    "trajectory window is %.1f min (%.2f h); capping --max-minutes from %.0f to %.1f\n",
+                    window_min, window_min / 60.0, max_minutes_away, window_min);
+            max_minutes_away = window_min;
+        }
     }
 
     /* Set up observer location */
@@ -274,7 +364,13 @@ int main(int argc, char **argv)
     struct tm utc_ref;
     Date_Time(jul_utc, &utc_ref);
 
-    printf("Checking %s for upcoming ", state.prediction.tles_filename);
+    if (trajectory_id != NULL) {
+        printf("Checking SSM trajectory %s (%s) for upcoming ",
+               trajectory_id,
+               oem.object_name[0] ? oem.object_name : "UNKNOWN");
+    } else {
+        printf("Checking %s for upcoming ", state.prediction.tles_filename);
+    }
     if (satellite_name != NULL) {
         printf("%s", satellite_name);
     } else {
@@ -307,18 +403,23 @@ int main(int argc, char **argv)
     status = find_passes(&state.prediction, jul_utc, 1.0, &criteria, &count, &number_checked, reverse, satellite_name != NULL ? 1 : 0);
     const size_t n_passes = number_of_passes();
 
-    // satellite info
+    // Satellite radio-info annotation. Only loaded if the user asked for
+    // it (--show-radio-info) and we have a TLE directory to derive the
+    // file path from. Not applicable to the OEM / trajectory path.
     satellite_status_t *sat_info = NULL;
     int n_entries = 0;
-    char radios_file[FILENAME_MAX];
-    const char *slash = strrchr(state.prediction.tles_filename, '/');
-    if (slash != NULL) {
-        int dir_len = (int)(slash - state.prediction.tles_filename);
-        snprintf(radios_file, sizeof(radios_file), "%.*s/active_radios.txt", dir_len, state.prediction.tles_filename);
-    } else {
-        snprintf(radios_file, sizeof(radios_file), "active_radios.txt");
+    if (show_radio_info && state.prediction.tles_filename != NULL) {
+        char radios_file[FILENAME_MAX];
+        const char *slash = strrchr(state.prediction.tles_filename, '/');
+        if (slash != NULL) {
+            int dir_len = (int)(slash - state.prediction.tles_filename);
+            snprintf(radios_file, sizeof(radios_file),
+                     "%.*s/active_radios.txt", dir_len, state.prediction.tles_filename);
+        } else {
+            snprintf(radios_file, sizeof(radios_file), "active_radios.txt");
+        }
+        status = parse_satellite_status_file(radios_file, &sat_info, &n_entries);
     }
-    status = parse_satellite_status_file(radios_file, &sat_info, &n_entries);
 
 
     if (n_passes > 0) {
@@ -367,6 +468,7 @@ int main(int argc, char **argv)
     }
 
     free_passes();
+    oem_free(&oem);
 
     return 0;
 }
