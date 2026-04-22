@@ -99,7 +99,9 @@ static void usage(FILE *dest, const char *name, int full)
         "simple_sat_ops owns the radio. tx_tone configures it fully every run:\n"
         "  - satellite mode OFF (simplex, single active VFO)\n"
         "  - Sub parked on 145.150 MHz (VHF) to avoid same-band collisions\n"
-        "  - Main = VFO A, FM, FIL1, tuned to --freq-hz\n"
+        "  - Main = VFO A, FM-DATA, FIL1, tuned to --freq-hz\n"
+        "  - DATA MOD source is NOT touched; set it on the front panel to\n"
+        "    match whichever jack carries the audio cable (ACC/USB/MIC).\n"
         "  - PTT asserted via CI-V 0x1C 0x00 (unless --no-ptt)\n"
         "  - On exit (clean or signal) PTT is released before disconnect.\n"
         "\n"
@@ -118,9 +120,8 @@ static void usage(FILE *dest, const char *name, int full)
         "\n"
         "CAVEATS\n"
         "\n"
-        "  - Plain FM mode; audio goes through the 9700's mic EQ. When we move\n"
-        "    to 9600 bps packet we will switch to PKT-FM (data mode) for flat\n"
-        "    modulation; tx_tone does not set that today.\n"
+        "  - FM-DATA mode (flat TX audio, no mic EQ) — same path AX100 frames\n"
+        "    use. Radio is left in FM-DATA on exit.\n"
         "  - The modulation input source (MIC / ACC / USB / DATA) is a front-\n"
         "    panel menu setting and must be aligned with whichever jack carries\n"
         "    the audio cable. Not configured via CI-V here.\n"
@@ -196,6 +197,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "error: radio_init failed (rc=%d)\n", rc);
         if (g_radio.connected) radio_disconnect(&g_radio);
         return EXIT_FAILURE;
+    }
+    // radio_init leaves Main in plain FM (CI-V 0x06 clears the DATA flag).
+    // Restore DATA so the TX audio path matches the AX100 uplink chain —
+    // same modulator bandwidth / no pre-emphasis as a real frame.
+    rc = radio_set_data_mode(&g_radio, 1, RADIO_FILTER_FIL1);
+    if (rc != RADIO_OK) {
+        fprintf(stderr, "warning: could not re-enable DATA mode (rc=%d); "
+                "radio will transmit in voice FM.\n", rc);
     }
 
     fprintf(stderr, "tx_tone: %.6f MHz FM simplex, tone %.1f Hz, %.2f s, amp %.2f, audio %s, ptt %s\n",
