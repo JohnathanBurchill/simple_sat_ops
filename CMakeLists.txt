@@ -29,7 +29,7 @@ pkg_check_modules(NCURSES REQUIRED ncurses)
 pkg_check_modules(OPENSSL REQUIRED libcrypto)
 
 # Add the main executable
-add_executable(simple_sat_ops main.c prediction.c radio.c antenna_rotator.c audio.c telemetry.c)
+add_executable(simple_sat_ops main.c prediction.c radio.c antenna_rotator.c audio.c telemetry.c oem.c)
 # target_compile_definitions(simple_sat_ops PUBLIC -DQOL)
 
 # Link the sgp4sdp4 library
@@ -40,7 +40,7 @@ add_executable(next_in_queue next_in_queue.c prediction.c satellite_status.c oem
 target_link_libraries(next_in_queue PRIVATE sgp4sdp4 m)
 
 # Lifetime tool
-add_executable(lifetime lifetime.c prediction.c)
+add_executable(lifetime lifetime.c prediction.c oem.c)
 target_link_libraries(lifetime PRIVATE sgp4sdp4 m)
 
 # TX test tone tool
