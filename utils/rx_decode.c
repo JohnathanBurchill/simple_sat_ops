@@ -43,6 +43,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -327,24 +328,79 @@ int main(int argc, char **argv)
                     fprintf(stderr, "  phase=%d  altrun=%zu@bit%zu  best_asm_hamming=%d@bit%zu\n",
                             phase, best_run, best_run_start, best_ham, best_ham_pos);
                 }
-                // Find where the actual TX burst is in the file via sliding
-                // RMS. Peak RMS window = burst center; dump bits around it
-                // instead of wasting diagnostic on leading static.
-                size_t win_samples = (size_t)mp.samp_rate / 100u;  // 10 ms
+                // Sliding RMS envelope in non-overlapping 100 ms windows.
+                // Report the top-N loudest + the global median so the operator
+                // can tell whether the signal is actually louder than the RX
+                // noise floor. Peak sample also used to anchor the bit dump.
+                size_t win_samples = (size_t)mp.samp_rate / 10u;  // 100 ms
                 if (win_samples < 64) win_samples = 64;
+                size_t n_windows = n_samples / win_samples;
+                double *rms = (double *)malloc(n_windows * sizeof(double));
+                if (rms != NULL && n_windows > 0) {
+                    for (size_t w = 0; w < n_windows; ++w) {
+                        double sum_sq = 0.0;
+                        for (size_t j = 0; j < win_samples; ++j) {
+                            double v = (double)samples[w * win_samples + j];
+                            sum_sq += v * v;
+                        }
+                        rms[w] = sqrt(sum_sq / (double)win_samples);
+                    }
+                    double sorted[16];
+                    size_t top_n = n_windows < 8 ? n_windows : 8;
+                    for (size_t i = 0; i < top_n; ++i) sorted[i] = -1.0;
+                    size_t top_idx[16] = {0};
+                    for (size_t w = 0; w < n_windows; ++w) {
+                        for (size_t i = 0; i < top_n; ++i) {
+                            if (rms[w] > sorted[i]) {
+                                for (size_t j = top_n - 1; j > i; --j) {
+                                    sorted[j] = sorted[j-1];
+                                    top_idx[j] = top_idx[j-1];
+                                }
+                                sorted[i] = rms[w];
+                                top_idx[i] = w;
+                                break;
+                            }
+                        }
+                    }
+                    // Median (approximate via partial sort of a copy).
+                    double med = 0.0;
+                    double *tmp = (double *)malloc(n_windows * sizeof(double));
+                    if (tmp) {
+                        memcpy(tmp, rms, n_windows * sizeof(double));
+                        for (size_t i = 0; i < n_windows / 2 + 1; ++i) {
+                            size_t mn = i;
+                            for (size_t j = i + 1; j < n_windows; ++j)
+                                if (tmp[j] < tmp[mn]) mn = j;
+                            double t = tmp[i]; tmp[i] = tmp[mn]; tmp[mn] = t;
+                        }
+                        med = tmp[n_windows / 2];
+                        free(tmp);
+                    }
+                    fprintf(stderr, "rx_decode: RMS envelope (%zu windows of %.0f ms, "
+                            "median %.1f):\n",
+                            n_windows, 1000.0 * (double)win_samples / mp.samp_rate, med);
+                    for (size_t i = 0; i < top_n; ++i) {
+                        double wt = (double)(top_idx[i] * win_samples
+                                             + win_samples / 2) / mp.samp_rate;
+                        fprintf(stderr, "  top-%zu: t=%.3fs  rms=%.1f  (x%.1f median)\n",
+                                i + 1, wt, sorted[i],
+                                med > 0 ? sorted[i] / med : 0.0);
+                    }
+                    free(rms);
+                }
+                // Anchor the bit dump at the loudest window.
                 double peak_rms = 0.0;
                 size_t peak_center_sample = 0;
-                size_t step = win_samples / 4u;
-                if (step == 0) step = 1;
-                for (size_t s = 0; s + win_samples <= n_samples; s += step) {
+                size_t step_s = (size_t)mp.samp_rate / 100u;
+                if (step_s == 0) step_s = 1;
+                for (size_t s = 0; s + win_samples <= n_samples; s += step_s) {
                     double sum_sq = 0.0;
                     for (size_t j = 0; j < win_samples; ++j) {
                         double v = (double)samples[s + j];
                         sum_sq += v * v;
                     }
-                    double rms = sum_sq / (double)win_samples;
-                    if (rms > peak_rms) {
-                        peak_rms = rms;
+                    if (sum_sq > peak_rms) {
+                        peak_rms = sum_sq;
                         peak_center_sample = s + win_samples / 2u;
                     }
                 }
