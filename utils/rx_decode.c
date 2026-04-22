@@ -388,26 +388,49 @@ int main(int argc, char **argv)
                     }
                     free(rms);
                 }
-                // Anchor the bit dump at the loudest window.
-                double peak_rms = 0.0;
-                size_t peak_center_sample = 0;
-                size_t step_s = (size_t)mp.samp_rate / 100u;
-                if (step_s == 0) step_s = 1;
-                for (size_t s = 0; s + win_samples <= n_samples; s += step_s) {
-                    double sum_sq = 0.0;
-                    for (size_t j = 0; j < win_samples; ++j) {
-                        double v = (double)samples[s + j];
-                        sum_sq += v * v;
+                // Anchor the bit dump at the global best_asm_hamming
+                // position across all phases (rather than peak-RMS, which
+                // is a bad detector under FM capture — a strong narrowband
+                // signal can have LOWER RMS than wideband noise after FM
+                // demodulation). The best_asm_hamming window is the closest
+                // the bit stream ever gets to the ASM, so if there's a
+                // burst at all that's where it is.
+                int global_best_ham = 33;
+                size_t global_best_ham_bit = 0;
+                int global_best_phase = 0;
+                for (int phase = 0; phase < sps; ++phase) {
+                    size_t mid = (size_t)phase + (size_t)sps / 2u;
+                    size_t nb = 0;
+                    for (size_t i = mid; i < n_samples; i += (size_t)sps) {
+                        pb[nb++] = (uint8_t)((samples[i] > 0) ? 1 : 0);
                     }
-                    if (sum_sq > peak_rms) {
-                        peak_rms = sum_sq;
-                        peak_center_sample = s + win_samples / 2u;
+                    if (nb < 32) continue;
+                    uint32_t w = 0;
+                    for (int i = 0; i < 32; ++i) w = (w << 1) | pb[i];
+                    const uint32_t ASM = 0x930B51DEu;
+                    int h = __builtin_popcount(w ^ ASM);
+                    if (h < global_best_ham) {
+                        global_best_ham = h; global_best_ham_bit = 0;
+                        global_best_phase = phase;
+                    }
+                    for (size_t i = 32; i < nb; ++i) {
+                        w = (w << 1) | pb[i];
+                        h = __builtin_popcount(w ^ ASM);
+                        if (h < global_best_ham) {
+                            global_best_ham = h;
+                            global_best_ham_bit = i - 31;
+                            global_best_phase = phase;
+                        }
                     }
                 }
+                size_t peak_center_sample = (size_t)global_best_phase
+                    + (size_t)sps / 2u
+                    + global_best_ham_bit * (size_t)sps;
+                if (peak_center_sample >= n_samples) peak_center_sample = n_samples - 1;
                 double peak_t = (double)peak_center_sample / (double)mp.samp_rate;
-                fprintf(stderr, "rx_decode: peak-RMS window centered at t=%.3fs "
-                        "(sample %zu of %zu)\n",
-                        peak_t, peak_center_sample, n_samples);
+                fprintf(stderr, "rx_decode: best-ASM-match window at t=%.3fs "
+                        "(phase %d, ham=%d)\n",
+                        peak_t, global_best_phase, global_best_ham);
                 // Dump 512 bits starting ~20 ms before the peak so the preamble
                 // (if present) is visible at the start of each line.
                 size_t lead_samples = (size_t)mp.samp_rate / 50u;  // 20 ms
