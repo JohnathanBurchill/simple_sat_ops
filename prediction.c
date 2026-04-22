@@ -404,10 +404,9 @@ int find_passes(prediction_t *external_prediction, double jul_utc_start, double 
         const char *name = external_prediction->oem->object_name;
         if (name == NULL || name[0] == '\0') name = "UNKNOWN";
 
+        // Don't cap jul_utc_stop at the OEM window — oem_sample_at()
+        // transparently extrapolates past it via two-body Kepler.
         double jul_utc_stop = jul_utc_start + criteria->max_minutes / 1440.0;
-        if (jul_utc_stop > external_prediction->oem->stop_jul_utc) {
-            jul_utc_stop = external_prediction->oem->stop_jul_utc;
-        }
 
         update_satellite_position(&prediction, jul_utc_start);
         if (prediction.satellite_ephem.altitude_km >= criteria->min_altitude_km &&

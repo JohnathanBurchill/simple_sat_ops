@@ -344,10 +344,14 @@ int main(int argc, char **argv)
                                               ? oem.object_name : (char *)"UNKNOWN";
         double window_min = (oem.stop_jul_utc - oem.start_jul_utc) * 1440.0;
         if (max_minutes_away > window_min) {
+            // Beyond the propagated window we fall back to two-body
+            // Kepler extrapolation inside oem_sample_at(). Good enough
+            // for ground-segment scheduling; not for conjunction work.
             fprintf(stderr,
-                    "trajectory window is %.1f min (%.2f h); capping --max-minutes from %.0f to %.1f\n",
-                    window_min, window_min / 60.0, max_minutes_away, window_min);
-            max_minutes_away = window_min;
+                    "note: --max-minutes=%.0f exceeds OEM window (%.1f min / %.2f h); "
+                    "passes beyond the window use two-body Kepler extrapolation "
+                    "(no J2, no drag — drift of minutes/day for LEO).\n",
+                    max_minutes_away, window_min, window_min / 60.0);
         }
     }
 

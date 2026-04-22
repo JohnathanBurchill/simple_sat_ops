@@ -103,13 +103,20 @@ next_in_queue --trajectory-id=<uuid> --list \
 
 Gotchas:
 - `ssm` must be on `PATH` (installed to `$HOME/bin/ssm` by its build).
-- The trajectory has a finite time window (defaults to 3 h when
-  created by `ssm propagate ... --duration 3`). `--max-minutes` is
-  clamped to that window with a warning on stderr.
-- The OEM from SSM is interpolated (cubic Hermite) for pass searches.
-  Accuracy inside the window is sub-kilometre against the SSM
-  propagation; there's no extrapolation beyond it.
+- The trajectory has a finite propagated window (defaults to 3 h when
+  created by `ssm propagate ... --duration 3`). Inside the window,
+  state is cubic-Hermite interpolated from the OEM samples. Beyond
+  the window, `next_in_queue` falls back to **two-body Kepler
+  extrapolation** from the last OEM sample: no J2, no drag. For a
+  LEO that's ~minutes/day of AOS drift — fine for ground-segment
+  scheduling, not fine for space-safety / conjunction screening.
+  A note is printed on stderr when `--max-minutes` would push past
+  the window.
 - Not compatible with `--tle=` — they're mutually exclusive sources.
+- If you want higher-accuracy long-horizon predictions, regenerate the
+  trajectory with a longer duration (`ssm propagate <opm> --duration
+  168 ...` for one week) so the full span is inside the Hermite-
+  interpolated window.
 
 ---
 

@@ -22,9 +22,22 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// Two-body extrapolation constants. Used beyond the OEM window so
+// ground-segment planners can schedule passes further ahead than the
+// propagated ephemeris covers. Pure Kepler (no J2, no drag) — degrades
+// to minutes/day for LEO; unsuitable for space-safety / conjunction
+// screening, fine for pass scheduling.
+#define MU_EARTH_KM3_S2     398600.4418
+#define OMEGA_EARTH_RAD_S   7.2921150e-5
 
 // Convert Gregorian UTC Y/M/D/h/m/s to Julian Date (fractional days).
 // Uses Fliegel & Van Flandern's formula; leap seconds are ignored
@@ -333,6 +346,134 @@ int oem_load_from_ssm(const char *trajectory_id, oem_table_t *out)
     return rv;
 }
 
+// Greenwich Mean Sidereal Time in radians, IAU 1982 simplified form.
+// Good to arcseconds over decades — far better than needed for ground-
+// segment pointing accuracy.
+static double gmst_rad(double jul_utc)
+{
+    double d = jul_utc - 2451545.0;  // days since J2000
+    double g = 2.0 * M_PI * (0.7790572732640 + 1.00273781191135448 * d);
+    g = fmod(g, 2.0 * M_PI);
+    if (g < 0.0) g += 2.0 * M_PI;
+    return g;
+}
+
+// ITRF (rotating) -> ECI (inertial) state transform at `jul_utc`.
+static void itrf_to_eci(double jul_utc,
+                        const double r_itrf[3], const double v_itrf[3],
+                        double r_eci[3], double v_eci[3])
+{
+    double th = gmst_rad(jul_utc);
+    double c = cos(th), s = sin(th);
+    r_eci[0] = c * r_itrf[0] - s * r_itrf[1];
+    r_eci[1] = s * r_itrf[0] + c * r_itrf[1];
+    r_eci[2] = r_itrf[2];
+    // v_eci = ω × r_eci + R_z(θ) · v_itrf
+    double v_rot[3] = {
+        c * v_itrf[0] - s * v_itrf[1],
+        s * v_itrf[0] + c * v_itrf[1],
+        v_itrf[2]
+    };
+    v_eci[0] = v_rot[0] - OMEGA_EARTH_RAD_S * r_eci[1];
+    v_eci[1] = v_rot[1] + OMEGA_EARTH_RAD_S * r_eci[0];
+    v_eci[2] = v_rot[2];
+}
+
+// ECI (inertial) -> ITRF (rotating) state transform at `jul_utc`.
+static void eci_to_itrf(double jul_utc,
+                        const double r_eci[3], const double v_eci[3],
+                        double r_itrf[3], double v_itrf[3])
+{
+    double th = gmst_rad(jul_utc);
+    double c = cos(th), s = sin(th);
+    r_itrf[0] =  c * r_eci[0] + s * r_eci[1];
+    r_itrf[1] = -s * r_eci[0] + c * r_eci[1];
+    r_itrf[2] = r_eci[2];
+    // v_itrf = R_z(-θ) · (v_eci - ω × r_eci)
+    double vm[3] = {
+        v_eci[0] + OMEGA_EARTH_RAD_S * r_eci[1],
+        v_eci[1] - OMEGA_EARTH_RAD_S * r_eci[0],
+        v_eci[2]
+    };
+    v_itrf[0] =  c * vm[0] + s * vm[1];
+    v_itrf[1] = -s * vm[0] + c * vm[1];
+    v_itrf[2] = vm[2];
+}
+
+// Two-body Keplerian propagator using Lagrange f/g coefficients.
+// Returns 0 on success, -1 if the orbit is parabolic/hyperbolic (we
+// don't handle escape trajectories here).
+static int kepler_propagate_eci(const double r0[3], const double v0[3],
+                                double dt_sec,
+                                double r_out[3], double v_out[3])
+{
+    double mu = MU_EARTH_KM3_S2;
+    double r0m = sqrt(r0[0]*r0[0] + r0[1]*r0[1] + r0[2]*r0[2]);
+    if (r0m <= 0.0) return -1;
+    double v0sq = v0[0]*v0[0] + v0[1]*v0[1] + v0[2]*v0[2];
+    double energy = 0.5 * v0sq - mu / r0m;
+    if (energy >= 0.0) return -1;
+    double a = -mu / (2.0 * energy);
+
+    // h = r × v, |h|
+    double h[3] = {
+        r0[1]*v0[2] - r0[2]*v0[1],
+        r0[2]*v0[0] - r0[0]*v0[2],
+        r0[0]*v0[1] - r0[1]*v0[0]
+    };
+    (void)h;
+
+    // Eccentricity vector e_vec = (v × h)/μ - r/|r|
+    double vxh[3] = {
+        v0[1]*h[2] - v0[2]*h[1],
+        v0[2]*h[0] - v0[0]*h[2],
+        v0[0]*h[1] - v0[1]*h[0]
+    };
+    double e_vec[3] = {
+        vxh[0]/mu - r0[0]/r0m,
+        vxh[1]/mu - r0[1]/r0m,
+        vxh[2]/mu - r0[2]/r0m
+    };
+    double e = sqrt(e_vec[0]*e_vec[0] + e_vec[1]*e_vec[1] + e_vec[2]*e_vec[2]);
+
+    // Eccentric anomaly at t0
+    double cosE0 = (1.0 - r0m / a) / (e > 1e-20 ? e : 1e-20);
+    if (cosE0 >  1.0) cosE0 =  1.0;
+    if (cosE0 < -1.0) cosE0 = -1.0;
+    double E0 = acos(cosE0);
+    double rdv = r0[0]*v0[0] + r0[1]*v0[1] + r0[2]*v0[2];
+    if (rdv < 0.0) E0 = -E0;
+
+    double n = sqrt(mu / (a*a*a));
+    double M0 = E0 - e * sin(E0);
+    double M  = M0 + n * dt_sec;
+
+    // Newton solve M = E - e sin E. Initial guess = M; converges in <10
+    // iterations for any eccentricity we'd see on a LEO satellite.
+    double E = M;
+    for (int i = 0; i < 30; ++i) {
+        double f  = E - e * sin(E) - M;
+        double fp = 1.0 - e * cos(E);
+        double dE = f / fp;
+        E -= dE;
+        if (fabs(dE) < 1e-12) break;
+    }
+
+    double dE_step = E - E0;
+    double sinDE = sin(dE_step), cosDE = cos(dE_step);
+    double rm = a * (1.0 - e * cos(E));
+    double fc = 1.0 - (a / r0m) * (1.0 - cosDE);
+    double gc = dt_sec - sqrt(a*a*a / mu) * (dE_step - sinDE);
+    double fcd = -sqrt(mu * a) / (rm * r0m) * sinDE;
+    double gcd = 1.0 - (a / rm) * (1.0 - cosDE);
+
+    for (int k = 0; k < 3; ++k) {
+        r_out[k] = fc  * r0[k] + gc  * v0[k];
+        v_out[k] = fcd * r0[k] + gcd * v0[k];
+    }
+    return 0;
+}
+
 // Binary search for the largest index i such that samples[i].jul_utc <= t.
 // Returns -1 if t is before samples[0], or n_samples-1 if after the last.
 static ssize_t bracket_left(const oem_table_t *t, double jul_utc)
@@ -355,9 +496,26 @@ int oem_sample_at(const oem_table_t *t, double jul_utc,
                   double r_ecef[3], double v_ecef[3])
 {
     if (t == NULL || t->n_samples < 2) return -1;
+
+    // Beyond-window: two-body Keplerian extrapolation from the nearest
+    // endpoint sample. Accuracy for LEO is ~minutes/day of AOS drift
+    // (no J2, no drag); adequate for ground-segment scheduling, not
+    // space-safety work.
     if (jul_utc < t->start_jul_utc - 1e-9 ||
         jul_utc > t->stop_jul_utc  + 1e-9) {
-        return -1;
+        const oem_sample_t *anchor =
+            (jul_utc > t->stop_jul_utc)
+                ? &t->samples[t->n_samples - 1]
+                : &t->samples[0];
+        double r_eci[3], v_eci[3];
+        itrf_to_eci(anchor->jul_utc, anchor->r_ecef, anchor->v_ecef, r_eci, v_eci);
+        double dt_sec = (jul_utc - anchor->jul_utc) * 86400.0;
+        double r_eci_new[3], v_eci_new[3];
+        if (kepler_propagate_eci(r_eci, v_eci, dt_sec, r_eci_new, v_eci_new) != 0) {
+            return -1;
+        }
+        eci_to_itrf(jul_utc, r_eci_new, v_eci_new, r_ecef, v_ecef);
+        return 0;
     }
 
     ssize_t i = bracket_left(t, jul_utc);
