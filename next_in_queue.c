@@ -78,6 +78,8 @@ void usage(FILE *dest, const char *name, int full)
         "  --min-elevation=<deg>        Minimum peak elevation (default 0)\n"
         "  --max-elevation=<deg>        Maximum peak elevation (default 90)\n"
         "  --minutes-offset=<n>         Advance `now` by n minutes for planning\n"
+        "  --t0=<yyyy-mm-ddThh:mm:ss>   Absolute UTC start time (default: now).\n"
+        "                               --minutes-offset= is applied on top.\n"
         "  --all-satellites             Include Starlink/OneWeb-style swarms\n"
         "                               (default: constellations are excluded)\n"
         "  --regex=<pattern>            Only satellites whose names match\n"
@@ -170,6 +172,7 @@ int main(int argc, char **argv)
     int reverse = 0;
     int tle_explicit = 0;
     const char *trajectory_id = NULL;
+    const char *t0_str = NULL;
     double min_altitude_km = 0.0;
     double max_altitude_km = 100000.0;
 
@@ -205,12 +208,19 @@ int main(int argc, char **argv)
             }
             site_altitude = atof(argv[i] + 6);
         } else if (strncmp("--minutes-offset=", argv[i], 17) == 0) {
-            state.n_options++; 
+            state.n_options++;
             if (strlen(argv[i]) < 18) {
                 fprintf(stderr, "Unable to parse %s\n", argv[i]);
                 return EXIT_FAILURE;
             }
             minutes_offset = atoi(argv[i] + 17);
+        } else if (strncmp("--t0=", argv[i], 5) == 0) {
+            state.n_options++;
+            if (strlen(argv[i]) < 6) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            t0_str = argv[i] + 5;
         } else if (strcmp("--list", argv[i]) == 0) {
             state.n_options++;
             list_all = 1;
@@ -383,10 +393,30 @@ int main(int argc, char **argv)
     state.prediction.observer_ephem.position_geodetic.lon = site_longitude * M_PI / 180.0;
     state.prediction.observer_ephem.position_geodetic.alt = site_altitude / 1000.0;
 
-    struct tm utc;
-    struct timeval tv;
-    UTC_Calendar_Now(&utc, &tv);
-    double jul_utc = Julian_Date(&utc, &tv);
+    double jul_utc;
+    if (t0_str != NULL) {
+        int y = 0, mo = 0, d = 0, h = 0, mi = 0;
+        double sec = 0.0;
+        int n = sscanf(t0_str, "%d-%d-%dT%d:%d:%lf", &y, &mo, &d, &h, &mi, &sec);
+        if (n != 6) {
+            fprintf(stderr, "--t0: expected yyyy-mm-ddThh:mm:ss, got '%s'\n", t0_str);
+            return EXIT_FAILURE;
+        }
+        int a = (14 - mo) / 12;
+        int yy = y + 4800 - a;
+        int mm = mo + 12 * a - 3;
+        long jdn = (long)d + (153L * mm + 2) / 5 + 365L * yy
+                 + yy / 4 - yy / 100 + yy / 400 - 32045L;
+        jul_utc = (double)jdn
+                + ((double)h - 12.0) / 24.0
+                + (double)mi / 1440.0
+                + sec / 86400.0;
+    } else {
+        struct tm utc;
+        struct timeval tv;
+        UTC_Calendar_Now(&utc, &tv);
+        jul_utc = Julian_Date(&utc, &tv);
+    }
     jul_utc += minutes_offset / 1440.0;
     struct tm utc_ref;
     Date_Time(jul_utc, &utc_ref);
