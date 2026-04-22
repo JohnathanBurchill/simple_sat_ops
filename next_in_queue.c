@@ -145,10 +145,9 @@ static void format_local_aos(double jul_utc, char *buf, size_t bufsize)
 
 int main(int argc, char **argv)
 {
-    // Ground station is at RAO (Priddis, AB). Pin the timezone so AOS
-    // rendering in --list output is Calgary local regardless of how
-    // the operator's shell is configured.
-    setenv("TZ", "America/Edmonton", 1);
+    // AOS-local rendering follows the operator's TZ (system default or
+    // shell-set). Set TZ=America/Edmonton in the env if you want
+    // Calgary time regardless of where you're ssh'd in from.
     tzset();
 
     double site_latitude = RAO_LATITUDE;
