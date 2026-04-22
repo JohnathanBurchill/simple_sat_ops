@@ -85,6 +85,9 @@ static void usage(FILE *dest, const char *name, int full)
         "  --no-ptt                     Skip CI-V PTT; play audio only (bench test)\n"
         "  --record=<wav>               Capture the USB CODEC to <wav> during TX\n"
         "                               (needs radio MONI on for useful content)\n"
+        "  --record-warmup-ms=<ms>      Delay between arecord start and PTT on so\n"
+        "                               its DMA/CODEC startup transient lands\n"
+        "                               before TX audio (default 600)\n"
         "  --moni-level=<0..100>        MONI loopback gain, %% (CI-V 14 07; MONI\n"
         "                               itself stays a front-panel toggle)\n"
         "  --help                       Short help (this message)\n"
@@ -162,7 +165,10 @@ static void usage(FILE *dest, const char *name, int full)
 // stashed in g_record_pid so on_signal() / the main flow can SIGINT it.
 // The sample format matches AUDIO_RATE_HZ / AUDIO_CHANNELS / S16_LE so
 // the captured WAV is byte-comparable with uplink_test --out=.
-static int start_recorder(const char *device, const char *out_path)
+// warmup_ms: sleep after fork so arecord's DMA/CODEC startup transient
+// (first ~100 ms of noise + silence) is past before PTT fires.
+static int start_recorder(const char *device, const char *out_path,
+                          int warmup_ms)
 {
     pid_t pid = fork();
     if (pid < 0) {
@@ -189,8 +195,9 @@ static int start_recorder(const char *device, const char *out_path)
         _exit(127);
     }
     g_record_pid = pid;
-    // Give arecord a beat to open the device before we start TX.
-    usleep(200000);
+    if (warmup_ms > 0) {
+        usleep((useconds_t)warmup_ms * 1000);
+    }
     return 0;
 }
 
@@ -205,6 +212,7 @@ int main(int argc, char **argv)
     double duration_s = 3.0;
     double amplitude = 0.3;
     int moni_level_pct = -1;  // < 0 = don't touch
+    int record_warmup_ms = 600;
 
     for (int i = 1; i < argc; i++) {
         if (strncmp("--radio-device=", argv[i], 15) == 0) {
@@ -240,6 +248,10 @@ int main(int argc, char **argv)
                 fprintf(stderr, "--moni-level must be 0..100 (%%)\n");
                 return EXIT_FAILURE;
             }
+        } else if (strncmp("--record-warmup-ms=", argv[i], 19) == 0) {
+            if (strlen(argv[i]) < 20) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
+            record_warmup_ms = atoi(argv[i] + 19);
+            if (record_warmup_ms < 0) record_warmup_ms = 0;
         } else if (strcmp("--help", argv[i]) == 0) {
             usage(stdout, argv[0], 0);
             return 0;
@@ -298,8 +310,9 @@ int main(int argc, char **argv)
     }
 
     if (record_path != NULL) {
-        fprintf(stderr, "tx_tone: recording %s <- %s\n", record_path, audio_device);
-        if (start_recorder(audio_device, record_path) != 0) {
+        fprintf(stderr, "tx_tone: recording %s <- %s (warmup %d ms)\n",
+                record_path, audio_device, record_warmup_ms);
+        if (start_recorder(audio_device, record_path, record_warmup_ms) != 0) {
             audio_playback_close(playback);
             goto fail_radio;
         }

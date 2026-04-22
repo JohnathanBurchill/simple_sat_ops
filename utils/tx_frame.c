@@ -66,8 +66,10 @@ static void stop_recorder(void)
 // Fork arecord against the USB CODEC into a WAV file. Format matches
 // the tx_frame baseband (mono S16_LE at the modem sample rate) so the
 // captured file lines up with uplink_test --out= for decoder diffing.
+// warmup_ms: sleep after fork so arecord's DMA/CODEC startup transient
+// (first ~100 ms of noise + silence) is past before PTT fires.
 static int start_recorder(const char *device, const char *out_path,
-                          unsigned int rate_hz)
+                          unsigned int rate_hz, int warmup_ms)
 {
     pid_t pid = fork();
     if (pid < 0) {
@@ -93,8 +95,9 @@ static int start_recorder(const char *device, const char *out_path,
         _exit(127);
     }
     g_record_pid = pid;
-    // Give arecord a beat to open the device before we start TX.
-    usleep(200000);
+    if (warmup_ms > 0) {
+        usleep((useconds_t)warmup_ms * 1000);
+    }
     return 0;
 }
 
@@ -187,6 +190,9 @@ static void usage(FILE *out, const char *argv0)
         "  --post-ms=<ms>              Delay after audio ends before PTT off (200)\n"
         "  --record=<wav>              Capture the USB CODEC to <wav> during TX\n"
         "                              (needs radio MONI on for useful content)\n"
+        "  --record-warmup-ms=<ms>     Delay between arecord start and PTT on so\n"
+        "                              its DMA/CODEC startup transient lands\n"
+        "                              before TX audio (default 600)\n"
         "  --moni-level=<0..100>       MONI loopback gain, %% (CI-V 14 07; MONI\n"
         "                              itself stays a front-panel toggle)\n"
         "\n"
@@ -211,6 +217,7 @@ int main(int argc, char **argv)
     int pre_ms = 200;
     int post_ms = 200;
     int moni_level_pct = -1;  // < 0 = don't touch
+    int record_warmup_ms = 600;
 
     csp_v1_header_t csp_hdr = {
         .prio = CSP_PRIO_NORM,
@@ -252,6 +259,10 @@ int main(int argc, char **argv)
                 fprintf(stderr, "--moni-level must be 0..100 (%%)\n");
                 return 1;
             }
+        }
+        else if (starts_with(a, "--record-warmup-ms=")) {
+            record_warmup_ms = atoi(a + 19);
+            if (record_warmup_ms < 0) record_warmup_ms = 0;
         }
         else if (starts_with(a, "--pre-ms="))           pre_ms       = atoi(a + 9);
         else if (starts_with(a, "--post-ms="))          post_ms      = atoi(a + 10);
@@ -391,8 +402,10 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
 
     if (record_path != NULL) {
-        fprintf(stderr, "tx_frame: recording %s <- %s\n", record_path, audio_device);
-        if (start_recorder(audio_device, record_path, (unsigned)mp.samp_rate) != 0) {
+        fprintf(stderr, "tx_frame: recording %s <- %s (warmup %d ms)\n",
+                record_path, audio_device, record_warmup_ms);
+        if (start_recorder(audio_device, record_path,
+                           (unsigned)mp.samp_rate, record_warmup_ms) != 0) {
             snd_pcm_close(pcm);
             radio_disconnect(&radio);
             free(samples);
