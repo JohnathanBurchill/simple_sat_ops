@@ -130,7 +130,7 @@ static void usage(FILE *out, const char *argv0)
         "  --radio-serial-speed=<bps>  Serial speed (default 115200)\n"
         "\n"
         "Audio (ALSA playback):\n"
-        "  --audio-device=<device>     ALSA device (default plughw:1,0)\n"
+        "  --audio-device=<device>     ALSA device (default plughw:4,0)\n"
         "  --pre-ms=<ms>               Delay after PTT on before audio starts (200)\n"
         "  --post-ms=<ms>              Delay after audio ends before PTT off (200)\n"
         "\n"
@@ -146,7 +146,7 @@ int main(int argc, char **argv)
     const char *payload_ascii = NULL;
     const char *keyfile_path = NULL;
     const char *radio_device = "/dev/ttyUSB1";
-    const char *audio_device = "plughw:1,0";
+    const char *audio_device = "plughw:4,0";
     speed_t radio_speed = B115200;
     int use_hmac = 1;
     int dry_run = 0;
