@@ -281,21 +281,64 @@ int main(int argc, char **argv)
                 "(tried both polarities, sync-threshold=%d)\n",
                 sync_max_ham);
         if (verbose) {
-            // Dump the first 128 bits sliced at each phase so the operator
-            // can eyeball whether a 0xAA (10101010) preamble pattern is
-            // anywhere in the input. If yes, sync-threshold is too strict;
-            // if no, the signal isn't there at all.
+            // For each phase, scan the full bit stream for:
+            //   - longest alternating run (0xAA preamble detector)
+            //   - closest 32-bit window match to the ASM (min Hamming distance)
+            // Strong preamble + close sync = signal is there, relax threshold.
+            // Weak preamble + far sync = signal isn't present at all.
             int sps = mp.samp_rate / mp.bit_rate;
-            fprintf(stderr, "rx_decode: first 128 bits at each phase (for debug):\n");
-            for (int phase = 0; phase < sps; ++phase) {
-                fprintf(stderr, "  phase=%d  ", phase);
-                size_t mid = (size_t)phase + (size_t)sps / 2u;
-                size_t printed = 0;
-                for (size_t i = mid; i < n_samples && printed < 128; i += (size_t)sps) {
-                    fputc((samples[i] > 0) ? '1' : '0', stderr);
-                    ++printed;
+            size_t n_phase_bits = n_samples / (size_t)sps;
+            uint8_t *pb = (uint8_t *)malloc(n_phase_bits);
+            if (pb != NULL) {
+                const uint32_t ASM = 0x930B51DEu;
+                fprintf(stderr, "rx_decode: per-phase diagnostic:\n");
+                for (int phase = 0; phase < sps; ++phase) {
+                    size_t mid = (size_t)phase + (size_t)sps / 2u;
+                    size_t nb = 0;
+                    for (size_t i = mid; i < n_samples; i += (size_t)sps) {
+                        pb[nb++] = (uint8_t)((samples[i] > 0) ? 1 : 0);
+                    }
+                    // Longest alternating run.
+                    size_t best_run = 1, cur_run = 1, best_run_start = 0, cur_run_start = 0;
+                    for (size_t i = 1; i < nb; ++i) {
+                        if (pb[i] != pb[i-1]) {
+                            ++cur_run;
+                        } else {
+                            if (cur_run > best_run) { best_run = cur_run; best_run_start = cur_run_start; }
+                            cur_run = 1;
+                            cur_run_start = i;
+                        }
+                    }
+                    if (cur_run > best_run) { best_run = cur_run; best_run_start = cur_run_start; }
+                    // Closest 32-bit match to ASM.
+                    int best_ham = 33;
+                    size_t best_ham_pos = 0;
+                    if (nb >= 32) {
+                        uint32_t w = 0;
+                        for (int i = 0; i < 32; ++i) w = (w << 1) | pb[i];
+                        int h = __builtin_popcount(w ^ ASM);
+                        if (h < best_ham) { best_ham = h; best_ham_pos = 0; }
+                        for (size_t i = 32; i < nb; ++i) {
+                            w = (w << 1) | pb[i];
+                            h = __builtin_popcount(w ^ ASM);
+                            if (h < best_ham) { best_ham = h; best_ham_pos = i - 31; }
+                        }
+                    }
+                    fprintf(stderr, "  phase=%d  altrun=%zu@bit%zu  best_asm_hamming=%d@bit%zu\n",
+                            phase, best_run, best_run_start, best_ham, best_ham_pos);
                 }
-                fputc('\n', stderr);
+                fprintf(stderr, "rx_decode: first 256 bits at each phase (for debug):\n");
+                for (int phase = 0; phase < sps; ++phase) {
+                    fprintf(stderr, "  phase=%d  ", phase);
+                    size_t mid = (size_t)phase + (size_t)sps / 2u;
+                    size_t printed = 0;
+                    for (size_t i = mid; i < n_samples && printed < 256; i += (size_t)sps) {
+                        fputc((samples[i] > 0) ? '1' : '0', stderr);
+                        ++printed;
+                    }
+                    fputc('\n', stderr);
+                }
+                free(pb);
             }
         }
         free(samples);
