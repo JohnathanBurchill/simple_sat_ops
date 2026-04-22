@@ -208,6 +208,12 @@ static void usage(FILE *out, const char *argv0)
         "  --radio-serial-speed=<bps>  Serial speed (default 115200)\n"
         "  --freq-hz=<hz>              UHF simplex carrier (default %.0f)\n"
         "\n"
+        "Modem:\n"
+        "  --bit-rate=<bps>            Baud rate (default 9600). Must divide\n"
+        "                              48000 Hz evenly. Try 2400 if the 9700's\n"
+        "                              FM-DATA passband filter kills the 4.8 kHz\n"
+        "                              preamble fundamental at 9600 bps.\n"
+        "\n"
         "Audio (ALSA playback):\n"
         "  --audio-device=<device>     ALSA device (default plughw:4,0)\n"
         "  --pre-ms=<ms>               Delay after PTT on before audio starts (200)\n"
@@ -282,6 +288,14 @@ int main(int argc, char **argv)
             else { fprintf(stderr, "unsupported baud: %d\n", bps); return 1; }
         }
         else if (starts_with(a, "--audio-device="))     audio_device = a + 15;
+        else if (starts_with(a, "--bit-rate=")) {
+            int bps = atoi(a + 11);
+            if (bps <= 0 || (48000 % bps) != 0) {
+                fprintf(stderr, "--bit-rate must be a positive divisor of 48000\n");
+                return 1;
+            }
+            mp.bit_rate = bps;
+        }
         else if (starts_with(a, "--freq-hz="))          freq_hz      = atof(a + 10);
         else if (starts_with(a, "--record="))           record_path  = a + 9;
         else if (strcmp(a, "--no-record") == 0)         no_record = 1;
