@@ -327,12 +327,49 @@ int main(int argc, char **argv)
                     fprintf(stderr, "  phase=%d  altrun=%zu@bit%zu  best_asm_hamming=%d@bit%zu\n",
                             phase, best_run, best_run_start, best_ham, best_ham_pos);
                 }
-                fprintf(stderr, "rx_decode: first 256 bits at each phase (for debug):\n");
+                // Find where the actual TX burst is in the file via sliding
+                // RMS. Peak RMS window = burst center; dump bits around it
+                // instead of wasting diagnostic on leading static.
+                size_t win_samples = (size_t)mp.samp_rate / 100u;  // 10 ms
+                if (win_samples < 64) win_samples = 64;
+                double peak_rms = 0.0;
+                size_t peak_center_sample = 0;
+                size_t step = win_samples / 4u;
+                if (step == 0) step = 1;
+                for (size_t s = 0; s + win_samples <= n_samples; s += step) {
+                    double sum_sq = 0.0;
+                    for (size_t j = 0; j < win_samples; ++j) {
+                        double v = (double)samples[s + j];
+                        sum_sq += v * v;
+                    }
+                    double rms = sum_sq / (double)win_samples;
+                    if (rms > peak_rms) {
+                        peak_rms = rms;
+                        peak_center_sample = s + win_samples / 2u;
+                    }
+                }
+                double peak_t = (double)peak_center_sample / (double)mp.samp_rate;
+                fprintf(stderr, "rx_decode: peak-RMS window centered at t=%.3fs "
+                        "(sample %zu of %zu)\n",
+                        peak_t, peak_center_sample, n_samples);
+                // Dump 512 bits starting ~20 ms before the peak so the preamble
+                // (if present) is visible at the start of each line.
+                size_t lead_samples = (size_t)mp.samp_rate / 50u;  // 20 ms
+                size_t dump_start = peak_center_sample > lead_samples
+                    ? peak_center_sample - lead_samples : 0;
+                fprintf(stderr, "rx_decode: 512 bits @ each phase starting %.3fs into file:\n",
+                        (double)dump_start / (double)mp.samp_rate);
                 for (int phase = 0; phase < sps; ++phase) {
                     fprintf(stderr, "  phase=%d  ", phase);
+                    // Align start to this phase's slicing grid.
                     size_t mid = (size_t)phase + (size_t)sps / 2u;
+                    size_t first = mid;
+                    if (dump_start > mid) {
+                        size_t skip = (dump_start - mid + (size_t)sps - 1) / (size_t)sps;
+                        first = mid + skip * (size_t)sps;
+                    }
                     size_t printed = 0;
-                    for (size_t i = mid; i < n_samples && printed < 256; i += (size_t)sps) {
+                    for (size_t i = first; i < n_samples && printed < 512; i += (size_t)sps) {
                         fputc((samples[i] > 0) ? '1' : '0', stderr);
                         ++printed;
                     }
