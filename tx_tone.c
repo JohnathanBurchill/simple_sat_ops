@@ -27,7 +27,9 @@
 #include <string.h>
 #include <signal.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 
@@ -83,8 +85,10 @@ static void usage(FILE *dest, const char *name, int full)
         "\n"
         "Behaviour flags:\n"
         "  --no-ptt                     Skip CI-V PTT; play audio only (bench test)\n"
-        "  --record=<wav>               Capture the USB CODEC to <wav> during TX\n"
-        "                               (needs radio MONI on for useful content)\n"
+        "  --record=<path>              Capture USB CODEC to <path> (headerless\n"
+        "                               S16_LE; default: auto-generated\n"
+        "                               tx_tone_UT=YYYYMMDDTHHMMSS.sss.raw in CWD)\n"
+        "  --no-record                  Disable auto-recording\n"
         "  --record-warmup-ms=<ms>      Delay between arecord start and PTT on so\n"
         "                               its DMA/CODEC startup transient lands\n"
         "                               before TX audio (default 600)\n"
@@ -142,13 +146,17 @@ static void usage(FILE *dest, const char *name, int full)
         "\n"
         "RECORDING THE TX\n"
         "\n"
-        "  --record=<wav> forks `arecord` against the same USB CODEC for the\n"
-        "  duration of the TX. To hear anything in the resulting WAV you need\n"
-        "  to turn the radio's monitor function on (MONI key / MONITOR LEVEL\n"
-        "  set non-zero) so the transmitted audio is looped back onto the USB\n"
-        "  AF output. Otherwise the receiver is muted during TX and the WAV\n"
-        "  will be silence. Output format: 48 kHz S16_LE stereo WAV,\n"
-        "  byte-compatible with uplink_test --out=.\n"
+        "  Recording is ON by default; each run drops a headerless S16_LE\n"
+        "  raw file into the current working directory named\n"
+        "  `tx_tone_UT=YYYYMMDDTHHMMSS.sss.raw`. Pass --record=<path> to\n"
+        "  override the filename, or --no-record to disable entirely.\n"
+        "\n"
+        "  To hear anything in the capture, the radio's MONI function must\n"
+        "  be on (MONI key + MONITOR LEVEL non-zero); otherwise the USB AF\n"
+        "  output is muted during TX and the file is silence.\n"
+        "\n"
+        "  Replay: `ffplay -f s16le -ar 48000 -ac 2 <file>.raw`, or convert\n"
+        "  to WAV with `ffmpeg -f s16le -ar 48000 -ac 2 -i <file>.raw ...`.\n"
         "\n"
         "CAVEATS\n"
         "\n"
@@ -161,10 +169,11 @@ static void usage(FILE *dest, const char *name, int full)
         name, name, name);
 }
 
-// Spawn `arecord` capturing the USB CODEC to a WAV file. Child PID is
-// stashed in g_record_pid so on_signal() / the main flow can SIGINT it.
-// The sample format matches AUDIO_RATE_HZ / AUDIO_CHANNELS / S16_LE so
-// the captured WAV is byte-comparable with uplink_test --out=.
+// Spawn `arecord` capturing the USB CODEC into a headerless S16_LE raw
+// file. Child PID is stashed in g_record_pid so on_signal() / the main
+// flow can SIGINT it. Headerless so the file lines up byte-for-byte
+// with the output of `rtl_fm -M fm` (also headerless S16_LE) for decoder
+// diffing; replay/inspect with `ffplay -f s16le -ar 48000 -ac N <file>`.
 // warmup_ms: sleep after fork so arecord's DMA/CODEC startup transient
 // (first ~100 ms of noise + silence) is past before PTT fires.
 static int start_recorder(const char *device, const char *out_path,
@@ -186,7 +195,7 @@ static int start_recorder(const char *device, const char *out_path,
             "-f", "S16_LE",
             "-r", rate_str,
             "-c", chan_str,
-            "-t", "wav",
+            "-t", "raw",
             (char *)out_path,
             NULL,
         };
@@ -201,12 +210,36 @@ static int start_recorder(const char *device, const char *out_path,
     return 0;
 }
 
+// Build an auto-record filename "<tool>_UT=YYYYMMDDTHHMMSS.sss.raw" in the
+// current working directory. Timestamp is UTC at the instant of generation.
+// Returns 0 on success, -1 on overflow.
+static int make_auto_record_path(const char *tool, char *out, size_t out_size)
+{
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) != 0) {
+        return -1;
+    }
+    struct tm utc;
+    if (gmtime_r(&tv.tv_sec, &utc) == NULL) {
+        return -1;
+    }
+    int n = snprintf(out, out_size,
+                     "%s_UT=%04d%02d%02dT%02d%02d%02d.%03ld.raw",
+                     tool,
+                     utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                     utc.tm_hour, utc.tm_min, utc.tm_sec,
+                     (long)(tv.tv_usec / 1000));
+    return (n > 0 && (size_t)n < out_size) ? 0 : -1;
+}
+
 int main(int argc, char **argv)
 {
     const char *radio_device = "/dev/ttyUSB1";
     speed_t radio_speed = B115200;
     const char *audio_device = "plughw:4,0";
     const char *record_path = NULL;
+    char auto_record_path[256];
+    int no_record = 0;
     double freq_hz = FRONTIERSAT_CARRIER_HZ;
     double tone_hz = 1000.0;
     double duration_s = 3.0;
@@ -241,6 +274,8 @@ int main(int argc, char **argv)
         } else if (strncmp("--record=", argv[i], 9) == 0) {
             if (strlen(argv[i]) < 10) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
             record_path = argv[i] + 9;
+        } else if (strcmp("--no-record", argv[i]) == 0) {
+            no_record = 1;
         } else if (strncmp("--moni-level=", argv[i], 13) == 0) {
             if (strlen(argv[i]) < 14) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
             moni_level_pct = atoi(argv[i] + 13);
@@ -301,6 +336,20 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "tx_tone: %.6f MHz FM simplex, tone %.1f Hz, %.2f s, amp %.2f, audio %s, ptt %s\n",
             freq_hz / 1e6, tone_hz, duration_s, amplitude, audio_device, g_no_ptt ? "off" : "on");
+
+    // Auto-generate a record path if recording is on and the user didn't
+    // pass --record=<path>. Writes tx_tone_UT=YYYYMMDDTHHMMSS.sss.raw in
+    // the current working directory so every run leaves a searchable
+    // breadcrumb without the operator having to remember a filename.
+    if (record_path == NULL && !no_record) {
+        if (make_auto_record_path("tx_tone", auto_record_path,
+                                  sizeof auto_record_path) != 0) {
+            fprintf(stderr, "warning: could not build auto-record filename; "
+                    "recording disabled for this run\n");
+        } else {
+            record_path = auto_record_path;
+        }
+    }
 
     // Start the recorder first so arecord owns the device at open time.
     // Opening playback afterwards won't reset the capture clock the way

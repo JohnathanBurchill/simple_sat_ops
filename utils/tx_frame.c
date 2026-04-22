@@ -44,7 +44,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 
@@ -63,9 +65,9 @@ static void stop_recorder(void)
     g_record_pid = 0;
 }
 
-// Fork arecord against the USB CODEC into a WAV file. Format matches
-// the tx_frame baseband (mono S16_LE at the modem sample rate) so the
-// captured file lines up with uplink_test --out= for decoder diffing.
+// Fork arecord against the USB CODEC into a headerless S16_LE raw file
+// at the modem sample rate. Headerless so the file lines up byte-for-byte
+// with `rtl_fm -M fm` output (same format, same rate) for decoder diffing.
 // warmup_ms: sleep after fork so arecord's DMA/CODEC startup transient
 // (first ~100 ms of noise + silence) is past before PTT fires.
 static int start_recorder(const char *device, const char *out_path,
@@ -86,7 +88,7 @@ static int start_recorder(const char *device, const char *out_path,
             "-f", "S16_LE",
             "-r", rate_str,
             "-c", "1",
-            "-t", "wav",
+            "-t", "raw",
             (char *)out_path,
             NULL,
         };
@@ -99,6 +101,28 @@ static int start_recorder(const char *device, const char *out_path,
         usleep((useconds_t)warmup_ms * 1000);
     }
     return 0;
+}
+
+// Build an auto-record filename "<tool>_UT=YYYYMMDDTHHMMSS.sss.raw" in the
+// current working directory. Timestamp is UTC at the instant of generation.
+// Returns 0 on success, -1 on overflow.
+static int make_auto_record_path(const char *tool, char *out, size_t out_size)
+{
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) != 0) {
+        return -1;
+    }
+    struct tm utc;
+    if (gmtime_r(&tv.tv_sec, &utc) == NULL) {
+        return -1;
+    }
+    int n = snprintf(out, out_size,
+                     "%s_UT=%04d%02d%02dT%02d%02d%02d.%03ld.raw",
+                     tool,
+                     utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                     utc.tm_hour, utc.tm_min, utc.tm_sec,
+                     (long)(tv.tv_usec / 1000));
+    return (n > 0 && (size_t)n < out_size) ? 0 : -1;
 }
 
 static void on_sigint(int sig)
@@ -188,8 +212,10 @@ static void usage(FILE *out, const char *argv0)
         "  --audio-device=<device>     ALSA device (default plughw:4,0)\n"
         "  --pre-ms=<ms>               Delay after PTT on before audio starts (200)\n"
         "  --post-ms=<ms>              Delay after audio ends before PTT off (200)\n"
-        "  --record=<wav>              Capture the USB CODEC to <wav> during TX\n"
-        "                              (needs radio MONI on for useful content)\n"
+        "  --record=<path>             Capture USB CODEC to <path> (headerless\n"
+        "                              S16_LE; default: auto-generated\n"
+        "                              tx_frame_UT=YYYYMMDDTHHMMSS.sss.raw in CWD)\n"
+        "  --no-record                 Disable auto-recording\n"
         "  --record-warmup-ms=<ms>     Delay between arecord start and PTT on so\n"
         "                              its DMA/CODEC startup transient lands\n"
         "                              before TX audio (default 600)\n"
@@ -210,6 +236,8 @@ int main(int argc, char **argv)
     const char *radio_device = "/dev/ttyUSB1";
     const char *audio_device = "plughw:4,0";
     const char *record_path = NULL;
+    char auto_record_path[256];
+    int no_record = 0;
     double freq_hz = FRONTIERSAT_CARRIER_HZ;
     speed_t radio_speed = B115200;
     int use_hmac = 1;
@@ -253,6 +281,7 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--audio-device="))     audio_device = a + 15;
         else if (starts_with(a, "--freq-hz="))          freq_hz      = atof(a + 10);
         else if (starts_with(a, "--record="))           record_path  = a + 9;
+        else if (strcmp(a, "--no-record") == 0)         no_record = 1;
         else if (starts_with(a, "--moni-level=")) {
             moni_level_pct = atoi(a + 13);
             if (moni_level_pct < 0 || moni_level_pct > 100) {
@@ -383,6 +412,20 @@ int main(int argc, char **argv)
     sa.sa_flags = 0;  // no SA_RESTART: want ALSA blocking calls to return EINTR
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+
+    // Auto-generate a record path if recording is on and the user didn't
+    // pass --record=<path>. Writes tx_frame_UT=YYYYMMDDTHHMMSS.sss.raw in
+    // the current working directory so every frame we transmit leaves a
+    // searchable breadcrumb.
+    if (record_path == NULL && !no_record) {
+        if (make_auto_record_path("tx_frame", auto_record_path,
+                                  sizeof auto_record_path) != 0) {
+            fprintf(stderr, "warning: could not build auto-record filename; "
+                    "recording disabled for this run\n");
+        } else {
+            record_path = auto_record_path;
+        }
+    }
 
     // Start the recorder before opening playback so arecord gets a clean
     // device. Opening playback first on the PCM2901 seems to perturb the
