@@ -85,6 +85,8 @@ static void usage(FILE *dest, const char *name, int full)
         "  --no-ptt                     Skip CI-V PTT; play audio only (bench test)\n"
         "  --record=<wav>               Capture the USB CODEC to <wav> during TX\n"
         "                               (needs radio MONI on for useful content)\n"
+        "  --moni-level=<0..100>        MONI loopback gain, %% (CI-V 14 07; MONI\n"
+        "                               itself stays a front-panel toggle)\n"
         "  --help                       Short help (this message)\n"
         "  --help-full                  Detailed help with setup and verification\n",
         name, FRONTIERSAT_CARRIER_HZ, FRONTIERSAT_CARRIER_HZ / 1e6);
@@ -202,6 +204,7 @@ int main(int argc, char **argv)
     double tone_hz = 1000.0;
     double duration_s = 3.0;
     double amplitude = 0.3;
+    int moni_level_pct = -1;  // < 0 = don't touch
 
     for (int i = 1; i < argc; i++) {
         if (strncmp("--radio-device=", argv[i], 15) == 0) {
@@ -230,6 +233,13 @@ int main(int argc, char **argv)
         } else if (strncmp("--record=", argv[i], 9) == 0) {
             if (strlen(argv[i]) < 10) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
             record_path = argv[i] + 9;
+        } else if (strncmp("--moni-level=", argv[i], 13) == 0) {
+            if (strlen(argv[i]) < 14) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
+            moni_level_pct = atoi(argv[i] + 13);
+            if (moni_level_pct < 0 || moni_level_pct > 100) {
+                fprintf(stderr, "--moni-level must be 0..100 (%%)\n");
+                return EXIT_FAILURE;
+            }
         } else if (strcmp("--help", argv[i]) == 0) {
             usage(stdout, argv[0], 0);
             return 0;
@@ -266,6 +276,15 @@ int main(int argc, char **argv)
     if (rc != RADIO_OK) {
         fprintf(stderr, "warning: could not re-enable DATA mode (rc=%d); "
                 "radio will transmit in voice FM.\n", rc);
+    }
+    if (moni_level_pct >= 0) {
+        // Percent -> 0..255 scale (IC-9700 monitor-level range). MONI
+        // ON/OFF is still a front-panel toggle.
+        int raw = (int)((moni_level_pct * 255 + 50) / 100);
+        rc = radio_set_moni_level(&g_radio, raw);
+        if (rc != RADIO_OK) {
+            fprintf(stderr, "warning: could not set MONI level (rc=%d)\n", rc);
+        }
     }
 
     fprintf(stderr, "tx_tone: %.6f MHz FM simplex, tone %.1f Hz, %.2f s, amp %.2f, audio %s, ptt %s\n",

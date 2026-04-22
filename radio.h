@@ -126,6 +126,7 @@ int radio_set_mode(radio_t *radio, int mode, int filter);
 int radio_set_data_mode(radio_t *radio, int on, int filter);
 int radio_set_data_mod_source(radio_t *radio, int source);
 int radio_set_usb_mod_level(radio_t *radio, int level_0_to_255);
+int radio_set_moni_level(radio_t *radio, int level_0_to_255);
 int radio_uplink_prep(radio_t *radio);
 int radio_ptt(radio_t *radio, int on);
 int radio_get_band_selection(radio_t *radio, int band);

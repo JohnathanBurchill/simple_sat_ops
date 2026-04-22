@@ -187,6 +187,8 @@ static void usage(FILE *out, const char *argv0)
         "  --post-ms=<ms>              Delay after audio ends before PTT off (200)\n"
         "  --record=<wav>              Capture the USB CODEC to <wav> during TX\n"
         "                              (needs radio MONI on for useful content)\n"
+        "  --moni-level=<0..100>       MONI loopback gain, %% (CI-V 14 07; MONI\n"
+        "                              itself stays a front-panel toggle)\n"
         "\n"
         "Safety / dry-run:\n"
         "  --dry-run                   Build the frame, print size, do not TX\n"
@@ -208,6 +210,7 @@ int main(int argc, char **argv)
     int dry_run = 0;
     int pre_ms = 200;
     int post_ms = 200;
+    int moni_level_pct = -1;  // < 0 = don't touch
 
     csp_v1_header_t csp_hdr = {
         .prio = CSP_PRIO_NORM,
@@ -243,6 +246,13 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--audio-device="))     audio_device = a + 15;
         else if (starts_with(a, "--freq-hz="))          freq_hz      = atof(a + 10);
         else if (starts_with(a, "--record="))           record_path  = a + 9;
+        else if (starts_with(a, "--moni-level=")) {
+            moni_level_pct = atoi(a + 13);
+            if (moni_level_pct < 0 || moni_level_pct > 100) {
+                fprintf(stderr, "--moni-level must be 0..100 (%%)\n");
+                return 1;
+            }
+        }
         else if (starts_with(a, "--pre-ms="))           pre_ms       = atoi(a + 9);
         else if (starts_with(a, "--post-ms="))          post_ms      = atoi(a + 10);
         else if (strcmp(a, "--dry-run") == 0)           dry_run = 1;
@@ -360,6 +370,13 @@ int main(int argc, char **argv)
     if (rc != RADIO_OK) {
         fprintf(stderr, "warning: could not re-enable DATA mode (rc=%d); "
                 "radio will transmit in voice FM.\n", rc);
+    }
+    if (moni_level_pct >= 0) {
+        int raw = (int)((moni_level_pct * 255 + 50) / 100);
+        rc = radio_set_moni_level(&radio, raw);
+        if (rc != RADIO_OK) {
+            fprintf(stderr, "warning: could not set MONI level (rc=%d)\n", rc);
+        }
     }
 
     // Arm a SIGINT handler that writes PTT-off directly to the radio fd
