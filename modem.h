@@ -62,13 +62,14 @@ int pcm16_write_wav(const char *path,
 // ASM (0x930B51DE) sync word. Pipeline:
 //   1. High-pass (DC-block, α=0.995 IIR) — defeats rtl_fm discriminator drift
 //   2. Bipolar threshold at 0: sample mid-bit, bit = (x > 0)
-//   3. Try all sps = samp_rate/bit_rate phase offsets; pick the one whose
-//      resulting bit stream contains the ASM within sync_max_ham bit errors.
+//   3. Try both polarities and all sps = samp_rate/bit_rate phase offsets;
+//      pick the first combination whose resulting bit stream contains the
+//      ASM within sync_max_ham bit errors.
 //   4. Copy the bit stream starting AT the ASM into out_bits; record the
 //      bit-stream start offset for diagnostics.
 //
-// invert_polarity: flip the threshold sign (bit = (x < 0)). Use when FM
-// deviation polarity is inverted end-to-end.
+// invert_polarity: preferred polarity to try first (0 normal, 1 inverted).
+// Both are always tried; this just changes the order.
 // sync_max_ham: 0 = strict match, 1..8 = tolerate up to that many errors
 // in the 32-bit ASM.
 //
@@ -76,6 +77,8 @@ int pcm16_write_wav(const char *path,
 // *n_bits_out: on success, number of bits written.
 // *sync_bit_offset: on success, where in the pre-alignment raw bit stream
 // the ASM was found (bit 0 of ASM = first bit copied to out_bits).
+// *polarity_used: optional; on success, 0 if normal polarity matched, 1 if
+// inverted. NULL to ignore.
 //
 // Returns 0 on success, -1 on no sync or bad args.
 int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
@@ -83,7 +86,8 @@ int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
                         int invert_polarity,
                         int sync_max_ham,
                         uint8_t *out_bits, size_t *n_bits_out,
-                        size_t *sync_bit_offset);
+                        size_t *sync_bit_offset,
+                        int *polarity_used);
 
 // Pack a bit stream (bit[i] = 0 or 1, MSB-first) into bytes. Last partial
 // byte is zero-padded on the LSB side. n_bits need not be a multiple of 8.

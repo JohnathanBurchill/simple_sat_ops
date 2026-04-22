@@ -233,7 +233,8 @@ int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
                         int invert_polarity,
                         int sync_max_ham,
                         uint8_t *out_bits, size_t *n_bits_out,
-                        size_t *sync_bit_offset)
+                        size_t *sync_bit_offset,
+                        int *polarity_used)
 {
     if (samples == NULL || p == NULL || out_bits == NULL || n_bits_out == NULL) {
         return -1;
@@ -271,32 +272,47 @@ int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
         return -1;
     }
 
+    // Search over both polarity conventions unless the caller forced one
+    // (invert_polarity=0 tries normal first then inverted; =1 tries
+    // inverted first then normal). FM-discriminator polarity is a
+    // radio-side convention — IC-9700 MONI differs from RTL-SDR, for
+    // example — so it's easier to brute-force than document.
+    int polarities[2];
+    polarities[0] = invert_polarity ? 1 : 0;
+    polarities[1] = invert_polarity ? 0 : 1;
+
     size_t best_sync = (size_t)-1;
     int best_phase = -1;
-    for (int phase = 0; phase < sps; ++phase) {
-        size_t mid_offset = (size_t)phase + (size_t)sps / 2u;
-        size_t n_bits = 0;
-        for (size_t i = mid_offset; i < n_samples; i += (size_t)sps) {
-            int bit;
-            if (invert_polarity) {
-                bit = (dc_blocked[i] < 0.0f) ? 1 : 0;
-            } else {
-                bit = (dc_blocked[i] > 0.0f) ? 1 : 0;
+    int best_polarity = -1;
+
+    for (int pi = 0; pi < 2 && best_phase < 0; ++pi) {
+        int this_invert = polarities[pi];
+        for (int phase = 0; phase < sps; ++phase) {
+            size_t mid_offset = (size_t)phase + (size_t)sps / 2u;
+            size_t n_bits = 0;
+            for (size_t i = mid_offset; i < n_samples; i += (size_t)sps) {
+                int bit;
+                if (this_invert) {
+                    bit = (dc_blocked[i] < 0.0f) ? 1 : 0;
+                } else {
+                    bit = (dc_blocked[i] > 0.0f) ? 1 : 0;
+                }
+                tmp_bits[n_bits++] = (uint8_t)bit;
             }
-            tmp_bits[n_bits++] = (uint8_t)bit;
-        }
-        size_t off = find_u32_pattern(tmp_bits, n_bits,
-                                      ASM_BIG_ENDIAN_U32, sync_max_ham);
-        if (off != (size_t)-1) {
-            // Copy the tail starting at the ASM.
-            size_t copy_bits = n_bits - off;
-            memcpy(out_bits, tmp_bits + off, copy_bits);
-            *n_bits_out = copy_bits;
-            best_sync = off;
-            best_phase = phase;
-            break;
+            size_t off = find_u32_pattern(tmp_bits, n_bits,
+                                          ASM_BIG_ENDIAN_U32, sync_max_ham);
+            if (off != (size_t)-1) {
+                size_t copy_bits = n_bits - off;
+                memcpy(out_bits, tmp_bits + off, copy_bits);
+                *n_bits_out = copy_bits;
+                best_sync = off;
+                best_phase = phase;
+                best_polarity = this_invert;
+                break;
+            }
         }
     }
+    if (polarity_used) *polarity_used = best_polarity;
 
     free(tmp_bits);
     free(dc_blocked);

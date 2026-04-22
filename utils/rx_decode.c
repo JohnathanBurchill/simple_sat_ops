@@ -149,7 +149,8 @@ static void usage(FILE *out, const char *argv0)
         "\n"
         "Modem:\n"
         "  --bit-rate=<bps>           Default 9600\n"
-        "  --invert                   Flip slicer polarity\n"
+        "  --invert                   Try inverted polarity first (both are\n"
+        "                             always tried; this just reorders)\n"
         "  --sync-threshold=<0..8>    Max bit errors in the 32-bit ASM match\n"
         "                             (default 0 = strict)\n"
         "\n"
@@ -271,20 +272,40 @@ int main(int argc, char **argv)
 
     size_t n_bits = 0;
     size_t sync_off = 0;
+    int polarity_used = -1;
     int rc = modem_pcm16_to_bits(samples, n_samples, &mp,
                                  invert, sync_max_ham,
-                                 bits, &n_bits, &sync_off);
-    free(samples);
+                                 bits, &n_bits, &sync_off, &polarity_used);
     if (rc != 0) {
         fprintf(stderr, "rx_decode: no AX100 sync word (0x930B51DE) found "
-                "(tried polarity %s, sync-threshold=%d)\n",
-                invert ? "inverted" : "normal", sync_max_ham);
+                "(tried both polarities, sync-threshold=%d)\n",
+                sync_max_ham);
+        if (verbose) {
+            // Dump the first 128 bits sliced at each phase so the operator
+            // can eyeball whether a 0xAA (10101010) preamble pattern is
+            // anywhere in the input. If yes, sync-threshold is too strict;
+            // if no, the signal isn't there at all.
+            int sps = mp.samp_rate / mp.bit_rate;
+            fprintf(stderr, "rx_decode: first 128 bits at each phase (for debug):\n");
+            for (int phase = 0; phase < sps; ++phase) {
+                fprintf(stderr, "  phase=%d  ", phase);
+                size_t mid = (size_t)phase + (size_t)sps / 2u;
+                size_t printed = 0;
+                for (size_t i = mid; i < n_samples && printed < 128; i += (size_t)sps) {
+                    fputc((samples[i] > 0) ? '1' : '0', stderr);
+                    ++printed;
+                }
+                fputc('\n', stderr);
+            }
+        }
+        free(samples);
         free(bits);
         return 1;
     }
+    free(samples);
     if (verbose) {
-        fprintf(stderr, "rx_decode: ASM at bit offset %zu, %zu bits after ASM\n",
-                sync_off, n_bits);
+        fprintf(stderr, "rx_decode: ASM at bit offset %zu, %zu bits after ASM, polarity=%s\n",
+                sync_off, n_bits, polarity_used ? "inverted" : "normal");
     }
 
     // Pack bits back into bytes for the framer.
