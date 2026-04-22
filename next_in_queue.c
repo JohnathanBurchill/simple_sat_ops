@@ -130,8 +130,27 @@ void usage(FILE *dest, const char *name, int full)
 
 void print_radio_info(const char *name, satellite_status_t *sat_info, int n_entries);
 
+// Format a Julian Date (UTC) as Calgary local time. Relies on TZ having
+// been set to "America/Edmonton" at startup so DST is handled.
+static void format_local_aos(double jul_utc, char *buf, size_t bufsize)
+{
+    time_t t = (time_t)((jul_utc - 2440587.5) * 86400.0);
+    struct tm lt;
+    if (localtime_r(&t, &lt) == NULL) {
+        snprintf(buf, bufsize, "          ?");
+        return;
+    }
+    strftime(buf, bufsize, "%m-%d %H:%M", &lt);
+}
+
 int main(int argc, char **argv)
 {
+    // Ground station is at RAO (Priddis, AB). Pin the timezone so AOS
+    // rendering in --list output is Calgary local regardless of how
+    // the operator's shell is configured.
+    setenv("TZ", "America/Edmonton", 1);
+    tzset();
+
     double site_latitude = RAO_LATITUDE;
     double site_longitude = RAO_LONGITUDE;
     double site_altitude = RAO_ALTITUDE;
@@ -442,11 +461,13 @@ int main(int argc, char **argv)
                 if (satellite_name == NULL) {
                     printf("Found %lu upcoming passes from a total of %d satellites\n", n_passes, count);
                 }
-                printf("%26s  %8s %8s %8s %9s %9s %9s %9s %9s %25s %9s\n", "Name", "in (min)", "dur (min)", "alt (km)", "azi (deg)", "ele (deg)", "up (MHz)", "down (MHz)", "bcn (MHz)", "mode", "status");
+                printf("%26s  %11s %8s %8s %8s %9s %9s %9s %9s %9s %25s %9s\n", "Name", "AOS local", "in (min)", "dur (min)", "alt (km)", "azi (deg)", "ele (deg)", "up (MHz)", "down (MHz)", "bcn (MHz)", "mode", "status");
             }
             for (int i = 0; i < max_passes; i++) {
                 p = get_pass(i);
-                printf("%26s  ", p->name);
+                char aos_local[32];
+                format_local_aos(p->ascension_jul_utc, aos_local, sizeof(aos_local));
+                printf("%26s  %11s ", p->name, aos_local);
                 if (p->minutes_away < 120.0) {
                     printf("%8.1f m ", p->minutes_away);
                 } else if (p->minutes_away < 2880.0) {
@@ -461,7 +482,7 @@ int main(int argc, char **argv)
                 printf("\n");
             }
             if (reverse) {
-                printf("%26s  %8s %8s %8s %9s %9s %9s %9s %9s %25s %9s\n", "Name", "in (min)", "dur (min)", "alt (km)", "azi (deg)", "ele (deg)", "up (MHz)", "down (MHz)", "bcn (MHz)", "mode", "status");
+                printf("%26s  %11s %8s %8s %8s %9s %9s %9s %9s %9s %25s %9s\n", "Name", "AOS local", "in (min)", "dur (min)", "alt (km)", "azi (deg)", "ele (deg)", "up (MHz)", "down (MHz)", "bcn (MHz)", "mode", "status");
                 if (satellite_name != NULL) {
                     printf("Found %lu upcoming passes for %s\n", n_passes, satellite_name);
                 } else {
