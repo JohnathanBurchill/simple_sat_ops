@@ -52,6 +52,10 @@ add_executable(uplink_test uplink_test.c csp.c golay24.c ax100.c hmac_keyfile.c 
 target_include_directories(uplink_test PRIVATE ${OPENSSL_INCLUDE_DIRS})
 target_link_libraries(uplink_test PRIVATE ${OPENSSL_LIBRARIES} m)
 
+# RS self-test: validates rs.c against reed_solomon_ccsds known vectors
+add_executable(rs_selftest utils/rs_selftest.c rs.c)
+target_include_directories(rs_selftest PRIVATE ${CMAKE_SOURCE_DIR})
+
 # FM-audio preview tool: baseband WAV -> audible FM-modulated WAV
 add_executable(fm_preview utils/fm_preview.c utils/wav_read.c modem.c)
 target_include_directories(fm_preview PRIVATE ${CMAKE_SOURCE_DIR})
@@ -68,7 +72,7 @@ add_executable(rx_decode utils/rx_decode.c utils/wav_read.c
 target_include_directories(rx_decode PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
 target_link_libraries(rx_decode PRIVATE ${OPENSSL_LIBRARIES} m)
 
-install(TARGETS simple_sat_ops next_in_queue lifetime tx_tone uplink_test fm_preview tx_frame rx_decode DESTINATION $ENV{HOME}/bin)
+install(TARGETS simple_sat_ops next_in_queue lifetime tx_tone uplink_test fm_preview tx_frame rx_decode rs_selftest DESTINATION $ENV{HOME}/bin)
 
 install(PROGRAMS scripts/upcoming_amateur_satellite_passes.sh DESTINATION $ENV{HOME}/bin)
 install(PROGRAMS scripts/pcm2wav.sh DESTINATION $ENV{HOME}/bin)
