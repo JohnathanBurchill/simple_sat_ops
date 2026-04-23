@@ -51,6 +51,8 @@ static void usage(FILE *out, const char *argv0)
         "Options:\n"
         "  --keyfile=<path>         HMAC keyfile (default: $HOME/%s)\n"
         "  --no-hmac                Skip HMAC (invalid for live ops; test-only)\n"
+        "  --reed-solomon           RS(255,223) encode (DEFAULT; matches pycsplink uplink)\n"
+        "  --no-reed-solomon        Disable RS encode (for bit-compat with legacy frames)\n"
         "  --src=<0..31>            CSP source address (default 1)\n"
         "  --dst=<0..31>            CSP destination address (default 2)\n"
         "  --dport=<0..63>          CSP destination port (default 3)\n"
@@ -116,6 +118,7 @@ int main(int argc, char **argv)
     const char *keyfile_path = NULL;
     const char *out_wav = NULL;
     int use_hmac = 1;
+    int use_rs = 1;  // default ON to match pycsplink uplink
     int print_frame = 0;
 
     csp_v1_header_t csp_hdr = {
@@ -135,6 +138,8 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--payload-ascii=")) payload_ascii = a + 16;
         else if (starts_with(a, "--keyfile="))       keyfile_path  = a + 10;
         else if (strcmp(a, "--no-hmac") == 0)        use_hmac = 0;
+        else if (strcmp(a, "--reed-solomon") == 0)    use_rs = 1;
+        else if (strcmp(a, "--no-reed-solomon") == 0) use_rs = 0;
         else if (starts_with(a, "--src="))     csp_hdr.src   = (uint8_t)atoi(a + 6);
         else if (starts_with(a, "--dst="))     csp_hdr.dst   = (uint8_t)atoi(a + 6);
         else if (starts_with(a, "--dport="))   csp_hdr.dport = (uint8_t)atoi(a + 8);
@@ -207,6 +212,7 @@ int main(int argc, char **argv)
         opts.hmac_key = hmac_key;
         opts.hmac_key_len = (size_t)hmac_key_len;
     }
+    opts.reed_solomon = use_rs;
 
     uint8_t frame[4200];
     ssize_t frame_len = ax100_frame(csp_packet, (size_t)csp_len, &opts,

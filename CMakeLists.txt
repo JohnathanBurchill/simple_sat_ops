@@ -48,7 +48,7 @@ add_executable(tx_tone tx_tone.c radio.c audio.c)
 target_link_libraries(tx_tone PRIVATE m asound)
 
 # Uplink test tool: builds CSP + AX100 frame, optionally modulates to WAV
-add_executable(uplink_test uplink_test.c csp.c golay24.c ax100.c hmac_keyfile.c modem.c)
+add_executable(uplink_test uplink_test.c csp.c golay24.c ax100.c rs.c hmac_keyfile.c modem.c)
 target_include_directories(uplink_test PRIVATE ${OPENSSL_INCLUDE_DIRS})
 target_link_libraries(uplink_test PRIVATE ${OPENSSL_LIBRARIES} m)
 
@@ -62,13 +62,13 @@ target_include_directories(fm_preview PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(fm_preview PRIVATE m)
 
 # Single-shot frame transmitter: CSP+AX100 -> PCM -> CI-V PTT + ALSA playback
-add_executable(tx_frame utils/tx_frame.c csp.c golay24.c ax100.c hmac_keyfile.c modem.c radio.c)
+add_executable(tx_frame utils/tx_frame.c csp.c golay24.c ax100.c rs.c hmac_keyfile.c modem.c radio.c)
 target_include_directories(tx_frame PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
 target_link_libraries(tx_frame PRIVATE ${OPENSSL_LIBRARIES} m asound)
 
 # Offline AX100 frame decoder: WAV/RAW -> demod -> ax100_unframe -> CSP
 add_executable(rx_decode utils/rx_decode.c utils/wav_read.c
-               modem.c ax100.c golay24.c csp.c hmac_keyfile.c)
+               modem.c ax100.c rs.c golay24.c csp.c hmac_keyfile.c)
 target_include_directories(rx_decode PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
 target_link_libraries(rx_decode PRIVATE ${OPENSSL_LIBRARIES} m)
 

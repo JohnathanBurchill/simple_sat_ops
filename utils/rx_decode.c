@@ -143,10 +143,15 @@ static void usage(FILE *out, const char *argv0)
         "  --rate=<hz>                Sample rate for --raw (default 48000)\n"
         "  --channels=<n>             Channels for --raw (default 1; ch 0 used)\n"
         "\n"
-        "Framing / HMAC:\n"
+        "Framing / HMAC / FEC:\n"
         "  --keyfile=<path>           HMAC keyfile (default $HOME/%s)\n"
         "  --no-hmac                  Skip HMAC verification (matches\n"
         "                             `tx_frame --no-hmac`)\n"
+        "  --reed-solomon             RS(255,223) decode (DEFAULT for uplink)\n"
+        "  --no-reed-solomon          Disable RS decode. Use when talking to\n"
+        "                             a TX that did not RS-encode (e.g.,\n"
+        "                             legacy tx_frame output, or downlink\n"
+        "                             which uses CRC instead per pycsplink).\n"
         "\n"
         "Modem:\n"
         "  --bit-rate=<bps>           Default 9600\n"
@@ -179,6 +184,7 @@ int main(int argc, char **argv)
     int invert = 0;
     int sync_max_ham = 0;
     int use_hmac = 1;
+    int use_rs = 1;  // default ON to match pycsplink uplink
     int verbose = 0;
     int hex_only = 0;
 
@@ -197,6 +203,10 @@ int main(int argc, char **argv)
             keyfile_path = a + 10;
         } else if (strcmp(a, "--no-hmac") == 0) {
             use_hmac = 0;
+        } else if (strcmp(a, "--reed-solomon") == 0) {
+            use_rs = 1;
+        } else if (strcmp(a, "--no-reed-solomon") == 0) {
+            use_rs = 0;
         } else if (starts_with(a, "--bit-rate=")) {
             bit_rate = atoi(a + 11);
         } else if (strcmp(a, "--invert") == 0) {
@@ -306,6 +316,7 @@ int main(int argc, char **argv)
         opts.hmac_key = hmac_key;
         opts.hmac_key_len = (size_t)hmac_key_len;
     }
+    opts.reed_solomon = use_rs;
 
     // Preamble-anchored sync search: find the longest alternating run in
     // any phase/polarity, then start the sync-word scan just past its end.
@@ -384,6 +395,7 @@ int main(int argc, char **argv)
     uint8_t packet[4100];
     ssize_t packet_len = -1;
     int golay_errs = 0, hmac_ok = -1;
+    int rs_errs = -1, used_golay_len = -1;
     int rc = 0;
 
     const int MAX_ATTEMPTS = 256;
@@ -427,7 +439,8 @@ int main(int argc, char **argv)
         size_t n_bytes = modem_bits_to_bytes(bits, n_bits, bytes);
         packet_len = ax100_unframe(bytes, n_bytes, &opts,
                                    packet, sizeof(packet),
-                                   &golay_errs, &hmac_ok);
+                                   &golay_errs, &hmac_ok,
+                                   &rs_errs, &used_golay_len);
         free(bytes);
         if (packet_len < 0) {
             // Unframing failed outright (golay uncorrectable or length
@@ -646,9 +659,16 @@ int main(int argc, char **argv)
                 "polarity=%s, candidate #%d%s\n",
                 sync_off, n_bits, polarity_used ? "inverted" : "normal",
                 attempts, use_hmac ? " (HMAC-validated)" : "");
-        fprintf(stderr, "rx_decode: inner packet %zd bytes, golay errors=%d, hmac=%s\n",
+        char rs_buf[32];
+        if (rs_errs < 0) snprintf(rs_buf, sizeof rs_buf, "(off/failed)");
+        else snprintf(rs_buf, sizeof rs_buf, "%d", rs_errs);
+        fprintf(stderr, "rx_decode: inner packet %zd bytes, golay errors=%d, "
+                "hmac=%s, rs_corrected=%s, len_source=%s\n",
                 packet_len, golay_errs,
-                hmac_ok == 1 ? "ok" : hmac_ok == 0 ? "MISMATCH" : "(not checked)");
+                hmac_ok == 1 ? "ok" : hmac_ok == 0 ? "MISMATCH" : "(not checked)",
+                rs_buf,
+                used_golay_len == 1 ? "golay-header"
+                : used_golay_len == 0 ? "brute-force" : "(n/a)");
     }
 
     if (packet_len < 4) {
@@ -674,11 +694,17 @@ int main(int argc, char **argv)
         return (hmac_ok == 0) ? 2 : 0;
     }
 
-    fprintf(stdout, "AX100: golay_errors=%d  hmac=%s\n",
+    char rs_summary[32];
+    if (rs_errs < 0) snprintf(rs_summary, sizeof rs_summary, "off");
+    else snprintf(rs_summary, sizeof rs_summary, "corrected=%d", rs_errs);
+    fprintf(stdout, "AX100: golay_errors=%d  hmac=%s  rs=%s  len=%s\n",
             golay_errs,
             hmac_ok == 1 ? "ok"
             : hmac_ok == 0 ? "MISMATCH"
-            : "(not checked)");
+            : "(not checked)",
+            rs_summary,
+            used_golay_len == 1 ? "golay-header"
+            : used_golay_len == 0 ? "brute-forced" : "(n/a)");
     fprintf(stdout, "CSP v1: src=%u dst=%u dport=%u sport=%u prio=%u flags=0x%02x\n",
             hdr.src, hdr.dst, hdr.dport, hdr.sport, hdr.prio, hdr.flags);
     fprintf(stdout, "payload (%zu bytes):\n", payload_len);

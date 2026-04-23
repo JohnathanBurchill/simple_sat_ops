@@ -7,11 +7,15 @@
       [32x 0xAA preamble]
       [4-byte sync word 0x93 0x0B 0x51 0xDE]
       [3-byte Golay(12,24)-encoded length]
-      [CCSDS scrambled payload (payload = CSP_packet || optional HMAC trailer)]
+      [CCSDS scrambled payload (payload = CSP_packet || optional HMAC
+        trailer || optional 32-byte Reed-Solomon parity)]
       [1x 0xAA postamble]
 
-    Reed-Solomon (255,223) and CRC-32C are not yet implemented; they are
-    off by default in the reference and not used by pycsp_tx.py.
+    Reed-Solomon (255,223) is implemented (see rs.c) and matches
+    reed_solomon_ccsds.encode(x, False, 1) semantics: left-zero-pad to 223,
+    encode to 255, strip padding. Enabled via ax100_opts_t.reed_solomon.
+    CRC-32C is still not implemented — pycsplink.AX100 enables it only on
+    the downlink (reed_solomon=False, crc=True), which is not our TX path.
 
     Copyright (C) 2025  Johnathan K Burchill
 
@@ -50,6 +54,10 @@ typedef struct ax100_opts {
     size_t hmac_key_len;
 
     int randomize;   // 1: apply CCSDS scrambler (default); 0: skip
+    int reed_solomon;// 1: RS(255,223) encode post-HMAC, decode pre-HMAC;
+                     // 0: skip (default, for backwards compatibility).
+                     // pycsplink uplink enables this; enable it whenever
+                     // TX and RX sides agree.
     int len_field;   // 1: prepend 3-byte Golay24 length (default); 0: skip
     int syncword;    // 1: prepend 4-byte ASM (default); 0: skip
     int prefill;     // number of 0xAA preamble bytes (default 32)
@@ -57,7 +65,9 @@ typedef struct ax100_opts {
 } ax100_opts_t;
 
 // Initializes opts to the pycsplink defaults (randomize=1, len_field=1,
-// syncword=1, prefill=32, tailfill=1, no HMAC).
+// syncword=1, prefill=32, tailfill=1, no HMAC, no Reed-Solomon).
+// Callers that want the pycsp uplink profile should also set
+// opts->reed_solomon = 1 after calling this.
 void ax100_opts_defaults(ax100_opts_t *opts);
 
 // Computes the AX100 HMAC trailer (4 bytes) for the given data.
@@ -80,24 +90,39 @@ ssize_t ax100_frame(const uint8_t *packet, size_t packet_len,
 // word — the decoder's timing-recovery stage finds that in the bit stream
 // and byte-aligns the remainder.
 //
-// Honors the same ax100_opts_t used on the encode side: if opts->len_field
-// is set, the 3-byte Golay24-encoded length is consumed; if opts->randomize,
-// the payload is descrambled; if opts->hmac_key, the trailing 4-byte HMAC
-// is verified.
+// Honors the same ax100_opts_t used on the encode side: Golay24 length,
+// scrambler, HMAC, and Reed-Solomon are each toggled by the corresponding
+// opts field.
 //
-// Writes the inner CSP packet (with HMAC trailer stripped, if applicable)
-// to out_packet. On success returns the inner packet length.
+// When opts->reed_solomon AND opts->hmac_key are BOTH set, and the frame
+// length decoded from the Golay header does not produce a valid payload
+// (RS uncorrectable, or RS ok but HMAC mismatch), ax100_unframe brute-
+// forces alternative inner_len candidates in [33, 255] and accepts the
+// first one that RS-decodes cleanly and HMAC-validates. This recovers
+// frames where the 3-byte Golay header took >3 bit errors and misdecoded
+// the length field — an outcome RS alone cannot fix because RS sits
+// inside the Golay-length envelope.
+//
+// Writes the inner CSP packet (with HMAC trailer and RS parity stripped,
+// if applicable) to out_packet. On success returns the inner packet length.
 // *out_golay_errors (optional) gets 0..3 on success, or the uncorrectable
 // bit count (>3) on failure.
 // *out_hmac_ok (optional) is 1 if the HMAC matched, 0 if it did not, or
 // -1 if HMAC verification wasn't attempted (no key supplied).
+// *out_rs_errors (optional) gets the number of byte errors RS corrected
+// (0..16); unused (-1) if opts->reed_solomon is not set.
+// *out_used_golay_len (optional) is 1 if the Golay-decoded length was
+// accepted, 0 if the brute-force length search found a different length,
+// -1 if not applicable. Useful for debugging weak-signal captures.
 //
-// Returns -1 on any fatal error (missing ASM, uncorrectable Golay, not
-// enough bytes to satisfy the decoded length, invalid args).
+// Returns -1 on any fatal error (missing ASM, uncorrectable Golay AND
+// no RS fallback, no candidate satisfying RS+HMAC, invalid args).
 ssize_t ax100_unframe(const uint8_t *bytes, size_t n_bytes,
                       const ax100_opts_t *opts,
                       uint8_t *out_packet, size_t out_packet_cap,
                       int *out_golay_errors,
-                      int *out_hmac_ok);
+                      int *out_hmac_ok,
+                      int *out_rs_errors,
+                      int *out_used_golay_len);
 
 #endif // AX100_H

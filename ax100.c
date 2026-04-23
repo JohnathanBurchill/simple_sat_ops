@@ -20,9 +20,9 @@
 
 #include "ax100.h"
 #include "golay24.h"
+#include "rs.h"
 
 #include <string.h>
-#include "golay24.h"
 
 #include <openssl/evp.h>
 
@@ -72,6 +72,7 @@ void ax100_opts_defaults(ax100_opts_t *opts)
     opts->hmac_key = NULL;
     opts->hmac_key_len = 0;
     opts->randomize = 1;
+    opts->reed_solomon = 0;
     opts->len_field = 1;
     opts->syncword = 1;
     opts->prefill = 32;
@@ -153,15 +154,26 @@ ssize_t ax100_frame(const uint8_t *packet, size_t packet_len,
     }
 
     // Assemble the "x" buffer (matches pycsplink.AX100.encode's x variable)
-    // = packet || optional HMAC trailer, optionally scrambled.
-    // 12-bit Golay length field caps inner_len at 4095, so packet_len
-    // must leave room for the 4-byte HMAC trailer.
+    // = packet || optional HMAC trailer || optional 32-byte RS parity,
+    // optionally scrambled afterward.
+    // 12-bit Golay length field caps inner_len at 4095; RS-shortened code
+    // caps inner_len at 255; we respect both.
     uint8_t inner[4100];
     size_t inner_len = 0;
 
     size_t needed = packet_len + (opts->hmac_key != NULL ? 4 : 0);
-    if (needed > sizeof(inner) || needed > 0x0FFFu) {
-        return -1;
+    if (opts->reed_solomon) {
+        // pycsplink.AX100.encode truncates pre-RS input to 223 silently.
+        // We refuse instead — C callers should see the error rather than
+        // unknowingly lose bytes.
+        if (needed > RS_K) return -1;
+        // Final on-wire size will be `needed + 32`; RS-shortened codes
+        // never exceed 255 and the 12-bit Golay field covers that.
+        if (needed + RS_NROOTS > sizeof(inner)) return -1;
+    } else {
+        if (needed > sizeof(inner) || needed > 0x0FFFu) {
+            return -1;
+        }
     }
     memcpy(inner, packet, packet_len);
     inner_len = packet_len;
@@ -174,6 +186,18 @@ ssize_t ax100_frame(const uint8_t *packet, size_t packet_len,
         }
         memcpy(inner + inner_len, mac, 4);
         inner_len += 4;
+    }
+
+    // Reed-Solomon encode (post-HMAC/CRC, pre-scrambler). pycsp semantics:
+    // left-zero-pad to 223, rs_encode to 255, strip the leading padding.
+    // Result is (inner_len + 32) bytes — the 32-byte parity is always
+    // appended regardless of input length.
+    if (opts->reed_solomon) {
+        uint8_t rs_out[RS_N];
+        ssize_t rs_len = rs_pycsp_encode(inner, inner_len, rs_out, sizeof rs_out);
+        if (rs_len < 0) return -1;
+        memcpy(inner, rs_out, (size_t)rs_len);
+        inner_len = (size_t)rs_len;
     }
 
     // CCSDS scrambler: XOR each byte with the table, wrapping the table.
@@ -230,15 +254,79 @@ ssize_t ax100_frame(const uint8_t *packet, size_t packet_len,
     return (ssize_t)(p - out_buf);
 }
 
+// Try one length hypothesis. `scrambled` points at the first byte after
+// the Golay header. `on_wire_len` is how many scrambled bytes we'll eat.
+// Writes recovered CSP packet to out_packet on full success (RS + HMAC).
+// Returns:
+//   >= 0: packet length, hmac_ok accurately set (if HMAC requested).
+//   -1  : reject (descramble ok, but RS uncorrectable, or HMAC mismatch,
+//         or buffer overflow, or insufficient bytes).
+static ssize_t ax100_try_length(const uint8_t *scrambled, size_t on_wire_len,
+                                const ax100_opts_t *opts,
+                                uint8_t *out_packet, size_t out_packet_cap,
+                                int *out_hmac_ok,
+                                int *out_rs_errors)
+{
+    // Scratch large enough for either RS-off (up to 4095 post-scramble,
+    // which is impossible on-wire but tolerate here) or RS-on (<=255).
+    uint8_t inner[4100];
+    if (on_wire_len > sizeof(inner)) return -1;
+
+    memcpy(inner, scrambled, on_wire_len);
+    if (opts->randomize) {
+        for (size_t i = 0; i < on_wire_len; ++i) {
+            inner[i] ^= CCSDS_SCRAMBLER_TABLE[i % sizeof(CCSDS_SCRAMBLER_TABLE)];
+        }
+    }
+
+    size_t data_len = on_wire_len;
+    if (opts->reed_solomon) {
+        if (on_wire_len <= RS_NROOTS || on_wire_len > RS_N) return -1;
+        uint8_t decoded[RS_K];
+        int rs_errs = 0;
+        ssize_t rc = rs_pycsp_decode(inner, on_wire_len,
+                                     decoded, sizeof decoded, &rs_errs);
+        if (rc < 0) {
+            if (out_rs_errors) *out_rs_errors = -1;
+            return -1;
+        }
+        if (out_rs_errors) *out_rs_errors = rs_errs;
+        memcpy(inner, decoded, (size_t)rc);
+        data_len = (size_t)rc;
+    }
+
+    size_t packet_len = data_len;
+    if (opts->hmac_key != NULL) {
+        if (data_len < 4) return -1;
+        uint8_t expected[4];
+        if (ax100_hmac(opts->hmac_key, opts->hmac_key_len,
+                       inner, data_len - 4, expected) != 0) {
+            return -1;
+        }
+        int match = (memcmp(expected, inner + data_len - 4, 4) == 0);
+        if (out_hmac_ok) *out_hmac_ok = match ? 1 : 0;
+        if (!match) return -1;
+        packet_len = data_len - 4;
+    }
+
+    if (packet_len > out_packet_cap) return -1;
+    memcpy(out_packet, inner, packet_len);
+    return (ssize_t)packet_len;
+}
+
 ssize_t ax100_unframe(const uint8_t *bytes, size_t n_bytes,
                       const ax100_opts_t *opts,
                       uint8_t *out_packet, size_t out_packet_cap,
                       int *out_golay_errors,
-                      int *out_hmac_ok)
+                      int *out_hmac_ok,
+                      int *out_rs_errors,
+                      int *out_used_golay_len)
 {
     if (bytes == NULL || opts == NULL || out_packet == NULL) return -1;
     if (out_hmac_ok) *out_hmac_ok = -1;
     if (out_golay_errors) *out_golay_errors = 0;
+    if (out_rs_errors) *out_rs_errors = -1;
+    if (out_used_golay_len) *out_used_golay_len = -1;
 
     size_t off = 0;
 
@@ -251,7 +339,11 @@ ssize_t ax100_unframe(const uint8_t *bytes, size_t n_bytes,
         off += 4;
     }
 
-    size_t inner_len = 0;
+    // Decode the Golay length header (if present). If Golay reports an
+    // uncorrectable header, we don't abort outright when RS+HMAC are on —
+    // the brute-force length search below can still recover.
+    size_t golay_len = 0;
+    int golay_ok = 0;
     if (opts->len_field) {
         if (n_bytes - off < 3) return -1;
         uint32_t g = ((uint32_t)bytes[off    ] << 16)
@@ -260,43 +352,65 @@ ssize_t ax100_unframe(const uint8_t *bytes, size_t n_bytes,
         off += 3;
         uint16_t decoded = 0;
         int errs = 0;
-        if (golay24_decode(g, &decoded, &errs) != 0) {
-            if (out_golay_errors) *out_golay_errors = errs;
-            return -1;
-        }
+        int rc = golay24_decode(g, &decoded, &errs);
         if (out_golay_errors) *out_golay_errors = errs;
-        inner_len = (size_t)decoded;
+        if (rc == 0) {
+            golay_len = (size_t)decoded;
+            golay_ok = 1;
+        }
     } else {
-        // No length field — use whatever bytes remain. (Not a supported
-        // wire format in this codebase; included for symmetry with encoder.)
-        inner_len = n_bytes - off;
+        // No length field — caller is saying "all remaining bytes belong
+        // to the payload". Fall through with golay_ok=0 so we try
+        // n_bytes-off as the length.
+        golay_len = n_bytes - off;
+        golay_ok = 1;
     }
 
-    if (inner_len > n_bytes - off) return -1;
-    if (inner_len > out_packet_cap + 4u) return -1;
+    size_t avail = n_bytes - off;
+    const uint8_t *scrambled = bytes + off;
 
-    // Copy inner (scrambled + optional HMAC trailer) into out_packet staging.
-    memcpy(out_packet, bytes + off, inner_len);
+    int can_validate_hmac = (opts->hmac_key != NULL);
 
-    if (opts->randomize) {
-        for (size_t i = 0; i < inner_len; ++i) {
-            out_packet[i] ^= CCSDS_SCRAMBLER_TABLE[i % sizeof(CCSDS_SCRAMBLER_TABLE)];
+    // First attempt: the Golay-decoded length, if sensible.
+    if (golay_ok && golay_len > 0 && golay_len <= avail) {
+        int hmac_tmp = -1, rs_tmp = -1;
+        ssize_t r = ax100_try_length(scrambled, golay_len, opts,
+                                     out_packet, out_packet_cap,
+                                     &hmac_tmp, &rs_tmp);
+        if (r >= 0) {
+            if (out_hmac_ok) *out_hmac_ok = hmac_tmp;
+            if (out_rs_errors) *out_rs_errors = rs_tmp;
+            if (out_used_golay_len) *out_used_golay_len = 1;
+            return r;
+        }
+        // Keep the HMAC / RS diagnostics from the first try in case we
+        // fall out below without a brute-force retry.
+        if (out_hmac_ok && hmac_tmp != -1) *out_hmac_ok = hmac_tmp;
+        if (out_rs_errors && rs_tmp != -1) *out_rs_errors = rs_tmp;
+    }
+
+    // Brute-force fallback: when RS+HMAC are BOTH on, scan every plausible
+    // on-wire length [RS_NROOTS+1, min(RS_N, avail)] and accept the first
+    // that RS-decodes AND HMAC-validates. This rescues frames where the
+    // Golay length header took >3 bit errors and misdecoded. Without HMAC
+    // we have no way to distinguish a false RS match, so we skip this path.
+    if (opts->reed_solomon && can_validate_hmac) {
+        size_t lo = RS_NROOTS + 1;
+        size_t hi = avail < RS_N ? avail : RS_N;
+        for (size_t L = lo; L <= hi; ++L) {
+            if (golay_ok && L == golay_len) continue;  // already tried
+            int hmac_tmp = -1, rs_tmp = -1;
+            ssize_t r = ax100_try_length(scrambled, L, opts,
+                                         out_packet, out_packet_cap,
+                                         &hmac_tmp, &rs_tmp);
+            if (r >= 0) {
+                if (out_hmac_ok) *out_hmac_ok = hmac_tmp;
+                if (out_rs_errors) *out_rs_errors = rs_tmp;
+                if (out_used_golay_len) *out_used_golay_len = 0;
+                return r;
+            }
         }
     }
 
-    size_t packet_len = inner_len;
-    if (opts->hmac_key != NULL) {
-        if (inner_len < 4) return -1;
-        uint8_t expected[4];
-        if (ax100_hmac(opts->hmac_key, opts->hmac_key_len,
-                       out_packet, inner_len - 4, expected) != 0) {
-            return -1;
-        }
-        int match = (memcmp(expected, out_packet + inner_len - 4, 4) == 0);
-        if (out_hmac_ok) *out_hmac_ok = match ? 1 : 0;
-        packet_len = inner_len - 4;
-    }
-
-    if (packet_len > out_packet_cap) return -1;
-    return (ssize_t)packet_len;
+    return -1;
 }

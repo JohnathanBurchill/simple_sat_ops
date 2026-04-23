@@ -199,9 +199,13 @@ static void usage(FILE *out, const char *argv0)
         "  --sport=<0..63>             source port (4)\n"
         "  --prio=<0..3>               priority, 2=norm (2)\n"
         "\n"
-        "HMAC:\n"
+        "HMAC / FEC:\n"
         "  --keyfile=<path>            HMAC keyfile (default: $HOME/%s)\n"
         "  --no-hmac                   Skip HMAC (invalid for live ops; test-only)\n"
+        "  --reed-solomon              RS(255,223) encode (DEFAULT for uplink,\n"
+        "                              matches pycsplink). Adds 32 parity bytes;\n"
+        "                              receiver gets up to 16 byte-errors of FEC.\n"
+        "  --no-reed-solomon           Disable RS encode (smaller frame, no FEC).\n"
         "\n"
         "Radio (CI-V for PTT):\n"
         "  --radio-device=<path>       CI-V tty (default /dev/ttyUSB1)\n"
@@ -249,6 +253,7 @@ int main(int argc, char **argv)
     double freq_hz = FRONTIERSAT_CARRIER_HZ;
     speed_t radio_speed = B115200;
     int use_hmac = 1;
+    int use_rs = 1;  // default ON to match pycsplink uplink
     int dry_run = 0;
     int pre_ms = 200;
     int post_ms = 200;
@@ -272,6 +277,8 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--payload-ascii="))    payload_ascii = a + 16;
         else if (starts_with(a, "--keyfile="))          keyfile_path  = a + 10;
         else if (strcmp(a, "--no-hmac") == 0)           use_hmac = 0;
+        else if (strcmp(a, "--reed-solomon") == 0)      use_rs = 1;
+        else if (strcmp(a, "--no-reed-solomon") == 0)   use_rs = 0;
         else if (starts_with(a, "--src="))     csp_hdr.src   = (uint8_t)atoi(a + 6);
         else if (starts_with(a, "--dst="))     csp_hdr.dst   = (uint8_t)atoi(a + 6);
         else if (starts_with(a, "--dport="))   csp_hdr.dport = (uint8_t)atoi(a + 8);
@@ -375,6 +382,7 @@ int main(int argc, char **argv)
         opts.hmac_key = hmac_key;
         opts.hmac_key_len = (size_t)hmac_key_len;
     }
+    opts.reed_solomon = use_rs;
     uint8_t frame[4200];
     ssize_t frame_len = ax100_frame(csp_packet, (size_t)csp_len, &opts, frame, sizeof(frame));
     if (frame_len < 0) { fprintf(stderr, "ax100_frame failed\n"); return 1; }
