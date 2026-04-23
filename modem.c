@@ -205,24 +205,27 @@ int pcm16_write_wav(const char *path,
 #define ASM_BIG_ENDIAN_U32  0x930B51DEu
 
 // Given a bit stream (MSB-first), find the offset in bits at which the
-// 32-bit pattern `needle` first matches within `max_ham` bit errors.
-// Returns the bit offset, or (size_t)-1 if not found.
+// 32-bit pattern `needle` matches within `max_ham` bit errors, starting
+// the search at or past `min_offset`. Returns the bit offset of the
+// first match, or (size_t)-1 if not found.
 static size_t find_u32_pattern(const uint8_t *bits, size_t n_bits,
-                               uint32_t needle, int max_ham)
+                               uint32_t needle, int max_ham,
+                               size_t min_offset)
 {
     if (n_bits < 32) return (size_t)-1;
+    size_t start = min_offset;
+    if (start > n_bits - 32) return (size_t)-1;
     uint32_t window = 0;
-    // Pre-load first 32 bits.
-    for (int i = 0; i < 32; ++i) {
-        window = (window << 1) | (bits[i] & 1u);
+    for (size_t i = 0; i < 32; ++i) {
+        window = (window << 1) | (bits[start + i] & 1u);
     }
     if ((int)__builtin_popcount(window ^ needle) <= max_ham) {
-        return 0;
+        return start;
     }
-    for (size_t i = 32; i < n_bits; ++i) {
-        window = (window << 1) | (bits[i] & 1u);
+    for (size_t i = 32; i < n_bits - start; ++i) {
+        window = (window << 1) | (bits[start + i] & 1u);
         if ((int)__builtin_popcount(window ^ needle) <= max_ham) {
-            return i - 31;
+            return start + i - 31;
         }
     }
     return (size_t)-1;
@@ -232,6 +235,7 @@ int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
                         const modem_params_t *p,
                         int invert_polarity,
                         int sync_max_ham,
+                        size_t min_bit_offset,
                         uint8_t *out_bits, size_t *n_bits_out,
                         size_t *sync_bit_offset,
                         int *polarity_used)
@@ -300,7 +304,8 @@ int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
                 tmp_bits[n_bits++] = (uint8_t)bit;
             }
             size_t off = find_u32_pattern(tmp_bits, n_bits,
-                                          ASM_BIG_ENDIAN_U32, sync_max_ham);
+                                          ASM_BIG_ENDIAN_U32, sync_max_ham,
+                                          min_bit_offset);
             if (off != (size_t)-1) {
                 size_t copy_bits = n_bits - off;
                 memcpy(out_bits, tmp_bits + off, copy_bits);

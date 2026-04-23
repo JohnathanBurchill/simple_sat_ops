@@ -72,6 +72,10 @@ int pcm16_write_wav(const char *path,
 // Both are always tried; this just changes the order.
 // sync_max_ham: 0 = strict match, 1..8 = tolerate up to that many errors
 // in the 32-bit ASM.
+// min_bit_offset: only consider sync matches at this phase-relative bit
+// index or later. Set to 0 for "find first match anywhere"; bump it
+// past a previously-tried position to look for the next candidate
+// (used for multi-hypothesis HMAC validation in rx_decode).
 //
 // out_bits: caller-allocated, at least (n_samples/sps - sync_offset) bits.
 // *n_bits_out: on success, number of bits written.
@@ -85,6 +89,7 @@ int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
                         const modem_params_t *p,
                         int invert_polarity,
                         int sync_max_ham,
+                        size_t min_bit_offset,
                         uint8_t *out_bits, size_t *n_bits_out,
                         size_t *sync_bit_offset,
                         int *polarity_used);

@@ -153,7 +153,12 @@ static void usage(FILE *out, const char *argv0)
         "  --invert                   Try inverted polarity first (both are\n"
         "                             always tried; this just reorders)\n"
         "  --sync-threshold=<0..8>    Max bit errors in the 32-bit ASM match\n"
-        "                             (default 0 = strict)\n"
+        "                             (default 0 = strict; relax to 4-6 for\n"
+        "                             real-RF captures where the sync word\n"
+        "                             gets ~5 bit errors from ISI). When HMAC\n"
+        "                             is enabled, rx_decode iterates through\n"
+        "                             successive sync candidates until one\n"
+        "                             HMAC-validates, so relaxing this is safe.\n"
         "\n"
         "Output:\n"
         "  -v                         Verbose: pipeline-stage diagnostics\n"
@@ -271,16 +276,188 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // Load HMAC key now so we can use HMAC as a validation gate against
+    // false-positive sync matches.
+    uint8_t hmac_key[128];
+    ssize_t hmac_key_len = 0;
+    if (use_hmac) {
+        char default_path[512];
+        const char *path = keyfile_path;
+        if (path == NULL) {
+            if (hmac_keyfile_default_path(default_path, sizeof(default_path)) != 0) {
+                fprintf(stderr, "rx_decode: HOME is unset; pass --keyfile=<path>\n");
+                free(bits);
+                free(samples);
+                return 1;
+            }
+            path = default_path;
+        }
+        hmac_key_len = hmac_keyfile_load(path, hmac_key, sizeof(hmac_key));
+        if (hmac_key_len < 0) {
+            free(bits);
+            free(samples);
+            return 1;
+        }
+    }
+
+    ax100_opts_t opts;
+    ax100_opts_defaults(&opts);
+    if (use_hmac) {
+        opts.hmac_key = hmac_key;
+        opts.hmac_key_len = (size_t)hmac_key_len;
+    }
+
+    // Preamble-anchored sync search: find the longest alternating run in
+    // any phase/polarity, then start the sync-word scan just past its end.
+    // The actual AX100 ASM is ALWAYS at (prefill * 8) bits after the
+    // preamble starts, so anchoring the search there massively reduces
+    // false positives compared to the full-file scan. We still do the
+    // full scan as a fallback after exhausting preamble-anchored attempts.
+    //
+    // Must use the same DC-block as modem_pcm16_to_bits so the bit
+    // streams align — otherwise altrun positions are off-grid.
+    int sps_int = mp.samp_rate / mp.bit_rate;
+    size_t best_altrun_len = 0;
+    size_t best_altrun_start = 0;
+    float *dc_blocked = (float *)malloc(n_samples * sizeof(float));
+    uint8_t *pb_scratch = (uint8_t *)malloc(n_samples / (size_t)sps_int);
+    if (dc_blocked != NULL && pb_scratch != NULL) {
+        const float alpha = 0.995f;
+        float prev_x = 0.0f, prev_y = 0.0f;
+        for (size_t i = 0; i < n_samples; ++i) {
+            float x = (float)samples[i];
+            float y = x - prev_x + alpha * prev_y;
+            dc_blocked[i] = y;
+            prev_x = x; prev_y = y;
+        }
+        for (int pol = 0; pol < 2; ++pol) {
+            for (int phase = 0; phase < sps_int; ++phase) {
+                size_t mid = (size_t)phase + (size_t)sps_int / 2u;
+                size_t nb = 0;
+                for (size_t i = mid; i < n_samples; i += (size_t)sps_int) {
+                    int v = (dc_blocked[i] > 0.0f) ? 1 : 0;
+                    if (pol) v = !v;
+                    pb_scratch[nb++] = (uint8_t)v;
+                }
+                size_t cur = 1, cur_start = 0, run_best = 1, run_start = 0;
+                for (size_t i = 1; i < nb; ++i) {
+                    if (pb_scratch[i] != pb_scratch[i-1]) { ++cur; }
+                    else {
+                        if (cur > run_best) { run_best = cur; run_start = cur_start; }
+                        cur = 1; cur_start = i;
+                    }
+                }
+                if (cur > run_best) { run_best = cur; run_start = cur_start; }
+                if (run_best > best_altrun_len) {
+                    best_altrun_len = run_best;
+                    best_altrun_start = run_start;
+                }
+            }
+        }
+    }
+    free(dc_blocked);
+    free(pb_scratch);
+    // Preamble ASM starts right at the end of the alt-run. We anchor
+    // sync_search at one bit before that (to allow a single edge slip).
+    int preamble_found = (best_altrun_len >= 64);  // 8 bytes of 0xAA = 64 bits
+    size_t preamble_anchor = preamble_found
+        ? best_altrun_start + best_altrun_len
+        : 0;
+    if (verbose && preamble_found) {
+        fprintf(stderr, "rx_decode: preamble detected (altrun=%zu bits), "
+                "anchoring sync scan at phase-bit %zu\n",
+                best_altrun_len, preamble_anchor);
+    }
+
+    // Multi-hypothesis sync: find the Nth sync match, try to decode;
+    // if HMAC fails (and HMAC is enabled as a gate), advance past it
+    // and try again. Without this gate, the first random 32-bit
+    // noise match in a ~10 s RX file gets accepted and produces
+    // garbage payload + golay length.
     size_t n_bits = 0;
     size_t sync_off = 0;
     int polarity_used = -1;
-    int rc = modem_pcm16_to_bits(samples, n_samples, &mp,
-                                 invert, sync_max_ham,
+    size_t min_offset = preamble_anchor > 4 ? preamble_anchor - 4 : 0;
+    int attempts = 0;
+    int decoded = 0;
+    int preamble_fallback_done = 0;
+    uint8_t packet[4100];
+    ssize_t packet_len = -1;
+    int golay_errs = 0, hmac_ok = -1;
+    int rc = 0;
+
+    const int MAX_ATTEMPTS = 256;
+    while (!decoded && attempts < MAX_ATTEMPTS) {
+        rc = modem_pcm16_to_bits(samples, n_samples, &mp,
+                                 invert, sync_max_ham, min_offset,
                                  bits, &n_bits, &sync_off, &polarity_used);
-    if (rc != 0) {
-        fprintf(stderr, "rx_decode: no AX100 sync word (0x930B51DE) found "
-                "(tried both polarities, sync-threshold=%d)\n",
-                sync_max_ham);
+        if (rc != 0) {
+            // No more matches at or past min_offset. If we were anchored
+            // at the preamble and still haven't found a valid frame, fall
+            // back to the full scan from bit 0.
+            if (!preamble_fallback_done && preamble_anchor > 0) {
+                preamble_fallback_done = 1;
+                min_offset = 0;
+                if (verbose) {
+                    fprintf(stderr, "rx_decode: no match past preamble anchor, "
+                            "falling back to full scan from bit 0\n");
+                }
+                continue;
+            }
+            break;
+        }
+        // If we moved past the anchored window without decoding, also
+        // trigger the fallback. The anchor is ~30 bits around preamble_end
+        // but the returned sync_off may drift as we advance min_offset.
+        if (preamble_anchor > 0 && !preamble_fallback_done
+            && sync_off > preamble_anchor + 32) {
+            preamble_fallback_done = 1;
+            min_offset = 0;
+            if (verbose) {
+                fprintf(stderr, "rx_decode: preamble-anchored window exhausted "
+                        "(match drifted to bit %zu), falling back to full scan\n",
+                        sync_off);
+            }
+            continue;
+        }
+        ++attempts;
+        size_t max_bytes = (n_bits + 7) / 8;
+        uint8_t *bytes = (uint8_t *)malloc(max_bytes);
+        if (bytes == NULL) break;
+        size_t n_bytes = modem_bits_to_bytes(bits, n_bits, bytes);
+        packet_len = ax100_unframe(bytes, n_bytes, &opts,
+                                   packet, sizeof(packet),
+                                   &golay_errs, &hmac_ok);
+        free(bytes);
+        if (packet_len < 0) {
+            // Unframing failed outright (golay uncorrectable or length
+            // overruns the buffer). Move past this sync and try next.
+            if (verbose) {
+                fprintf(stderr, "rx_decode: candidate #%d at bit %zu: unframe failed "
+                        "(golay_errs=%d), trying next\n",
+                        attempts, sync_off, golay_errs);
+            }
+            min_offset = sync_off + 1;
+            continue;
+        }
+        // If HMAC is required and failed, this is likely a false match.
+        if (use_hmac && hmac_ok == 0) {
+            if (verbose) {
+                fprintf(stderr, "rx_decode: candidate #%d at bit %zu: HMAC mismatch "
+                        "(%zd-byte packet, golay_errs=%d), trying next\n",
+                        attempts, sync_off, packet_len, golay_errs);
+            }
+            min_offset = sync_off + 1;
+            continue;
+        }
+        decoded = 1;
+    }
+
+    if (!decoded) {
+        fprintf(stderr, "rx_decode: no valid AX100 frame found "
+                "(tried both polarities, sync-threshold=%d, %d candidate(s)%s)\n",
+                sync_max_ham, attempts,
+                use_hmac ? " HMAC-validated" : "");
         if (verbose) {
             // For each phase, scan the full bit stream for:
             //   - longest alternating run (0xAA preamble detector)
@@ -457,68 +634,18 @@ int main(int argc, char **argv)
                 free(pb);
             }
         }
+        free(bits);
         free(samples);
-        free(bits);
         return 1;
     }
-    free(samples);
-    if (verbose) {
-        fprintf(stderr, "rx_decode: ASM at bit offset %zu, %zu bits after ASM, polarity=%s\n",
-                sync_off, n_bits, polarity_used ? "inverted" : "normal");
-    }
-
-    // Pack bits back into bytes for the framer.
-    size_t max_bytes = (n_bits + 7) / 8;
-    uint8_t *bytes = (uint8_t *)malloc(max_bytes);
-    if (bytes == NULL) {
-        fprintf(stderr, "rx_decode: out of memory for %zu bytes\n", max_bytes);
-        free(bits);
-        return 1;
-    }
-    size_t n_bytes = modem_bits_to_bytes(bits, n_bits, bytes);
     free(bits);
-
-    // Load HMAC key if requested.
-    uint8_t hmac_key[128];
-    ssize_t hmac_key_len = 0;
-    if (use_hmac) {
-        char default_path[512];
-        const char *path = keyfile_path;
-        if (path == NULL) {
-            if (hmac_keyfile_default_path(default_path, sizeof(default_path)) != 0) {
-                fprintf(stderr, "rx_decode: HOME is unset; pass --keyfile=<path>\n");
-                free(bytes);
-                return 1;
-            }
-            path = default_path;
-        }
-        hmac_key_len = hmac_keyfile_load(path, hmac_key, sizeof(hmac_key));
-        if (hmac_key_len < 0) {
-            free(bytes);
-            return 1;
-        }
-    }
-
-    ax100_opts_t opts;
-    ax100_opts_defaults(&opts);
-    if (use_hmac) {
-        opts.hmac_key = hmac_key;
-        opts.hmac_key_len = (size_t)hmac_key_len;
-    }
-
-    uint8_t packet[4100];
-    int golay_errs = 0, hmac_ok = -1;
-    ssize_t packet_len = ax100_unframe(bytes, n_bytes, &opts,
-                                       packet, sizeof(packet),
-                                       &golay_errs, &hmac_ok);
-    free(bytes);
-    if (packet_len < 0) {
-        fprintf(stderr, "rx_decode: ax100_unframe failed (golay_errs=%d)\n",
-                golay_errs);
-        return 1;
-    }
+    free(samples);
 
     if (verbose) {
+        fprintf(stderr, "rx_decode: ASM at bit offset %zu, %zu bits after ASM, "
+                "polarity=%s, candidate #%d%s\n",
+                sync_off, n_bits, polarity_used ? "inverted" : "normal",
+                attempts, use_hmac ? " (HMAC-validated)" : "");
         fprintf(stderr, "rx_decode: inner packet %zd bytes, golay errors=%d, hmac=%s\n",
                 packet_len, golay_errs,
                 hmac_ok == 1 ? "ok" : hmac_ok == 0 ? "MISMATCH" : "(not checked)");
