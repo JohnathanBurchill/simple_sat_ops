@@ -420,10 +420,13 @@ int radio_set_usb_mod_level(radio_t *radio, int level_0_to_255)
     return radio_command(radio, 0x1A, 0x05, -1, data, 4, NULL, 0);
 }
 
-// CI-V `14 07 <BCD4>`: TX Monitor Level. Value is a 2-byte packed-BCD
-// 0000..0255 carrying 0..100% of monitor gain. MONI itself is a front-
-// panel toggle (no CI-V on/off), so setting a level only has audible
-// effect once MONI is on. Useful for bringing up --record= loopback.
+// CI-V `14 15 <BCD4>`: Monitor audio (MONI) level. Value is a 2-byte
+// packed-BCD 0000..0255 carrying 0..100% of monitor gain. MONI itself
+// is a front-panel toggle (no CI-V on/off), so setting a level only
+// has audible effect once MONI is on. Useful for bringing up --record=
+// loopback. Subcommand 0x07 (which this used to be) is Inner PBT — the
+// radio returns NG to 14 07 outside SSB, which was the source of the
+// "could not set MONI level (rc=2)" warnings.
 int radio_set_moni_level(radio_t *radio, int level_0_to_255)
 {
     if (level_0_to_255 < 0)   level_0_to_255 = 0;
@@ -433,7 +436,7 @@ int radio_set_moni_level(radio_t *radio, int level_0_to_255)
     uint8_t data[2];
     data[0] = (uint8_t)(((hundreds / 10) << 4) | (hundreds % 10));
     data[1] = (uint8_t)(((ones / 10)     << 4) | (ones     % 10));
-    return radio_command(radio, 0x14, 0x07, -1, data, 2, NULL, 0);
+    return radio_command(radio, 0x14, 0x15, -1, data, 2, NULL, 0);
 }
 
 // Convenience: put the IC-9700 in the full configuration needed for an
