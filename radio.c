@@ -381,8 +381,18 @@ int radio_set_mode(radio_t *radio, int mode, int filter)
 
 // CI-V `1A 06 <on> <filter>`: data-mode flag + filter for the currently
 // selected operating mode. Filter byte must be 0x00 when disabling.
-// On IC-9700 in FM, this is what bypasses pre-emphasis and widens TX audio
-// for 9600 bps packet / G3RUH use.
+// The `filter` argument picks which IF RX bandwidth (FIL1/2/3) is active;
+// it does NOT affect TX audio bandwidth on the IC-9700.
+// What DATA mode actually does on the 9700: bypasses pre-emphasis, mic AGC,
+// and speech compressor so the MOD source (USB in our uplink flow) reaches
+// the FM modulator with a linear amplitude response. It does NOT widen
+// the TX audio passband beyond the voice-band rolloff (~300 Hz–2.9 kHz)
+// that is hardwired into the FM TX chain. This was empirically verified by
+// the 3 kHz rolloff in the TX spectrum during 9600 bps testing — the
+// preamble fundamental at 4.8 kHz gets clobbered. For this rig, 2400 bps
+// (1.2 kHz fundamental) is the practical ceiling through the USB/FM-DATA
+// path. 9600 bps requires a radio with a genuine direct-FSK modulator
+// input (Kenwood TM-D710, TS-2000) or a software-defined radio.
 int radio_set_data_mode(radio_t *radio, int on, int filter)
 {
     uint8_t data[2];
