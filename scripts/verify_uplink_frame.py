@@ -15,19 +15,31 @@ Usage
     # Or point at a different checkout:
     CTS_PATH=/path/to/Working_Python_Files ./scripts/verify_uplink_frame.py
 
-The CRC / XTEA / Reed-Solomon modules referenced by pycsp/pycsplink at
-import time are stubbed below because we don't exercise them in this
-test. If you ever enable CRC, RS, or XTEA, install the real modules
-(`pip install crc xtea reed-solomon-ccsds` or equivalent) and drop the
-stub block.
+Reed-Solomon is on by default (matches pycsplink uplink and our
+uplink_test default). Install with:
+
+    pip install reed-solomon-ccsds crc xtea
+
+Pass --no-rs if you want to compare against a frame built without RS.
+CRC and XTEA are still stubbed because we don't exercise them here.
 """
+import argparse
 import os
 import sys
 import types
 
-for dep in ("xtea", "crc", "reed_solomon_ccsds"):
+for dep in ("xtea", "crc"):
     if dep not in sys.modules:
         sys.modules[dep] = types.ModuleType(dep)
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--payload", default="ping",
+                help="ASCII payload (default: ping)")
+ap.add_argument("--no-rs", action="store_true",
+                help="Disable Reed-Solomon (match uplink_test --no-reed-solomon)")
+ap.add_argument("--no-hmac", action="store_true",
+                help="Disable HMAC (match uplink_test --no-hmac)")
+args = ap.parse_args()
 
 CTS_PATH = os.environ.get(
     "CTS_PATH",
@@ -46,16 +58,15 @@ import pycsplink as csplink    # noqa: E402
 
 # Test vector — must match uplink_test CLI invocation exactly.
 HMAC_KEY_HEX = "00112233445566778899AABBCCDDEEFF"
-PAYLOAD = b"ping"
 CSP_ARGS = dict(src=1, dst=2, dport=3, sport=4, prio="norm")
 
 pkt = csp.Packet(**CSP_ARGS, crc_endian=None)
-pkt.payload = PAYLOAD
+pkt.payload = args.payload.encode("ascii")
 
 uplink = csplink.AX100(
-    hmac_key=bytes.fromhex(HMAC_KEY_HEX),
+    hmac_key=None if args.no_hmac else bytes.fromhex(HMAC_KEY_HEX),
     crc=False,
-    reed_solomon=False,
+    reed_solomon=not args.no_rs,
     randomize=True,
     len_field=True,
     syncword=True,

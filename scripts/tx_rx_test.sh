@@ -12,6 +12,10 @@
 #                         [--moni-level=<0..100>]
 #                         [--bit-rate=<bps>]   (passed to tx_frame and
 #                                              rx_decode; must divide 48000)
+#                         [--no-reed-solomon]  (match pycsplink downlink
+#                                              or legacy non-RS frames —
+#                                              default is RS on, matching
+#                                              pycsplink uplink)
 #                         [--play]
 #
 # Prerequisites on Mac (local):   ssh, scp, ffmpeg, ffplay
@@ -38,6 +42,7 @@ UPLINK_MOD_LEVEL=50
 MONI_LEVEL=80
 BIT_RATE=9600
 PLAY=0
+RS_FLAG=""
 
 for arg in "$@"; do
     case "$arg" in
@@ -48,6 +53,8 @@ for arg in "$@"; do
         --uplink-mod-level=*)  UPLINK_MOD_LEVEL="${arg#*=}" ;;
         --moni-level=*)        MONI_LEVEL="${arg#*=}" ;;
         --bit-rate=*)          BIT_RATE="${arg#*=}" ;;
+        --no-reed-solomon)     RS_FLAG="--no-reed-solomon" ;;
+        --reed-solomon)        RS_FLAG="--reed-solomon" ;;
         --play)                PLAY=1 ;;
         --help|-h)
             sed -n '3,20p' "$0"
@@ -88,7 +95,7 @@ timeout $DURATION rtl_fm -M fm -f 436150000 -s 48000 -g 40 -p 0 "\$RTL_FILE" >/d
 RTL_PID=\$!
 sleep 1
 echo ">> running tx_frame (bit-rate=$BIT_RATE)" >&2
-tx_frame --payload-ascii='$PAYLOAD' --bit-rate=$BIT_RATE --uplink-mod-level=$UPLINK_MOD_LEVEL --moni-level=$MONI_LEVEL
+tx_frame --payload-ascii='$PAYLOAD' --bit-rate=$BIT_RATE --uplink-mod-level=$UPLINK_MOD_LEVEL --moni-level=$MONI_LEVEL $RS_FLAG
 wait \$RTL_PID 2>/dev/null || true
 # Newest tx_frame and rtl recordings:
 TX_FILE=\$(ls -t tx_frame_UT=*.raw | head -n1)
@@ -119,7 +126,7 @@ process_one() {
     ffmpeg -y -loglevel error -f s16le -ar 48000 -ac "$channels" -i "$raw" \
         -lavfi "showspectrumpic=s=1600x300:scale=log" "${base}_spec.png"
     echo ">> rx_decode ${raw} (bit-rate=$BIT_RATE)"
-    if ssh "$REMOTE" "export PATH=\$HOME/bin:\$PATH && cd $REMOTE_DIR && rx_decode --raw --bit-rate=$BIT_RATE -v '$raw'" \
+    if ssh "$REMOTE" "export PATH=\$HOME/bin:\$PATH && cd $REMOTE_DIR && rx_decode --raw --bit-rate=$BIT_RATE $RS_FLAG -v '$raw'" \
         > "${base}_decode.txt" 2>&1
     then
         echo "   decode OK (see ${base}_decode.txt)"
