@@ -10,6 +10,8 @@
 #                         [--remote-dir=<dir>] [--duration=<sec>]
 #                         [--uplink-mod-level=<0..100>]
 #                         [--moni-level=<0..100>]
+#                         [--bit-rate=<bps>]   (passed to tx_frame and
+#                                              rx_decode; must divide 48000)
 #                         [--play]
 #
 # Prerequisites on Mac (local):   ssh, scp, ffmpeg, ffplay
@@ -34,6 +36,7 @@ REMOTE_DIR="rxtest"
 DURATION=10
 UPLINK_MOD_LEVEL=50
 MONI_LEVEL=80
+BIT_RATE=9600
 PLAY=0
 
 for arg in "$@"; do
@@ -44,6 +47,7 @@ for arg in "$@"; do
         --duration=*)          DURATION="${arg#*=}" ;;
         --uplink-mod-level=*)  UPLINK_MOD_LEVEL="${arg#*=}" ;;
         --moni-level=*)        MONI_LEVEL="${arg#*=}" ;;
+        --bit-rate=*)          BIT_RATE="${arg#*=}" ;;
         --play)                PLAY=1 ;;
         --help|-h)
             sed -n '3,20p' "$0"
@@ -83,8 +87,8 @@ RTL_FILE="rtl_UT=\$(date -u '+%Y%m%dT%H%M%S').raw"
 timeout $DURATION rtl_fm -M fm -f 436150000 -s 48000 -g 40 -p 0 "\$RTL_FILE" >/dev/null 2>&1 &
 RTL_PID=\$!
 sleep 1
-echo ">> running tx_frame" >&2
-tx_frame --payload-ascii='$PAYLOAD' --uplink-mod-level=$UPLINK_MOD_LEVEL --moni-level=$MONI_LEVEL
+echo ">> running tx_frame (bit-rate=$BIT_RATE)" >&2
+tx_frame --payload-ascii='$PAYLOAD' --bit-rate=$BIT_RATE --uplink-mod-level=$UPLINK_MOD_LEVEL --moni-level=$MONI_LEVEL
 wait \$RTL_PID 2>/dev/null || true
 # Newest tx_frame and rtl recordings:
 TX_FILE=\$(ls -t tx_frame_UT=*.raw | head -n1)
@@ -114,8 +118,8 @@ process_one() {
     ffmpeg -y -loglevel error -f s16le -ar 48000 -ac "$channels" -i "$raw" "${base}.wav"
     ffmpeg -y -loglevel error -f s16le -ar 48000 -ac "$channels" -i "$raw" \
         -lavfi "showspectrumpic=s=1600x300:scale=log" "${base}_spec.png"
-    echo ">> rx_decode ${raw}"
-    if ssh "$REMOTE" "export PATH=\$HOME/bin:\$PATH && cd $REMOTE_DIR && rx_decode --raw -v '$raw'" \
+    echo ">> rx_decode ${raw} (bit-rate=$BIT_RATE)"
+    if ssh "$REMOTE" "export PATH=\$HOME/bin:\$PATH && cd $REMOTE_DIR && rx_decode --raw --bit-rate=$BIT_RATE -v '$raw'" \
         > "${base}_decode.txt" 2>&1
     then
         echo "   decode OK (see ${base}_decode.txt)"
