@@ -20,6 +20,7 @@ mkdir -p "$OUTDIR"
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 RAW="${OUTDIR}/rx_${STAMP}.raw"
 WAV="${OUTDIR}/rx_${STAMP}.wav"
+PNG="${OUTDIR}/rx_${STAMP}.png"
 
 echo "rx_record: f=${FREQ} Hz, fs=${SAMP} Hz, gain=${GAIN}, ppm=${PPM}" >&2
 echo "rx_record: writing ${RAW}" >&2
@@ -40,5 +41,11 @@ fi
 ffmpeg -hide_banner -loglevel error -y \
     -f s16le -ar "$SAMP" -ac 1 -i "$RAW" "$WAV"
 
+ffmpeg -hide_banner -loglevel error -y \
+    -i "$WAV" \
+    -lavfi "showspectrumpic=s=1920x1080:mode=combined:color=intensity:legend=1" \
+    "$PNG"
+
 echo "$RAW"
 echo "$WAV"
+echo "$PNG"
