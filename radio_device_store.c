@@ -20,8 +20,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define STORE_RELPATH "/.local/share/simple_sat_ops/radio_device"
-#define MAX_PATH_LEN  1024
+#define STORE_RELPATH       "/.local/share/simple_sat_ops/radio_device"
+#define STORE_SPEED_RELPATH "/.local/share/simple_sat_ops/radio_serial_speed"
+#define MAX_PATH_LEN        1024
 
 int radio_device_store_path(char *out, size_t cap)
 {
@@ -95,6 +96,43 @@ int radio_device_store_save(const char *path)
     FILE *f = fopen(store_path, "w");
     if (f == NULL) return -1;
     int n = fprintf(f, "%s\n", path);
+    int closed = fclose(f);
+    if (n < 0 || closed != 0) return -1;
+    return 0;
+}
+
+static int speed_store_path(char *out, size_t cap)
+{
+    const char *home = getenv("HOME");
+    if (home == NULL || home[0] == '\0') return -1;
+    int n = snprintf(out, cap, "%s%s", home, STORE_SPEED_RELPATH);
+    if (n < 0 || (size_t)n >= cap) return -1;
+    return 0;
+}
+
+int radio_device_store_load_speed(int *out_bps)
+{
+    if (out_bps == NULL) return -2;
+    char path[MAX_PATH_LEN];
+    if (speed_store_path(path, sizeof path) < 0) return -2;
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return (errno == ENOENT) ? -1 : -2;
+    int v = 0;
+    int got = fscanf(f, "%d", &v);
+    fclose(f);
+    if (got != 1 || v <= 0) return -1;
+    *out_bps = v;
+    return 0;
+}
+
+int radio_device_store_save_speed(int bps)
+{
+    char path[MAX_PATH_LEN];
+    if (speed_store_path(path, sizeof path) < 0) return -1;
+    if (mkdir_p_for_file(path) < 0) return -1;
+    FILE *f = fopen(path, "w");
+    if (f == NULL) return -1;
+    int n = fprintf(f, "%d\n", bps);
     int closed = fclose(f);
     if (n < 0 || closed != 0) return -1;
     return 0;

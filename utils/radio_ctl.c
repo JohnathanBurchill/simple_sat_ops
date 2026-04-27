@@ -52,8 +52,14 @@ static void usage(FILE *f)
         "                             above. Prompts before overwriting an\n"
         "                             existing different value.\n"
         "  --radio-type=<id>          yaesu-cat (default) | icom-civ | usrp-b210\n"
-        "  --radio-serial-speed=<bps> Default 38400 for yaesu-cat,\n"
-        "                             115200 for icom-civ. Ignored on USB-CDC.\n"
+        "  --radio-serial-speed=<bps> Override the speed for this run. If\n"
+        "                             omitted, the value at\n"
+        "                             ~/.local/share/simple_sat_ops/radio_serial_speed\n"
+        "                             is loaded; if missing, 4800 (yaesu-cat)\n"
+        "                             or 115200 (icom-civ) is used.\n"
+        "  --store-serial-speed       Persist --radio-serial-speed= as the\n"
+        "                             default above. Same overwrite-prompt\n"
+        "                             behaviour as --store-device.\n"
         "  --freq-hz=<hz>             Override radio_t.nominal_downlink_frequency\n"
         "                             used by 'init' (default %.0f).\n"
         "  --allow-tx                 Required to actually key TX (ptt on).\n"
@@ -113,7 +119,9 @@ static speed_t default_speed_for(radio_backend_type_t t)
 {
     switch (t) {
         case RADIO_BACKEND_ICOM_CIV:  return B115200;
-        case RADIO_BACKEND_YAESU_CAT: return B38400;
+        // FT-991A factory default is 4800 bps. Persisted via
+        // --store-serial-speed once you've changed Menu 031.
+        case RADIO_BACKEND_YAESU_CAT: return B4800;
         default:                      return B115200;
     }
 }
@@ -142,6 +150,7 @@ int main(int argc, char **argv)
     int allow_tx = 0;
     int allow_high_power = 0;
     int store_device = 0;
+    int store_serial_speed = 0;
 
     int i = 1;
     for (; i < argc; ++i) {
@@ -157,6 +166,7 @@ int main(int argc, char **argv)
             backend = t;
         }
         else if (strncmp(a, "--radio-serial-speed=", 21) == 0)   speed_override = atoi(a + 21);
+        else if (strcmp(a, "--store-serial-speed") == 0)         store_serial_speed = 1;
         else if (strncmp(a, "--freq-hz=", 10) == 0)              nominal_hz = atof(a + 10);
         else if (strcmp(a, "--allow-tx") == 0)                   allow_tx = 1;
         else if (strcmp(a, "--allow-high-power") == 0)           allow_high_power = 1;
@@ -220,6 +230,47 @@ int main(int argc, char **argv)
         }
     }
 
+    // Same logic for --store-serial-speed.
+    if (store_serial_speed) {
+        if (speed_override <= 0) {
+            fprintf(stderr, "--store-serial-speed: nothing to store "
+                    "(no --radio-serial-speed= given).\n");
+        } else {
+            int existing = 0;
+            int load_rc = radio_device_store_load_speed(&existing);
+            if (load_rc == -1) {
+                if (radio_device_store_save_speed(speed_override) == 0) {
+                    fprintf(stderr, "radio serial speed default saved: %d\n",
+                            speed_override);
+                } else {
+                    perror("warning: could not save serial speed default");
+                }
+            } else if (load_rc == 0 && existing == speed_override) {
+                // Already stored — silent no-op.
+            } else if (load_rc == 0) {
+                fprintf(stderr, "Overwrite stored radio serial speed %d -> %d? [y,N] ",
+                        existing, speed_override);
+                fflush(stderr);
+                char ans[8] = {0};
+                if (fgets(ans, sizeof ans, stdin) != NULL
+                    && (ans[0] == 'y' || ans[0] == 'Y')) {
+                    if (radio_device_store_save_speed(speed_override) == 0) {
+                        fprintf(stderr, "radio serial speed default updated: %d\n",
+                                speed_override);
+                    } else {
+                        perror("warning: could not save serial speed default");
+                    }
+                } else {
+                    fprintf(stderr, "kept existing default; using new speed for "
+                            "this run only.\n");
+                }
+            } else {
+                fprintf(stderr, "warning: could not read existing speed "
+                        "(rc=%d); not saving.\n", load_rc);
+            }
+        }
+    }
+
     // Resolve the effective device for this run:
     //   --radio-device= wins; else stored default; else /dev/ttyUSB0.
     char effective_device[1024];
@@ -230,15 +281,30 @@ int main(int argc, char **argv)
         snprintf(effective_device, sizeof effective_device, "/dev/ttyUSB0");
     }
 
-    radio_t r = {0};
-    r.device_filename = effective_device;
-    r.serial_speed = (speed_override > 0)
-                     ? speed_from_int(speed_override)
-                     : default_speed_for(backend);
-    if (r.serial_speed == 0) {
-        fprintf(stderr, "unsupported --radio-serial-speed=%d\n", speed_override);
+    // Resolve the effective serial speed for this run:
+    //   --radio-serial-speed= wins; else stored default; else backend default.
+    int effective_speed_int = -1;
+    speed_t effective_speed = 0;
+    if (speed_override > 0) {
+        effective_speed_int = speed_override;
+        effective_speed = speed_from_int(speed_override);
+    } else {
+        int stored = 0;
+        if (radio_device_store_load_speed(&stored) == 0) {
+            effective_speed_int = stored;
+            effective_speed = speed_from_int(stored);
+        } else {
+            effective_speed = default_speed_for(backend);
+        }
+    }
+    if (effective_speed == 0) {
+        fprintf(stderr, "unsupported serial speed %d\n", effective_speed_int);
         return RADIO_ERROR;
     }
+
+    radio_t r = {0};
+    r.device_filename = effective_device;
+    r.serial_speed = effective_speed;
     r.nominal_downlink_frequency = nominal_hz;
     r.tx_inhibit_cleared = allow_tx;
 

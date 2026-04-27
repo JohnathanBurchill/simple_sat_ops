@@ -21,9 +21,21 @@
 // Yaesu FT-991A (CAT ASCII protocol) backend. Targets 9600-bps GFSK uplink
 // via the radio's analog FM modulator with switchable-input chain — the
 // path the IC-9700's FPGA TX filter blocks. CAT commands are short ASCII
-// strings terminated by ';'. The USB-CAT virtual COM port ignores baud,
-// so --radio-serial-speed= is moot for native USB but still honoured if
-// the user wires through an external USB-serial adapter.
+// strings terminated by ';'.
+//
+// FT-991A bring-up checklist (radio side):
+//   Menu 031 CAT RATE = 4800      — must match --radio-serial-speed=.
+//                                   Factory default is 4800; honour what
+//                                   the front panel shows.
+//   Menu 032 CAT TOT  = 10 ms     — CAT timeout. Must be > 0 or the radio
+//                                   silently drops command-line replies.
+//   Menu 079 PKT RATE = 9600      — set by this backend during init();
+//                                   needed for 9600-bps uplink path.
+//
+// The FT-991A's USB bridge (Silicon Labs CP2105) is a dual-port chip;
+// either virtual COM port carries CAT, so first-time bring-up may need
+// trying both /dev/cu.usbserial-XXXa and -XXXb (or /dev/ttyUSB0/1 on
+// Linux). --store-device persists the working one.
 //
 // CAT command reference for the operations we use:
 //

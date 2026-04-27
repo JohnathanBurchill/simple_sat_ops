@@ -35,4 +35,9 @@ int radio_device_store_load(char *out, size_t cap);
 // needed. Returns 0 on success, -1 on error (errno preserved).
 int radio_device_store_save(const char *path);
 
+// Same store directory, sibling file `radio_serial_speed`. Holds a single
+// decimal integer (bps) on a single line.
+int radio_device_store_load_speed(int *out_bps);
+int radio_device_store_save_speed(int bps);
+
 #endif // !RADIO_DEVICE_STORE_H
