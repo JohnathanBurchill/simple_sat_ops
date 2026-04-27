@@ -232,11 +232,16 @@ static int icom_civ_command(radio_t *radio, uint8_t cmd, int16_t subcmd, int16_t
     telemetry[offset++] = 0xFD;
     printcmd("Radio command:", telemetry, offset);
 
-    tcflush(radio->fd, TCIOFLUSH);
+    // TCIFLUSH (input only) — TCIOFLUSH would also drop bytes still
+    // queued for transmission from the prior write, truncating commands
+    // mid-byte at lower baud rates. tcdrain() after write blocks until
+    // the UART has actually emitted everything.
+    tcflush(radio->fd, TCIFLUSH);
     ssize_t bytes_sent = write(radio->fd, telemetry, offset);
     if (bytes_sent != (ssize_t)offset) {
         return RADIO_BAD_RESPONSE;
     }
+    tcdrain(radio->fd);
     radio->result[0] = '\0';
     ssize_t bytes_received = -1;
     int remaining_buffer = RADIO_MAX_COMMAND_RESULT_LEN;

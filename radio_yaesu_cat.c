@@ -124,11 +124,21 @@ static int yaesu_send(radio_t *radio, const char *cmd, char *reply, size_t reply
     }
     yaesu_trace(radio, "CAT command:", cmd, strlen(cmd));
 
-    tcflush(radio->fd, TCIOFLUSH);
-    ssize_t n = write(radio->fd, cmd, strlen(cmd));
-    if (n != (ssize_t)strlen(cmd)) {
+    // Drop any stale bytes the radio sent us (e.g. an unread reply from a
+    // prior command, or auto-info chatter). TCIFLUSH only — TCIOFLUSH
+    // would also discard our pending OUTPUT, truncating commands mid-byte
+    // when the next caller's tcflush fires before the UART has drained.
+    tcflush(radio->fd, TCIFLUSH);
+    size_t cmd_len = strlen(cmd);
+    ssize_t n = write(radio->fd, cmd, cmd_len);
+    if (n != (ssize_t)cmd_len) {
         return RADIO_BAD_RESPONSE;
     }
+    // Block until the bytes have actually left the UART. Without this a
+    // subsequent operation can flush them mid-flight; at 38400 baud a
+    // 12-byte FA<freq>; takes ~3 ms which is well within typical
+    // user-space scheduling jitter.
+    tcdrain(radio->fd);
 
     if (reply == NULL || reply_cap == 0) {
         return RADIO_OK;

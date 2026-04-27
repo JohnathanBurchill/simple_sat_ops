@@ -29,6 +29,7 @@
 #include "radio_device_store.h"
 
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,6 +69,9 @@ static void usage(FILE *f)
         "                             ASCII for the FT-991A's text CAT;\n"
         "                             always hex for the IC-9700's binary\n"
         "                             CI-V).\n"
+        "  --verify                   After set-freq / set-mode / set-power,\n"
+        "                             read the value back and report whether\n"
+        "                             it matches what was requested.\n"
         "  -h, --help                 This message.\n"
         "\n"
         "Commands:\n"
@@ -156,6 +160,7 @@ int main(int argc, char **argv)
     int store_device = 0;
     int store_serial_speed = 0;
     int debug_wire = 0;
+    int verify = 0;
 
     int i = 1;
     for (; i < argc; ++i) {
@@ -176,6 +181,7 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--allow-tx") == 0)                   allow_tx = 1;
         else if (strcmp(a, "--allow-high-power") == 0)           allow_high_power = 1;
         else if (strcmp(a, "--debug-output") == 0)               debug_wire = 1;
+        else if (strcmp(a, "--verify") == 0)                     verify = 1;
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
             usage(stdout);
             return 0;
@@ -340,14 +346,35 @@ int main(int argc, char **argv)
     }
     else if (strcmp(cmd, "set-freq") == 0) {
         if (i >= argc) { fprintf(stderr, "set-freq: missing <hz>\n"); rc = RADIO_ERROR; }
-        else { rc = radio_set_frequency(&r, atof(argv[i])); }
+        else {
+            double want = atof(argv[i]);
+            rc = radio_set_frequency(&r, want);
+            if (rc == RADIO_OK && verify) {
+                double got = radio_get_frequency(&r);
+                if (got < 0) {
+                    fprintf(stderr, "set-freq: verify read failed\n");
+                    rc = RADIO_BAD_RESPONSE;
+                } else if (llround(got) != llround(want)) {
+                    fprintf(stderr, "set-freq: MISMATCH requested=%.0f got=%.0f\n", want, got);
+                    rc = RADIO_BAD_RESPONSE;
+                } else {
+                    fprintf(stderr, "set-freq: verified %.0f\n", got);
+                }
+            }
+        }
     }
     else if (strcmp(cmd, "set-mode") == 0) {
         if (i >= argc) { fprintf(stderr, "set-mode: missing <mode>\n"); rc = RADIO_ERROR; }
         else {
             int m = parse_mode(argv[i]);
             if (m < 0) { fprintf(stderr, "set-mode: unknown '%s'\n", argv[i]); rc = RADIO_ERROR; }
-            else { rc = radio_set_mode(&r, m, RADIO_FILTER_FIL1); }
+            else {
+                rc = radio_set_mode(&r, m, RADIO_FILTER_FIL1);
+                if (rc == RADIO_OK && verify) {
+                    fprintf(stderr, "set-mode: verify not implemented "
+                            "(no portable get-mode op yet)\n");
+                }
+            }
         }
     }
     else if (strcmp(cmd, "set-data-mode") == 0) {
@@ -377,6 +404,10 @@ int main(int argc, char **argv)
         } else {
             int raw = (pct * 255 + 50) / 100;
             rc = radio_set_rf_power(&r, raw);
+            if (rc == RADIO_OK && verify) {
+                fprintf(stderr, "set-power: verify not implemented "
+                        "(no portable get-rf-power op yet)\n");
+            }
         }
     }
     else if (strcmp(cmd, "set-mod-level") == 0) {
