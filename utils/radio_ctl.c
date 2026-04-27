@@ -443,12 +443,13 @@ int main(int argc, char **argv)
         rc = RADIO_ERROR;
     }
 
-    // Best-effort PTT release on the way out — but NOT if the user's
-    // explicit subcommand was 'ptt' (they may have just keyed). Otherwise
-    // an early error mid-script could leave the radio keyed.
-    if (strcmp(cmd, "ptt") != 0) {
-        radio_ptt(&r, 0);
-    }
+    // No unconditional TX0; cleanup. None of the subcommands above can
+    // leave the radio keyed unless 'ptt on' was just run (and that path
+    // is intentionally left keyed for the user's follow-up 'ptt off').
+    // An auto-TX0; here was preempting the previous command in flight —
+    // for example, a set-freq's FA<freq>; would still be processing
+    // inside the radio when TX0; arrived ~3 ms later, causing the freq
+    // change to be silently discarded.
     radio_disconnect(&r);
 
     if (rc != RADIO_OK) {

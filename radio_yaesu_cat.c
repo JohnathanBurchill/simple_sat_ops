@@ -249,6 +249,13 @@ static void yaesu_cat_connect(radio_t *radio)
 static void yaesu_cat_disconnect(radio_t *radio)
 {
     if (radio->connected) {
+        // Give the radio a moment to commit the most-recent fire-and-
+        // forget command (e.g. FA<freq>;) before close() drops DTR and
+        // potentially resets CAT state. tcdrain() has already ensured
+        // the bytes left the UART; this covers the radio's own
+        // microcontroller processing latency. ~80 ms covers the
+        // observed FT-991A worst case with margin.
+        usleep(80 * 1000);
         close(radio->fd);
         radio->connected = 0;
     }
