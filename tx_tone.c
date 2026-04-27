@@ -79,9 +79,17 @@ static void usage(FILE *dest, const char *name, int full)
         "Carrier and tone:\n"
         "  --freq-hz=<hz>               UHF simplex carrier (default %.0f\n"
         "                               = %.6f MHz, FRONTIERSAT_CARRIER_HZ)\n"
-        "  --tone-hz=<hz>               Tone frequency (default 1000)\n"
-        "  --duration-s=<seconds>       Tone duration (default 3.0)\n"
+        "  --tone-hz=<hz>               Tone frequency / step start (default 1000)\n"
+        "  --tone-stop-hz=<hz>          Stepped sweep stop frequency. If set, plays\n"
+        "                               steps from --tone-hz to here in --tone-step-hz\n"
+        "                               increments, --duration-s seconds per step.\n"
+        "  --tone-step-hz=<hz>          Step size for stepped sweep (default 500)\n"
+        "  --duration-s=<seconds>       Tone duration (default 3.0). Per-step when\n"
+        "                               --tone-stop-hz is set.\n"
         "  --amplitude=<0..1>           Amplitude into S16 full-scale (default 0.3)\n"
+        "  --data-mod-source=<src>      DATA MOD source: usb|acc|mic|mic+acc|\n"
+        "                               mic+usb|lan (default usb). Use acc or mic\n"
+        "                               when feeding the 9700 from a SignaLink etc.\n"
         "\n"
         "Behaviour flags:\n"
         "  --no-ptt                     Skip CI-V PTT; play audio only (bench test)\n"
@@ -244,8 +252,11 @@ int main(int argc, char **argv)
     int no_record = 0;
     double freq_hz = FRONTIERSAT_CARRIER_HZ;
     double tone_hz = 1000.0;
+    double tone_stop_hz = -1.0;  // < 0 = single-tone mode
+    double tone_step_hz = 500.0;
     double duration_s = 3.0;
     double amplitude = 0.3;
+    int data_mod_source = -1;  // < 0 = leave whatever radio_uplink_prep set
     int moni_level_pct = -1;  // < 0 = don't touch
     int uplink_mod_level = -1;  // < 0 = don't touch (% 0..100)
     int record_warmup_ms = 600;
@@ -266,6 +277,29 @@ int main(int argc, char **argv)
         } else if (strncmp("--tone-hz=", argv[i], 10) == 0) {
             if (strlen(argv[i]) < 11) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
             tone_hz = atof(argv[i] + 10);
+        } else if (strncmp("--tone-stop-hz=", argv[i], 15) == 0) {
+            if (strlen(argv[i]) < 16) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
+            tone_stop_hz = atof(argv[i] + 15);
+        } else if (strncmp("--tone-step-hz=", argv[i], 15) == 0) {
+            if (strlen(argv[i]) < 16) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
+            tone_step_hz = atof(argv[i] + 15);
+            if (tone_step_hz <= 0) {
+                fprintf(stderr, "--tone-step-hz must be > 0\n");
+                return EXIT_FAILURE;
+            }
+        } else if (strncmp("--data-mod-source=", argv[i], 18) == 0) {
+            if (strlen(argv[i]) < 19) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
+            const char *s = argv[i] + 18;
+            if      (strcmp(s, "mic")     == 0) data_mod_source = RADIO_DATA_MOD_SRC_MIC;
+            else if (strcmp(s, "acc")     == 0) data_mod_source = RADIO_DATA_MOD_SRC_ACC;
+            else if (strcmp(s, "mic+acc") == 0) data_mod_source = RADIO_DATA_MOD_SRC_MIC_ACC;
+            else if (strcmp(s, "usb")     == 0) data_mod_source = RADIO_DATA_MOD_SRC_USB;
+            else if (strcmp(s, "mic+usb") == 0) data_mod_source = RADIO_DATA_MOD_SRC_MIC_USB;
+            else if (strcmp(s, "lan")     == 0) data_mod_source = RADIO_DATA_MOD_SRC_LAN;
+            else {
+                fprintf(stderr, "--data-mod-source: unknown '%s' (mic|acc|mic+acc|usb|mic+usb|lan)\n", s);
+                return EXIT_FAILURE;
+            }
         } else if (strncmp("--duration-s=", argv[i], 13) == 0) {
             if (strlen(argv[i]) < 14) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
             duration_s = atof(argv[i] + 13);
@@ -336,6 +370,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "warning: radio_uplink_prep failed (rc=%d); "
                 "check MODE/DATA/DATA-MOD on the front panel.\n", rc);
     }
+    if (data_mod_source >= 0) {
+        rc = radio_set_data_mod_source(&g_radio, data_mod_source);
+        if (rc != RADIO_OK) {
+            fprintf(stderr, "warning: could not override DATA MOD source (rc=%d)\n", rc);
+        }
+    }
     if (uplink_mod_level >= 0) {
         int raw = (int)((uplink_mod_level * 255 + 50) / 100);
         rc = radio_set_usb_mod_level(&g_radio, raw);
@@ -353,8 +393,14 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "tx_tone: %.6f MHz FM simplex, tone %.1f Hz, %.2f s, amp %.2f, audio %s, ptt %s\n",
-            freq_hz / 1e6, tone_hz, duration_s, amplitude, audio_device, g_no_ptt ? "off" : "on");
+    if (tone_stop_hz > 0) {
+        fprintf(stderr, "tx_tone: %.6f MHz FM simplex, sweep %.1f -> %.1f Hz step %.1f, %.2f s/step, amp %.2f, audio %s, ptt %s\n",
+                freq_hz / 1e6, tone_hz, tone_stop_hz, tone_step_hz, duration_s, amplitude,
+                audio_device, g_no_ptt ? "off" : "on");
+    } else {
+        fprintf(stderr, "tx_tone: %.6f MHz FM simplex, tone %.1f Hz, %.2f s, amp %.2f, audio %s, ptt %s\n",
+                freq_hz / 1e6, tone_hz, duration_s, amplitude, audio_device, g_no_ptt ? "off" : "on");
+    }
 
     // Auto-generate a record path if recording is on and the user didn't
     // pass --record=<path>. Writes tx_tone_UT=YYYYMMDDTHHMMSS.sss.raw in
@@ -401,7 +447,23 @@ int main(int argc, char **argv)
         usleep(100000);
     }
 
-    arc = audio_play_tone(playback, tone_hz, amplitude, duration_s, AUDIO_RATE_HZ, AUDIO_CHANNELS);
+    if (tone_stop_hz > 0) {
+        // Stepped sweep: ascending if stop > start, descending otherwise.
+        // Inclusive of stop frequency (stops once next step would overshoot).
+        double step = (tone_stop_hz >= tone_hz) ? tone_step_hz : -tone_step_hz;
+        double f = tone_hz;
+        arc = AUDIO_OK;
+        while ((step > 0 && f <= tone_stop_hz + 1e-6) ||
+               (step < 0 && f >= tone_stop_hz - 1e-6)) {
+            fprintf(stderr, "tx_tone: step %.1f Hz\n", f);
+            arc = audio_play_tone(playback, f, amplitude, duration_s,
+                                  AUDIO_RATE_HZ, AUDIO_CHANNELS);
+            if (arc != AUDIO_OK) break;
+            f += step;
+        }
+    } else {
+        arc = audio_play_tone(playback, tone_hz, amplitude, duration_s, AUDIO_RATE_HZ, AUDIO_CHANNELS);
+    }
     audio_playback_close(playback);
 
     if (!g_no_ptt) {
