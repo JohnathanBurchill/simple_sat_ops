@@ -65,6 +65,10 @@ static void usage(FILE *f)
         "                             used by 'init' (default %.0f).\n"
         "  --allow-tx                 Required to actually key TX (ptt on).\n"
         "  --allow-high-power         Required for set-power above 10%%.\n"
+        "  --allow-hf-tx              Required to key TX below 100 MHz. Blocks\n"
+        "                             accidental TX into an HF/50 connector\n"
+        "                             when only a VHF/UHF dummy load or\n"
+        "                             antenna is wired up.\n"
         "  --debug-output             Print wire bytes as hex (default is\n"
         "                             ASCII for the FT-991A's text CAT;\n"
         "                             always hex for the IC-9700's binary\n"
@@ -161,6 +165,7 @@ int main(int argc, char **argv)
     int store_serial_speed = 0;
     int debug_wire = 0;
     int verify = 0;
+    int allow_hf_tx = 0;
 
     int i = 1;
     for (; i < argc; ++i) {
@@ -182,6 +187,7 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--allow-high-power") == 0)           allow_high_power = 1;
         else if (strcmp(a, "--debug-output") == 0)               debug_wire = 1;
         else if (strcmp(a, "--verify") == 0)                     verify = 1;
+        else if (strcmp(a, "--allow-hf-tx") == 0)                allow_hf_tx = 1;
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
             usage(stdout);
             return 0;
@@ -434,7 +440,25 @@ int main(int argc, char **argv)
         if (i >= argc) { fprintf(stderr, "ptt: missing <on|off>\n"); rc = RADIO_ERROR; }
         else {
             int on = (strcasecmp(argv[i], "on") == 0 || strcmp(argv[i], "1") == 0);
-            rc = radio_ptt(&r, on);
+            // Before keying, check the radio is on a band that goes to the
+            // V/U connector. The FT-991A's HF/50 connector handles 1.8 MHz
+            // through 50 MHz; anything < 100 MHz routes there. If your
+            // dummy load / antenna is only on V/U, an HF TX into an
+            // unconnected jack is a serious risk to the PA.
+            if (on && !allow_hf_tx) {
+                double f = radio_get_frequency(&r);
+                if (f > 0.0 && f < 100e6) {
+                    fprintf(stderr,
+                            "ptt: refusing — current freq %.6f MHz routes to "
+                            "the HF/50 connector. Add --allow-hf-tx if you "
+                            "really mean it.\n", f / 1e6);
+                    rc = RADIO_ERROR;
+                } else {
+                    rc = radio_ptt(&r, on);
+                }
+            } else {
+                rc = radio_ptt(&r, on);
+            }
         }
     }
     else {
