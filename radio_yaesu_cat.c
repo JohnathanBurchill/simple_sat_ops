@@ -23,20 +23,24 @@
 // path the IC-9700's FPGA TX filter blocks. CAT commands are short ASCII
 // strings terminated by ';'.
 //
-// FT-991A bring-up checklist (radio side):
-//   Menu 031 CAT RATE = 4800      — must match --radio-serial-speed=.
-//                                   Factory default is 4800; honour what
-//                                   the front panel shows.
-//   Menu 032 CAT TOT  = 10 ms     — CAT timeout. Must be > 0 or the radio
-//                                   silently drops command-line replies.
-//   Menu 033 CAT RTS  = DISABLE   — without this the radio waits for the
-//                                   host to assert RTS before transmitting
-//                                   any reply. macOS's CP2105 driver
-//                                   doesn't always raise RTS reliably,
-//                                   so leave RTS off.
-//   9600 RATE menu (number varies — 077 on some firmwares) must be set to
-//   9600 for the GFSK uplink path; not driven here because the menu
-//   number isn't stable across firmware revisions.
+// FT-991A bring-up checklist (radio side). All menu numbers verified
+// against "FT-991A CAT Operation Reference Manual" 1711-D, page 7-8:
+//
+//   Menu 031 CAT RATE  = 4800     P2 0:4800 1:9600 2:19200 3:38400.
+//                                  Must match --radio-serial-speed=.
+//   Menu 032 CAT TOT   = 10 ms    P2 0:10ms 1:100ms 2:1000ms 3:3000ms.
+//                                  Must be >0 ms or replies are dropped.
+//   Menu 033 CAT RTS   = DISABLE  P2 0:DISABLE 1:ENABLE.
+//                                  macOS's CP2105 driver doesn't reliably
+//                                  raise RTS; leave the radio off.
+//   Menu 070 DATA IN   = REAR     0:MIC 1:REAR. Set by set_data_mod_source.
+//   Menu 072 DATA PORT = USB|DATA 1:DATA jack 2:USB. Same.
+//   Menu 079 FM PKT MODE = 9600   P2 0:1200 1:9600. Set on the front panel
+//                                  before any 9600-bps work; not driven
+//                                  here because it only matters when the
+//                                  radio is in FM packet mode (MD04;).
+//                                  Operating mode for our uplink is
+//                                  DATA-FM (MD0A;) which uses Menu 070-072.
 //
 // The FT-991A's USB bridge (Silicon Labs CP2105) is a dual-port chip;
 // either virtual COM port carries CAT, so first-time bring-up may need
@@ -74,13 +78,23 @@
 #include <math.h>
 #include <errno.h>
 
-// FT-991A operating-mode characters (used in MD0<n>;).
+// FT-991A operating-mode characters (used in MD0<n>;), per the
+// FT-991A CAT Operation Reference Manual page 11:
+//   1 LSB   2 USB   3 CW-U   4 FM      5 AM       6 RTTY-LSB
+//   7 CW-L  8 DATA-LSB       9 RTTY-USB
+//   A DATA-FM   B FM-N   C DATA-USB   D AM-N   E C4FM
+//
+// Note 'B' is FM-N (Narrow FM, ~5 kHz channel spacing), NOT DATA-FM.
+// DATA-FM is 'A'. An earlier version of this file had them swapped,
+// which silently put DATA-FM uplinks in narrow-FM with a much smaller
+// modulator passband.
 #define YAESU_MODE_LSB       '1'
 #define YAESU_MODE_USB       '2'
 #define YAESU_MODE_CW        '3'
 #define YAESU_MODE_FM        '4'
 #define YAESU_MODE_AM        '5'
-#define YAESU_MODE_DATA_FM   'B'
+#define YAESU_MODE_DATA_FM   'A'
+#define YAESU_MODE_FM_N      'B'
 #define YAESU_MODE_DATA_USB  'C'
 
 static void yaesu_cat_connect(radio_t *radio);
@@ -159,9 +173,9 @@ static int yaesu_cat_init(radio_t *radio)
     }
     radio->transceiver_id = 0x0670;
 
-    // CAT PTT-off is "RX;". Three bytes — fits comfortably and lets the
-    // SIGINT handler release TX with a single async-signal-safe write().
-    static const uint8_t ptt_off[] = {'R', 'X', ';'};
+    // CAT PTT-off bytes for the SIGINT handler — one async-signal-safe
+    // write() releases TX. "TX0;" matches the documented form on FT-991A.
+    static const uint8_t ptt_off[] = {'T', 'X', '0', ';'};
     memcpy(radio->ptt_off_raw, ptt_off, sizeof ptt_off);
     radio->ptt_off_raw_len = (uint8_t)sizeof ptt_off;
 
@@ -276,40 +290,45 @@ static int yaesu_cat_set_data_mode(radio_t *radio, int on, int filter)
     return yaesu_send(radio, cmd, NULL, 0);
 }
 
-// Menu 076 routes the modulator input. DAKY = USB CODEC (the FT-991A's
-// internal sound card); MIC = front MIC jack. ACC has its own menu (079
-// for level, 116 for selection on some firmwares); not addressed here.
-// The project's source-id enum is IC-9700-shaped, so we collapse:
-//   USB / MIC_USB → DAKY
-//   MIC / MIC_ACC → MIC
-// Anything else logs and treats as USB.
+// FT-991A DATA-mode modulator routing (from the CAT manual menu list,
+// page 8). All EX<menu><value>; values are pure digits.
+//   Menu 070 DATA IN SELECT   : 0=MIC,  1=REAR
+//   Menu 072 DATA PORT SELECT : 1=DATA jack, 2=USB CODEC (only when 070=REAR)
+// We emit both so the routing is unambiguous regardless of any prior
+// front-panel state. Caller's enum is IC-9700-shaped:
+//   USB / MIC_USB → REAR + USB CODEC
+//   ACC           → REAR + DATA jack
+//   MIC / MIC_ACC → MIC (jack on the front of the radio)
 static int yaesu_cat_set_data_mod_source(radio_t *radio, int source)
 {
-    const char *cmd;
+    const char *in_sel = NULL;     // Menu 070
+    const char *port_sel = NULL;   // Menu 072 (only when REAR)
     switch (source) {
         case RADIO_DATA_MOD_SRC_MIC:
         case RADIO_DATA_MOD_SRC_MIC_ACC:
-            cmd = "EX076MIC;";
+            in_sel = "EX0700;";
             break;
         case RADIO_DATA_MOD_SRC_USB:
         case RADIO_DATA_MOD_SRC_MIC_USB:
-            cmd = "EX076DAKY;";
+            in_sel = "EX0701;";
+            port_sel = "EX0722;";
             break;
         case RADIO_DATA_MOD_SRC_ACC:
-            // FT-991A doesn't have ACC-only DATA MOD as a Menu 076 option;
-            // the rear DATA jack is the real "ACC equivalent" and is wired
-            // through Menu 079/116. Fall through to MIC; user will likely
-            // need to select the rear jack manually. Log a hint.
-            fprintf(stderr, "yaesu_cat: ACC-only DATA MOD not directly mappable; "
-                    "set Menu 116 manually for rear DATA jack.\n");
-            cmd = "EX076MIC;";
+            in_sel = "EX0701;";
+            port_sel = "EX0721;";
             break;
         default:
-            fprintf(stderr, "yaesu_cat: DATA MOD source 0x%02X unknown; using DAKY\n", source);
-            cmd = "EX076DAKY;";
+            fprintf(stderr, "yaesu_cat: DATA MOD source 0x%02X unknown; using REAR/USB\n", source);
+            in_sel = "EX0701;";
+            port_sel = "EX0722;";
             break;
     }
-    return yaesu_send(radio, cmd, NULL, 0);
+    int rc = yaesu_send(radio, in_sel, NULL, 0);
+    if (rc != RADIO_OK) return rc;
+    if (port_sel != NULL) {
+        rc = yaesu_send(radio, port_sel, NULL, 0);
+    }
+    return rc;
 }
 
 // Menu 078 = USB MOD level, 0..100. The project passes 0..255; rescale.
@@ -343,7 +362,10 @@ static int yaesu_cat_set_rf_power(radio_t *radio, int level_0_to_255)
 
 static int yaesu_cat_ptt(radio_t *radio, int on)
 {
-    return yaesu_send(radio, on ? "TX1;" : "RX;", NULL, 0);
+    // TX1; = key via CAT (RADIO TX OFF / CAT TX ON in the manual's
+    // wording). TX0; = release. The FT-991A CAT command list does not
+    // include the legacy "RX;" alias, so use TX0; per the manual.
+    return yaesu_send(radio, on ? "TX1;" : "TX0;", NULL, 0);
 }
 
 static const radio_backend_ops_t yaesu_cat_ops = {
