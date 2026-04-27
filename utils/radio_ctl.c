@@ -26,6 +26,7 @@
 
 #include "radio.h"
 #include "radio_backend.h"
+#include "radio_device_store.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -42,9 +43,14 @@ static void usage(FILE *f)
         "usage: %s [global-flags] <command> [args]\n"
         "\n"
         "Global flags:\n"
-        "  --radio-device=<path>      Serial device. Default /dev/ttyUSB0;\n"
-        "                             on macOS pass /dev/cu.usbserial-XXX\n"
-        "                             or /dev/cu.usbmodemXXX explicitly.\n"
+        "  --radio-device=<path>      Serial device. If omitted, the default\n"
+        "                             stored at\n"
+        "                             ~/.local/share/simple_sat_ops/radio_device\n"
+        "                             is loaded; if that's missing too,\n"
+        "                             /dev/ttyUSB0 is used.\n"
+        "  --store-device             Persist --radio-device= as the default\n"
+        "                             above. Prompts before overwriting an\n"
+        "                             existing different value.\n"
         "  --radio-type=<id>          yaesu-cat (default) | icom-civ | usrp-b210\n"
         "  --radio-serial-speed=<bps> Default 38400 for yaesu-cat,\n"
         "                             115200 for icom-civ. Ignored on USB-CDC.\n"
@@ -129,17 +135,19 @@ int main(int argc, char **argv)
 {
     g_argv0 = argv[0];
 
-    const char *device = "/dev/ttyUSB0";
+    const char *device_arg = NULL;  // explicit --radio-device=, NULL if absent
     radio_backend_type_t backend = RADIO_BACKEND_YAESU_CAT;
     int speed_override = -1;
     double nominal_hz = FRONTIERSAT_CARRIER_HZ;
     int allow_tx = 0;
     int allow_high_power = 0;
+    int store_device = 0;
 
     int i = 1;
     for (; i < argc; ++i) {
         const char *a = argv[i];
-        if (strncmp(a, "--radio-device=", 15) == 0)              device = a + 15;
+        if (strncmp(a, "--radio-device=", 15) == 0)              device_arg = a + 15;
+        else if (strcmp(a, "--store-device") == 0)               store_device = 1;
         else if (strncmp(a, "--radio-type=", 13) == 0) {
             radio_backend_type_t t = radio_backend_type_from_string(a + 13);
             if (t == RADIO_BACKEND__COUNT) {
@@ -169,8 +177,61 @@ int main(int argc, char **argv)
     }
     const char *cmd = argv[i++];
 
+    // --store-device handling. Three cases:
+    //   1) --radio-device= absent: warn, no-op.
+    //   2) Stored value matches new path: no-op.
+    //   3) No stored value yet: silent fresh save.
+    //   4) Stored value differs: prompt "Overwrite? [y,N]".
+    if (store_device) {
+        if (device_arg == NULL) {
+            fprintf(stderr, "--store-device: nothing to store "
+                    "(no --radio-device= given).\n");
+        } else {
+            char existing[1024] = {0};
+            int load_rc = radio_device_store_load(existing, sizeof existing);
+            if (load_rc == -1) {
+                if (radio_device_store_save(device_arg) == 0) {
+                    fprintf(stderr, "radio device default saved: %s\n", device_arg);
+                } else {
+                    perror("warning: could not save radio device default");
+                }
+            } else if (load_rc == 0 && strcmp(existing, device_arg) == 0) {
+                // Already stored — silent no-op.
+            } else if (load_rc == 0) {
+                fprintf(stderr, "Overwrite stored radio device '%s' -> '%s'? [y,N] ",
+                        existing, device_arg);
+                fflush(stderr);
+                char ans[8] = {0};
+                if (fgets(ans, sizeof ans, stdin) != NULL
+                    && (ans[0] == 'y' || ans[0] == 'Y')) {
+                    if (radio_device_store_save(device_arg) == 0) {
+                        fprintf(stderr, "radio device default updated: %s\n", device_arg);
+                    } else {
+                        perror("warning: could not save radio device default");
+                    }
+                } else {
+                    fprintf(stderr, "kept existing default; using new device for "
+                            "this run only.\n");
+                }
+            } else {
+                fprintf(stderr, "warning: could not read existing default "
+                        "(rc=%d); not saving.\n", load_rc);
+            }
+        }
+    }
+
+    // Resolve the effective device for this run:
+    //   --radio-device= wins; else stored default; else /dev/ttyUSB0.
+    char effective_device[1024];
+    if (device_arg != NULL) {
+        snprintf(effective_device, sizeof effective_device, "%s", device_arg);
+    } else if (radio_device_store_load(effective_device,
+                                       sizeof effective_device) != 0) {
+        snprintf(effective_device, sizeof effective_device, "/dev/ttyUSB0");
+    }
+
     radio_t r = {0};
-    r.device_filename = (char *)device;
+    r.device_filename = effective_device;
     r.serial_speed = (speed_override > 0)
                      ? speed_from_int(speed_override)
                      : default_speed_for(backend);

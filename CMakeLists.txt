@@ -55,7 +55,7 @@ set(SSO_TARGETS)
 # Radio control / CAT verification tool. Pure radio dispatcher; no audio,
 # no SGP4, no ncurses. Builds on macOS for FT-991A bring-up off the Linux
 # ground-station box.
-add_executable(radio_ctl utils/radio_ctl.c ${RADIO_SOURCES})
+add_executable(radio_ctl utils/radio_ctl.c radio_device_store.c ${RADIO_SOURCES})
 target_include_directories(radio_ctl PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_definitions(radio_ctl PRIVATE QOL)
 target_link_libraries(radio_ctl PRIVATE m)
