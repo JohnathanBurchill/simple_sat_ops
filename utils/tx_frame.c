@@ -240,7 +240,7 @@ static void usage(FILE *out, const char *argv0)
         "  --allow-tx                  Clear the default TX inhibit. Without this,\n"
         "                              PTT is gated and the radio is configured\n"
         "                              but never keyed.\n"
-        "  --radio-type=<id>           icom-civ (default) | yaesu-cat | usrp-b210\n"
+        "  --radio-type=<id>           yaesu-cat (default) | icom-civ | usrp-b210\n"
         "\n"
         "Safety / dry-run:\n"
         "  --dry-run                   Build the frame, print size, do not TX\n"
@@ -270,7 +270,7 @@ int main(int argc, char **argv)
     int tx_power_pct = -1;  // < 0 = don't touch (% 0..100)
     int allow_high_power = 0;
     int allow_tx = 0;
-    radio_backend_type_t radio_backend = RADIO_BACKEND_ICOM_CIV;
+    radio_backend_type_t radio_backend = RADIO_BACKEND_YAESU_CAT;
     int record_warmup_ms = 600;
 
     csp_v1_header_t csp_hdr = {

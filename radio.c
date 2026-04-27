@@ -30,12 +30,12 @@
 #include <stdio.h>
 #include <string.h>
 
-// Default backend = IC-9700. radio_init() applies this if no caller has
-// run radio_backend_select(); preserves byte-for-byte behaviour for code
-// paths that don't yet pass --radio-type=.
-static const radio_backend_ops_t *default_ops_or_icom(const radio_backend_ops_t *ops)
+// Default backend on the multi-radio branch = FT-991A. Applied by
+// radio_init() if no caller has run radio_backend_select(). The IC-9700
+// path is still available with --radio-type=icom-civ.
+static const radio_backend_ops_t *default_ops_or_default(const radio_backend_ops_t *ops)
 {
-    return ops ? ops : radio_backend_icom_civ_ops();
+    return ops ? ops : radio_backend_yaesu_cat_ops();
 }
 
 // One-line warning when a caller hits an op the active backend doesn't
@@ -77,7 +77,7 @@ radio_backend_type_t radio_backend_type_from_string(const char *s)
 int radio_init(radio_t *radio)
 {
     if (radio == NULL) return RADIO_ERROR;
-    radio->ops = default_ops_or_icom(radio->ops);
+    radio->ops = default_ops_or_default(radio->ops);
     if (!radio->ops || !radio->ops->init) return unsupported(radio, "init");
     return radio->ops->init(radio);
 }

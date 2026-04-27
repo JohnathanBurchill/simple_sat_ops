@@ -110,7 +110,7 @@ static void usage(FILE *dest, const char *name, int full)
         "  --allow-tx                   Clear the default TX inhibit. Without this\n"
         "                               flag PTT is gated and the radio is\n"
         "                               configured but never keyed.\n"
-        "  --radio-type=<id>            icom-civ (default) | yaesu-cat | usrp-b210\n"
+        "  --radio-type=<id>            yaesu-cat (default) | icom-civ | usrp-b210\n"
         "  --help                       Short help (this message)\n"
         "  --help-full                  Detailed help with setup and verification\n",
         name, FRONTIERSAT_CARRIER_HZ, FRONTIERSAT_CARRIER_HZ / 1e6);
@@ -269,7 +269,7 @@ int main(int argc, char **argv)
     int tx_power_pct = -1;  // < 0 = don't touch (% 0..100)
     int allow_high_power = 0;
     int allow_tx = 0;
-    radio_backend_type_t radio_backend = RADIO_BACKEND_ICOM_CIV;
+    radio_backend_type_t radio_backend = RADIO_BACKEND_YAESU_CAT;
     int record_warmup_ms = 600;
 
     for (int i = 1; i < argc; i++) {

@@ -93,7 +93,7 @@ void usage(FILE *dest, const char *name, int full)
         "  --allow-tx                   Clear the default TX inhibit. Without this,\n"
         "                               PTT-on calls return RADIO_TX_INHIBITED so\n"
         "                               the radio is configured but never keyed.\n"
-        "  --radio-type=<id>            icom-civ (default) | yaesu-cat | usrp-b210\n"
+        "  --radio-type=<id>            yaesu-cat (default) | icom-civ | usrp-b210\n"
         "\n"
         "Radio transport (see --help-full for the two supported setups):\n"
         "  --radio-device=<path>        CI-V tty (default /dev/ttyUSB1)\n"
@@ -829,7 +829,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->tx_power_pct = -1;
     state->allow_high_power = 0;
     state->allow_tx = 0;
-    state->radio_backend = RADIO_BACKEND_ICOM_CIV;
+    state->radio_backend = RADIO_BACKEND_YAESU_CAT;
     state->radio.device_filename = "/dev/ttyUSB1";
     state->radio.serial_speed = B115200;
     // state->radio.serial_speed = B9600;
