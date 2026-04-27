@@ -29,8 +29,14 @@
 //                                   the front panel shows.
 //   Menu 032 CAT TOT  = 10 ms     — CAT timeout. Must be > 0 or the radio
 //                                   silently drops command-line replies.
-//   Menu 079 PKT RATE = 9600      — set by this backend during init();
-//                                   needed for 9600-bps uplink path.
+//   Menu 033 CAT RTS  = DISABLE   — without this the radio waits for the
+//                                   host to assert RTS before transmitting
+//                                   any reply. macOS's CP2105 driver
+//                                   doesn't always raise RTS reliably,
+//                                   so leave RTS off.
+//   9600 RATE menu (number varies — 077 on some firmwares) must be set to
+//   9600 for the GFSK uplink path; not driven here because the menu
+//   number isn't stable across firmware revisions.
 //
 // The FT-991A's USB bridge (Silicon Labs CP2105) is a dual-port chip;
 // either virtual COM port carries CAT, so first-time bring-up may need
@@ -129,6 +135,15 @@ static int yaesu_send(radio_t *radio, const char *cmd, char *reply, size_t reply
     return RADIO_OK;
 }
 
+// Small breather between CAT commands during init. The FT-991A briefly
+// rejects follow-up commands (replies "?;") while it's still acting on a
+// preceding mode/freq change. ~80 ms is enough to clear that window
+// without making the operator wait noticeably.
+static void yaesu_cat_settle(void)
+{
+    usleep(80 * 1000);
+}
+
 static int yaesu_cat_init(radio_t *radio)
 {
     yaesu_cat_connect(radio);
@@ -149,10 +164,7 @@ static int yaesu_cat_init(radio_t *radio)
     }
     radio->transceiver_id = 0x0670;
 
-    // PKT RATE = 9600 (Menu 079 value 2). Best-effort — older firmwares
-    // expose this as a different EX number; if it NGs we keep going.
-    char rep[32];
-    yaesu_send(radio, "EX0792;", rep, sizeof rep);
+    yaesu_cat_settle();
 
     // Set VFO A to the nominal carrier (9 digits Hz, zero-padded).
     char fa[24];
@@ -162,14 +174,17 @@ static int yaesu_cat_init(radio_t *radio)
         fprintf(stderr, "Error setting Yaesu VFO A frequency\n");
         return RADIO_SET_FREQUENCY;
     }
+    yaesu_cat_settle();
 
     // Operating mode = FM by default; uplink-prep will switch to DATA-FM.
     yaesu_send(radio, "MD04;", NULL, 0);
+    yaesu_cat_settle();
 
-    // Read back FA; for the cached field.
+    // Read back FA; for the cached field. Best-effort; on some firmwares
+    // / states the FA; query returns "?;" — we just leave the cache 0.
+    char rep[32] = {0};
     if (yaesu_send(radio, "FA;", rep, sizeof rep) == RADIO_OK
         && strncmp(rep, "FA", 2) == 0) {
-        // Reply form: "FA<9 digits>;"
         char digits[16] = {0};
         strncpy(digits, rep + 2, 9);
         radio->vfo_main_actual_frequency = atof(digits);
