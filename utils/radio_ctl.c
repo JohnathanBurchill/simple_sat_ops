@@ -1,0 +1,293 @@
+/*
+
+   Simple Satellite Operations  utils/radio_ctl.c
+
+   Copyright (C) 2026  Johnathan K Burchill
+
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+*/
+
+// Subcommand-style CLI for the radio_t abstraction. No audio, no ncurses,
+// no SGP4 — just enough to drive an FT-991A or IC-9700 over a serial
+// port for control-protocol verification. Builds on macOS, Linux, and
+// any other POSIX host with a serial driver.
+//
+// Examples (Mac, FT-991A on USB-CAT):
+//
+//   radio_ctl --radio-device=/dev/cu.usbserial-FT991A init
+//   radio_ctl --radio-device=/dev/cu.usbserial-FT991A get-freq
+//   radio_ctl --radio-device=/dev/cu.usbserial-FT991A set-freq 436150000
+//   radio_ctl --radio-device=/dev/cu.usbserial-FT991A set-power 10
+//   radio_ctl --radio-device=/dev/cu.usbserial-FT991A --allow-tx ptt on
+//   radio_ctl --radio-device=/dev/cu.usbserial-FT991A --allow-tx ptt off
+
+#include "radio.h"
+#include "radio_backend.h"
+
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <termios.h>
+#include <strings.h>
+
+static const char *g_argv0 = "radio_ctl";
+
+static void usage(FILE *f)
+{
+    fprintf(f,
+        "usage: %s [global-flags] <command> [args]\n"
+        "\n"
+        "Global flags:\n"
+        "  --radio-device=<path>      Serial device. Default /dev/ttyUSB0;\n"
+        "                             on macOS pass /dev/cu.usbserial-XXX\n"
+        "                             or /dev/cu.usbmodemXXX explicitly.\n"
+        "  --radio-type=<id>          yaesu-cat (default) | icom-civ | usrp-b210\n"
+        "  --radio-serial-speed=<bps> Default 38400 for yaesu-cat,\n"
+        "                             115200 for icom-civ. Ignored on USB-CDC.\n"
+        "  --freq-hz=<hz>             Override radio_t.nominal_downlink_frequency\n"
+        "                             used by 'init' (default %.0f).\n"
+        "  --allow-tx                 Required to actually key TX (ptt on).\n"
+        "  --allow-high-power         Required for set-power above 10%%.\n"
+        "  -h, --help                 This message.\n"
+        "\n"
+        "Commands:\n"
+        "  init                       Run backend init() and exit.\n"
+        "  uplink-prep                radio_uplink_prep() and exit.\n"
+        "  get-freq                   Print current frequency in Hz.\n"
+        "  set-freq <hz>              Tune the active VFO.\n"
+        "  set-mode <fm|usb|lsb|am|cw>          Operating mode.\n"
+        "  set-data-mode <on|off>     DATA flag (icom) / mode-swap (yaesu).\n"
+        "  set-data-mod-source <usb|mic|acc|mic_acc|mic_usb|lan>\n"
+        "  set-power <0..100>         RF power, %%.\n"
+        "  set-mod-level <0..100>     USB MOD level, %%.\n"
+        "  set-moni-level <0..100>    Monitor level, %% (icom).\n"
+        "  ptt <on|off>               Key / unkey.\n"
+        "  identify                   Run init() then disconnect; loud about model.\n"
+        "\n"
+        "Exit code is RADIO_OK (0) on success, the RADIO_STATUS code otherwise.\n",
+        g_argv0, FRONTIERSAT_CARRIER_HZ);
+}
+
+static int parse_pct(const char *s, int *out)
+{
+    if (s == NULL) return -1;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v < 0 || v > 100) return -1;
+    *out = (int)v;
+    return 0;
+}
+
+static int parse_mode(const char *s)
+{
+    if (strcasecmp(s, "fm")  == 0) return RADIO_MODE_FM;
+    if (strcasecmp(s, "usb") == 0) return RADIO_MODE_USB;
+    if (strcasecmp(s, "lsb") == 0) return RADIO_MODE_LSB;
+    if (strcasecmp(s, "am")  == 0) return RADIO_MODE_AM;
+    if (strcasecmp(s, "cw")  == 0) return RADIO_MODE_CW;
+    return -1;
+}
+
+static int parse_mod_source(const char *s)
+{
+    if (strcasecmp(s, "mic")     == 0) return RADIO_DATA_MOD_SRC_MIC;
+    if (strcasecmp(s, "acc")     == 0) return RADIO_DATA_MOD_SRC_ACC;
+    if (strcasecmp(s, "mic_acc") == 0) return RADIO_DATA_MOD_SRC_MIC_ACC;
+    if (strcasecmp(s, "usb")     == 0) return RADIO_DATA_MOD_SRC_USB;
+    if (strcasecmp(s, "mic_usb") == 0) return RADIO_DATA_MOD_SRC_MIC_USB;
+    if (strcasecmp(s, "lan")     == 0) return RADIO_DATA_MOD_SRC_LAN;
+    return -1;
+}
+
+static speed_t default_speed_for(radio_backend_type_t t)
+{
+    switch (t) {
+        case RADIO_BACKEND_ICOM_CIV:  return B115200;
+        case RADIO_BACKEND_YAESU_CAT: return B38400;
+        default:                      return B115200;
+    }
+}
+
+static speed_t speed_from_int(int bps)
+{
+    switch (bps) {
+        case 4800:   return B4800;
+        case 9600:   return B9600;
+        case 19200:  return B19200;
+        case 38400:  return B38400;
+        case 57600:  return B57600;
+        case 115200: return B115200;
+        default:     return 0;
+    }
+}
+
+int main(int argc, char **argv)
+{
+    g_argv0 = argv[0];
+
+    const char *device = "/dev/ttyUSB0";
+    radio_backend_type_t backend = RADIO_BACKEND_YAESU_CAT;
+    int speed_override = -1;
+    double nominal_hz = FRONTIERSAT_CARRIER_HZ;
+    int allow_tx = 0;
+    int allow_high_power = 0;
+
+    int i = 1;
+    for (; i < argc; ++i) {
+        const char *a = argv[i];
+        if (strncmp(a, "--radio-device=", 15) == 0)              device = a + 15;
+        else if (strncmp(a, "--radio-type=", 13) == 0) {
+            radio_backend_type_t t = radio_backend_type_from_string(a + 13);
+            if (t == RADIO_BACKEND__COUNT) {
+                fprintf(stderr, "--radio-type: unknown '%s'\n", a + 13);
+                return RADIO_ERROR;
+            }
+            backend = t;
+        }
+        else if (strncmp(a, "--radio-serial-speed=", 21) == 0)   speed_override = atoi(a + 21);
+        else if (strncmp(a, "--freq-hz=", 10) == 0)              nominal_hz = atof(a + 10);
+        else if (strcmp(a, "--allow-tx") == 0)                   allow_tx = 1;
+        else if (strcmp(a, "--allow-high-power") == 0)           allow_high_power = 1;
+        else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
+            usage(stdout);
+            return 0;
+        }
+        else if (a[0] != '-') break;  // start of subcommand
+        else {
+            fprintf(stderr, "unknown option: %s\n", a);
+            usage(stderr);
+            return RADIO_ERROR;
+        }
+    }
+    if (i >= argc) {
+        usage(stderr);
+        return RADIO_ERROR;
+    }
+    const char *cmd = argv[i++];
+
+    radio_t r = {0};
+    r.device_filename = (char *)device;
+    r.serial_speed = (speed_override > 0)
+                     ? speed_from_int(speed_override)
+                     : default_speed_for(backend);
+    if (r.serial_speed == 0) {
+        fprintf(stderr, "unsupported --radio-serial-speed=%d\n", speed_override);
+        return RADIO_ERROR;
+    }
+    r.nominal_downlink_frequency = nominal_hz;
+    r.tx_inhibit_cleared = allow_tx;
+
+    if (radio_backend_select(&r, backend) != RADIO_OK) {
+        return RADIO_ERROR;
+    }
+
+    int rc = radio_init(&r);
+    if (rc != RADIO_OK) {
+        fprintf(stderr, "radio_init failed (rc=%d)\n", rc);
+        radio_disconnect(&r);
+        return rc;
+    }
+
+    if (strcmp(cmd, "init") == 0 || strcmp(cmd, "identify") == 0) {
+        fprintf(stderr, "radio_ctl: %s ok (transceiver_id=0x%04X)\n",
+                cmd, r.transceiver_id);
+    }
+    else if (strcmp(cmd, "uplink-prep") == 0) {
+        rc = radio_uplink_prep(&r);
+    }
+    else if (strcmp(cmd, "get-freq") == 0) {
+        double f = radio_get_frequency(&r);
+        if (f < 0) { rc = RADIO_GET_FREQUENCY; }
+        else { printf("%.0f\n", f); }
+    }
+    else if (strcmp(cmd, "set-freq") == 0) {
+        if (i >= argc) { fprintf(stderr, "set-freq: missing <hz>\n"); rc = RADIO_ERROR; }
+        else { rc = radio_set_frequency(&r, atof(argv[i])); }
+    }
+    else if (strcmp(cmd, "set-mode") == 0) {
+        if (i >= argc) { fprintf(stderr, "set-mode: missing <mode>\n"); rc = RADIO_ERROR; }
+        else {
+            int m = parse_mode(argv[i]);
+            if (m < 0) { fprintf(stderr, "set-mode: unknown '%s'\n", argv[i]); rc = RADIO_ERROR; }
+            else { rc = radio_set_mode(&r, m, RADIO_FILTER_FIL1); }
+        }
+    }
+    else if (strcmp(cmd, "set-data-mode") == 0) {
+        if (i >= argc) { fprintf(stderr, "set-data-mode: missing <on|off>\n"); rc = RADIO_ERROR; }
+        else {
+            int on = (strcasecmp(argv[i], "on") == 0 || strcmp(argv[i], "1") == 0);
+            rc = radio_set_data_mode(&r, on, RADIO_FILTER_FIL1);
+        }
+    }
+    else if (strcmp(cmd, "set-data-mod-source") == 0) {
+        if (i >= argc) { fprintf(stderr, "set-data-mod-source: missing <src>\n"); rc = RADIO_ERROR; }
+        else {
+            int s = parse_mod_source(argv[i]);
+            if (s < 0) { fprintf(stderr, "set-data-mod-source: unknown '%s'\n", argv[i]); rc = RADIO_ERROR; }
+            else { rc = radio_set_data_mod_source(&r, s); }
+        }
+    }
+    else if (strcmp(cmd, "set-power") == 0) {
+        int pct;
+        if (i >= argc || parse_pct(argv[i], &pct) < 0) {
+            fprintf(stderr, "set-power: need <0..100>\n");
+            rc = RADIO_ERROR;
+        } else if (pct > 10 && !allow_high_power) {
+            fprintf(stderr, "set-power=%d above 10%% safety threshold; "
+                    "add --allow-high-power.\n", pct);
+            rc = RADIO_ERROR;
+        } else {
+            int raw = (pct * 255 + 50) / 100;
+            rc = radio_set_rf_power(&r, raw);
+        }
+    }
+    else if (strcmp(cmd, "set-mod-level") == 0) {
+        int pct;
+        if (i >= argc || parse_pct(argv[i], &pct) < 0) {
+            fprintf(stderr, "set-mod-level: need <0..100>\n");
+            rc = RADIO_ERROR;
+        } else {
+            int raw = (pct * 255 + 50) / 100;
+            rc = radio_set_usb_mod_level(&r, raw);
+        }
+    }
+    else if (strcmp(cmd, "set-moni-level") == 0) {
+        int pct;
+        if (i >= argc || parse_pct(argv[i], &pct) < 0) {
+            fprintf(stderr, "set-moni-level: need <0..100>\n");
+            rc = RADIO_ERROR;
+        } else {
+            int raw = (pct * 255 + 50) / 100;
+            rc = radio_set_moni_level(&r, raw);
+        }
+    }
+    else if (strcmp(cmd, "ptt") == 0) {
+        if (i >= argc) { fprintf(stderr, "ptt: missing <on|off>\n"); rc = RADIO_ERROR; }
+        else {
+            int on = (strcasecmp(argv[i], "on") == 0 || strcmp(argv[i], "1") == 0);
+            rc = radio_ptt(&r, on);
+        }
+    }
+    else {
+        fprintf(stderr, "unknown command: %s\n", cmd);
+        usage(stderr);
+        rc = RADIO_ERROR;
+    }
+
+    // Best-effort PTT release on the way out — but NOT if the user's
+    // explicit subcommand was 'ptt' (they may have just keyed). Otherwise
+    // an early error mid-script could leave the radio keyed.
+    if (strcmp(cmd, "ptt") != 0) {
+        radio_ptt(&r, 0);
+    }
+    radio_disconnect(&r);
+
+    if (rc != RADIO_OK) {
+        fprintf(stderr, "radio_ctl: %s failed (rc=%d)\n", cmd, rc);
+    }
+    return rc;
+}

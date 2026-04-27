@@ -22,15 +22,21 @@
 #define QOL_H
 
 #ifdef QOL
+// Evaluate `array` once into a typed local so callers passing a cast
+// expression like `(uint8_t *)reply` parse correctly. Without this the
+// macro body would expand to `(uint8_t *)reply[i]` and trigger
+// -Wint-to-pointer-cast.
 #define printcmd(msg, array, len) do { \
+    const unsigned char *_qol_arr = (const unsigned char *)(array); \
+    int _qol_len = (int)(len); \
     fprintf(stderr, msg); \
-    for (int i = 0; i < len; ++i) { \
-        fprintf(stderr, " %02X", array[i]); \
+    for (int _qol_i = 0; _qol_i < _qol_len; ++_qol_i) { \
+        fprintf(stderr, " %02X", _qol_arr[_qol_i]); \
     } \
     fprintf(stderr, "\n"); \
-} while (0);
+} while (0)
 #else
-#define printcmd(msg, array, len) do {} while (0);
+#define printcmd(msg, array, len) do {} while (0)
 #endif
 
 #endif // QOL_H

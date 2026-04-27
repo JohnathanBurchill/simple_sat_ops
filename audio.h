@@ -1,7 +1,27 @@
 #ifndef AUDIO_H
 #define AUDIO_H
 
-#include <alsa/asoundlib.h>
+#include <pthread.h>
+#include <stdio.h>
+
+// On Linux we get the real ALSA types. On hosts without ALSA (macOS dev
+// boxes building only the radio_ctl / non-audio binaries) we provide
+// just-enough opaque stubs so audio_t can still be sized and state.h
+// remains includeable. Code that actually calls audio_* functions only
+// gets compiled on hosts where the real header is present.
+#if defined(__has_include)
+#  if __has_include(<alsa/asoundlib.h>)
+#    include <alsa/asoundlib.h>
+#    define SSO_HAVE_ALSA 1
+#  endif
+#endif
+#ifndef SSO_HAVE_ALSA
+typedef void *snd_pcm_t;
+typedef unsigned long snd_pcm_uframes_t;
+#  ifndef SND_PCM_FORMAT_S16_LE
+#    define SND_PCM_FORMAT_S16_LE 2
+#  endif
+#endif
 
 // RX capture path — IC-9700 native USB CODEC at card 4 on the RAO box.
 // The SignaLink (card 1) is the TX-side audio+PTT device and is not used
