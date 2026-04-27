@@ -135,15 +135,6 @@ static int yaesu_send(radio_t *radio, const char *cmd, char *reply, size_t reply
     return RADIO_OK;
 }
 
-// Small breather between CAT commands during init. The FT-991A briefly
-// rejects follow-up commands (replies "?;") while it's still acting on a
-// preceding mode/freq change. ~80 ms is enough to clear that window
-// without making the operator wait noticeably.
-static void yaesu_cat_settle(void)
-{
-    usleep(80 * 1000);
-}
-
 static int yaesu_cat_init(radio_t *radio)
 {
     yaesu_cat_connect(radio);
@@ -154,7 +145,11 @@ static int yaesu_cat_init(radio_t *radio)
     }
 
     // Identify the radio (ID;) so a wrong-radio mistake is loud.
-    // FT-991A returns "ID0670;".
+    // FT-991A returns "ID0670;". This is a passive query; init() is
+    // intentionally read-only on the radio side. Frequency / mode
+    // configuration belongs in radio_uplink_prep() (or explicit
+    // radio_set_frequency / radio_set_mode calls) so tools like
+    // radio_ctl 'identify' don't retune the rig as a side effect.
     char idbuf[32] = {0};
     if (yaesu_send(radio, "ID;", idbuf, sizeof idbuf) != RADIO_OK) {
         fprintf(stderr, "warning: no reply from Yaesu CAT (ID;); continuing.\n");
@@ -163,32 +158,6 @@ static int yaesu_cat_init(radio_t *radio)
                 "continuing anyway.\n", idbuf);
     }
     radio->transceiver_id = 0x0670;
-
-    yaesu_cat_settle();
-
-    // Set VFO A to the nominal carrier (9 digits Hz, zero-padded).
-    char fa[24];
-    snprintf(fa, sizeof fa, "FA%09llu;", (unsigned long long)
-             llround(radio->nominal_downlink_frequency));
-    if (yaesu_send(radio, fa, NULL, 0) != RADIO_OK) {
-        fprintf(stderr, "Error setting Yaesu VFO A frequency\n");
-        return RADIO_SET_FREQUENCY;
-    }
-    yaesu_cat_settle();
-
-    // Operating mode = FM by default; uplink-prep will switch to DATA-FM.
-    yaesu_send(radio, "MD04;", NULL, 0);
-    yaesu_cat_settle();
-
-    // Read back FA; for the cached field. Best-effort; on some firmwares
-    // / states the FA; query returns "?;" — we just leave the cache 0.
-    char rep[32] = {0};
-    if (yaesu_send(radio, "FA;", rep, sizeof rep) == RADIO_OK
-        && strncmp(rep, "FA", 2) == 0) {
-        char digits[16] = {0};
-        strncpy(digits, rep + 2, 9);
-        radio->vfo_main_actual_frequency = atof(digits);
-    }
 
     // CAT PTT-off is "RX;". Three bytes — fits comfortably and lets the
     // SIGINT handler release TX with a single async-signal-safe write().

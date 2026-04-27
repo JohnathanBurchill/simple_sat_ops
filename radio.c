@@ -176,12 +176,22 @@ int radio_set_rf_power(radio_t *radio, int level_0_to_255)
     return radio->ops->set_rf_power(radio, level_0_to_255);
 }
 
-// Composition of three primitives. Backends that NULL out set_data_mode
+// Composition of primitives. Backends that NULL out set_data_mode
 // (e.g. FT-991A, where DATA mode is a mode change rather than a flag) get
 // RADIO_NOT_SUPPORTED back; we treat that as OK and keep going so the
-// uplink is still configured by the other two ops.
+// uplink is still configured by the remaining ops.
+//
+// Tunes to radio->nominal_downlink_frequency if it is non-zero. The
+// frequency tune lives here (rather than in each backend's init) so that
+// passive tools like `radio_ctl identify` open the radio without
+// changing its tuning, while tx_tone / tx_frame / simple_sat_ops — which
+// always call uplink_prep — still land at the carrier they want.
 int radio_uplink_prep(radio_t *radio)
 {
+    if (radio != NULL && radio->nominal_downlink_frequency > 0.0) {
+        int rc = radio_set_frequency(radio, radio->nominal_downlink_frequency);
+        if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) return rc;
+    }
     int rc = radio_set_mode(radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
     if (rc != RADIO_OK) return rc;
     rc = radio_set_data_mode(radio, 1, RADIO_FILTER_FIL1);
