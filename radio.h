@@ -24,6 +24,8 @@
 #include <termios.h>
 #include <stdint.h>
 
+#include "radio_backend.h"
+
 #define RADIO_MAX_DEVICE_FILENAME_LEN 1024
 #define RADIO_MAX_COMMAND_LEN 128
 #define RADIO_MAX_COMMAND_RESULT_LEN 1024
@@ -43,6 +45,9 @@ enum RADIO_STATUS {
     RADIO_OPEN,
     RADIO_SET_FREQUENCY,
     RADIO_GET_FREQUENCY,
+    RADIO_NOT_SUPPORTED,    // backend doesn't expose this op
+    RADIO_TX_INHIBITED,     // PTT-on attempted before --allow-tx was given
+    RADIO_NOT_IMPLEMENTED,  // backend op exists but isn't wired up yet
 };
 
 enum RADIO_VFO {
@@ -72,6 +77,7 @@ enum RADIO_FILTER {
 };
 
 // CI-V `1A 05 01 16 <src>` — SET > Connectors > MOD Input > DATA MOD
+// (IC-9700-shaped numbering; backends translate to their own concept.)
 enum RADIO_DATA_MOD_SRC {
     RADIO_DATA_MOD_SRC_MIC     = 0x00,
     RADIO_DATA_MOD_SRC_ACC     = 0x01,
@@ -81,7 +87,7 @@ enum RADIO_DATA_MOD_SRC {
     RADIO_DATA_MOD_SRC_LAN     = 0x05,
 };
 
-typedef struct radio 
+typedef struct radio
 {
     char *device_filename;
     speed_t serial_speed;
@@ -111,6 +117,23 @@ typedef struct radio
     int waterfall_enabled;
     int mode;
     int filter;
+
+    // Backend dispatch. Wired by radio_backend_select() before radio_init().
+    // Defaults to icom-civ if untouched (set by radio_init when ops==NULL).
+    const radio_backend_ops_t *ops;
+    void *backend_state;  // backend-private; opaque to public callers
+
+    // PTT-on is rejected while this is 0 (the default). Callers set it via
+    // their own --allow-tx flag handling. PTT-off is always passed through.
+    int tx_inhibit_cleared;
+
+    // Raw "release PTT now" wire bytes, populated by the backend during
+    // init(). Callable from a SIGINT handler via a single async-signal-safe
+    // write(fd, ...) — radio_ptt(0) goes through the dispatcher and is not
+    // signal-safe (fprintf, malloc, etc). Length 0 means the backend has
+    // no out-of-band PTT-release path (e.g. B210 has no PTT to release).
+    uint8_t ptt_off_raw[16];
+    uint8_t ptt_off_raw_len;
 } radio_t;
 
 int radio_init(radio_t *radio);
@@ -136,5 +159,3 @@ int radio_toggle_waterfall(radio_t *radio);
 
 
 #endif // !RADIO_H
-
-

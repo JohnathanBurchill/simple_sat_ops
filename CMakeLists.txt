@@ -28,8 +28,19 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(NCURSES REQUIRED ncurses)
 pkg_check_modules(OPENSSL REQUIRED libcrypto)
 
+# Optional: USRP B210 backend (requires UHD). When OFF, radio_usrp_b210.c
+# is still compiled but its init() returns RADIO_NOT_IMPLEMENTED so the
+# binary builds without UHD.
+option(WITH_USRP_B210 "Build USRP B210 backend (requires UHD)" OFF)
+
+# Sources shared by every binary that links the radio dispatcher.
+set(RADIO_SOURCES radio.c radio_icom_civ.c radio_yaesu_cat.c radio_usrp_b210.c)
+if (WITH_USRP_B210)
+    add_compile_definitions(WITH_USRP_B210)
+endif()
+
 # Add the main executable
-add_executable(simple_sat_ops main.c prediction.c radio.c antenna_rotator.c audio.c telemetry.c oem.c)
+add_executable(simple_sat_ops main.c prediction.c ${RADIO_SOURCES} antenna_rotator.c audio.c telemetry.c oem.c)
 # target_compile_definitions(simple_sat_ops PUBLIC -DQOL)
 
 # Link the sgp4sdp4 library
@@ -44,7 +55,7 @@ add_executable(lifetime lifetime.c prediction.c oem.c)
 target_link_libraries(lifetime PRIVATE sgp4sdp4 m)
 
 # TX test tone tool
-add_executable(tx_tone tx_tone.c radio.c audio.c)
+add_executable(tx_tone tx_tone.c ${RADIO_SOURCES} audio.c)
 target_link_libraries(tx_tone PRIVATE m asound)
 
 # Uplink test tool: builds CSP + AX100 frame, optionally modulates to WAV
@@ -62,7 +73,7 @@ target_include_directories(fm_preview PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(fm_preview PRIVATE m)
 
 # Single-shot frame transmitter: CSP+AX100 -> PCM -> CI-V PTT + ALSA playback
-add_executable(tx_frame utils/tx_frame.c csp.c golay24.c ax100.c rs.c hmac_keyfile.c modem.c radio.c)
+add_executable(tx_frame utils/tx_frame.c csp.c golay24.c ax100.c rs.c hmac_keyfile.c modem.c ${RADIO_SOURCES})
 target_include_directories(tx_frame PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
 target_link_libraries(tx_frame PRIVATE ${OPENSSL_LIBRARIES} m asound)
 

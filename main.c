@@ -90,6 +90,10 @@ void usage(FILE *dest, const char *name, int full)
         "  --tx-power=<0..100>          RF power, %% (CI-V 14 0A). Untouched if\n"
         "                               omitted (uses the radio's current setting).\n"
         "  --allow-high-power           Required for --tx-power above 10%%.\n"
+        "  --allow-tx                   Clear the default TX inhibit. Without this,\n"
+        "                               PTT-on calls return RADIO_TX_INHIBITED so\n"
+        "                               the radio is configured but never keyed.\n"
+        "  --radio-type=<id>            icom-civ (default) | yaesu-cat | usrp-b210\n"
         "\n"
         "Radio transport (see --help-full for the two supported setups):\n"
         "  --radio-device=<path>        CI-V tty (default /dev/ttyUSB1)\n"
@@ -418,10 +422,14 @@ int main(int argc, char **argv)
     select_ephemeris(&state.prediction.satellite_ephem.tle);
 
     int radio_result = 0;
-    if (state.run_with_radio) { 
+    if (state.run_with_radio) {
         state.radio.is_required = 1;
         state.radio.nominal_downlink_frequency = state.radio.satellite_downlink_frequency;
         state.radio.nominal_uplink_frequency = state.radio.satellite_uplink_frequency;
+        state.radio.tx_inhibit_cleared = state.allow_tx;
+        if (radio_backend_select(&state.radio, state.radio_backend) != RADIO_OK) {
+            return EXIT_FAILURE;
+        }
         radio_result = radio_init(&state.radio);
         if (radio_result != RADIO_OK) {
             fprintf(stderr, "Error initializing radio\n");
@@ -820,6 +828,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->uplink_mod_level = -1;
     state->tx_power_pct = -1;
     state->allow_high_power = 0;
+    state->allow_tx = 0;
+    state->radio_backend = RADIO_BACKEND_ICOM_CIV;
     state->radio.device_filename = "/dev/ttyUSB1";
     state->radio.serial_speed = B115200;
     // state->radio.serial_speed = B9600;
@@ -890,6 +900,22 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strcmp("--allow-high-power", argv[i]) == 0) {
             state->n_options++;
             state->allow_high_power = 1;
+        } else if (strcmp("--allow-tx", argv[i]) == 0) {
+            state->n_options++;
+            state->allow_tx = 1;
+        } else if (strncmp("--radio-type=", argv[i], 13) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 14) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            radio_backend_type_t t = radio_backend_type_from_string(argv[i] + 13);
+            if (t == RADIO_BACKEND__COUNT) {
+                fprintf(stderr, "--radio-type: unknown '%s' "
+                        "(icom-civ|yaesu-cat|usrp-b210)\n", argv[i] + 13);
+                return EXIT_FAILURE;
+            }
+            state->radio_backend = t;
         } else if (strncmp("--radio-device=", argv[i], 15) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 16) {

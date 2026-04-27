@@ -128,12 +128,13 @@ static int make_auto_record_path(const char *tool, char *out, size_t out_size)
 static void on_sigint(int sig)
 {
     (void)sig;
-    // CI-V PTT off: FE FE A2 E0 1C 00 00 FD (transmit off)
-    static const uint8_t ptt_off_cmd[] = {
-        0xFE, 0xFE, 0xA2, 0xE0, 0x1C, 0x00, 0x00, 0xFD,
-    };
-    if (g_radio_for_sigint != NULL && g_radio_for_sigint->connected) {
-        (void)!write(g_radio_for_sigint->fd, ptt_off_cmd, sizeof(ptt_off_cmd));
+    // Backend-supplied PTT-off bytes (populated by radio backends during
+    // init). Async-signal-safe write() only — no fprintf/malloc here.
+    if (g_radio_for_sigint != NULL && g_radio_for_sigint->connected
+        && g_radio_for_sigint->ptt_off_raw_len > 0) {
+        (void)!write(g_radio_for_sigint->fd,
+                     g_radio_for_sigint->ptt_off_raw,
+                     g_radio_for_sigint->ptt_off_raw_len);
     }
     // Clean up the recorder child before we bail so its WAV is flushed.
     stop_recorder();
@@ -236,6 +237,10 @@ static void usage(FILE *out, const char *argv0)
         "  --tx-power=<0..100>         RF power, %% (CI-V 14 0A). Untouched if\n"
         "                              omitted (uses the radio's current setting).\n"
         "  --allow-high-power          Required for --tx-power above 10%%.\n"
+        "  --allow-tx                  Clear the default TX inhibit. Without this,\n"
+        "                              PTT is gated and the radio is configured\n"
+        "                              but never keyed.\n"
+        "  --radio-type=<id>           icom-civ (default) | yaesu-cat | usrp-b210\n"
         "\n"
         "Safety / dry-run:\n"
         "  --dry-run                   Build the frame, print size, do not TX\n"
@@ -264,6 +269,8 @@ int main(int argc, char **argv)
     int uplink_mod_level = -1;  // < 0 = don't touch (% 0..100)
     int tx_power_pct = -1;  // < 0 = don't touch (% 0..100)
     int allow_high_power = 0;
+    int allow_tx = 0;
+    radio_backend_type_t radio_backend = RADIO_BACKEND_ICOM_CIV;
     int record_warmup_ms = 600;
 
     csp_v1_header_t csp_hdr = {
@@ -333,6 +340,16 @@ int main(int argc, char **argv)
             }
         }
         else if (strcmp(a, "--allow-high-power") == 0) allow_high_power = 1;
+        else if (strcmp(a, "--allow-tx") == 0) allow_tx = 1;
+        else if (starts_with(a, "--radio-type=")) {
+            radio_backend_type_t t = radio_backend_type_from_string(a + 13);
+            if (t == RADIO_BACKEND__COUNT) {
+                fprintf(stderr, "--radio-type: unknown '%s' "
+                        "(icom-civ|yaesu-cat|usrp-b210)\n", a + 13);
+                return 1;
+            }
+            radio_backend = t;
+        }
         else if (starts_with(a, "--record-warmup-ms=")) {
             record_warmup_ms = atoi(a + 19);
             if (record_warmup_ms < 0) record_warmup_ms = 0;
@@ -425,6 +442,11 @@ int main(int argc, char **argv)
     radio.serial_speed = radio_speed;
     radio.nominal_downlink_frequency = freq_hz;
     radio.sub_park_frequency = RADIO_SUB_PARK_HZ;
+    radio.tx_inhibit_cleared = allow_tx;
+    if (radio_backend_select(&radio, radio_backend) != RADIO_OK) {
+        free(samples);
+        return 1;
+    }
     int rc = radio_init(&radio);
     if (rc != RADIO_OK) {
         fprintf(stderr, "radio_init(%s) failed (rc=%d)\n", radio_device, rc);

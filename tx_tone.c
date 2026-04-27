@@ -107,6 +107,10 @@ static void usage(FILE *dest, const char *name, int full)
         "  --tx-power=<0..100>          RF power, %% (CI-V 14 0A). Untouched if\n"
         "                               omitted (uses the radio's current setting).\n"
         "  --allow-high-power           Required for --tx-power above 10%%.\n"
+        "  --allow-tx                   Clear the default TX inhibit. Without this\n"
+        "                               flag PTT is gated and the radio is\n"
+        "                               configured but never keyed.\n"
+        "  --radio-type=<id>            icom-civ (default) | yaesu-cat | usrp-b210\n"
         "  --help                       Short help (this message)\n"
         "  --help-full                  Detailed help with setup and verification\n",
         name, FRONTIERSAT_CARRIER_HZ, FRONTIERSAT_CARRIER_HZ / 1e6);
@@ -264,6 +268,8 @@ int main(int argc, char **argv)
     int uplink_mod_level = -1;  // < 0 = don't touch (% 0..100)
     int tx_power_pct = -1;  // < 0 = don't touch (% 0..100)
     int allow_high_power = 0;
+    int allow_tx = 0;
+    radio_backend_type_t radio_backend = RADIO_BACKEND_ICOM_CIV;
     int record_warmup_ms = 600;
 
     for (int i = 1; i < argc; i++) {
@@ -341,6 +347,17 @@ int main(int argc, char **argv)
             }
         } else if (strcmp("--allow-high-power", argv[i]) == 0) {
             allow_high_power = 1;
+        } else if (strcmp("--allow-tx", argv[i]) == 0) {
+            allow_tx = 1;
+        } else if (strncmp("--radio-type=", argv[i], 13) == 0) {
+            if (strlen(argv[i]) < 14) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
+            radio_backend_type_t t = radio_backend_type_from_string(argv[i] + 13);
+            if (t == RADIO_BACKEND__COUNT) {
+                fprintf(stderr, "--radio-type: unknown '%s' "
+                        "(icom-civ|yaesu-cat|usrp-b210)\n", argv[i] + 13);
+                return EXIT_FAILURE;
+            }
+            radio_backend = t;
         } else if (strncmp("--record-warmup-ms=", argv[i], 19) == 0) {
             if (strlen(argv[i]) < 20) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
             record_warmup_ms = atoi(argv[i] + 19);
@@ -368,6 +385,10 @@ int main(int argc, char **argv)
     g_radio.serial_speed = radio_speed;
     g_radio.nominal_downlink_frequency = freq_hz;
     g_radio.sub_park_frequency = RADIO_SUB_PARK_HZ;
+    g_radio.tx_inhibit_cleared = allow_tx;
+    if (radio_backend_select(&g_radio, radio_backend) != RADIO_OK) {
+        return EXIT_FAILURE;
+    }
     int rc = radio_init(&g_radio);
     if (rc != RADIO_OK) {
         fprintf(stderr, "error: radio_init failed (rc=%d)\n", rc);
