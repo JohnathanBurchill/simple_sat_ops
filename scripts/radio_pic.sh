@@ -10,7 +10,7 @@ usage() {
 
 case "$1" in
     antenna) DEV=/dev/video0 ;;
-    rig)     DEV=/dev/video1 ;;
+    rig)     DEV=/dev/video2 ;;
     *)       usage ;;
 esac
 
