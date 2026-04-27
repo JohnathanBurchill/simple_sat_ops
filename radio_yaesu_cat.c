@@ -100,6 +100,19 @@
 static void yaesu_cat_connect(radio_t *radio);
 static void yaesu_cat_disconnect(radio_t *radio);
 
+// Print the wire trace for one CAT exchange. Default is the ASCII form
+// (these are text commands, after all). --debug-output flips on the
+// hex-bytes view useful when chasing parity / encoding issues.
+static void yaesu_trace(const radio_t *r, const char *label,
+                        const char *bytes, size_t len)
+{
+    if (r->debug_wire) {
+        printcmd(label, (const unsigned char *)bytes, (int)len);
+    } else {
+        fprintf(stderr, "%s %.*s\n", label, (int)len, bytes);
+    }
+}
+
 // Send an ASCII CAT command (no terminator added — caller includes the ';').
 // If reply is non-NULL, read until the next ';' into reply (size reply_cap)
 // and NUL-terminate. Returns RADIO_OK on success, RADIO_BAD_RESPONSE on I/O
@@ -109,7 +122,7 @@ static int yaesu_send(radio_t *radio, const char *cmd, char *reply, size_t reply
     if (!radio->connected) {
         return RADIO_BAD_RESPONSE;
     }
-    printcmd("CAT command:", (uint8_t *)cmd, strlen(cmd));
+    yaesu_trace(radio, "CAT command:", cmd, strlen(cmd));
 
     tcflush(radio->fd, TCIOFLUSH);
     ssize_t n = write(radio->fd, cmd, strlen(cmd));
@@ -142,7 +155,7 @@ static int yaesu_send(radio_t *radio, const char *cmd, char *reply, size_t reply
         if (ch == ';') break;
     }
     reply[off] = '\0';
-    printcmd("CAT reply:", (uint8_t *)reply, off);
+    yaesu_trace(radio, "CAT reply:  ", reply, off);
     if (off == 0) {
         return RADIO_BAD_RESPONSE;
     }

@@ -134,6 +134,11 @@ typedef struct radio
     // no out-of-band PTT-release path (e.g. B210 has no PTT to release).
     uint8_t ptt_off_raw[16];
     uint8_t ptt_off_raw_len;
+
+    // When set, backends with ASCII wire protocols (Yaesu CAT) print
+    // wire activity as raw hex bytes rather than the human-readable
+    // ASCII string. IC-9700 / CI-V is binary so its trace is always hex.
+    int debug_wire;
 } radio_t;
 
 int radio_init(radio_t *radio);

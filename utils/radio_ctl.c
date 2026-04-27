@@ -64,6 +64,10 @@ static void usage(FILE *f)
         "                             used by 'init' (default %.0f).\n"
         "  --allow-tx                 Required to actually key TX (ptt on).\n"
         "  --allow-high-power         Required for set-power above 10%%.\n"
+        "  --debug-output             Print wire bytes as hex (default is\n"
+        "                             ASCII for the FT-991A's text CAT;\n"
+        "                             always hex for the IC-9700's binary\n"
+        "                             CI-V).\n"
         "  -h, --help                 This message.\n"
         "\n"
         "Commands:\n"
@@ -151,6 +155,7 @@ int main(int argc, char **argv)
     int allow_high_power = 0;
     int store_device = 0;
     int store_serial_speed = 0;
+    int debug_wire = 0;
 
     int i = 1;
     for (; i < argc; ++i) {
@@ -170,6 +175,7 @@ int main(int argc, char **argv)
         else if (strncmp(a, "--freq-hz=", 10) == 0)              nominal_hz = atof(a + 10);
         else if (strcmp(a, "--allow-tx") == 0)                   allow_tx = 1;
         else if (strcmp(a, "--allow-high-power") == 0)           allow_high_power = 1;
+        else if (strcmp(a, "--debug-output") == 0)               debug_wire = 1;
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
             usage(stdout);
             return 0;
@@ -307,6 +313,7 @@ int main(int argc, char **argv)
     r.serial_speed = effective_speed;
     r.nominal_downlink_frequency = nominal_hz;
     r.tx_inhibit_cleared = allow_tx;
+    r.debug_wire = debug_wire;
 
     if (radio_backend_select(&r, backend) != RADIO_OK) {
         return RADIO_ERROR;
