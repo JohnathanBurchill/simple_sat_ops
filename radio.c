@@ -449,6 +449,22 @@ int radio_set_moni_level(radio_t *radio, int level_0_to_255)
     return radio_command(radio, 0x14, 0x15, -1, data, 2, NULL, 0);
 }
 
+// CI-V `14 0A <BCD4>`: RF Power, 0000..0255 ↔ 0..100% of the band's max
+// (UHF: 75 W = 100%). Affects whichever band/mode is active on the
+// current VFO. Callers express this as a percentage and convert with
+// (pct * 255 + 50) / 100, mirroring the moni/usb-mod helpers.
+int radio_set_rf_power(radio_t *radio, int level_0_to_255)
+{
+    if (level_0_to_255 < 0)   level_0_to_255 = 0;
+    if (level_0_to_255 > 255) level_0_to_255 = 255;
+    int hundreds = level_0_to_255 / 100;
+    int ones     = level_0_to_255 % 100;
+    uint8_t data[2];
+    data[0] = (uint8_t)(((hundreds / 10) << 4) | (hundreds % 10));
+    data[1] = (uint8_t)(((ones / 10)     << 4) | (ones     % 10));
+    return radio_command(radio, 0x14, 0x0A, -1, data, 2, NULL, 0);
+}
+
 // Convenience: put the IC-9700 in the full configuration needed for an
 // AX100 uplink. FM operating mode + DATA on + Data Mod source = USB.
 // Does not touch USB MOD Level — call radio_set_usb_mod_level() separately

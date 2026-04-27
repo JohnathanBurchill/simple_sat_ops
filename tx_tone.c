@@ -104,6 +104,9 @@ static void usage(FILE *dest, const char *name, int full)
         "                               itself stays a front-panel toggle)\n"
         "  --uplink-mod-level=<0..100>  USB MOD level, %% (CI-V 1A 05 01 13;\n"
         "                               how loud your PCM is on the modulator)\n"
+        "  --tx-power=<0..100>          RF power, %% (CI-V 14 0A). Untouched if\n"
+        "                               omitted (uses the radio's current setting).\n"
+        "  --allow-high-power           Required for --tx-power above 10%%.\n"
         "  --help                       Short help (this message)\n"
         "  --help-full                  Detailed help with setup and verification\n",
         name, FRONTIERSAT_CARRIER_HZ, FRONTIERSAT_CARRIER_HZ / 1e6);
@@ -259,6 +262,8 @@ int main(int argc, char **argv)
     int data_mod_source = -1;  // < 0 = leave whatever radio_uplink_prep set
     int moni_level_pct = -1;  // < 0 = don't touch
     int uplink_mod_level = -1;  // < 0 = don't touch (% 0..100)
+    int tx_power_pct = -1;  // < 0 = don't touch (% 0..100)
+    int allow_high_power = 0;
     int record_warmup_ms = 600;
 
     for (int i = 1; i < argc; i++) {
@@ -327,6 +332,15 @@ int main(int argc, char **argv)
                 fprintf(stderr, "--uplink-mod-level must be 0..100 (%%)\n");
                 return EXIT_FAILURE;
             }
+        } else if (strncmp("--tx-power=", argv[i], 11) == 0) {
+            if (strlen(argv[i]) < 12) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
+            tx_power_pct = atoi(argv[i] + 11);
+            if (tx_power_pct < 0 || tx_power_pct > 100) {
+                fprintf(stderr, "--tx-power must be 0..100 (%%)\n");
+                return EXIT_FAILURE;
+            }
+        } else if (strcmp("--allow-high-power", argv[i]) == 0) {
+            allow_high_power = 1;
         } else if (strncmp("--record-warmup-ms=", argv[i], 19) == 0) {
             if (strlen(argv[i]) < 20) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
             record_warmup_ms = atoi(argv[i] + 19);
@@ -374,6 +388,19 @@ int main(int argc, char **argv)
         rc = radio_set_data_mod_source(&g_radio, data_mod_source);
         if (rc != RADIO_OK) {
             fprintf(stderr, "warning: could not override DATA MOD source (rc=%d)\n", rc);
+        }
+    }
+    if (tx_power_pct >= 0) {
+        if (tx_power_pct > 10 && !allow_high_power) {
+            fprintf(stderr, "error: --tx-power=%d above 10%% safety threshold; "
+                    "add --allow-high-power to override.\n", tx_power_pct);
+            radio_disconnect(&g_radio);
+            return EXIT_FAILURE;
+        }
+        int raw = (int)((tx_power_pct * 255 + 50) / 100);
+        rc = radio_set_rf_power(&g_radio, raw);
+        if (rc != RADIO_OK) {
+            fprintf(stderr, "warning: could not set RF power (rc=%d)\n", rc);
         }
     }
     if (uplink_mod_level >= 0) {

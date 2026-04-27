@@ -51,6 +51,10 @@ typedef struct state
     int prepare_uplink;
     // Requested USB MOD level 0..255, or -1 to leave untouched.
     int uplink_mod_level;
+    // Requested RF power as a percentage 0..100, or -1 to leave untouched.
+    int tx_power_pct;
+    // Required when tx_power_pct > 10 to actually apply.
+    int allow_high_power;
     // Antenna control
     antenna_rotator_t antenna_rotator;
     int run_with_antenna_rotator;

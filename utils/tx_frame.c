@@ -233,6 +233,9 @@ static void usage(FILE *out, const char *argv0)
         "                              itself stays a front-panel toggle)\n"
         "  --uplink-mod-level=<0..100> USB MOD level, %% (CI-V 1A 05 01 13;\n"
         "                              how loud your PCM is on the modulator)\n"
+        "  --tx-power=<0..100>         RF power, %% (CI-V 14 0A). Untouched if\n"
+        "                              omitted (uses the radio's current setting).\n"
+        "  --allow-high-power          Required for --tx-power above 10%%.\n"
         "\n"
         "Safety / dry-run:\n"
         "  --dry-run                   Build the frame, print size, do not TX\n"
@@ -259,6 +262,8 @@ int main(int argc, char **argv)
     int post_ms = 200;
     int moni_level_pct = -1;  // < 0 = don't touch
     int uplink_mod_level = -1;  // < 0 = don't touch (% 0..100)
+    int tx_power_pct = -1;  // < 0 = don't touch (% 0..100)
+    int allow_high_power = 0;
     int record_warmup_ms = 600;
 
     csp_v1_header_t csp_hdr = {
@@ -320,6 +325,14 @@ int main(int argc, char **argv)
                 return 1;
             }
         }
+        else if (starts_with(a, "--tx-power=")) {
+            tx_power_pct = atoi(a + 11);
+            if (tx_power_pct < 0 || tx_power_pct > 100) {
+                fprintf(stderr, "--tx-power must be 0..100 (%%)\n");
+                return 1;
+            }
+        }
+        else if (strcmp(a, "--allow-high-power") == 0) allow_high_power = 1;
         else if (starts_with(a, "--record-warmup-ms=")) {
             record_warmup_ms = atoi(a + 19);
             if (record_warmup_ms < 0) record_warmup_ms = 0;
@@ -434,6 +447,19 @@ int main(int argc, char **argv)
         rc = radio_set_usb_mod_level(&radio, raw);
         if (rc != RADIO_OK) {
             fprintf(stderr, "warning: could not set USB MOD level (rc=%d)\n", rc);
+        }
+    }
+    if (tx_power_pct >= 0) {
+        if (tx_power_pct > 10 && !allow_high_power) {
+            fprintf(stderr, "error: --tx-power=%d above 10%% safety threshold; "
+                    "add --allow-high-power to override.\n", tx_power_pct);
+            radio_disconnect(&radio);
+            return 1;
+        }
+        int raw = (int)((tx_power_pct * 255 + 50) / 100);
+        rc = radio_set_rf_power(&radio, raw);
+        if (rc != RADIO_OK) {
+            fprintf(stderr, "warning: could not set RF power (rc=%d)\n", rc);
         }
     }
     if (moni_level_pct >= 0) {

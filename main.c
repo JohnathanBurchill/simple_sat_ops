@@ -87,6 +87,9 @@ void usage(FILE *dest, const char *name, int full)
         "                               (required config for AX100 uplink)\n"
         "  --uplink-mod-level=<0..255>  Also set USB MOD Level via CI-V\n"
         "                               (empirical; tune to AX100 deviation)\n"
+        "  --tx-power=<0..100>          RF power, %% (CI-V 14 0A). Untouched if\n"
+        "                               omitted (uses the radio's current setting).\n"
+        "  --allow-high-power           Required for --tx-power above 10%%.\n"
         "\n"
         "Radio transport (see --help-full for the two supported setups):\n"
         "  --radio-device=<path>        CI-V tty (default /dev/ttyUSB1)\n"
@@ -437,6 +440,19 @@ int main(int argc, char **argv)
                     fprintf(stderr, "Error setting USB MOD level\n");
                     return EXIT_FAILURE;
                 }
+            }
+        }
+        if (state.tx_power_pct >= 0) {
+            if (state.tx_power_pct > 10 && !state.allow_high_power) {
+                fprintf(stderr, "error: --tx-power=%d above 10%% safety threshold; "
+                        "add --allow-high-power to override.\n", state.tx_power_pct);
+                return EXIT_FAILURE;
+            }
+            int raw = (int)((state.tx_power_pct * 255 + 50) / 100);
+            radio_result = radio_set_rf_power(&state.radio, raw);
+            if (radio_result != RADIO_OK) {
+                fprintf(stderr, "Error setting RF power\n");
+                return EXIT_FAILURE;
             }
         }
         // Optional ALSA capture. Gated on audio_record so --without-audio
@@ -802,6 +818,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->run_with_radio = 0;
     state->prepare_uplink = 0;
     state->uplink_mod_level = -1;
+    state->tx_power_pct = -1;
+    state->allow_high_power = 0;
     state->radio.device_filename = "/dev/ttyUSB1";
     state->radio.serial_speed = B115200;
     // state->radio.serial_speed = B9600;
@@ -858,6 +876,20 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 return EXIT_FAILURE;
             }
             state->prepare_uplink = 1;
+        } else if (strncmp("--tx-power=", argv[i], 11) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 12) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state->tx_power_pct = atoi(argv[i] + 11);
+            if (state->tx_power_pct < 0 || state->tx_power_pct > 100) {
+                fprintf(stderr, "--tx-power must be 0..100 (%%)\n");
+                return EXIT_FAILURE;
+            }
+        } else if (strcmp("--allow-high-power", argv[i]) == 0) {
+            state->n_options++;
+            state->allow_high_power = 1;
         } else if (strncmp("--radio-device=", argv[i], 15) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 16) {
