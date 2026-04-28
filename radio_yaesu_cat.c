@@ -141,6 +141,15 @@ static int yaesu_send(radio_t *radio, const char *cmd, char *reply, size_t reply
     tcdrain(radio->fd);
 
     if (reply == NULL || reply_cap == 0) {
+        // Fire-and-forget: give the FT-991A's CAT engine time to commit
+        // this command before the next one starts arriving in its UART
+        // buffer. At 38400 baud the natural inter-command gap is just
+        // 1-3 ms (the wire time of the previous command) which is too
+        // tight — back-to-back FA;MD;EX; writes during uplink_prep can
+        // race the radio's per-command commit time. 40 ms covers the
+        // observed worst case with margin and is unnoticeable on the
+        // 5-command uplink_prep sequence.
+        usleep(40 * 1000);
         return RADIO_OK;
     }
 
