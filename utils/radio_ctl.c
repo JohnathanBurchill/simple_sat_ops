@@ -82,6 +82,10 @@ static void usage(FILE *f)
         "                             behaviour as --store-device.\n"
         "  --freq-hz=<hz>             Override radio_t.nominal_downlink_frequency\n"
         "                             used by 'init' (default %.0f).\n"
+        "  --tx-power=<0..100>        Set RF power (%%) before the subcommand\n"
+        "                             runs. Same 10%% safety gate as set-power.\n"
+        "                             Convenient with 'ptt on' so a low power\n"
+        "                             is applied before the radio is keyed.\n"
         "  --allow-tx                 Required to actually key TX (ptt on).\n"
         "  --allow-high-power         Required for set-power above 10%%.\n"
         "  --allow-hf-tx              Required to key TX below 100 MHz. Blocks\n"
@@ -190,6 +194,7 @@ int main(int argc, char **argv)
     int verify = 0;
     int allow_hf_tx = 0;
     double duration_s = 0.0;
+    int tx_power_pct = -1;  // < 0 = leave radio's current power alone
 
     int i = 1;
     for (; i < argc; ++i) {
@@ -213,6 +218,14 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--verify") == 0)                     verify = 1;
         else if (strcmp(a, "--allow-hf-tx") == 0)                allow_hf_tx = 1;
         else if (strncmp(a, "--duration=", 11) == 0)             duration_s = atof(a + 11);
+        else if (strncmp(a, "--tx-power=", 11) == 0) {
+            int pct;
+            if (parse_pct(a + 11, &pct) < 0) {
+                fprintf(stderr, "--tx-power: need <0..100>\n");
+                return RADIO_ERROR;
+            }
+            tx_power_pct = pct;
+        }
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
             usage(stdout);
             return 0;
@@ -361,6 +374,24 @@ int main(int argc, char **argv)
         fprintf(stderr, "radio_init failed (rc=%d)\n", rc);
         radio_disconnect(&r);
         return rc;
+    }
+
+    // --tx-power= applies before the subcommand. Same 10% safety gate as
+    // the explicit 'set-power' subcommand so the same override (--allow-
+    // high-power) opts in. Most useful with 'ptt on' (with or without
+    // --duration) so the power is staged before the radio keys.
+    if (tx_power_pct >= 0) {
+        if (tx_power_pct > 10 && !allow_high_power) {
+            fprintf(stderr, "--tx-power=%d above 10%% safety threshold; "
+                    "add --allow-high-power.\n", tx_power_pct);
+            radio_disconnect(&r);
+            return RADIO_ERROR;
+        }
+        int raw = (tx_power_pct * 255 + 50) / 100;
+        int p_rc = radio_set_rf_power(&r, raw);
+        if (p_rc != RADIO_OK) {
+            fprintf(stderr, "warning: --tx-power: rf_power set failed (rc=%d)\n", p_rc);
+        }
     }
 
     if (strcmp(cmd, "init") == 0 || strcmp(cmd, "identify") == 0) {
