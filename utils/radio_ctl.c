@@ -30,13 +30,32 @@
 
 #include <ctype.h>
 #include <math.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
+#include <unistd.h>
 #include <strings.h>
 
 static const char *g_argv0 = "radio_ctl";
+
+// For the SIGINT handler. Set to point at the live radio_t while we
+// might have TX keyed; cleared back to NULL afterwards. Only the raw
+// PTT-off bytes are written, via a single async-signal-safe write().
+static radio_t *g_signal_radio = NULL;
+
+static void on_sigint(int sig)
+{
+    (void)sig;
+    if (g_signal_radio != NULL && g_signal_radio->connected
+        && g_signal_radio->ptt_off_raw_len > 0) {
+        (void)!write(g_signal_radio->fd,
+                     g_signal_radio->ptt_off_raw,
+                     g_signal_radio->ptt_off_raw_len);
+    }
+    _exit(130);
+}
 
 static void usage(FILE *f)
 {
@@ -76,6 +95,10 @@ static void usage(FILE *f)
         "  --verify                   After set-freq / set-mode / set-power,\n"
         "                             read the value back and report whether\n"
         "                             it matches what was requested.\n"
+        "  --duration=<seconds>       For 'ptt on': key, sleep this many\n"
+        "                             seconds, then release. Fractional\n"
+        "                             seconds are accepted. Ctrl-C during the\n"
+        "                             sleep releases TX cleanly.\n"
         "  -h, --help                 This message.\n"
         "\n"
         "Commands:\n"
@@ -166,6 +189,7 @@ int main(int argc, char **argv)
     int debug_wire = 0;
     int verify = 0;
     int allow_hf_tx = 0;
+    double duration_s = 0.0;
 
     int i = 1;
     for (; i < argc; ++i) {
@@ -188,6 +212,7 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--debug-output") == 0)               debug_wire = 1;
         else if (strcmp(a, "--verify") == 0)                     verify = 1;
         else if (strcmp(a, "--allow-hf-tx") == 0)                allow_hf_tx = 1;
+        else if (strncmp(a, "--duration=", 11) == 0)             duration_s = atof(a + 11);
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
             usage(stdout);
             return 0;
@@ -445,6 +470,7 @@ int main(int argc, char **argv)
             // through 50 MHz; anything < 100 MHz routes there. If your
             // dummy load / antenna is only on V/U, an HF TX into an
             // unconnected jack is a serious risk to the PA.
+            int hf_blocked = 0;
             if (on && !allow_hf_tx) {
                 double f = radio_get_frequency(&r);
                 if (f > 0.0 && f < 100e6) {
@@ -453,11 +479,31 @@ int main(int argc, char **argv)
                             "the HF/50 connector. Add --allow-hf-tx if you "
                             "really mean it.\n", f / 1e6);
                     rc = RADIO_ERROR;
+                    hf_blocked = 1;
+                }
+            }
+            if (!hf_blocked) {
+                if (on && duration_s > 0.0) {
+                    // Auto-release path: install a Ctrl-C handler so the
+                    // radio is unkeyed even if the user kills us mid-sleep,
+                    // then key, sleep, release.
+                    g_signal_radio = &r;
+                    struct sigaction sa = {0};
+                    sa.sa_handler = on_sigint;
+                    sigemptyset(&sa.sa_mask);
+                    sigaction(SIGINT,  &sa, NULL);
+                    sigaction(SIGTERM, &sa, NULL);
+
+                    rc = radio_ptt(&r, 1);
+                    if (rc == RADIO_OK) {
+                        fprintf(stderr, "ptt: keyed for %.3f s ...\n", duration_s);
+                        usleep((useconds_t)(duration_s * 1.0e6));
+                        rc = radio_ptt(&r, 0);
+                    }
+                    g_signal_radio = NULL;
                 } else {
                     rc = radio_ptt(&r, on);
                 }
-            } else {
-                rc = radio_ptt(&r, on);
             }
         }
     }
