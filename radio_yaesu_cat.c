@@ -437,17 +437,33 @@ static int yaesu_cat_ptt(radio_t *radio, int on)
 // data, wait 1-2 seconds, then send PS1;. Without the dummy data the
 // radio sleeps through the PS1; entirely. The DC supply must be on
 // for any of this to work.
+//
+// Empirically the FT-991A needs more than the manual implies:
+//   - The wake-up burst has to be longer than ~5 ms of carrier; 5 null
+//     bytes at 38400 (~1.3 ms) was not enough. 60 bytes (~16 ms) wakes
+//     the MCU reliably.
+//   - The PS1; itself can be missed if it lands while the MCU is still
+//     coming up; sending it twice with a small gap covers that.
+//   - After PS1; we hold the port open for a beat so close()-induced
+//     DTR drop doesn't interrupt the radio's boot sequence.
 static int yaesu_cat_power(radio_t *radio, int on)
 {
     if (on) {
         if (radio->connected) {
-            uint8_t dummy[5] = {0};
+            uint8_t dummy[60] = {0};
             (void)!write(radio->fd, dummy, sizeof dummy);
             tcdrain(radio->fd);
         }
-        // Manual says >1 s and <2 s. 1.2 s sits comfortably in the window.
-        usleep(1200 * 1000);
-        return yaesu_send(radio, "PS1;", NULL, 0);
+        usleep(1500 * 1000);  // 1.5 s, middle of the 1-2 s window
+        int rc = yaesu_send(radio, "PS1;", NULL, 0);
+        usleep(250 * 1000);
+        // Belt-and-braces: a second PS1; in case the first slipped past
+        // a still-coming-up CAT decoder.
+        (void)yaesu_send(radio, "PS1;", NULL, 0);
+        // Hold the port open long enough for the radio's MCU to act on
+        // the command before our caller's close() drops DTR.
+        usleep(500 * 1000);
+        return rc;
     }
     return yaesu_send(radio, "PS0;", NULL, 0);
 }
