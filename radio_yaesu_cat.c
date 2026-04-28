@@ -432,6 +432,26 @@ static int yaesu_cat_ptt(radio_t *radio, int on)
     return yaesu_send(radio, on ? "TX1;" : "TX0;", NULL, 0);
 }
 
+// Soft power on/off via PS<n>;. Per the CAT manual page 14, PS-on
+// requires the radio's CAT decoder to be woken up first: send dummy
+// data, wait 1-2 seconds, then send PS1;. Without the dummy data the
+// radio sleeps through the PS1; entirely. The DC supply must be on
+// for any of this to work.
+static int yaesu_cat_power(radio_t *radio, int on)
+{
+    if (on) {
+        if (radio->connected) {
+            uint8_t dummy[5] = {0};
+            (void)!write(radio->fd, dummy, sizeof dummy);
+            tcdrain(radio->fd);
+        }
+        // Manual says >1 s and <2 s. 1.2 s sits comfortably in the window.
+        usleep(1200 * 1000);
+        return yaesu_send(radio, "PS1;", NULL, 0);
+    }
+    return yaesu_send(radio, "PS0;", NULL, 0);
+}
+
 static const radio_backend_ops_t yaesu_cat_ops = {
     .name                  = "yaesu-cat",
     .init                  = yaesu_cat_init,
@@ -450,6 +470,7 @@ static const radio_backend_ops_t yaesu_cat_ops = {
     .set_rf_power          = yaesu_cat_set_rf_power,
     .set_rf_power_watts    = yaesu_cat_set_rf_power_watts,
     .ptt                   = yaesu_cat_ptt,
+    .power                 = yaesu_cat_power,
     .get_band_selection    = NULL,
     .set_band_selection    = NULL,
     .toggle_waterfall      = NULL,

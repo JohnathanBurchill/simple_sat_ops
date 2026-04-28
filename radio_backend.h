@@ -71,6 +71,11 @@ typedef struct radio_backend_ops {
     // setting (e.g. it has only a 0..100% knob with no band-max info).
     int    (*set_rf_power_watts)(radio_t *r, int watts);
     int    (*ptt)(radio_t *r, int on);
+    // Power the radio on / off via CAT. Power-on includes the
+    // backend-specific wake-up sequence (Yaesu: dummy bytes + delay +
+    // PS1;; Icom: 0xFE preamble + 18 01). Requires the DC supply to be
+    // applied — CAT can't wake a radio that has no power at all.
+    int    (*power)(radio_t *r, int on);
     int    (*get_band_selection)(radio_t *r, int band);
     int    (*set_band_selection)(radio_t *r, int band);
     int    (*toggle_waterfall)(radio_t *r);

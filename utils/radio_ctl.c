@@ -120,6 +120,12 @@ static void usage(FILE *f)
         "  set-mod-level <0..100>     USB MOD level, %%.\n"
         "  set-moni-level <0..100>    Monitor level, %% (icom).\n"
         "  ptt <on|off>               Key / unkey.\n"
+        "  power <on|off>             Soft power the radio on or off via CAT.\n"
+        "                             Requires DC supply applied. Power-on\n"
+        "                             includes the wake-up sequence and takes\n"
+        "                             ~3 s to issue; the radio then needs\n"
+        "                             ~5-10 s to fully boot before further\n"
+        "                             CAT commands respond reliably.\n"
         "  identify                   Run init() then disconnect; loud about model.\n"
         "\n"
         "Exit code is RADIO_OK (0) on success, the RADIO_STATUS code otherwise.\n",
@@ -527,6 +533,17 @@ int main(int argc, char **argv)
         } else {
             int raw = (pct * 255 + 50) / 100;
             rc = radio_set_moni_level(&r, raw);
+        }
+    }
+    else if (strcmp(cmd, "power") == 0) {
+        if (i >= argc) { fprintf(stderr, "power: missing <on|off>\n"); rc = RADIO_ERROR; }
+        else {
+            int on = (strcasecmp(argv[i], "on") == 0 || strcmp(argv[i], "1") == 0);
+            rc = radio_power(&r, on);
+            if (rc == RADIO_OK && on) {
+                fprintf(stderr, "power: PS1; sent. Radio takes ~5-10 s to boot; "
+                        "wait before issuing further CAT.\n");
+            }
         }
     }
     else if (strcmp(cmd, "ptt") == 0) {

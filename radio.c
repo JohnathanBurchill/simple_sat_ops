@@ -219,6 +219,12 @@ int radio_ptt(radio_t *radio, int on)
     return radio->ops->ptt(radio, on);
 }
 
+int radio_power(radio_t *radio, int on)
+{
+    if (!radio || !radio->ops || !radio->ops->power) return unsupported(radio, "power");
+    return radio->ops->power(radio, on);
+}
+
 int radio_get_band_selection(radio_t *radio, int band)
 {
     if (!radio || !radio->ops || !radio->ops->get_band_selection) {

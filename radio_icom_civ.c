@@ -476,6 +476,25 @@ static int icom_civ_ptt(radio_t *radio, int on)
     return icom_civ_command(radio, 0x1C, 0x00, -1, data, 1, NULL, 0);
 }
 
+// Soft power on/off via CI-V `18 00` (off) / `18 01` (on). Power-on needs
+// a leading run of 0xFE bytes to wake the radio's CAT decoder; the count
+// scales with baud rate (Icom CI-V manual: ~25 at 4800, 13 at 9600,
+// 7 at 19200, 2 at 115200). Always sending 25 is harmless at higher
+// baud and leaves wide margin at lower.
+static int icom_civ_power(radio_t *radio, int on)
+{
+    if (on) {
+        if (radio->connected) {
+            uint8_t fe[25];
+            memset(fe, 0xFE, sizeof fe);
+            (void)!write(radio->fd, fe, sizeof fe);
+            tcdrain(radio->fd);
+        }
+        return icom_civ_command(radio, 0x18, 0x01, -1, NULL, 0, NULL, 0);
+    }
+    return icom_civ_command(radio, 0x18, 0x00, -1, NULL, 0, NULL, 0);
+}
+
 static int icom_civ_get_band_selection(radio_t *radio, int band)
 {
     uint64_t value = 0;
@@ -545,6 +564,7 @@ static const radio_backend_ops_t icom_civ_ops = {
     .set_rf_power          = icom_civ_set_rf_power,
     .set_rf_power_watts    = icom_civ_set_rf_power_watts,
     .ptt                   = icom_civ_ptt,
+    .power                 = icom_civ_power,
     .get_band_selection    = icom_civ_get_band_selection,
     .set_band_selection    = icom_civ_set_band_selection,
     .toggle_waterfall      = icom_civ_toggle_waterfall,

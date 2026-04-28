@@ -159,6 +159,7 @@ int radio_set_rf_power(radio_t *radio, int level_0_to_255);
 int radio_set_rf_power_watts(radio_t *radio, int watts);
 int radio_uplink_prep(radio_t *radio);
 int radio_ptt(radio_t *radio, int on);
+int radio_power(radio_t *radio, int on);
 int radio_get_band_selection(radio_t *radio, int band);
 int radio_set_band_selection(radio_t *radio, int band);
 int radio_toggle_waterfall(radio_t *radio);
