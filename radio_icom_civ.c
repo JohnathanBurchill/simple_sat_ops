@@ -446,6 +446,25 @@ static int icom_civ_set_rf_power(radio_t *radio, int level_0_to_255)
     return icom_civ_command(radio, 0x14, 0x0A, -1, data, 2, NULL, 0);
 }
 
+// IC-9700 has no direct "set absolute watts" CAT command; the 14 0A
+// scale is 0..100% of the active band's max. We pick the band max from
+// the current VFO frequency: 100 W on 2 m, 75 W on 70 cm, 10 W on 23 cm.
+// If we can't read the frequency or it's outside a known TX band, fall
+// back to 75 W (FrontierSat's UHF target).
+static int icom_civ_set_rf_power_watts(radio_t *radio, int watts)
+{
+    if (watts < 1) watts = 1;  // IC-9700's lowest commandable is 0% (~2 W)
+    int band_max_w = 75;
+    double f = icom_civ_get_frequency(radio);
+    if      (f >= 1240e6 && f <= 1300e6) band_max_w = 10;
+    else if (f >=  430e6 && f <=  450e6) band_max_w = 75;
+    else if (f >=  144e6 && f <=  148e6) band_max_w = 100;
+    if (watts > band_max_w) watts = band_max_w;
+    int raw = (watts * 255 + band_max_w / 2) / band_max_w;
+    if (raw > 255) raw = 255;
+    return icom_civ_set_rf_power(radio, raw);
+}
+
 static int icom_civ_ptt(radio_t *radio, int on)
 {
     uint8_t data[1];
@@ -520,6 +539,7 @@ static const radio_backend_ops_t icom_civ_ops = {
     .set_usb_mod_level     = icom_civ_set_usb_mod_level,
     .set_moni_level        = icom_civ_set_moni_level,
     .set_rf_power          = icom_civ_set_rf_power,
+    .set_rf_power_watts    = icom_civ_set_rf_power_watts,
     .ptt                   = icom_civ_ptt,
     .get_band_selection    = icom_civ_get_band_selection,
     .set_band_selection    = icom_civ_set_band_selection,

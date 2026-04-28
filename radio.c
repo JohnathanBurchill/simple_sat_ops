@@ -176,6 +176,12 @@ int radio_set_rf_power(radio_t *radio, int level_0_to_255)
     return radio->ops->set_rf_power(radio, level_0_to_255);
 }
 
+int radio_set_rf_power_watts(radio_t *radio, int watts)
+{
+    if (!radio || !radio->ops || !radio->ops->set_rf_power_watts) return unsupported(radio, "set_rf_power_watts");
+    return radio->ops->set_rf_power_watts(radio, watts);
+}
+
 // Composition of primitives. Backends that NULL out set_data_mode
 // (e.g. FT-991A, where DATA mode is a mode change rather than a flag) get
 // RADIO_NOT_SUPPORTED back; we treat that as OK and keep going so the

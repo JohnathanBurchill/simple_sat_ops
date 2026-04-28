@@ -65,6 +65,11 @@ typedef struct radio_backend_ops {
     int    (*set_usb_mod_level)(radio_t *r, int level_0_to_255);
     int    (*set_moni_level)(radio_t *r, int level_0_to_255);
     int    (*set_rf_power)(radio_t *r, int level_0_to_255);
+    // Set RF power in absolute watts. Backends clamp to their hardware
+    // minimum (printing a warning if the request was below it). Returns
+    // RADIO_NOT_SUPPORTED if the backend can't honour an absolute-watts
+    // setting (e.g. it has only a 0..100% knob with no band-max info).
+    int    (*set_rf_power_watts)(radio_t *r, int watts);
     int    (*ptt)(radio_t *r, int on);
     int    (*get_band_selection)(radio_t *r, int band);
     int    (*set_band_selection)(radio_t *r, int band);

@@ -381,18 +381,32 @@ static int yaesu_cat_set_usb_mod_level(radio_t *radio, int level_0_to_255)
     return yaesu_send(radio, cmd, NULL, 0);
 }
 
-// PC<nnn>; sets RF power 5..100 W. Project passes 0..255 ↔ 0..100% of band
-// max; on UHF max is 50 W, but PC<nnn>; uses absolute watts. Compromise:
-// scale 0..255 → 5..50 W on UHF for safety. The TX-inhibit and
+// PC<nnn>; sets RF power 5..100 W (page 14 of the CAT manual). Project
+// passes 0..255 ↔ 0..100% of band max; on UHF max is 50 W. Map
+// 0..255 → 5..50 W on UHF for safety. The TX-inhibit and
 // --allow-high-power gates upstream of this still apply.
 static int yaesu_cat_set_rf_power(radio_t *radio, int level_0_to_255)
 {
     if (level_0_to_255 < 0)   level_0_to_255 = 0;
     if (level_0_to_255 > 255) level_0_to_255 = 255;
-    // UHF cap on FT-991A is 50 W. Map 0..255 -> 5..50 W. Anything below 5
-    // is the radio's own minimum.
     int watts = 5 + (int)(((double)level_0_to_255 / 255.0) * 45.0 + 0.5);
     if (watts < 5)   watts = 5;
+    if (watts > 100) watts = 100;
+    char cmd[16];
+    snprintf(cmd, sizeof cmd, "PC%03d;", watts);
+    return yaesu_send(radio, cmd, NULL, 0);
+}
+
+// Direct watts. The FT-991A's PC command takes 005..100 (page 14), so
+// requests below 5 W are clamped up with a warning. Anything above 100
+// is clamped down silently (radio enforces band-specific max anyway).
+static int yaesu_cat_set_rf_power_watts(radio_t *radio, int watts)
+{
+    if (watts < 5) {
+        fprintf(stderr, "yaesu_cat: %d W requested; clamped to 5 W "
+                "(radio's PC minimum).\n", watts);
+        watts = 5;
+    }
     if (watts > 100) watts = 100;
     char cmd[16];
     snprintf(cmd, sizeof cmd, "PC%03d;", watts);
@@ -423,6 +437,7 @@ static const radio_backend_ops_t yaesu_cat_ops = {
     .set_usb_mod_level     = yaesu_cat_set_usb_mod_level,
     .set_moni_level        = NULL,  // future Menu 009 helper if ever needed
     .set_rf_power          = yaesu_cat_set_rf_power,
+    .set_rf_power_watts    = yaesu_cat_set_rf_power_watts,
     .ptt                   = yaesu_cat_ptt,
     .get_band_selection    = NULL,
     .set_band_selection    = NULL,

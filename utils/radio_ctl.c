@@ -82,10 +82,12 @@ static void usage(FILE *f)
         "                             behaviour as --store-device.\n"
         "  --freq-hz=<hz>             Override radio_t.nominal_downlink_frequency\n"
         "                             used by 'init' (default %.0f).\n"
-        "  --tx-power=<0..100>        Set RF power (%%) before the subcommand\n"
-        "                             runs. Same 10%% safety gate as set-power.\n"
-        "                             Convenient with 'ptt on' so a low power\n"
-        "                             is applied before the radio is keyed.\n"
+        "  --tx-power=<value>         Set RF power before the subcommand runs.\n"
+        "                             Plain number or 'N%%' = percent of band max\n"
+        "                             (10%% safety gate, --allow-high-power to\n"
+        "                             override). 'NW' = absolute watts (clamped\n"
+        "                             up to the radio's hardware minimum, 5 W on\n"
+        "                             FT-991A; not subject to the percent gate).\n"
         "  --allow-tx                 Required to actually key TX (ptt on).\n"
         "  --allow-high-power         Required for set-power above 10%%.\n"
         "  --allow-hf-tx              Required to key TX below 100 MHz. Blocks\n"
@@ -113,7 +115,8 @@ static void usage(FILE *f)
         "  set-mode <fm|usb|lsb|am|cw>          Operating mode.\n"
         "  set-data-mode <on|off>     DATA flag (icom) / mode-swap (yaesu).\n"
         "  set-data-mod-source <usb|mic|acc|mic_acc|mic_usb|lan>\n"
-        "  set-power <0..100>         RF power, %%.\n"
+        "  set-power <value>          RF power. Plain number or 'N%%' = percent;\n"
+        "                             'NW' = absolute watts. Examples: 10, 10%%, 5W.\n"
         "  set-mod-level <0..100>     USB MOD level, %%.\n"
         "  set-moni-level <0..100>    Monitor level, %% (icom).\n"
         "  ptt <on|off>               Key / unkey.\n"
@@ -130,6 +133,29 @@ static int parse_pct(const char *s, int *out)
     long v = strtol(s, &end, 10);
     if (end == s || *end != '\0' || v < 0 || v > 100) return -1;
     *out = (int)v;
+    return 0;
+}
+
+// Parses a power expression: "<n>" or "<n>%" → percent (0..100),
+// "<n>W" or "<n>w" → watts (>= 0). Sets *out_value and *out_is_watts.
+// Bash treats '%' as literal in argv (it only has special meaning inside
+// ${} parameter expansion), so 'radio_ctl --tx-power=10%' works
+// unquoted on the command line.
+static int parse_power(const char *s, int *out_value, int *out_is_watts)
+{
+    if (s == NULL || *s == '\0') return -1;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == s || v < 0) return -1;
+    if (*end == '\0' || *end == '%') {
+        if (v > 100) return -1;
+        *out_is_watts = 0;
+    } else if (*end == 'W' || *end == 'w') {
+        *out_is_watts = 1;
+    } else {
+        return -1;
+    }
+    *out_value = (int)v;
     return 0;
 }
 
@@ -194,7 +220,8 @@ int main(int argc, char **argv)
     int verify = 0;
     int allow_hf_tx = 0;
     double duration_s = 0.0;
-    int tx_power_pct = -1;  // < 0 = leave radio's current power alone
+    int tx_power_value = -1;     // < 0 = leave radio's current power alone
+    int tx_power_is_watts = 0;
 
     int i = 1;
     for (; i < argc; ++i) {
@@ -219,12 +246,13 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--allow-hf-tx") == 0)                allow_hf_tx = 1;
         else if (strncmp(a, "--duration=", 11) == 0)             duration_s = atof(a + 11);
         else if (strncmp(a, "--tx-power=", 11) == 0) {
-            int pct;
-            if (parse_pct(a + 11, &pct) < 0) {
-                fprintf(stderr, "--tx-power: need <0..100>\n");
+            int v, is_w;
+            if (parse_power(a + 11, &v, &is_w) < 0) {
+                fprintf(stderr, "--tx-power: expected '<n>', '<n>%%', or '<n>W'\n");
                 return RADIO_ERROR;
             }
-            tx_power_pct = pct;
+            tx_power_value = v;
+            tx_power_is_watts = is_w;
         }
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
             usage(stdout);
@@ -376,19 +404,26 @@ int main(int argc, char **argv)
         return rc;
     }
 
-    // --tx-power= applies before the subcommand. Same 10% safety gate as
-    // the explicit 'set-power' subcommand so the same override (--allow-
-    // high-power) opts in. Most useful with 'ptt on' (with or without
-    // --duration) so the power is staged before the radio keys.
-    if (tx_power_pct >= 0) {
-        if (tx_power_pct > 10 && !allow_high_power) {
-            fprintf(stderr, "--tx-power=%d above 10%% safety threshold; "
-                    "add --allow-high-power.\n", tx_power_pct);
-            radio_disconnect(&r);
-            return RADIO_ERROR;
+    // --tx-power= applies before the subcommand. Most useful with 'ptt
+    // on' so the power is staged before the radio keys. Two paths:
+    //   percent (10% safety gate, --allow-high-power to override)
+    //   absolute watts (no percent gate; backend clamps to its minimum
+    //                   and there's nothing wired to the front panel
+    //                   knob's > 5 W warning territory yet)
+    if (tx_power_value >= 0) {
+        int p_rc;
+        if (tx_power_is_watts) {
+            p_rc = radio_set_rf_power_watts(&r, tx_power_value);
+        } else {
+            if (tx_power_value > 10 && !allow_high_power) {
+                fprintf(stderr, "--tx-power=%d%% above 10%% safety threshold; "
+                        "add --allow-high-power.\n", tx_power_value);
+                radio_disconnect(&r);
+                return RADIO_ERROR;
+            }
+            int raw = (tx_power_value * 255 + 50) / 100;
+            p_rc = radio_set_rf_power(&r, raw);
         }
-        int raw = (tx_power_pct * 255 + 50) / 100;
-        int p_rc = radio_set_rf_power(&r, raw);
         if (p_rc != RADIO_OK) {
             fprintf(stderr, "warning: --tx-power: rf_power set failed (rc=%d)\n", p_rc);
         }
@@ -455,21 +490,23 @@ int main(int argc, char **argv)
         }
     }
     else if (strcmp(cmd, "set-power") == 0) {
-        int pct;
-        if (i >= argc || parse_pct(argv[i], &pct) < 0) {
-            fprintf(stderr, "set-power: need <0..100>\n");
+        int v, is_w;
+        if (i >= argc || parse_power(argv[i], &v, &is_w) < 0) {
+            fprintf(stderr, "set-power: expected '<n>', '<n>%%', or '<n>W'\n");
             rc = RADIO_ERROR;
-        } else if (pct > 10 && !allow_high_power) {
-            fprintf(stderr, "set-power=%d above 10%% safety threshold; "
-                    "add --allow-high-power.\n", pct);
+        } else if (is_w) {
+            rc = radio_set_rf_power_watts(&r, v);
+        } else if (v > 10 && !allow_high_power) {
+            fprintf(stderr, "set-power=%d%% above 10%% safety threshold; "
+                    "add --allow-high-power.\n", v);
             rc = RADIO_ERROR;
         } else {
-            int raw = (pct * 255 + 50) / 100;
+            int raw = (v * 255 + 50) / 100;
             rc = radio_set_rf_power(&r, raw);
-            if (rc == RADIO_OK && verify) {
-                fprintf(stderr, "set-power: verify not implemented "
-                        "(no portable get-rf-power op yet)\n");
-            }
+        }
+        if (rc == RADIO_OK && verify) {
+            fprintf(stderr, "set-power: verify not implemented "
+                    "(no portable get-rf-power op yet)\n");
         }
     }
     else if (strcmp(cmd, "set-mod-level") == 0) {
