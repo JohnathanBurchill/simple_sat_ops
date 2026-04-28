@@ -397,15 +397,26 @@ static int yaesu_cat_set_rf_power(radio_t *radio, int level_0_to_255)
     return yaesu_send(radio, cmd, NULL, 0);
 }
 
-// Direct watts. The FT-991A's PC command takes 005..100 (page 14), so
-// requests below 5 W are clamped up with a warning. Anything above 100
-// is clamped down silently (radio enforces band-specific max anyway).
+// Direct watts. The FT-991A's PC command takes 005..100 (page 14). FT-991A
+// per-band physical maxes: 100 W on HF / 6 m, 50 W on 2 m / 70 cm. We clamp
+// to the active band's max (looked up from the current VFO freq) with a
+// warning so an over-spec request is loud, not silent. Falls back to 100 W
+// if we can't read the frequency.
 static int yaesu_cat_set_rf_power_watts(radio_t *radio, int watts)
 {
     if (watts < 5) {
         fprintf(stderr, "yaesu_cat: %d W requested; clamped to 5 W "
                 "(radio's PC minimum).\n", watts);
         watts = 5;
+    }
+    int band_max_w = 100;
+    double f = yaesu_cat_get_frequency(radio);
+    if      (f >= 144e6 && f <= 148e6) band_max_w = 50;
+    else if (f >= 430e6 && f <= 450e6) band_max_w = 50;
+    if (watts > band_max_w) {
+        fprintf(stderr, "yaesu_cat: %d W requested; clamped to %d W "
+                "(active-band PA maximum).\n", watts, band_max_w);
+        watts = band_max_w;
     }
     if (watts > 100) watts = 100;
     char cmd[16];

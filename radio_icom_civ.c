@@ -459,7 +459,11 @@ static int icom_civ_set_rf_power_watts(radio_t *radio, int watts)
     if      (f >= 1240e6 && f <= 1300e6) band_max_w = 10;
     else if (f >=  430e6 && f <=  450e6) band_max_w = 75;
     else if (f >=  144e6 && f <=  148e6) band_max_w = 100;
-    if (watts > band_max_w) watts = band_max_w;
+    if (watts > band_max_w) {
+        fprintf(stderr, "icom_civ: %d W requested; clamped to %d W "
+                "(active-band PA maximum).\n", watts, band_max_w);
+        watts = band_max_w;
+    }
     int raw = (watts * 255 + band_max_w / 2) / band_max_w;
     if (raw > 255) raw = 255;
     return icom_civ_set_rf_power(radio, raw);
