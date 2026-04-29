@@ -192,6 +192,10 @@ int radio_set_rf_power_watts(radio_t *radio, int watts)
 // passive tools like `radio_ctl identify` open the radio without
 // changing its tuning, while tx_tone / tx_frame / simple_sat_ops — which
 // always call uplink_prep — still land at the carrier they want.
+//
+// Default MOD input = ACC (rear DATA jack) because the FrontierSat
+// ground-station path is SignaLink → rear DATA on both IC-9700 and
+// FT-991A. Operators running native USB CODEC pass --mod-input=usb.
 int radio_uplink_prep(radio_t *radio)
 {
     if (radio != NULL && radio->nominal_downlink_frequency > 0.0) {
@@ -202,7 +206,7 @@ int radio_uplink_prep(radio_t *radio)
     if (rc != RADIO_OK) return rc;
     rc = radio_set_data_mode(radio, 1, RADIO_FILTER_FIL1);
     if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) return rc;
-    rc = radio_set_data_mod_source(radio, RADIO_DATA_MOD_SRC_USB);
+    rc = radio_set_data_mod_source(radio, RADIO_DATA_MOD_SRC_ACC);
     if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) return rc;
     return RADIO_OK;
 }
