@@ -93,6 +93,12 @@ static void usage(FILE *dest, const char *name)
         "                               pass 0 to seed from the wall clock)\n"
         "  --data-mod-source=<src>      DATA MOD source: usb|acc|mic|mic+acc|\n"
         "                               mic+usb|lan (default usb)\n"
+        "  --filter=<fil1|fil2|fil3>    IC-9700 IF filter slot. Overrides the\n"
+        "                               FIL1 default set by radio_uplink_prep;\n"
+        "                               useful for comparing FIL1 vs FIL2/3\n"
+        "                               passband shapes against the same noise\n"
+        "                               source. Ignored on backends without\n"
+        "                               per-slot filters (e.g. FT-991A).\n"
         "\n"
         "Behaviour flags:\n"
         "  --no-ptt                     Skip PTT; play audio only (bench test)\n"
@@ -178,6 +184,7 @@ int main(int argc, char **argv)
     double amplitude = 0.2;
     uint64_t seed = 1;
     int data_mod_source = -1;
+    int filter = -1;  // < 0 = leave whatever radio_uplink_prep picked (FIL1)
     int moni_level_pct = -1;
     int uplink_mod_level = -1;
     int tx_power_pct = -1;
@@ -219,6 +226,16 @@ int main(int argc, char **argv)
             else if (strcmp(s, "lan")     == 0) data_mod_source = RADIO_DATA_MOD_SRC_LAN;
             else {
                 fprintf(stderr, "--data-mod-source: unknown '%s' (mic|acc|mic+acc|usb|mic+usb|lan)\n", s);
+                return EXIT_FAILURE;
+            }
+        } else if (strncmp("--filter=", argv[i], 9) == 0) {
+            if (strlen(argv[i]) < 10) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
+            const char *s = argv[i] + 9;
+            if      (strcmp(s, "fil1") == 0) filter = RADIO_FILTER_FIL1;
+            else if (strcmp(s, "fil2") == 0) filter = RADIO_FILTER_FIL2;
+            else if (strcmp(s, "fil3") == 0) filter = RADIO_FILTER_FIL3;
+            else {
+                fprintf(stderr, "--filter: unknown '%s' (fil1|fil2|fil3)\n", s);
                 return EXIT_FAILURE;
             }
         } else if (strcmp("--no-ptt", argv[i]) == 0) {
@@ -305,6 +322,21 @@ int main(int argc, char **argv)
         rc = radio_set_data_mod_source(&g_radio, data_mod_source);
         if (rc != RADIO_OK) {
             fprintf(stderr, "warning: could not override DATA MOD source (rc=%d)\n", rc);
+        }
+    }
+    // Filter override. radio_uplink_prep set FM + DATA on with FIL1; if the
+    // user asked for a different filter, re-issue both calls so the radio
+    // ends up in <mode>=FM-DATA with the requested filter slot. The IC-9700
+    // honours FIL1/2/3 directly; backends without that concept (FT-991A)
+    // will return RADIO_NOT_SUPPORTED, which we treat as a warning.
+    if (filter >= 0) {
+        rc = radio_set_mode(&g_radio, RADIO_MODE_FM, filter);
+        if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) {
+            fprintf(stderr, "warning: could not set filter (set_mode rc=%d)\n", rc);
+        }
+        rc = radio_set_data_mode(&g_radio, 1, filter);
+        if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) {
+            fprintf(stderr, "warning: could not set filter (set_data_mode rc=%d)\n", rc);
         }
     }
     if (tx_power_pct >= 0) {
