@@ -87,9 +87,12 @@ static void usage(FILE *dest, const char *name, int full)
         "  --duration-s=<seconds>       Tone duration (default 3.0). Per-step when\n"
         "                               --tone-stop-hz is set.\n"
         "  --amplitude=<0..1>           Amplitude into S16 full-scale (default 0.3)\n"
-        "  --data-mod-source=<src>      DATA MOD source: usb|acc|mic|mic+acc|\n"
-        "                               mic+usb|lan (default usb). Use acc or mic\n"
-        "                               when feeding the 9700 from a SignaLink etc.\n"
+        "  --mod-input=<src>            Modulator audio input: usb|acc|mic|\n"
+        "                               mic+acc|mic+usb|lan (default usb).\n"
+        "                               Yaesu mapping: usb=REAR+USB CODEC,\n"
+        "                               acc=REAR+DATA jack, mic=front MIC.\n"
+        "                               Pick acc when feeding either radio\n"
+        "                               from a SignaLink on the rear DATA jack.\n"
         "\n"
         "Behaviour flags:\n"
         "  --no-ptt                     Skip CI-V PTT; play audio only (bench test)\n"
@@ -298,9 +301,9 @@ int main(int argc, char **argv)
                 fprintf(stderr, "--tone-step-hz must be > 0\n");
                 return EXIT_FAILURE;
             }
-        } else if (strncmp("--data-mod-source=", argv[i], 18) == 0) {
-            if (strlen(argv[i]) < 19) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
-            const char *s = argv[i] + 18;
+        } else if (strncmp("--mod-input=", argv[i], 12) == 0) {
+            if (strlen(argv[i]) < 13) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
+            const char *s = argv[i] + 12;
             if      (strcmp(s, "mic")     == 0) data_mod_source = RADIO_DATA_MOD_SRC_MIC;
             else if (strcmp(s, "acc")     == 0) data_mod_source = RADIO_DATA_MOD_SRC_ACC;
             else if (strcmp(s, "mic+acc") == 0) data_mod_source = RADIO_DATA_MOD_SRC_MIC_ACC;
@@ -308,7 +311,7 @@ int main(int argc, char **argv)
             else if (strcmp(s, "mic+usb") == 0) data_mod_source = RADIO_DATA_MOD_SRC_MIC_USB;
             else if (strcmp(s, "lan")     == 0) data_mod_source = RADIO_DATA_MOD_SRC_LAN;
             else {
-                fprintf(stderr, "--data-mod-source: unknown '%s' (mic|acc|mic+acc|usb|mic+usb|lan)\n", s);
+                fprintf(stderr, "--mod-input: unknown '%s' (mic|acc|mic+acc|usb|mic+usb|lan)\n", s);
                 return EXIT_FAILURE;
             }
         } else if (strncmp("--duration-s=", argv[i], 13) == 0) {

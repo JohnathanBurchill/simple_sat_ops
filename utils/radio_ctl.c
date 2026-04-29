@@ -114,7 +114,11 @@ static void usage(FILE *f)
         "  set-freq <hz>              Tune the active VFO.\n"
         "  set-mode <fm|usb|lsb|am|cw>          Operating mode.\n"
         "  set-data-mode <on|off>     DATA flag (icom) / mode-swap (yaesu).\n"
-        "  set-data-mod-source <usb|mic|acc|mic_acc|mic_usb|lan>\n"
+        "  set-mod-input <usb|mic|acc|mic_acc|mic_usb|lan>\n"
+        "                             Modulator audio input. Yaesu mapping:\n"
+        "                             usb=REAR+USB CODEC, acc=REAR+DATA jack,\n"
+        "                             mic=front MIC. Also pins Yaesu PKT MODE\n"
+        "                             to 9600 so DATA-FM stays wide.\n"
         "  set-power <value>          RF power. Plain number or 'N%%' = percent;\n"
         "                             'NW' = absolute watts. Examples: 10, 10%%, 5W.\n"
         "  set-mod-level <0..100>     USB MOD level, %%.\n"
@@ -487,11 +491,11 @@ int main(int argc, char **argv)
             rc = radio_set_data_mode(&r, on, RADIO_FILTER_FIL1);
         }
     }
-    else if (strcmp(cmd, "set-data-mod-source") == 0) {
-        if (i >= argc) { fprintf(stderr, "set-data-mod-source: missing <src>\n"); rc = RADIO_ERROR; }
+    else if (strcmp(cmd, "set-mod-input") == 0) {
+        if (i >= argc) { fprintf(stderr, "set-mod-input: missing <src>\n"); rc = RADIO_ERROR; }
         else {
             int s = parse_mod_source(argv[i]);
-            if (s < 0) { fprintf(stderr, "set-data-mod-source: unknown '%s'\n", argv[i]); rc = RADIO_ERROR; }
+            if (s < 0) { fprintf(stderr, "set-mod-input: unknown '%s'\n", argv[i]); rc = RADIO_ERROR; }
             else { rc = radio_set_data_mod_source(&r, s); }
         }
     }

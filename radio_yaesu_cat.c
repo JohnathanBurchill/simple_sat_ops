@@ -35,12 +35,11 @@
 //                                  raise RTS; leave the radio off.
 //   Menu 070 DATA IN   = REAR     0:MIC 1:REAR. Set by set_data_mod_source.
 //   Menu 072 DATA PORT = USB|DATA 1:DATA jack 2:USB. Same.
-//   Menu 079 FM PKT MODE = 9600   P2 0:1200 1:9600. Set on the front panel
-//                                  before any 9600-bps work; not driven
-//                                  here because it only matters when the
-//                                  radio is in FM packet mode (MD04;).
-//                                  Operating mode for our uplink is
-//                                  DATA-FM (MD0A;) which uses Menu 070-072.
+//   Menu 079 FM PKT MODE = 9600   P2 0:1200 1:9600. Driven by
+//                                  set_data_mod_source so DATA-FM uplinks
+//                                  always come up wide enough to pass
+//                                  9600-baud GFSK; harmless if the operator
+//                                  is only doing tone/audio tests.
 //
 // The FT-991A's USB bridge (Silicon Labs CP2105) is a dual-port chip;
 // either virtual COM port carries CAT, so first-time bring-up may need
@@ -60,7 +59,8 @@
 //   TX1; / RX;           PTT keyed via mic / unkey
 //   EX076<DAKY|MIC>;     Menu 076 = DATA MOD source
 //   EX078<nnn>;          Menu 078 = USB MOD level (0..100)
-//   EX079<2>;            Menu 079 = PKT RATE (1=1200, 2=9600). Set on init.
+//   EX079<n>;            Menu 079 = PKT MODE (0=1200, 1=9600). Pinned to 1
+//                        whenever set_data_mod_source runs.
 //
 // FT-991A has no equivalent of the IC-9700's satellite mode, sub VFO,
 // FIL1/2/3 or 0x27 waterfall stream — those ops are NULL in the vtable.
@@ -366,8 +366,12 @@ static int yaesu_cat_set_data_mod_source(radio_t *radio, int source)
     if (rc != RADIO_OK) return rc;
     if (port_sel != NULL) {
         rc = yaesu_send(radio, port_sel, NULL, 0);
+        if (rc != RADIO_OK) return rc;
     }
-    return rc;
+    // Pin PKT MODE = 9600 so the DATA-FM modulator path is wide enough for
+    // 9600-baud GFSK. No-op if the radio was already there; harmless on
+    // tone tests; matters when AX100 frames hit the air.
+    return yaesu_send(radio, "EX0791;", NULL, 0);
 }
 
 // Menu 078 = USB MOD level, 0..100. The project passes 0..255; rescale.

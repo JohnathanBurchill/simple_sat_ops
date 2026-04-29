@@ -96,9 +96,11 @@ static void usage(FILE *dest, const char *name)
         "                               (subject to mic-EQ / pre-emphasis /\n"
         "                               front-panel MOD INPUT) instead of the\n"
         "                               flat FM-DATA path.\n"
-        "  --data-mod-source=<src>      DATA MOD source: usb|acc|mic|mic+acc|\n"
-        "                               mic+usb|lan (default usb). Ignored\n"
-        "                               when --mode=fm.\n"
+        "  --mod-input=<src>            Modulator audio input: usb|acc|mic|\n"
+        "                               mic+acc|mic+usb|lan (default usb).\n"
+        "                               Yaesu mapping: usb=REAR+USB CODEC,\n"
+        "                               acc=REAR+DATA jack, mic=front MIC.\n"
+        "                               Ignored when --mode=fm.\n"
         "  --filter=<fil1|fil2|fil3>    IC-9700 IF filter slot. Overrides the\n"
         "                               FIL1 default set by radio_uplink_prep;\n"
         "                               useful for comparing FIL1 vs FIL2/3\n"
@@ -222,9 +224,9 @@ int main(int argc, char **argv)
         } else if (strncmp("--seed=", argv[i], 7) == 0) {
             if (strlen(argv[i]) < 8) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
             seed = strtoull(argv[i] + 7, NULL, 0);
-        } else if (strncmp("--data-mod-source=", argv[i], 18) == 0) {
-            if (strlen(argv[i]) < 19) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
-            const char *s = argv[i] + 18;
+        } else if (strncmp("--mod-input=", argv[i], 12) == 0) {
+            if (strlen(argv[i]) < 13) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
+            const char *s = argv[i] + 12;
             if      (strcmp(s, "mic")     == 0) data_mod_source = RADIO_DATA_MOD_SRC_MIC;
             else if (strcmp(s, "acc")     == 0) data_mod_source = RADIO_DATA_MOD_SRC_ACC;
             else if (strcmp(s, "mic+acc") == 0) data_mod_source = RADIO_DATA_MOD_SRC_MIC_ACC;
@@ -232,7 +234,7 @@ int main(int argc, char **argv)
             else if (strcmp(s, "mic+usb") == 0) data_mod_source = RADIO_DATA_MOD_SRC_MIC_USB;
             else if (strcmp(s, "lan")     == 0) data_mod_source = RADIO_DATA_MOD_SRC_LAN;
             else {
-                fprintf(stderr, "--data-mod-source: unknown '%s' (mic|acc|mic+acc|usb|mic+usb|lan)\n", s);
+                fprintf(stderr, "--mod-input: unknown '%s' (mic|acc|mic+acc|usb|mic+usb|lan)\n", s);
                 return EXIT_FAILURE;
             }
         } else if (strncmp("--mode=", argv[i], 7) == 0) {
@@ -372,7 +374,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "warning: clearing DATA flag rc=%d\n", rc);
         }
         if (data_mod_source >= 0) {
-            fprintf(stderr, "warning: --data-mod-source ignored in --mode=fm "
+            fprintf(stderr, "warning: --mod-input ignored in --mode=fm "
                     "(plain FM uses the front-panel MOD INPUT)\n");
         }
     }
