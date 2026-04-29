@@ -204,17 +204,9 @@ int radio_uplink_prep(radio_t *radio)
     }
     int rc = radio_set_mode(radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
     if (rc != RADIO_OK) return rc;
-    // Set the menu routing once BEFORE the DATA-mode switch so the mode
-    // change commits with the correct values, then once AFTER to undo any
-    // mode-coupled reset the radio applies as it transitions. The FT-991A
-    // has been observed to force Menu 072 (DATA PORT SELECT) to USB CODEC
-    // on entry to DATA-FM regardless of the current value; the second
-    // call re-pins it. Idempotent on IC-9700, harmless extra latency.
     rc = radio_set_data_mod_source(radio, RADIO_DATA_MOD_SRC_ACC);
     if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) return rc;
     rc = radio_set_data_mode(radio, 1, RADIO_FILTER_FIL1);
-    if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) return rc;
-    rc = radio_set_data_mod_source(radio, RADIO_DATA_MOD_SRC_ACC);
     if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) return rc;
     return RADIO_OK;
 }

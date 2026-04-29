@@ -346,8 +346,14 @@ static int yaesu_cat_set_data_mode(radio_t *radio, int on, int filter)
 //   MIC / MIC_ACC → MIC (jack on the front of the radio)
 static int yaesu_cat_set_data_mod_source(radio_t *radio, int source)
 {
-    const char *in_sel = NULL;     // Menu 070
-    const char *port_sel = NULL;   // Menu 072 (only when REAR)
+    // We only drive Menu 070 (DATA IN SELECT: MIC vs REAR) and Menu 079
+    // (PKT MODE: 1200 vs 9600). Menu 072 (DATA PORT SELECT: DATA jack vs
+    // USB CODEC) is left alone — observed in the field, the FT-991A
+    // forces Menu 072 = USB on entry to DATA-FM regardless of any prior
+    // EX072x; write, and even a second write after the mode change
+    // doesn't stick. Set Menu 072 by hand on the front panel; the radio
+    // remembers it across power cycles.
+    const char *in_sel = NULL;
     switch (source) {
         case RADIO_DATA_MOD_SRC_MIC:
         case RADIO_DATA_MOD_SRC_MIC_ACC:
@@ -355,28 +361,18 @@ static int yaesu_cat_set_data_mod_source(radio_t *radio, int source)
             break;
         case RADIO_DATA_MOD_SRC_USB:
         case RADIO_DATA_MOD_SRC_MIC_USB:
-            in_sel = "EX0701;";
-            port_sel = "EX0722;";
-            break;
         case RADIO_DATA_MOD_SRC_ACC:
             in_sel = "EX0701;";
-            port_sel = "EX0721;";
             break;
         default:
-            fprintf(stderr, "yaesu_cat: DATA MOD source 0x%02X unknown; using REAR/USB\n", source);
+            fprintf(stderr, "yaesu_cat: DATA MOD source 0x%02X unknown; using REAR\n", source);
             in_sel = "EX0701;";
-            port_sel = "EX0722;";
             break;
     }
     int rc = yaesu_send(radio, in_sel, NULL, 0);
     if (rc != RADIO_OK) return rc;
-    if (port_sel != NULL) {
-        rc = yaesu_send(radio, port_sel, NULL, 0);
-        if (rc != RADIO_OK) return rc;
-    }
-    // Pin PKT MODE = 9600 so the DATA-FM modulator path is wide enough for
-    // 9600-baud GFSK. No-op if the radio was already there; harmless on
-    // tone tests; matters when AX100 frames hit the air.
+    // Pin PKT MODE = 9600 so the DATA-FM modulator path is wide enough
+    // for 9600-baud GFSK.
     return yaesu_send(radio, "EX0791;", NULL, 0);
 }
 
