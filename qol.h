@@ -29,7 +29,7 @@
 #define printcmd(msg, array, len) do { \
     const unsigned char *_qol_arr = (const unsigned char *)(array); \
     int _qol_len = (int)(len); \
-    fprintf(stderr, msg); \
+    fprintf(stderr, "%s", (msg)); \
     for (int _qol_i = 0; _qol_i < _qol_len; ++_qol_i) { \
         fprintf(stderr, " %02X", _qol_arr[_qol_i]); \
     } \
