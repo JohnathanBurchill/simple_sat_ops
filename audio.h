@@ -2,6 +2,7 @@
 #define AUDIO_H
 
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 
 // On Linux we get the real ALSA types. On hosts without ALSA (macOS dev
@@ -72,6 +73,13 @@ int audio_playback_open(snd_pcm_t **handle, const char *device,
                         unsigned int rate_hz, unsigned int channels);
 int audio_play_tone(snd_pcm_t *handle, double freq_hz, double amplitude,
                     double duration_s, unsigned int rate_hz, unsigned int channels);
+// Uniform-PRNG white noise across the full Nyquist band. Each output sample is
+// an independent draw, so the PSD is flat to within sampling noise and the
+// captured spectrum reflects the inherent TX/RX bandshape. seed=0 picks a
+// time-based seed; pass any non-zero value for deterministic output.
+int audio_play_white_noise(snd_pcm_t *handle, double amplitude,
+                           double duration_s, unsigned int rate_hz,
+                           unsigned int channels, uint64_t seed);
 void audio_playback_close(snd_pcm_t *handle);
 
 

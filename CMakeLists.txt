@@ -118,6 +118,12 @@ if (ASOUND_FOUND)
     target_link_libraries(tx_tone PRIVATE m ${ASOUND_LIBRARIES})
     list(APPEND SSO_TARGETS tx_tone)
 
+    # Full-band white noise — TX/RX response characterisation
+    add_executable(tx_white_noise tx_white_noise.c ${RADIO_SOURCES} audio.c)
+    target_link_directories(tx_white_noise PRIVATE ${ASOUND_LIBRARY_DIRS})
+    target_link_libraries(tx_white_noise PRIVATE m ${ASOUND_LIBRARIES})
+    list(APPEND SSO_TARGETS tx_white_noise)
+
     if (OPENSSL_FOUND)
         # Single-shot frame transmitter: CSP+AX100 -> PCM -> CI-V PTT + ALSA playback
         add_executable(tx_frame utils/tx_frame.c csp.c golay24.c ax100.c rs.c hmac_keyfile.c modem.c ${RADIO_SOURCES})

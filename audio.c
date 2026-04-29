@@ -258,6 +258,82 @@ int audio_play_tone(snd_pcm_t *handle, double freq_hz, double amplitude,
     return AUDIO_OK;
 }
 
+// xorshift64 — fast, decent statistical quality, no library dependency.
+// Plenty for audio-grade noise; we don't need cryptographic randomness.
+static inline uint64_t xorshift64_step(uint64_t *state)
+{
+    uint64_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    return x;
+}
+
+int audio_play_white_noise(snd_pcm_t *handle, double amplitude,
+                           double duration_s, unsigned int rate_hz,
+                           unsigned int channels, uint64_t seed)
+{
+    if (handle == NULL || channels == 0 || rate_hz == 0) {
+        return AUDIO_ARGS;
+    }
+    if (amplitude < 0.0) amplitude = 0.0;
+    if (amplitude > 1.0) amplitude = 1.0;
+
+    const snd_pcm_uframes_t frames_per_chunk = AUDIO_PLAYBACK_FRAMES_PER_CHUNK;
+    int16_t *buf = malloc(frames_per_chunk * channels * sizeof(int16_t));
+    if (buf == NULL) {
+        return AUDIO_MEMORY;
+    }
+
+    // xorshift64 deadlocks on a zero state; if the caller passed 0, derive a
+    // non-zero seed from the wall clock so successive runs differ. Any other
+    // value (including 1) is taken verbatim for repeatable captures.
+    uint64_t state = seed;
+    if (state == 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        state = (uint64_t)ts.tv_sec * 1000000003ull
+              ^ (uint64_t)ts.tv_nsec * 6364136223846793005ull;
+        if (state == 0) state = 0x9E3779B97F4A7C15ull;
+    }
+
+    const double scale = amplitude * 32767.0;
+    const uint64_t total_frames = (uint64_t)(duration_s * (double)rate_hz);
+    uint64_t frames_sent = 0;
+
+    while (frames_sent < total_frames) {
+        snd_pcm_uframes_t n = frames_per_chunk;
+        if (n > total_frames - frames_sent) {
+            n = (snd_pcm_uframes_t)(total_frames - frames_sent);
+        }
+        for (snd_pcm_uframes_t i = 0; i < n; i++) {
+            // Draw 32 bits and map to [-1, 1). Independent draw per frame
+            // gives a flat PSD; channels carry the same sample so left/right
+            // are coherent and the captured spectrum is unambiguous.
+            uint32_t r = (uint32_t)(xorshift64_step(&state) >> 32);
+            double u = ((double)r / 4294967295.0) * 2.0 - 1.0;
+            int16_t sample = (int16_t)(scale * u);
+            for (unsigned int c = 0; c < channels; c++) {
+                buf[i * channels + c] = sample;
+            }
+        }
+        snd_pcm_sframes_t written = snd_pcm_writei(handle, buf, n);
+        if (written == -EPIPE) {
+            snd_pcm_prepare(handle);
+            continue;
+        }
+        if (written < 0) {
+            free(buf);
+            return AUDIO_DEVICE_OPEN;
+        }
+        frames_sent += (uint64_t)written;
+    }
+
+    free(buf);
+    return AUDIO_OK;
+}
+
 void audio_playback_close(snd_pcm_t *handle)
 {
     if (handle == NULL) return;
