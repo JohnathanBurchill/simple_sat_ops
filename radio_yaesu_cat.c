@@ -143,13 +143,13 @@ static int yaesu_send(radio_t *radio, const char *cmd, char *reply, size_t reply
     if (reply == NULL || reply_cap == 0) {
         // Fire-and-forget: give the FT-991A's CAT engine time to commit
         // this command before the next one starts arriving in its UART
-        // buffer. At 38400 baud the natural inter-command gap is just
-        // 1-3 ms (the wire time of the previous command) which is too
-        // tight — back-to-back FA;MD;EX; writes during uplink_prep can
-        // race the radio's per-command commit time. 40 ms covers the
-        // observed worst case with margin and is unnoticeable on the
-        // 5-command uplink_prep sequence.
-        usleep(40 * 1000);
+        // buffer. 40 ms used to be enough for ordinary FA/MD/EX writes,
+        // but observed in the field: when a mode change (MD0A;) is
+        // followed by EX07x; menu writes, EX commands arriving inside
+        // ~80-120 ms of the mode change get silently dropped. 100 ms
+        // here covers that, and the cumulative slowdown across the
+        // 5-7-command uplink_prep is still well under a second.
+        usleep(100 * 1000);
         return RADIO_OK;
     }
 
@@ -326,7 +326,13 @@ static int yaesu_cat_set_data_mode(radio_t *radio, int on, int filter)
     (void)filter;
     char cmd[8];
     snprintf(cmd, sizeof cmd, "MD0%c;", on ? YAESU_MODE_DATA_FM : YAESU_MODE_FM);
-    return yaesu_send(radio, cmd, NULL, 0);
+    int rc = yaesu_send(radio, cmd, NULL, 0);
+    // Mode changes take much longer to settle on the FT-991A than menu /
+    // freq writes (the radio reconfigures the modulator chain). Wait an
+    // extra beat so any caller that immediately reads back menu state or
+    // keys PTT sees a fully-committed mode.
+    usleep(150 * 1000);
+    return rc;
 }
 
 // FT-991A DATA-mode modulator routing (from the CAT manual menu list,

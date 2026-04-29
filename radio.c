@@ -204,9 +204,16 @@ int radio_uplink_prep(radio_t *radio)
     }
     int rc = radio_set_mode(radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
     if (rc != RADIO_OK) return rc;
-    rc = radio_set_data_mode(radio, 1, RADIO_FILTER_FIL1);
-    if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) return rc;
+    // Pin the modulator routing menus BEFORE the DATA-mode switch. On the
+    // FT-991A, MD0A; takes ~40-100 ms to settle and any EX07x; commands
+    // arriving in that window can be silently dropped or overridden by the
+    // mode change's own auto-routing. Setting menu values first means the
+    // mode change commits with the correct routing already in place.
+    // On the IC-9700 this op is `1A 05 01 16 <src>` and is order-
+    // independent, so the reorder is harmless there.
     rc = radio_set_data_mod_source(radio, RADIO_DATA_MOD_SRC_ACC);
+    if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) return rc;
+    rc = radio_set_data_mode(radio, 1, RADIO_FILTER_FIL1);
     if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) return rc;
     return RADIO_OK;
 }
