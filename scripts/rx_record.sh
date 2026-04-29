@@ -3,7 +3,7 @@ set -uo pipefail
 
 usage() {
     echo "usage: $(basename "$0") [freq_hz] [outdir]" >&2
-    echo "  defaults: freq=436150000, outdir=/tmp" >&2
+    echo "  defaults: freq=436150000, outdir=\$PWD" >&2
     echo "  press Ctrl-C to stop; .raw and .wav paths are printed on exit" >&2
     exit 2
 }
@@ -11,7 +11,7 @@ usage() {
 case "${1:-}" in -h|--help) usage ;; esac
 
 FREQ="${1:-436150000}"
-OUTDIR="${2:-/tmp}"
+OUTDIR="${2:-$PWD}"
 PPM=16
 GAIN=40
 SAMP=48000
