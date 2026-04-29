@@ -19,6 +19,7 @@
 */
 
 #include "radio.h"
+#include "radio_device_store.h"
 #include "audio.h"
 
 #include <errno.h>
@@ -36,6 +37,19 @@
 static radio_t g_radio = {0};
 static int g_no_ptt = 0;
 static pid_t g_record_pid = 0;
+
+static speed_t speed_from_bps(int bps)
+{
+    switch (bps) {
+        case 4800:   return B4800;
+        case 9600:   return B9600;
+        case 19200:  return B19200;
+        case 38400:  return B38400;
+        case 57600:  return B57600;
+        case 115200: return B115200;
+        default:     return 0;
+    }
+}
 
 static void stop_recorder(void)
 {
@@ -254,8 +268,8 @@ static int make_auto_record_path(const char *tool, char *out, size_t out_size)
 
 int main(int argc, char **argv)
 {
-    const char *radio_device = "/dev/ttyUSB1";
-    speed_t radio_speed = B115200;
+    const char *radio_device = NULL;     // explicit --radio-device=, NULL if absent
+    int radio_speed_bps = -1;            // explicit --radio-serial-speed=, < 0 if absent
     const char *audio_device = "plughw:4,0";
     const char *record_path = NULL;
     char auto_record_path[256];
@@ -281,7 +295,7 @@ int main(int argc, char **argv)
             radio_device = argv[i] + 15;
         } else if (strncmp("--radio-serial-speed=", argv[i], 21) == 0) {
             if (strlen(argv[i]) < 22) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
-            radio_speed = (speed_t)atoi(argv[i] + 21);
+            radio_speed_bps = atoi(argv[i] + 21);
         } else if (strncmp("--audio-device=", argv[i], 15) == 0) {
             if (strlen(argv[i]) < 16) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
             audio_device = argv[i] + 15;
@@ -378,13 +392,35 @@ int main(int argc, char **argv)
         }
     }
 
+    // Resolve device + speed: explicit flag wins, else stored default,
+    // else compiled-in fallbacks. Same precedence radio_ctl uses.
+    char effective_device[1024];
+    if (radio_device != NULL) {
+        snprintf(effective_device, sizeof effective_device, "%s", radio_device);
+    } else if (radio_device_store_load(effective_device,
+                                       sizeof effective_device) != 0) {
+        snprintf(effective_device, sizeof effective_device, "/dev/ttyUSB1");
+    }
+    int effective_bps = radio_speed_bps;
+    if (effective_bps <= 0) {
+        if (radio_device_store_load_speed(&effective_bps) != 0) {
+            effective_bps = (radio_backend == RADIO_BACKEND_YAESU_CAT)
+                                ? 4800 : 115200;
+        }
+    }
+    speed_t radio_speed = speed_from_bps(effective_bps);
+    if (radio_speed == 0) {
+        fprintf(stderr, "error: unsupported serial speed %d\n", effective_bps);
+        return EXIT_FAILURE;
+    }
+
     struct sigaction sa = {0};
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    g_radio.device_filename = (char *)radio_device;
+    g_radio.device_filename = effective_device;
     g_radio.serial_speed = radio_speed;
     g_radio.nominal_downlink_frequency = freq_hz;
     g_radio.sub_park_frequency = RADIO_SUB_PARK_HZ;

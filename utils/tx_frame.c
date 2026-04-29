@@ -36,6 +36,7 @@
 #include "hmac_keyfile.h"
 #include "modem.h"
 #include "radio.h"
+#include "radio_device_store.h"
 
 #include <alsa/asoundlib.h>
 #include <errno.h>
@@ -253,13 +254,13 @@ int main(int argc, char **argv)
     const char *payload_hex = NULL;
     const char *payload_ascii = NULL;
     const char *keyfile_path = NULL;
-    const char *radio_device = "/dev/ttyUSB1";
+    const char *radio_device = NULL;
     const char *audio_device = "plughw:4,0";
     const char *record_path = NULL;
     char auto_record_path[256];
     int no_record = 0;
     double freq_hz = FRONTIERSAT_CARRIER_HZ;
-    speed_t radio_speed = B115200;
+    int radio_speed_bps = -1;
     int use_hmac = 1;
     int use_rs = 1;  // default ON to match pycsplink uplink
     int dry_run = 0;
@@ -297,15 +298,7 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--sport="))   csp_hdr.sport = (uint8_t)atoi(a + 8);
         else if (starts_with(a, "--prio="))    csp_hdr.prio  = (uint8_t)atoi(a + 7);
         else if (starts_with(a, "--radio-device="))     radio_device = a + 15;
-        else if (starts_with(a, "--radio-serial-speed=")) {
-            int bps = atoi(a + 21);
-            if      (bps == 9600)   radio_speed = B9600;
-            else if (bps == 19200)  radio_speed = B19200;
-            else if (bps == 38400)  radio_speed = B38400;
-            else if (bps == 57600)  radio_speed = B57600;
-            else if (bps == 115200) radio_speed = B115200;
-            else { fprintf(stderr, "unsupported baud: %d\n", bps); return 1; }
-        }
+        else if (starts_with(a, "--radio-serial-speed=")) radio_speed_bps = atoi(a + 21);
         else if (starts_with(a, "--audio-device="))     audio_device = a + 15;
         else if (starts_with(a, "--bit-rate=")) {
             int bps = atoi(a + 11);
@@ -437,8 +430,36 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    char effective_device[1024];
+    if (radio_device != NULL) {
+        snprintf(effective_device, sizeof effective_device, "%s", radio_device);
+    } else if (radio_device_store_load(effective_device,
+                                       sizeof effective_device) != 0) {
+        snprintf(effective_device, sizeof effective_device, "/dev/ttyUSB1");
+    }
+    int effective_bps = radio_speed_bps;
+    if (effective_bps <= 0) {
+        if (radio_device_store_load_speed(&effective_bps) != 0) {
+            effective_bps = (radio_backend == RADIO_BACKEND_YAESU_CAT)
+                                ? 4800 : 115200;
+        }
+    }
+    speed_t radio_speed;
+    switch (effective_bps) {
+        case 4800:   radio_speed = B4800;   break;
+        case 9600:   radio_speed = B9600;   break;
+        case 19200:  radio_speed = B19200;  break;
+        case 38400:  radio_speed = B38400;  break;
+        case 57600:  radio_speed = B57600;  break;
+        case 115200: radio_speed = B115200; break;
+        default:
+            fprintf(stderr, "unsupported baud: %d\n", effective_bps);
+            free(samples);
+            return 1;
+    }
+
     radio_t radio = {0};
-    radio.device_filename = (char *)radio_device;
+    radio.device_filename = effective_device;
     radio.serial_speed = radio_speed;
     radio.nominal_downlink_frequency = freq_hz;
     radio.sub_park_frequency = RADIO_SUB_PARK_HZ;
@@ -449,7 +470,7 @@ int main(int argc, char **argv)
     }
     int rc = radio_init(&radio);
     if (rc != RADIO_OK) {
-        fprintf(stderr, "radio_init(%s) failed (rc=%d)\n", radio_device, rc);
+        fprintf(stderr, "radio_init(%s) failed (rc=%d)\n", effective_device, rc);
         if (radio.connected) radio_disconnect(&radio);
         free(samples);
         return 1;

@@ -368,10 +368,14 @@ int main(int argc, char **argv)
     // Resolve the effective device for this run:
     //   --radio-device= wins; else stored default; else /dev/ttyUSB0.
     char effective_device[1024];
+    const char *device_origin = "compiled-in";
     if (device_arg != NULL) {
         snprintf(effective_device, sizeof effective_device, "%s", device_arg);
+        device_origin = "--radio-device=";
     } else if (radio_device_store_load(effective_device,
-                                       sizeof effective_device) != 0) {
+                                       sizeof effective_device) == 0) {
+        device_origin = "store";
+    } else {
         snprintf(effective_device, sizeof effective_device, "/dev/ttyUSB0");
     }
 
@@ -379,14 +383,17 @@ int main(int argc, char **argv)
     //   --radio-serial-speed= wins; else stored default; else backend default.
     int effective_speed_int = -1;
     speed_t effective_speed = 0;
+    const char *speed_origin = "backend default";
     if (speed_override > 0) {
         effective_speed_int = speed_override;
         effective_speed = speed_from_int(speed_override);
+        speed_origin = "--radio-serial-speed=";
     } else {
         int stored = 0;
         if (radio_device_store_load_speed(&stored) == 0) {
             effective_speed_int = stored;
             effective_speed = speed_from_int(stored);
+            speed_origin = "store";
         } else {
             effective_speed = default_speed_for(backend);
         }
@@ -394,6 +401,13 @@ int main(int argc, char **argv)
     if (effective_speed == 0) {
         fprintf(stderr, "unsupported serial speed %d\n", effective_speed_int);
         return RADIO_ERROR;
+    }
+
+    if (debug_wire) {
+        fprintf(stderr, "radio_ctl: device=%s (from %s), speed=%d (from %s)\n",
+                effective_device, device_origin,
+                effective_speed_int > 0 ? effective_speed_int : 0,
+                speed_origin);
     }
 
     radio_t r = {0};
