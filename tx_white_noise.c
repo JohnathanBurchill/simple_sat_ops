@@ -91,8 +91,14 @@ static void usage(FILE *dest, const char *name)
         "                               ~0.577 of peak)\n"
         "  --seed=<u64>                 PRNG seed (default 1 = repeatable runs;\n"
         "                               pass 0 to seed from the wall clock)\n"
+        "  --mode=<fm|fm-data>          TX mode (default fm-data). Use fm to\n"
+        "                               drive the radio's voice-FM mod chain\n"
+        "                               (subject to mic-EQ / pre-emphasis /\n"
+        "                               front-panel MOD INPUT) instead of the\n"
+        "                               flat FM-DATA path.\n"
         "  --data-mod-source=<src>      DATA MOD source: usb|acc|mic|mic+acc|\n"
-        "                               mic+usb|lan (default usb)\n"
+        "                               mic+usb|lan (default usb). Ignored\n"
+        "                               when --mode=fm.\n"
         "  --filter=<fil1|fil2|fil3>    IC-9700 IF filter slot. Overrides the\n"
         "                               FIL1 default set by radio_uplink_prep;\n"
         "                               useful for comparing FIL1 vs FIL2/3\n"
@@ -184,6 +190,7 @@ int main(int argc, char **argv)
     double amplitude = 0.2;
     uint64_t seed = 1;
     int data_mod_source = -1;
+    int use_data_mode = 1;  // 1 = FM-DATA (default); 0 = plain FM
     int filter = -1;  // < 0 = leave whatever radio_uplink_prep picked (FIL1)
     int moni_level_pct = -1;
     int uplink_mod_level = -1;
@@ -226,6 +233,15 @@ int main(int argc, char **argv)
             else if (strcmp(s, "lan")     == 0) data_mod_source = RADIO_DATA_MOD_SRC_LAN;
             else {
                 fprintf(stderr, "--data-mod-source: unknown '%s' (mic|acc|mic+acc|usb|mic+usb|lan)\n", s);
+                return EXIT_FAILURE;
+            }
+        } else if (strncmp("--mode=", argv[i], 7) == 0) {
+            if (strlen(argv[i]) < 8) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
+            const char *s = argv[i] + 7;
+            if      (strcmp(s, "fm-data") == 0) use_data_mode = 1;
+            else if (strcmp(s, "fm")      == 0) use_data_mode = 0;
+            else {
+                fprintf(stderr, "--mode: unknown '%s' (fm|fm-data)\n", s);
                 return EXIT_FAILURE;
             }
         } else if (strncmp("--filter=", argv[i], 9) == 0) {
@@ -313,30 +329,51 @@ int main(int argc, char **argv)
         if (g_radio.connected) radio_disconnect(&g_radio);
         return EXIT_FAILURE;
     }
-    rc = radio_uplink_prep(&g_radio);
-    if (rc != RADIO_OK) {
-        fprintf(stderr, "warning: radio_uplink_prep failed (rc=%d); "
-                "check MODE/DATA/DATA-MOD on the front panel.\n", rc);
-    }
-    if (data_mod_source >= 0) {
-        rc = radio_set_data_mod_source(&g_radio, data_mod_source);
+    const int eff_filter = (filter >= 0) ? filter : RADIO_FILTER_FIL1;
+    if (use_data_mode) {
+        rc = radio_uplink_prep(&g_radio);
         if (rc != RADIO_OK) {
-            fprintf(stderr, "warning: could not override DATA MOD source (rc=%d)\n", rc);
+            fprintf(stderr, "warning: radio_uplink_prep failed (rc=%d); "
+                    "check MODE/DATA/DATA-MOD on the front panel.\n", rc);
         }
-    }
-    // Filter override. radio_uplink_prep set FM + DATA on with FIL1; if the
-    // user asked for a different filter, re-issue both calls so the radio
-    // ends up in <mode>=FM-DATA with the requested filter slot. The IC-9700
-    // honours FIL1/2/3 directly; backends without that concept (FT-991A)
-    // will return RADIO_NOT_SUPPORTED, which we treat as a warning.
-    if (filter >= 0) {
-        rc = radio_set_mode(&g_radio, RADIO_MODE_FM, filter);
-        if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) {
-            fprintf(stderr, "warning: could not set filter (set_mode rc=%d)\n", rc);
+        if (data_mod_source >= 0) {
+            rc = radio_set_data_mod_source(&g_radio, data_mod_source);
+            if (rc != RADIO_OK) {
+                fprintf(stderr, "warning: could not override DATA MOD source (rc=%d)\n", rc);
+            }
         }
-        rc = radio_set_data_mode(&g_radio, 1, filter);
+        // Filter override. radio_uplink_prep set FM + DATA on with FIL1; if
+        // the user asked for a different slot, re-issue both calls.
+        if (filter >= 0) {
+            rc = radio_set_mode(&g_radio, RADIO_MODE_FM, filter);
+            if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) {
+                fprintf(stderr, "warning: could not set filter (set_mode rc=%d)\n", rc);
+            }
+            rc = radio_set_data_mode(&g_radio, 1, filter);
+            if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) {
+                fprintf(stderr, "warning: could not set filter (set_data_mode rc=%d)\n", rc);
+            }
+        }
+    } else {
+        // Plain FM: tune, set mode, and clear the DATA flag in case the
+        // radio was previously left in FM-DATA. DATA-MOD source doesn't
+        // apply in plain FM (the radio uses the front-panel MOD INPUT
+        // setting), so we don't issue it.
+        rc = radio_set_frequency(&g_radio, freq_hz);
         if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) {
-            fprintf(stderr, "warning: could not set filter (set_data_mode rc=%d)\n", rc);
+            fprintf(stderr, "warning: set_frequency rc=%d\n", rc);
+        }
+        rc = radio_set_mode(&g_radio, RADIO_MODE_FM, eff_filter);
+        if (rc != RADIO_OK) {
+            fprintf(stderr, "warning: set_mode FM rc=%d\n", rc);
+        }
+        rc = radio_set_data_mode(&g_radio, 0, eff_filter);
+        if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) {
+            fprintf(stderr, "warning: clearing DATA flag rc=%d\n", rc);
+        }
+        if (data_mod_source >= 0) {
+            fprintf(stderr, "warning: --data-mod-source ignored in --mode=fm "
+                    "(plain FM uses the front-panel MOD INPUT)\n");
         }
     }
     if (tx_power_pct >= 0) {
@@ -368,9 +405,9 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr,
-            "tx_white_noise: %.6f MHz FM simplex, white noise %.2f s, amp %.2f, "
+            "tx_white_noise: %.6f MHz %s simplex, white noise %.2f s, amp %.2f, "
             "seed=%llu, audio %s, ptt %s\n",
-            freq_hz / 1e6, duration_s, amplitude,
+            freq_hz / 1e6, use_data_mode ? "FM-DATA" : "FM", duration_s, amplitude,
             (unsigned long long)seed, audio_device, g_no_ptt ? "off" : "on");
 
     if (record_path == NULL && !no_record) {
