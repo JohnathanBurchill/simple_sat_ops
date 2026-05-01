@@ -655,6 +655,9 @@ int main(int argc, char **argv)
     }
     audio_wav_writer_close(synth_wav);
     audio_playback_close(playback);
+    if (synth_wav_path[0] != '\0') {
+        audio_generate_spectrogram(synth_wav_path);
+    }
 
     if (!g_no_ptt) {
         // Tail: capture the receiver's post-TX recovery before stopping.

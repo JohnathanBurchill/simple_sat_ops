@@ -97,6 +97,13 @@ int audio_play_white_noise(snd_pcm_t *handle, audio_wav_writer_t *wav,
                            uint64_t seed);
 void audio_playback_close(snd_pcm_t *handle);
 
+// Spawn ffmpeg to render a 1920x1080 showspectrumpic PNG from a WAV
+// file. PNG path = WAV path with .wav -> .png. Blocks until ffmpeg
+// exits. Returns 0 on success, -1 on fork/wait error or ffmpeg
+// non-zero exit (e.g. binary not on PATH). Logs the PNG path to
+// stderr on success.
+int audio_generate_spectrogram(const char *wav_path);
+
 // Autodetect helpers for /proc/asound/cards. We've burned hours pointing
 // tx_tone at the wrong USB CODEC; these scan kernel-reported card names
 // for known fingerprints and return a "plughw:N,0" string ready to hand

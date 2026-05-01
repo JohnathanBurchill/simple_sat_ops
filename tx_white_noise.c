@@ -577,6 +577,9 @@ int main(int argc, char **argv)
                                  AUDIO_RATE_HZ, AUDIO_CHANNELS, seed);
     audio_wav_writer_close(synth_wav);
     audio_playback_close(playback);
+    if (synth_wav_path[0] != '\0') {
+        audio_generate_spectrogram(synth_wav_path);
+    }
 
     if (!g_no_ptt) {
         usleep(200000);

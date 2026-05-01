@@ -6,6 +6,9 @@
 #include <alsa/asoundlib.h>
 #include <math.h>
 #include <time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static int result_status = 0;
 
@@ -425,6 +428,55 @@ void audio_playback_close(snd_pcm_t *handle)
     if (handle == NULL) return;
     snd_pcm_drain(handle);
     snd_pcm_close(handle);
+}
+
+int audio_generate_spectrogram(const char *wav_path)
+{
+    if (wav_path == NULL) return -1;
+    size_t len = strlen(wav_path);
+    char png_path[512];
+    int n;
+    if (len >= 4 && strcmp(wav_path + len - 4, ".wav") == 0) {
+        n = snprintf(png_path, sizeof png_path, "%.*s.png",
+                     (int)(len - 4), wav_path);
+    } else {
+        n = snprintf(png_path, sizeof png_path, "%s.png", wav_path);
+    }
+    if (n <= 0 || (size_t)n >= sizeof png_path) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "warning: fork() for ffmpeg spectrogram failed\n");
+        return -1;
+    }
+    if (pid == 0) {
+        // Child. Replace stdout/stderr with /dev/null so ffmpeg's normal
+        // chatter doesn't pollute the parent's terminal — we already pass
+        // -loglevel error, but the encoder still emits a few lines.
+        char *args[] = {
+            "ffmpeg",
+            "-hide_banner", "-loglevel", "error", "-y",
+            "-i", (char *)wav_path,
+            "-lavfi",
+            "showspectrumpic=s=1920x1080:mode=combined:color=intensity:legend=1",
+            png_path,
+            NULL,
+        };
+        execvp("ffmpeg", args);
+        // execvp only returns on failure.
+        fprintf(stderr, "warning: ffmpeg not found on PATH; "
+                "skipping spectrogram for %s\n", wav_path);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        return -1;
+    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        fprintf(stderr, "spectrogram -> %s\n", png_path);
+        return 0;
+    }
+    return -1;
 }
 
 // /proc/asound/cards is two lines per card:
