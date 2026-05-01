@@ -279,6 +279,23 @@ static int make_auto_record_path(const char *tool, char *out, size_t out_size)
     return (n > 0 && (size_t)n < out_size) ? 0 : -1;
 }
 
+// Derive a sibling .wav path by replacing a trailing .raw with .wav, or
+// appending .wav if the input has no extension. The synth-side WAV uses
+// the same base name as the loopback .raw so the two files sort together
+// in `ls`. Returns 0 on success, -1 on overflow.
+static int derive_wav_path(const char *raw_path, char *out, size_t out_size)
+{
+    if (raw_path == NULL) return -1;
+    size_t len = strlen(raw_path);
+    int n;
+    if (len >= 4 && strcmp(raw_path + len - 4, ".raw") == 0) {
+        n = snprintf(out, out_size, "%.*s.wav", (int)(len - 4), raw_path);
+    } else {
+        n = snprintf(out, out_size, "%s.wav", raw_path);
+    }
+    return (n > 0 && (size_t)n < out_size) ? 0 : -1;
+}
+
 int main(int argc, char **argv)
 {
     const char *radio_device = NULL;     // explicit --radio-device=, NULL if absent
@@ -579,10 +596,38 @@ int main(int argc, char **argv)
         goto fail_radio;
     }
 
+    // Synth WAV: capture exactly what we feed the audio card. Filename is
+    // the .raw base with .wav extension, in CWD. Always written (the
+    // synth signal is independent of whether the operator wants the
+    // loopback .raw); --no-record only suppresses the loopback capture.
+    char synth_wav_path[300] = {0};
+    const char *synth_wav_base = record_path;
+    char synth_wav_auto[256];
+    if (synth_wav_base == NULL) {
+        if (make_auto_record_path("tx_tone", synth_wav_auto,
+                                  sizeof synth_wav_auto) == 0) {
+            synth_wav_base = synth_wav_auto;
+        }
+    }
+    audio_wav_writer_t *synth_wav = NULL;
+    if (synth_wav_base != NULL
+        && derive_wav_path(synth_wav_base, synth_wav_path,
+                           sizeof synth_wav_path) == 0) {
+        synth_wav = audio_wav_writer_open(synth_wav_path,
+                                          AUDIO_RATE_HZ, AUDIO_CHANNELS);
+        if (synth_wav == NULL) {
+            fprintf(stderr, "warning: could not open synth WAV %s\n",
+                    synth_wav_path);
+        } else {
+            fprintf(stderr, "tx_tone: synth WAV -> %s\n", synth_wav_path);
+        }
+    }
+
     if (!g_no_ptt) {
         rc = radio_ptt(&g_radio, 1);
         if (rc != RADIO_OK) {
             fprintf(stderr, "error: PTT on (rc=%d)\n", rc);
+            audio_wav_writer_close(synth_wav);
             stop_recorder();
             audio_playback_close(playback);
             goto fail_radio;
@@ -599,14 +644,16 @@ int main(int argc, char **argv)
         while ((step > 0 && f <= tone_stop_hz + 1e-6) ||
                (step < 0 && f >= tone_stop_hz - 1e-6)) {
             fprintf(stderr, "tx_tone: step %.1f Hz\n", f);
-            arc = audio_play_tone(playback, f, amplitude, duration_s,
+            arc = audio_play_tone(playback, synth_wav, f, amplitude, duration_s,
                                   AUDIO_RATE_HZ, AUDIO_CHANNELS);
             if (arc != AUDIO_OK) break;
             f += step;
         }
     } else {
-        arc = audio_play_tone(playback, tone_hz, amplitude, duration_s, AUDIO_RATE_HZ, AUDIO_CHANNELS);
+        arc = audio_play_tone(playback, synth_wav, tone_hz, amplitude, duration_s,
+                              AUDIO_RATE_HZ, AUDIO_CHANNELS);
     }
+    audio_wav_writer_close(synth_wav);
     audio_playback_close(playback);
 
     if (!g_no_ptt) {

@@ -71,15 +71,30 @@ void *capture_audio(void *data);
 
 int audio_playback_open(snd_pcm_t **handle, const char *device,
                         unsigned int rate_hz, unsigned int channels);
-int audio_play_tone(snd_pcm_t *handle, double freq_hz, double amplitude,
+
+// WAV writer for capturing the synthesized signal as it streams to the
+// audio card. PCM S16_LE; opaque handle. open() writes a placeholder
+// header; close() patches the size fields and closes the file. Pass the
+// returned handle (or NULL = don't write) to audio_play_tone /
+// audio_play_white_noise; multiple play calls against the same writer
+// concatenate into one growing WAV (useful for stepped sweeps).
+typedef struct audio_wav_writer audio_wav_writer_t;
+audio_wav_writer_t *audio_wav_writer_open(const char *path,
+                                          unsigned int rate_hz,
+                                          unsigned int channels);
+void audio_wav_writer_close(audio_wav_writer_t *w);
+
+int audio_play_tone(snd_pcm_t *handle, audio_wav_writer_t *wav,
+                    double freq_hz, double amplitude,
                     double duration_s, unsigned int rate_hz, unsigned int channels);
 // Uniform-PRNG white noise across the full Nyquist band. Each output sample is
 // an independent draw, so the PSD is flat to within sampling noise and the
 // captured spectrum reflects the inherent TX/RX bandshape. seed=0 picks a
 // time-based seed; pass any non-zero value for deterministic output.
-int audio_play_white_noise(snd_pcm_t *handle, double amplitude,
-                           double duration_s, unsigned int rate_hz,
-                           unsigned int channels, uint64_t seed);
+int audio_play_white_noise(snd_pcm_t *handle, audio_wav_writer_t *wav,
+                           double amplitude, double duration_s,
+                           unsigned int rate_hz, unsigned int channels,
+                           uint64_t seed);
 void audio_playback_close(snd_pcm_t *handle);
 
 // Autodetect helpers for /proc/asound/cards. We've burned hours pointing

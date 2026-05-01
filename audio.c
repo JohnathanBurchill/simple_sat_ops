@@ -208,7 +208,87 @@ int audio_playback_open(snd_pcm_t **handle, const char *device,
     return AUDIO_OK;
 }
 
-int audio_play_tone(snd_pcm_t *handle, double freq_hz, double amplitude,
+// PCM S16_LE WAV writer. Header is a fixed 44 bytes (RIFF/fmt /data) with
+// 32-bit length placeholders that get patched on close. We assume little-
+// endian host (true on every box this project runs on); the multi-byte
+// fields go in via memcpy of host-order ints, which matches the WAV
+// spec's LE encoding without any swapping.
+struct audio_wav_writer {
+    FILE *fp;
+    uint32_t data_bytes;
+    unsigned int rate_hz;
+    unsigned int channels;
+};
+
+audio_wav_writer_t *audio_wav_writer_open(const char *path,
+                                          unsigned int rate_hz,
+                                          unsigned int channels)
+{
+    if (path == NULL || channels == 0 || rate_hz == 0) return NULL;
+    FILE *fp = fopen(path, "wb");
+    if (fp == NULL) return NULL;
+    uint8_t hdr[44] = {0};
+    memcpy(hdr + 0, "RIFF", 4);
+    /* hdr[4..7]   = 36 + data_bytes  (patched on close) */
+    memcpy(hdr + 8, "WAVE", 4);
+    memcpy(hdr + 12, "fmt ", 4);
+    uint32_t fmt_chunk_size = 16;
+    memcpy(hdr + 16, &fmt_chunk_size, 4);
+    uint16_t fmt_pcm = 1;
+    memcpy(hdr + 20, &fmt_pcm, 2);
+    uint16_t ch16 = (uint16_t)channels;
+    memcpy(hdr + 22, &ch16, 2);
+    uint32_t rate32 = rate_hz;
+    memcpy(hdr + 24, &rate32, 4);
+    uint32_t byte_rate = rate_hz * channels * 2;
+    memcpy(hdr + 28, &byte_rate, 4);
+    uint16_t block_align = (uint16_t)(channels * 2);
+    memcpy(hdr + 32, &block_align, 2);
+    uint16_t bits = 16;
+    memcpy(hdr + 34, &bits, 2);
+    memcpy(hdr + 36, "data", 4);
+    /* hdr[40..43] = data_bytes  (patched on close) */
+    if (fwrite(hdr, 1, sizeof hdr, fp) != sizeof hdr) {
+        fclose(fp);
+        return NULL;
+    }
+    audio_wav_writer_t *w = malloc(sizeof *w);
+    if (w == NULL) {
+        fclose(fp);
+        return NULL;
+    }
+    w->fp = fp;
+    w->data_bytes = 0;
+    w->rate_hz = rate_hz;
+    w->channels = channels;
+    return w;
+}
+
+void audio_wav_writer_close(audio_wav_writer_t *w)
+{
+    if (w == NULL) return;
+    if (w->fp != NULL) {
+        uint32_t riff_size = 36 + w->data_bytes;
+        if (fseek(w->fp, 4, SEEK_SET) == 0) {
+            fwrite(&riff_size, 4, 1, w->fp);
+        }
+        if (fseek(w->fp, 40, SEEK_SET) == 0) {
+            fwrite(&w->data_bytes, 4, 1, w->fp);
+        }
+        fclose(w->fp);
+    }
+    free(w);
+}
+
+static void wav_writer_append(audio_wav_writer_t *w, const void *buf, size_t bytes)
+{
+    if (w == NULL || w->fp == NULL || bytes == 0) return;
+    size_t n = fwrite(buf, 1, bytes, w->fp);
+    w->data_bytes += (uint32_t)n;
+}
+
+int audio_play_tone(snd_pcm_t *handle, audio_wav_writer_t *wav,
+                    double freq_hz, double amplitude,
                     double duration_s, unsigned int rate_hz, unsigned int channels)
 {
     if (handle == NULL || channels == 0 || rate_hz == 0) {
@@ -242,6 +322,10 @@ int audio_play_tone(snd_pcm_t *handle, double freq_hz, double amplitude,
                 buf[i * channels + c] = sample;
             }
         }
+        // Mirror to the synth WAV before the ALSA write — that way the
+        // WAV captures the chunk we *intended* to send, even if ALSA
+        // returns a short write or EPIPE and we re-try.
+        wav_writer_append(wav, buf, (size_t)n * channels * sizeof(int16_t));
         snd_pcm_sframes_t written = snd_pcm_writei(handle, buf, n);
         if (written == -EPIPE) {
             snd_pcm_prepare(handle);
@@ -270,9 +354,10 @@ static inline uint64_t xorshift64_step(uint64_t *state)
     return x;
 }
 
-int audio_play_white_noise(snd_pcm_t *handle, double amplitude,
-                           double duration_s, unsigned int rate_hz,
-                           unsigned int channels, uint64_t seed)
+int audio_play_white_noise(snd_pcm_t *handle, audio_wav_writer_t *wav,
+                           double amplitude, double duration_s,
+                           unsigned int rate_hz, unsigned int channels,
+                           uint64_t seed)
 {
     if (handle == NULL || channels == 0 || rate_hz == 0) {
         return AUDIO_ARGS;
@@ -318,6 +403,7 @@ int audio_play_white_noise(snd_pcm_t *handle, double amplitude,
                 buf[i * channels + c] = sample;
             }
         }
+        wav_writer_append(wav, buf, (size_t)n * channels * sizeof(int16_t));
         snd_pcm_sframes_t written = snd_pcm_writei(handle, buf, n);
         if (written == -EPIPE) {
             snd_pcm_prepare(handle);

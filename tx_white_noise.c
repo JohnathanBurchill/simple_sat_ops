@@ -206,6 +206,19 @@ static int make_auto_record_path(const char *tool, char *out, size_t out_size)
     return (n > 0 && (size_t)n < out_size) ? 0 : -1;
 }
 
+static int derive_wav_path(const char *raw_path, char *out, size_t out_size)
+{
+    if (raw_path == NULL) return -1;
+    size_t len = strlen(raw_path);
+    int n;
+    if (len >= 4 && strcmp(raw_path + len - 4, ".raw") == 0) {
+        n = snprintf(out, out_size, "%.*s.wav", (int)(len - 4), raw_path);
+    } else {
+        n = snprintf(out, out_size, "%s.wav", raw_path);
+    }
+    return (n > 0 && (size_t)n < out_size) ? 0 : -1;
+}
+
 int main(int argc, char **argv)
 {
     const char *radio_device = NULL;
@@ -522,10 +535,37 @@ int main(int argc, char **argv)
         goto fail_radio;
     }
 
+    // Synth WAV: same base name as the loopback .raw, .wav extension, in
+    // CWD. Always written; --no-record only suppresses the loopback side.
+    char synth_wav_path[300] = {0};
+    const char *synth_wav_base = record_path;
+    char synth_wav_auto[256];
+    if (synth_wav_base == NULL) {
+        if (make_auto_record_path("tx_white_noise", synth_wav_auto,
+                                  sizeof synth_wav_auto) == 0) {
+            synth_wav_base = synth_wav_auto;
+        }
+    }
+    audio_wav_writer_t *synth_wav = NULL;
+    if (synth_wav_base != NULL
+        && derive_wav_path(synth_wav_base, synth_wav_path,
+                           sizeof synth_wav_path) == 0) {
+        synth_wav = audio_wav_writer_open(synth_wav_path,
+                                          AUDIO_RATE_HZ, AUDIO_CHANNELS);
+        if (synth_wav == NULL) {
+            fprintf(stderr, "warning: could not open synth WAV %s\n",
+                    synth_wav_path);
+        } else {
+            fprintf(stderr, "tx_white_noise: synth WAV -> %s\n",
+                    synth_wav_path);
+        }
+    }
+
     if (!g_no_ptt) {
         rc = radio_ptt(&g_radio, 1);
         if (rc != RADIO_OK) {
             fprintf(stderr, "error: PTT on (rc=%d)\n", rc);
+            audio_wav_writer_close(synth_wav);
             stop_recorder();
             audio_playback_close(playback);
             goto fail_radio;
@@ -533,8 +573,9 @@ int main(int argc, char **argv)
         usleep(100000);
     }
 
-    arc = audio_play_white_noise(playback, amplitude, duration_s,
+    arc = audio_play_white_noise(playback, synth_wav, amplitude, duration_s,
                                  AUDIO_RATE_HZ, AUDIO_CHANNELS, seed);
+    audio_wav_writer_close(synth_wav);
     audio_playback_close(playback);
 
     if (!g_no_ptt) {
