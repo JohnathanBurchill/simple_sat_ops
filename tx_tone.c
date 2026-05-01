@@ -78,17 +78,26 @@ static void usage(FILE *dest, const char *name, int full)
     fprintf(dest,
         "usage: %s [options]\n"
         "\n"
-        "Key the IC-9700 on a simplex UHF carrier and play a sine tone through\n"
-        "the radio's TX chain. Uplink bring-up tool; does no modulation yet.\n"
+        "Key the configured radio on a simplex UHF carrier and play a sine tone\n"
+        "through the TX chain. Uplink bring-up tool; does no modulation yet.\n"
         "\n"
         "Audio:\n"
-        "  --audio-device=<name>        ALSA PCM device (default plughw:4,0,\n"
-        "                               IC-9700 native USB CODEC)\n"
+        "  --signalink-audio            (default) Auto-detect the SignaLink USB\n"
+        "                               (TI Burr-Brown PCM2901/PCM2904) and use\n"
+        "                               its plughw:N,0. Implies --mod-input=acc.\n"
+        "  --radio-audio                Auto-detect the radio's native USB CODEC\n"
+        "                               (Yaesu/ICOM) and use its plughw:N,0.\n"
+        "                               Implies --mod-input=usb.\n"
+        "  --audio-device=<name>        Explicit ALSA PCM device, overriding\n"
+        "                               either auto-detect (e.g. plughw:1,0)\n"
         "\n"
         "Radio transport:\n"
-        "  --radio-device=<path>        CI-V tty (default /dev/ttyUSB1)\n"
-        "  --radio-serial-speed=<bps>   Serial speed integer (default 115200;\n"
-        "                               ignored on CDC-ACM / native-USB)\n"
+        "  --radio-device=<path>        CAT/CI-V tty. Falls back to the saved\n"
+        "                               default in ~/.local/share/simple_sat_ops/\n"
+        "                               radio_device, then /dev/ttyUSB1.\n"
+        "  --radio-serial-speed=<bps>   Serial speed integer. Falls back to the\n"
+        "                               saved default, then 4800 (yaesu-cat) or\n"
+        "                               115200 (icom-civ).\n"
         "\n"
         "Carrier and tone:\n"
         "  --freq-hz=<hz>               UHF simplex carrier (default %.0f\n"
@@ -110,20 +119,20 @@ static void usage(FILE *dest, const char *name, int full)
         "                               the radio's native USB audio.\n"
         "\n"
         "Behaviour flags:\n"
-        "  --no-ptt                     Skip CI-V PTT; play audio only (bench test)\n"
-        "  --record=<path>              Capture USB CODEC to <path> (headerless\n"
-        "                               S16_LE; default: auto-generated\n"
+        "  --no-ptt                     Skip PTT; play audio only (bench test)\n"
+        "  --record=<path>              Capture the audio device to <path>\n"
+        "                               (headerless S16_LE; default: auto-named\n"
         "                               tx_tone_UT=YYYYMMDDTHHMMSS.sss.raw in CWD)\n"
         "  --no-record                  Disable auto-recording\n"
         "  --record-warmup-ms=<ms>      Delay between arecord start and PTT on so\n"
         "                               its DMA/CODEC startup transient lands\n"
         "                               before TX audio (default 600)\n"
-        "  --moni-level=<0..100>        MONI loopback gain, %% (CI-V 14 07; MONI\n"
-        "                               itself stays a front-panel toggle)\n"
-        "  --uplink-mod-level=<0..100>  USB MOD level, %% (CI-V 1A 05 01 13;\n"
-        "                               how loud your PCM is on the modulator)\n"
-        "  --tx-power=<0..100>          RF power, %% (CI-V 14 0A). Untouched if\n"
-        "                               omitted (uses the radio's current setting).\n"
+        "  --moni-level=<0..100>        MONI loopback gain, %%. Backend-specific;\n"
+        "                               IC-9700 only on this branch.\n"
+        "  --uplink-mod-level=<0..100>  USB MOD level, %% — how loud your PCM is\n"
+        "                               on the modulator.\n"
+        "  --tx-power=<0..100>          RF power, %%. Untouched if omitted (uses\n"
+        "                               the radio's current setting).\n"
         "  --allow-high-power           Required for --tx-power above 10%%.\n"
         "  --allow-tx                   Clear the default TX inhibit. Without this\n"
         "                               flag PTT is gated and the radio is\n"
@@ -139,32 +148,35 @@ static void usage(FILE *dest, const char *name, int full)
         "\n"
         "TRANSPORT SETUPS\n"
         "\n"
-        "Both are supported transparently; only device paths differ.\n"
+        "All supported transparently; pick the radio with --radio-type=.\n"
         "\n"
-        "  A. External USB-to-serial + external USB soundcard (SignaLink etc.)\n"
-        "       --radio-device=/dev/ttyUSB1  --audio-device=hw:3,0\n"
-        "       The serial speed must match the 9700's CI-V menu setting.\n"
-        "       Audio goes over the soundcard's line-out into the 9700's MIC\n"
-        "       or ACC/DATA jack.\n"
+        "  A. SignaLink (or similar external USB soundcard) into rear DATA jack\n"
+        "       --radio-type=yaesu-cat --radio-device=/dev/ttyUSBn\n"
+        "       --audio-device=plughw:<signalink-card>,0 --mod-input=acc\n"
+        "       Default mod path; works on FT-991A and IC-9700.\n"
         "\n"
-        "  B. IC-9700 native USB (CI-V on CDC-ACM, MOD on USB Audio Class)\n"
-        "       --radio-device=/dev/ttyACM0  --audio-device=hw:<9700-card>,0\n"
-        "       Baud is ignored by CDC-ACM. Audio is carried by the 9700's\n"
-        "       built-in USB CODEC; no external soundcard needed.\n"
+        "  B. Radio's native USB CODEC (audio over USB Audio Class)\n"
+        "       --radio-type=yaesu-cat --radio-device=/dev/ttyUSBn\n"
+        "       --audio-device=plughw:<radio-card>,0 --mod-input=usb\n"
+        "       FT-991A and IC-9700 both expose a USB CODEC; on the FT-991A\n"
+        "       the codec has been observed to pass tones up to 12 kHz.\n"
         "\n"
         "Run `aplay -l` on the target to enumerate ALSA cards and pick the right\n"
         "hw:N,M string for --audio-device.\n"
         "\n"
         "RADIO CONFIGURATION AT STARTUP\n"
         "\n"
-        "simple_sat_ops owns the radio. tx_tone configures it fully every run:\n"
-        "  - satellite mode OFF (simplex, single active VFO)\n"
-        "  - Sub parked on 145.150 MHz (VHF) to avoid same-band collisions\n"
-        "  - Main = VFO A, FM-DATA, FIL1, tuned to --freq-hz\n"
-        "  - DATA MOD source is NOT touched; set it on the front panel to\n"
-        "    match whichever jack carries the audio cable (ACC/USB/MIC).\n"
-        "  - PTT asserted via CI-V 0x1C 0x00 (unless --no-ptt)\n"
+        "tx_tone configures the radio fully every run via radio_uplink_prep:\n"
+        "  - tune to --freq-hz on the active VFO\n"
+        "  - FM mode\n"
+        "  - DATA MOD source = --mod-input (default acc = rear DATA jack)\n"
+        "  - DATA mode ON (FM-DATA / DATA-FM depending on backend)\n"
+        "  - PTT asserted via the active backend (unless --no-ptt or TX is\n"
+        "    inhibited; see --allow-tx)\n"
         "  - On exit (clean or signal) PTT is released before disconnect.\n"
+        "\n"
+        "Operator-set front-panel items (not driven by CAT) — see the comment\n"
+        "block at the top of radio_yaesu_cat.c for the FT-991A checklist.\n"
         "\n"
         "VERIFICATION SEQUENCE\n"
         "\n"
@@ -173,11 +185,11 @@ static void usage(FILE *dest, const char *name, int full)
         "     Confirms NCO + ALSA playback via snd-aloop.\n"
         "\n"
         "  2. PTT only, dummy load, no audio:\n"
-        "       %s --duration-s=0.5 --amplitude=0\n"
-        "     Radio keys TX briefly then releases. Confirms CI-V PTT.\n"
+        "       %s --duration-s=0.5 --amplitude=0 --allow-tx\n"
+        "     Radio keys TX briefly then releases. Confirms CAT-side PTT.\n"
         "\n"
         "  3. Full end-to-end on a dummy load, monitor on a 2nd receiver:\n"
-        "       %s --duration-s=5 --amplitude=0.3\n"
+        "       %s --duration-s=5 --amplitude=0.3 --allow-tx\n"
         "\n"
         "RECORDING THE TX\n"
         "\n"
@@ -197,9 +209,9 @@ static void usage(FILE *dest, const char *name, int full)
         "\n"
         "  - FM-DATA mode (flat TX audio, no mic EQ) — same path AX100 frames\n"
         "    use. Radio is left in FM-DATA on exit.\n"
-        "  - The modulation input source (MIC / ACC / USB / DATA) is a front-\n"
-        "    panel menu setting and must be aligned with whichever jack carries\n"
-        "    the audio cable. Not configured via CI-V here.\n"
+        "  - --mod-input picks the modulator audio source via CAT, but a few\n"
+        "    front-panel menus are operator-set (FT-991A: 071=DAKY, 072=DATA;\n"
+        "    see radio_yaesu_cat.c for the full checklist).\n"
         "  - SIGINT / SIGTERM handler releases PTT before exit, so ^C is safe.\n",
         name, name, name);
 }
@@ -271,7 +283,9 @@ int main(int argc, char **argv)
 {
     const char *radio_device = NULL;     // explicit --radio-device=, NULL if absent
     int radio_speed_bps = -1;            // explicit --radio-serial-speed=, < 0 if absent
-    const char *audio_device = "plughw:4,0";
+    const char *audio_device = NULL;
+    char audio_device_buf[64] = {0};     // backing store for autodetect result
+    int audio_pick = 1;  // 0=explicit --audio-device, 1=signalink, 2=radio
     const char *record_path = NULL;
     char auto_record_path[256];
     int no_record = 0;
@@ -300,6 +314,11 @@ int main(int argc, char **argv)
         } else if (strncmp("--audio-device=", argv[i], 15) == 0) {
             if (strlen(argv[i]) < 16) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
             audio_device = argv[i] + 15;
+            audio_pick = 0;
+        } else if (strcmp("--signalink-audio", argv[i]) == 0) {
+            audio_pick = 1;
+        } else if (strcmp("--radio-audio", argv[i]) == 0) {
+            audio_pick = 2;
         } else if (strncmp("--freq-hz=", argv[i], 10) == 0) {
             if (strlen(argv[i]) < 11) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
             freq_hz = atof(argv[i] + 10);
@@ -391,6 +410,42 @@ int main(int argc, char **argv)
             usage(stderr, argv[0], 0);
             return EXIT_FAILURE;
         }
+    }
+
+    // Audio device resolution: explicit --audio-device= wins; otherwise
+    // autodetect based on --signalink-audio (default) or --radio-audio
+    // by reading /proc/asound/cards. Wrong-device-of-the-day mistakes
+    // are how we lost most of yesterday — make the auto path the default.
+    if (audio_device == NULL) {
+        const char *backend_hint =
+            (radio_backend == RADIO_BACKEND_ICOM_CIV) ? "icom" :
+            (radio_backend == RADIO_BACKEND_YAESU_CAT) ? "yaesu" : NULL;
+        int rc;
+        if (audio_pick == 2) {
+            rc = audio_find_radio_device(backend_hint, audio_device_buf,
+                                         sizeof audio_device_buf);
+            if (rc != 0) {
+                fprintf(stderr, "error: --radio-audio: no matching ALSA card "
+                        "found in /proc/asound/cards (rc=%d)\n", rc);
+                return EXIT_FAILURE;
+            }
+            // --radio-audio implies USB CODEC routing on the radio.
+            if (data_mod_source < 0) data_mod_source = RADIO_DATA_MOD_SRC_USB;
+        } else {
+            rc = audio_find_signalink_device(audio_device_buf,
+                                             sizeof audio_device_buf);
+            if (rc != 0) {
+                fprintf(stderr, "error: --signalink-audio: SignaLink not "
+                        "found in /proc/asound/cards (rc=%d). Pass "
+                        "--audio-device= explicitly or --radio-audio for the "
+                        "rig's native USB CODEC.\n", rc);
+                return EXIT_FAILURE;
+            }
+            // --signalink-audio implies rear DATA jack routing.
+            if (data_mod_source < 0) data_mod_source = RADIO_DATA_MOD_SRC_ACC;
+        }
+        audio_device = audio_device_buf;
+        fprintf(stderr, "tx_tone: auto-detected audio device %s\n", audio_device);
     }
 
     // Resolve device + speed: explicit flag wins, else stored default,

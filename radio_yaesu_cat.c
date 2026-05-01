@@ -18,28 +18,56 @@
    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-// Yaesu FT-991A (CAT ASCII protocol) backend. Targets 9600-bps GFSK uplink
-// via the radio's analog FM modulator with switchable-input chain — the
-// path the IC-9700's FPGA TX filter blocks. CAT commands are short ASCII
-// strings terminated by ';'.
+// Yaesu FT-991A (CAT ASCII protocol) backend. The FT-991A is the canonical
+// operational radio for this codebase: the simple_sat_ops UI, tx_tone,
+// tx_white_noise, tx_frame, and radio_ctl all default to --radio-type=
+// yaesu-cat. The IC-9700 (radio_icom_civ.c) is preserved as a secondary
+// backend but no longer exercised. CAT commands are short ASCII strings
+// terminated by ';'.
 //
-// FT-991A bring-up checklist (radio side). All menu numbers verified
-// against "FT-991A CAT Operation Reference Manual" 1711-D, page 7-8:
+// FT-991A bring-up checklist (radio side, one-time). Menu numbers
+// verified against "FT-991A CAT Operation Reference Manual" 1711-D and
+// the FT-991A operating manual. The values below persist across power
+// cycles, so set them once on the front panel and forget them.
 //
-//   Menu 031 CAT RATE  = 4800     P2 0:4800 1:9600 2:19200 3:38400.
-//                                  Must match --radio-serial-speed=.
-//   Menu 032 CAT TOT   = 10 ms    P2 0:10ms 1:100ms 2:1000ms 3:3000ms.
+// CAT-driven (set automatically by this backend; listed here for context):
+//
+//   Menu 070 DATA IN SELECT       0:MIC 1:REAR. Pinned to 1 by
+//                                  set_data_mod_source (EX0701;).
+//   Menu 079 FM PKT MODE          0:1200 1:9600. Pinned to 1 by
+//                                  set_data_mod_source (EX0791;) so
+//                                  DATA-FM uplinks always come up wide
+//                                  enough to pass 9600-baud GFSK;
+//                                  harmless if the operator is only
+//                                  doing tone/audio tests.
+//
+// Operator-set on the front panel (NOT touched by CAT — the radio either
+// rejects our writes or has firmware quirks that fight us):
+//
+//   Menu 031 CAT RATE             0:4800 1:9600 2:19200 3:38400. Must
+//                                  match --radio-serial-speed=. Default
+//                                  38400 is comfortable.
+//   Menu 032 CAT TOT              0:10ms 1:100ms 2:1000ms 3:3000ms.
 //                                  Must be >0 ms or replies are dropped.
-//   Menu 033 CAT RTS   = DISABLE  P2 0:DISABLE 1:ENABLE.
-//                                  macOS's CP2105 driver doesn't reliably
-//                                  raise RTS; leave the radio off.
-//   Menu 070 DATA IN   = REAR     0:MIC 1:REAR. Set by set_data_mod_source.
-//   Menu 072 DATA PORT = USB|DATA 1:DATA jack 2:USB. Same.
-//   Menu 079 FM PKT MODE = 9600   P2 0:1200 1:9600. Driven by
-//                                  set_data_mod_source so DATA-FM uplinks
-//                                  always come up wide enough to pass
-//                                  9600-baud GFSK; harmless if the operator
-//                                  is only doing tone/audio tests.
+//   Menu 033 CAT RTS              0:DISABLE 1:ENABLE. The CP2105 driver
+//                                  on macOS and Linux doesn't reliably
+//                                  toggle RTS; leave DISABLE or every
+//                                  CAT command silently fails.
+//   Menu 071 DATA PTT SELECT      0:DAKY 1:RTS 2:DTR. Set DAKY. Even
+//                                  though we CAT-key (TX1;/TX0;), the
+//                                  rear-DATA audio path is gated on
+//                                  Menu 071 = DAKY on this radio — with
+//                                  RTS or DTR selected, audio injected
+//                                  via the DATA jack is silently dropped.
+//   Menu 072 DATA PORT SELECT     1:DATA jack 2:USB CODEC. Set DATA for
+//                                  the SignaLink-on-rear path. The
+//                                  FT-991A force-resets Menu 072 to USB
+//                                  on entry to DATA-FM regardless of any
+//                                  prior EX072x; write, so this backend
+//                                  deliberately doesn't drive it. The
+//                                  radio remembers the front-panel
+//                                  setting across power cycles, which
+//                                  is what we rely on.
 //
 // The FT-991A's USB bridge (Silicon Labs CP2105) is a dual-port chip;
 // either virtual COM port carries CAT, so first-time bring-up may need

@@ -340,3 +340,89 @@ void audio_playback_close(snd_pcm_t *handle)
     snd_pcm_drain(handle);
     snd_pcm_close(handle);
 }
+
+// /proc/asound/cards is two lines per card:
+//
+//    N [shortname     ]: driver - longname
+//                         details on second line
+//
+// We pair adjacent lines, strip leading whitespace, and substring-match
+// the concatenation against the needle list. Returns the leading card
+// index from the first matching pair.
+int audio_find_alsa_card(const char *const *needles, int needle_count,
+                         char *out_hint, size_t hint_cap)
+{
+    if (needles == NULL || needle_count <= 0) return -2;
+    FILE *f = fopen("/proc/asound/cards", "r");
+    if (f == NULL) return -2;
+    char header[256];
+    char details[256];
+    int found = -1;
+    while (fgets(header, sizeof header, f) != NULL) {
+        if (fgets(details, sizeof details, f) == NULL) break;
+        // Header starts with N or whitespace+N.
+        const char *p = header;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p < '0' || *p > '9') continue;
+        int idx = atoi(p);
+        char combined[512];
+        snprintf(combined, sizeof combined, "%s %s", header, details);
+        for (int i = 0; i < needle_count; i++) {
+            if (needles[i] != NULL && strstr(combined, needles[i]) != NULL) {
+                found = idx;
+                if (out_hint != NULL && hint_cap > 0) {
+                    snprintf(out_hint, hint_cap, "%s", combined);
+                    // Trim trailing newline for tidy log output.
+                    size_t n = strlen(out_hint);
+                    while (n > 0 && (out_hint[n-1] == '\n' || out_hint[n-1] == '\r')) {
+                        out_hint[--n] = '\0';
+                    }
+                }
+                break;
+            }
+        }
+        if (found >= 0) break;
+    }
+    fclose(f);
+    return found >= 0 ? found : -1;
+}
+
+int audio_find_signalink_device(char *out, size_t cap)
+{
+    if (out == NULL || cap < 16) return -2;
+    // SignaLink USB uses TI/Burr-Brown PCM290x. Kernel reports it with
+    // either string in the long-name field; either is enough to ID it
+    // uniquely on our ground-station boxes (no other Burr-Brown audio
+    // chips in use here).
+    const char *needles[] = { "Burr-Brown", "PCM2901", "PCM2904" };
+    int idx = audio_find_alsa_card(needles, 3, NULL, 0);
+    if (idx < 0) return idx;
+    snprintf(out, cap, "plughw:%d,0", idx);
+    return 0;
+}
+
+int audio_find_radio_device(const char *backend_hint, char *out, size_t cap)
+{
+    if (out == NULL || cap < 16) return -2;
+    // Yaesu rigs enumerate with "Yaesu" or specific model number (FT-991A,
+    // FT-DX, etc.) in the long-name. ICOM rigs enumerate with "IC-9700"
+    // or "ICOM". Caller can narrow via backend_hint, otherwise we search
+    // both.
+    const char *yaesu_needles[] = { "Yaesu", "YAESU", "FT-991A", "FT-DX" };
+    const char *icom_needles[]  = { "IC-9700", "IC-705", "ICOM", "Icom" };
+
+    int idx = -1;
+    if (backend_hint == NULL || strcmp(backend_hint, "yaesu") == 0) {
+        idx = audio_find_alsa_card(yaesu_needles,
+                                   (int)(sizeof yaesu_needles / sizeof yaesu_needles[0]),
+                                   NULL, 0);
+        if (idx >= 0) { snprintf(out, cap, "plughw:%d,0", idx); return 0; }
+    }
+    if (backend_hint == NULL || strcmp(backend_hint, "icom") == 0) {
+        idx = audio_find_alsa_card(icom_needles,
+                                   (int)(sizeof icom_needles / sizeof icom_needles[0]),
+                                   NULL, 0);
+        if (idx >= 0) { snprintf(out, cap, "plughw:%d,0", idx); return 0; }
+    }
+    return -1;
+}

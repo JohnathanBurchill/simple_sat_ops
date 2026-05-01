@@ -89,11 +89,22 @@ static void usage(FILE *dest, const char *name)
         "the combined TX+RX inherent frequency response.\n"
         "\n"
         "Audio:\n"
-        "  --audio-device=<name>        ALSA PCM device (default plughw:4,0)\n"
+        "  --signalink-audio            (default) Auto-detect the SignaLink USB\n"
+        "                               (TI Burr-Brown PCM2901/PCM2904) and use\n"
+        "                               its plughw:N,0. Implies --mod-input=acc.\n"
+        "  --radio-audio                Auto-detect the radio's native USB CODEC\n"
+        "                               (Yaesu/ICOM) and use its plughw:N,0.\n"
+        "                               Implies --mod-input=usb.\n"
+        "  --audio-device=<name>        Explicit ALSA PCM device, overriding\n"
+        "                               either auto-detect (e.g. plughw:1,0)\n"
         "\n"
         "Radio transport:\n"
-        "  --radio-device=<path>        CAT/CI-V tty (default /dev/ttyUSB1)\n"
-        "  --radio-serial-speed=<bps>   Serial speed integer (default 115200)\n"
+        "  --radio-device=<path>        CAT/CI-V tty. Falls back to the saved\n"
+        "                               default in ~/.local/share/simple_sat_ops/\n"
+        "                               radio_device, then /dev/ttyUSB1.\n"
+        "  --radio-serial-speed=<bps>   Serial speed integer. Falls back to the\n"
+        "                               saved default, then 4800 (yaesu-cat) or\n"
+        "                               115200 (icom-civ).\n"
         "  --radio-type=<id>            yaesu-cat (default) | icom-civ | usrp-b210\n"
         "\n"
         "Carrier and signal:\n"
@@ -199,7 +210,9 @@ int main(int argc, char **argv)
 {
     const char *radio_device = NULL;
     int radio_speed_bps = -1;
-    const char *audio_device = "plughw:4,0";
+    const char *audio_device = NULL;
+    char audio_device_buf[64] = {0};
+    int audio_pick = 1;  // 0=explicit, 1=signalink (default), 2=radio
     const char *record_path = NULL;
     char auto_record_path[256];
     int no_record = 0;
@@ -228,6 +241,11 @@ int main(int argc, char **argv)
         } else if (strncmp("--audio-device=", argv[i], 15) == 0) {
             if (strlen(argv[i]) < 16) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
             audio_device = argv[i] + 15;
+            audio_pick = 0;
+        } else if (strcmp("--signalink-audio", argv[i]) == 0) {
+            audio_pick = 1;
+        } else if (strcmp("--radio-audio", argv[i]) == 0) {
+            audio_pick = 2;
         } else if (strncmp("--freq-hz=", argv[i], 10) == 0) {
             if (strlen(argv[i]) < 11) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
             freq_hz = atof(argv[i] + 10);
@@ -325,6 +343,36 @@ int main(int argc, char **argv)
             usage(stderr, argv[0]);
             return EXIT_FAILURE;
         }
+    }
+
+    if (audio_device == NULL) {
+        const char *backend_hint =
+            (radio_backend == RADIO_BACKEND_ICOM_CIV) ? "icom" :
+            (radio_backend == RADIO_BACKEND_YAESU_CAT) ? "yaesu" : NULL;
+        int rc;
+        if (audio_pick == 2) {
+            rc = audio_find_radio_device(backend_hint, audio_device_buf,
+                                         sizeof audio_device_buf);
+            if (rc != 0) {
+                fprintf(stderr, "error: --radio-audio: no matching ALSA card "
+                        "found (rc=%d)\n", rc);
+                return EXIT_FAILURE;
+            }
+            if (data_mod_source < 0) data_mod_source = RADIO_DATA_MOD_SRC_USB;
+        } else {
+            rc = audio_find_signalink_device(audio_device_buf,
+                                             sizeof audio_device_buf);
+            if (rc != 0) {
+                fprintf(stderr, "error: --signalink-audio: SignaLink not "
+                        "found (rc=%d). Pass --audio-device= or "
+                        "--radio-audio.\n", rc);
+                return EXIT_FAILURE;
+            }
+            if (data_mod_source < 0) data_mod_source = RADIO_DATA_MOD_SRC_ACC;
+        }
+        audio_device = audio_device_buf;
+        fprintf(stderr, "tx_white_noise: auto-detected audio device %s\n",
+                audio_device);
     }
 
     char effective_device[1024];

@@ -185,10 +185,9 @@ static void usage(FILE *out, const char *argv0)
         "usage: %s (--payload-hex=<HEX> | --payload-ascii=<STR>) [options]\n"
         "\n"
         "Builds a CSP+AX100 frame, initializes the radio to FM-DATA on the\n"
-        "FrontierSat UHF carrier, keys PTT via CI-V, streams the modulated\n"
+        "FrontierSat UHF carrier, keys PTT via CAT, streams the modulated\n"
         "baseband to an ALSA playback device, then unkeys. The DATA MOD\n"
-        "source is NOT touched — set it on the front panel to match the\n"
-        "audio cabling (USB for the 9700's native USB CODEC).\n"
+        "source is set via --mod-input= (default acc = rear DATA jack).\n"
         "\n"
         "Required (exactly one):\n"
         "  --payload-hex=<HEX>         Payload as hex\n"
@@ -209,39 +208,53 @@ static void usage(FILE *out, const char *argv0)
         "                              receiver gets up to 16 byte-errors of FEC.\n"
         "  --no-reed-solomon           Disable RS encode (smaller frame, no FEC).\n"
         "\n"
-        "Radio (CI-V for PTT):\n"
-        "  --radio-device=<path>       CI-V tty (default /dev/ttyUSB1)\n"
-        "  --radio-serial-speed=<bps>  Serial speed (default 115200)\n"
+        "Radio (CAT for PTT):\n"
+        "  --radio-type=<id>           yaesu-cat (default) | icom-civ | usrp-b210\n"
+        "  --radio-device=<path>       CAT tty. Falls back to the saved default\n"
+        "                              in ~/.local/share/simple_sat_ops/radio_device,\n"
+        "                              then /dev/ttyUSB1.\n"
+        "  --radio-serial-speed=<bps>  Serial speed integer. Falls back to the saved\n"
+        "                              default, then 4800 (yaesu-cat) or 115200\n"
+        "                              (icom-civ).\n"
         "  --freq-hz=<hz>              UHF simplex carrier (default %.0f)\n"
         "\n"
         "Modem:\n"
         "  --bit-rate=<bps>            Baud rate (default 9600). Must divide\n"
-        "                              48000 Hz evenly. Try 2400 if the 9700's\n"
+        "                              48000 Hz evenly. Try 2400 if the radio's\n"
         "                              FM-DATA passband filter kills the 4.8 kHz\n"
         "                              preamble fundamental at 9600 bps.\n"
         "\n"
         "Audio (ALSA playback):\n"
-        "  --audio-device=<device>     ALSA device (default plughw:4,0)\n"
+        "  --signalink-audio           (default) Auto-detect the SignaLink USB and\n"
+        "                              use its plughw:N,0. Implies --mod-input=acc.\n"
+        "  --radio-audio               Auto-detect the radio's native USB CODEC\n"
+        "                              and use its plughw:N,0. Implies\n"
+        "                              --mod-input=usb.\n"
+        "  --audio-device=<device>     Explicit ALSA device, overriding either\n"
+        "                              auto-detect.\n"
+        "  --mod-input=<src>           Modulator audio input: usb|acc|mic|mic+acc|\n"
+        "                              mic+usb|lan. Inferred from --signalink-audio /\n"
+        "                              --radio-audio above; pass explicitly to\n"
+        "                              override.\n"
         "  --pre-ms=<ms>               Delay after PTT on before audio starts (200)\n"
         "  --post-ms=<ms>              Delay after audio ends before PTT off (200)\n"
-        "  --record=<path>             Capture USB CODEC to <path> (headerless\n"
+        "  --record=<path>             Capture audio device to <path> (headerless\n"
         "                              S16_LE; default: auto-generated\n"
         "                              tx_frame_UT=YYYYMMDDTHHMMSS.sss.raw in CWD)\n"
         "  --no-record                 Disable auto-recording\n"
         "  --record-warmup-ms=<ms>     Delay between arecord start and PTT on so\n"
         "                              its DMA/CODEC startup transient lands\n"
         "                              before TX audio (default 600)\n"
-        "  --moni-level=<0..100>       MONI loopback gain, %% (CI-V 14 07; MONI\n"
-        "                              itself stays a front-panel toggle)\n"
-        "  --uplink-mod-level=<0..100> USB MOD level, %% (CI-V 1A 05 01 13;\n"
-        "                              how loud your PCM is on the modulator)\n"
-        "  --tx-power=<0..100>         RF power, %% (CI-V 14 0A). Untouched if\n"
-        "                              omitted (uses the radio's current setting).\n"
+        "  --moni-level=<0..100>       MONI loopback gain, %%. Backend-specific;\n"
+        "                              IC-9700 only on this branch.\n"
+        "  --uplink-mod-level=<0..100> USB MOD level, %% — how loud your PCM is on\n"
+        "                              the modulator.\n"
+        "  --tx-power=<0..100>         RF power, %%. Untouched if omitted (uses the\n"
+        "                              radio's current setting).\n"
         "  --allow-high-power          Required for --tx-power above 10%%.\n"
         "  --allow-tx                  Clear the default TX inhibit. Without this,\n"
         "                              PTT is gated and the radio is configured\n"
         "                              but never keyed.\n"
-        "  --radio-type=<id>           yaesu-cat (default) | icom-civ | usrp-b210\n"
         "\n"
         "Safety / dry-run:\n"
         "  --dry-run                   Build the frame, print size, do not TX\n"
@@ -255,7 +268,7 @@ int main(int argc, char **argv)
     const char *payload_ascii = NULL;
     const char *keyfile_path = NULL;
     const char *radio_device = NULL;
-    const char *audio_device = "plughw:4,0";
+    const char *audio_device = NULL;
     const char *record_path = NULL;
     char auto_record_path[256];
     int no_record = 0;
@@ -271,6 +284,9 @@ int main(int argc, char **argv)
     int tx_power_pct = -1;  // < 0 = don't touch (% 0..100)
     int allow_high_power = 0;
     int allow_tx = 0;
+    int mod_input_override = -1;  // < 0 = leave whatever radio_uplink_prep picks
+    char audio_device_buf[64] = {0};
+    int audio_pick = 1;  // 0=explicit, 1=signalink (default), 2=radio
     radio_backend_type_t radio_backend = RADIO_BACKEND_YAESU_CAT;
     int record_warmup_ms = 600;
 
@@ -299,7 +315,19 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--prio="))    csp_hdr.prio  = (uint8_t)atoi(a + 7);
         else if (starts_with(a, "--radio-device="))     radio_device = a + 15;
         else if (starts_with(a, "--radio-serial-speed=")) radio_speed_bps = atoi(a + 21);
-        else if (starts_with(a, "--audio-device="))     audio_device = a + 15;
+        else if (starts_with(a, "--audio-device="))   { audio_device = a + 15; audio_pick = 0; }
+        else if (strcmp(a, "--signalink-audio") == 0) audio_pick = 1;
+        else if (strcmp(a, "--radio-audio") == 0)     audio_pick = 2;
+        else if (starts_with(a, "--mod-input=")) {
+            const char *s = a + 12;
+            if      (strcmp(s, "mic")     == 0) mod_input_override = RADIO_DATA_MOD_SRC_MIC;
+            else if (strcmp(s, "acc")     == 0) mod_input_override = RADIO_DATA_MOD_SRC_ACC;
+            else if (strcmp(s, "mic+acc") == 0) mod_input_override = RADIO_DATA_MOD_SRC_MIC_ACC;
+            else if (strcmp(s, "usb")     == 0) mod_input_override = RADIO_DATA_MOD_SRC_USB;
+            else if (strcmp(s, "mic+usb") == 0) mod_input_override = RADIO_DATA_MOD_SRC_MIC_USB;
+            else if (strcmp(s, "lan")     == 0) mod_input_override = RADIO_DATA_MOD_SRC_LAN;
+            else { fprintf(stderr, "--mod-input: unknown '%s'\n", s); return 1; }
+        }
         else if (starts_with(a, "--bit-rate=")) {
             int bps = atoi(a + 11);
             if (bps <= 0 || (48000 % bps) != 0) {
@@ -361,6 +389,34 @@ int main(int argc, char **argv)
         fprintf(stderr, "pass exactly one of --payload-hex or --payload-ascii\n");
         usage(stderr, argv[0]);
         return 1;
+    }
+    if (audio_device == NULL && !dry_run) {
+        const char *backend_hint =
+            (radio_backend == RADIO_BACKEND_ICOM_CIV) ? "icom" :
+            (radio_backend == RADIO_BACKEND_YAESU_CAT) ? "yaesu" : NULL;
+        int rc;
+        if (audio_pick == 2) {
+            rc = audio_find_radio_device(backend_hint, audio_device_buf,
+                                         sizeof audio_device_buf);
+            if (rc != 0) {
+                fprintf(stderr, "error: --radio-audio: no matching ALSA card "
+                        "found (rc=%d)\n", rc);
+                return 1;
+            }
+            if (mod_input_override < 0) mod_input_override = RADIO_DATA_MOD_SRC_USB;
+        } else {
+            rc = audio_find_signalink_device(audio_device_buf,
+                                             sizeof audio_device_buf);
+            if (rc != 0) {
+                fprintf(stderr, "error: --signalink-audio: SignaLink not "
+                        "found (rc=%d). Pass --audio-device= or "
+                        "--radio-audio.\n", rc);
+                return 1;
+            }
+            if (mod_input_override < 0) mod_input_override = RADIO_DATA_MOD_SRC_ACC;
+        }
+        audio_device = audio_device_buf;
+        fprintf(stderr, "tx_frame: auto-detected audio device %s\n", audio_device);
     }
 
     uint8_t payload[2048];
@@ -475,15 +531,22 @@ int main(int argc, char **argv)
         free(samples);
         return 1;
     }
-    // radio_init leaves Main in plain FM (CI-V 0x06 clears the DATA flag).
-    // radio_uplink_prep sets FM + DATA on + DATA MOD source = USB so the
-    // PCM we're about to stream actually reaches the modulator. Without
-    // forcing DATA MOD = USB, a stale front-panel setting (MIC / ACC) gives
-    // you an unmodulated carrier — CW on the waterfall instead of FSK.
+    // radio_init leaves Main in plain FM. radio_uplink_prep tunes, sets
+    // FM mode, picks the MOD input (default ACC = rear DATA jack), and
+    // flips into DATA mode so the PCM we're about to stream actually
+    // reaches the modulator. Without DATA mode + correct MOD input, a
+    // stale front-panel setting gives an unmodulated carrier — CW on
+    // the waterfall instead of GFSK.
     rc = radio_uplink_prep(&radio);
     if (rc != RADIO_OK) {
         fprintf(stderr, "warning: radio_uplink_prep failed (rc=%d); "
                 "check MODE/DATA/DATA-MOD on the front panel.\n", rc);
+    }
+    if (mod_input_override >= 0) {
+        rc = radio_set_data_mod_source(&radio, mod_input_override);
+        if (rc != RADIO_OK && rc != RADIO_NOT_SUPPORTED) {
+            fprintf(stderr, "warning: --mod-input override failed (rc=%d)\n", rc);
+        }
     }
     if (uplink_mod_level >= 0) {
         int raw = (int)((uplink_mod_level * 255 + 50) / 100);
