@@ -139,7 +139,7 @@ endif()
 # ----- Optional: full main UI (needs ALSA + ncurses + SGP4) -----------------
 
 if (ASOUND_FOUND AND NCURSES_FOUND AND SGP4SDP4_LIB)
-    add_executable(simple_sat_ops main.c prediction.c ${RADIO_SOURCES} antenna_rotator.c audio.c telemetry.c oem.c)
+    add_executable(simple_sat_ops main.c prediction.c ${RADIO_SOURCES} radio_device_store.c antenna_rotator.c audio.c telemetry.c oem.c)
     target_link_directories(simple_sat_ops PRIVATE ${ASOUND_LIBRARY_DIRS} ${NCURSES_LIBRARY_DIRS})
     target_link_libraries(simple_sat_ops PRIVATE ${SGP4SDP4_LIB} ${NCURSES_LIBRARIES} m ${ASOUND_LIBRARIES} pthread)
     list(APPEND SSO_TARGETS simple_sat_ops)

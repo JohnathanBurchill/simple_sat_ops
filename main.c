@@ -23,6 +23,7 @@
 #include "antenna_rotator.h"
 #include "audio.h"
 #include "radio.h"
+#include "radio_device_store.h"
 #include "state.h"
 #include "prediction.h"
 
@@ -60,6 +61,19 @@ void stop_tracking(state_t *state);
 void enable_wildrose_mode(state_t *state);
 int point_to_stationary_target(state_t *state, double azimuth, double elevation);
 void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, double downlink_freq);
+
+static speed_t speed_from_bps(int bps)
+{
+    switch (bps) {
+        case 4800:   return B4800;
+        case 9600:   return B9600;
+        case 19200:  return B19200;
+        case 38400:  return B38400;
+        case 57600:  return B57600;
+        case 115200: return B115200;
+        default:     return 0;
+    }
+}
 
 void usage(FILE *dest, const char *name, int full)
 {
@@ -782,15 +796,28 @@ int main(int argc, char **argv)
 
     /* Cleanup */
     if (state.radio.connected) {
-	// Turn off waterfall output to USB
-	uint8_t data[1] = {0};
-	radio_result = radio_command(&state.radio, 0x27, 0x10, -1, data, 1, NULL, 0);
-	if (radio_result != RADIO_OK) {
-	    fprintf(stderr, "Unable to set waveform data status\n");
-	    return radio_result;
-	}
+        // Turn off waterfall output. IC-9700-specific (CI-V `27 10 00`),
+        // and only meaningful if we ever started it. Skip on any other
+        // backend or if waterfall was never enabled — sending raw CI-V
+        // bytes to an FT-991A would just confuse its CAT engine.
+        if (state.radio_backend == RADIO_BACKEND_ICOM_CIV
+            && state.radio.waterfall_enabled) {
+            uint8_t data[1] = {0};
+            radio_result = radio_command(&state.radio, 0x27, 0x10, -1,
+                                         data, 1, NULL, 0);
+            if (radio_result != RADIO_OK) {
+                fprintf(stderr, "Unable to set waveform data status\n");
+                // Continue cleanup; this is best-effort.
+            }
+        }
 
-        radio_set_satellite_mode(&state.radio, 0);
+        // set_satellite_mode is NULL on the Yaesu vtable so the dispatcher
+        // returns RADIO_NOT_SUPPORTED with a one-line warning. Harmless,
+        // but skip the call when we know it won't apply to keep cleanup
+        // output clean.
+        if (state.radio_backend == RADIO_BACKEND_ICOM_CIV) {
+            radio_set_satellite_mode(&state.radio, 0);
+        }
         radio_disconnect(&state.radio);
     }
     if (state.antenna_rotator.connected) {
@@ -835,9 +862,12 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->allow_high_power = 0;
     state->allow_tx = 0;
     state->radio_backend = RADIO_BACKEND_YAESU_CAT;
-    state->radio.device_filename = "/dev/ttyUSB1";
-    state->radio.serial_speed = B115200;
-    // state->radio.serial_speed = B9600;
+    // device_filename and serial_speed are resolved post-argv: explicit
+    // flag wins, then ~/.local/share/simple_sat_ops/ store, then a
+    // backend-default fallback. Leave NULL/0 here so argv parsing can
+    // detect "user didn't pass --radio-device=" cleanly.
+    state->radio.device_filename = NULL;
+    state->radio.serial_speed = 0;
     state->radio.waterfall_enabled = 0;
 
     state->run_with_antenna_rotator = 0;
@@ -941,10 +971,17 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strncmp("--radio-serial-speed=", argv[i], 21) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 22) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]); 
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
                 return EXIT_FAILURE;
-            } 
-            state->radio.serial_speed = atoi(argv[i] + 21);
+            }
+            int bps = atoi(argv[i] + 21);
+            speed_t s = speed_from_bps(bps);
+            if (s == 0) {
+                fprintf(stderr, "Unsupported --radio-serial-speed=%d "
+                        "(supported: 4800,9600,19200,38400,57600,115200)\n", bps);
+                return EXIT_FAILURE;
+            }
+            state->radio.serial_speed = s;
         } else if (strncmp("--uplink-mode=", argv[i], 14) == 0) {
             state->n_options++; 
             if (strlen(argv[i]) < 15) {
@@ -1111,6 +1148,31 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         return 1;
     }
 
+    // Resolve radio device + speed: explicit flag wins, then the saved
+    // default at ~/.local/share/simple_sat_ops/, then a backend-default
+    // fallback. Same precedence radio_ctl / tx_tone / tx_white_noise /
+    // tx_frame use, so an operator who's run `radio_ctl --store-device
+    // --store-serial-speed` once doesn't have to retype the path here.
+    static char effective_radio_device[1024];
+    if (state->radio.device_filename == NULL) {
+        if (radio_device_store_load(effective_radio_device,
+                                    sizeof effective_radio_device) == 0) {
+            state->radio.device_filename = effective_radio_device;
+        } else {
+            state->radio.device_filename = "/dev/ttyUSB1";
+        }
+    }
+    if (state->radio.serial_speed == 0) {
+        int stored_bps = 0;
+        if (radio_device_store_load_speed(&stored_bps) == 0) {
+            state->radio.serial_speed = speed_from_bps(stored_bps);
+        }
+        if (state->radio.serial_speed == 0) {
+            state->radio.serial_speed = (state->radio_backend == RADIO_BACKEND_YAESU_CAT)
+                                            ? B4800 : B115200;
+        }
+    }
+
     state->radio.doppler_uplink_frequency = state->radio.nominal_uplink_frequency;
     state->radio.doppler_downlink_frequency = state->radio.nominal_downlink_frequency;
 
@@ -1217,9 +1279,11 @@ void enable_wildrose_mode(state_t *state)
     state->radio.nominal_downlink_frequency = state->radio.reference_downlink_frequency;
     state->radio.doppler_correction_enabled = 0;
     if (state->have_radio) {
+        // VFOMain is an IC-9700 sub/main concept; the FT-991A backend has
+        // a single VFO and reports RADIO_NOT_SUPPORTED. Treat that as OK.
         radio_result = radio_set_vfo(&state->radio, VFOMain);
-        if (radio_result != RADIO_OK) {
-            fprintf(stderr, "Error setting radio VFO to VFOMain");
+        if (radio_result != RADIO_OK && radio_result != RADIO_NOT_SUPPORTED) {
+            fprintf(stderr, "Error setting radio VFO to VFOMain\n");
             return;
         }
         radio_result = radio_set_mode(&state->radio, RADIO_MODE_CW, RADIO_FILTER_FIL1);
