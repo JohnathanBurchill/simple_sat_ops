@@ -19,12 +19,14 @@
 */
 
 // Receive-side counterpart of tx_tone / tx_white_noise: capture the
-// SignaLink (default) or radio's native USB CODEC into a WAV in CWD and
-// auto-render a 1920x1080 spectrogram PNG. No radio dispatcher — this
-// tool is purely audio-side. Configure the radio (frequency, mode, etc.)
-// separately with radio_ctl, then point rx_capture at the SignaLink to
-// see what's coming out of the rear DATA-OUT jack, or at the radio's
-// native USB CODEC to see the AF demod.
+// SignaLink (default) or radio's native USB CODEC into a WAV plus a
+// headerless S16_LE .raw in CWD, and auto-render a 1920x1080 spectrogram
+// PNG from the WAV. No radio dispatcher — this tool is purely audio-side.
+// Configure the radio (frequency, mode, etc.) separately with radio_ctl,
+// then point rx_capture at the SignaLink to see what's coming out of the
+// rear DATA-OUT jack, or at the radio's native USB CODEC to see the AF
+// demod. The .raw is the format rx_decode --raw expects, so a typical
+// flow is `rx_capture` → `rx_decode --raw --rate=48000 --channels=2 <raw>`.
 
 #include "audio.h"
 
@@ -52,7 +54,11 @@ static void usage(FILE *dest, const char *name)
         "usage: %s [options]\n"
         "\n"
         "Capture audio from the SignaLink (default) or radio's native USB\n"
-        "CODEC, write a WAV in CWD, and render a 1920x1080 spectrogram PNG.\n"
+        "CODEC, write both a WAV and a headerless S16_LE .raw in CWD, and\n"
+        "render a 1920x1080 spectrogram PNG from the WAV. The .raw is the\n"
+        "format rx_decode --raw expects, so a typical flow is\n"
+        "  rx_capture --duration-s=10\n"
+        "  rx_decode --raw --rate=48000 --channels=2 <raw_path>\n"
         "Mirrors tx_tone / tx_white_noise on the receive side: feed the\n"
         "off-air RX (or SDR-via-radio audio) into the SignaLink and read\n"
         "the bandshape off the resulting spectrogram.\n"
@@ -76,7 +82,11 @@ static void usage(FILE *dest, const char *name)
         "                           the last chunk read.\n"
         "  --output=<path>          WAV path (default: auto-named\n"
         "                           rx_capture_UT=YYYYMMDDTHHMMSS.sss.wav\n"
-        "                           in CWD).\n"
+        "                           in CWD). The companion .raw uses the\n"
+        "                           same base name with a .raw extension.\n"
+        "  --no-raw                 Skip the headerless .raw output.\n"
+        "  --no-wav                 Skip the .wav (and therefore the\n"
+        "                           spectrogram). Capture .raw only.\n"
         "  --no-spectrogram         Skip the ffmpeg spectrogram step.\n"
         "  --help                   Show this help.\n",
         name);
@@ -96,6 +106,22 @@ static int make_auto_wav_path(char *out, size_t out_size)
     return (n > 0 && (size_t)n < out_size) ? 0 : -1;
 }
 
+// Derive a sibling .raw path from a wav path: replace .wav extension if
+// present, otherwise append .raw. Returns 0 on success, -1 if the path
+// would overflow the output buffer.
+static int derive_raw_path(const char *wav_path, char *out, size_t out_size)
+{
+    if (wav_path == NULL) return -1;
+    size_t len = strlen(wav_path);
+    int n;
+    if (len >= 4 && strcmp(wav_path + len - 4, ".wav") == 0) {
+        n = snprintf(out, out_size, "%.*s.raw", (int)(len - 4), wav_path);
+    } else {
+        n = snprintf(out, out_size, "%s.raw", wav_path);
+    }
+    return (n > 0 && (size_t)n < out_size) ? 0 : -1;
+}
+
 int main(int argc, char **argv)
 {
     const char *audio_device = NULL;
@@ -104,8 +130,11 @@ int main(int argc, char **argv)
     const char *backend_hint = NULL;
     const char *output_path = NULL;
     char auto_path[256];
+    char raw_path[300] = {0};
     double duration_s = 10.0;
     int do_spectrogram = 1;
+    int want_raw = 1;
+    int want_wav = 1;
 
     for (int i = 1; i < argc; i++) {
         if (strncmp("--audio-device=", argv[i], 15) == 0) {
@@ -128,6 +157,10 @@ int main(int argc, char **argv)
             output_path = argv[i] + 9;
         } else if (strcmp("--no-spectrogram", argv[i]) == 0) {
             do_spectrogram = 0;
+        } else if (strcmp("--no-raw", argv[i]) == 0) {
+            want_raw = 0;
+        } else if (strcmp("--no-wav", argv[i]) == 0) {
+            want_wav = 0;
         } else if (strcmp("--help", argv[i]) == 0) {
             usage(stdout, argv[0]);
             return 0;
@@ -163,12 +196,23 @@ int main(int argc, char **argv)
                 audio_device);
     }
 
+    if (!want_raw && !want_wav) {
+        fprintf(stderr, "error: --no-raw and --no-wav: nothing to write\n");
+        return EXIT_FAILURE;
+    }
+
     if (output_path == NULL) {
         if (make_auto_wav_path(auto_path, sizeof auto_path) != 0) {
             fprintf(stderr, "error: could not build auto WAV filename\n");
             return EXIT_FAILURE;
         }
         output_path = auto_path;
+    }
+    if (want_raw && derive_raw_path(output_path, raw_path,
+                                    sizeof raw_path) != 0) {
+        fprintf(stderr, "error: could not derive .raw path from '%s'\n",
+                output_path);
+        return EXIT_FAILURE;
     }
 
     struct sigaction sa = {0};
@@ -186,26 +230,42 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    audio_wav_writer_t *wav = audio_wav_writer_open(output_path,
-                                                    AUDIO_RATE_HZ,
-                                                    AUDIO_CHANNELS);
-    if (wav == NULL) {
-        fprintf(stderr, "error: could not open WAV %s\n", output_path);
-        audio_capture_close(capture);
-        return EXIT_FAILURE;
+    audio_wav_writer_t *wav = NULL;
+    if (want_wav) {
+        wav = audio_wav_writer_open(output_path,
+                                    AUDIO_RATE_HZ, AUDIO_CHANNELS);
+        if (wav == NULL) {
+            fprintf(stderr, "error: could not open WAV %s\n", output_path);
+            audio_capture_close(capture);
+            return EXIT_FAILURE;
+        }
+    }
+    FILE *raw_fp = NULL;
+    if (want_raw) {
+        raw_fp = fopen(raw_path, "wb");
+        if (raw_fp == NULL) {
+            fprintf(stderr, "error: could not open raw %s: %s\n",
+                    raw_path, strerror(errno));
+            audio_wav_writer_close(wav);
+            audio_capture_close(capture);
+            return EXIT_FAILURE;
+        }
     }
 
     if (duration_s > 0.0) {
-        fprintf(stderr, "rx_capture: %.2f s from %s -> %s\n",
-                duration_s, audio_device, output_path);
+        fprintf(stderr, "rx_capture: %.2f s from %s\n",
+                duration_s, audio_device);
     } else {
-        fprintf(stderr, "rx_capture: open-ended from %s -> %s "
-                "(Ctrl-C to stop)\n", audio_device, output_path);
+        fprintf(stderr, "rx_capture: open-ended from %s "
+                "(Ctrl-C to stop)\n", audio_device);
     }
+    if (want_wav) fprintf(stderr, "rx_capture: WAV -> %s\n", output_path);
+    if (want_raw) fprintf(stderr, "rx_capture: raw -> %s\n", raw_path);
 
-    arc = audio_capture_to_wav(capture, wav, duration_s,
-                               AUDIO_RATE_HZ, AUDIO_CHANNELS, &g_stop);
+    arc = audio_capture(capture, wav, raw_fp, duration_s,
+                        AUDIO_RATE_HZ, AUDIO_CHANNELS, &g_stop);
     audio_wav_writer_close(wav);
+    if (raw_fp != NULL) fclose(raw_fp);
     audio_capture_close(capture);
 
     if (arc != AUDIO_OK) {
@@ -217,8 +277,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "rx_capture: stopped on signal\n");
     }
 
-    if (do_spectrogram) {
+    if (do_spectrogram && want_wav) {
         audio_generate_spectrogram(output_path);
+    }
+
+    if (want_raw) {
+        fprintf(stderr, "rx_capture: to decode AX100, run\n"
+                "  rx_decode --raw --rate=%u --channels=%u %s\n",
+                AUDIO_RATE_HZ, AUDIO_CHANNELS, raw_path);
     }
 
     return 0;

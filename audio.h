@@ -105,20 +105,22 @@ int audio_play_white_noise(snd_pcm_t *handle, audio_wav_writer_t *wav,
 void audio_playback_close(snd_pcm_t *handle);
 
 // Capture symmetric to audio_playback_*. audio_capture_open() configures
-// rate/format/channels just like the playback variant. audio_capture_to_wav
-// reads chunks via snd_pcm_readi and appends them to the WAV writer; with
+// rate/format/channels just like the playback variant. audio_capture()
+// reads chunks via snd_pcm_readi and tees each chunk to the WAV writer
+// and/or a headerless raw FILE*; either output may be NULL. With
 // duration_s > 0 it stops when target frames are reached, with duration_s
-// <= 0 it captures indefinitely. stop_flag, if non-NULL, is checked between
-// reads so a SIGINT handler can flip it and break the loop cleanly (header
-// gets patched, no truncated WAV). audio_capture_close() drops pending
-// samples instead of draining (which would otherwise block until something
-// reads them).
+// <= 0 it captures indefinitely. stop_flag, if non-NULL, is checked
+// between reads so a SIGINT handler can flip it and break the loop
+// cleanly (WAV header gets patched, no truncated file).
+// audio_capture_close() drops pending samples instead of draining (which
+// would otherwise block until something reads them).
 int audio_capture_open(snd_pcm_t **handle, const char *device,
                        unsigned int rate_hz, unsigned int channels);
-int audio_capture_to_wav(snd_pcm_t *handle, audio_wav_writer_t *wav,
-                         double duration_s,
-                         unsigned int rate_hz, unsigned int channels,
-                         volatile sig_atomic_t *stop_flag);
+int audio_capture(snd_pcm_t *handle,
+                  audio_wav_writer_t *wav, FILE *raw_out,
+                  double duration_s,
+                  unsigned int rate_hz, unsigned int channels,
+                  volatile sig_atomic_t *stop_flag);
 void audio_capture_close(snd_pcm_t *handle);
 
 // Spawn ffmpeg to render a 1920x1080 showspectrumpic PNG from a WAV

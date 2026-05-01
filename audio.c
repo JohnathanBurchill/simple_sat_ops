@@ -520,12 +520,13 @@ int audio_capture_open(snd_pcm_t **handle, const char *device,
     return AUDIO_OK;
 }
 
-int audio_capture_to_wav(snd_pcm_t *handle, audio_wav_writer_t *wav,
-                         double duration_s,
-                         unsigned int rate_hz, unsigned int channels,
-                         volatile sig_atomic_t *stop_flag)
+int audio_capture(snd_pcm_t *handle,
+                  audio_wav_writer_t *wav, FILE *raw_out,
+                  double duration_s,
+                  unsigned int rate_hz, unsigned int channels,
+                  volatile sig_atomic_t *stop_flag)
 {
-    if (handle == NULL || wav == NULL || channels == 0 || rate_hz == 0) {
+    if (handle == NULL || channels == 0 || rate_hz == 0) {
         return AUDIO_ARGS;
     }
 
@@ -537,9 +538,9 @@ int audio_capture_to_wav(snd_pcm_t *handle, audio_wav_writer_t *wav,
 
     // duration_s <= 0 means "capture until stop_flag is set" — useful for
     // open-ended Ctrl-C captures. With duration_s > 0 we still honour
-    // stop_flag so an early Ctrl-C cleanly truncates the WAV at the last
+    // stop_flag so an early Ctrl-C cleanly truncates outputs at the last
     // chunk read, instead of either timing out the full duration or
-    // SIGKILLing with a half-written header.
+    // SIGKILLing with a half-written WAV header.
     const uint64_t target_frames = (duration_s > 0.0)
         ? (uint64_t)(duration_s * (double)rate_hz)
         : 0;
@@ -562,7 +563,16 @@ int audio_capture_to_wav(snd_pcm_t *handle, audio_wav_writer_t *wav,
             free(buf);
             return AUDIO_DEVICE_OPEN;
         }
-        wav_writer_append(wav, buf, (size_t)got * channels * sizeof(int16_t));
+        size_t bytes = (size_t)got * channels * sizeof(int16_t);
+        if (wav != NULL) {
+            wav_writer_append(wav, buf, bytes);
+        }
+        if (raw_out != NULL) {
+            // Best-effort: a short write here only loses tail samples, the
+            // capture itself keeps running. We don't error out so the WAV
+            // (which will still be valid) gets a chance to close cleanly.
+            (void)fwrite(buf, 1, bytes, raw_out);
+        }
         frames_read += (uint64_t)got;
     }
 
