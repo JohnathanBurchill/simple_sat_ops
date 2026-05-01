@@ -31,6 +31,7 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "audio.h"
 #include "ax100.h"
 #include "csp.h"
 #include "hmac_keyfile.h"
