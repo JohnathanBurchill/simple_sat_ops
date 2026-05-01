@@ -2,6 +2,7 @@
 #define AUDIO_H
 
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -102,6 +103,23 @@ int audio_play_white_noise(snd_pcm_t *handle, audio_wav_writer_t *wav,
                            unsigned int rate_hz, unsigned int channels,
                            uint64_t seed, double bandwidth_hz);
 void audio_playback_close(snd_pcm_t *handle);
+
+// Capture symmetric to audio_playback_*. audio_capture_open() configures
+// rate/format/channels just like the playback variant. audio_capture_to_wav
+// reads chunks via snd_pcm_readi and appends them to the WAV writer; with
+// duration_s > 0 it stops when target frames are reached, with duration_s
+// <= 0 it captures indefinitely. stop_flag, if non-NULL, is checked between
+// reads so a SIGINT handler can flip it and break the loop cleanly (header
+// gets patched, no truncated WAV). audio_capture_close() drops pending
+// samples instead of draining (which would otherwise block until something
+// reads them).
+int audio_capture_open(snd_pcm_t **handle, const char *device,
+                       unsigned int rate_hz, unsigned int channels);
+int audio_capture_to_wav(snd_pcm_t *handle, audio_wav_writer_t *wav,
+                         double duration_s,
+                         unsigned int rate_hz, unsigned int channels,
+                         volatile sig_atomic_t *stop_flag);
+void audio_capture_close(snd_pcm_t *handle);
 
 // Spawn ffmpeg to render a 1920x1080 showspectrumpic PNG from a WAV
 // file. PNG path = WAV path with .wav -> .png. Blocks until ffmpeg

@@ -124,6 +124,13 @@ if (ASOUND_FOUND)
     target_link_libraries(tx_white_noise PRIVATE m ${ASOUND_LIBRARIES})
     list(APPEND SSO_TARGETS tx_white_noise)
 
+    # Receive-side capture: SignaLink / radio USB CODEC -> WAV + spectrogram.
+    # No radio dispatcher dependency — pure audio in.
+    add_executable(rx_capture rx_capture.c audio.c)
+    target_link_directories(rx_capture PRIVATE ${ASOUND_LIBRARY_DIRS})
+    target_link_libraries(rx_capture PRIVATE m ${ASOUND_LIBRARIES})
+    list(APPEND SSO_TARGETS rx_capture)
+
     if (OPENSSL_FOUND)
         # Single-shot frame transmitter: CSP+AX100 -> PCM -> CAT PTT + ALSA playback
         add_executable(tx_frame utils/tx_frame.c csp.c golay24.c ax100.c rs.c hmac_keyfile.c modem.c radio_device_store.c audio.c ${RADIO_SOURCES})
@@ -133,7 +140,7 @@ if (ASOUND_FOUND)
         list(APPEND SSO_TARGETS tx_frame)
     endif()
 else()
-    message(STATUS "libasound not found; tx_tone, tx_frame will not be built.")
+    message(STATUS "libasound not found; tx_tone, tx_white_noise, tx_frame, rx_capture will not be built.")
 endif()
 
 # ----- Optional: full main UI (needs ALSA + ncurses + SGP4) -----------------

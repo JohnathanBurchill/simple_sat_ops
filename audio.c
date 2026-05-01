@@ -489,6 +489,96 @@ void audio_playback_close(snd_pcm_t *handle)
     snd_pcm_close(handle);
 }
 
+int audio_capture_open(snd_pcm_t **handle, const char *device,
+                       unsigned int rate_hz, unsigned int channels)
+{
+    if (handle == NULL || device == NULL) {
+        return AUDIO_ARGS;
+    }
+    if (snd_pcm_open(handle, device, SND_PCM_STREAM_CAPTURE, 0) < 0) {
+        return AUDIO_DEVICE_OPEN;
+    }
+
+    snd_pcm_hw_params_t *params = NULL;
+    snd_pcm_hw_params_malloc(&params);
+    snd_pcm_hw_params_any(*handle, params);
+    snd_pcm_hw_params_set_access(*handle, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(*handle, params, AUDIO_FORMAT);
+    snd_pcm_hw_params_set_channels(*handle, params, channels);
+    unsigned int rate = rate_hz;
+    int dir = 0;
+    snd_pcm_hw_params_set_rate_near(*handle, params, &rate, &dir);
+    snd_pcm_uframes_t period = AUDIO_PLAYBACK_FRAMES_PER_CHUNK;
+    snd_pcm_hw_params_set_period_size_near(*handle, params, &period, &dir);
+    int apply = snd_pcm_hw_params(*handle, params);
+    snd_pcm_hw_params_free(params);
+    if (apply < 0) {
+        snd_pcm_close(*handle);
+        *handle = NULL;
+        return AUDIO_DEVICE_OPEN;
+    }
+    return AUDIO_OK;
+}
+
+int audio_capture_to_wav(snd_pcm_t *handle, audio_wav_writer_t *wav,
+                         double duration_s,
+                         unsigned int rate_hz, unsigned int channels,
+                         volatile sig_atomic_t *stop_flag)
+{
+    if (handle == NULL || wav == NULL || channels == 0 || rate_hz == 0) {
+        return AUDIO_ARGS;
+    }
+
+    const snd_pcm_uframes_t frames_per_chunk = AUDIO_PLAYBACK_FRAMES_PER_CHUNK;
+    int16_t *buf = malloc(frames_per_chunk * channels * sizeof(int16_t));
+    if (buf == NULL) {
+        return AUDIO_MEMORY;
+    }
+
+    // duration_s <= 0 means "capture until stop_flag is set" — useful for
+    // open-ended Ctrl-C captures. With duration_s > 0 we still honour
+    // stop_flag so an early Ctrl-C cleanly truncates the WAV at the last
+    // chunk read, instead of either timing out the full duration or
+    // SIGKILLing with a half-written header.
+    const uint64_t target_frames = (duration_s > 0.0)
+        ? (uint64_t)(duration_s * (double)rate_hz)
+        : 0;
+    uint64_t frames_read = 0;
+
+    while ((target_frames == 0 || frames_read < target_frames)
+           && (stop_flag == NULL || *stop_flag == 0)) {
+        snd_pcm_uframes_t want = frames_per_chunk;
+        if (target_frames != 0) {
+            uint64_t remain = target_frames - frames_read;
+            if (want > remain) want = (snd_pcm_uframes_t)remain;
+        }
+        snd_pcm_sframes_t got = snd_pcm_readi(handle, buf, want);
+        if (got == -EPIPE) {
+            // Overrun. Recover and keep going.
+            snd_pcm_prepare(handle);
+            continue;
+        }
+        if (got < 0) {
+            free(buf);
+            return AUDIO_DEVICE_OPEN;
+        }
+        wav_writer_append(wav, buf, (size_t)got * channels * sizeof(int16_t));
+        frames_read += (uint64_t)got;
+    }
+
+    free(buf);
+    return AUDIO_OK;
+}
+
+void audio_capture_close(snd_pcm_t *handle)
+{
+    if (handle == NULL) return;
+    // drop, not drain: drain on a capture stream waits for the app to
+    // read out everything still in the buffer, which we don't want here.
+    snd_pcm_drop(handle);
+    snd_pcm_close(handle);
+}
+
 int audio_generate_spectrogram(const char *wav_path)
 {
     if (wav_path == NULL) return -1;
