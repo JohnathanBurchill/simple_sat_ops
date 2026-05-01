@@ -116,6 +116,11 @@ static void usage(FILE *dest, const char *name)
         "                               ~0.577 of peak)\n"
         "  --seed=<u64>                 PRNG seed (default 1 = repeatable runs;\n"
         "                               pass 0 to seed from the wall clock)\n"
+        "  --bandwidth-hz=<hz>          Band-limit the noise to <hz> via a 127-tap\n"
+        "                               windowed-sinc low-pass FIR. Default 0 = no\n"
+        "                               filtering (full Nyquist = 24 kHz at\n"
+        "                               48 kHz fs). Use e.g. 15000 to test the\n"
+        "                               radio's response over just 0..15 kHz.\n"
         "  --mode=<fm|fm-data>          TX mode (default fm-data). Use fm to\n"
         "                               drive the radio's voice-FM mod chain\n"
         "                               (subject to mic-EQ / pre-emphasis /\n"
@@ -233,6 +238,7 @@ int main(int argc, char **argv)
     double duration_s = 5.0;
     double amplitude = 0.2;
     uint64_t seed = 1;
+    double bandwidth_hz = 0.0;  // 0 = full Nyquist, no filtering
     int data_mod_source = -1;
     int use_data_mode = 1;  // 1 = FM-DATA (default); 0 = plain FM
     int filter = -1;  // < 0 = leave whatever radio_uplink_prep picked (FIL1)
@@ -271,6 +277,13 @@ int main(int argc, char **argv)
         } else if (strncmp("--seed=", argv[i], 7) == 0) {
             if (strlen(argv[i]) < 8) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
             seed = strtoull(argv[i] + 7, NULL, 0);
+        } else if (strncmp("--bandwidth-hz=", argv[i], 15) == 0) {
+            if (strlen(argv[i]) < 16) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
+            bandwidth_hz = atof(argv[i] + 15);
+            if (bandwidth_hz < 0.0) {
+                fprintf(stderr, "--bandwidth-hz must be >= 0\n");
+                return EXIT_FAILURE;
+            }
         } else if (strncmp("--mod-input=", argv[i], 12) == 0) {
             if (strlen(argv[i]) < 13) { fprintf(stderr, "Unable to parse %s\n", argv[i]); return EXIT_FAILURE; }
             const char *s = argv[i] + 12;
@@ -574,7 +587,8 @@ int main(int argc, char **argv)
     }
 
     arc = audio_play_white_noise(playback, synth_wav, amplitude, duration_s,
-                                 AUDIO_RATE_HZ, AUDIO_CHANNELS, seed);
+                                 AUDIO_RATE_HZ, AUDIO_CHANNELS, seed,
+                                 bandwidth_hz);
     audio_wav_writer_close(synth_wav);
     audio_playback_close(playback);
     if (synth_wav_path[0] != '\0') {

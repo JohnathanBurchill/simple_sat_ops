@@ -91,10 +91,16 @@ int audio_play_tone(snd_pcm_t *handle, audio_wav_writer_t *wav,
 // an independent draw, so the PSD is flat to within sampling noise and the
 // captured spectrum reflects the inherent TX/RX bandshape. seed=0 picks a
 // time-based seed; pass any non-zero value for deterministic output.
+//
+// bandwidth_hz: optional band-limit. If 0 < bandwidth_hz < rate_hz/2, a
+// 127-tap Hamming-windowed-sinc FIR low-pass is applied so the synth
+// signal has flat PSD up to bandwidth_hz and ~80 dB rejection above.
+// Pass <= 0 or >= rate_hz/2 to skip filtering and keep the full Nyquist
+// band.
 int audio_play_white_noise(snd_pcm_t *handle, audio_wav_writer_t *wav,
                            double amplitude, double duration_s,
                            unsigned int rate_hz, unsigned int channels,
-                           uint64_t seed);
+                           uint64_t seed, double bandwidth_hz);
 void audio_playback_close(snd_pcm_t *handle);
 
 // Spawn ffmpeg to render a 1920x1080 showspectrumpic PNG from a WAV

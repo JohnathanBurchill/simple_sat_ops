@@ -357,10 +357,37 @@ static inline uint64_t xorshift64_step(uint64_t *state)
     return x;
 }
 
+// Build a Hamming-windowed sinc lowpass FIR with N taps and normalized
+// cutoff fc_norm = fc/fs (0 < fc_norm < 0.5). N must be odd. Sums to
+// unity so DC gain is 1. ~80 dB rejection beyond the transition band
+// for N=127, fc_norm = 0.3 (i.e. 14.4 kHz at 48 kHz).
+static void make_lowpass_fir(double *taps, int N, double fc_norm)
+{
+    int M = N - 1;
+    double sum = 0.0;
+    for (int n = 0; n < N; n++) {
+        int k = n - M / 2;
+        double s;
+        if (k == 0) {
+            s = 2.0 * fc_norm;
+        } else {
+            double w = 2.0 * M_PI * fc_norm * (double)k;
+            s = sin(w) / (M_PI * (double)k);
+        }
+        double window = 0.54 - 0.46 * cos(2.0 * M_PI * (double)n / (double)M);
+        taps[n] = s * window;
+        sum += taps[n];
+    }
+    // Normalise so DC gain = 1 (Hamming + sinc has small ripple).
+    if (sum != 0.0) {
+        for (int n = 0; n < N; n++) taps[n] /= sum;
+    }
+}
+
 int audio_play_white_noise(snd_pcm_t *handle, audio_wav_writer_t *wav,
                            double amplitude, double duration_s,
                            unsigned int rate_hz, unsigned int channels,
-                           uint64_t seed)
+                           uint64_t seed, double bandwidth_hz)
 {
     if (handle == NULL || channels == 0 || rate_hz == 0) {
         return AUDIO_ARGS;
@@ -372,6 +399,27 @@ int audio_play_white_noise(snd_pcm_t *handle, audio_wav_writer_t *wav,
     int16_t *buf = malloc(frames_per_chunk * channels * sizeof(int16_t));
     if (buf == NULL) {
         return AUDIO_MEMORY;
+    }
+
+    // Optional FIR low-pass. 127 taps at fs=48k gives a transition band of
+    // about 750 Hz and ~80 dB stopband rejection — sharp enough that the
+    // spectrogram of the synth WAV has a near-vertical edge at the
+    // requested cutoff. Convolution uses a circular buffer to avoid
+    // shifting state on every sample.
+    int filter_taps = 0;
+    double *taps = NULL;
+    double *fir_state = NULL;
+    int fir_idx = 0;
+    const double nyquist = (double)rate_hz / 2.0;
+    if (bandwidth_hz > 0.0 && bandwidth_hz < nyquist) {
+        filter_taps = 127;
+        taps = malloc((size_t)filter_taps * sizeof(double));
+        fir_state = calloc((size_t)filter_taps, sizeof(double));
+        if (taps == NULL || fir_state == NULL) {
+            free(taps); free(fir_state); free(buf);
+            return AUDIO_MEMORY;
+        }
+        make_lowpass_fir(taps, filter_taps, bandwidth_hz / (double)rate_hz);
     }
 
     // xorshift64 deadlocks on a zero state; if the caller passed 0, derive a
@@ -396,11 +444,20 @@ int audio_play_white_noise(snd_pcm_t *handle, audio_wav_writer_t *wav,
             n = (snd_pcm_uframes_t)(total_frames - frames_sent);
         }
         for (snd_pcm_uframes_t i = 0; i < n; i++) {
-            // Draw 32 bits and map to [-1, 1). Independent draw per frame
-            // gives a flat PSD; channels carry the same sample so left/right
-            // are coherent and the captured spectrum is unambiguous.
             uint32_t r = (uint32_t)(xorshift64_step(&state) >> 32);
             double u = ((double)r / 4294967295.0) * 2.0 - 1.0;
+            if (filter_taps > 0) {
+                // Push current sample into circular buffer, then convolve.
+                fir_state[fir_idx] = u;
+                double y = 0.0;
+                int idx = fir_idx;
+                for (int k = 0; k < filter_taps; k++) {
+                    y += fir_state[idx] * taps[k];
+                    idx = (idx == 0) ? filter_taps - 1 : idx - 1;
+                }
+                fir_idx = (fir_idx + 1) % filter_taps;
+                u = y;
+            }
             int16_t sample = (int16_t)(scale * u);
             for (unsigned int c = 0; c < channels; c++) {
                 buf[i * channels + c] = sample;
@@ -413,12 +470,14 @@ int audio_play_white_noise(snd_pcm_t *handle, audio_wav_writer_t *wav,
             continue;
         }
         if (written < 0) {
-            free(buf);
+            free(taps); free(fir_state); free(buf);
             return AUDIO_DEVICE_OPEN;
         }
         frames_sent += (uint64_t)written;
     }
 
+    free(taps);
+    free(fir_state);
     free(buf);
     return AUDIO_OK;
 }
