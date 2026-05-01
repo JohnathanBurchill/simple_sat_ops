@@ -525,42 +525,128 @@ int audio_find_alsa_card(const char *const *needles, int needle_count,
     return found >= 0 ? found : -1;
 }
 
+int audio_card_usbid(int card_idx, char *out, size_t cap)
+{
+    if (out == NULL || cap < 12) return -1;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/asound/card%d/usbid", card_idx);
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return -1;
+    if (fgets(out, cap, f) == NULL) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    size_t n = strlen(out);
+    while (n > 0 && (out[n-1] == '\n' || out[n-1] == '\r' || out[n-1] == ' ')) {
+        out[--n] = '\0';
+    }
+    return n > 0 ? 0 : -1;
+}
+
+int audio_find_alsa_card_by_usbid(const char *const *ids, int id_count)
+{
+    if (ids == NULL || id_count <= 0) return -2;
+    FILE *f = fopen("/proc/asound/cards", "r");
+    if (f == NULL) return -2;
+    char header[256], details[256];
+    int found = -1;
+    while (fgets(header, sizeof header, f) != NULL) {
+        if (fgets(details, sizeof details, f) == NULL) break;
+        const char *p = header;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p < '0' || *p > '9') continue;
+        int idx = atoi(p);
+        char usbid[16] = {0};
+        if (audio_card_usbid(idx, usbid, sizeof usbid) != 0) continue;
+        for (int i = 0; i < id_count; i++) {
+            if (ids[i] != NULL && strcasecmp(ids[i], usbid) == 0) {
+                found = idx;
+                break;
+            }
+        }
+        if (found >= 0) break;
+    }
+    fclose(f);
+    return found >= 0 ? found : -1;
+}
+
 int audio_find_signalink_device(char *out, size_t cap)
 {
     if (out == NULL || cap < 16) return -2;
-    // SignaLink USB uses TI/Burr-Brown PCM290x. Kernel reports it with
-    // either string in the long-name field; either is enough to ID it
-    // uniquely on our ground-station boxes (no other Burr-Brown audio
-    // chips in use here).
-    const char *needles[] = { "Burr-Brown", "PCM2901", "PCM2904" };
-    int idx = audio_find_alsa_card(needles, 3, NULL, 0);
+    // SignaLink USB uses TI/Burr-Brown PCM290x. The VID is always 08bb
+    // (Texas Instruments); the PID varies across hardware revisions.
+    // We match by VID:PID first (stable across kernel-string changes,
+    // identically-named devices, etc.) and fall back to substring
+    // matching the kernel-reported card name in case a future revision
+    // ships with a PID we haven't catalogued.
+    const char *ids[] = { "08bb:2901", "08bb:2902", "08bb:2904" };
+    int idx = audio_find_alsa_card_by_usbid(ids,
+                                           (int)(sizeof ids / sizeof ids[0]));
+    if (idx < 0) {
+        const char *needles[] = { "Burr-Brown", "PCM2901", "PCM2902", "PCM2904" };
+        idx = audio_find_alsa_card(needles,
+                                   (int)(sizeof needles / sizeof needles[0]),
+                                   NULL, 0);
+    }
     if (idx < 0) return idx;
     snprintf(out, cap, "plughw:%d,0", idx);
+    char usbid[16] = {0};
+    if (audio_card_usbid(idx, usbid, sizeof usbid) == 0) {
+        fprintf(stderr, "audio: SignaLink %s on card %d\n", usbid, idx);
+    }
     return 0;
 }
 
 int audio_find_radio_device(const char *backend_hint, char *out, size_t cap)
 {
     if (out == NULL || cap < 16) return -2;
-    // Yaesu rigs enumerate with "Yaesu" or specific model number (FT-991A,
-    // FT-DX, etc.) in the long-name. ICOM rigs enumerate with "IC-9700"
-    // or "ICOM". Caller can narrow via backend_hint, otherwise we search
-    // both.
+    // VID:PID lists for radio USB Audio Class interfaces. These are the
+    // values observed in the field; add more as you encounter them.
+    //
+    //   Yaesu FT-991A    : 0bda:481c (Realtek-licensed CMedia in some
+    //                      lots) / 0d8c:0008 (CMedia branded). Confirm
+    //                      on the Linux box with `cat /proc/asound/
+    //                      card<N>/usbid` once the radio enumerates.
+    //   ICOM IC-9700    : 0c26:001a / 0c26:0030 (ICOM Inc.).
+    //
+    // We always also fall back to substring matching by manufacturer
+    // name in case the VID:PID isn't on our list yet.
+    const char *yaesu_ids[]    = { "0bda:481c", "0d8c:0008", "0779:0001" };
+    const char *icom_ids[]     = { "0c26:001a", "0c26:0030" };
     const char *yaesu_needles[] = { "Yaesu", "YAESU", "FT-991A", "FT-DX" };
     const char *icom_needles[]  = { "IC-9700", "IC-705", "ICOM", "Icom" };
 
     int idx = -1;
+    const char *kind = NULL;
+
     if (backend_hint == NULL || strcmp(backend_hint, "yaesu") == 0) {
-        idx = audio_find_alsa_card(yaesu_needles,
-                                   (int)(sizeof yaesu_needles / sizeof yaesu_needles[0]),
-                                   NULL, 0);
-        if (idx >= 0) { snprintf(out, cap, "plughw:%d,0", idx); return 0; }
+        idx = audio_find_alsa_card_by_usbid(yaesu_ids,
+                                           (int)(sizeof yaesu_ids / sizeof yaesu_ids[0]));
+        if (idx < 0) {
+            idx = audio_find_alsa_card(yaesu_needles,
+                                       (int)(sizeof yaesu_needles / sizeof yaesu_needles[0]),
+                                       NULL, 0);
+        }
+        if (idx >= 0) kind = "Yaesu";
     }
-    if (backend_hint == NULL || strcmp(backend_hint, "icom") == 0) {
-        idx = audio_find_alsa_card(icom_needles,
-                                   (int)(sizeof icom_needles / sizeof icom_needles[0]),
-                                   NULL, 0);
-        if (idx >= 0) { snprintf(out, cap, "plughw:%d,0", idx); return 0; }
+    if (idx < 0 && (backend_hint == NULL || strcmp(backend_hint, "icom") == 0)) {
+        idx = audio_find_alsa_card_by_usbid(icom_ids,
+                                           (int)(sizeof icom_ids / sizeof icom_ids[0]));
+        if (idx < 0) {
+            idx = audio_find_alsa_card(icom_needles,
+                                       (int)(sizeof icom_needles / sizeof icom_needles[0]),
+                                       NULL, 0);
+        }
+        if (idx >= 0) kind = "ICOM";
     }
-    return -1;
+    if (idx < 0) return -1;
+
+    snprintf(out, cap, "plughw:%d,0", idx);
+    char usbid[16] = {0};
+    if (audio_card_usbid(idx, usbid, sizeof usbid) == 0) {
+        fprintf(stderr, "audio: %s radio %s on card %d\n",
+                kind ? kind : "radio", usbid, idx);
+    }
+    return 0;
 }

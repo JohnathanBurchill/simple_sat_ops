@@ -125,5 +125,17 @@ int audio_find_radio_device(const char *backend_hint, char *out, size_t cap);
 int audio_find_alsa_card(const char *const *needles, int needle_count,
                          char *out_hint, size_t hint_cap);
 
+// Read the USB VID:PID for an ALSA card from /proc/asound/cardN/usbid.
+// Format: "vvvv:pppp\n" (lowercase hex). Returns 0 on success, -1 if the
+// file is missing (non-USB card) or unreadable. Buffer should be >= 16.
+int audio_card_usbid(int card_idx, char *out, size_t cap);
+
+// Find an ALSA card by USB VID:PID. ids is a list of "vvvv:pppp" strings
+// (case-insensitive). Returns the card index on success, -1 if none of
+// the listed devices are present, -2 on I/O error. More stable than
+// substring-matching the card name — survives kernel-string changes,
+// re-enumeration order, and clones with identical product names.
+int audio_find_alsa_card_by_usbid(const char *const *ids, int id_count);
+
 
 #endif // AUDIO_H
