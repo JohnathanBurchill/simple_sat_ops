@@ -138,9 +138,17 @@ if (ASOUND_FOUND)
         target_link_directories(tx_frame PRIVATE ${OPENSSL_LIBRARY_DIRS} ${ASOUND_LIBRARY_DIRS})
         target_link_libraries(tx_frame PRIVATE ${OPENSSL_LIBRARIES} m ${ASOUND_LIBRARIES})
         list(APPEND SSO_TARGETS tx_frame)
+
+        # Live AX100 decoder over ALSA capture -> stdout / log file.
+        # No radio dispatcher — pure audio in + decode + print.
+        add_executable(rx_live rx_live.c modem.c ax100.c rs.c golay24.c csp.c hmac_keyfile.c audio.c)
+        target_include_directories(rx_live PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
+        target_link_directories(rx_live PRIVATE ${OPENSSL_LIBRARY_DIRS} ${ASOUND_LIBRARY_DIRS})
+        target_link_libraries(rx_live PRIVATE ${OPENSSL_LIBRARIES} m ${ASOUND_LIBRARIES})
+        list(APPEND SSO_TARGETS rx_live)
     endif()
 else()
-    message(STATUS "libasound not found; tx_tone, tx_white_noise, tx_frame, rx_capture will not be built.")
+    message(STATUS "libasound not found; tx_tone, tx_white_noise, tx_frame, rx_capture, rx_live will not be built.")
 endif()
 
 # ----- Optional: full main UI (needs ALSA + ncurses + SGP4) -----------------
