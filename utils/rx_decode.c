@@ -773,6 +773,38 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // CSP v1 downlink: 4-byte zlib CRC trailer (libcsp CRC mode). Validate
+    // and strip when HMAC is off; uplink frames have a 32-byte SHA-256
+    // HMAC tag instead and that's the user's problem to interpret.
+    int crc_ok = -1;
+    if (!use_hmac && packet_len >= 8) {
+        uint32_t computed = csp_crc32_zlib(packet, (size_t)(packet_len - 4));
+        uint32_t le = (uint32_t)packet[packet_len - 4]
+                    | ((uint32_t)packet[packet_len - 3] << 8)
+                    | ((uint32_t)packet[packet_len - 2] << 16)
+                    | ((uint32_t)packet[packet_len - 1] << 24);
+        uint32_t be = ((uint32_t)packet[packet_len - 4] << 24)
+                    | ((uint32_t)packet[packet_len - 3] << 16)
+                    | ((uint32_t)packet[packet_len - 2] <<  8)
+                    |  (uint32_t)packet[packet_len - 1];
+        if (computed == le || computed == be) {
+            crc_ok = 1;
+            packet_len -= 4;
+            if (verbose) {
+                fprintf(stderr, "rx_decode: csp_crc32 ok (0x%08x), "
+                        "4-byte trailer stripped\n", computed);
+            }
+        } else {
+            crc_ok = 0;
+            if (verbose) {
+                fprintf(stderr, "rx_decode: csp_crc32 MISMATCH "
+                        "(computed=0x%08x, trailer LE=0x%08x BE=0x%08x), "
+                        "trailer kept in payload\n", computed, le, be);
+            }
+        }
+    }
+    (void)crc_ok;
+
     csp_v1_header_t hdr;
     if (csp_v1_decode(packet, &hdr) != 0) {
         fprintf(stderr, "rx_decode: csp_v1_decode failed\n");

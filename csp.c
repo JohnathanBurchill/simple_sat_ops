@@ -77,3 +77,19 @@ int csp_v1_decode(const uint8_t bytes[4], csp_v1_header_t *out_hdr)
     out_hdr->flags = (uint8_t)( h        & 0xFF);
     return 0;
 }
+
+// Standard zlib / PNG / IEEE 802.3 CRC-32 (reflected polynomial). Bit-by-bit
+// implementation — small (no 1KB lookup table) and called once per
+// decoded frame, so speed isn't important.
+uint32_t csp_crc32_zlib(const uint8_t *data, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            uint32_t mask = -(crc & 1u);
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}

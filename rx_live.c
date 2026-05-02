@@ -137,20 +137,26 @@ static void fmt_utc(char *buf, size_t cap)
 // advance min_offset past the bad match and try again. With HMAC enabled,
 // HMAC mismatch is treated as a false-positive sync (advance + retry).
 // Returns 1 on a successful decode (packet/packet_len/* filled), 0 if no
-// frame found within MAX_ATTEMPTS.
+// frame found. The caller may loop on this function with min_offset_in
+// advanced past the previously-returned sync_off to extract multiple
+// frames per window (e.g. when bursts arrive faster than the slide
+// interval); *out_sync_off receives the offset of the accepted sync
+// match so the caller can compute the next min_offset_in.
 static int try_decode_window(const int16_t *samples, size_t n_samples,
                              const modem_params_t *mp,
                              const ax100_opts_t *opts,
                              int sync_max_ham, int use_hmac,
+                             size_t min_offset_in,
                              uint8_t *bits_scratch, size_t bits_cap,
                              uint8_t *bytes_scratch, size_t bytes_cap,
                              uint8_t *packet, size_t packet_cap,
                              ssize_t *out_packet_len,
                              int *out_golay_errs, int *out_hmac_ok,
-                             int *out_rs_errs, int *out_used_golay_len)
+                             int *out_rs_errs, int *out_used_golay_len,
+                             size_t *out_sync_off)
 {
     const int MAX_ATTEMPTS = 32;
-    size_t min_offset = 0;
+    size_t min_offset = min_offset_in;
     int attempts = 0;
 
     while (attempts < MAX_ATTEMPTS) {
@@ -189,6 +195,7 @@ static int try_decode_window(const int16_t *samples, size_t n_samples,
             continue;
         }
         *out_packet_len = plen;
+        if (out_sync_off) *out_sync_off = sync_off;
         return 1;
     }
     return 0;
@@ -567,8 +574,15 @@ int main(int argc, char **argv)
                 raw_path ? raw_path : "(none)");
     }
 
-    // Dedup: hash of last successfully-decoded packet (FNV-1a 64).
-    uint64_t last_hash = 0;
+    // Dedup: ring of recently-decoded FNV-1a-64 packet hashes. Sized so
+    // a frame appearing across all overlapping windows in the slide
+    // span is only emitted once. With window=1.5s and slide=0.5s,
+    // overlap span = 1 s; at 5 frames/sec a ring of 32 covers it with
+    // safety margin and is trivial to scan.
+    enum { DEDUP_RING_SZ = 32 };
+    uint64_t recent_hashes[DEDUP_RING_SZ] = {0};
+    int recent_idx = 0;
+    int recent_count = 0;
 
     while (!g_stop) {
         snd_pcm_sframes_t got = snd_pcm_readi(capture, chunk, chunk_frames);
@@ -597,33 +611,72 @@ int main(int argc, char **argv)
             window[window_filled++] = chunk[i * channels];
             if (window_filled < window_samples) continue;
 
-            ssize_t plen = -1;
-            int golay_errs = 0, hmac_ok = -1;
-            int rs_errs = -1, used_golay_len = -1;
-            if (try_decode_window(window, window_samples, &mp, &opts,
-                                  sync_max_ham, use_hmac,
-                                  bits_scratch, bits_cap,
-                                  bytes_scratch, bytes_cap,
-                                  packet, sizeof packet,
-                                  &plen, &golay_errs, &hmac_ok,
-                                  &rs_errs, &used_golay_len)) {
-                // Sanity: must include a CSP header.
-                if (plen >= 4 && plen <= 256) {
-                    uint64_t h = 1469598103934665603ULL;
-                    for (ssize_t k = 0; k < plen; k++) {
-                        h ^= packet[k];
-                        h *= 1099511628211ULL;
-                    }
-                    if (h != last_hash) {
-                        char ts[64];
-                        fmt_utc(ts, sizeof ts);
-                        emit_frame(log_path, quiet, ts,
-                                   packet, (size_t)plen,
-                                   golay_errs, hmac_ok, use_hmac,
-                                   rs_errs, used_golay_len);
-                        last_hash = h;
-                    }
+            // Inner loop: pull every decodable frame out of this window
+            // before sliding. With bursts arriving at 200 ms intervals
+            // and window=1.5 s, a single window can hold 6+ frames; the
+            // old "first decode then slide" path emitted only one and
+            // missed the rest until the slide caught up.
+            size_t inner_min_offset = 0;
+            for (;;) {
+                ssize_t plen = -1;
+                int golay_errs = 0, hmac_ok = -1;
+                int rs_errs = -1, used_golay_len = -1;
+                size_t sync_off_local = 0;
+                if (!try_decode_window(window, window_samples, &mp, &opts,
+                                       sync_max_ham, use_hmac,
+                                       inner_min_offset,
+                                       bits_scratch, bits_cap,
+                                       bytes_scratch, bytes_cap,
+                                       packet, sizeof packet,
+                                       &plen, &golay_errs, &hmac_ok,
+                                       &rs_errs, &used_golay_len,
+                                       &sync_off_local)) {
+                    break;
                 }
+                inner_min_offset = sync_off_local + 1;
+                if (plen < 4 || plen > 256) continue;
+                // CSP v1 downlink frames carry a trailing 32-bit zlib CRC
+                // over the entire packet (header + payload). libcsp peers
+                // emit it little-endian on the wire on most builds, but
+                // we accept either endianness so the same code works
+                // against unknown-endian satellite firmwares. Skip when
+                // HMAC mode is on (uplink frames carry a 32-byte SHA-256
+                // tag, not a CRC).
+                if (!use_hmac) {
+                    if (plen < 8) continue;  // need header + CRC at minimum
+                    uint32_t computed = csp_crc32_zlib(packet, (size_t)(plen - 4));
+                    uint32_t le = (uint32_t)packet[plen - 4]
+                                | ((uint32_t)packet[plen - 3] << 8)
+                                | ((uint32_t)packet[plen - 2] << 16)
+                                | ((uint32_t)packet[plen - 1] << 24);
+                    uint32_t be = ((uint32_t)packet[plen - 4] << 24)
+                                | ((uint32_t)packet[plen - 3] << 16)
+                                | ((uint32_t)packet[plen - 2] <<  8)
+                                |  (uint32_t)packet[plen - 1];
+                    if (computed != le && computed != be) continue;
+                    plen -= 4;  // strip the trailer for downstream / printing
+                }
+                uint64_t h = 1469598103934665603ULL;
+                for (ssize_t k = 0; k < plen; k++) {
+                    h ^= packet[k];
+                    h *= 1099511628211ULL;
+                }
+                int seen = 0;
+                int ring_n = recent_count < DEDUP_RING_SZ
+                    ? recent_count : DEDUP_RING_SZ;
+                for (int r = 0; r < ring_n; r++) {
+                    if (recent_hashes[r] == h) { seen = 1; break; }
+                }
+                if (seen) continue;
+                recent_hashes[recent_idx] = h;
+                recent_idx = (recent_idx + 1) % DEDUP_RING_SZ;
+                if (recent_count < DEDUP_RING_SZ) recent_count++;
+                char ts[64];
+                fmt_utc(ts, sizeof ts);
+                emit_frame(log_path, quiet, ts,
+                           packet, (size_t)plen,
+                           golay_errs, hmac_ok, use_hmac,
+                           rs_errs, used_golay_len);
             }
 
             // Slide the window.
