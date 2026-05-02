@@ -89,6 +89,9 @@ static void usage(FILE *dest, const char *name)
         "  --reed-solomon           RS(255,223) decode (DEFAULT).\n"
         "  --no-reed-solomon        Skip RS decode (use when decoding\n"
         "                           downlink-style CRC frames).\n"
+        "  --no-dc-block            Skip the modem's DC-block IIR. Useful\n"
+        "                           on radio digital taps (FT-991A USB\n"
+        "                           CODEC) where there's no DC offset.\n"
         "\n"
         "Output:\n"
         "  --log=<path>             Append decoded frames to <path>.\n"
@@ -250,6 +253,7 @@ int main(int argc, char **argv)
     int sync_max_ham = 4;
     int use_hmac = 1;
     int use_rs = 1;
+    int no_dc_block = 0;
     int quiet = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -293,6 +297,8 @@ int main(int argc, char **argv)
             use_rs = 1;
         } else if (strcmp("--no-reed-solomon", a) == 0) {
             use_rs = 0;
+        } else if (strcmp("--no-dc-block", a) == 0) {
+            no_dc_block = 1;
         } else if (strncmp("--log=", a, 6) == 0) {
             if (strlen(a) < 7) { fprintf(stderr, "Unable to parse %s\n", a); return EXIT_FAILURE; }
             log_path = a + 6;
@@ -431,6 +437,7 @@ int main(int argc, char **argv)
     modem_params_defaults(&mp);
     mp.samp_rate = samp_rate;
     mp.bit_rate = bit_rate;
+    mp.rx_disable_dc_block = no_dc_block;
 
     ax100_opts_t opts;
     ax100_opts_defaults(&opts);
