@@ -558,7 +558,18 @@ int find_passes(prediction_t *external_prediction, double jul_utc_start, double 
         // TODO filter on perigee / apogee instead of current altitude?
         if (prediction.satellite_ephem.altitude_km >= criteria->min_altitude_km && prediction.satellite_ephem.altitude_km <= criteria->max_altitude_km) {
             internal_number_checked++;
+            // For fresh OPM-derived TLEs the epoch can be in the future
+            // (e.g. ExoLaunch's deployment-time TLEs, used hours before
+            // the actual deploy). SGP4 back-propagation from a fresh
+            // post-deployment state isn't physically meaningful, so we
+            // pin the per-TLE search start at the epoch when the epoch
+            // is later than the user's t0. Pre-loading utc_offset_minutes
+            // with the skip preserves the "minutes from t0" semantics of
+            // predicted_minutes_until_visible + utc_offset_minutes.
             double utc_offset_minutes = 0;
+            if (prediction.jul_epoch > jul_utc_start) {
+                utc_offset_minutes = (prediction.jul_epoch - jul_utc_start) * 1440.0;
+            }
             double minutes_until_visible = 0;
             double jul_utc_stop = jul_utc_start + criteria->max_minutes / 1440.0;
             while (get_next_pass(&prediction, jul_utc_start + utc_offset_minutes / 1440.0, jul_utc_stop, delta_t_minutes)) {
