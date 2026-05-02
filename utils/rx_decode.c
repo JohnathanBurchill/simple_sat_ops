@@ -139,9 +139,13 @@ static void usage(FILE *out, const char *argv0)
         "\n"
         "Input:\n"
         "  --raw                      Treat <path> as headerless S16_LE PCM\n"
-        "                             (output of `rtl_fm -M fm -s 48000`)\n"
+        "                             (output of `rtl_fm -M fm -s 48000` or\n"
+        "                             rx_capture's .raw companion). Auto-\n"
+        "                             enabled when <path> ends in '.raw'.\n"
         "  --rate=<hz>                Sample rate for --raw (default 48000)\n"
-        "  --channels=<n>             Channels for --raw (default 1; ch 0 used)\n"
+        "  --channels=<n>             Channels for --raw (default 2; ch 0\n"
+        "                             used — matches rx_capture's stereo\n"
+        "                             output. Pass --channels=1 for rtl_fm.)\n"
         "\n"
         "Framing / FEC / HMAC:\n"
         "  --reed-solomon             RS(255,223) decode (DEFAULT for uplink)\n"
@@ -200,8 +204,9 @@ int main(int argc, char **argv)
     const char *input_path = NULL;
     const char *keyfile_path = NULL;
     int raw_mode = 0;
+    int raw_mode_explicit = 0;
     int raw_rate = 48000;
-    int raw_channels = 1;
+    int raw_channels = 2;
     int bit_rate = 9600;
     int invert = 0;
     int sync_max_ham = 0;
@@ -219,6 +224,7 @@ int main(int argc, char **argv)
             return 0;
         } else if (strcmp(a, "--raw") == 0) {
             raw_mode = 1;
+            raw_mode_explicit = 1;
         } else if (starts_with(a, "--rate=")) {
             raw_rate = atoi(a + 7);
         } else if (starts_with(a, "--channels=")) {
@@ -276,6 +282,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "rx_decode: missing <path>\n");
         usage(stderr, argv[0]);
         return 1;
+    }
+    // Auto-detect raw mode by file extension when --raw wasn't explicit.
+    // .raw → headerless S16_LE PCM; anything else assumed to be a WAV
+    // file (wav_read_pcm16 will reject mismatches with a clear error).
+    if (!raw_mode_explicit) {
+        size_t plen = strlen(input_path);
+        if (plen >= 4 && strcmp(input_path + plen - 4, ".raw") == 0) {
+            raw_mode = 1;
+        }
     }
     if (raw_channels < 1 || raw_channels > 8) {
         fprintf(stderr, "rx_decode: --channels out of range [1,8]\n");
