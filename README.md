@@ -75,6 +75,13 @@ For Yaesu FT-991A operators: see the front-panel one-time-setup checklist
 at the top of `radio_yaesu_cat.c` (Menus 031 / 033 / 071 / 072 are
 operator-set; 070 / 079 are pinned by CAT during `radio_uplink_prep`).
 
+The ICOM IC-9700 (`icom-civ`) backend compiles and the basic CAT path
+works, but it is **untested at satellite-pass level** for FM voice
+repeater operation or low-baud data, and the radio appears unable to
+handle 9600 baud TX through any audio path tried. For operational
+satellite use the Yaesu FT-991A (default `--radio-type=yaesu-cat`) is
+the canonical radio.
+
 ## next_in_queue
 
 Prints upcoming overpasses of satellites from a file of TLEs using a `sgp4sdp4`
