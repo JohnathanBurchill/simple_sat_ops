@@ -169,6 +169,14 @@ static void usage(FILE *out, const char *argv0)
         "  -v                         Verbose: pipeline-stage diagnostics\n"
         "  --hex-only                 Print only the decoded payload as hex\n"
         "                             (for scripting)\n"
+        "  --dump-bits[=<N>]          Print N bits at the detected ASM (default\n"
+        "                             512). On success: bits from the modem's\n"
+        "                             post-slicer stream starting at sync_off,\n"
+        "                             with the expected ASM (0x930B51DE) shown\n"
+        "                             above for visual Hamming inspection. On\n"
+        "                             failure: 512 bits per phase from the\n"
+        "                             diagnostic raw-slicer's best ASM-match\n"
+        "                             window (was -v-only before).\n"
         "  --help                     This message\n",
         argv0, argv0, HMAC_KEYFILE_DEFAULT_RELPATH);
 }
@@ -187,6 +195,7 @@ int main(int argc, char **argv)
     int use_rs = 1;  // default ON to match pycsplink uplink
     int verbose = 0;
     int hex_only = 0;
+    int dump_bits = 0;  // 0 = disabled; >0 = bits to print on success/failure
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
@@ -221,6 +230,14 @@ int main(int argc, char **argv)
             verbose = 1;
         } else if (strcmp(a, "--hex-only") == 0) {
             hex_only = 1;
+        } else if (strcmp(a, "--dump-bits") == 0) {
+            dump_bits = 512;
+        } else if (starts_with(a, "--dump-bits=")) {
+            dump_bits = atoi(a + 12);
+            if (dump_bits <= 0) {
+                fprintf(stderr, "rx_decode: --dump-bits must be > 0\n");
+                return 1;
+            }
         } else if (a[0] == '-') {
             fprintf(stderr, "rx_decode: unknown option '%s'\n", a);
             usage(stderr, argv[0]);
@@ -471,7 +488,7 @@ int main(int argc, char **argv)
                 "(tried both polarities, sync-threshold=%d, %d candidate(s)%s)\n",
                 sync_max_ham, attempts,
                 use_hmac ? " HMAC-validated" : "");
-        if (verbose) {
+        if (verbose || dump_bits > 0) {
             // For each phase, scan the full bit stream for:
             //   - longest alternating run (0xAA preamble detector)
             //   - closest 32-bit window match to the ASM (min Hamming distance)
@@ -626,8 +643,9 @@ int main(int argc, char **argv)
                 size_t lead_samples = (size_t)mp.samp_rate / 50u;  // 20 ms
                 size_t dump_start = peak_center_sample > lead_samples
                     ? peak_center_sample - lead_samples : 0;
-                fprintf(stderr, "rx_decode: 512 bits @ each phase starting %.3fs into file:\n",
-                        (double)dump_start / (double)mp.samp_rate);
+                size_t fail_bits = (size_t)(dump_bits > 0 ? dump_bits : 512);
+                fprintf(stderr, "rx_decode: %zu bits @ each phase starting %.3fs into file:\n",
+                        fail_bits, (double)dump_start / (double)mp.samp_rate);
                 for (int phase = 0; phase < sps; ++phase) {
                     fprintf(stderr, "  phase=%d  ", phase);
                     // Align start to this phase's slicing grid.
@@ -638,7 +656,7 @@ int main(int argc, char **argv)
                         first = mid + skip * (size_t)sps;
                     }
                     size_t printed = 0;
-                    for (size_t i = first; i < n_samples && printed < 512; i += (size_t)sps) {
+                    for (size_t i = first; i < n_samples && printed < fail_bits; i += (size_t)sps) {
                         fputc((samples[i] > 0) ? '1' : '0', stderr);
                         ++printed;
                     }
@@ -651,6 +669,39 @@ int main(int argc, char **argv)
         free(samples);
         return 1;
     }
+    if (dump_bits > 0) {
+        // Modem-stream bit dump. modem_pcm16_to_bits aligns out_bits so
+        // that bit 0 IS the ASM (despite sync_off being recorded as an
+        // offset into the pre-alignment raw stream, which is just a
+        // diagnostic). With normal polarity bits[0..31] match
+        // 0x930B51DE; with inverted polarity all bits are flipped.
+        const uint32_t ASM = 0x930B51DEu;
+        fprintf(stderr,
+                "rx_decode: bit dump (sync_off=%zu in raw stream, "
+                "polarity=%s, %d-bit ASM | post-ASM data):\n",
+                sync_off, polarity_used ? "inverted" : "normal", 32);
+        fprintf(stderr, "  ASM expected: ");
+        for (int b = 31; b >= 0; --b) {
+            int bit = (int)((ASM >> b) & 1u);
+            if (polarity_used) bit = !bit;
+            fputc(bit ? '1' : '0', stderr);
+            if (b > 0 && b % 8 == 0) fputc(' ', stderr);
+        }
+        fputc('\n', stderr);
+        fprintf(stderr, "  bits @ bit 0: ");
+        size_t want = (size_t)dump_bits;
+        if (want > n_bits) want = n_bits;
+        for (size_t k = 0; k < want; ++k) {
+            fputc(bits[k] ? '1' : '0', stderr);
+            // Space every 8 bits, double-space at the ASM/data boundary.
+            if ((k + 1) % 8 == 0 && k + 1 < want) {
+                fputc(' ', stderr);
+                if (k + 1 == 32) fputc('|', stderr);
+            }
+        }
+        fputc('\n', stderr);
+    }
+
     free(bits);
     free(samples);
 
