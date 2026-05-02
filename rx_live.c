@@ -65,9 +65,15 @@ static void usage(FILE *dest, const char *name)
         "Sibling of rx_decode (offline) and rx_capture (capture only).\n"
         "\n"
         "Audio source:\n"
-        "  --signalink-audio        (default) Auto-detect SignaLink USB\n"
-        "                           (TI Burr-Brown PCM2901/PCM2904).\n"
-        "  --radio-audio            Auto-detect radio's native USB CODEC.\n"
+        "  --radio-audio            (default) Auto-detect radio's native\n"
+        "                           USB CODEC. The FT-991A's discriminator\n"
+        "                           digital tap is the path that decodes\n"
+        "                           cleanly at 9600 baud.\n"
+        "  --signalink-audio        Auto-detect SignaLink USB (TI Burr-\n"
+        "                           Brown PCM2901/PCM2904). Doesn't work\n"
+        "                           reliably for 9600-baud RX through the\n"
+        "                           FT-991A's rear DATA jack — use the\n"
+        "                           radio's USB CODEC instead.\n"
         "  --audio-device=<name>    Explicit ALSA PCM device, e.g. plughw:1,0.\n"
         "  --backend-hint=<id>      yaesu|icom for --radio-audio.\n"
         "\n"
@@ -94,13 +100,21 @@ static void usage(FILE *dest, const char *name)
         "                           on radio digital taps (FT-991A USB\n"
         "                           CODEC) where there's no DC offset.\n"
         "\n"
-        "Output:\n"
-        "  --log=<path>             Append decoded frames to <path>.\n"
-        "                           Re-opened per frame so log-rotation\n"
-        "                           works (mv the log mid-run, next\n"
-        "                           frame creates a fresh file).\n"
-        "  --raw=<path>             Tee captured audio to a headerless\n"
-        "                           S16_LE .raw file for post-mortem.\n"
+        "Output (defaults: ON, auto-named\n"
+        "        rx_live_UT=YYYYMMDDTHHMMSS.sss.{log,raw,wav,png} in CWD):\n"
+        "  --log=<path>             Override log path. Re-opened per frame\n"
+        "                           so log-rotation works (mv the log\n"
+        "                           mid-run, next frame creates a fresh\n"
+        "                           file).\n"
+        "  --raw=<path>             Override headerless S16_LE raw path.\n"
+        "  --wav=<path>             Override WAV path.\n"
+        "  --no-log                 Skip the decode log.\n"
+        "  --no-raw                 Skip the .raw companion.\n"
+        "  --no-wav                 Skip the .wav companion (also skips\n"
+        "                           the spectrogram).\n"
+        "  --no-spectrogram         Skip the end-of-session spectrogram\n"
+        "                           PNG (rendered from the WAV via\n"
+        "                           ffmpeg showspectrumpic on Ctrl-C).\n"
         "  --quiet                  Skip stdout output (log-only mode).\n"
         "  --help                   Show this help.\n",
         name, HMAC_KEYFILE_DEFAULT_RELPATH);
@@ -249,10 +263,11 @@ int main(int argc, char **argv)
 {
     const char *audio_device = NULL;
     char audio_device_buf[64] = {0};
-    int audio_pick = 1;
+    int audio_pick = 2;  // default to --radio-audio (FT-991A USB CODEC)
     const char *backend_hint = NULL;
     const char *log_path = NULL;
     const char *raw_path = NULL;
+    const char *wav_path = NULL;
     const char *keyfile_path = NULL;
     int bit_rate = 9600;
     double window_s = 1.5;
@@ -262,6 +277,13 @@ int main(int argc, char **argv)
     int use_rs = 1;
     int no_dc_block = 0;
     int quiet = 0;
+    int want_log = 1;
+    int want_raw = 1;
+    int want_wav = 1;
+    int want_spectrogram = 1;
+    char auto_log_path[300] = {0};
+    char auto_raw_path[300] = {0};
+    char auto_wav_path[300] = {0};
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -312,9 +334,23 @@ int main(int argc, char **argv)
         } else if (strncmp("--log=", a, 6) == 0) {
             if (strlen(a) < 7) { fprintf(stderr, "Unable to parse %s\n", a); return EXIT_FAILURE; }
             log_path = a + 6;
+            want_log = 1;
+        } else if (strcmp("--no-log", a) == 0) {
+            want_log = 0;
         } else if (strncmp("--raw=", a, 6) == 0) {
             if (strlen(a) < 7) { fprintf(stderr, "Unable to parse %s\n", a); return EXIT_FAILURE; }
             raw_path = a + 6;
+            want_raw = 1;
+        } else if (strcmp("--no-raw", a) == 0) {
+            want_raw = 0;
+        } else if (strncmp("--wav=", a, 6) == 0) {
+            if (strlen(a) < 7) { fprintf(stderr, "Unable to parse %s\n", a); return EXIT_FAILURE; }
+            wav_path = a + 6;
+            want_wav = 1;
+        } else if (strcmp("--no-wav", a) == 0) {
+            want_wav = 0;
+        } else if (strcmp("--no-spectrogram", a) == 0) {
+            want_spectrogram = 0;
         } else if (strcmp("--quiet", a) == 0) {
             quiet = 1;
         } else if (strcmp("--help", a) == 0) {
@@ -363,6 +399,43 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    // Auto-name log / raw / wav using a single UTC-stamped session basename
+    // when the operator didn't pass an explicit path. All three end up
+    // sharing the same basename so post-mortem inspection (.raw, .wav,
+    // .log, .png) groups together in directory listings.
+    if ((want_log && log_path == NULL) ||
+        (want_raw && raw_path == NULL) ||
+        (want_wav && wav_path == NULL)) {
+        struct timeval tv;
+        struct tm utc;
+        if (gettimeofday(&tv, NULL) != 0 || gmtime_r(&tv.tv_sec, &utc) == NULL) {
+            fprintf(stderr, "rx_live: could not read wall clock for "
+                    "auto session names\n");
+            return EXIT_FAILURE;
+        }
+        char base[200];
+        snprintf(base, sizeof base,
+                 "rx_live_UT=%04d%02d%02dT%02d%02d%02d.%03ld",
+                 utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                 utc.tm_hour, utc.tm_min, utc.tm_sec,
+                 (long)(tv.tv_usec / 1000));
+        if (want_log && log_path == NULL) {
+            snprintf(auto_log_path, sizeof auto_log_path, "%s.log", base);
+            log_path = auto_log_path;
+        }
+        if (want_raw && raw_path == NULL) {
+            snprintf(auto_raw_path, sizeof auto_raw_path, "%s.raw", base);
+            raw_path = auto_raw_path;
+        }
+        if (want_wav && wav_path == NULL) {
+            snprintf(auto_wav_path, sizeof auto_wav_path, "%s.wav", base);
+            wav_path = auto_wav_path;
+        }
+    }
+    if (!want_log)  log_path = NULL;
+    if (!want_raw)  raw_path = NULL;
+    if (!want_wav)  wav_path = NULL;
+
     // HMAC key.
     uint8_t hmac_key[128];
     ssize_t hmac_key_len = 0;
@@ -391,13 +464,25 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // Optional raw tee.
+    // Raw and WAV tees. Both are optional via --no-raw / --no-wav; default
+    // ON with auto-named paths (set just above) for post-mortem analysis.
     FILE *raw_fp = NULL;
     if (raw_path != NULL) {
         raw_fp = fopen(raw_path, "wb");
         if (raw_fp == NULL) {
             fprintf(stderr, "rx_live: fopen(%s): %s\n",
                     raw_path, strerror(errno));
+            audio_capture_close(capture);
+            return EXIT_FAILURE;
+        }
+    }
+    audio_wav_writer_t *wav_w = NULL;
+    if (wav_path != NULL) {
+        wav_w = audio_wav_writer_open(wav_path, (unsigned)samp_rate,
+                                      (unsigned)channels);
+        if (wav_w == NULL) {
+            fprintf(stderr, "rx_live: could not open WAV %s\n", wav_path);
+            if (raw_fp) fclose(raw_fp);
             audio_capture_close(capture);
             return EXIT_FAILURE;
         }
@@ -414,6 +499,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "rx_live: out of memory for window (%zu samples)\n",
                 window_samples);
         if (raw_fp) fclose(raw_fp);
+        if (wav_w) audio_wav_writer_close(wav_w);
         audio_capture_close(capture);
         return EXIT_FAILURE;
     }
@@ -425,6 +511,7 @@ int main(int argc, char **argv)
     if (chunk == NULL) {
         free(window);
         if (raw_fp) fclose(raw_fp);
+        if (wav_w) audio_wav_writer_close(wav_w);
         audio_capture_close(capture);
         return EXIT_FAILURE;
     }
@@ -439,6 +526,7 @@ int main(int argc, char **argv)
     if (bits_scratch == NULL || bytes_scratch == NULL) {
         free(bits_scratch); free(bytes_scratch); free(chunk); free(window);
         if (raw_fp) fclose(raw_fp);
+        if (wav_w) audio_wav_writer_close(wav_w);
         audio_capture_close(capture);
         return EXIT_FAILURE;
     }
@@ -498,6 +586,11 @@ int main(int argc, char **argv)
             (void)fwrite(chunk, sizeof(int16_t),
                          (size_t)got * (size_t)channels, raw_fp);
         }
+        if (wav_w != NULL) {
+            audio_wav_writer_append(wav_w, chunk,
+                                    (size_t)got * (size_t)channels
+                                    * sizeof(int16_t));
+        }
 
         // Append channel 0 to the window, decode whenever the window fills.
         for (snd_pcm_sframes_t i = 0; i < got; i++) {
@@ -550,5 +643,15 @@ int main(int argc, char **argv)
     free(window);
     audio_capture_close(capture);
     if (raw_fp) fclose(raw_fp);
+    if (wav_w) {
+        // Close WAV (patches header sizes) before invoking ffmpeg so
+        // showspectrumpic reads a complete file. Spectrogram is
+        // best-effort: if ffmpeg isn't on PATH, audio_generate_spectrogram
+        // logs and returns non-zero but rx_live still exits cleanly.
+        audio_wav_writer_close(wav_w);
+        if (want_spectrogram && wav_path != NULL) {
+            audio_generate_spectrogram(wav_path);
+        }
+    }
     return 0;
 }

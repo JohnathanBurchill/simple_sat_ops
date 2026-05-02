@@ -283,7 +283,7 @@ void audio_wav_writer_close(audio_wav_writer_t *w)
     free(w);
 }
 
-static void wav_writer_append(audio_wav_writer_t *w, const void *buf, size_t bytes)
+void audio_wav_writer_append(audio_wav_writer_t *w, const void *buf, size_t bytes)
 {
     if (w == NULL || w->fp == NULL || bytes == 0) return;
     size_t n = fwrite(buf, 1, bytes, w->fp);
@@ -328,7 +328,7 @@ int audio_play_tone(snd_pcm_t *handle, audio_wav_writer_t *wav,
         // Mirror to the synth WAV before the ALSA write — that way the
         // WAV captures the chunk we *intended* to send, even if ALSA
         // returns a short write or EPIPE and we re-try.
-        wav_writer_append(wav, buf, (size_t)n * channels * sizeof(int16_t));
+        audio_wav_writer_append(wav, buf, (size_t)n * channels * sizeof(int16_t));
         snd_pcm_sframes_t written = snd_pcm_writei(handle, buf, n);
         if (written == -EPIPE) {
             snd_pcm_prepare(handle);
@@ -463,7 +463,7 @@ int audio_play_white_noise(snd_pcm_t *handle, audio_wav_writer_t *wav,
                 buf[i * channels + c] = sample;
             }
         }
-        wav_writer_append(wav, buf, (size_t)n * channels * sizeof(int16_t));
+        audio_wav_writer_append(wav, buf, (size_t)n * channels * sizeof(int16_t));
         snd_pcm_sframes_t written = snd_pcm_writei(handle, buf, n);
         if (written == -EPIPE) {
             snd_pcm_prepare(handle);
@@ -565,7 +565,7 @@ int audio_capture(snd_pcm_t *handle,
         }
         size_t bytes = (size_t)got * channels * sizeof(int16_t);
         if (wav != NULL) {
-            wav_writer_append(wav, buf, bytes);
+            audio_wav_writer_append(wav, buf, bytes);
         }
         if (raw_out != NULL) {
             // Best-effort: a short write here only loses tail samples, the

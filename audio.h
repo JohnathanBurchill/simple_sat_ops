@@ -83,6 +83,11 @@ typedef struct audio_wav_writer audio_wav_writer_t;
 audio_wav_writer_t *audio_wav_writer_open(const char *path,
                                           unsigned int rate_hz,
                                           unsigned int channels);
+// Append raw S16_LE PCM bytes to an open WAV writer. Used by tools that
+// run their own ALSA capture loop (rx_live) and want to tee chunks to
+// both a raw FILE* and a WAV writer; audio_capture()'s callers don't
+// need to call this directly.
+void audio_wav_writer_append(audio_wav_writer_t *w, const void *buf, size_t bytes);
 void audio_wav_writer_close(audio_wav_writer_t *w);
 
 int audio_play_tone(snd_pcm_t *handle, audio_wav_writer_t *wav,
