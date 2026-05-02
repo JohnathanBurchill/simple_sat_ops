@@ -99,6 +99,10 @@ static void usage(FILE *dest, const char *name)
         "  --no-dc-block            Skip the modem's DC-block IIR. Useful\n"
         "                           on radio digital taps (FT-991A USB\n"
         "                           CODEC) where there's no DC offset.\n"
+        "  --no-csp-crc32           Don't validate / strip the trailing\n"
+        "                           CSP zlib CRC32. Default ON for\n"
+        "                           downlink decode. Disable for raw\n"
+        "                           test frames that don't carry a CRC.\n"
         "\n"
         "Output (defaults: ON, auto-named\n"
         "        rx_live_UT=YYYYMMDDTHHMMSS.sss.{log,raw,wav,png} in CWD):\n"
@@ -155,7 +159,10 @@ static int try_decode_window(const int16_t *samples, size_t n_samples,
                              int *out_rs_errs, int *out_used_golay_len,
                              size_t *out_sync_off)
 {
-    const int MAX_ATTEMPTS = 32;
+    // Was 32; bumped to 256 because the cross-phase best-Hamming search
+    // can flounder through many low-HD noise candidates between real
+    // frames in a long-packet window before finding the next real ASM.
+    const int MAX_ATTEMPTS = 256;
     size_t min_offset = min_offset_in;
     int attempts = 0;
 
@@ -283,6 +290,7 @@ int main(int argc, char **argv)
     int use_hmac = 0;  // AX100 downlink does not use HMAC; opt in with --hmac
     int use_rs = 1;
     int no_dc_block = 0;
+    int csp_crc32 = 1;  // strip + validate downlink CRC32 trailer by default
     int quiet = 0;
     int want_log = 1;
     int want_raw = 1;
@@ -338,6 +346,8 @@ int main(int argc, char **argv)
             use_rs = 0;
         } else if (strcmp("--no-dc-block", a) == 0) {
             no_dc_block = 1;
+        } else if (strcmp("--no-csp-crc32", a) == 0) {
+            csp_crc32 = 0;
         } else if (strncmp("--log=", a, 6) == 0) {
             if (strlen(a) < 7) { fprintf(stderr, "Unable to parse %s\n", a); return EXIT_FAILURE; }
             log_path = a + 6;
@@ -634,7 +644,14 @@ int main(int argc, char **argv)
                     break;
                 }
                 inner_min_offset = sync_off_local + 1;
-                if (plen < 4 || plen > 256) continue;
+                // Sanity bound: must fit a CSP header at minimum, and must
+                // not exceed the packet buffer. Was 256 — too tight; AX100
+                // frames at the format max go up to 255 bytes pre-CRC and
+                // ax100_unframe's brute-force length search can come back
+                // with values close to that. Use the buffer size as the
+                // upper bound; the remaining filter is the CSP CRC32
+                // validation a few lines below.
+                if (plen < 4 || (size_t)plen > sizeof packet) continue;
                 // CSP v1 downlink frames carry a trailing 32-bit zlib CRC
                 // over the entire packet (header + payload). libcsp peers
                 // emit it little-endian on the wire on most builds, but
@@ -642,7 +659,7 @@ int main(int argc, char **argv)
                 // against unknown-endian satellite firmwares. Skip when
                 // HMAC mode is on (uplink frames carry a 32-byte SHA-256
                 // tag, not a CRC).
-                if (!use_hmac) {
+                if (!use_hmac && csp_crc32) {
                     if (plen < 8) continue;  // need header + CRC at minimum
                     uint32_t computed = csp_crc32_zlib(packet, (size_t)(plen - 4));
                     uint32_t le = (uint32_t)packet[plen - 4]
