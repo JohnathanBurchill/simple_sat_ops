@@ -502,6 +502,42 @@ static int yaesu_cat_power(radio_t *radio, int on)
     return yaesu_send(radio, "PS0;", NULL, 0);
 }
 
+// RX-side cleanup for data decode. The rear DATA-OUT path on the FT-991A
+// has at least four DSPs that subtly mangle 9600-baud bit transitions
+// while leaving voice audio sounding fine: noise blanker, DSP NR, auto
+// notch and contour. Forces them all OFF, sets AGC FAST so peaks aren't
+// squashed across burst boundaries, and pins Menu 079 = 9600 so the rear
+// DATA jack carries the wide pre-de-emphasis discriminator output.
+//
+// Resilient: on the (unlikely) chance the radio rejects one command (e.g.
+// firmware variant that doesn't recognise BC00; or CO0000;), we log it
+// and continue rather than aborting partway through. Mode is left alone
+// — call radio_uplink_prep first if D-FM also needs to be set.
+static int yaesu_cat_set_rx_clean(radio_t *radio)
+{
+    static const struct {
+        const char *cmd;
+        const char *what;
+    } steps[] = {
+        {"EX0791;", "Menu 079 PKT MODE = 9600"},
+        {"NB0;",    "noise blanker OFF"},
+        {"NR0;",    "DSP NR OFF"},
+        {"BC00;",   "auto notch OFF"},
+        {"CO0000;", "contour OFF"},
+        {"GT01;",   "AGC FAST"},
+    };
+    int errors = 0;
+    for (size_t i = 0; i < sizeof steps / sizeof steps[0]; i++) {
+        int rc = yaesu_send(radio, steps[i].cmd, NULL, 0);
+        if (rc != RADIO_OK) {
+            fprintf(stderr, "yaesu_cat: set_rx_clean: '%s' (%s) failed (rc=%d)\n",
+                    steps[i].cmd, steps[i].what, rc);
+            errors++;
+        }
+    }
+    return errors == 0 ? RADIO_OK : RADIO_BAD_RESPONSE;
+}
+
 static const radio_backend_ops_t yaesu_cat_ops = {
     .name                  = "yaesu-cat",
     .init                  = yaesu_cat_init,
@@ -515,6 +551,7 @@ static const radio_backend_ops_t yaesu_cat_ops = {
     .set_mode              = yaesu_cat_set_mode,
     .set_data_mode         = yaesu_cat_set_data_mode,
     .set_data_mod_source   = yaesu_cat_set_data_mod_source,
+    .set_rx_clean          = yaesu_cat_set_rx_clean,
     .set_usb_mod_level     = yaesu_cat_set_usb_mod_level,
     .set_moni_level        = NULL,  // future Menu 009 helper if ever needed
     .set_rf_power          = yaesu_cat_set_rf_power,

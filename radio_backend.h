@@ -62,6 +62,11 @@ typedef struct radio_backend_ops {
     int    (*set_mode)(radio_t *r, int mode, int filter);
     int    (*set_data_mode)(radio_t *r, int on, int filter);
     int    (*set_data_mod_source)(radio_t *r, int source);
+    // RX-side prep for data decode: turn off DSPs that mangle bit
+    // transitions (NB, NR, notch, contour) and force a flat AGC profile.
+    // Backends that lack the concept can leave this NULL — the dispatcher
+    // returns RADIO_NOT_SUPPORTED.
+    int    (*set_rx_clean)(radio_t *r);
     int    (*set_usb_mod_level)(radio_t *r, int level_0_to_255);
     int    (*set_moni_level)(radio_t *r, int level_0_to_255);
     int    (*set_rf_power)(radio_t *r, int level_0_to_255);

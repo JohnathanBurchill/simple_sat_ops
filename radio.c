@@ -158,6 +158,12 @@ int radio_set_data_mod_source(radio_t *radio, int source)
     return radio->ops->set_data_mod_source(radio, source);
 }
 
+int radio_set_rx_clean(radio_t *radio)
+{
+    if (!radio || !radio->ops || !radio->ops->set_rx_clean) return unsupported(radio, "set_rx_clean");
+    return radio->ops->set_rx_clean(radio);
+}
+
 int radio_set_usb_mod_level(radio_t *radio, int level_0_to_255)
 {
     if (!radio || !radio->ops || !radio->ops->set_usb_mod_level) return unsupported(radio, "set_usb_mod_level");

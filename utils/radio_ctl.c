@@ -110,6 +110,11 @@ static void usage(FILE *f)
         "Commands:\n"
         "  init                       Run backend init() and exit.\n"
         "  uplink-prep                radio_uplink_prep() and exit.\n"
+        "  set-rx-clean               Prep radio for clean data RX: NB, DSP NR,\n"
+        "                             auto notch, contour OFF, AGC FAST. Yaesu\n"
+        "                             also pins Menu 079 = 9600 so DATA-OUT\n"
+        "                             carries the wide pre-de-emphasis path.\n"
+        "                             Run before rx_capture / rx_live.\n"
         "  get-freq                   Print current frequency in Hz.\n"
         "  set-freq <hz>              Tune the active VFO.\n"
         "  set-mode <fm|usb|lsb|am|cw>          Operating mode.\n"
@@ -459,6 +464,9 @@ int main(int argc, char **argv)
     }
     else if (strcmp(cmd, "uplink-prep") == 0) {
         rc = radio_uplink_prep(&r);
+    }
+    else if (strcmp(cmd, "set-rx-clean") == 0) {
+        rc = radio_set_rx_clean(&r);
     }
     else if (strcmp(cmd, "get-freq") == 0) {
         double f = radio_get_frequency(&r);
