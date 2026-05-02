@@ -81,11 +81,12 @@ static void usage(FILE *dest, const char *name)
         "                           catches more edge-straddling frames,\n"
         "                           costs CPU).\n"
         "  --sync-threshold=<0..8>  Max ASM bit errors (default 4).\n"
-        "  --keyfile=<path>         HMAC keyfile (default $HOME/%s).\n"
-        "  --no-hmac                Skip HMAC verify. Without HMAC the\n"
-        "                           first successful unframe is accepted;\n"
-        "                           expect occasional false-positive\n"
-        "                           frames in noisy captures.\n"
+        "  --hmac                   Enable HMAC verification. AX100\n"
+        "                           downlink frames do NOT use HMAC, so\n"
+        "                           this is OFF by default. Use only when\n"
+        "                           round-tripping uplink_test output.\n"
+        "  --keyfile=<path>         HMAC keyfile (only relevant with\n"
+        "                           --hmac; default $HOME/%s).\n"
         "  --reed-solomon           RS(255,223) decode (DEFAULT).\n"
         "  --no-reed-solomon        Skip RS decode (use when decoding\n"
         "                           downlink-style CRC frames).\n"
@@ -184,7 +185,7 @@ static int try_decode_window(const int16_t *samples, size_t n_samples,
 // to stdout if not quiet.
 static void emit_frame(const char *log_path, int quiet, const char *ts,
                        const uint8_t *packet, size_t packet_len,
-                       int golay_errs, int hmac_ok,
+                       int golay_errs, int hmac_ok, int use_hmac,
                        int rs_errs, int used_golay_len)
 {
     char rs_buf[32];
@@ -203,17 +204,23 @@ static void emit_frame(const char *log_path, int quiet, const char *ts,
         if (log_fp != NULL) streams[1] = log_fp;
     }
 
+    const char *len_src =
+        used_golay_len == 1 ? "golay-header"
+        : used_golay_len == 0 ? "brute-forced" : "(n/a)";
     for (int s = 0; s < 2; s++) {
         FILE *fp = streams[s];
         if (fp == NULL) continue;
-        fprintf(fp, "[%s] AX100: golay_errors=%d hmac=%s rs=%s len=%s "
-                "len_bytes=%zu\n",
-                ts, golay_errs,
-                hmac_ok == 1 ? "ok" : hmac_ok == 0 ? "MISMATCH" : "(off)",
-                rs_buf,
-                used_golay_len == 1 ? "golay-header"
-                : used_golay_len == 0 ? "brute-forced" : "(n/a)",
-                packet_len);
+        if (use_hmac) {
+            fprintf(fp, "[%s] AX100: golay_errors=%d hmac=%s rs=%s len=%s "
+                    "len_bytes=%zu\n",
+                    ts, golay_errs,
+                    hmac_ok == 1 ? "ok" : hmac_ok == 0 ? "MISMATCH" : "(off)",
+                    rs_buf, len_src, packet_len);
+        } else {
+            fprintf(fp, "[%s] AX100: golay_errors=%d rs=%s len=%s "
+                    "len_bytes=%zu\n",
+                    ts, golay_errs, rs_buf, len_src, packet_len);
+        }
         if (csp_ok) {
             fprintf(fp, "[%s] CSP v1: src=%u dst=%u dport=%u sport=%u "
                     "prio=%u flags=0x%02x\n",
@@ -251,7 +258,7 @@ int main(int argc, char **argv)
     double window_s = 1.5;
     double slide_s = 0.5;
     int sync_max_ham = 4;
-    int use_hmac = 1;
+    int use_hmac = 0;  // AX100 downlink does not use HMAC; opt in with --hmac
     int use_rs = 1;
     int no_dc_block = 0;
     int quiet = 0;
@@ -291,7 +298,10 @@ int main(int argc, char **argv)
         } else if (strncmp("--keyfile=", a, 10) == 0) {
             if (strlen(a) < 11) { fprintf(stderr, "Unable to parse %s\n", a); return EXIT_FAILURE; }
             keyfile_path = a + 10;
+        } else if (strcmp("--hmac", a) == 0) {
+            use_hmac = 1;
         } else if (strcmp("--no-hmac", a) == 0) {
+            // Default; kept as a no-op so existing scripts don't break.
             use_hmac = 0;
         } else if (strcmp("--reed-solomon", a) == 0) {
             use_rs = 1;
@@ -453,12 +463,21 @@ int main(int argc, char **argv)
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    fprintf(stderr, "rx_live: %s window=%.2fs slide=%.2fs sync_thr=%d "
-            "hmac=%s rs=%s log=%s raw=%s\n",
-            audio_device, window_s, slide_s, sync_max_ham,
-            use_hmac ? "on" : "off", use_rs ? "on" : "off",
-            log_path ? log_path : "(none)",
-            raw_path ? raw_path : "(none)");
+    if (use_hmac) {
+        fprintf(stderr, "rx_live: %s window=%.2fs slide=%.2fs sync_thr=%d "
+                "hmac=on rs=%s log=%s raw=%s\n",
+                audio_device, window_s, slide_s, sync_max_ham,
+                use_rs ? "on" : "off",
+                log_path ? log_path : "(none)",
+                raw_path ? raw_path : "(none)");
+    } else {
+        fprintf(stderr, "rx_live: %s window=%.2fs slide=%.2fs sync_thr=%d "
+                "rs=%s log=%s raw=%s\n",
+                audio_device, window_s, slide_s, sync_max_ham,
+                use_rs ? "on" : "off",
+                log_path ? log_path : "(none)",
+                raw_path ? raw_path : "(none)");
+    }
 
     // Dedup: hash of last successfully-decoded packet (FNV-1a 64).
     uint64_t last_hash = 0;
@@ -507,7 +526,7 @@ int main(int argc, char **argv)
                         fmt_utc(ts, sizeof ts);
                         emit_frame(log_path, quiet, ts,
                                    packet, (size_t)plen,
-                                   golay_errs, hmac_ok,
+                                   golay_errs, hmac_ok, use_hmac,
                                    rs_errs, used_golay_len);
                         last_hash = h;
                     }

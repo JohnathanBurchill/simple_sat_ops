@@ -143,15 +143,18 @@ static void usage(FILE *out, const char *argv0)
         "  --rate=<hz>                Sample rate for --raw (default 48000)\n"
         "  --channels=<n>             Channels for --raw (default 1; ch 0 used)\n"
         "\n"
-        "Framing / HMAC / FEC:\n"
-        "  --keyfile=<path>           HMAC keyfile (default $HOME/%s)\n"
-        "  --no-hmac                  Skip HMAC verification (matches\n"
-        "                             `tx_frame --no-hmac`)\n"
+        "Framing / FEC / HMAC:\n"
         "  --reed-solomon             RS(255,223) decode (DEFAULT for uplink)\n"
         "  --no-reed-solomon          Disable RS decode. Use when talking to\n"
         "                             a TX that did not RS-encode (e.g.,\n"
         "                             legacy tx_frame output, or downlink\n"
         "                             which uses CRC instead per pycsplink).\n"
+        "  --hmac                     Enable HMAC verification. AX100\n"
+        "                             downlink frames do NOT use HMAC, so\n"
+        "                             this is OFF by default. Use when\n"
+        "                             round-tripping uplink_test output.\n"
+        "  --keyfile=<path>           HMAC keyfile (only relevant with\n"
+        "                             --hmac; default $HOME/%s)\n"
         "\n"
         "Modem:\n"
         "  --bit-rate=<bps>           Default 9600\n"
@@ -202,7 +205,7 @@ int main(int argc, char **argv)
     int bit_rate = 9600;
     int invert = 0;
     int sync_max_ham = 0;
-    int use_hmac = 1;
+    int use_hmac = 0;  // AX100 downlink does not use HMAC; opt in with --hmac
     int use_rs = 1;  // default ON to match pycsplink uplink
     int verbose = 0;
     int hex_only = 0;
@@ -222,7 +225,11 @@ int main(int argc, char **argv)
             raw_channels = atoi(a + 11);
         } else if (starts_with(a, "--keyfile=")) {
             keyfile_path = a + 10;
+        } else if (strcmp(a, "--hmac") == 0) {
+            use_hmac = 1;
         } else if (strcmp(a, "--no-hmac") == 0) {
+            // Default is now --no-hmac; kept as a no-op so existing
+            // scripts / docs don't break.
             use_hmac = 0;
         } else if (strcmp(a, "--reed-solomon") == 0) {
             use_rs = 1;
@@ -728,13 +735,21 @@ int main(int argc, char **argv)
         char rs_buf[32];
         if (rs_errs < 0) snprintf(rs_buf, sizeof rs_buf, "(off/failed)");
         else snprintf(rs_buf, sizeof rs_buf, "%d", rs_errs);
-        fprintf(stderr, "rx_decode: inner packet %zd bytes, golay errors=%d, "
-                "hmac=%s, rs_corrected=%s, len_source=%s\n",
-                packet_len, golay_errs,
-                hmac_ok == 1 ? "ok" : hmac_ok == 0 ? "MISMATCH" : "(not checked)",
-                rs_buf,
-                used_golay_len == 1 ? "golay-header"
-                : used_golay_len == 0 ? "brute-force" : "(n/a)");
+        if (use_hmac) {
+            fprintf(stderr, "rx_decode: inner packet %zd bytes, golay errors=%d, "
+                    "hmac=%s, rs_corrected=%s, len_source=%s\n",
+                    packet_len, golay_errs,
+                    hmac_ok == 1 ? "ok" : hmac_ok == 0 ? "MISMATCH" : "(not checked)",
+                    rs_buf,
+                    used_golay_len == 1 ? "golay-header"
+                    : used_golay_len == 0 ? "brute-force" : "(n/a)");
+        } else {
+            fprintf(stderr, "rx_decode: inner packet %zd bytes, golay errors=%d, "
+                    "rs_corrected=%s, len_source=%s\n",
+                    packet_len, golay_errs, rs_buf,
+                    used_golay_len == 1 ? "golay-header"
+                    : used_golay_len == 0 ? "brute-force" : "(n/a)");
+        }
     }
 
     if (packet_len < 4) {
@@ -763,14 +778,20 @@ int main(int argc, char **argv)
     char rs_summary[32];
     if (rs_errs < 0) snprintf(rs_summary, sizeof rs_summary, "off");
     else snprintf(rs_summary, sizeof rs_summary, "corrected=%d", rs_errs);
-    fprintf(stdout, "AX100: golay_errors=%d  hmac=%s  rs=%s  len=%s\n",
-            golay_errs,
-            hmac_ok == 1 ? "ok"
-            : hmac_ok == 0 ? "MISMATCH"
-            : "(not checked)",
-            rs_summary,
-            used_golay_len == 1 ? "golay-header"
-            : used_golay_len == 0 ? "brute-forced" : "(n/a)");
+    const char *len_src =
+        used_golay_len == 1 ? "golay-header"
+        : used_golay_len == 0 ? "brute-forced" : "(n/a)";
+    if (use_hmac) {
+        fprintf(stdout, "AX100: golay_errors=%d  hmac=%s  rs=%s  len=%s\n",
+                golay_errs,
+                hmac_ok == 1 ? "ok"
+                : hmac_ok == 0 ? "MISMATCH"
+                : "(not checked)",
+                rs_summary, len_src);
+    } else {
+        fprintf(stdout, "AX100: golay_errors=%d  rs=%s  len=%s\n",
+                golay_errs, rs_summary, len_src);
+    }
     fprintf(stdout, "CSP v1: src=%u dst=%u dport=%u sport=%u prio=%u flags=0x%02x\n",
             hdr.src, hdr.dst, hdr.dport, hdr.sport, hdr.prio, hdr.flags);
     fprintf(stdout, "payload (%zu bytes):\n", payload_len);
