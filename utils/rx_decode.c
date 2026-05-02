@@ -184,6 +184,14 @@ static void usage(FILE *out, const char *argv0)
         "                             failure: 512 bits per phase from the\n"
         "                             diagnostic raw-slicer's best ASM-match\n"
         "                             window (was -v-only before).\n"
+        "  --csp-crc32                Validate + strip a trailing CSP zlib\n"
+        "                             CRC32. Off by default. AX100 frames\n"
+        "                             in either direction don't necessarily\n"
+        "                             carry one (uplink has HMAC; downlink\n"
+        "                             depends on firmware). Enable only\n"
+        "                             when you know the TX side appends a\n"
+        "                             CRC; otherwise frames fail validation\n"
+        "                             and the trailer stays in the payload.\n"
         "  --no-dc-block              Skip the modem's DC-block IIR (alpha=0.995)\n"
         "                             on RX. Default-ON setting was added for\n"
         "                             rtl_fm's discriminator drift; for radio\n"
@@ -212,6 +220,7 @@ int main(int argc, char **argv)
     int sync_max_ham = 0;
     int use_hmac = 0;  // AX100 downlink does not use HMAC; opt in with --hmac
     int use_rs = 1;  // default ON to match pycsplink uplink
+    int csp_crc32 = 0;  // opt-in via --csp-crc32
     int verbose = 0;
     int hex_only = 0;
     int dump_bits = 0;  // 0 = disabled; >0 = bits to print on success/failure
@@ -265,6 +274,10 @@ int main(int argc, char **argv)
             }
         } else if (strcmp(a, "--no-dc-block") == 0) {
             no_dc_block = 1;
+        } else if (strcmp(a, "--csp-crc32") == 0) {
+            csp_crc32 = 1;
+        } else if (strcmp(a, "--no-csp-crc32") == 0) {
+            csp_crc32 = 0;
         } else if (a[0] == '-') {
             fprintf(stderr, "rx_decode: unknown option '%s'\n", a);
             usage(stderr, argv[0]);
@@ -777,7 +790,7 @@ int main(int argc, char **argv)
     // and strip when HMAC is off; uplink frames have a 32-byte SHA-256
     // HMAC tag instead and that's the user's problem to interpret.
     int crc_ok = -1;
-    if (!use_hmac && packet_len >= 8) {
+    if (!use_hmac && csp_crc32 && packet_len >= 8) {
         uint32_t computed = csp_crc32_zlib(packet, (size_t)(packet_len - 4));
         uint32_t le = (uint32_t)packet[packet_len - 4]
                     | ((uint32_t)packet[packet_len - 3] << 8)

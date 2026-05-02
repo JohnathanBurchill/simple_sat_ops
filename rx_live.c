@@ -99,10 +99,15 @@ static void usage(FILE *dest, const char *name)
         "  --no-dc-block            Skip the modem's DC-block IIR. Useful\n"
         "                           on radio digital taps (FT-991A USB\n"
         "                           CODEC) where there's no DC offset.\n"
-        "  --no-csp-crc32           Don't validate / strip the trailing\n"
-        "                           CSP zlib CRC32. Default ON for\n"
-        "                           downlink decode. Disable for raw\n"
-        "                           test frames that don't carry a CRC.\n"
+        "  --csp-crc32              Validate + strip a trailing CSP zlib\n"
+        "                           CRC32 (libcsp CRC mode). Off by\n"
+        "                           default. AX100 frames in either\n"
+        "                           direction don't necessarily carry\n"
+        "                           one (uplink has HMAC; downlink\n"
+        "                           depends on firmware). Enable only\n"
+        "                           when you know the TX side appends\n"
+        "                           a CRC; otherwise frames will fail\n"
+        "                           validation and be silently dropped.\n"
         "\n"
         "Output (defaults: ON, auto-named\n"
         "        rx_live_UT=YYYYMMDDTHHMMSS.sss.{log,raw,wav,png} in CWD):\n"
@@ -290,7 +295,7 @@ int main(int argc, char **argv)
     int use_hmac = 0;  // AX100 downlink does not use HMAC; opt in with --hmac
     int use_rs = 1;
     int no_dc_block = 0;
-    int csp_crc32 = 1;  // strip + validate downlink CRC32 trailer by default
+    int csp_crc32 = 0;  // opt-in via --csp-crc32 (some firmwares use it)
     int quiet = 0;
     int want_log = 1;
     int want_raw = 1;
@@ -346,7 +351,10 @@ int main(int argc, char **argv)
             use_rs = 0;
         } else if (strcmp("--no-dc-block", a) == 0) {
             no_dc_block = 1;
+        } else if (strcmp("--csp-crc32", a) == 0) {
+            csp_crc32 = 1;
         } else if (strcmp("--no-csp-crc32", a) == 0) {
+            // Default; kept as a no-op for any existing scripts.
             csp_crc32 = 0;
         } else if (strncmp("--log=", a, 6) == 0) {
             if (strlen(a) < 7) { fprintf(stderr, "Unable to parse %s\n", a); return EXIT_FAILURE; }
