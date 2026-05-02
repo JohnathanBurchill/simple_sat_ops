@@ -34,6 +34,7 @@ void modem_params_defaults(modem_params_t *p)
     p->gain_db = 0.0;
     p->gauss_bt = 0.5;
     p->gauss_symbol_span = 4;
+    p->rx_disable_dc_block = 0;
 }
 
 ssize_t modem_bytes_to_pcm16(const uint8_t *frame, size_t frame_len,
@@ -207,7 +208,7 @@ int pcm16_write_wav(const char *path,
 // Given a bit stream (MSB-first), find the offset in bits at which the
 // 32-bit pattern `needle` matches within `max_ham` bit errors, starting
 // the search at or past `min_offset`. Returns the bit offset of the
-// first match, or (size_t)-1 if not found.
+// FIRST match, or (size_t)-1 if not found.
 static size_t find_u32_pattern(const uint8_t *bits, size_t n_bits,
                                uint32_t needle, int max_ham,
                                size_t min_offset)
@@ -229,6 +230,46 @@ static size_t find_u32_pattern(const uint8_t *bits, size_t n_bits,
         }
     }
     return (size_t)-1;
+}
+
+// Like find_u32_pattern but returns the LOWEST-HAMMING match in
+// [min_offset, end]. Ties broken by earliest position. *out_ham
+// receives the Hamming distance of the match (or 33 if none).
+// Used by the cross-phase modem to prefer good signal matches over
+// noise matches in earlier phases — at sync_max_ham >= 4 the bit
+// stream is sprinkled with random Hamming-4-or-5 noise hits, and
+// returning the first one (find_u32_pattern's behaviour) buries
+// the real Hamming-1 ASM behind a wall of noise advances.
+static size_t find_u32_pattern_best(const uint8_t *bits, size_t n_bits,
+                                    uint32_t needle, int max_ham,
+                                    size_t min_offset, int *out_ham)
+{
+    if (out_ham) *out_ham = 33;
+    if (n_bits < 32) return (size_t)-1;
+    size_t start = min_offset;
+    if (start > n_bits - 32) return (size_t)-1;
+    uint32_t window = 0;
+    for (size_t i = 0; i < 32; ++i) {
+        window = (window << 1) | (bits[start + i] & 1u);
+    }
+    int best_ham = 33;
+    size_t best_off = (size_t)-1;
+    int h = (int)__builtin_popcount(window ^ needle);
+    if (h <= max_ham) {
+        best_ham = h;
+        best_off = start;
+    }
+    for (size_t i = 32; i < n_bits - start; ++i) {
+        window = (window << 1) | (bits[start + i] & 1u);
+        h = (int)__builtin_popcount(window ^ needle);
+        if (h <= max_ham && h < best_ham) {
+            best_ham = h;
+            best_off = start + i - 31;
+            if (best_ham == 0) break;  // can't beat zero
+        }
+    }
+    if (out_ham && best_off != (size_t)-1) *out_ham = best_ham;
+    return best_off;
 }
 
 int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
@@ -254,16 +295,25 @@ int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
 
     // DC-block: 1-pole HPF, y[n] = x[n] - x[n-1] + α·y[n-1].
     // α close to 1 → narrow low-cut. 0.995 at 48 kHz ≈ 40 Hz -3dB.
+    // Skipped (samples copied through) when p->rx_disable_dc_block is set —
+    // useful for radio paths with no DC offset, where the HPF only adds
+    // baseline transients and group delay.
     float *dc_blocked = (float *)malloc(n_samples * sizeof(float));
     if (dc_blocked == NULL) return -1;
-    const float alpha = 0.995f;
-    float prev_x = 0.0f, prev_y = 0.0f;
-    for (size_t i = 0; i < n_samples; ++i) {
-        float x = (float)samples[i];
-        float y = x - prev_x + alpha * prev_y;
-        dc_blocked[i] = y;
-        prev_x = x;
-        prev_y = y;
+    if (p->rx_disable_dc_block) {
+        for (size_t i = 0; i < n_samples; ++i) {
+            dc_blocked[i] = (float)samples[i];
+        }
+    } else {
+        const float alpha = 0.995f;
+        float prev_x = 0.0f, prev_y = 0.0f;
+        for (size_t i = 0; i < n_samples; ++i) {
+            float x = (float)samples[i];
+            float y = x - prev_x + alpha * prev_y;
+            dc_blocked[i] = y;
+            prev_x = x;
+            prev_y = y;
+        }
     }
 
     // Pre-slice into per-sample bits for each of the `sps` possible mid-bit
@@ -289,8 +339,19 @@ int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
     int best_phase = -1;
     int best_polarity = -1;
 
+    // Per-polarity, search ALL phases and return the LOWEST-HAMMING match
+    // (ties broken by earliest position). Old behaviour was "first match
+    // in phase order", which is fine at sync_max_ham=0 but at >= 4 lets
+    // random noise in phase 0 hide a real Hamming-1 ASM in phase 4
+    // behind a wall of false-positive advances. Polarity preference is
+    // preserved: if normal polarity has any qualifying match, it wins
+    // (we only fall through to inverted if normal returned nothing at
+    // all in [min_offset, end]).
     for (int pi = 0; pi < 2 && best_phase < 0; ++pi) {
         int this_invert = polarities[pi];
+        int local_best_ham = 33;
+        int local_best_phase = -1;
+        size_t local_best_off = (size_t)-1;
         for (int phase = 0; phase < sps; ++phase) {
             size_t mid_offset = (size_t)phase + (size_t)sps / 2u;
             size_t n_bits = 0;
@@ -303,18 +364,37 @@ int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
                 }
                 tmp_bits[n_bits++] = (uint8_t)bit;
             }
-            size_t off = find_u32_pattern(tmp_bits, n_bits,
-                                          ASM_BIG_ENDIAN_U32, sync_max_ham,
-                                          min_bit_offset);
-            if (off != (size_t)-1) {
-                size_t copy_bits = n_bits - off;
-                memcpy(out_bits, tmp_bits + off, copy_bits);
-                *n_bits_out = copy_bits;
-                best_sync = off;
-                best_phase = phase;
-                best_polarity = this_invert;
-                break;
+            int this_ham = 33;
+            size_t off = find_u32_pattern_best(tmp_bits, n_bits,
+                                               ASM_BIG_ENDIAN_U32, sync_max_ham,
+                                               min_bit_offset, &this_ham);
+            if (off != (size_t)-1 && this_ham < local_best_ham) {
+                local_best_ham = this_ham;
+                local_best_phase = phase;
+                local_best_off = off;
             }
+        }
+        if (local_best_phase >= 0) {
+            // Recompute the winning phase's bit stream and copy into
+            // out_bits (tmp_bits got overwritten by later phases'
+            // sweeps; cheap to rebuild for one phase).
+            size_t mid_offset = (size_t)local_best_phase + (size_t)sps / 2u;
+            size_t n_bits = 0;
+            for (size_t i = mid_offset; i < n_samples; i += (size_t)sps) {
+                int bit;
+                if (this_invert) {
+                    bit = (dc_blocked[i] < 0.0f) ? 1 : 0;
+                } else {
+                    bit = (dc_blocked[i] > 0.0f) ? 1 : 0;
+                }
+                tmp_bits[n_bits++] = (uint8_t)bit;
+            }
+            size_t copy_bits = n_bits - local_best_off;
+            memcpy(out_bits, tmp_bits + local_best_off, copy_bits);
+            *n_bits_out = copy_bits;
+            best_sync = local_best_off;
+            best_phase = local_best_phase;
+            best_polarity = this_invert;
         }
     }
     if (polarity_used) *polarity_used = best_polarity;

@@ -177,6 +177,17 @@ static void usage(FILE *out, const char *argv0)
         "                             failure: 512 bits per phase from the\n"
         "                             diagnostic raw-slicer's best ASM-match\n"
         "                             window (was -v-only before).\n"
+        "  --no-dc-block              Skip the modem's DC-block IIR (alpha=0.995)\n"
+        "                             on RX. Default-ON setting was added for\n"
+        "                             rtl_fm's discriminator drift; for radio\n"
+        "                             paths with no DC offset (FT-991A\n"
+        "                             discriminator) the HPF only adds baseline\n"
+        "                             transients across burst boundaries that\n"
+        "                             cost a few bits in the ASM detector. If\n"
+        "                             the failure-path diagnostic shows ASM\n"
+        "                             at HD=2-4 in the raw slicer but the\n"
+        "                             modem reports 'no valid AX100 frame',\n"
+        "                             this flag often closes the gap.\n"
         "  --help                     This message\n",
         argv0, argv0, HMAC_KEYFILE_DEFAULT_RELPATH);
 }
@@ -196,6 +207,7 @@ int main(int argc, char **argv)
     int verbose = 0;
     int hex_only = 0;
     int dump_bits = 0;  // 0 = disabled; >0 = bits to print on success/failure
+    int no_dc_block = 0;
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
@@ -238,6 +250,8 @@ int main(int argc, char **argv)
                 fprintf(stderr, "rx_decode: --dump-bits must be > 0\n");
                 return 1;
             }
+        } else if (strcmp(a, "--no-dc-block") == 0) {
+            no_dc_block = 1;
         } else if (a[0] == '-') {
             fprintf(stderr, "rx_decode: unknown option '%s'\n", a);
             usage(stderr, argv[0]);
@@ -287,6 +301,7 @@ int main(int argc, char **argv)
     modem_params_defaults(&mp);
     mp.samp_rate = samp_rate;
     mp.bit_rate = bit_rate;
+    mp.rx_disable_dc_block = no_dc_block;
     if (mp.samp_rate <= 0 || mp.bit_rate <= 0 ||
         mp.samp_rate % mp.bit_rate != 0) {
         fprintf(stderr, "rx_decode: samp_rate (%d) must be a multiple of bit_rate (%d)\n",

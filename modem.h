@@ -39,6 +39,14 @@ typedef struct modem_params {
     double gain_db;          // output gain in dB; 0 means unity at the filter output
     double gauss_bt;         // Gaussian BT product; 0 disables filter (pure NRZ)
     int gauss_symbol_span;   // filter length in symbol periods (e.g. 4)
+    // RX-side DC-block bypass. The default IIR high-pass (α=0.995) was
+    // added to defeat rtl_fm's discriminator drift, but it also adds
+    // group delay and per-burst baseline transients that can shift
+    // bit-slicer thresholds enough to cost a few Hamming bits in the
+    // ASM detector. For radio paths with no DC offset (e.g. FT-991A
+    // discriminator output), set this to 1 to slice the raw samples
+    // directly. Default 0 (DC-block enabled).
+    int rx_disable_dc_block;
 } modem_params_t;
 
 // Initializes p to the FrontierSat defaults (9600 bps at 48 kHz,
