@@ -318,13 +318,26 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    int n_args = argc - state.n_options;
-    int n_pos = n_args - 1;
+    // Collect positional args (anything that didn't match a recognized
+    // --flag). Numeric arg values like '0' / '2000' and string names like
+    // 'ISS (ZARYA)' both qualify; only --foo[=...] starts with '--'. We
+    // can't trust argv[1] as "the first positional" because flags and
+    // positionals can interleave on the command line.
+    int positional_argv[8];
+    int n_positional = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strncmp("--", argv[i], 2) == 0) continue;
+        if (n_positional >= (int)(sizeof positional_argv / sizeof positional_argv[0])) {
+            fprintf(stderr, "too many positional arguments\n");
+            return EXIT_FAILURE;
+        }
+        positional_argv[n_positional++] = i;
+    }
     char *satellite_name = NULL;
 
     if (trajectory_id != NULL) {
         // OEM path: no positionals (trajectory is implicit).
-        if (n_pos != 0) {
+        if (n_positional != 0) {
             fprintf(stderr,
                     "--trajectory-id= does not accept positional arguments; "
                     "use --min-altitude-km= / --max-altitude-km= for altitude filtering.\n");
@@ -332,22 +345,22 @@ int main(int argc, char **argv)
         }
     } else if (tle_explicit) {
         // Explicit --tle=: 0 or 1 positional (optional <satellite_name>).
-        if (n_pos > 1) {
+        if (n_positional > 1) {
             fprintf(stderr,
                     "with --tle=, pass at most one positional (<satellite_name>). "
                     "Use --min-altitude-km= / --max-altitude-km= for altitude filtering.\n");
             return EXIT_FAILURE;
         }
-        if (n_pos == 1) satellite_name = argv[1];
+        if (n_positional == 1) satellite_name = argv[positional_argv[0]];
     } else {
         // Implicit default TLE: require 2 or 3 positionals.
-        if (n_pos != 2 && n_pos != 3) {
+        if (n_positional != 2 && n_positional != 3) {
             usage(stderr, argv[0], 0);
             return EXIT_FAILURE;
         }
-        min_altitude_km = atof(argv[1]);
-        max_altitude_km = atof(argv[2]);
-        if (n_pos == 3) satellite_name = argv[3];
+        min_altitude_km = atof(argv[positional_argv[0]]);
+        max_altitude_km = atof(argv[positional_argv[1]]);
+        if (n_positional == 3) satellite_name = argv[positional_argv[2]];
     }
     if (satellite_name != NULL && !max_minutes_user_set) {
         max_minutes_away = 1440 * 7;  // one week when filtering to a specific sat
@@ -457,7 +470,11 @@ int main(int argc, char **argv)
 
     int count = 0;
     int number_checked = 0;
-    int find_all = (satellite_name != NULL || trajectory_id != NULL) ? 1 : 0;
+    // --list says "show every matching pass" — without it, find_passes
+    // breaks after the first pass per satellite. Otherwise a single-sat
+    // TLE plus --list returns just one pass even though we have 7 days
+    // of orbits to find passes in.
+    int find_all = (list_all || satellite_name != NULL || trajectory_id != NULL) ? 1 : 0;
     status = find_passes(&state.prediction, jul_utc, 1.0, &criteria, &count, &number_checked, reverse, find_all);
     const size_t n_passes = number_of_passes();
 
@@ -482,8 +499,10 @@ int main(int argc, char **argv)
 
     if (n_passes > 0) {
         const pass_t *p = NULL;
-        if (max_passes == -1) {
-            max_passes = n_passes;
+        // Default (-1) shows all; explicit user value is clamped down to
+        // n_passes so the print loop's get_pass(i) never returns NULL.
+        if (max_passes < 0 || (size_t)max_passes > n_passes) {
+            max_passes = (int)n_passes;
         }
         if (list_all || satellite_name != NULL) {
             if (!reverse) {

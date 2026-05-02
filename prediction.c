@@ -560,7 +560,7 @@ int find_passes(prediction_t *external_prediction, double jul_utc_start, double 
             internal_number_checked++;
             double utc_offset_minutes = 0;
             double minutes_until_visible = 0;
-            double jul_utc_stop = jul_utc_start + criteria->max_minutes / 1400.0;
+            double jul_utc_stop = jul_utc_start + criteria->max_minutes / 1440.0;
             while (get_next_pass(&prediction, jul_utc_start + utc_offset_minutes / 1440.0, jul_utc_stop, delta_t_minutes)) {
                 minutes_until_visible = prediction.predicted_minutes_until_visible + utc_offset_minutes;
                 utc_offset_minutes += prediction.predicted_minutes_until_visible + 60;
