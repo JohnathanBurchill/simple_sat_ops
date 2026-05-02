@@ -219,7 +219,9 @@ static int try_decode_window(const int16_t *samples, size_t n_samples,
 static void emit_frame(const char *log_path, int quiet, const char *ts,
                        const uint8_t *packet, size_t packet_len,
                        int golay_errs, int hmac_ok, int use_hmac,
-                       int rs_errs, int used_golay_len)
+                       int rs_errs, int used_golay_len,
+                       int crc_status,
+                       uint32_t crc_computed, uint32_t crc_le, uint32_t crc_be)
 {
     char rs_buf[32];
     if (rs_errs < 0) snprintf(rs_buf, sizeof rs_buf, "off");
@@ -253,6 +255,18 @@ static void emit_frame(const char *log_path, int quiet, const char *ts,
             fprintf(fp, "[%s] AX100: golay_errors=%d rs=%s len=%s "
                     "len_bytes=%zu\n",
                     ts, golay_errs, rs_buf, len_src, packet_len);
+        }
+        // CRC notice (only when --csp-crc32 was active for this frame).
+        // Mismatch never drops the frame; the trailer stays in payload
+        // so the operator can inspect what was received.
+        if (crc_status == 1) {
+            fprintf(fp, "[%s] csp_crc32: ok (0x%08x, 4-byte trailer "
+                    "stripped)\n", ts, crc_computed);
+        } else if (crc_status == 0) {
+            fprintf(fp, "[%s] csp_crc32: MISMATCH "
+                    "(computed=0x%08x, trailer LE=0x%08x BE=0x%08x; "
+                    "trailer kept in payload)\n",
+                    ts, crc_computed, crc_le, crc_be);
         }
         if (csp_ok) {
             fprintf(fp, "[%s] CSP v1: src=%u dst=%u dport=%u sport=%u "
@@ -667,19 +681,26 @@ int main(int argc, char **argv)
                 // against unknown-endian satellite firmwares. Skip when
                 // HMAC mode is on (uplink frames carry a 32-byte SHA-256
                 // tag, not a CRC).
-                if (!use_hmac && csp_crc32) {
-                    if (plen < 8) continue;  // need header + CRC at minimum
-                    uint32_t computed = csp_crc32_zlib(packet, (size_t)(plen - 4));
-                    uint32_t le = (uint32_t)packet[plen - 4]
-                                | ((uint32_t)packet[plen - 3] << 8)
-                                | ((uint32_t)packet[plen - 2] << 16)
-                                | ((uint32_t)packet[plen - 1] << 24);
-                    uint32_t be = ((uint32_t)packet[plen - 4] << 24)
-                                | ((uint32_t)packet[plen - 3] << 16)
-                                | ((uint32_t)packet[plen - 2] <<  8)
-                                |  (uint32_t)packet[plen - 1];
-                    if (computed != le && computed != be) continue;
-                    plen -= 4;  // strip the trailer for downstream / printing
+                int crc_status = -1;
+                uint32_t crc_computed = 0, crc_le = 0, crc_be = 0;
+                if (!use_hmac && csp_crc32 && plen >= 8) {
+                    crc_computed = csp_crc32_zlib(packet, (size_t)(plen - 4));
+                    crc_le = (uint32_t)packet[plen - 4]
+                           | ((uint32_t)packet[plen - 3] << 8)
+                           | ((uint32_t)packet[plen - 2] << 16)
+                           | ((uint32_t)packet[plen - 1] << 24);
+                    crc_be = ((uint32_t)packet[plen - 4] << 24)
+                           | ((uint32_t)packet[plen - 3] << 16)
+                           | ((uint32_t)packet[plen - 2] <<  8)
+                           |  (uint32_t)packet[plen - 1];
+                    if (crc_computed == crc_le || crc_computed == crc_be) {
+                        crc_status = 1;
+                        plen -= 4;  // strip the trailer for output
+                    } else {
+                        crc_status = 0;
+                        // Mismatch: keep the frame and the trailer; emit_frame
+                        // will print a 'csp_crc32: MISMATCH' line for the operator.
+                    }
                 }
                 uint64_t h = 1469598103934665603ULL;
                 for (ssize_t k = 0; k < plen; k++) {
@@ -701,7 +722,8 @@ int main(int argc, char **argv)
                 emit_frame(log_path, quiet, ts,
                            packet, (size_t)plen,
                            golay_errs, hmac_ok, use_hmac,
-                           rs_errs, used_golay_len);
+                           rs_errs, used_golay_len,
+                           crc_status, crc_computed, crc_le, crc_be);
             }
 
             // Slide the window.

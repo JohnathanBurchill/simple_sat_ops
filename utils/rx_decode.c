@@ -803,17 +803,17 @@ int main(int argc, char **argv)
         if (computed == le || computed == be) {
             crc_ok = 1;
             packet_len -= 4;
-            if (verbose) {
-                fprintf(stderr, "rx_decode: csp_crc32 ok (0x%08x), "
-                        "4-byte trailer stripped\n", computed);
-            }
+            // Print to stdout (not stderr / -v only) so the integrity
+            // verdict is part of the regular decode output.
+            fprintf(stdout, "csp_crc32: ok (0x%08x, 4-byte trailer "
+                    "stripped)\n", computed);
         } else {
             crc_ok = 0;
-            if (verbose) {
-                fprintf(stderr, "rx_decode: csp_crc32 MISMATCH "
-                        "(computed=0x%08x, trailer LE=0x%08x BE=0x%08x), "
-                        "trailer kept in payload\n", computed, le, be);
-            }
+            // Mismatch: keep the trailer in the payload so the operator
+            // can inspect what was received. Print the verdict regardless.
+            fprintf(stdout, "csp_crc32: MISMATCH "
+                    "(computed=0x%08x, trailer LE=0x%08x BE=0x%08x; "
+                    "trailer kept in payload)\n", computed, le, be);
         }
     }
     (void)crc_ok;
