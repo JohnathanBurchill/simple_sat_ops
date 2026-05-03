@@ -151,10 +151,18 @@ static void fmt_utc(char *buf, size_t cap)
 // frames per window (e.g. when bursts arrive faster than the slide
 // interval); *out_sync_off receives the offset of the accepted sync
 // match so the caller can compute the next min_offset_in.
+//
+// rs_errs sentinels (out_rs_errs):
+//   >= 0  RS-corrected; value is the count of corrected byte errors
+//   -1    RS off / not exercised
+//   -2    RS uncorrectable, descrambled-but-uncorrected bytes returned
+//         via packet/packet_len so the operator can still see the data
+//         (only happens when allow_partial_rs is on and HMAC is off).
 static int try_decode_window(const int16_t *samples, size_t n_samples,
                              const modem_params_t *mp,
                              const ax100_opts_t *opts,
                              int sync_max_ham, int use_hmac,
+                             int allow_partial_rs,
                              size_t min_offset_in,
                              uint8_t *bits_scratch, size_t bits_cap,
                              uint8_t *bytes_scratch, size_t bytes_cap,
@@ -199,6 +207,41 @@ static int try_decode_window(const int16_t *samples, size_t n_samples,
                                      out_rs_errs, out_used_golay_len);
         (void)polarity_used;
         if (plen < 0) {
+            // Partial-decode rescue: RS(255,223) gives up at >16 byte
+            // errors, but for long bursts on a marginal link the
+            // descrambled bytes are still mostly readable. When the
+            // Golay header decoded perfectly (errs==0) we trust the
+            // sync was real; retry with RS disabled to recover the
+            // uncorrected payload, mark it rs=-2 (UNCORRECTABLE), and
+            // hand it up so the operator sees "Happy birthday..." with
+            // a few flipped bytes instead of nothing at all. Off in
+            // HMAC mode (no integrity gate would mean we'd emit
+            // garbage at every false sync hit) and never overrides a
+            // good RS decode.
+            if (allow_partial_rs && !use_hmac && opts->reed_solomon
+                && *out_golay_errs == 0) {
+                ax100_opts_t partial_opts = *opts;
+                partial_opts.reed_solomon = 0;
+                int p_golay = 0, p_hmac = -1, p_rs = -1, p_lensrc = -1;
+                ssize_t pp = ax100_unframe(bytes_scratch, n_bytes,
+                                           &partial_opts,
+                                           packet, packet_cap,
+                                           &p_golay, &p_hmac,
+                                           &p_rs, &p_lensrc);
+                // Strip the trailing 32-byte RS parity (it's noise to
+                // the operator and would push the apparent length up
+                // by 32 vs. the as-transmitted packet). Anything <=32
+                // would underflow; treat as no usable bytes.
+                if (pp > 32) {
+                    *out_packet_len = pp - 32;
+                    *out_golay_errs = p_golay;
+                    *out_hmac_ok = -1;
+                    *out_rs_errs = -2;
+                    *out_used_golay_len = p_lensrc;
+                    if (out_sync_off) *out_sync_off = sync_off;
+                    return 1;
+                }
+            }
             min_offset = sync_off + 1;
             continue;
         }
@@ -224,8 +267,9 @@ static void emit_frame(const char *log_path, int quiet, const char *ts,
                        uint32_t crc_computed, uint32_t crc_le, uint32_t crc_be)
 {
     char rs_buf[32];
-    if (rs_errs < 0) snprintf(rs_buf, sizeof rs_buf, "off");
-    else snprintf(rs_buf, sizeof rs_buf, "corrected=%d", rs_errs);
+    if (rs_errs == -2)      snprintf(rs_buf, sizeof rs_buf, "UNCORRECTABLE");
+    else if (rs_errs < 0)   snprintf(rs_buf, sizeof rs_buf, "off");
+    else                    snprintf(rs_buf, sizeof rs_buf, "corrected=%d", rs_errs);
 
     csp_v1_header_t hdr = {0};
     int csp_ok = (packet_len >= 4) && (csp_v1_decode(packet, &hdr) == 0);
@@ -606,15 +650,31 @@ int main(int argc, char **argv)
                 raw_path ? raw_path : "(none)");
     }
 
-    // Dedup: ring of recently-decoded FNV-1a-64 packet hashes. Sized so
-    // a frame appearing across all overlapping windows in the slide
-    // span is only emitted once. With window=1.5s and slide=0.5s,
-    // overlap span = 1 s; at 5 frames/sec a ring of 32 covers it with
-    // safety margin and is trivial to scan.
-    enum { DEDUP_RING_SZ = 32 };
-    uint64_t recent_hashes[DEDUP_RING_SZ] = {0};
+    // Dedup by absolute sample position (quantised). The same burst is
+    // visible in every window whose [start, end] contains it; with
+    // window=1.5s slide=0.5s that's up to 4 windows per burst, so we
+    // need to suppress 3-4 redundant emits per real frame. Using
+    // *position* (not content hash) means:
+    //   1. Partial-RS emits, whose descrambled bytes drift slightly
+    //      across windows due to DC-block IIR state, still dedup.
+    //   2. Legitimate retransmissions of the same payload at
+    //      different times all emit (the old FNV ring suppressed
+    //      every retransmission of an already-seen content hash for
+    //      the rest of the session, which is the "rapid 0.2 s bursts
+    //      misses some" symptom).
+    // Quantisation: 100 ms (4800 samples @ 48 kHz). Bursts ~200 ms
+    // apart map to distinct keys; a single burst seen across slides
+    // maps to the same key (the absolute ASM sample is invariant
+    // since slide_samples is a multiple of sps).
+    enum { DEDUP_RING_SZ = 64 };
+    enum { DEDUP_QUANT_SAMPLES = 4800 };
+    uint64_t recent_pos_quant[DEDUP_RING_SZ] = {0};
     int recent_idx = 0;
     int recent_count = 0;
+    // Running total of channel-0 samples appended to `window`. Used
+    // with sync_off_local to recover the absolute sample index of the
+    // ASM at emit time.
+    uint64_t total_window_samples = 0;
 
     while (!g_stop) {
         snd_pcm_sframes_t got = snd_pcm_readi(capture, chunk, chunk_frames);
@@ -641,6 +701,7 @@ int main(int argc, char **argv)
         // Append channel 0 to the window, decode whenever the window fills.
         for (snd_pcm_sframes_t i = 0; i < got; i++) {
             window[window_filled++] = chunk[i * channels];
+            ++total_window_samples;
             if (window_filled < window_samples) continue;
 
             // Inner loop: pull every decodable frame out of this window
@@ -656,6 +717,7 @@ int main(int argc, char **argv)
                 size_t sync_off_local = 0;
                 if (!try_decode_window(window, window_samples, &mp, &opts,
                                        sync_max_ham, use_hmac,
+                                       /*allow_partial_rs=*/1,
                                        inner_min_offset,
                                        bits_scratch, bits_cap,
                                        bytes_scratch, bytes_cap,
@@ -702,19 +764,32 @@ int main(int argc, char **argv)
                         // will print a 'csp_crc32: MISMATCH' line for the operator.
                     }
                 }
-                uint64_t h = 1469598103934665603ULL;
-                for (ssize_t k = 0; k < plen; k++) {
-                    h ^= packet[k];
-                    h *= 1099511628211ULL;
-                }
+                // Recover the absolute sample index of the ASM. The
+                // window currently spans the most recent
+                // window_samples appended to `window`, so the window
+                // start in absolute sample units is
+                // total_window_samples - window_samples. sync_off_local
+                // is the bit offset (within whichever phase the modem
+                // picked) at which the ASM was found; *sps maps it
+                // back to a sample offset within the window. We don't
+                // know the exact phase here (modem doesn't return it)
+                // but the ambiguity is ≤ sps-1 samples — well below
+                // DEDUP_QUANT_SAMPLES, so the dedup key is stable
+                // across overlapping windows.
+                uint64_t window_start_abs =
+                    total_window_samples - (uint64_t)window_samples;
+                uint64_t asm_abs_sample = window_start_abs
+                    + (uint64_t)sync_off_local * (uint64_t)sps
+                    + (uint64_t)(sps / 2);
+                uint64_t pos_quant = asm_abs_sample / DEDUP_QUANT_SAMPLES;
                 int seen = 0;
                 int ring_n = recent_count < DEDUP_RING_SZ
                     ? recent_count : DEDUP_RING_SZ;
                 for (int r = 0; r < ring_n; r++) {
-                    if (recent_hashes[r] == h) { seen = 1; break; }
+                    if (recent_pos_quant[r] == pos_quant) { seen = 1; break; }
                 }
                 if (seen) continue;
-                recent_hashes[recent_idx] = h;
+                recent_pos_quant[recent_idx] = pos_quant;
                 recent_idx = (recent_idx + 1) % DEDUP_RING_SZ;
                 if (recent_count < DEDUP_RING_SZ) recent_count++;
                 char ts[64];
