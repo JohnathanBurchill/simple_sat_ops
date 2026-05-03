@@ -102,6 +102,11 @@ void antenna_rotator_disconnect(antenna_rotator_t *antenna_rotator)
 
 int antenna_rotator_command(antenna_rotator_t *antenna_rotator, antenna_rotator_command_t cmd, double *azimuth, double *elevation)
 {
+    // Refuse I/O on an unconnected rotator: fd may be zero-initialized (= stdin),
+    // which would cause read() to block the UI thread waiting for keyboard input.
+    if (!antenna_rotator->connected) {
+        return ANTENNA_ROTATOR_BAD_RESPONSE;
+    }
     uint8_t telemetry[AR_CMD_LEN] = {'W', '0', '0', '0', '0', 0x0, '0', '0', '0', '0', 0x0, (uint8_t)cmd, ' '};
 
     char az[5], el[5];

@@ -57,10 +57,56 @@ double lifetime(prediction_t *prediction, double jul_utc_start, double delta_t_m
     return years;
 }
 
-void usage(FILE *dest, const char *name) 
+void usage(FILE *dest, const char *name, int full)
 {
-    fprintf(dest, "usage: %s <tles_file> <satellite_name> <max_years>\n", name);
-    return;
+    fprintf(dest,
+        "usage: %s <satellite_name> <max_years> [--tle=<path>]\n"
+        "\n"
+        "Toy orbit-decay estimator. Propagates the SGP4/SDP4 state forward in\n"
+        "time and reports how long until the satellite drops below 100 km.\n"
+        "The TLE's empirical drag term is used; do not treat the result as\n"
+        "an engineering-grade lifetime prediction.\n"
+        "\n"
+        "Positional arguments:\n"
+        "  <satellite_name>             Name prefix to match in the TLE\n"
+        "  <max_years>                  Stop propagating after this many years\n"
+        "\n"
+        "TLE source:\n"
+        "  --tle=<path>                 Path to a TLE file (2 or 3-line format).\n"
+        "                               Default: $HOME/.local/state/simple_sat_ops/active.tle\n"
+        "\n"
+        "Output:\n"
+        "  Prints `Years above 100.0 km: <years>` to stdout.\n"
+        "  Writes /tmp/lifetime_<name>.dat with time,altitude samples.\n"
+        "\n"
+        "Other:\n"
+        "  --help                       Short help (this message)\n"
+        "  --help-full                  Detailed help with example and caveats\n",
+        name);
+
+    if (!full) return;
+
+    fprintf(dest,
+        "\n"
+        "EXAMPLE\n"
+        "\n"
+        "  %s 'ISS (ZARYA)' 20 --tle=TLEs/amateur.tle\n"
+        "  # then plot the result:\n"
+        "  gnuplot -p -e \"plot '/tmp/lifetime_ISS (ZARYA).dat' with lines\"\n"
+        "\n"
+        "ACCURACY CAVEATS\n"
+        "\n"
+        "The SGP4/SDP4 drag model uses the BSTAR term recorded in the TLE at\n"
+        "epoch. It does not account for:\n"
+        "  - Changes in solar activity over the propagation window\n"
+        "  - Satellite attitude or drag-area changes\n"
+        "  - Orbital manoeuvres\n"
+        "  - Long-term BSTAR drift (TLEs are snapshots, not time-series)\n"
+        "\n"
+        "Treat the result as a `what-if` sanity check. For real end-of-life\n"
+        "predictions, use a dedicated propagator with atmospheric density\n"
+        "models (NRLMSISE-00 etc.) and updated drag observations.\n",
+        name);
 }
 
 int main(int argc, char **argv)
@@ -76,22 +122,39 @@ int main(int argc, char **argv)
 
     for (int i = 0; i < argc; i++) {
         if (strcmp("--help", argv[i]) == 0) {
-            usage(stdout, argv[0]);
+            usage(stdout, argv[0], 0);
             return 0;
+        } else if (strcmp("--help-full", argv[i]) == 0) {
+            usage(stdout, argv[0], 1);
+            return 0;
+        } else if (strncmp("--tle=", argv[i], 6) == 0) {
+            n_options++;
+            if (strlen(argv[i]) < 7) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            prediction.tles_filename = argv[i] + 6;
         } else if (strncmp("--", argv[i], 2) == 0) {
             fprintf(stderr, "Unable to parse option '%s'\n", argv[i]);
             return 1;
         }
     }
 
-    if (argc - n_options != 4) {
-        usage(stderr, argv[0]);
+    if (argc - n_options != 3) {
+        usage(stderr, argv[0], 0);
         return EXIT_FAILURE;
     }
 
-    prediction.tles_filename = argv[1];
-    prediction.satellite_ephem.name = argv[2];
-    double max_years = atof(argv[3]);
+    if (prediction.tles_filename == NULL) {
+        static char default_tle[1024];
+        if (tle_default_path(default_tle, sizeof(default_tle)) != 0) {
+            fprintf(stderr, "HOME unset or path too long; pass --tle=<path>\n");
+            return EXIT_FAILURE;
+        }
+        prediction.tles_filename = default_tle;
+    }
+    prediction.satellite_ephem.name = argv[1];
+    double max_years = atof(argv[2]);
     double min_alt_km = 100.0;
 
     /* Set up observer location */

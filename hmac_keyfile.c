@@ -1,0 +1,139 @@
+/*
+
+    Simple Satellite Operations  hmac_keyfile.c
+
+    Copyright (C) 2025  Johnathan K Burchill
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
+#include "hmac_keyfile.h"
+
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+int hmac_keyfile_default_path(char *out_path, size_t out_cap)
+{
+    const char *home = getenv("HOME");
+    if (home == NULL || home[0] == '\0') {
+        return -1;
+    }
+    int n = snprintf(out_path, out_cap, "%s/%s", home,
+                     HMAC_KEYFILE_DEFAULT_RELPATH);
+    if (n < 0 || (size_t)n >= out_cap) {
+        return -1;
+    }
+    return 0;
+}
+
+ssize_t hmac_keyfile_load(const char *path, uint8_t *out, size_t out_cap)
+{
+    if (path == NULL || out == NULL || out_cap == 0) {
+        return -1;
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        fprintf(stderr, "hmac_keyfile: stat(%s): %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr, "hmac_keyfile: %s is not a regular file\n", path);
+        return -1;
+    }
+    // Owner read/write only; no group, no other.
+    if ((st.st_mode & 0777) != 0600) {
+        fprintf(stderr,
+                "hmac_keyfile: %s must be chmod 0600 (got 0%03o); run: chmod 600 %s\n",
+                path, st.st_mode & 0777, path);
+        return -1;
+    }
+
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        fprintf(stderr, "hmac_keyfile: open(%s): %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    // Read into a fixed local buffer. HMAC keys are small; 1 KiB of hex
+    // is overkill but harmless.
+    char buf[1024];
+    size_t n_read = fread(buf, 1, sizeof(buf) - 1, f);
+    int read_err = ferror(f);
+    int at_eof = feof(f);
+    fclose(f);
+
+    if (read_err) {
+        fprintf(stderr, "hmac_keyfile: read error on %s\n", path);
+        return -1;
+    }
+    if (!at_eof) {
+        fprintf(stderr, "hmac_keyfile: %s exceeds %zu bytes (not a key)\n",
+                path, sizeof(buf) - 1);
+        return -1;
+    }
+    buf[n_read] = '\0';
+
+    if (n_read > 0 && buf[n_read - 1] == '\n') {
+        n_read--;
+        buf[n_read] = '\0';
+    }
+
+    if (n_read == 0) {
+        fprintf(stderr, "hmac_keyfile: %s is empty\n", path);
+        return -1;
+    }
+    if ((n_read & 1u) != 0) {
+        fprintf(stderr,
+                "hmac_keyfile: %s has %zu hex chars (must be even)\n",
+                path, n_read);
+        return -1;
+    }
+
+    size_t n_bytes = n_read / 2;
+    if (n_bytes > out_cap) {
+        fprintf(stderr,
+                "hmac_keyfile: %s decodes to %zu bytes (buffer holds %zu)\n",
+                path, n_bytes, out_cap);
+        return -1;
+    }
+
+    for (size_t i = 0; i < n_read; ++i) {
+        int v = hex_value(buf[i]);
+        if (v < 0) {
+            fprintf(stderr,
+                    "hmac_keyfile: %s has non-uppercase-hex char 0x%02X at offset %zu\n",
+                    path, (unsigned char)buf[i], i);
+            return -1;
+        }
+    }
+
+    for (size_t i = 0; i < n_bytes; ++i) {
+        int hi = hex_value(buf[2 * i]);
+        int lo = hex_value(buf[2 * i + 1]);
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+
+    return (ssize_t)n_bytes;
+}

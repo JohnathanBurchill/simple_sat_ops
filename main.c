@@ -23,6 +23,7 @@
 #include "antenna_rotator.h"
 #include "audio.h"
 #include "radio.h"
+#include "radio_device_store.h"
 #include "state.h"
 #include "prediction.h"
 
@@ -61,10 +62,150 @@ void enable_wildrose_mode(state_t *state);
 int point_to_stationary_target(state_t *state, double azimuth, double elevation);
 void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, double downlink_freq);
 
-void usage(FILE *dest, const char *name) 
+static speed_t speed_from_bps(int bps)
 {
-    fprintf(dest, "usage: %s <tles_file> <satellite_id>\n", name);
-    return;
+    switch (bps) {
+        case 4800:   return B4800;
+        case 9600:   return B9600;
+        case 19200:  return B19200;
+        case 38400:  return B38400;
+        case 57600:  return B57600;
+        case 115200: return B115200;
+        default:     return 0;
+    }
+}
+
+void usage(FILE *dest, const char *name, int full)
+{
+    fprintf(dest,
+        "usage: %s <satellite_id> [options]\n"
+        "\n"
+        "Live satellite tracker for the FrontierSat ground station. Predicts\n"
+        "passes, drives the SPID rotator, and (with --with-radio) tunes the\n"
+        "configured radio onto the simplex UHF carrier with Doppler correction.\n"
+        "\n"
+        "Positional arguments:\n"
+        "  <satellite_id>               Name prefix to match in the TLE, or `next`\n"
+        "                               to auto-select the next visible pass\n"
+        "\n"
+        "TLE source:\n"
+        "  --tle=<path>                 Path to a TLE file (2 or 3-line format).\n"
+        "                               Default: $HOME/.local/state/simple_sat_ops/active.tle\n"
+        "\n"
+        "Hardware toggles (all opt-in; no hardware is the default):\n"
+        "  --with-radio                 Initialise and command the radio\n"
+        "  --with-rotator               Initialise and command the SPID Rot2Prog\n"
+        "  --with-hardware              Shortcut: enables both of the above\n"
+        "  --uplink-ready               After radio init, run radio_uplink_prep\n"
+        "                               (FM + DATA-on + MOD source = ACC) — the\n"
+        "                               configuration AX100 uplink expects.\n"
+        "  --uplink-mod-level=<0..255>  Also set USB MOD level — how loud the PCM\n"
+        "                               is on the modulator (empirical).\n"
+        "  --tx-power=<0..100>          RF power, %%. Untouched if omitted (uses\n"
+        "                               the radio's current setting).\n"
+        "  --allow-high-power           Required for --tx-power above 10%%.\n"
+        "  --allow-tx                   Clear the default TX inhibit. Without this,\n"
+        "                               PTT-on calls return RADIO_TX_INHIBITED so\n"
+        "                               the radio is configured but never keyed.\n"
+        "  --radio-type=<id>            yaesu-cat (default) | icom-civ | usrp-b210\n"
+        "\n"
+        "Radio transport (see --help-full for the supported setups):\n"
+        "  --radio-device=<path>        CAT/CI-V tty. Falls back to the saved\n"
+        "                               default in ~/.local/share/simple_sat_ops/\n"
+        "                               radio_device, then /dev/ttyUSB1.\n"
+        "  --radio-serial-speed=<bps>   Serial speed integer. Falls back to the\n"
+        "                               saved default, then 4800 (yaesu-cat) or\n"
+        "                               115200 (icom-civ).\n"
+        "\n"
+        "Carrier and modes:\n"
+        "  --uplink-freq-mhz=<mhz>      Uplink nominal (default %.6f)\n"
+        "  --downlink-freq-mhz=<mhz>    Downlink / simplex carrier nominal\n"
+        "                               (default %.6f)\n"
+        "  --uplink-mode=<mode>         FM|USB|LSB|CW|AM (default FM)\n"
+        "  --downlink-mode=<mode>       FM|USB|LSB|CW|AM (default FM)\n"
+        "  --no-doppler-correction      Disable runtime Doppler retuning\n"
+        "\n"
+        "Rotator overrides:\n"
+        "  --rotator-target-azimuth=<deg>    Park on a fixed azimuth\n"
+        "  --rotator-target-elevation=<deg>  Park on a fixed elevation\n"
+        "\n"
+        "Observer location (default RAO Priddis):\n"
+        "  --lat=<deg>                  Geodetic latitude\n"
+        "  --lon=<deg>                  Geodetic longitude (east positive)\n"
+        "  --alt=<m>                    Altitude above ellipsoid, metres\n"
+        "\n"
+        "Pass filter (used when <satellite_id> = `next`):\n"
+        "  --include-constellations     Include Starlink/OneWeb-style swarms\n"
+        "  --min-altitude-km=<km>       Minimum orbital altitude (default 0)\n"
+        "  --max-altitude-km=<km>       Maximum orbital altitude (default 1000)\n"
+        "  --min-elevation=<deg>        Minimum peak elevation (default 0)\n"
+        "  --min-minutes=<n>            Minimum minutes until AOS (default 1)\n"
+        "  --max-minutes=<n>            Maximum minutes until AOS (default 90)\n"
+        "\n"
+        "Recording:\n"
+        "  --without-audio              Skip ALSA capture thread\n"
+        "  --radio-audio-output-file=<basename>\n"
+        "                               Capture file basename\n"
+        "                               (default session/session_pcm_audio)\n"
+        "\n"
+        "Other:\n"
+        "  --verbose=<level>            Verbosity integer\n"
+        "  --help                       Short help (this message)\n"
+        "  --help-full                  Detailed help with keyboard, transports,\n"
+        "                               and operational notes\n",
+        name,
+        UPLINK_FREQ_MHZ, DOWNLINK_FREQ_MHZ);
+
+    if (!full) return;
+
+    fprintf(dest,
+        "\n"
+        "KEYBOARD (locked by default, press K to unlock for ~5 s)\n"
+        "\n"
+        "  K         Unlock keyboard for ~5 seconds\n"
+        "  T         Start tracking the current satellite\n"
+        "  s         Stop tracking\n"
+        "  r         Reset rotator to az=0, el=0\n"
+        "  [         Nudge antenna azimuth -5 deg\n"
+        "  ]         Nudge antenna azimuth +5 deg\n"
+        "  *         Enable Wildrose reference mode (432.325 MHz CW)\n"
+        "  q         Quit\n"
+        "\n"
+        "RADIO TRANSPORT SETUPS\n"
+        "\n"
+        "Pick the radio with --radio-type=. Both supported backends speak over a\n"
+        "USB-CAT serial port; the binary is dispatch-agnostic.\n"
+        "\n"
+        "  A. Yaesu FT-991A (default, --radio-type=yaesu-cat)\n"
+        "       --radio-device=/dev/ttyUSBn  --radio-serial-speed=38400\n"
+        "       See radio_yaesu_cat.c header for the front-panel one-time setup.\n"
+        "\n"
+        "  B. ICOM IC-9700 (legacy, --radio-type=icom-civ)\n"
+        "       --radio-device=/dev/ttyUSBn or /dev/ttyACM0 (native USB-CDC)\n"
+        "       --radio-serial-speed=115200 (or stored default)\n"
+        "\n"
+        "RADIO STARTUP STATE (when --with-radio)\n"
+        "\n"
+        "simple_sat_ops assumes exclusive ownership of the configured radio:\n"
+        "  - tuned to --downlink-freq-mhz on the active VFO\n"
+        "  - FM mode\n"
+        "  - With --uplink-ready: FM-DATA + MOD source = --mod-input\n"
+        "  - Doppler correction retunes the active VFO only while in-pass\n"
+        "\n"
+        "EXAMPLES\n"
+        "\n"
+        "  # Dry-run prediction (uses default TLE at ~/.local/state/simple_sat_ops/active.tle)\n"
+        "  %s 'ISS (ZARYA)'\n"
+        "\n"
+        "  # Auto-pick the next 10-45 min visible pass above 10 deg\n"
+        "  %s next --min-elevation=10 --min-minutes=10 --max-minutes=45\n"
+        "\n"
+        "  # Explicit TLE file\n"
+        "  %s next --tle=TLEs/amateur.tle --with-hardware\n"
+        "\n"
+        "  # Live operation, override the device path for this run\n"
+        "  %s next --with-hardware --radio-device=/dev/ttyUSB0\n",
+        name, name, name, name);
 }
 
 void init_window(void)
@@ -211,13 +352,9 @@ void report_status(state_t *state, int *print_row, int print_col)
     clrtoeol();
 
     if (state->have_radio) {
-        mvprintw(row++, col, "%15s   %.6f MHz", "DOWNLINK", state->radio.doppler_correction_enabled ? state->radio.doppler_downlink_frequency / 1e6 : state->radio.nominal_downlink_frequency / 1e6);
+        mvprintw(row++, col, "%15s   %.6f MHz", "CARRIER", state->radio.doppler_correction_enabled ? state->radio.doppler_downlink_frequency / 1e6 : state->radio.nominal_downlink_frequency / 1e6);
         clrtoeol();
         mvprintw(row++, col, "%15s   %.6f MHz", "VFO Main", state->radio.vfo_main_actual_frequency / 1e6);
-        clrtoeol();
-        mvprintw(row++, col, "%15s   %.6f MHz", "UPLINK", state->radio.doppler_correction_enabled ? state->radio.doppler_uplink_frequency / 1e6 : state->radio.nominal_uplink_frequency / 1e6);
-        clrtoeol();
-        mvprintw(row++, col, "%15s   %.6f MHz", "VFO Sub", state->radio.vfo_sub_actual_frequency / 1e6);
         clrtoeol();
         row++;
     } else {
@@ -304,25 +441,61 @@ int main(int argc, char **argv)
     select_ephemeris(&state.prediction.satellite_ephem.tle);
 
     int radio_result = 0;
-    if (state.run_with_radio) { 
+    if (state.run_with_radio) {
         state.radio.is_required = 1;
         state.radio.nominal_downlink_frequency = state.radio.satellite_downlink_frequency;
         state.radio.nominal_uplink_frequency = state.radio.satellite_uplink_frequency;
+        state.radio.tx_inhibit_cleared = state.allow_tx;
+        if (radio_backend_select(&state.radio, state.radio_backend) != RADIO_OK) {
+            return EXIT_FAILURE;
+        }
         radio_result = radio_init(&state.radio);
         if (radio_result != RADIO_OK) {
             fprintf(stderr, "Error initializing radio\n");
             return EXIT_FAILURE;
         }
         state.have_radio = 1;
-        // Record audio
-        state.audio.recording_audio = 1;
-        status = init_audio_capture(&state.audio);
-        if (status != AUDIO_OK) {
-            endwin();
-            fprintf(stderr, "Unable to initialize audio capture\n");
-            return 1;
+        if (state.prepare_uplink) {
+            radio_result = radio_uplink_prep(&state.radio);
+            if (radio_result != RADIO_OK) {
+                fprintf(stderr, "Error configuring radio for uplink (--uplink-ready)\n");
+                return EXIT_FAILURE;
+            }
+            if (state.uplink_mod_level >= 0) {
+                radio_result = radio_set_usb_mod_level(&state.radio, state.uplink_mod_level);
+                if (radio_result != RADIO_OK) {
+                    fprintf(stderr, "Error setting USB MOD level\n");
+                    return EXIT_FAILURE;
+                }
+            }
         }
+        if (state.tx_power_pct >= 0) {
+            if (state.tx_power_pct > 10 && !state.allow_high_power) {
+                fprintf(stderr, "error: --tx-power=%d above 10%% safety threshold; "
+                        "add --allow-high-power to override.\n", state.tx_power_pct);
+                return EXIT_FAILURE;
+            }
+            int raw = (int)((state.tx_power_pct * 255 + 50) / 100);
+            radio_result = radio_set_rf_power(&state.radio, raw);
+            if (radio_result != RADIO_OK) {
+                fprintf(stderr, "Error setting RF power\n");
+                return EXIT_FAILURE;
+            }
+        }
+        // Optional ALSA capture. Gated on audio_record so --without-audio
+        // actually skips the init call; the device names in audio.h
+        // (hw:3,0 / hw:4,0) are system-specific and will fail to open on
+        // most boxes, which we shouldn't turn into a hard abort when the
+        // operator explicitly said they don't want recording.
         if (state.audio.audio_record) {
+            state.audio.recording_audio = 1;
+            status = init_audio_capture(&state.audio);
+            if (status != AUDIO_OK) {
+                endwin();
+                fprintf(stderr, "Unable to initialize audio capture "
+                        "(pass --without-audio to skip)\n");
+                return 1;
+            }
             int thread_status = pthread_create(&state.audio.audio_thread_main, NULL, capture_audio, &state);
             if (thread_status != 0) {
                 endwin();
@@ -470,22 +643,16 @@ int main(int argc, char **argv)
                 }
             }
 
-            /* Set radio frequencies with Doppler correction*/
-            if (state.have_radio && state.run_with_radio && ((doppler_delta_uplink > doppler_max_delta) || (doppler_delta_downlink > doppler_max_delta))) {
-                current_uplink_frequency = state.radio.doppler_uplink_frequency;
+            // Simplex UHF: Doppler-tune Main only. Sub stays parked; never
+            // retune it here or we risk a same-band collision on the 9700.
+            if (state.have_radio && state.run_with_radio && doppler_delta_downlink > doppler_max_delta) {
                 current_downlink_frequency = state.radio.doppler_downlink_frequency;
-                radio_set_vfo(&state.radio, VFOMain);
+                current_uplink_frequency = state.radio.doppler_downlink_frequency;
                 ret = radio_set_frequency(&state.radio, state.radio.doppler_downlink_frequency);
                 if (ret != RADIO_OK) {
-                    fprintf(stderr, "Error setting downlink frequency on VFO Main\n");
+                    fprintf(stderr, "Error setting carrier frequency on VFO Main\n");
                 }
                 state.radio.vfo_main_actual_frequency = radio_get_frequency(&state.radio);
-                radio_set_vfo(&state.radio, VFOSub);
-                ret = radio_set_frequency(&state.radio, state.radio.doppler_uplink_frequency);
-                if (ret != RADIO_OK) {
-                    fprintf(stderr, "Error setting uplink frequency on VFO Sub\n");
-                }
-                state.radio.vfo_sub_actual_frequency = radio_get_frequency(&state.radio);
                 clrtoeol();
             }
 
@@ -629,15 +796,28 @@ int main(int argc, char **argv)
 
     /* Cleanup */
     if (state.radio.connected) {
-	// Turn off waterfall output to USB
-	uint8_t data[1] = {0};
-	radio_result = radio_command(&state.radio, 0x27, 0x10, -1, data, 1, NULL, 0);
-	if (radio_result != RADIO_OK) {
-	    fprintf(stderr, "Unable to set waveform data status\n");
-	    return radio_result;
-	}
+        // Turn off waterfall output. IC-9700-specific (CI-V `27 10 00`),
+        // and only meaningful if we ever started it. Skip on any other
+        // backend or if waterfall was never enabled — sending raw CI-V
+        // bytes to an FT-991A would just confuse its CAT engine.
+        if (state.radio_backend == RADIO_BACKEND_ICOM_CIV
+            && state.radio.waterfall_enabled) {
+            uint8_t data[1] = {0};
+            radio_result = radio_command(&state.radio, 0x27, 0x10, -1,
+                                         data, 1, NULL, 0);
+            if (radio_result != RADIO_OK) {
+                fprintf(stderr, "Unable to set waveform data status\n");
+                // Continue cleanup; this is best-effort.
+            }
+        }
 
-        radio_set_satellite_mode(&state.radio, 0);
+        // set_satellite_mode is NULL on the Yaesu vtable so the dispatcher
+        // returns RADIO_NOT_SUPPORTED with a one-line warning. Harmless,
+        // but skip the call when we know it won't apply to keep cleanup
+        // output clean.
+        if (state.radio_backend == RADIO_BACKEND_ICOM_CIV) {
+            radio_set_satellite_mode(&state.radio, 0);
+        }
         radio_disconnect(&state.radio);
     }
     if (state.antenna_rotator.connected) {
@@ -672,12 +852,22 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->radio.satellite_uplink_frequency = UPLINK_FREQ_MHZ * 1e6;
     state->radio.satellite_downlink_frequency = DOWNLINK_FREQ_MHZ * 1e6;
     state->radio.reference_downlink_frequency = REFERENCE_DOWNLINK_FREQ_MHZ * 1e6;
+    state->radio.sub_park_frequency = RADIO_SUB_PARK_HZ;
     state->radio.doppler_correction_enabled = 1;
 
     state->run_with_radio = 0;
-    state->radio.device_filename = "/dev/ttyUSB1";
-    state->radio.serial_speed = B115200;
-    // state->radio.serial_speed = B9600;
+    state->prepare_uplink = 0;
+    state->uplink_mod_level = -1;
+    state->tx_power_pct = -1;
+    state->allow_high_power = 0;
+    state->allow_tx = 0;
+    state->radio_backend = RADIO_BACKEND_YAESU_CAT;
+    // device_filename and serial_speed are resolved post-argv: explicit
+    // flag wins, then ~/.local/share/simple_sat_ops/ store, then a
+    // backend-default fallback. Leave NULL/0 here so argv parsing can
+    // detect "user didn't pass --radio-device=" cleanly.
+    state->radio.device_filename = NULL;
+    state->radio.serial_speed = 0;
     state->radio.waterfall_enabled = 0;
 
     state->run_with_antenna_rotator = 0;
@@ -709,6 +899,58 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             state->n_options++;
             state->run_with_radio = 1;
             state->run_with_antenna_rotator = 1;
+        } else if (strncmp("--tle=", argv[i], 6) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 7) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state->prediction.tles_filename = argv[i] + 6;
+        } else if (strcmp("--uplink-ready", argv[i]) == 0) {
+            state->n_options++;
+            state->prepare_uplink = 1;
+        } else if (strncmp("--uplink-mod-level=", argv[i], 19) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 20) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state->uplink_mod_level = atoi(argv[i] + 19);
+            if (state->uplink_mod_level < 0 || state->uplink_mod_level > 255) {
+                fprintf(stderr, "--uplink-mod-level must be in 0..255\n");
+                return EXIT_FAILURE;
+            }
+            state->prepare_uplink = 1;
+        } else if (strncmp("--tx-power=", argv[i], 11) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 12) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state->tx_power_pct = atoi(argv[i] + 11);
+            if (state->tx_power_pct < 0 || state->tx_power_pct > 100) {
+                fprintf(stderr, "--tx-power must be 0..100 (%%)\n");
+                return EXIT_FAILURE;
+            }
+        } else if (strcmp("--allow-high-power", argv[i]) == 0) {
+            state->n_options++;
+            state->allow_high_power = 1;
+        } else if (strcmp("--allow-tx", argv[i]) == 0) {
+            state->n_options++;
+            state->allow_tx = 1;
+        } else if (strncmp("--radio-type=", argv[i], 13) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 14) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            radio_backend_type_t t = radio_backend_type_from_string(argv[i] + 13);
+            if (t == RADIO_BACKEND__COUNT) {
+                fprintf(stderr, "--radio-type: unknown '%s' "
+                        "(icom-civ|yaesu-cat|usrp-b210)\n", argv[i] + 13);
+                return EXIT_FAILURE;
+            }
+            state->radio_backend = t;
         } else if (strncmp("--radio-device=", argv[i], 15) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 16) {
@@ -729,10 +971,17 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strncmp("--radio-serial-speed=", argv[i], 21) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 22) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]); 
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
                 return EXIT_FAILURE;
-            } 
-            state->radio.serial_speed = atoi(argv[i] + 21);
+            }
+            int bps = atoi(argv[i] + 21);
+            speed_t s = speed_from_bps(bps);
+            if (s == 0) {
+                fprintf(stderr, "Unsupported --radio-serial-speed=%d "
+                        "(supported: 4800,9600,19200,38400,57600,115200)\n", bps);
+                return EXIT_FAILURE;
+            }
+            state->radio.serial_speed = s;
         } else if (strncmp("--uplink-mode=", argv[i], 14) == 0) {
             state->n_options++; 
             if (strlen(argv[i]) < 15) {
@@ -883,7 +1132,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             }
             max_minutes_away = atof(argv[i] + 14);
         } else if (strcmp("--help", argv[i]) == 0) {
-            usage(stdout, argv[0]);
+            usage(stdout, argv[0], 0);
+            return 2;
+        } else if (strcmp("--help-full", argv[i]) == 0) {
+            usage(stdout, argv[0], 1);
             return 2;
         } else if (strncmp("--", argv[i], 2) == 0) {
             fprintf(stderr, "Unable to parse option '%s'\n", argv[i]);
@@ -891,9 +1143,34 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         }
 
     }
-    if (argc - state->n_options != 3) {
-        usage(stderr, argv[0]);
+    if (argc - state->n_options != 2) {
+        usage(stderr, argv[0], 0);
         return 1;
+    }
+
+    // Resolve radio device + speed: explicit flag wins, then the saved
+    // default at ~/.local/share/simple_sat_ops/, then a backend-default
+    // fallback. Same precedence radio_ctl / tx_tone / tx_white_noise /
+    // tx_frame use, so an operator who's run `radio_ctl --store-device
+    // --store-serial-speed` once doesn't have to retype the path here.
+    static char effective_radio_device[1024];
+    if (state->radio.device_filename == NULL) {
+        if (radio_device_store_load(effective_radio_device,
+                                    sizeof effective_radio_device) == 0) {
+            state->radio.device_filename = effective_radio_device;
+        } else {
+            state->radio.device_filename = "/dev/ttyUSB1";
+        }
+    }
+    if (state->radio.serial_speed == 0) {
+        int stored_bps = 0;
+        if (radio_device_store_load_speed(&stored_bps) == 0) {
+            state->radio.serial_speed = speed_from_bps(stored_bps);
+        }
+        if (state->radio.serial_speed == 0) {
+            state->radio.serial_speed = (state->radio_backend == RADIO_BACKEND_YAESU_CAT)
+                                            ? B4800 : B115200;
+        }
     }
 
     state->radio.doppler_uplink_frequency = state->radio.nominal_uplink_frequency;
@@ -903,8 +1180,15 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->prediction.observer_ephem.position_geodetic.lon = site_longitude * M_PI / 180.0;
     state->prediction.observer_ephem.position_geodetic.alt = site_altitude / 1000.0;
 
-    state->prediction.tles_filename = argv[1];
-    state->prediction.satellite_ephem.name = argv[2];
+    if (state->prediction.tles_filename == NULL) {
+        static char default_tle[1024];
+        if (tle_default_path(default_tle, sizeof(default_tle)) != 0) {
+            fprintf(stderr, "HOME unset or path too long; pass --tle=<path>\n");
+            return EXIT_FAILURE;
+        }
+        state->prediction.tles_filename = default_tle;
+    }
+    state->prediction.satellite_ephem.name = argv[1];
 
     if (strcmp(state->prediction.satellite_ephem.name, "next") == 0) {
         state->prediction.auto_sat = 1;
@@ -947,12 +1231,11 @@ void start_tracking(state_t *state)
 
     state->satellite_tracking = 1;
     state->radio.nominal_downlink_frequency = state->radio.satellite_downlink_frequency;
-    state->radio.nominal_uplink_frequency = state->radio.satellite_uplink_frequency;
     state->radio.doppler_correction_enabled = 1;
 
+    // Simplex UHF: only Main is used on-air. Sub remains parked where
+    // radio_init left it; do not touch it here or we risk a same-band clash.
     radio_set_vfo(&state->radio, VFOMain);
-    radio_set_mode(&state->radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
-    radio_set_vfo(&state->radio, VFOSub);
     radio_set_mode(&state->radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
     state->antenna_rotator.antenna_is_under_control = state->antenna_rotator.antenna_should_be_controlled;
     if (state->antenna_rotator.fixed_target) {
@@ -996,9 +1279,11 @@ void enable_wildrose_mode(state_t *state)
     state->radio.nominal_downlink_frequency = state->radio.reference_downlink_frequency;
     state->radio.doppler_correction_enabled = 0;
     if (state->have_radio) {
+        // VFOMain is an IC-9700 sub/main concept; the FT-991A backend has
+        // a single VFO and reports RADIO_NOT_SUPPORTED. Treat that as OK.
         radio_result = radio_set_vfo(&state->radio, VFOMain);
-        if (radio_result != RADIO_OK) {
-            fprintf(stderr, "Error setting radio VFO to VFOMain");
+        if (radio_result != RADIO_OK && radio_result != RADIO_NOT_SUPPORTED) {
+            fprintf(stderr, "Error setting radio VFO to VFOMain\n");
             return;
         }
         radio_result = radio_set_mode(&state->radio, RADIO_MODE_CW, RADIO_FILTER_FIL1);

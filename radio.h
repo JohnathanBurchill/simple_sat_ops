@@ -24,9 +24,17 @@
 #include <termios.h>
 #include <stdint.h>
 
+#include "radio_backend.h"
+
 #define RADIO_MAX_DEVICE_FILENAME_LEN 1024
 #define RADIO_MAX_COMMAND_LEN 128
 #define RADIO_MAX_COMMAND_RESULT_LEN 1024
+
+#define FRONTIERSAT_CARRIER_HZ 436150000.0
+
+/* simple_sat_ops owns this radio. Sub is never used on-air; park it on an
+   unused VHF freq so Main (UHF) never collides with Sub on the same band. */
+#define RADIO_SUB_PARK_HZ 145150000.0
 
 enum RADIO_STATUS {
     RADIO_OK = 0,
@@ -37,6 +45,9 @@ enum RADIO_STATUS {
     RADIO_OPEN,
     RADIO_SET_FREQUENCY,
     RADIO_GET_FREQUENCY,
+    RADIO_NOT_SUPPORTED,    // backend doesn't expose this op
+    RADIO_TX_INHIBITED,     // PTT-on attempted before --allow-tx was given
+    RADIO_NOT_IMPLEMENTED,  // backend op exists but isn't wired up yet
 };
 
 enum RADIO_VFO {
@@ -65,7 +76,18 @@ enum RADIO_FILTER {
     RADIO_FILTER_FIL3 = 0x03,
 };
 
-typedef struct radio 
+// CI-V `1A 05 01 16 <src>` — SET > Connectors > MOD Input > DATA MOD
+// (IC-9700-shaped numbering; backends translate to their own concept.)
+enum RADIO_DATA_MOD_SRC {
+    RADIO_DATA_MOD_SRC_MIC     = 0x00,
+    RADIO_DATA_MOD_SRC_ACC     = 0x01,
+    RADIO_DATA_MOD_SRC_MIC_ACC = 0x02,
+    RADIO_DATA_MOD_SRC_USB     = 0x03,
+    RADIO_DATA_MOD_SRC_MIC_USB = 0x04,
+    RADIO_DATA_MOD_SRC_LAN     = 0x05,
+};
+
+typedef struct radio
 {
     char *device_filename;
     speed_t serial_speed;
@@ -86,6 +108,7 @@ typedef struct radio
     double reference_downlink_frequency;
     double nominal_uplink_frequency;
     double nominal_downlink_frequency;
+    double sub_park_frequency;
     double doppler_uplink_frequency;
     double doppler_downlink_frequency;
     double vfo_main_actual_frequency;
@@ -94,6 +117,28 @@ typedef struct radio
     int waterfall_enabled;
     int mode;
     int filter;
+
+    // Backend dispatch. Wired by radio_backend_select() before radio_init().
+    // Defaults to icom-civ if untouched (set by radio_init when ops==NULL).
+    const radio_backend_ops_t *ops;
+    void *backend_state;  // backend-private; opaque to public callers
+
+    // PTT-on is rejected while this is 0 (the default). Callers set it via
+    // their own --allow-tx flag handling. PTT-off is always passed through.
+    int tx_inhibit_cleared;
+
+    // Raw "release PTT now" wire bytes, populated by the backend during
+    // init(). Callable from a SIGINT handler via a single async-signal-safe
+    // write(fd, ...) — radio_ptt(0) goes through the dispatcher and is not
+    // signal-safe (fprintf, malloc, etc). Length 0 means the backend has
+    // no out-of-band PTT-release path (e.g. B210 has no PTT to release).
+    uint8_t ptt_off_raw[16];
+    uint8_t ptt_off_raw_len;
+
+    // When set, backends with ASCII wire protocols (Yaesu CAT) print
+    // wire activity as raw hex bytes rather than the human-readable
+    // ASCII string. IC-9700 / CI-V is binary so its trace is always hex.
+    int debug_wire;
 } radio_t;
 
 int radio_init(radio_t *radio);
@@ -106,11 +151,23 @@ int radio_set_frequency(radio_t *radio, double frequency);
 int radio_get_satellite_mode(radio_t *radio);
 int radio_set_satellite_mode(radio_t *radio, int sat_mode);
 int radio_set_mode(radio_t *radio, int mode, int filter);
+int radio_set_data_mode(radio_t *radio, int on, int filter);
+int radio_set_data_mod_source(radio_t *radio, int source);
+// Prep the radio for clean data RX: NB / NR / notch / contour off,
+// AGC FAST. Yaesu also pins Menu 079 = 9600 so the rear DATA-OUT is the
+// wide pre-de-emphasis path. Issued before rx_capture / rx_live to keep
+// 9600-baud bit transitions undistorted.
+int radio_set_rx_clean(radio_t *radio);
+int radio_set_usb_mod_level(radio_t *radio, int level_0_to_255);
+int radio_set_moni_level(radio_t *radio, int level_0_to_255);
+int radio_set_rf_power(radio_t *radio, int level_0_to_255);
+int radio_set_rf_power_watts(radio_t *radio, int watts);
+int radio_uplink_prep(radio_t *radio);
+int radio_ptt(radio_t *radio, int on);
+int radio_power(radio_t *radio, int on);
 int radio_get_band_selection(radio_t *radio, int band);
 int radio_set_band_selection(radio_t *radio, int band);
 int radio_toggle_waterfall(radio_t *radio);
 
 
 #endif // !RADIO_H
-
-

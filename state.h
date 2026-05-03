@@ -47,6 +47,18 @@ typedef struct state
     radio_t radio;
     int run_with_radio;
     int have_radio;
+    // Apply the IC-9700 FM+DATA+USB-MOD uplink-prep sequence after radio_init.
+    int prepare_uplink;
+    // Requested USB MOD level 0..255, or -1 to leave untouched.
+    int uplink_mod_level;
+    // Requested RF power as a percentage 0..100, or -1 to leave untouched.
+    int tx_power_pct;
+    // Required when tx_power_pct > 10 to actually apply.
+    int allow_high_power;
+    // Required to clear the per-process TX-inhibit (radio_t.tx_inhibit_cleared).
+    int allow_tx;
+    // Selected backend (--radio-type=). Default = ICOM_CIV.
+    radio_backend_type_t radio_backend;
     // Antenna control
     antenna_rotator_t antenna_rotator;
     int run_with_antenna_rotator;

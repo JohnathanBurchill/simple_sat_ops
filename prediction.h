@@ -34,6 +34,9 @@ typedef struct criteria
     char *regex;
     int regex_ignore_case;
     int with_constellations;
+    // If non-NULL, only satellites whose names start with this string
+    // are considered, bypassing the constellation filter.
+    const char *name_prefix;
 } criteria_t;
 
 typedef struct pass
@@ -47,6 +50,10 @@ typedef struct pass
     char name[26];
     char tle[160];
 } pass_t;
+
+// Forward decl: when non-NULL on prediction_t, state comes from a
+// pre-propagated ephemeris (ITRF Cartesian), not from SGP4/TLE.
+struct oem_table;
 
 typedef struct prediction
 {
@@ -65,6 +72,9 @@ typedef struct prediction
     double predicted_minutes_above_30_degrees;
     double predicted_ascension_azimuth;
     double predicted_ascension_jul_utc;
+    // Alternative state source. When non-NULL, update_satellite_position
+    // interpolates from this table instead of running SGP4.
+    struct oem_table *oem;
 } prediction_t;
 
 /* RAO site observer location in Priddis, SW of Calgary */
@@ -76,6 +86,9 @@ void update_satellite_position(prediction_t *state, double jul_utc);
 void update_pass_predictions(prediction_t *external_state, double jul_utc_start, double delta_t_minutes);
 void minutes_until_visible(prediction_t *external_state, double jul_utc_start, double jul_utc_stop, double delta_t_minutes);
 int load_tle(prediction_t *state);
+// Fills out_path with "$HOME/.local/state/simple_sat_ops/active.tle".
+// Returns 0 on success, -1 if $HOME is unset or the buffer is too small.
+int tle_default_path(char *out_path, size_t out_cap);
 int find_passes(prediction_t *external_state, double jul_utc_start, double delta_t_minutes, criteria_t *criteria, int *count, int *number_checked, int reverse_order, int find_all);
 const pass_t *get_pass(int index);
 const size_t number_of_passes(void);

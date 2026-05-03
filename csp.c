@@ -1,0 +1,95 @@
+/*
+
+    Simple Satellite Operations  csp.c
+
+    Copyright (C) 2025  Johnathan K Burchill
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
+#include "csp.h"
+
+#include <string.h>
+
+ssize_t csp_v1_encode(const csp_v1_header_t *hdr,
+                      const uint8_t *payload, size_t payload_len,
+                      uint8_t *out_buf, size_t out_buf_size)
+{
+    if (hdr == NULL || out_buf == NULL) {
+        return -1;
+    }
+    if (hdr->prio  > 3  || hdr->src   > 31 || hdr->dst   > 31 ||
+        hdr->dport > 63 || hdr->sport > 63) {
+        return -1;
+    }
+    if (payload_len > 0 && payload == NULL) {
+        return -1;
+    }
+    if (out_buf_size < 4 + payload_len) {
+        return -1;
+    }
+
+    uint32_t h = 0;
+    h |= ((uint32_t)(hdr->prio  & 0x03)) << 30;
+    h |= ((uint32_t)(hdr->src   & 0x1F)) << 25;
+    h |= ((uint32_t)(hdr->dst   & 0x1F)) << 20;
+    h |= ((uint32_t)(hdr->dport & 0x3F)) << 14;
+    h |= ((uint32_t)(hdr->sport & 0x3F)) << 8;
+    h |= (uint32_t)hdr->flags;
+
+    out_buf[0] = (uint8_t)((h >> 24) & 0xFF);
+    out_buf[1] = (uint8_t)((h >> 16) & 0xFF);
+    out_buf[2] = (uint8_t)((h >>  8) & 0xFF);
+    out_buf[3] = (uint8_t)( h        & 0xFF);
+
+    if (payload_len > 0) {
+        memcpy(out_buf + 4, payload, payload_len);
+    }
+
+    return (ssize_t)(4 + payload_len);
+}
+
+int csp_v1_decode(const uint8_t bytes[4], csp_v1_header_t *out_hdr)
+{
+    if (bytes == NULL || out_hdr == NULL) {
+        return -1;
+    }
+    uint32_t h = ((uint32_t)bytes[0] << 24)
+               | ((uint32_t)bytes[1] << 16)
+               | ((uint32_t)bytes[2] <<  8)
+               |  (uint32_t)bytes[3];
+    out_hdr->prio  = (uint8_t)((h >> 30) & 0x03);
+    out_hdr->src   = (uint8_t)((h >> 25) & 0x1F);
+    out_hdr->dst   = (uint8_t)((h >> 20) & 0x1F);
+    out_hdr->dport = (uint8_t)((h >> 14) & 0x3F);
+    out_hdr->sport = (uint8_t)((h >>  8) & 0x3F);
+    out_hdr->flags = (uint8_t)( h        & 0xFF);
+    return 0;
+}
+
+// Standard zlib / PNG / IEEE 802.3 CRC-32 (reflected polynomial). Bit-by-bit
+// implementation — small (no 1KB lookup table) and called once per
+// decoded frame, so speed isn't important.
+uint32_t csp_crc32_zlib(const uint8_t *data, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            uint32_t mask = -(crc & 1u);
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
