@@ -89,6 +89,16 @@ if (OPENSSL_FOUND)
     target_link_directories(rx_decode PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(rx_decode PRIVATE ${OPENSSL_LIBRARIES} m)
     list(APPEND SSO_TARGETS rx_decode)
+
+    # Offline equivalent of rx_live: same sliding-window decode loop,
+    # same partial-RS rescue, same position-quantised dedup, fed from
+    # a WAV / raw S16_LE file rather than ALSA. Mac-buildable.
+    add_executable(rx_replay utils/rx_replay.c utils/wav_read.c decode_loop.c
+                   modem.c ax100.c rs.c golay24.c csp.c hmac_keyfile.c)
+    target_include_directories(rx_replay PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(rx_replay PRIVATE ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(rx_replay PRIVATE ${OPENSSL_LIBRARIES} m)
+    list(APPEND SSO_TARGETS rx_replay)
 else()
     message(STATUS "libcrypto not found; uplink_test and rx_decode will not be built.")
 endif()
@@ -141,7 +151,7 @@ if (ASOUND_FOUND)
 
         # Live AX100 decoder over ALSA capture -> stdout / log file.
         # No radio dispatcher — pure audio in + decode + print.
-        add_executable(rx_live rx_live.c modem.c ax100.c rs.c golay24.c csp.c hmac_keyfile.c audio.c)
+        add_executable(rx_live rx_live.c decode_loop.c modem.c ax100.c rs.c golay24.c csp.c hmac_keyfile.c audio.c)
         target_include_directories(rx_live PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
         target_link_directories(rx_live PRIVATE ${OPENSSL_LIBRARY_DIRS} ${ASOUND_LIBRARY_DIRS})
         target_link_libraries(rx_live PRIVATE ${OPENSSL_LIBRARIES} m ${ASOUND_LIBRARIES})
