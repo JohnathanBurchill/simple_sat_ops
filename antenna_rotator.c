@@ -245,22 +245,38 @@ int antenna_rotator_seed_from_status(antenna_rotator_t *antenna_rotator)
     return ANTENNA_ROTATOR_OK;
 }
 
-void antenna_rotator_to_mech_coords(int flip, double sky_az, double sky_el,
-                                    double *out_az, double *out_el)
+void antenna_rotator_to_mech_coords(int flip, double aos_az,
+                                    double sat_az, double sat_el,
+                                    double *out_az, double *out_el,
+                                    int *out_half)
 {
     if (out_az == NULL || out_el == NULL) {
         return;
     }
-    if (flip && ANTENNA_ROTATOR_MAXIMUM_ELEVATION > 90) {
-        double az = fmod(sky_az + 180.0, 360.0);
-        if (az < 0.0) {
-            az += 360.0;
-        }
-        *out_az = az;
-        *out_el = 180.0 - sky_el;
+    if (!flip || ANTENNA_ROTATOR_MAXIMUM_ELEVATION <= 90) {
+        *out_az = sat_az;
+        *out_el = sat_el;
+        if (out_half) *out_half = 0;
+        return;
+    }
+    double az_diff = sat_az - aos_az;
+    while (az_diff > 180.0) az_diff -= 360.0;
+    while (az_diff <= -180.0) az_diff += 360.0;
+    if (fabs(az_diff) <= 90.0) {
+        // First half: sat is on AOS side, boom tracks it directly.
+        *out_az = sat_az;
+        *out_el = sat_el;
+        if (out_half) *out_half = 0;
     } else {
-        *out_az = sky_az;
-        *out_el = sky_el;
+        // Second half: sat has crossed to the back hemisphere. Boom stays
+        // roughly on the AOS meridian; mech_el continues past 90 to point
+        // backwards through the rotator.
+        double az = sat_az + 180.0;
+        while (az >= 360.0) az -= 360.0;
+        while (az < 0.0)    az += 360.0;
+        *out_az = az;
+        *out_el = 180.0 - sat_el;
+        if (out_half) *out_half = 1;
     }
 }
 

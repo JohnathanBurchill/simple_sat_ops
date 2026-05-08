@@ -83,10 +83,23 @@ typedef struct antenna_rotator
     int antenna_should_be_controlled;
     int antenna_is_moving;
     // Set when entering a high-elevation pass (>= FLIP_ELEVATION_THRESHOLD)
-    // and MAXIMUM_ELEVATION > 90. While set, predicted (az,el) sky targets
-    // are rewritten to mechanical (az+180, 180-el) so the boom travels up
-    // and over zenith instead of slewing AZ fast at the apex.
+    // and MAXIMUM_ELEVATION > 90. While set, predicted (az, el) sky targets
+    // are routed through antenna_rotator_to_mech_coords with flip_aos_az,
+    // so the boom can sweep mech_el 0->180 over the top.
     int flip_mode_pass;
+    // Sky azimuth at the moment flip mode was decided. Used to classify
+    // each subsequent prediction as "first half" (boom on same side as
+    // satellite) or "second half" (sat has crossed to the back hemisphere
+    // and the boom tracks via 180-el).
+    double flip_aos_az;
+    // One-shot latch: prevents the per-tick re-enable from re-running the
+    // flip decision after a mid-pass bailout. Cleared at LOS / s / r.
+    int flip_decision_made;
+    // Cached half: 0 = first (sat near aos_az), 1 = second (sat across).
+    // Set on the first valid tick under flip mode; transition triggers a
+    // reseed of target_azimuth_unwrapped so the unwrap accumulator doesn't
+    // try to bridge the 180 deg jump.
+    int flip_half;
 } antenna_rotator_t;
 
 int antenna_rotator_init(antenna_rotator_t *antenna_rotator);
@@ -101,10 +114,16 @@ double antenna_rotator_home_unwrapped_target(double prev_unwrapped, double home_
 int antenna_rotator_seed_from_status(antenna_rotator_t *antenna_rotator);
 int antenna_rotator_set_unwrapped(antenna_rotator_t *antenna_rotator, double az_unwrapped, double elevation);
 // Map a predicted sky direction (sat az/el, both in standard convention) to
-// the mechanical (az,el) the rotator should drive. With flip == 0 it's a
-// pass-through. With flip != 0 it returns (az+180 mod 360, 180-el), valid
-// only when MAXIMUM_ELEVATION supports over-the-top travel.
-void antenna_rotator_to_mech_coords(int flip, double sky_az, double sky_el,
-                                    double *out_az, double *out_el);
+// the mechanical (az, el) the rotator should drive. With flip == 0 it's a
+// pass-through. With flip != 0 (and MAXIMUM_ELEVATION > 90) it splits the
+// pass into halves around aos_az: first half (|sat_az - aos_az| <= 90 deg)
+// tracks normally; second half (|...| > 90 deg) returns ((sat_az + 180) mod
+// 360, 180 - sat_el) so the boom stays roughly on the AOS meridian and
+// sweeps mech_el 0..180 instead of slewing AZ fast at the apex. *out_half
+// gets 0 or 1 so the caller can detect the transition.
+void antenna_rotator_to_mech_coords(int flip, double aos_az,
+                                    double sat_az, double sat_el,
+                                    double *out_az, double *out_el,
+                                    int *out_half);
 
 #endif // ANTENNA_ROTATOR_H

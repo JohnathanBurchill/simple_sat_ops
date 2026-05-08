@@ -668,16 +668,22 @@ int main(int argc, char **argv)
                 state.in_pass = 1;
             }
             if (state.antenna_rotator.antenna_should_be_controlled && !state.antenna_rotator.tracking) {
-                if (!state.antenna_rotator.fixed_target) {
-                    // Decide flip mode for this pass once, before the first
-                    // SET goes out, so the antenna can pre-position to the
-                    // flipped horizon if needed instead of switching mid-pass.
+                if (!state.antenna_rotator.fixed_target
+                    && !state.antenna_rotator.flip_decision_made) {
+                    // One-shot per pass. After a mid-pass bailout the latch
+                    // stays set, so we don't re-evaluate against a now-stale
+                    // predicted_max_elevation (which is looking at the next
+                    // pass once we're past apex).
                     state.antenna_rotator.flip_mode_pass = 0;
+                    state.antenna_rotator.flip_half = 0;
                     if (ANTENNA_ROTATOR_MAXIMUM_ELEVATION > 90
                         && state.prediction.predicted_max_elevation
                                >= ANTENNA_ROTATOR_FLIP_ELEVATION_THRESHOLD) {
                         state.antenna_rotator.flip_mode_pass = 1;
+                        state.antenna_rotator.flip_aos_az =
+                            state.prediction.satellite_ephem.azimuth;
                     }
+                    state.antenna_rotator.flip_decision_made = 1;
                     state.antenna_rotator.tracking = 1;
                 }
             }
@@ -695,8 +701,23 @@ int main(int argc, char **argv)
                     double pred_el = state.prediction.satellite_ephem.elevation;
                     double mech_az = pred_az;
                     double mech_el = pred_el;
+                    int half = 0;
                     antenna_rotator_to_mech_coords(state.antenna_rotator.flip_mode_pass,
-                                                   pred_az, pred_el, &mech_az, &mech_el);
+                                                   state.antenna_rotator.flip_aos_az,
+                                                   pred_az, pred_el,
+                                                   &mech_az, &mech_el, &half);
+                    // Flip transition: sat just crossed from first to second
+                    // half (or back). The mech_az jumps by ~180 deg; the
+                    // unwrap accumulator can't bridge that without bailing,
+                    // so snap the unwrap target to the new mech_az and let
+                    // the SPID slew through it. At the transition mech_el is
+                    // ~90 (boom near zenith), so any pointing error during
+                    // the slew is forgivable.
+                    if (state.antenna_rotator.flip_mode_pass
+                        && half != state.antenna_rotator.flip_half) {
+                        state.antenna_rotator.target_azimuth_unwrapped = mech_az;
+                        state.antenna_rotator.flip_half = half;
+                    }
                     double prev_unwrapped = state.antenna_rotator.target_azimuth_unwrapped;
                     double next_az = antenna_rotator_accumulate_unwrapped(prev_unwrapped, mech_az);
                     double next_el = mech_el;
@@ -719,9 +740,12 @@ int main(int argc, char **argv)
 
                     if (fabs(delta_az) >= MAX_DELTA_AZIMUTH_DEGREES || fabs(delta_el) >= MAX_DELTA_ELEVATION_DEGREES) {
                         if (next_az < ANTENNA_ROTATOR_MINIMUM_AZIMUTH || next_az > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
-                            // Continuous unwrap would carry the rotator past its mechanical
-                            // limits. Stop tracking and let the operator decide whether to
-                            // re-seed from the opposite hemisphere.
+                            // Continuous unwrap would carry the rotator past
+                            // its mechanical limits. Stop tracking but leave
+                            // flip_decision_made == 1 so the per-tick re-enable
+                            // can't immediately fire and ping-pong the antenna.
+                            // Operator must press s, r, or T to recover; each
+                            // of those clears the latch.
                             state.antenna_rotator.tracking = 0;
                         } else {
                             int rc = antenna_rotator_set_unwrapped(&state.antenna_rotator, next_az, next_el);
@@ -744,6 +768,8 @@ int main(int argc, char **argv)
             if (state.antenna_rotator.tracking) {
                 state.antenna_rotator.tracking = 0;
                 state.antenna_rotator.flip_mode_pass = 0;
+                state.antenna_rotator.flip_decision_made = 0;
+                state.antenna_rotator.flip_half = 0;
             }
         }
 
@@ -1349,6 +1375,12 @@ void start_tracking(state_t *state)
     // Anything mode-changing belongs in radio_uplink_prep (--uplink-ready)
     // or the explicit '*' (Wildrose) keystroke.
     state->antenna_rotator.antenna_is_under_control = state->antenna_rotator.antenna_should_be_controlled;
+    // Clear the flip latch so the next tracking-enable re-decides for the
+    // upcoming pass. T after a mid-pass bailout is one of the operator's
+    // recovery paths.
+    state->antenna_rotator.flip_mode_pass = 0;
+    state->antenna_rotator.flip_decision_made = 0;
+    state->antenna_rotator.flip_half = 0;
     if (state->antenna_rotator.fixed_target) {
         antenna_rotator_result = antenna_rotator_set_unwrapped(
             &state->antenna_rotator,
@@ -1391,6 +1423,8 @@ void stop_tracking(state_t *state)
     state->antenna_rotator.homing_in_progress = 0;
     state->antenna_rotator.home_pending_final_az = 0.0;
     state->antenna_rotator.flip_mode_pass = 0;
+    state->antenna_rotator.flip_decision_made = 0;
+    state->antenna_rotator.flip_half = 0;
 
     return;
 }
@@ -1431,6 +1465,8 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
     // in progress when the operator hit reset, drop the flag so the next
     // tracking pass re-evaluates from scratch.
     state->antenna_rotator.flip_mode_pass = 0;
+    state->antenna_rotator.flip_decision_made = 0;
+    state->antenna_rotator.flip_half = 0;
 
     if (!state->antenna_rotator.unwrapped_target_valid) {
         if (antenna_rotator_seed_from_status(&state->antenna_rotator) != ANTENNA_ROTATOR_OK) {
