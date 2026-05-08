@@ -400,11 +400,12 @@ void report_status(state_t *state, int *print_row, int print_col)
         if (target_az_display < 0) {
             target_az_display += 360.0;
         }
-        mvprintw(row++, col, "%15s   %.1f deg", "target azimuth", target_az_display);
+        const char *flip_tag = state->antenna_rotator.flip_mode_pass ? " (flip)" : "";
+        mvprintw(row++, col, "%15s   %.1f deg%s", "target azimuth", target_az_display, flip_tag);
         clrtoeol();
         mvprintw(row++, col, "%15s   %.1f deg", "azimuth", az_display);
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.1f deg", "target elevation", state->antenna_rotator.target_elevation);
+        mvprintw(row++, col, "%15s   %.1f deg%s", "target elevation", state->antenna_rotator.target_elevation, flip_tag);
         clrtoeol();
         mvprintw(row++, col, "%15s   %.1f deg", "elevation", elevation);
         clrtoeol();
@@ -668,6 +669,15 @@ int main(int argc, char **argv)
             }
             if (state.antenna_rotator.antenna_should_be_controlled && !state.antenna_rotator.tracking) {
                 if (!state.antenna_rotator.fixed_target) {
+                    // Decide flip mode for this pass once, before the first
+                    // SET goes out, so the antenna can pre-position to the
+                    // flipped horizon if needed instead of switching mid-pass.
+                    state.antenna_rotator.flip_mode_pass = 0;
+                    if (ANTENNA_ROTATOR_MAXIMUM_ELEVATION > 90
+                        && state.prediction.predicted_max_elevation
+                               >= ANTENNA_ROTATOR_FLIP_ELEVATION_THRESHOLD) {
+                        state.antenna_rotator.flip_mode_pass = 1;
+                    }
                     state.antenna_rotator.tracking = 1;
                 }
             }
@@ -681,16 +691,27 @@ int main(int argc, char **argv)
                         state.antenna_rotator.tracking = 0;
                     }
                 } else if (!state.antenna_rotator.antenna_is_moving) {
+                    double pred_az = state.prediction.satellite_ephem.azimuth;
+                    double pred_el = state.prediction.satellite_ephem.elevation;
+                    double mech_az = pred_az;
+                    double mech_el = pred_el;
+                    antenna_rotator_to_mech_coords(state.antenna_rotator.flip_mode_pass,
+                                                   pred_az, pred_el, &mech_az, &mech_el);
                     double prev_unwrapped = state.antenna_rotator.target_azimuth_unwrapped;
-                    double next_az = antenna_rotator_accumulate_unwrapped(prev_unwrapped, state.prediction.satellite_ephem.azimuth);
-                    double next_el = state.prediction.satellite_ephem.elevation;
+                    double next_az = antenna_rotator_accumulate_unwrapped(prev_unwrapped, mech_az);
+                    double next_el = mech_el;
                     if (next_el < ANTENNA_ROTATOR_MINIMUM_ELEVATION) {
                         next_el = ANTENNA_ROTATOR_MINIMUM_ELEVATION;
                     } else if (next_el > ANTENNA_ROTATOR_MAXIMUM_ELEVATION) {
                         next_el = ANTENNA_ROTATOR_MAXIMUM_ELEVATION;
                     }
                     delta_az = next_az - prev_unwrapped;
-                    if (state.prediction.satellite_ephem.elevation >= 0) {
+                    // In flip mode, mech_el always wants updating: 180 - sky_el
+                    // for sky_el < 0 just clamps to MAX, so the antenna parks
+                    // at flipped zenith until AOS. In normal mode, leave EL
+                    // alone while the satellite is below the horizon.
+                    if (state.antenna_rotator.flip_mode_pass
+                        || state.prediction.satellite_ephem.elevation >= 0) {
                         delta_el = next_el - state.antenna_rotator.target_elevation;
                     } else {
                         delta_el = 0.0;
@@ -722,6 +743,7 @@ int main(int argc, char **argv)
             }
             if (state.antenna_rotator.tracking) {
                 state.antenna_rotator.tracking = 0;
+                state.antenna_rotator.flip_mode_pass = 0;
             }
         }
 
@@ -1136,8 +1158,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             state->antenna_rotator.target_elevation = atof(argv[i] + 27);
             if (state->antenna_rotator.target_elevation < 0.0) {
                 state->antenna_rotator.target_elevation = 0.0;
-            } else if (state->antenna_rotator.target_elevation > 90.0) {
-                state->antenna_rotator.target_elevation = 90.0;
+            } else if (state->antenna_rotator.target_elevation > ANTENNA_ROTATOR_MAXIMUM_ELEVATION) {
+                state->antenna_rotator.target_elevation = ANTENNA_ROTATOR_MAXIMUM_ELEVATION;
             }
             state->antenna_rotator.fixed_target = 1;
         } else if (strncmp("--rotator-target-azimuth=", argv[i], 25) == 0) {
@@ -1368,6 +1390,7 @@ void stop_tracking(state_t *state)
     state->antenna_rotator.antenna_is_moving = 0;
     state->antenna_rotator.homing_in_progress = 0;
     state->antenna_rotator.home_pending_final_az = 0.0;
+    state->antenna_rotator.flip_mode_pass = 0;
 
     return;
 }
@@ -1404,6 +1427,10 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
 {
     state->satellite_tracking = 0;
     state->antenna_rotator.antenna_is_under_control = 0;
+    // The home/park target is a normal-coords sky target; if a flip pass was
+    // in progress when the operator hit reset, drop the flag so the next
+    // tracking pass re-evaluates from scratch.
+    state->antenna_rotator.flip_mode_pass = 0;
 
     if (!state->antenna_rotator.unwrapped_target_valid) {
         if (antenna_rotator_seed_from_status(&state->antenna_rotator) != ANTENNA_ROTATOR_OK) {

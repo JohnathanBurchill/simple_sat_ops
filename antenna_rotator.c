@@ -245,6 +245,25 @@ int antenna_rotator_seed_from_status(antenna_rotator_t *antenna_rotator)
     return ANTENNA_ROTATOR_OK;
 }
 
+void antenna_rotator_to_mech_coords(int flip, double sky_az, double sky_el,
+                                    double *out_az, double *out_el)
+{
+    if (out_az == NULL || out_el == NULL) {
+        return;
+    }
+    if (flip && ANTENNA_ROTATOR_MAXIMUM_ELEVATION > 90) {
+        double az = fmod(sky_az + 180.0, 360.0);
+        if (az < 0.0) {
+            az += 360.0;
+        }
+        *out_az = az;
+        *out_el = 180.0 - sky_el;
+    } else {
+        *out_az = sky_az;
+        *out_el = sky_el;
+    }
+}
+
 int antenna_rotator_set_unwrapped(antenna_rotator_t *antenna_rotator, double az_unwrapped, double elevation)
 {
     if (az_unwrapped < ANTENNA_ROTATOR_MINIMUM_AZIMUTH || az_unwrapped > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
