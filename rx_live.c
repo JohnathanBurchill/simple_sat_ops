@@ -190,10 +190,15 @@ static void fmt_utc(char *buf, size_t cap)
     gettimeofday(&tv, NULL);
     struct tm utc;
     gmtime_r(&tv.tv_sec, &utc);
-    snprintf(buf, cap, "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
-             utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
-             utc.tm_hour, utc.tm_min, utc.tm_sec,
-             (long)(tv.tv_usec / 1000));
+    int yr = (utc.tm_year + 1900) % 10000;
+    int mo = (utc.tm_mon + 1) % 100;
+    int da = utc.tm_mday % 100;
+    int hh = utc.tm_hour % 100;
+    int mm = utc.tm_min  % 100;
+    int ss = utc.tm_sec  % 100;
+    int ms = (int)((tv.tv_usec / 1000) % 1000);
+    snprintf(buf, cap, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+             yr, mo, da, hh, mm, ss, ms);
 }
 
 int main(int argc, char **argv)

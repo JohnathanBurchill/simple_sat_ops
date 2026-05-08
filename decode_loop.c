@@ -478,11 +478,20 @@ void decode_loop_record_packet(const char *ts,
         clock_gettime(CLOCK_REALTIME, &now);
         struct tm utc;
         gmtime_r(&now.tv_sec, &utc);
+        // Mask each field into the range its format slot allows so
+        // gcc -Wformat-truncation= can prove no overrun. Without the
+        // masks gcc sees plain `int`s and computes a worst-case 88-
+        // byte expansion that doesn't fit ts_iso.
+        int yr = (utc.tm_year + 1900) % 10000;
+        int mo = (utc.tm_mon + 1) % 100;
+        int da = utc.tm_mday % 100;
+        int hh = utc.tm_hour % 100;
+        int mm = utc.tm_min  % 100;
+        int ss = utc.tm_sec  % 100;
+        int ms = (int)((now.tv_nsec / 1000000) % 1000);
         snprintf(ts_iso, sizeof ts_iso,
-                 "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
-                 utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
-                 utc.tm_hour, utc.tm_min, utc.tm_sec,
-                 (long)(now.tv_nsec / 1000000));
+                 "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+                 yr, mo, da, hh, mm, ss, ms);
         ts_for_db = ts_iso;
     }
 

@@ -1111,11 +1111,18 @@ int main(int argc, char **argv)
         clock_gettime(CLOCK_REALTIME, &now);
         struct tm utc;
         gmtime_r(&now.tv_sec, &utc);
+        // Masks bound each field so gcc's -Wformat-truncation= can
+        // prove no overrun (see decode_loop.c for the same pattern).
+        int yr = (utc.tm_year + 1900) % 10000;
+        int mo = (utc.tm_mon + 1) % 100;
+        int da = utc.tm_mday % 100;
+        int hh = utc.tm_hour % 100;
+        int mm = utc.tm_min  % 100;
+        int ss = utc.tm_sec  % 100;
+        int ms = (int)((now.tv_nsec / 1000000) % 1000);
         snprintf(ts_iso, sizeof ts_iso,
-                 "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
-                 utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
-                 utc.tm_hour, utc.tm_min, utc.tm_sec,
-                 (long)(now.tv_nsec / 1000000));
+                 "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+                 yr, mo, da, hh, mm, ss, ms);
         decode_loop_record_packet(ts_iso, &hdr, /*csp_ok=*/1,
                                   payload, payload_len,
                                   golay_errs, hmac_ok,

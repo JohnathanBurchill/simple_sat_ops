@@ -205,12 +205,19 @@ static int parse_ut_from_filename(const char *path, double *out_unix_seconds)
 static void unix_seconds_to_iso(double t, char *out, size_t outn)
 {
     time_t sec = (time_t)t;
-    int ms = (int)((t - sec) * 1000.0 + 0.5);
+    int ms = (int)((t - sec) * 1000.0 + 0.5) % 1000;
     struct tm utc;
     gmtime_r(&sec, &utc);
+    // Masks bound each field so gcc's -Wformat-truncation= can prove
+    // the formatted result fits the caller's buffer.
+    int yr = (utc.tm_year + 1900) % 10000;
+    int mo = (utc.tm_mon + 1) % 100;
+    int da = utc.tm_mday % 100;
+    int hh = utc.tm_hour % 100;
+    int mm = utc.tm_min  % 100;
+    int ss = utc.tm_sec  % 100;
     snprintf(out, outn, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
-             utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
-             utc.tm_hour, utc.tm_min, utc.tm_sec, ms);
+             yr, mo, da, hh, mm, ss, ms);
 }
 
 // Parse "YYYY-MM-DDTHH:MM:SS[.fff]Z" -> unix seconds. Returns 0 / -1.
