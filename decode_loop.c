@@ -22,10 +22,14 @@
 
 #include "beacon_cts1.h"
 #include "csp.h"
+#include "packet_db.h"
 
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // Process-global because emit_frame is called from rx_live, rx_replay,
 // b210_rx_live, and rx_decode. The alternative — a parameter on
@@ -33,6 +37,23 @@
 // is read-mostly (set once at startup or via a REPL command) so the
 // no-locking single-int approach is fine.
 static int g_show_headers = 0;
+
+// Optional packet-DB tap. NULL when no DB is configured (the default —
+// rx_decode without --db, or any receiver run with --no-db). Strings
+// are borrowed, not copied, so callers must keep them alive for the
+// process lifetime — typically static run-id buffers in main().
+static packet_db_t *g_packet_db = NULL;
+static const char  *g_db_source_tool = NULL;
+static const char  *g_db_source_run  = NULL;
+
+void decode_loop_set_packet_db(packet_db_t *db,
+                               const char *source_tool,
+                               const char *source_run)
+{
+    g_packet_db = db;
+    g_db_source_tool = source_tool;
+    g_db_source_run  = source_run;
+}
 
 void decode_loop_set_show_headers(int on)
 {
@@ -353,4 +374,104 @@ void emit_frame(const char *log_path, int quiet, const char *ts,
     }
 
     if (log_fp != NULL) fclose(log_fp);
+
+    decode_loop_record_packet(ts, &hdr, csp_ok,
+                              payload, payload_len,
+                              golay_errs, hmac_ok, rs_errs, crc_status);
+}
+
+void decode_loop_record_packet(const char *ts,
+                               const csp_v1_header_t *hdr, int csp_ok,
+                               const uint8_t *payload, size_t payload_len,
+                               int golay_errs, int hmac_ok,
+                               int rs_errs, int crc_status)
+{
+    if (g_packet_db == NULL) return;
+    if (!csp_ok || payload == NULL || payload_len == 0) return;
+
+    int          ptype       = -1;
+    const char  *ptype_name  = NULL;
+    const char  *satellite   = NULL;
+    if (beacon_is_basic(payload, payload_len)) {
+        ptype = 0x01; ptype_name = "beacon"; satellite = "CTS1";
+    } else if (tcmd_response_is(payload, payload_len)) {
+        ptype = 0x04; ptype_name = "tcmd_response";
+    } else if (log_message_is(payload, payload_len)) {
+        ptype = 0x03; ptype_name = "log";
+    } else if (bulk_file_is(payload, payload_len)) {
+        ptype = 0x10; ptype_name = "bulk_file";
+    }
+    if (ptype_name == NULL) return;
+
+    // Render the firmware-aware text into a stack buffer. 2 KiB is
+    // more than enough for any of the four packet types (beacon's six
+    // lines top out near 700 chars; tcmd_response adds ~200 for the
+    // data preview).
+    char summary_buf[2048];
+    FILE *mem = fmemopen(summary_buf, sizeof summary_buf, "w");
+    if (mem != NULL) {
+        cts1_packet_print(mem, NULL, payload, payload_len);
+        fflush(mem);
+        long pos = ftell(mem);
+        if (pos < 0) pos = 0;
+        if ((size_t)pos >= sizeof summary_buf) pos = sizeof summary_buf - 1;
+        summary_buf[pos] = '\0';
+        fclose(mem);
+    } else {
+        summary_buf[0] = '\0';
+    }
+
+    // ts_received uses the ISO-8601 form when emit_frame's caller
+    // produces one (rx_live / b210_rx_live / rx_decode). rx_replay
+    // passes a "t=NN.NNNs" relative offset; in that case parse the
+    // offset out for audio_offset_s and stamp ts_received with
+    // wall-clock-now so the column stays sortable as a real
+    // timestamp. Lossy compared to "the moment the satellite
+    // actually transmitted," but the recording's filename usually
+    // carries the absolute UTC anchor for that.
+    char ts_iso[40];
+    const char *ts_for_db = ts;
+    double offset_s = (0.0 / 0.0);  // NaN
+    if (ts != NULL && strncmp(ts, "t=", 2) == 0) {
+        char *endp = NULL;
+        double v = strtod(ts + 2, &endp);
+        if (endp != NULL && *endp == 's') {
+            offset_s = v;
+        }
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        struct tm utc;
+        gmtime_r(&now.tv_sec, &utc);
+        snprintf(ts_iso, sizeof ts_iso,
+                 "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
+                 utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                 utc.tm_hour, utc.tm_min, utc.tm_sec,
+                 (long)(now.tv_nsec / 1000000));
+        ts_for_db = ts_iso;
+    }
+
+    packet_db_record_t rec = {
+        .ts_received      = ts_for_db,
+        .satellite        = satellite,
+        .packet_type      = ptype,
+        .packet_type_name = ptype_name,
+        .csp_src          = hdr->src,
+        .csp_dst          = hdr->dst,
+        .csp_dport        = hdr->dport,
+        .csp_sport        = hdr->sport,
+        .csp_prio         = hdr->prio,
+        .csp_flags        = hdr->flags,
+        .csp_present      = 1,
+        .payload          = payload,
+        .payload_len      = payload_len,
+        .golay_errs       = golay_errs,
+        .rs_errs          = rs_errs,
+        .hmac_ok          = hmac_ok,
+        .crc_status       = crc_status,
+        .source_tool      = g_db_source_tool,
+        .source_run       = g_db_source_run,
+        .audio_offset_s   = offset_s,
+        .decoded_summary  = summary_buf[0] ? summary_buf : NULL,
+    };
+    (void)packet_db_insert(g_packet_db, &rec);
 }

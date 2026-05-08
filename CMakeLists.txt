@@ -32,7 +32,30 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(NCURSES ncurses)
 pkg_check_modules(ASOUND alsa)
 pkg_check_modules(OPENSSL libcrypto)
+pkg_check_modules(SQLITE3 sqlite3)
 find_library(SGP4SDP4_LIB sgp4sdp4)
+
+# packet_db is a shared dependency of every receiver: rx_decode,
+# rx_replay, rx_live, b210_rx_live all tap emit_frame and write each
+# decoded packet into a project-wide SQLite store. When sqlite3 is
+# present, packet_db.c compiles against it and WITH_SQLITE3 is defined
+# on the targets that use it. When absent, packet_db.c falls back to a
+# no-op stub so the binaries still link and run; the receivers' --db
+# flags warn and continue.
+if (NOT SQLITE3_FOUND)
+    message(WARNING "sqlite3 not found via pkg-config; packet_db will "
+                    "compile as a no-op stub. Install sqlite3 (`brew "
+                    "install sqlite` on macOS) for full DB support.")
+endif()
+function(target_link_packet_db target)
+    target_sources(${target} PRIVATE packet_db.c)
+    if (SQLITE3_FOUND)
+        target_compile_definitions(${target} PRIVATE WITH_SQLITE3)
+        target_include_directories(${target} PRIVATE ${SQLITE3_INCLUDE_DIRS})
+        target_link_directories(${target} PRIVATE ${SQLITE3_LIBRARY_DIRS})
+        target_link_libraries(${target} PRIVATE ${SQLITE3_LIBRARIES})
+    endif()
+endfunction()
 
 # USRP B210 backend (requires UHD). Default ON: the FrontierSat ground
 # station runs the B210 receiver, so the SDR-side tools (b210_rx_capture,
@@ -117,10 +140,11 @@ if (OPENSSL_FOUND)
     # Offline AX100 frame decoder: WAV/RAW -> demod -> ax100_unframe -> CSP
     add_executable(rx_decode utils/rx_decode.c utils/wav_read.c
                    modem.c ax100.c rs.c golay24.c csp.c hmac_keyfile.c
-                   beacon_cts1.c)
+                   beacon_cts1.c decode_loop.c)
     target_include_directories(rx_decode PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(rx_decode PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(rx_decode PRIVATE ${OPENSSL_LIBRARIES} m)
+    target_link_packet_db(rx_decode)
     list(APPEND SSO_TARGETS rx_decode)
 
     # Offline equivalent of rx_live: same sliding-window decode loop,
@@ -138,6 +162,7 @@ if (OPENSSL_FOUND)
         target_link_directories(rx_replay PRIVATE ${NCURSES_LIBRARY_DIRS})
         target_link_libraries(rx_replay PRIVATE ${NCURSES_LIBRARIES})
     endif()
+    target_link_packet_db(rx_replay)
     list(APPEND SSO_TARGETS rx_replay)
 
     # CTS1 beacon WAV generator: fills the firmware-canonical packed
@@ -220,6 +245,7 @@ if (OPENSSL_FOUND)
             target_link_directories(b210_rx_live PRIVATE ${ASOUND_LIBRARY_DIRS})
             target_link_libraries(b210_rx_live PRIVATE ${ASOUND_LIBRARIES})
         endif()
+        target_link_packet_db(b210_rx_live)
         list(APPEND SSO_TARGETS b210_rx_live)
     endif()
 else()
@@ -287,6 +313,7 @@ if (ASOUND_FOUND)
             target_link_directories(rx_live PRIVATE ${NCURSES_LIBRARY_DIRS})
             target_link_libraries(rx_live PRIVATE ${NCURSES_LIBRARIES})
         endif()
+        target_link_packet_db(rx_live)
         list(APPEND SSO_TARGETS rx_live)
     endif()
 else()

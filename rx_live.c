@@ -34,6 +34,7 @@
 #include "decode_loop.h"
 #include "hmac_keyfile.h"
 #include "modem.h"
+#include "packet_db.h"
 #include "rx_tui.h"
 
 #include <ctype.h>
@@ -172,6 +173,13 @@ static void usage(FILE *dest, const char *name)
         "                           `packetheaders on|off` (or `ph on|off`)\n"
         "                           to flip the toggle mid-pass.\n"
         "  --no-packet-headers      Default; kept as a no-op for scripts.\n"
+        "  --db=<path>              SQLite store for decoded packets.\n"
+        "                           Default: $SSO_PACKET_DB or\n"
+        "                           $HOME/.local/share/simple_sat_ops/\n"
+        "                           packets.db. Append-only across runs.\n"
+        "  --no-db                  Skip DB writes.\n"
+        "  --source-run=<id>        Override the per-launch run-id used\n"
+        "                           for dedup of re-decoded captures.\n"
         "  --help                   Show this help.\n",
         name, HMAC_KEYFILE_DEFAULT_RELPATH);
 }
@@ -209,6 +217,9 @@ int main(int argc, char **argv)
     int quiet = 0;
     int use_tui = 0;
     int show_packet_headers = 0;
+    const char *db_path = NULL;
+    const char *source_run_override = NULL;
+    int no_db = 0;
     const char *ref_hex_arg = NULL;
     uint8_t ref_buf[4100];
     size_t ref_buf_len = 0;
@@ -302,6 +313,12 @@ int main(int argc, char **argv)
             show_packet_headers = 1;
         } else if (strcmp("--no-packet-headers", a) == 0) {
             show_packet_headers = 0;
+        } else if (strncmp("--db=", a, 5) == 0) {
+            db_path = a + 5;
+        } else if (strcmp("--no-db", a) == 0) {
+            no_db = 1;
+        } else if (strncmp("--source-run=", a, 13) == 0) {
+            source_run_override = a + 13;
         } else if (strcmp("--help", a) == 0) {
             usage(stdout, argv[0]);
             return 0;
@@ -554,6 +571,14 @@ int main(int argc, char **argv)
     opts.reed_solomon = use_rs;
 
     decode_loop_set_show_headers(show_packet_headers);
+
+    char db_run_id[24];
+    packet_db_t *db = packet_db_setup(db_path, no_db,
+                                      db_run_id, sizeof db_run_id);
+    if (source_run_override != NULL) {
+        snprintf(db_run_id, sizeof db_run_id, "%s", source_run_override);
+    }
+    decode_loop_set_packet_db(db, "rx_live", db_run_id);
 
     struct sigaction sa = {0};
     sa.sa_handler = on_signal;

@@ -35,6 +35,7 @@
 #include "hmac_keyfile.h"
 #include "modem.h"
 #include "monitor_squelch.h"
+#include "packet_db.h"
 #include "radio.h"
 #include "rx_tui.h"
 
@@ -656,6 +657,12 @@ static void usage(FILE *dest, const char *name)
         "                              print. Toggle live with\n"
         "                              `packetheaders on|off` (or `ph on|off`).\n"
         "  --no-packet-headers         Default; kept as a no-op for scripts.\n"
+        "  --db=<path>                 SQLite store for decoded packets.\n"
+        "                              Default: $SSO_PACKET_DB or\n"
+        "                              $HOME/.local/share/simple_sat_ops/\n"
+        "                              packets.db. Append-only across runs.\n"
+        "  --no-db                     Skip DB writes.\n"
+        "  --source-run=<id>           Override the per-launch run-id.\n"
         "\n"
         "Live monitor (Linux only — requires this binary be built with ALSA):\n"
         "  --monitor                  Pipe the FM-demoded audio to ALSA so\n"
@@ -816,6 +823,9 @@ int main(int argc, char **argv)
     int    csp_crc32         = 0;
     int    force_beacon      = 0;
     int    show_packet_headers = 0;
+    const char *db_path = NULL;
+    const char *source_run_override = NULL;
+    int no_db = 0;
     const char *keyfile_path = NULL;
 
     const char *log_path     = NULL;
@@ -949,6 +959,9 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--force-beacon") == 0)          force_beacon = 1;
         else if (strcmp(a, "--packet-headers") == 0)        show_packet_headers = 1;
         else if (strcmp(a, "--no-packet-headers") == 0)     show_packet_headers = 0;
+        else if (strncmp(a, "--db=", 5) == 0)               db_path = a + 5;
+        else if (strcmp(a, "--no-db") == 0)                 no_db = 1;
+        else if (strncmp(a, "--source-run=", 13) == 0)      source_run_override = a + 13;
         else if (starts_with(a, "--keyfile="))              keyfile_path = a + 10;
 
         else if (starts_with(a, "--log="))                  { log_path = a + 6; want_log = 1; }
@@ -1364,6 +1377,14 @@ int main(int argc, char **argv)
     spectrum_job_t spec_job = {0};
     int monitor_active = 0;
     decode_loop_set_show_headers(show_packet_headers);
+
+    char db_run_id[24];
+    packet_db_t *db = packet_db_setup(db_path, no_db,
+                                      db_run_id, sizeof db_run_id);
+    if (source_run_override != NULL) {
+        snprintf(db_run_id, sizeof db_run_id, "%s", source_run_override);
+    }
+    decode_loop_set_packet_db(db, "b210_rx_live", db_run_id);
 #ifdef WITH_ALSA
     monitor_active = (alsa != NULL);
 #endif

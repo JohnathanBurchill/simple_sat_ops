@@ -29,6 +29,7 @@
 #define DECODE_LOOP_H
 
 #include "ax100.h"
+#include "csp.h"
 #include "modem.h"
 
 #include <stddef.h>
@@ -135,5 +136,35 @@ int  decode_loop_show_headers(void);
 // Unknown input leaves status_buf empty and returns 0 so the caller can
 // chain its own per-tool commands (sq, spectrum, force-beacon, ...).
 int decode_loop_try_command(const char *cmd, char *status_buf, size_t cap);
+
+// Forward decl so callers don't need to include packet_db.h here.
+typedef struct packet_db packet_db_t;
+
+// Plug a packet_db handle into emit_frame and decode_loop_record_packet.
+// After this is called with a non-NULL `db`, every successfully decoded
+// frame routed through either entry point produces one row in the DB
+// (deduplicated by payload SHA-1 + source_tool + source_run, so
+// rerunning the same capture is harmless). Pass db=NULL to disable
+// (e.g. when --no-db was given). source_tool / source_run strings must
+// remain valid for the rest of the process; they are not copied.
+void decode_loop_set_packet_db(packet_db_t *db,
+                               const char *source_tool,
+                               const char *source_run);
+
+// Record one decoded packet into the configured packet DB. No-op when
+// no DB is set or when the payload doesn't match a recognised firmware
+// packet type. Used by emit_frame internally and by rx_decode's
+// duplicate output path; callers that already use emit_frame don't
+// need to call this directly.
+//
+// ts: caller's timestamp string. ISO-8601 UTC is preferred and stored
+// verbatim in ts_received. A "t=NN.NNNs" string from rx_replay's
+// relative-clock mode is parsed into audio_offset_s, with ts_received
+// getting wall-clock-now so the column stays sortable.
+void decode_loop_record_packet(const char *ts,
+                               const csp_v1_header_t *hdr, int csp_ok,
+                               const uint8_t *payload, size_t payload_len,
+                               int golay_errs, int hmac_ok,
+                               int rs_errs, int crc_status);
 
 #endif // DECODE_LOOP_H

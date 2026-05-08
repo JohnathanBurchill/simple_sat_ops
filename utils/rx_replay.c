@@ -40,6 +40,7 @@
 #include "decode_loop.h"
 #include "hmac_keyfile.h"
 #include "modem.h"
+#include "packet_db.h"
 #include "rx_tui.h"
 #include "wav_read.h"
 
@@ -193,6 +194,15 @@ static void usage(FILE *dest, const char *name)
         "                           `packetheaders on|off` (or `ph on|off`)\n"
         "                           to flip the toggle mid-replay.\n"
         "  --no-packet-headers      Default; kept as a no-op for scripts.\n"
+        "  --db=<path>              SQLite store for decoded packets.\n"
+        "                           Default: $SSO_PACKET_DB or\n"
+        "                           $HOME/.local/share/simple_sat_ops/\n"
+        "                           packets.db. Append-only across runs;\n"
+        "                           re-running the same input is dedup'd\n"
+        "                           (pass --source-run=<id> to force a\n"
+        "                           fresh row group).\n"
+        "  --no-db                  Skip DB writes.\n"
+        "  --source-run=<id>        Override the per-launch run-id.\n"
         "  --help                   Show this help.\n",
         name, HMAC_KEYFILE_DEFAULT_RELPATH);
 }
@@ -222,6 +232,9 @@ int main(int argc, char **argv)
     size_t ref_buf_len = 0;
     int force_beacon = 0;
     int show_packet_headers = 0;
+    const char *db_path = NULL;
+    const char *source_run_override = NULL;
+    int no_db = 0;
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
@@ -260,6 +273,9 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--force-beacon") == 0)     force_beacon = 1;
         else if (strcmp(a, "--packet-headers") == 0)   show_packet_headers = 1;
         else if (strcmp(a, "--no-packet-headers") == 0) show_packet_headers = 0;
+        else if (starts_with(a, "--db="))              db_path = a + 5;
+        else if (strcmp(a, "--no-db") == 0)            no_db = 1;
+        else if (starts_with(a, "--source-run="))      source_run_override = a + 13;
         else if (a[0] == '-') {
             fprintf(stderr, "rx_replay: unknown option '%s'\n", a);
             usage(stderr, argv[0]);
@@ -398,6 +414,14 @@ int main(int argc, char **argv)
     }
 
     decode_loop_set_show_headers(show_packet_headers);
+
+    char db_run_id[24];
+    packet_db_t *db = packet_db_setup(db_path, no_db,
+                                      db_run_id, sizeof db_run_id);
+    if (source_run_override != NULL) {
+        snprintf(db_run_id, sizeof db_run_id, "%s", source_run_override);
+    }
+    decode_loop_set_packet_db(db, "rx_replay", db_run_id);
 
     // Position-quantised dedup ring (mirrors rx_live).
     enum { DEDUP_RING_SZ = 64 };

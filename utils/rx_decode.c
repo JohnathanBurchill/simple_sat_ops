@@ -38,12 +38,15 @@
 #include "ax100.h"
 #include "beacon_cts1.h"
 #include "csp.h"
+#include "decode_loop.h"
 #include "hmac_keyfile.h"
 #include "modem.h"
+#include "packet_db.h"
 #include "wav_read.h"
 
 #include <ctype.h>
 #include <errno.h>
+#include <time.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -226,6 +229,19 @@ static void usage(FILE *out, const char *argv0)
         "                             consistency with rx_live/rx_replay.\n"
         "  --packet-headers           Default; show every field. Kept as\n"
         "                             a no-op for scripts.\n"
+        "  --db=<path>                Append decoded packets to a SQLite\n"
+        "                             store. Default: $SSO_PACKET_DB or\n"
+        "                             $HOME/.local/share/simple_sat_ops/\n"
+        "                             packets.db. Rows are deduplicated\n"
+        "                             on payload SHA1 + source-tool +\n"
+        "                             source-run, so re-decoding the same\n"
+        "                             capture is harmless.\n"
+        "  --no-db                    Skip DB writes (the .log text\n"
+        "                             output continues unchanged).\n"
+        "  --source-run=<id>          Override the auto-generated\n"
+        "                             per-launch run-id used for dedup.\n"
+        "                             Useful when re-running the same\n"
+        "                             input and you DO want a fresh row.\n"
         "  --no-dc-block              Skip the modem's DC-block IIR (alpha=0.995)\n"
         "                             on RX. Default-ON setting was added for\n"
         "                             rtl_fm's discriminator drift; for radio\n"
@@ -267,6 +283,9 @@ int main(int argc, char **argv)
     // Forensic CLI: default to showing the raw header lines so single-frame
     // post-mortems aren't missing context. --quiet-headers flips it.
     int show_packet_headers = 1;
+    const char *db_path = NULL;
+    const char *source_run_override = NULL;
+    int no_db = 0;
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
@@ -331,6 +350,12 @@ int main(int argc, char **argv)
         } else if (strcmp(a, "--quiet-headers") == 0
                    || strcmp(a, "--no-packet-headers") == 0) {
             show_packet_headers = 0;
+        } else if (starts_with(a, "--db=")) {
+            db_path = a + 5;
+        } else if (strcmp(a, "--no-db") == 0) {
+            no_db = 1;
+        } else if (starts_with(a, "--source-run=")) {
+            source_run_override = a + 13;
         } else if (a[0] == '-') {
             fprintf(stderr, "rx_decode: unknown option '%s'\n", a);
             usage(stderr, argv[0]);
@@ -349,6 +374,20 @@ int main(int argc, char **argv)
         usage(stderr, argv[0]);
         return 1;
     }
+
+    // Open the packet DB (or skip on --no-db) and plug it into emit_frame.
+    // Note rx_decode doesn't actually call emit_frame (it has its own
+    // duplicated output path), so this tap is currently inactive — but
+    // wiring it now keeps rx_decode consistent with the other receivers
+    // and primes for a future refactor that consolidates onto emit_frame.
+    char db_run_id[24];
+    packet_db_t *db = packet_db_setup(db_path, no_db,
+                                      db_run_id, sizeof db_run_id);
+    if (source_run_override != NULL) {
+        snprintf(db_run_id, sizeof db_run_id, "%s", source_run_override);
+    }
+    decode_loop_set_packet_db(db, "rx_decode", db_run_id);
+
     if (ref_hex_arg != NULL) {
         // Tolerant hex parser: skip whitespace and ':' separators so
         // copy-pasted hex from beacon_gen output / ascii dumps Just Works.
@@ -940,7 +979,7 @@ int main(int argc, char **argv)
                     "trailer kept in payload)\n", computed, le, be);
         }
     }
-    (void)crc_ok;
+    // crc_ok is consumed below by decode_loop_record_packet.
 
     csp_v1_header_t hdr;
     if (csp_v1_decode(packet, &hdr) != 0) {
@@ -1059,6 +1098,28 @@ int main(int argc, char **argv)
         if (payload_len > 0) {
             print_hex_ascii(payload, payload_len);
         }
+    }
+
+    // DB tap. rx_decode has its own duplicated output path (it doesn't
+    // route through emit_frame), so call decode_loop_record_packet
+    // explicitly. No-op when --no-db was passed or sqlite3 isn't built
+    // in; the receiver's setter passed NULL into decode_loop in that
+    // case.
+    {
+        char ts_iso[40];
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        struct tm utc;
+        gmtime_r(&now.tv_sec, &utc);
+        snprintf(ts_iso, sizeof ts_iso,
+                 "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
+                 utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                 utc.tm_hour, utc.tm_min, utc.tm_sec,
+                 (long)(now.tv_nsec / 1000000));
+        decode_loop_record_packet(ts_iso, &hdr, /*csp_ok=*/1,
+                                  payload, payload_len,
+                                  golay_errs, hmac_ok,
+                                  rs_errs, crc_ok);
     }
 
     return (hmac_ok == 0) ? 2 : 0;
