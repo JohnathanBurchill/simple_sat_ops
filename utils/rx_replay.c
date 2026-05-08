@@ -44,12 +44,22 @@
 #include "rx_tui.h"
 #include "wav_read.h"
 
+#ifdef WITH_SGP4SDP4
+#include "prediction.h"
+#endif
+
+#include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
+#include <libgen.h>
+#include <math.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -92,6 +102,136 @@ static void rx_replay_cmd_handler(const char *cmd, void *ctx)
 static int starts_with(const char *s, const char *prefix)
 {
     return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+// Read three lines (name + line1 + line2) for the requested satellite
+// out of a TLE file. sat_prefix may be NULL — in that case the first
+// non-comment 3-line block is returned (useful when the file is a
+// single-sat TLE the user dropped next to the WAV). Returns 0 on
+// success, -1 on miss / I/O error.
+static int read_tle_lines(const char *path, const char *sat_prefix,
+                          char *out_name,  size_t name_n,
+                          char *out_line1, size_t line1_n,
+                          char *out_line2, size_t line2_n)
+{
+    if (path == NULL) return -1;
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return -1;
+    char a[128], b[128], c[128];
+    int rc = -1;
+    while (fgets(a, sizeof a, f) != NULL) {
+        size_t n = strlen(a);
+        while (n > 0 && (a[n-1] == '\n' || a[n-1] == '\r')) a[--n] = '\0';
+        if (n == 0 || a[0] == '#') continue;
+        if (sat_prefix != NULL
+            && strncmp(a, sat_prefix, strlen(sat_prefix)) != 0) continue;
+        if (fgets(b, sizeof b, f) == NULL) break;
+        n = strlen(b);
+        while (n > 0 && (b[n-1] == '\n' || b[n-1] == '\r')) b[--n] = '\0';
+        if (fgets(c, sizeof c, f) == NULL) break;
+        n = strlen(c);
+        while (n > 0 && (c[n-1] == '\n' || c[n-1] == '\r')) c[--n] = '\0';
+        if (b[0] != '1' || c[0] != '2') break;
+        snprintf(out_name,  name_n,  "%s", a);
+        snprintf(out_line1, line1_n, "%s", b);
+        snprintf(out_line2, line2_n, "%s", c);
+        rc = 0;
+        break;
+    }
+    fclose(f);
+    return rc;
+}
+
+// If the input file's directory contains exactly one *.tle file,
+// return its absolute-or-relative path in `out`. Returns 0 on hit, -1
+// on zero or multiple matches.
+static int autodiscover_tle(const char *input_path, char *out, size_t outn)
+{
+    if (input_path == NULL) return -1;
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", input_path);
+    const char *dir = dirname(buf);
+    DIR *d = opendir(dir);
+    if (d == NULL) return -1;
+    struct dirent *de;
+    char hit[1024] = {0};
+    int count = 0;
+    while ((de = readdir(d)) != NULL) {
+        size_t nlen = strlen(de->d_name);
+        if (nlen < 4) continue;
+        if (strcmp(de->d_name + nlen - 4, ".tle") != 0) continue;
+        snprintf(hit, sizeof hit, "%s/%s", dir, de->d_name);
+        count++;
+        if (count > 1) break;
+    }
+    closedir(d);
+    if (count == 1) {
+        snprintf(out, outn, "%s", hit);
+        return 0;
+    }
+    return -1;
+}
+
+// Parse "...UT=YYYYMMDDTHHMMSS.sss..." out of a filename and return
+// the seconds-since-epoch of that timestamp into *out_unix_ms.
+// Returns 0 on success, -1 if the pattern isn't found.
+static int parse_ut_from_filename(const char *path, double *out_unix_seconds)
+{
+    if (path == NULL) return -1;
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", path);
+    const char *base = basename(buf);
+    const char *p = strstr(base, "UT=");
+    if (p == NULL) return -1;
+    p += 3;
+    int yr, mo, d, h, mi, s, ms = 0;
+    int got = sscanf(p, "%4d%2d%2dT%2d%2d%2d.%3d",
+                     &yr, &mo, &d, &h, &mi, &s, &ms);
+    if (got < 6) return -1;
+    struct tm utc = {0};
+    utc.tm_year = yr - 1900;
+    utc.tm_mon  = mo - 1;
+    utc.tm_mday = d;
+    utc.tm_hour = h;
+    utc.tm_min  = mi;
+    utc.tm_sec  = s;
+    time_t epoch = timegm(&utc);
+    if (epoch == (time_t)-1) return -1;
+    *out_unix_seconds = (double)epoch + ms / 1000.0;
+    return 0;
+}
+
+// Format seconds-since-epoch (UTC) as ISO-8601.
+static void unix_seconds_to_iso(double t, char *out, size_t outn)
+{
+    time_t sec = (time_t)t;
+    int ms = (int)((t - sec) * 1000.0 + 0.5);
+    struct tm utc;
+    gmtime_r(&sec, &utc);
+    snprintf(out, outn, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+             utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+             utc.tm_hour, utc.tm_min, utc.tm_sec, ms);
+}
+
+// Parse "YYYY-MM-DDTHH:MM:SS[.fff]Z" -> unix seconds. Returns 0 / -1.
+static int parse_iso_to_unix_seconds(const char *iso, double *out)
+{
+    if (iso == NULL) return -1;
+    int yr, mo, d, h, mi, s, ms = 0;
+    int got = sscanf(iso, "%4d-%2d-%2dT%2d:%2d:%2d.%3d",
+                     &yr, &mo, &d, &h, &mi, &s, &ms);
+    if (got < 6) return -1;
+    struct tm utc = {0};
+    utc.tm_year = yr - 1900;
+    utc.tm_mon  = mo - 1;
+    utc.tm_mday = d;
+    utc.tm_hour = h;
+    utc.tm_min  = mi;
+    utc.tm_sec  = s;
+    time_t epoch = timegm(&utc);
+    if (epoch == (time_t)-1) return -1;
+    *out = (double)epoch + ms / 1000.0;
+    return 0;
 }
 
 // Read a raw S16_LE file into a freshly-malloc'd int16 buffer. Returns
@@ -235,6 +375,15 @@ int main(int argc, char **argv)
     const char *db_path = NULL;
     const char *source_run_override = NULL;
     int no_db = 0;
+    const char *tle_path = NULL;
+    const char *sat_arg  = NULL;
+    const char *start_utc_arg = NULL;
+    const char *session_dir_arg = NULL;
+    int update_mode = 0;
+    double obs_lat_deg = 50.8688;   // RAO defaults; overridden by flags
+    double obs_lon_deg = -114.2910;
+    double obs_alt_m   = 1279.0;
+    double nominal_freq_hz = 436150000.0; // FrontierSat carrier
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
@@ -276,6 +425,15 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--db="))              db_path = a + 5;
         else if (strcmp(a, "--no-db") == 0)            no_db = 1;
         else if (starts_with(a, "--source-run="))      source_run_override = a + 13;
+        else if (starts_with(a, "--tle="))             tle_path = a + 6;
+        else if (starts_with(a, "--satellite="))       sat_arg = a + 12;
+        else if (starts_with(a, "--start-utc="))       start_utc_arg = a + 12;
+        else if (starts_with(a, "--session-dir="))     session_dir_arg = a + 14;
+        else if (strcmp(a, "--update") == 0)           update_mode = 1;
+        else if (starts_with(a, "--lat="))             obs_lat_deg = atof(a + 6);
+        else if (starts_with(a, "--lon="))             obs_lon_deg = atof(a + 6);
+        else if (starts_with(a, "--alt="))             obs_alt_m   = atof(a + 6);
+        else if (starts_with(a, "--carrier-mhz="))     nominal_freq_hz = atof(a + 14) * 1e6;
         else if (a[0] == '-') {
             fprintf(stderr, "rx_replay: unknown option '%s'\n", a);
             usage(stderr, argv[0]);
@@ -421,7 +579,117 @@ int main(int argc, char **argv)
     if (source_run_override != NULL) {
         snprintf(db_run_id, sizeof db_run_id, "%s", source_run_override);
     }
-    decode_loop_set_packet_db(db, "rx_replay", db_run_id);
+    // In --update mode, suppress emit_frame's INSERT — we manually
+    // call packet_db_update_observer per packet so existing rows
+    // (typically from the original b210_rx_live capture) get the
+    // observer / TLE / session_dir gaps filled in without piling up
+    // duplicate rx_replay rows in the DB.
+    decode_loop_set_packet_db(update_mode ? NULL : db, "rx_replay", db_run_id);
+
+    // Auto-discover TLE in the input file's directory if --tle wasn't
+    // given. Single-TLE-per-folder is the b210_rx_live convention so
+    // this Just Works on a captured pass folder.
+    char tle_path_buf[1024];
+    if (tle_path == NULL && db != NULL) {
+        if (autodiscover_tle(input_path, tle_path_buf, sizeof tle_path_buf) == 0) {
+            tle_path = tle_path_buf;
+            fprintf(stderr, "rx_replay: auto-discovered TLE %s\n", tle_path);
+        }
+    }
+
+    long long tle_id = 0;
+    char tle_name[128]  = "";
+    char tle_line1[128] = "";
+    char tle_line2[128] = "";
+    if (db != NULL && tle_path != NULL) {
+        if (read_tle_lines(tle_path, sat_arg,
+                           tle_name,  sizeof tle_name,
+                           tle_line1, sizeof tle_line1,
+                           tle_line2, sizeof tle_line2) == 0) {
+            tle_id = packet_db_register_tle(db, tle_name, tle_line1, tle_line2);
+            if (tle_id > 0) decode_loop_set_tle_id(tle_id);
+        } else {
+            fprintf(stderr, "rx_replay: TLE %s did not yield a 3-line block "
+                    "for %s — observer state will be NULL\n",
+                    tle_path, sat_arg ? sat_arg : "(first sat in file)");
+        }
+    }
+
+    // Determine the absolute UTC of audio_offset_s=0 — needed to
+    // propagate SGP4 per-packet. Order: --start-utc, then UT= in the
+    // input filename, then file mtime as a last resort.
+    double start_utc_seconds = 0.0;
+    int have_start_utc = 0;
+    if (start_utc_arg != NULL) {
+        if (parse_iso_to_unix_seconds(start_utc_arg, &start_utc_seconds) == 0) {
+            have_start_utc = 1;
+        } else {
+            fprintf(stderr, "rx_replay: bad --start-utc='%s' "
+                    "(want YYYY-MM-DDTHH:MM:SS[.fff]Z)\n", start_utc_arg);
+        }
+    }
+    if (!have_start_utc) {
+        if (parse_ut_from_filename(input_path, &start_utc_seconds) == 0) {
+            have_start_utc = 1;
+        }
+    }
+    if (!have_start_utc) {
+        struct stat st;
+        if (stat(input_path, &st) == 0) {
+            start_utc_seconds = (double)st.st_mtime;
+            have_start_utc = 1;
+            fprintf(stderr,
+                    "rx_replay: no UT stamp in filename and --start-utc "
+                    "not set; falling back to file mtime\n");
+        }
+    }
+
+    // Session dir — explicit flag wins, else dirname of input file.
+    static char session_dir_buf[1024];
+    if (session_dir_arg != NULL) {
+        snprintf(session_dir_buf, sizeof session_dir_buf, "%s", session_dir_arg);
+    } else {
+        char tmp[1024];
+        snprintf(tmp, sizeof tmp, "%s", input_path);
+        snprintf(session_dir_buf, sizeof session_dir_buf, "%s", dirname(tmp));
+    }
+    if (db != NULL) decode_loop_set_session_dir(session_dir_buf);
+
+#ifdef WITH_SGP4SDP4
+    // SGP4 propagation state, only used when --tle was given (or
+    // auto-discovered) and a start-utc could be resolved.
+    prediction_t pred;
+    int have_pred = 0;
+    if (tle_id > 0 && have_start_utc) {
+        memset(&pred, 0, sizeof pred);
+        pred.observer_ephem.position_geodetic.lat = obs_lat_deg * (M_PI / 180.0);
+        pred.observer_ephem.position_geodetic.lon = obs_lon_deg * (M_PI / 180.0);
+        pred.observer_ephem.position_geodetic.alt = obs_alt_m / 1000.0;
+        pred.tles_filename = (char *)tle_path;
+        pred.satellite_ephem.name = (char *)(sat_arg ? sat_arg : tle_name);
+        if (load_tle(&pred) == 0) {
+            ClearFlag(ALL_FLAGS);
+            select_ephemeris(&pred.satellite_ephem.tle);
+            have_pred = 1;
+        } else {
+            fprintf(stderr, "rx_replay: load_tle failed; observer state "
+                    "will be NULL\n");
+        }
+    }
+#else
+    int have_pred = 0;
+    (void)obs_lat_deg; (void)obs_lon_deg; (void)obs_alt_m;
+#endif
+
+    if (update_mode && db == NULL) {
+        fprintf(stderr, "rx_replay: --update needs a writable DB; "
+                "remove --no-db or pass --db=<path>\n");
+        return 1;
+    }
+    if (update_mode && tle_id == 0) {
+        fprintf(stderr, "rx_replay: --update without a working TLE — "
+                "the only thing to backfill would be session_dir\n");
+    }
 
     // Position-quantised dedup ring (mirrors rx_live).
     enum { DEDUP_RING_SZ = 64 };
@@ -536,6 +804,37 @@ int main(int argc, char **argv)
             char ts[32];
             double t_sec = (double)asm_abs_sample / (double)samp_rate;
             snprintf(ts, sizeof ts, "t=%.3fs", t_sec);
+
+            // Observer state for this packet. SGP4-propagate to the
+            // moment in absolute UTC when this burst's ASM was
+            // detected (start_utc + audio_offset_s). Skipped (and the
+            // setter cleared back to NaN) when no TLE / no start_utc
+            // was available.
+            double az_deg = (0.0/0.0), el_deg = (0.0/0.0);
+            double range_km = (0.0/0.0), range_rate_km_s = (0.0/0.0);
+            double doppler_hz = (0.0/0.0);
+#ifdef WITH_SGP4SDP4
+            if (have_pred && have_start_utc) {
+                double abs_t = start_utc_seconds + t_sec;
+                time_t epoch = (time_t)abs_t;
+                struct tm utc;
+                gmtime_r(&epoch, &utc);
+                struct timeval tv;
+                tv.tv_sec = epoch;
+                tv.tv_usec = (long)((abs_t - epoch) * 1e6);
+                double jul_utc = Julian_Date(&utc, &tv);
+                update_satellite_position(&pred, jul_utc);
+                az_deg = pred.satellite_ephem.azimuth;
+                el_deg = pred.satellite_ephem.elevation;
+                range_km = pred.satellite_ephem.range_km;
+                range_rate_km_s = pred.satellite_ephem.range_rate_km_s;
+                doppler_hz = nominal_freq_hz
+                           * (-range_rate_km_s / 299792.458);
+            }
+#endif
+            decode_loop_set_observer(az_deg, el_deg, range_km,
+                                     range_rate_km_s, doppler_hz);
+
             emit_frame(log_path, quiet, ts,
                        packet, (size_t)plen,
                        golay_errs, hmac_ok, use_hmac,
@@ -544,6 +843,21 @@ int main(int argc, char **argv)
                        rs_locs,
                        ref_buf_len > 0 ? ref_buf : NULL, ref_buf_len,
                        force_beacon);
+
+            // --update mode: emit_frame's INSERT was suppressed (db
+            // passed as NULL above), so backfill the existing rows
+            // for this payload — typically the b210_rx_live row from
+            // the original capture — with whatever observer state we
+            // have now.
+            if (update_mode && db != NULL && plen >= 4) {
+                size_t pl = (size_t)plen;
+                packet_db_update_observer(db, packet + 4, pl - 4,
+                                          az_deg, el_deg, range_km,
+                                          range_rate_km_s, doppler_hz,
+                                          tle_id,
+                                          session_dir_buf,
+                                          /*force=*/0);
+            }
             if (use_tui) {
                 rx_tui_observe_frame(ts, packet, (size_t)plen,
                                      golay_errs, hmac_ok, use_hmac,
