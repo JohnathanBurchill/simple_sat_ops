@@ -294,6 +294,58 @@ static void iq_level_format(const b210_rx_core_t *core,
     snprintf(buf, cap, "peak=%+5.1f rms=%+5.1f dBFS", peak_dbfs, rms_dbfs);
 }
 
+// Build the unified TUI status line. Single source for the row so the
+// 100 ms level-refresh path and the per-second Doppler-tick path stop
+// flickering between two different formats. NaN inputs render as "---"
+// — the operator sees az/el and range_rate appear as soon as the first
+// Doppler tick populates them. az/el are the SGP4-predicted satellite
+// position; b210_rx_live doesn't talk to the rotator, so the line shows
+// where the satellite *should* be, not where the dish is actually
+// pointing.
+static void format_tui_status(char *out, size_t outn,
+                              int do_doppler,
+                              double actual_freq, double nominal_freq_hz,
+                              double range_rate_km_s,
+                              double az_deg, double el_deg,
+                              int reed_solomon, int force_beacon,
+                              const char *sqsuffix,
+                              const char *lvldesc,
+                              const char *sat_name)
+{
+    if (!do_doppler) {
+        snprintf(out, outn,
+                 "freq=%.6f MHz | rs=%s fb=%s%s | %s | no-doppler",
+                 actual_freq / 1e6,
+                 reed_solomon ? "on" : "off",
+                 force_beacon ? "on" : "off",
+                 sqsuffix, lvldesc);
+        return;
+    }
+    char rrate[64];
+    if (isnan(range_rate_km_s)) {
+        snprintf(rrate, sizeof rrate,
+                 "nominal=%.6f MHz | range_rate=---", nominal_freq_hz / 1e6);
+    } else {
+        double off_hz = actual_freq - nominal_freq_hz;
+        snprintf(rrate, sizeof rrate,
+                 "(Δ=%+.0f Hz from %.6f MHz) | range_rate=%+.3f km/s",
+                 off_hz, nominal_freq_hz / 1e6, range_rate_km_s);
+    }
+    char azel[40];
+    if (isnan(az_deg) || isnan(el_deg)) {
+        snprintf(azel, sizeof azel, "az=--- el=---");
+    } else {
+        snprintf(azel, sizeof azel,
+                 "az=%5.1f° el=%+5.1f°", az_deg, el_deg);
+    }
+    snprintf(out, outn,
+             "freq=%.6f MHz %s | %s | rs=%s fb=%s%s | %s | sat=%s",
+             actual_freq / 1e6, rrate, azel,
+             reed_solomon ? "on" : "off",
+             force_beacon ? "on" : "off",
+             sqsuffix, lvldesc, sat_name);
+}
+
 // REPL handler context. The TUI calls cmd_handler() inside its tick,
 // which runs synchronously in the main thread between decode-window
 // passes — so mutating opts.reed_solomon directly is safe.
@@ -1347,20 +1399,15 @@ int main(int argc, char **argv)
         }
         char lvldesc[48];
         iq_level_format(core, lvldesc, sizeof lvldesc);
-        if (do_doppler) {
-            snprintf(tui_status, sizeof tui_status,
-                     "freq=%.6f MHz (waiting for first Doppler tick) | "
-                     "nominal=%.6f MHz | rs=%s fb=%s%s | %s | sat=%s",
-                     actual_freq / 1e6, nominal_freq_hz / 1e6,
-                     opts.reed_solomon ? "on" : "off",
-                     force_beacon ? "on" : "off", sqsuffix, lvldesc, sat_name);
-        } else {
-            snprintf(tui_status, sizeof tui_status,
-                     "freq=%.6f MHz | rs=%s fb=%s%s | %s | no-doppler",
-                     actual_freq / 1e6,
-                     opts.reed_solomon ? "on" : "off",
-                     force_beacon ? "on" : "off", sqsuffix, lvldesc);
-        }
+        // First-tick state: range_rate / az / el haven't been computed
+        // yet, so pass NaN sentinels and the helper renders them as
+        // "---" until the Doppler loop fills them in.
+        format_tui_status(tui_status, sizeof tui_status,
+                          do_doppler,
+                          actual_freq, nominal_freq_hz,
+                          (0.0/0.0), (0.0/0.0), (0.0/0.0),
+                          opts.reed_solomon, force_beacon,
+                          sqsuffix, lvldesc, sat_name);
         rx_tui_set_status(tui_status);
         // Persistent REPL history: $HOME/.local/state/simple_sat_ops/
         // b210_rx_live_history. mkdir -p the parent best-effort.
@@ -1448,14 +1495,13 @@ int main(int argc, char **argv)
             }
             char lvldesc[48];
             iq_level_format(core, lvldesc, sizeof lvldesc);
-            snprintf(tui_status, sizeof tui_status,
-                     "freq=%.6f MHz | rs=%s fb=%s%s | %s%s%s",
-                     actual_freq / 1e6,
-                     opts.reed_solomon ? "on" : "off",
-                     force_beacon ? "on" : "off",
-                     sqsuffix, lvldesc,
-                     do_doppler ? " | sat="     : " | no-doppler",
-                     do_doppler ? sat_name      : "");
+            format_tui_status(tui_status, sizeof tui_status,
+                              do_doppler,
+                              actual_freq, nominal_freq_hz,
+                              last_range_rate_km_s,
+                              last_az_deg, last_el_deg,
+                              opts.reed_solomon, force_beacon,
+                              sqsuffix, lvldesc, sat_name);
             rx_tui_set_status(tui_status);
             want_status_refresh = 0;
         }
@@ -1722,7 +1768,6 @@ doppler_tick:
                     // moving as the pass progresses. Outside --ui mode
                     // this is a no-op.
                     if (use_tui) {
-                        double off_hz = actual_freq - nominal_freq_hz;
                         char sqsuffix[80] = {0};
                         if (monitor_active) {
                             char sqdesc[64];
@@ -1732,15 +1777,13 @@ doppler_tick:
                         }
                         char lvldesc[48];
                         iq_level_format(core, lvldesc, sizeof lvldesc);
-                        snprintf(tui_status, sizeof tui_status,
-                                 "freq=%.6f MHz (Δ=%+.0f Hz from %.6f MHz) | "
-                                 "range_rate=%+.3f km/s | rs=%s fb=%s%s | "
-                                 "%s | sat=%s",
-                                 actual_freq / 1e6, off_hz,
-                                 nominal_freq_hz / 1e6, range_rate_km_s,
-                                 opts.reed_solomon ? "on" : "off",
-                                 force_beacon ? "on" : "off",
-                                 sqsuffix, lvldesc, sat_name);
+                        format_tui_status(tui_status, sizeof tui_status,
+                                          do_doppler,
+                                          actual_freq, nominal_freq_hz,
+                                          range_rate_km_s,
+                                          last_az_deg, last_el_deg,
+                                          opts.reed_solomon, force_beacon,
+                                          sqsuffix, lvldesc, sat_name);
                         rx_tui_set_status(tui_status);
                         want_status_refresh = 0;
                     }
