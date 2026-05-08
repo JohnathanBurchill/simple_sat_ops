@@ -129,8 +129,23 @@ int packet_db_default_path(char *buf, size_t cap)
 
 #ifdef WITH_SQLITE3
 
-#include <openssl/sha.h>
+// SHA1 via the EVP_* API — the legacy SHA1_Init/Update/Final and the
+// one-shot SHA1() helper are -Wdeprecated-declarations on OpenSSL 3.0+
+// (Ubuntu 22.04 etc.). EVP is the supported successor and works on
+// older OpenSSL too.
+#include <openssl/evp.h>
 #include <sqlite3.h>
+
+#define PACKET_DB_SHA1_LEN 20
+
+static void sha1_digest(const void *data, size_t len, uint8_t out[PACKET_DB_SHA1_LEN])
+{
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_sha1(), NULL);
+    EVP_DigestUpdate(ctx, data, len);
+    EVP_DigestFinal_ex(ctx, out, NULL);
+    EVP_MD_CTX_free(ctx);
+}
 
 struct packet_db {
     sqlite3      *db;
@@ -370,8 +385,8 @@ int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec)
 
     // SHA1 of the raw payload, used for dedup. 20 bytes; stored as a
     // BLOB rather than hex so the index entries stay small.
-    uint8_t sha[SHA_DIGEST_LENGTH];
-    SHA1(rec->payload, rec->payload_len, sha);
+    uint8_t sha[PACKET_DB_SHA1_LEN];
+    sha1_digest(rec->payload, rec->payload_len, sha);
 
     sqlite3_reset(s);
     sqlite3_clear_bindings(s);
@@ -427,17 +442,17 @@ void packet_db_close(packet_db_t *db)
     free(db);
 }
 
-// Compute SHA1 of "line1\nline2" — the canonical TLE identity. SHA1 is
-// already used elsewhere in this file (for the payload dedup); not
-// adding any new dependency.
-static void tle_sha1(const char *line1, const char *line2, uint8_t out[20])
+// Compute SHA1 of "line1\nline2" — the canonical TLE identity.
+static void tle_sha1(const char *line1, const char *line2,
+                     uint8_t out[PACKET_DB_SHA1_LEN])
 {
-    SHA_CTX ctx;
-    SHA1_Init(&ctx);
-    SHA1_Update(&ctx, line1, strlen(line1));
-    SHA1_Update(&ctx, "\n", 1);
-    SHA1_Update(&ctx, line2, strlen(line2));
-    SHA1_Final(out, &ctx);
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_sha1(), NULL);
+    EVP_DigestUpdate(ctx, line1, strlen(line1));
+    EVP_DigestUpdate(ctx, "\n", 1);
+    EVP_DigestUpdate(ctx, line2, strlen(line2));
+    EVP_DigestFinal_ex(ctx, out, NULL);
+    EVP_MD_CTX_free(ctx);
 }
 
 // Parse line1's catalog-number / epoch fields. TLE line 1 layout (NORAD):
@@ -473,7 +488,7 @@ long long packet_db_register_tle(packet_db_t *db,
         || satellite == NULL || line1 == NULL || line2 == NULL) {
         return 0;
     }
-    uint8_t sha[SHA_DIGEST_LENGTH];
+    uint8_t sha[PACKET_DB_SHA1_LEN];
     tle_sha1(line1, line2, sha);
 
     // Try to find existing row first — saves an INSERT round-trip in
@@ -539,8 +554,8 @@ int packet_db_update_observer(packet_db_t *db,
     sqlite3_stmt *s = force ? db->update_force_stmt : db->update_gaps_stmt;
     if (s == NULL) return -1;
 
-    uint8_t sha[SHA_DIGEST_LENGTH];
-    SHA1(payload, payload_len, sha);
+    uint8_t sha[PACKET_DB_SHA1_LEN];
+    sha1_digest(payload, payload_len, sha);
 
     sqlite3_reset(s);
     sqlite3_clear_bindings(s);
