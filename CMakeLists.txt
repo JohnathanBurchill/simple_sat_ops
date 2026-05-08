@@ -160,6 +160,26 @@ if (OPENSSL_FOUND)
     target_link_packet_db(packet_query)
     list(APPEND SSO_TARGETS packet_query)
 
+    # Curses TUI sibling of packet_query. Same DB, same filters, but
+    # with a scrolling list and a detail panel that polls at ~1 Hz so
+    # live decodes appear while a receiver is running. ncurses is
+    # required; without it the binary is still built but main() prints
+    # a friendly stderr message.
+    if (NCURSES_FOUND)
+        add_executable(packet_browser utils/packet_browser.c)
+        target_compile_definitions(packet_browser PRIVATE
+            PACKET_BROWSER_HAVE_NCURSES)
+        target_include_directories(packet_browser PRIVATE
+            ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS}
+            ${NCURSES_INCLUDE_DIRS})
+        target_link_directories(packet_browser PRIVATE
+            ${OPENSSL_LIBRARY_DIRS} ${NCURSES_LIBRARY_DIRS})
+        target_link_libraries(packet_browser PRIVATE
+            ${OPENSSL_LIBRARIES} ${NCURSES_LIBRARIES} m)
+        target_link_packet_db(packet_browser)
+        list(APPEND SSO_TARGETS packet_browser)
+    endif()
+
     # Offline equivalent of rx_live: same sliding-window decode loop,
     # same partial-RS rescue, same position-quantised dedup, fed from
     # a WAV / raw S16_LE file rather than ALSA. Mac-buildable.
