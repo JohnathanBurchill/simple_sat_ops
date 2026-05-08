@@ -384,5 +384,15 @@ endif()
 # ----- Install --------------------------------------------------------------
 
 install(TARGETS ${SSO_TARGETS} DESTINATION $ENV{HOME}/bin)
-install(PROGRAMS scripts/upcoming_amateur_satellite_passes.sh DESTINATION $ENV{HOME}/bin)
-install(PROGRAMS scripts/pcm2wav.sh DESTINATION $ENV{HOME}/bin)
+
+# Install every helper script in scripts/ — *.sh and *.py — alongside
+# the binaries. file(GLOB) is evaluated at configure time, so adding a
+# new script needs a re-run of `cmake ..` before it'll be picked up by
+# `make install`. CONFIGURE_DEPENDS would auto-rerun on directory
+# changes, but it needs cmake >= 3.12; this project still pins 3.10.
+file(GLOB SSO_SCRIPTS
+    "${CMAKE_SOURCE_DIR}/scripts/*.sh"
+    "${CMAKE_SOURCE_DIR}/scripts/*.py")
+if (SSO_SCRIPTS)
+    install(PROGRAMS ${SSO_SCRIPTS} DESTINATION $ENV{HOME}/bin)
+endif()
