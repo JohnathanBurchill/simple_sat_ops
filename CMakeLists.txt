@@ -147,6 +147,19 @@ if (OPENSSL_FOUND)
     target_link_packet_db(rx_decode)
     list(APPEND SSO_TARGETS rx_decode)
 
+    # Non-interactive query CLI over the packet DB. Read-only; safe to
+    # run while a receiver is filling the DB in another shell. No
+    # OpenSSL or ncurses needed — just SQLite. When sqlite3 isn't
+    # available the binary is still built but its main() prints a
+    # helpful "rebuild with libsqlite3-dev" message and exits.
+    add_executable(packet_query utils/packet_query.c)
+    target_include_directories(packet_query PRIVATE
+        ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(packet_query PRIVATE ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(packet_query PRIVATE ${OPENSSL_LIBRARIES} m)
+    target_link_packet_db(packet_query)
+    list(APPEND SSO_TARGETS packet_query)
+
     # Offline equivalent of rx_live: same sliding-window decode loop,
     # same partial-RS rescue, same position-quantised dedup, fed from
     # a WAV / raw S16_LE file rather than ALSA. Mac-buildable.
