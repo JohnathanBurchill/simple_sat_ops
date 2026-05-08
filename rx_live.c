@@ -34,6 +34,7 @@
 #include "decode_loop.h"
 #include "hmac_keyfile.h"
 #include "modem.h"
+#include "rx_tui.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -52,6 +53,36 @@ static void on_signal(int sig)
 {
     (void)sig;
     g_stop = 1;
+    rx_tui_request_quit();
+}
+
+// REPL handler used in --ui mode. Recognises the shared
+// decode_loop_try_command verbs (packetheaders / ph) plus a `quit`
+// command — the TUI disables its q-as-quit shortcut once a handler
+// is registered, so the operator needs an in-REPL exit besides Ctrl-C.
+static void rx_live_cmd_handler(const char *cmd, void *ctx)
+{
+    (void)ctx;
+    char status[128];
+    if (decode_loop_try_command(cmd, status, sizeof status)) {
+        rx_tui_set_status(status);
+        return;
+    }
+    // Strip leading whitespace before the verb-by-strcmp checks below.
+    while (*cmd == ' ' || *cmd == '\t') cmd++;
+    if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0
+        || strcmp(cmd, "exit") == 0) {
+        g_stop = 1;
+        rx_tui_request_quit();
+        return;
+    }
+    if (cmd[0] != '\0') {
+        char m[160];
+        snprintf(m, sizeof m,
+                 "unknown: `%.80s` — try `packetheaders on|off` or `quit`",
+                 cmd);
+        rx_tui_set_status(m);
+    }
 }
 
 static void usage(FILE *dest, const char *name)
@@ -126,6 +157,21 @@ static void usage(FILE *dest, const char *name)
         "                           PNG (rendered from the WAV via\n"
         "                           ffmpeg showspectrumpic on Ctrl-C).\n"
         "  --quiet                  Skip stdout output (log-only mode).\n"
+        "  --ui                     Switch from streaming text to a curses\n"
+        "                           panel display (latest beacon broken\n"
+        "                           out by subsystem, scrolling list of\n"
+        "                           recent telecommand responses, frame\n"
+        "                           counters). File logging continues.\n"
+        "                           Press q to quit. Default off.\n"
+        "  --packet-headers         Show the AX100 framing line, CSP v1\n"
+        "                           header line, and per-frame hex/ascii\n"
+        "                           dumps. Default off — only the\n"
+        "                           interpreted body (beacon/tcmd/log/\n"
+        "                           bulk_file) and error conditions print.\n"
+        "                           In --ui mode, the REPL also accepts\n"
+        "                           `packetheaders on|off` (or `ph on|off`)\n"
+        "                           to flip the toggle mid-pass.\n"
+        "  --no-packet-headers      Default; kept as a no-op for scripts.\n"
         "  --help                   Show this help.\n",
         name, HMAC_KEYFILE_DEFAULT_RELPATH);
 }
@@ -161,6 +207,11 @@ int main(int argc, char **argv)
     int no_dc_block = 0;
     int csp_crc32 = 0;  // opt-in via --csp-crc32 (some firmwares use it)
     int quiet = 0;
+    int use_tui = 0;
+    int show_packet_headers = 0;
+    const char *ref_hex_arg = NULL;
+    uint8_t ref_buf[4100];
+    size_t ref_buf_len = 0;
     int want_log = 1;
     int want_raw = 1;
     int want_wav = 1;
@@ -220,6 +271,9 @@ int main(int argc, char **argv)
         } else if (strcmp("--no-csp-crc32", a) == 0) {
             // Default; kept as a no-op for any existing scripts.
             csp_crc32 = 0;
+        } else if (strncmp("--ref-hex=", a, 10) == 0) {
+            if (strlen(a) < 11) { fprintf(stderr, "Unable to parse %s\n", a); return EXIT_FAILURE; }
+            ref_hex_arg = a + 10;
         } else if (strncmp("--log=", a, 6) == 0) {
             if (strlen(a) < 7) { fprintf(stderr, "Unable to parse %s\n", a); return EXIT_FAILURE; }
             log_path = a + 6;
@@ -242,6 +296,12 @@ int main(int argc, char **argv)
             want_spectrogram = 0;
         } else if (strcmp("--quiet", a) == 0) {
             quiet = 1;
+        } else if (strcmp("--ui", a) == 0) {
+            use_tui = 1;
+        } else if (strcmp("--packet-headers", a) == 0) {
+            show_packet_headers = 1;
+        } else if (strcmp("--no-packet-headers", a) == 0) {
+            show_packet_headers = 0;
         } else if (strcmp("--help", a) == 0) {
             usage(stdout, argv[0]);
             return 0;
@@ -253,6 +313,42 @@ int main(int argc, char **argv)
     }
 
     if (slide_s > window_s) slide_s = window_s;
+
+    if (ref_hex_arg != NULL) {
+        size_t n = 0;
+        int high = -1;
+        for (const char *p = ref_hex_arg; *p; ++p) {
+            char c = *p;
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ':') continue;
+            int v = (c >= '0' && c <= '9') ? c - '0'
+                  : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+                  : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+            if (v < 0) {
+                fprintf(stderr, "rx_live: --ref-hex: bad char '%c'\n", c);
+                return EXIT_FAILURE;
+            }
+            if (high < 0) {
+                high = v;
+            } else {
+                if (n >= sizeof ref_buf) {
+                    fprintf(stderr, "rx_live: --ref-hex too long (>%zu bytes)\n",
+                            sizeof ref_buf);
+                    return EXIT_FAILURE;
+                }
+                ref_buf[n++] = (uint8_t)((high << 4) | v);
+                high = -1;
+            }
+        }
+        if (high >= 0) {
+            fprintf(stderr, "rx_live: --ref-hex: odd number of hex digits\n");
+            return EXIT_FAILURE;
+        }
+        if (n == 0) {
+            fprintf(stderr, "rx_live: --ref-hex: empty\n");
+            return EXIT_FAILURE;
+        }
+        ref_buf_len = n;
+    }
 
     // Audio device autodetect.
     if (audio_device == NULL) {
@@ -324,6 +420,29 @@ int main(int argc, char **argv)
     if (!want_log)  log_path = NULL;
     if (!want_raw)  raw_path = NULL;
     if (!want_wav)  wav_path = NULL;
+
+    // Touch the log at startup so it exists before the first decoded
+    // frame. emit_frame's fopen("a") would otherwise only create the
+    // file on first hit, leaving `tail -F rx_live_*.log` with nothing
+    // to follow during AOS wait. One-line session header makes the
+    // file's purpose obvious if found on disk later.
+    if (log_path != NULL) {
+        FILE *lf = fopen(log_path, "a");
+        if (lf == NULL) {
+            fprintf(stderr, "rx_live: fopen(%s, a): %s\n",
+                    log_path, strerror(errno));
+        } else {
+            char ts[64];
+            fmt_utc(ts, sizeof ts);
+            fprintf(lf,
+                    "[%s] rx_live: session start audio=%s window=%.2fs "
+                    "slide=%.2fs sync_thr=%d rs=%s hmac=%s\n",
+                    ts, audio_device, window_s, slide_s, sync_max_ham,
+                    use_rs ? "on" : "off",
+                    use_hmac ? "on" : "off");
+            fclose(lf);
+        }
+    }
 
     // HMAC key.
     uint8_t hmac_key[128];
@@ -434,13 +553,39 @@ int main(int argc, char **argv)
     }
     opts.reed_solomon = use_rs;
 
+    decode_loop_set_show_headers(show_packet_headers);
+
     struct sigaction sa = {0};
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    if (use_hmac) {
+    // In --ui mode the banner becomes the TUI title bar instead of a
+    // stderr line that would scribble over the curses screen. quiet=1
+    // is also forced so emit_frame doesn't write to stdout (ncurses
+    // owns it). File logging continues either way.
+    // Sized to comfortably hold an auto-named log path (up to 299
+    // chars from auto_log_path) plus the rest of the format. The TUI
+    // truncates to terminal width when rendering, so an oversized
+    // header is harmless.
+    char tui_header[512];
+    if (use_tui) {
+        if (rx_tui_init() != 0) {
+            fprintf(stderr, "rx_live: --ui requested but ncurses is not "
+                    "built in (rebuild with libncurses-dev installed).\n");
+            return EXIT_FAILURE;
+        }
+        snprintf(tui_header, sizeof tui_header,
+                 "rx_live | %s | win=%.2fs slide=%.2fs sync_thr=%d rs=%s hmac=%s | log=%s",
+                 audio_device, window_s, slide_s, sync_max_ham,
+                 use_rs ? "on" : "off",
+                 use_hmac ? "on" : "off",
+                 log_path ? log_path : "(none)");
+        rx_tui_set_header(tui_header);
+        rx_tui_set_command_handler(rx_live_cmd_handler, NULL);
+        quiet = 1;
+    } else if (use_hmac) {
         fprintf(stderr, "rx_live: %s window=%.2fs slide=%.2fs sync_thr=%d "
                 "hmac=on rs=%s log=%s raw=%s\n",
                 audio_device, window_s, slide_s, sync_max_ham,
@@ -483,12 +628,14 @@ int main(int argc, char **argv)
     uint64_t total_window_samples = 0;
 
     while (!g_stop) {
+        if (use_tui && rx_tui_tick()) g_stop = 1;
         snd_pcm_sframes_t got = snd_pcm_readi(capture, chunk, chunk_frames);
         if (got == -EPIPE) {
             snd_pcm_prepare(capture);
             continue;
         }
         if (got < 0) {
+            if (use_tui) rx_tui_close();
             fprintf(stderr, "rx_live: snd_pcm_readi: %s\n",
                     snd_strerror((int)got));
             break;
@@ -520,6 +667,7 @@ int main(int argc, char **argv)
                 ssize_t plen = -1;
                 int golay_errs = 0, hmac_ok = -1;
                 int rs_errs = -1, used_golay_len = -1;
+                int rs_locs[32];
                 size_t sync_off_local = 0;
                 if (!try_decode_window(window, window_samples, &mp, &opts,
                                        sync_max_ham, use_hmac,
@@ -530,7 +678,8 @@ int main(int argc, char **argv)
                                        packet, sizeof packet,
                                        &plen, &golay_errs, &hmac_ok,
                                        &rs_errs, &used_golay_len,
-                                       &sync_off_local)) {
+                                       &sync_off_local,
+                                       rs_locs)) {
                     break;
                 }
                 inner_min_offset = sync_off_local + 1;
@@ -604,7 +753,15 @@ int main(int argc, char **argv)
                            packet, (size_t)plen,
                            golay_errs, hmac_ok, use_hmac,
                            rs_errs, used_golay_len,
-                           crc_status, crc_computed, crc_le, crc_be);
+                           crc_status, crc_computed, crc_le, crc_be,
+                           rs_locs,
+                           ref_buf_len > 0 ? ref_buf : NULL, ref_buf_len,
+                           /*force_beacon=*/0);
+                if (use_tui) {
+                    rx_tui_observe_frame(ts, packet, (size_t)plen,
+                                         golay_errs, hmac_ok, use_hmac,
+                                         rs_errs, crc_status);
+                }
             }
 
             // Slide the window.
@@ -614,6 +771,7 @@ int main(int argc, char **argv)
         }
     }
 
+    if (use_tui) rx_tui_close();
     if (g_stop) {
         fprintf(stderr, "rx_live: stopped on signal\n");
     }

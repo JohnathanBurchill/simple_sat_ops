@@ -171,42 +171,98 @@ int antenna_rotator_command(antenna_rotator_t *antenna_rotator, antenna_rotator_
 
 int antenna_rotator_increase_azimuth(antenna_rotator_t *antenna_rotator, double angle)
 {
-    double current_azimuth = antenna_rotator->target_azimuth;
-    double new_azimuth = current_azimuth + angle;
+    double base = antenna_rotator->unwrapped_target_valid
+        ? antenna_rotator->target_azimuth_unwrapped
+        : antenna_rotator->target_azimuth;
+    double new_azimuth = base + angle;
     if (new_azimuth < ANTENNA_ROTATOR_MINIMUM_AZIMUTH || new_azimuth > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
         return ANTENNA_ROTATOR_AZIMUTH_LIMIT;
     }
 
-    antenna_rotator->target_azimuth = new_azimuth;
-    double azimuth = antenna_rotator->target_azimuth;
-    double elevation = antenna_rotator->target_elevation;
-    int antenna_rotator_result = antenna_rotator_command(antenna_rotator, ANTENNA_ROTATOR_SET, &azimuth, &elevation);
-    if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
+    int rc = antenna_rotator_set_unwrapped(antenna_rotator, new_azimuth, antenna_rotator->target_elevation);
+    if (rc != ANTENNA_ROTATOR_OK) {
         fprintf(stderr, "Error setting antenna rotator position\n");
         return ANTENNA_ROTATOR_BAD_RESPONSE;
     }
-
     return ANTENNA_ROTATOR_OK;
 }
 
 int antenna_rotator_point_to_target(antenna_rotator_t *antenna_rotator, double azimuth, double elevation)
 {
-    if (azimuth < ANTENNA_ROTATOR_MINIMUM_AZIMUTH || azimuth > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
+    return antenna_rotator_set_unwrapped(antenna_rotator, azimuth, elevation);
+}
+
+double antenna_rotator_wrap_to_pm180(double d)
+{
+    while (d > 180.0)   d -= 360.0;
+    while (d <= -180.0) d += 360.0;
+    return d;
+}
+
+double antenna_rotator_accumulate_unwrapped(double prev, double pred_az)
+{
+    return prev + antenna_rotator_wrap_to_pm180(pred_az - prev);
+}
+
+// Pick the in-range co-terminal of `home_wrapped` (typically 0) with the
+// smallest absolute value, tiebreaking toward `prev`. The aim is to leave the
+// antenna physically at the home azimuth with as little accumulated rotation
+// as the rotator's mechanical range allows -- i.e., always unwind, never wind
+// another revolution. Used only by the home-return path.
+double antenna_rotator_home_unwrapped_target(double prev, double home_wrapped)
+{
+    double best = home_wrapped;
+    int have_best = 0;
+    // Cover [-720, +900], comfortably larger than the [-179, +539] mechanical range.
+    for (int k = -2; k <= 2; ++k) {
+        double c = home_wrapped + 360.0 * (double)k;
+        if (c < ANTENNA_ROTATOR_MINIMUM_AZIMUTH || c > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
+            continue;
+        }
+        if (!have_best
+            || fabs(c) < fabs(best)
+            || (fabs(c) == fabs(best) && fabs(c - prev) < fabs(best - prev))) {
+            best = c;
+            have_best = 1;
+        }
+    }
+    return best;
+}
+
+int antenna_rotator_seed_from_status(antenna_rotator_t *antenna_rotator)
+{
+    double az = 0.0, el = 0.0;
+    int rc = antenna_rotator_command(antenna_rotator, ANTENNA_ROTATOR_STATUS, &az, &el);
+    if (rc != ANTENNA_ROTATOR_OK) {
+        return rc;
+    }
+    antenna_rotator->azimuth = az;
+    antenna_rotator->elevation = el;
+    antenna_rotator->target_azimuth = az;
+    antenna_rotator->target_elevation = el;
+    antenna_rotator->target_azimuth_unwrapped = az;
+    antenna_rotator->unwrapped_target_valid = 1;
+    return ANTENNA_ROTATOR_OK;
+}
+
+int antenna_rotator_set_unwrapped(antenna_rotator_t *antenna_rotator, double az_unwrapped, double elevation)
+{
+    if (az_unwrapped < ANTENNA_ROTATOR_MINIMUM_AZIMUTH || az_unwrapped > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
         return ANTENNA_ROTATOR_AZIMUTH_LIMIT;
     }
     if (elevation < ANTENNA_ROTATOR_MINIMUM_ELEVATION || elevation > ANTENNA_ROTATOR_MAXIMUM_ELEVATION) {
         return ANTENNA_ROTATOR_ELEVATION_LIMIT;
     }
-
-    antenna_rotator->target_azimuth = azimuth;
-    antenna_rotator->target_elevation = elevation;
-    double cmd_azimuth = antenna_rotator->target_azimuth;
-    double cmd_elevation = antenna_rotator->target_elevation;
-    int antenna_rotator_result = antenna_rotator_command(antenna_rotator, ANTENNA_ROTATOR_SET, &cmd_azimuth, &cmd_elevation);
-    if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
+    double az = az_unwrapped;
+    double el = elevation;
+    int rc = antenna_rotator_command(antenna_rotator, ANTENNA_ROTATOR_SET, &az, &el);
+    if (rc != ANTENNA_ROTATOR_OK) {
         return ANTENNA_ROTATOR_BAD_RESPONSE;
     }
-
+    antenna_rotator->target_azimuth_unwrapped = az_unwrapped;
+    antenna_rotator->target_azimuth = az_unwrapped;
+    antenna_rotator->target_elevation = elevation;
+    antenna_rotator->unwrapped_target_valid = 1;
     return ANTENNA_ROTATOR_OK;
 }
 

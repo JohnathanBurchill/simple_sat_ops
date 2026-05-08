@@ -110,11 +110,17 @@ static void usage(FILE *f)
         "Commands:\n"
         "  init                       Run backend init() and exit.\n"
         "  uplink-prep                radio_uplink_prep() and exit.\n"
-        "  set-rx-clean               Prep radio for clean data RX: NB, DSP NR,\n"
-        "                             auto notch, contour OFF, AGC FAST. Yaesu\n"
-        "                             also pins Menu 079 = 9600 so DATA-OUT\n"
-        "                             carries the wide pre-de-emphasis path.\n"
-        "                             Run before rx_capture / rx_live.\n"
+        "  set-rx-clean               Prep radio for clean data RX. On Yaesu:\n"
+        "                             auto-info OFF, wide IF, all DSPs OFF\n"
+        "                             (NB / NR / auto-notch / manual-notch /\n"
+        "                             contour), AGC FAST, RF front-end at\n"
+        "                             max sensitivity (preamp ON, attenuator\n"
+        "                             OFF, RF gain max), IF shift centred,\n"
+        "                             repeater shift / CTCSS cleared, and\n"
+        "                             Menu 079 = 9600 for wide pre-de-emphasis\n"
+        "                             on rear DATA-OUT. Run before rx_capture\n"
+        "                             / rx_live. Squelch is left alone — use\n"
+        "                             set-squelch 0 to open it.\n"
         "  get-freq                   Print current frequency in Hz.\n"
         "  set-freq <hz>              Tune the active VFO.\n"
         "  set-mode <fm|usb|lsb|am|cw>          Operating mode.\n"
@@ -128,6 +134,19 @@ static void usage(FILE *f)
         "                             'NW' = absolute watts. Examples: 10, 10%%, 5W.\n"
         "  set-mod-level <0..100>     USB MOD level, %%.\n"
         "  set-moni-level <0..100>    Monitor level, %% (icom).\n"
+        "  set-squelch <0..100>       Carrier squelch threshold (Main VFO).\n"
+        "                             Pass 0 to open the squelch — required\n"
+        "                             for AX100 RX so the radio doesn't mute\n"
+        "                             the discriminator output between bursts.\n"
+        "  get-squelch                Read the current squelch level (Main VFO).\n"
+        "  send <cat>                 Send raw ASCII CAT bytes (Yaesu only)\n"
+        "                             and print any reply. Caller must include\n"
+        "                             the protocol terminator. Examples:\n"
+        "                               radio_ctl send 'FA;'\n"
+        "                               radio_ctl send 'MD0;'\n"
+        "                               radio_ctl send 'EX0700;'\n"
+        "                             A command with no reply prints nothing\n"
+        "                             and exits 0.\n"
         "  ptt <on|off>               Key / unkey.\n"
         "  power <on|off>             Soft power the radio on or off via CAT.\n"
         "                             Requires DC supply applied. Power-on\n"
@@ -559,6 +578,45 @@ int main(int argc, char **argv)
         } else {
             int raw = (pct * 255 + 50) / 100;
             rc = radio_set_moni_level(&r, raw);
+        }
+    }
+    else if (strcmp(cmd, "set-squelch") == 0) {
+        int pct;
+        if (i >= argc || parse_pct(argv[i], &pct) < 0) {
+            fprintf(stderr, "set-squelch: need <0..100>\n");
+            rc = RADIO_ERROR;
+        } else {
+            rc = radio_set_squelch(&r, pct);
+            if (rc == RADIO_OK && verify) {
+                int got = radio_get_squelch(&r);
+                if (got < 0) {
+                    fprintf(stderr, "set-squelch: verify read failed\n");
+                    rc = RADIO_BAD_RESPONSE;
+                } else if (got != pct) {
+                    fprintf(stderr, "set-squelch: MISMATCH requested=%d got=%d\n",
+                            pct, got);
+                    rc = RADIO_BAD_RESPONSE;
+                } else {
+                    fprintf(stderr, "set-squelch: verified %d\n", got);
+                }
+            }
+        }
+    }
+    else if (strcmp(cmd, "get-squelch") == 0) {
+        int v = radio_get_squelch(&r);
+        if (v < 0) { rc = RADIO_BAD_RESPONSE; }
+        else { printf("%d\n", v); }
+    }
+    else if (strcmp(cmd, "send") == 0) {
+        if (i >= argc) {
+            fprintf(stderr, "send: missing CAT bytes (e.g. 'FA;')\n");
+            rc = RADIO_ERROR;
+        } else {
+            char reply[256] = {0};
+            rc = radio_cat_send(&r, argv[i], reply, sizeof reply);
+            if (rc == RADIO_OK && reply[0] != '\0') {
+                printf("%s\n", reply);
+            }
         }
     }
     else if (strcmp(cmd, "power") == 0) {

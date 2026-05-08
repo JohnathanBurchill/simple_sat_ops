@@ -265,7 +265,8 @@ static ssize_t ax100_try_length(const uint8_t *scrambled, size_t on_wire_len,
                                 const ax100_opts_t *opts,
                                 uint8_t *out_packet, size_t out_packet_cap,
                                 int *out_hmac_ok,
-                                int *out_rs_errors)
+                                int *out_rs_errors,
+                                int *out_rs_locs)
 {
     // Scratch large enough for either RS-off (up to 4095 post-scramble,
     // which is impossible on-wire but tolerate here) or RS-on (<=255).
@@ -285,7 +286,8 @@ static ssize_t ax100_try_length(const uint8_t *scrambled, size_t on_wire_len,
         uint8_t decoded[RS_K];
         int rs_errs = 0;
         ssize_t rc = rs_pycsp_decode(inner, on_wire_len,
-                                     decoded, sizeof decoded, &rs_errs);
+                                     decoded, sizeof decoded, &rs_errs,
+                                     out_rs_locs);
         if (rc < 0) {
             if (out_rs_errors) *out_rs_errors = -1;
             return -1;
@@ -320,7 +322,8 @@ ssize_t ax100_unframe(const uint8_t *bytes, size_t n_bytes,
                       int *out_golay_errors,
                       int *out_hmac_ok,
                       int *out_rs_errors,
-                      int *out_used_golay_len)
+                      int *out_used_golay_len,
+                      int *out_rs_locs)
 {
     if (bytes == NULL || opts == NULL || out_packet == NULL) return -1;
     if (out_hmac_ok) *out_hmac_ok = -1;
@@ -376,7 +379,8 @@ ssize_t ax100_unframe(const uint8_t *bytes, size_t n_bytes,
         int hmac_tmp = -1, rs_tmp = -1;
         ssize_t r = ax100_try_length(scrambled, golay_len, opts,
                                      out_packet, out_packet_cap,
-                                     &hmac_tmp, &rs_tmp);
+                                     &hmac_tmp, &rs_tmp,
+                                     out_rs_locs);
         if (r >= 0) {
             if (out_hmac_ok) *out_hmac_ok = hmac_tmp;
             if (out_rs_errors) *out_rs_errors = rs_tmp;
@@ -402,7 +406,8 @@ ssize_t ax100_unframe(const uint8_t *bytes, size_t n_bytes,
             int hmac_tmp = -1, rs_tmp = -1;
             ssize_t r = ax100_try_length(scrambled, L, opts,
                                          out_packet, out_packet_cap,
-                                         &hmac_tmp, &rs_tmp);
+                                         &hmac_tmp, &rs_tmp,
+                                         out_rs_locs);
             if (r >= 0) {
                 if (out_hmac_ok) *out_hmac_ok = hmac_tmp;
                 if (out_rs_errors) *out_rs_errors = rs_tmp;

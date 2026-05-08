@@ -38,12 +38,17 @@ static const radio_backend_ops_t *default_ops_or_default(const radio_backend_ops
     return ops ? ops : radio_backend_yaesu_cat_ops();
 }
 
-// One-line warning when a caller hits an op the active backend doesn't
-// implement. Centralised so the message is uniform.
+// Returns RADIO_NOT_SUPPORTED. Logs only when the backend is missing
+// entirely (programmer error / forgot --with-radio); a NULL slot on a
+// real backend is intentional (e.g. FT-991A leaves set_vfo NULL because
+// there's only one VFO) and the caller already handles the return code.
 static int unsupported(const radio_t *r, const char *op)
 {
-    const char *backend = (r && r->ops && r->ops->name) ? r->ops->name : "(unset)";
-    fprintf(stderr, "radio: op '%s' not supported by backend '%s'\n", op, backend);
+    if (!r || !r->ops) {
+        const char *backend = (r && r->ops && r->ops->name) ? r->ops->name : "(unset)";
+        fprintf(stderr, "radio: op '%s' but no backend selected (backend=%s)\n",
+                op, backend);
+    }
     return RADIO_NOT_SUPPORTED;
 }
 
@@ -186,6 +191,29 @@ int radio_set_rf_power_watts(radio_t *radio, int watts)
 {
     if (!radio || !radio->ops || !radio->ops->set_rf_power_watts) return unsupported(radio, "set_rf_power_watts");
     return radio->ops->set_rf_power_watts(radio, watts);
+}
+
+int radio_set_squelch(radio_t *radio, int level_0_to_100)
+{
+    if (!radio || !radio->ops || !radio->ops->set_squelch) return unsupported(radio, "set_squelch");
+    return radio->ops->set_squelch(radio, level_0_to_100);
+}
+
+int radio_get_squelch(radio_t *radio)
+{
+    if (!radio || !radio->ops || !radio->ops->get_squelch) {
+        unsupported(radio, "get_squelch");
+        return -1;
+    }
+    return radio->ops->get_squelch(radio);
+}
+
+int radio_cat_send(radio_t *radio, const char *cmd, char *reply, int reply_cap)
+{
+    if (reply != NULL && reply_cap > 0) reply[0] = '\0';
+    if (!radio || !radio->ops || !radio->ops->cat_send) return unsupported(radio, "cat_send");
+    if (cmd == NULL) return RADIO_ERROR;
+    return radio->ops->cat_send(radio, cmd, reply, reply_cap);
 }
 
 // Composition of primitives. Backends that NULL out set_data_mode

@@ -60,6 +60,13 @@ typedef struct antenna_rotator
     double target_elevation;
     double azimuth;
     double elevation;
+    // Last commanded extended-range azimuth; canonical for path planning.
+    // target_azimuth is kept as the display-friendly (often wrapped) form.
+    double target_azimuth_unwrapped;
+    int unwrapped_target_valid;
+    // Pending second leg when a home-return needs an intermediate waypoint.
+    double home_pending_final_az;
+    int homing_in_progress;
     int fixed_target;
     int tracking;
     double tracking_prep_time_minutes;
@@ -73,5 +80,11 @@ void antenna_rotator_connect(antenna_rotator_t *antenna_rotator);
 int antenna_rotator_command(antenna_rotator_t *antenna_rotator, antenna_rotator_command_t cmd, double *azimuth, double *elevation);
 int antenna_rotator_increase_azimuth(antenna_rotator_t *antenna_rotator, double angle);
 int antenna_rotator_point_to_target(antenna_rotator_t *antenna_rotator, double azimuth, double elevation);
+
+double antenna_rotator_wrap_to_pm180(double delta_deg);
+double antenna_rotator_accumulate_unwrapped(double prev_unwrapped, double prediction_az);
+double antenna_rotator_home_unwrapped_target(double prev_unwrapped, double home_az_wrapped);
+int antenna_rotator_seed_from_status(antenna_rotator_t *antenna_rotator);
+int antenna_rotator_set_unwrapped(antenna_rotator_t *antenna_rotator, double az_unwrapped, double elevation);
 
 #endif // ANTENNA_ROTATOR_H

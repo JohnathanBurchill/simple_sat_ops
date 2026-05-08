@@ -117,7 +117,7 @@ void rs_encode(const uint8_t data_in[KK], uint8_t codeword_out[NN])
     }
 }
 
-int rs_decode(uint8_t block[NN])
+int rs_decode(uint8_t block[NN], int *out_locs)
 {
     int syndromes[NROOTS];
     for (int i = 0; i < NROOTS; ++i) syndromes[i] = block[0];
@@ -271,6 +271,9 @@ int rs_decode(uint8_t block[NN])
                 (int)INDEX_OF[num1] + (int)INDEX_OF[num2] + NN - (int)INDEX_OF[den])];
         }
     }
+    if (out_locs != NULL) {
+        for (int j = 0; j < count; ++j) out_locs[j] = loc[j];
+    }
     return count;
 }
 
@@ -295,7 +298,8 @@ ssize_t rs_pycsp_encode(const uint8_t *in, size_t in_len,
 
 ssize_t rs_pycsp_decode(const uint8_t *in, size_t in_len,
                         uint8_t *out, size_t out_cap,
-                        int *out_errors)
+                        int *out_errors,
+                        int *out_locs)
 {
     if (in == NULL || out == NULL) return -1;
     if (in_len <= NROOTS || in_len > NN) return -1;
@@ -307,9 +311,16 @@ ssize_t rs_pycsp_decode(const uint8_t *in, size_t in_len,
     memset(buf, 0, padding);
     memcpy(buf + padding, in, in_len);
 
-    int errs = rs_decode(buf);
+    int errs = rs_decode(buf, out_locs);
     if (errs < 0) return -1;
     if (out_errors) *out_errors = errs;
+
+    // Translate codeword indices (0..NN-1) to on-wire byte offsets
+    // (0..in_len-1). Anything left negative landed in the synthetic
+    // zero-pad and signals an RS-solver false correction.
+    if (out_locs != NULL) {
+        for (int i = 0; i < errs; ++i) out_locs[i] -= (int)padding;
+    }
 
     memcpy(out, buf + padding, data_len);
     return (ssize_t)data_len;

@@ -6,11 +6,15 @@
     it for the AX100 (HMAC + scrambler + Golay length + sync word + pre/
     postamble), modulates to baseband PCM, then:
 
-        1. CI-V PTT on
-        2. optional pre-audio settle (guard-time)
-        3. stream the baseband PCM to an ALSA playback device
-        4. optional post-audio settle
-        5. CI-V PTT off
+        1. CAT PTT on
+        2. stream baseband PCM = preroll 0xAA + AX100 frame + postroll 0xAA
+           to an ALSA playback device. The preroll modulation bridges the
+           radio's PA ramp-up so the satellite RX sees a clean modulated-
+           carrier rise rather than 200 ms of unmodulated carrier ahead
+           of the AX100 preamble (which would let the squelch open on a
+           steady tone before the bit-clock loop has anything to lock on).
+        3. snd_pcm_drain to flush ALSA's buffer
+        4. CAT PTT off
 
     Intended for bench / commissioning TX tests. No pass-event scheduling,
     no current_telecommand.txt watcher, no looping. One frame per run.
@@ -194,11 +198,11 @@ static void usage(FILE *out, const char *argv0)
         "  --payload-hex=<HEX>         Payload as hex\n"
         "  --payload-ascii=<STR>       Payload as literal ASCII bytes\n"
         "\n"
-        "CSP header (defaults shown):\n"
-        "  --src=<0..31>               source address (1)\n"
-        "  --dst=<0..31>               destination address (2)\n"
-        "  --dport=<0..63>             destination port (3)\n"
-        "  --sport=<0..63>             source port (4)\n"
+        "CSP header (defaults shown — match cts_send to FrontierSat OBC):\n"
+        "  --src=<0..31>               source address (10 = GCS)\n"
+        "  --dst=<0..31>               destination address (1 = OBC)\n"
+        "  --dport=<0..63>             destination port (7 = CTS1 command)\n"
+        "  --sport=<0..63>             source port (16)\n"
         "  --prio=<0..3>               priority, 2=norm (2)\n"
         "\n"
         "HMAC / FEC:\n"
@@ -237,8 +241,18 @@ static void usage(FILE *out, const char *argv0)
         "                              mic+usb|lan. Inferred from --signalink-audio /\n"
         "                              --radio-audio above; pass explicitly to\n"
         "                              override.\n"
-        "  --pre-ms=<ms>               Delay after PTT on before audio starts (200)\n"
-        "  --post-ms=<ms>              Delay after audio ends before PTT off (200)\n"
+        "  --preroll-ms=<ms>           Modulated 0xAA bytes prepended to the\n"
+        "                              AX100 frame (default 200). Bridges\n"
+        "                              the radio's PA ramp-up time so the\n"
+        "                              satellite RX sees a clean modulated-\n"
+        "                              carrier rise, not unmodulated carrier\n"
+        "                              followed by the preamble. --pre-ms is\n"
+        "                              an alias.\n"
+        "  --postroll-ms=<ms>          Modulated 0xAA bytes appended to the\n"
+        "                              AX100 frame (default 200). Holds the\n"
+        "                              modulator busy past the tail-fill byte\n"
+        "                              while the PA carrier drops. --post-ms\n"
+        "                              is an alias.\n"
         "  --record=<path>             Capture audio device to <path> (headerless\n"
         "                              S16_LE; default: auto-generated\n"
         "                              tx_frame_UT=YYYYMMDDTHHMMSS.sss.raw in CWD)\n"
@@ -278,8 +292,8 @@ int main(int argc, char **argv)
     int use_hmac = 1;
     int use_rs = 1;  // default ON to match pycsplink uplink
     int dry_run = 0;
-    int pre_ms = 200;
-    int post_ms = 200;
+    int preroll_ms  = 200;
+    int postroll_ms = 200;
     int moni_level_pct = -1;  // < 0 = don't touch
     int uplink_mod_level = -1;  // < 0 = don't touch (% 0..100)
     int tx_power_pct = -1;  // < 0 = don't touch (% 0..100)
@@ -291,10 +305,15 @@ int main(int argc, char **argv)
     radio_backend_type_t radio_backend = RADIO_BACKEND_YAESU_CAT;
     int record_warmup_ms = 600;
 
+    // Defaults match the cts_send gold reference in
+    // CalgaryToSpace/CTS-SAT-1-Ground-Station/gnu_radio/supporting_demo_scripts/pycsp_tx.py:
+    // src = GCS_ADDR (10), dst = OBC_ADDR (1), dport = 7 (CTS1 command
+    // handler), sport = 16, prio = norm. CSP-layer flags stay 0 — the
+    // HMAC trailer is added at the AX100 layer, not inside the packet.
     csp_v1_header_t csp_hdr = {
         .prio = CSP_PRIO_NORM,
-        .src = 1, .dst = 2,
-        .dport = 3, .sport = 4,
+        .src = 10, .dst = 1,
+        .dport = 7, .sport = 16,
         .flags = 0,
     };
     modem_params_t mp;
@@ -376,8 +395,10 @@ int main(int argc, char **argv)
             record_warmup_ms = atoi(a + 19);
             if (record_warmup_ms < 0) record_warmup_ms = 0;
         }
-        else if (starts_with(a, "--pre-ms="))           pre_ms       = atoi(a + 9);
-        else if (starts_with(a, "--post-ms="))          post_ms      = atoi(a + 10);
+        else if (starts_with(a, "--preroll-ms="))       preroll_ms   = atoi(a + 13);
+        else if (starts_with(a, "--postroll-ms="))      postroll_ms  = atoi(a + 14);
+        else if (starts_with(a, "--pre-ms="))           preroll_ms   = atoi(a + 9);
+        else if (starts_with(a, "--post-ms="))          postroll_ms  = atoi(a + 10);
         else if (strcmp(a, "--dry-run") == 0)           dry_run = 1;
         else {
             fprintf(stderr, "unknown option: %s\n", a);
@@ -468,18 +489,45 @@ int main(int argc, char **argv)
     if (frame_len < 0) { fprintf(stderr, "ax100_frame failed\n"); return 1; }
 
     int sps = mp.samp_rate / mp.bit_rate;
-    size_t n_samples = (size_t)frame_len * 8u * (size_t)sps;
+    // Convert the requested preroll/postroll milliseconds into whole
+    // 0xAA bytes at the modem's bit rate. Whole-byte granularity keeps
+    // the modem call simple; the requested ms is approximate anyway.
+    // At 9600 bps, 200 ms = 240 bytes — plenty to cover the FT-991A's
+    // PA ramp-up + ALSA fill latency. The modem already prefixes the
+    // AX100 frame with its standard 32-byte preamble, so the satellite
+    // RX just sees a longer-than-32-byte 0xAA preamble run; that's
+    // strictly harmless.
+    if (preroll_ms  < 0) preroll_ms  = 0;
+    if (postroll_ms < 0) postroll_ms = 0;
+    size_t preroll_bytes  = (size_t)preroll_ms  * (size_t)mp.bit_rate / 8000;
+    size_t postroll_bytes = (size_t)postroll_ms * (size_t)mp.bit_rate / 8000;
+    size_t padded_len = preroll_bytes + (size_t)frame_len + postroll_bytes;
+    uint8_t *padded = (uint8_t *)malloc(padded_len);
+    if (padded == NULL) {
+        fprintf(stderr, "out of memory for %zu padded frame bytes\n", padded_len);
+        return 1;
+    }
+    memset(padded, 0xAA, preroll_bytes);
+    memcpy(padded + preroll_bytes, frame, (size_t)frame_len);
+    memset(padded + preroll_bytes + (size_t)frame_len, 0xAA, postroll_bytes);
+
+    size_t n_samples = padded_len * 8u * (size_t)sps;
     int16_t *samples = (int16_t *)malloc(n_samples * sizeof(int16_t));
     if (samples == NULL) {
         fprintf(stderr, "out of memory for %zu samples\n", n_samples);
+        free(padded);
         return 1;
     }
-    ssize_t n = modem_bytes_to_pcm16(frame, (size_t)frame_len, &mp, samples, n_samples);
+    ssize_t n = modem_bytes_to_pcm16(padded, padded_len, &mp, samples, n_samples);
+    free(padded);
     if (n < 0) { fprintf(stderr, "modem_bytes_to_pcm16 failed\n"); free(samples); return 1; }
 
     double tx_seconds = (double)n_samples / (double)mp.samp_rate;
-    fprintf(stderr, "tx_frame: frame=%zd bytes, %zu samples, %.3f s on-air\n",
-            frame_len, n_samples, tx_seconds);
+    fprintf(stderr,
+            "tx_frame: frame=%zd bytes (+%zu preroll + %zu postroll = %zu),"
+            " %zu samples, %.3f s on-air\n",
+            frame_len, preroll_bytes, postroll_bytes, padded_len,
+            n_samples, tx_seconds);
 
     if (dry_run) {
         fprintf(stderr, "tx_frame: --dry-run, not keying PTT\n");
@@ -647,8 +695,11 @@ int main(int argc, char **argv)
         free(samples);
         return 1;
     }
-    if (pre_ms > 0) usleep((useconds_t)pre_ms * 1000);
 
+    // No pre-audio sleep: the preroll 0xAA bytes at the head of the
+    // PCM buffer already do the bridging job, and ALSA's own ~50-100 ms
+    // buffer fill latency gives the radio time to commit to TX state
+    // before the first modulator-bound sample emerges.
     size_t written = 0;
     while (written < n_samples) {
         snd_pcm_sframes_t wrote = snd_pcm_writei(pcm, samples + written, n_samples - written);
@@ -663,8 +714,10 @@ int main(int argc, char **argv)
     }
     snd_pcm_drain(pcm);
 
-    if (post_ms > 0) usleep((useconds_t)post_ms * 1000);
-
+    // No post-audio sleep: snd_pcm_drain blocks until the buffer has
+    // emptied out the device, and the postroll 0xAA bytes at the tail
+    // of the PCM keep the modulator busy past the AX100 tail-fill
+    // byte. Drop PTT immediately afterwards.
     fprintf(stderr, "tx_frame: PTT off\n");
     radio_ptt(&radio, 0);
 

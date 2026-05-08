@@ -128,17 +128,17 @@
 static void yaesu_cat_connect(radio_t *radio);
 static void yaesu_cat_disconnect(radio_t *radio);
 
-// Print the wire trace for one CAT exchange. Default is the ASCII form
-// (these are text commands, after all). --debug-output flips on the
-// hex-bytes view useful when chasing parity / encoding issues.
+// Print the wire trace for one CAT exchange. Silent unless --debug-wire
+// is on; otherwise the ASCII trace (or the QOL-gated hex form) would
+// scribble across simple_sat_ops's curses screen on every FA/MD/EX
+// command. radio_ctl users who want traces pass --debug-wire.
 static void yaesu_trace(const radio_t *r, const char *label,
                         const char *bytes, size_t len)
 {
-    if (r->debug_wire) {
-        printcmd(label, (const unsigned char *)bytes, (int)len);
-    } else {
-        fprintf(stderr, "%s %.*s\n", label, (int)len, bytes);
-    }
+    if (!r->debug_wire) return;
+    fprintf(stderr, "%s %.*s\n", label, (int)len, bytes);
+    // Hex form too if the binary was built with QOL; no-op otherwise.
+    printcmd(label, (const unsigned char *)bytes, (int)len);
 }
 
 // Send an ASCII CAT command (no terminator added — caller includes the ';').
@@ -458,6 +458,56 @@ static int yaesu_cat_set_rf_power_watts(radio_t *radio, int watts)
     return yaesu_send(radio, cmd, NULL, 0);
 }
 
+// SQ<vfo><level>; carrier squelch threshold (CAT manual page 18).
+// VFO 0 = Main, 1 = Sub. Level is 000..100; 000 = squelch open. We only
+// drive Main here — the simple_sat_ops radio path is single-VFO and Sub
+// is parked. For FrontierSat AX100 RX we want this at 0 so the rear
+// DATA-OUT discriminator output is unmuted regardless of signal level
+// (frame detection runs downstream).
+static int yaesu_cat_set_squelch(radio_t *radio, int level_0_to_100)
+{
+    if (level_0_to_100 < 0)   level_0_to_100 = 0;
+    if (level_0_to_100 > 100) level_0_to_100 = 100;
+    char cmd[16];
+    snprintf(cmd, sizeof cmd, "SQ0%03d;", level_0_to_100);
+    return yaesu_send(radio, cmd, NULL, 0);
+}
+
+static int yaesu_cat_get_squelch(radio_t *radio)
+{
+    char rep[32] = {0};
+    if (yaesu_send(radio, "SQ0;", rep, sizeof rep) != RADIO_OK) {
+        return -1;
+    }
+    // Reply is "SQ0nnn;" — 7 chars.
+    if (strncmp(rep, "SQ0", 3) != 0 || strlen(rep) < 7) {
+        return -1;
+    }
+    char digits[4] = { rep[3], rep[4], rep[5], 0 };
+    int v = atoi(digits);
+    if (v < 0 || v > 100) return -1;
+    return v;
+}
+
+// Raw CAT passthrough for radio_ctl's `send` subcommand. yaesu_send
+// reports RADIO_BAD_RESPONSE if the caller asked for a reply and the
+// read timed out; here we map "no bytes" to RADIO_OK with an empty
+// reply so the operator can throw arbitrary CAT (including
+// fire-and-forget commands like PS0;) without having to predict
+// whether a given command produces a response.
+static int yaesu_cat_cat_send(radio_t *radio, const char *cmd,
+                              char *reply, int reply_cap)
+{
+    if (reply == NULL || reply_cap <= 0) {
+        return yaesu_send(radio, cmd, NULL, 0);
+    }
+    int rc = yaesu_send(radio, cmd, reply, (size_t)reply_cap);
+    if (rc == RADIO_BAD_RESPONSE && reply[0] == '\0') {
+        return RADIO_OK;
+    }
+    return rc;
+}
+
 static int yaesu_cat_ptt(radio_t *radio, int on)
 {
     // TX1; = key via CAT (RADIO TX OFF / CAT TX ON in the manual's
@@ -502,29 +552,47 @@ static int yaesu_cat_power(radio_t *radio, int on)
     return yaesu_send(radio, "PS0;", NULL, 0);
 }
 
-// RX-side cleanup for data decode. The rear DATA-OUT path on the FT-991A
-// has at least four DSPs that subtly mangle 9600-baud bit transitions
-// while leaving voice audio sounding fine: noise blanker, DSP NR, auto
-// notch and contour. Forces them all OFF, sets AGC FAST so peaks aren't
-// squashed across burst boundaries, and pins Menu 079 = 9600 so the rear
-// DATA jack carries the wide pre-de-emphasis discriminator output.
+// Full RX prep for AX100 downlink decode. Drives the radio into a known
+// clean state so 9600-baud GFSK bit transitions reach the rear DATA-OUT
+// undistorted. Mode and frequency are left alone — call radio_uplink_prep
+// first if D-FM at 436.150 also needs to be set. Resilient: if the
+// firmware rejects one command we log it and keep going.
 //
-// Resilient: on the (unlikely) chance the radio rejects one command (e.g.
-// firmware variant that doesn't recognise BC00; or CO0000;), we log it
-// and continue rather than aborting partway through. Mode is left alone
-// — call radio_uplink_prep first if D-FM also needs to be set.
+// Groups of commands and why each matters:
+//   - Auto-info OFF: stops unsolicited status bytes from colliding
+//     with our yaesu_send reads.
+//   - Wide IF (NA00) + Menu 079 PKT MODE = 9600: 9600 GFSK deviation
+//     needs the wide bandpass; narrow clips the modulation tails.
+//   - DSPs OFF (NB / NR / auto-notch / manual-notch / contour) and
+//     AGC FAST: each of these subtly mangles bit transitions while
+//     leaving voice audio sounding fine.
+//   - RX front-end max sensitivity (RF gain max, attenuator off,
+//     preamp AMP1 on): satellite downlinks are weak.
+//   - IF shift centered, repeater shift off, CTCSS off: recover from
+//     voice-mode leftovers that would otherwise off-tune or tone-gate
+//     the receiver. Without CT00 a leftover sub-audible tone squelch
+//     mutes RX completely.
 static int yaesu_cat_set_rx_clean(radio_t *radio)
 {
     static const struct {
         const char *cmd;
         const char *what;
     } steps[] = {
-        {"EX0791;", "Menu 079 PKT MODE = 9600"},
-        {"NB0;",    "noise blanker OFF"},
-        {"NR0;",    "DSP NR OFF"},
-        {"BC00;",   "auto notch OFF"},
-        {"CO0000;", "contour OFF"},
-        {"GT01;",   "AGC FAST"},
+        {"AI0;",      "Auto-info OFF"},
+        {"NA00;",     "Wide IF (NAR OFF)"},
+        {"EX0791;",   "Menu 079 PKT MODE = 9600"},
+        {"NB0;",      "noise blanker OFF"},
+        {"NR0;",      "DSP NR OFF"},
+        {"BC00;",     "auto notch OFF"},
+        {"BP0000;",   "manual notch OFF"},
+        {"CO0000;",   "contour OFF"},
+        {"GT01;",     "AGC FAST"},
+        {"RG0255;",   "RF gain max"},
+        {"RA00;",     "RF attenuator OFF"},
+        {"PA01;",     "preamp = AMP1"},
+        {"IS0+0000;", "IF shift centered"},
+        {"OS00;",     "repeater shift OFF"},
+        {"CT00;",     "CTCSS OFF"},
     };
     int errors = 0;
     for (size_t i = 0; i < sizeof steps / sizeof steps[0]; i++) {
@@ -556,6 +624,9 @@ static const radio_backend_ops_t yaesu_cat_ops = {
     .set_moni_level        = NULL,  // future Menu 009 helper if ever needed
     .set_rf_power          = yaesu_cat_set_rf_power,
     .set_rf_power_watts    = yaesu_cat_set_rf_power_watts,
+    .set_squelch           = yaesu_cat_set_squelch,
+    .get_squelch           = yaesu_cat_get_squelch,
+    .cat_send              = yaesu_cat_cat_send,
     .ptt                   = yaesu_cat_ptt,
     .power                 = yaesu_cat_power,
     .get_band_selection    = NULL,

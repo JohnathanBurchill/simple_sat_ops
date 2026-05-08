@@ -46,7 +46,12 @@ void rs_encode(const uint8_t data_in[RS_K], uint8_t codeword_out[RS_N]);
 // corrected byte errors (0..16). On failure (uncorrectable) returns -1.
 // Only codeword[0..222] (the data portion) is guaranteed meaningful after
 // decode; the parity tail is overwritten.
-int rs_decode(uint8_t codeword[RS_N]);
+//
+// out_locs (optional): if non-NULL, must have at least RS_NROOTS slots.
+// On a non-negative return, the first `return` entries hold the codeword
+// indices (0..RS_N-1) of corrected bytes, in the order the Forney
+// algorithm produced them.
+int rs_decode(uint8_t codeword[RS_N], int *out_locs);
 
 // pycsplink-compatible encode: left-zero-pad input to 223 bytes, RS-encode,
 // strip the leading padding. Output length = in_len + 32 (the 32-byte
@@ -59,9 +64,16 @@ ssize_t rs_pycsp_encode(const uint8_t *in, size_t in_len,
 // strip the leading padding and parity. Output length = in_len - 32.
 // in_len must satisfy 32 < in_len <= 255.
 // *out_errors (optional): number of corrected byte errors.
+// out_locs (optional): if non-NULL, must have at least RS_NROOTS slots.
+// On success, the first *out_errors entries hold byte offsets relative
+// to the start of `in` (range 0..in_len-1; the last 32 are the RS parity
+// tail). RS-solver false-corrections that land in the synthetic
+// zero-pad region are emitted as negative offsets so the operator can
+// flag them; this is rare in practice.
 // Returns output length on success, -1 on uncorrectable / bad args.
 ssize_t rs_pycsp_decode(const uint8_t *in, size_t in_len,
                         uint8_t *out, size_t out_cap,
-                        int *out_errors);
+                        int *out_errors,
+                        int *out_locs);
 
 #endif // RS_H

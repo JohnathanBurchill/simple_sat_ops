@@ -8,7 +8,9 @@
     -> 16-bit mono PCM.
 
     Default parameters match the FrontierSat link: samp_rate=48000,
-    bit_rate=9600, Gaussian BT=0.5 across 4 symbols, gain=0 dB.
+    bit_rate=9600, no Gaussian filter (rectangular NRZ — the gr-satellites
+    fsk_demodulator the gold-reference receiver uses is matched to NRZ
+    FSK), gain=0 dB.
 
     Copyright (C) 2025  Johnathan K Burchill
 
@@ -50,7 +52,8 @@ typedef struct modem_params {
 } modem_params_t;
 
 // Initializes p to the FrontierSat defaults (9600 bps at 48 kHz,
-// Gaussian BT=0.5, 4-symbol span, unity gain).
+// no Gaussian filter (rectangular NRZ), 4-symbol span (irrelevant
+// when BT=0), unity gain).
 void modem_params_defaults(modem_params_t *p);
 
 // Modulates frame bytes into mono 16-bit PCM samples at p->samp_rate.
@@ -68,13 +71,19 @@ int pcm16_write_wav(const char *path,
 
 // Demodulator: recover bit stream from mono int16 PCM and find the AX100
 // ASM (0x930B51DE) sync word. Pipeline:
-//   1. High-pass (DC-block, α=0.995 IIR) — defeats rtl_fm discriminator drift
-//   2. Bipolar threshold at 0: sample mid-bit, bit = (x > 0)
-//   3. Try both polarities and all sps = samp_rate/bit_rate phase offsets;
-//      pick the first combination whose resulting bit stream contains the
-//      ASM within sync_max_ham bit errors.
-//   4. Copy the bit stream starting AT the ASM into out_bits; record the
-//      bit-stream start offset for diagnostics.
+//   1. High-pass (DC-block, α=0.995 IIR) — defeats discriminator drift
+//   2. AGC: divide by signal RMS so downstream gains are scale-free
+//   3. Matched filter: sliding boxcar of length sps = samp_rate/bit_rate.
+//      For rectangular NRZ this is the integrate-and-dump optimum
+//      (~10·log10(sps) dB SNR gain over single-sample slicing).
+//   4. Mueller-Müller decision-directed symbol-timing recovery: one strobe
+//      per symbol, linearly interpolated from the matched-filter output;
+//      proportional loop filter pulls in within a few symbols.
+//   5. Hard slicer at 0 (sign of the strobe sample). M&M is sign-invariant
+//      under polarity flip, so a single timing loop produces the strobe
+//      samples that we then slice under each polarity to handle the
+//      radio-side FM-discriminator convention.
+//   6. ASM search over the resulting bit stream; pick lowest-Hamming match.
 //
 // invert_polarity: preferred polarity to try first (0 normal, 1 inverted).
 // Both are always tried; this just changes the order.

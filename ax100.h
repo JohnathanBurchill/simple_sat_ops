@@ -114,6 +114,15 @@ ssize_t ax100_frame(const uint8_t *packet, size_t packet_len,
 // *out_used_golay_len (optional) is 1 if the Golay-decoded length was
 // accepted, 0 if the brute-force length search found a different length,
 // -1 if not applicable. Useful for debugging weak-signal captures.
+// out_rs_locs (optional): if non-NULL, must have at least 32 slots
+// (RS_NROOTS). On success with reed_solomon enabled, the first
+// *out_rs_errors entries hold byte offsets of corrected bytes relative
+// to the start of the on-wire scrambled payload (i.e., the byte right
+// after the Golay24 length header). The last 32 of those positions are
+// the RS parity tail; lower positions are the data portion. Negative
+// offsets indicate RS placed a (likely false) correction in the
+// synthetic zero-pad region. Useful for spotting timing-drift signatures
+// (errors clustering at high offsets) vs. uniform BER.
 //
 // Returns -1 on any fatal error (missing ASM, uncorrectable Golay AND
 // no RS fallback, no candidate satisfying RS+HMAC, invalid args).
@@ -123,6 +132,7 @@ ssize_t ax100_unframe(const uint8_t *bytes, size_t n_bytes,
                       int *out_golay_errors,
                       int *out_hmac_ok,
                       int *out_rs_errors,
-                      int *out_used_golay_len);
+                      int *out_used_golay_len,
+                      int *out_rs_locs);
 
 #endif // AX100_H

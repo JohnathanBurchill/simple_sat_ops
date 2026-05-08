@@ -52,6 +52,13 @@
 //   -2    RS uncorrectable, descrambled-but-uncorrected bytes returned
 //         via packet/packet_len so the operator can still see the data
 //         (only happens when allow_partial_rs is on and HMAC is off).
+//
+// out_rs_locs (optional): if non-NULL, must have at least 32 slots. On a
+// successful RS decode the first *out_rs_errs entries are byte offsets
+// of corrected bytes relative to the start of the on-wire scrambled
+// payload (last 32 are RS parity tail; lower indices are data). Lets
+// callers print where in each frame the errors landed so the operator
+// can spot timing-drift signatures (tail-clustered) vs uniform BER.
 int try_decode_window(const int16_t *samples, size_t n_samples,
                       const modem_params_t *mp,
                       const ax100_opts_t *opts,
@@ -64,18 +71,69 @@ int try_decode_window(const int16_t *samples, size_t n_samples,
                       ssize_t *out_packet_len,
                       int *out_golay_errs, int *out_hmac_ok,
                       int *out_rs_errs, int *out_used_golay_len,
-                      size_t *out_sync_off);
+                      size_t *out_sync_off,
+                      int *out_rs_locs);
 
 // Append-only log line writer. Re-opens the log per frame so log
 // rotation works (mv the log mid-run, next frame creates a fresh
 // file). Mirrored to stdout if not quiet. ts is the timestamp string
 // the caller picks — UTC wall clock for rx_live, file-relative
 // "t=NN.NNNs" for rx_replay — always wrapped in [...] in the output.
+//
+// rs_locs (optional, NULL ok): pointer to the on-wire byte offsets of
+// the bytes RS corrected. When non-NULL and rs_errs > 0, an extra line
+//   `[ts] rs_locs: corrected=N of M on-wire bytes: a b c ...`
+// is emitted (M = packet_len + (use_hmac?4:0) + 32). The list helps the
+// operator distinguish tail-clustered errors (clock drift) from
+// scattered errors (channel noise).
+//
+// ref_buf / ref_len (optional, NULL/0 ok): a known-good reference to
+// compare the decoded bytes against. If ref_len matches packet_len the
+// diff runs over the full packet (positions reported as packet bytes);
+// if ref_len matches the payload length (packet_len - 4) the diff runs
+// over just the payload (positions reported as payload bytes). On a
+// length mismatch the line reports the mismatch and skips. Useful when
+// RS gave up (rs_errs == -2 / partial-RS rescue) and the operator has
+// a clean copy of the same frame to diff against.
+//
+// force_beacon (non-zero): bypass the dispatch and always print the
+// payload as a CTS1 basic beacon. Bytes below 130 are zero-padded;
+// bytes beyond 130 are truncated. Useful for prying telemetry out of
+// frames whose magic bytes / length got mangled. Affects text output
+// only (the TUI keeps its own length-based routing).
 void emit_frame(const char *log_path, int quiet, const char *ts,
                 const uint8_t *packet, size_t packet_len,
                 int golay_errs, int hmac_ok, int use_hmac,
                 int rs_errs, int used_golay_len,
                 int crc_status,
-                uint32_t crc_computed, uint32_t crc_le, uint32_t crc_be);
+                uint32_t crc_computed, uint32_t crc_le, uint32_t crc_be,
+                const int *rs_locs,
+                const uint8_t *ref_buf, size_t ref_len,
+                int force_beacon);
+
+// Headers toggle. When OFF (the default for live/replay tools), emit_frame
+// hides the AX100 framing line, the CSP v1 header line, the rs_locs and
+// ref_diff lines, the csp_crc32-OK confirmation, and the per-frame hex /
+// ascii dumps. The interpreted body lines (beacon: / tcmd_response: /
+// log: / bulk_file:) and error conditions (HMAC mismatch, csp_crc32
+// mismatch, rs=UNCORRECTABLE) are always shown either way.
+//
+// rx_decode (offline forensic CLI) defaults this ON; rx_live, rx_replay,
+// b210_rx_live default it OFF and expose --packet-headers / `packetheaders
+// on` to flip it. Flag is process-global because emit_frame is called
+// from many sites and threading the bool through every call site would
+// be churn for no benefit.
+void decode_loop_set_show_headers(int on);
+int  decode_loop_show_headers(void);
+
+// Parse and apply a single REPL command. Returns 1 if recognised and
+// handled, 0 if unknown. On success writes a one-line status into
+// status_buf (truncated to cap) for the caller to surface via
+// rx_tui_set_status / stderr / log. Recognised commands:
+//   "packetheaders on"   / "packetheaders off"
+//   "ph on"              / "ph off"
+// Unknown input leaves status_buf empty and returns 0 so the caller can
+// chain its own per-tool commands (sq, spectrum, force-beacon, ...).
+int decode_loop_try_command(const char *cmd, char *status_buf, size_t cap);
 
 #endif // DECODE_LOOP_H

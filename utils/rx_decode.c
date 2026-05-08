@@ -36,6 +36,7 @@
 */
 
 #include "ax100.h"
+#include "beacon_cts1.h"
 #include "csp.h"
 #include "hmac_keyfile.h"
 #include "modem.h"
@@ -192,6 +193,39 @@ static void usage(FILE *out, const char *argv0)
         "                             when you know the TX side appends a\n"
         "                             CRC; otherwise frames fail validation\n"
         "                             and the trailer stays in the payload.\n"
+        "  --ref-hex=<hex>            Compare the decoded packet (or payload,\n"
+        "                             auto-detected by length) against this\n"
+        "                             reference and print byte positions\n"
+        "                             that differ. Useful with the\n"
+        "                             partial-RS rescue path to see where\n"
+        "                             bit errors landed in a corrupted\n"
+        "                             beacon. Whitespace and ':' in the hex\n"
+        "                             string are ignored.\n"
+        "  --no-partial-rs            Disable the partial-RS rescue. By\n"
+        "                             default, when RS is on but the frame\n"
+        "                             exceeds RS's 16-byte budget,\n"
+        "                             rx_decode retries with RS off and\n"
+        "                             reports the descrambled (uncorrected)\n"
+        "                             bytes with rs=UNCORRECTABLE so the\n"
+        "                             operator still sees the frame.\n"
+        "  --force-beacon             Pad the decoded payload with zeros\n"
+        "                             up to 130 bytes and print it as a\n"
+        "                             beacon regardless of length or\n"
+        "                             dispatch result. Last-ditch view of\n"
+        "                             a heavily corrupted frame; a notice\n"
+        "                             reports how many bytes were synthetic.\n"
+        "  --quiet-headers            Hide the AX100 framing line, CSP\n"
+        "                             header line, and payload hex/ascii\n"
+        "                             dumps. Only the interpreted body\n"
+        "                             (beacon/tcmd/log/bulk_file) and\n"
+        "                             error states (HMAC/CRC mismatch,\n"
+        "                             rs=UNCORRECTABLE) print. Default off\n"
+        "                             — rx_decode is a forensic tool and\n"
+        "                             ships with full headers. The same\n"
+        "                             toggle is `--no-packet-headers` for\n"
+        "                             consistency with rx_live/rx_replay.\n"
+        "  --packet-headers           Default; show every field. Kept as\n"
+        "                             a no-op for scripts.\n"
         "  --no-dc-block              Skip the modem's DC-block IIR (alpha=0.995)\n"
         "                             on RX. Default-ON setting was added for\n"
         "                             rtl_fm's discriminator drift; for radio\n"
@@ -225,6 +259,14 @@ int main(int argc, char **argv)
     int hex_only = 0;
     int dump_bits = 0;  // 0 = disabled; >0 = bits to print on success/failure
     int no_dc_block = 0;
+    const char *ref_hex_arg = NULL;
+    uint8_t ref_buf[4100];
+    size_t ref_buf_len = 0;
+    int allow_partial_rs = 1;  // rescue path on by default; --no-partial-rs to disable
+    int force_beacon = 0;
+    // Forensic CLI: default to showing the raw header lines so single-frame
+    // post-mortems aren't missing context. --quiet-headers flips it.
+    int show_packet_headers = 1;
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
@@ -278,6 +320,17 @@ int main(int argc, char **argv)
             csp_crc32 = 1;
         } else if (strcmp(a, "--no-csp-crc32") == 0) {
             csp_crc32 = 0;
+        } else if (starts_with(a, "--ref-hex=")) {
+            ref_hex_arg = a + 10;
+        } else if (strcmp(a, "--no-partial-rs") == 0) {
+            allow_partial_rs = 0;
+        } else if (strcmp(a, "--force-beacon") == 0) {
+            force_beacon = 1;
+        } else if (strcmp(a, "--packet-headers") == 0) {
+            show_packet_headers = 1;
+        } else if (strcmp(a, "--quiet-headers") == 0
+                   || strcmp(a, "--no-packet-headers") == 0) {
+            show_packet_headers = 0;
         } else if (a[0] == '-') {
             fprintf(stderr, "rx_decode: unknown option '%s'\n", a);
             usage(stderr, argv[0]);
@@ -295,6 +348,43 @@ int main(int argc, char **argv)
         fprintf(stderr, "rx_decode: missing <path>\n");
         usage(stderr, argv[0]);
         return 1;
+    }
+    if (ref_hex_arg != NULL) {
+        // Tolerant hex parser: skip whitespace and ':' separators so
+        // copy-pasted hex from beacon_gen output / ascii dumps Just Works.
+        size_t n = 0;
+        int high = -1;
+        for (const char *p = ref_hex_arg; *p; ++p) {
+            char c = *p;
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ':') continue;
+            int v = (c >= '0' && c <= '9') ? c - '0'
+                  : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+                  : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+            if (v < 0) {
+                fprintf(stderr, "rx_decode: --ref-hex: bad char '%c'\n", c);
+                return 1;
+            }
+            if (high < 0) {
+                high = v;
+            } else {
+                if (n >= sizeof ref_buf) {
+                    fprintf(stderr, "rx_decode: --ref-hex too long (>%zu bytes)\n",
+                            sizeof ref_buf);
+                    return 1;
+                }
+                ref_buf[n++] = (uint8_t)((high << 4) | v);
+                high = -1;
+            }
+        }
+        if (high >= 0) {
+            fprintf(stderr, "rx_decode: --ref-hex: odd number of hex digits\n");
+            return 1;
+        }
+        if (n == 0) {
+            fprintf(stderr, "rx_decode: --ref-hex: empty\n");
+            return 1;
+        }
+        ref_buf_len = n;
     }
     // Auto-detect raw mode by file extension when --raw wasn't explicit.
     // .raw → headerless S16_LE PCM; anything else assumed to be a WAV
@@ -463,6 +553,7 @@ int main(int argc, char **argv)
     ssize_t packet_len = -1;
     int golay_errs = 0, hmac_ok = -1;
     int rs_errs = -1, used_golay_len = -1;
+    int rs_locs[32];
     int rc = 0;
 
     const int MAX_ATTEMPTS = 256;
@@ -507,7 +598,35 @@ int main(int argc, char **argv)
         packet_len = ax100_unframe(bytes, n_bytes, &opts,
                                    packet, sizeof(packet),
                                    &golay_errs, &hmac_ok,
-                                   &rs_errs, &used_golay_len);
+                                   &rs_errs, &used_golay_len,
+                                   rs_locs);
+        // Partial-RS rescue: when RS is on, HMAC is off, and the Golay
+        // length header decoded cleanly, retry with RS disabled to
+        // recover the descrambled (uncorrected) bytes. Lets the operator
+        // see corrupted-but-recognizable beacons when bit errors exceed
+        // RS's 16-byte budget. Mirrors decode_loop's allow_partial_rs.
+        if (packet_len < 0 && allow_partial_rs && use_rs && !use_hmac
+            && golay_errs == 0) {
+            ax100_opts_t partial = opts;
+            partial.reed_solomon = 0;
+            int p_golay = 0, p_hmac = -1, p_rs = -1, p_lensrc = -1;
+            ssize_t pp = ax100_unframe(bytes, n_bytes, &partial,
+                                       packet, sizeof(packet),
+                                       &p_golay, &p_hmac,
+                                       &p_rs, &p_lensrc,
+                                       NULL);
+            // pp is the descrambled byte count INCLUDING the original
+            // 32-byte RS parity tail (RS isn't running to strip it).
+            // Strip those 32 bytes here so the apparent packet length
+            // matches what RS-on would have produced.
+            if (pp > 32) {
+                packet_len = pp - 32;
+                golay_errs = p_golay;
+                hmac_ok = -1;
+                rs_errs = -2;  // UNCORRECTABLE marker
+                used_golay_len = p_lensrc;
+            }
+        }
         free(bytes);
         if (packet_len < 0) {
             // Unframing failed outright (golay uncorrectable or length
@@ -761,8 +880,9 @@ int main(int argc, char **argv)
                 sync_off, n_bits, polarity_used ? "inverted" : "normal",
                 attempts, use_hmac ? " (HMAC-validated)" : "");
         char rs_buf[32];
-        if (rs_errs < 0) snprintf(rs_buf, sizeof rs_buf, "(off/failed)");
-        else snprintf(rs_buf, sizeof rs_buf, "%d", rs_errs);
+        if (rs_errs == -2)    snprintf(rs_buf, sizeof rs_buf, "UNCORRECTABLE");
+        else if (rs_errs < 0) snprintf(rs_buf, sizeof rs_buf, "(off/failed)");
+        else                  snprintf(rs_buf, sizeof rs_buf, "%d", rs_errs);
         if (use_hmac) {
             fprintf(stderr, "rx_decode: inner packet %zd bytes, golay errors=%d, "
                     "hmac=%s, rs_corrected=%s, len_source=%s\n",
@@ -804,9 +924,13 @@ int main(int argc, char **argv)
             crc_ok = 1;
             packet_len -= 4;
             // Print to stdout (not stderr / -v only) so the integrity
-            // verdict is part of the regular decode output.
-            fprintf(stdout, "csp_crc32: ok (0x%08x, 4-byte trailer "
-                    "stripped)\n", computed);
+            // verdict is part of the regular decode output. Gated by
+            // the headers toggle since success is just confirmation;
+            // the MISMATCH branch below stays unconditional.
+            if (show_packet_headers) {
+                fprintf(stdout, "csp_crc32: ok (0x%08x, 4-byte trailer "
+                        "stripped)\n", computed);
+            }
         } else {
             crc_ok = 0;
             // Mismatch: keep the trailer in the payload so the operator
@@ -836,27 +960,105 @@ int main(int argc, char **argv)
     }
 
     char rs_summary[32];
-    if (rs_errs < 0) snprintf(rs_summary, sizeof rs_summary, "off");
-    else snprintf(rs_summary, sizeof rs_summary, "corrected=%d", rs_errs);
+    if (rs_errs == -2)    snprintf(rs_summary, sizeof rs_summary, "UNCORRECTABLE");
+    else if (rs_errs < 0) snprintf(rs_summary, sizeof rs_summary, "off");
+    else                  snprintf(rs_summary, sizeof rs_summary, "corrected=%d", rs_errs);
     const char *len_src =
         used_golay_len == 1 ? "golay-header"
         : used_golay_len == 0 ? "brute-forced" : "(n/a)";
-    if (use_hmac) {
-        fprintf(stdout, "AX100: golay_errors=%d  hmac=%s  rs=%s  len=%s\n",
-                golay_errs,
-                hmac_ok == 1 ? "ok"
-                : hmac_ok == 0 ? "MISMATCH"
-                : "(not checked)",
-                rs_summary, len_src);
-    } else {
-        fprintf(stdout, "AX100: golay_errors=%d  rs=%s  len=%s\n",
-                golay_errs, rs_summary, len_src);
+    int hmac_bad = use_hmac && hmac_ok == 0;
+    int rs_bad = rs_errs == -2;
+    int show_ax100 = show_packet_headers || hmac_bad || rs_bad;
+    if (show_ax100) {
+        if (use_hmac) {
+            fprintf(stdout, "AX100: golay_errors=%d  hmac=%s  rs=%s  len=%s\n",
+                    golay_errs,
+                    hmac_ok == 1 ? "ok"
+                    : hmac_ok == 0 ? "MISMATCH"
+                    : "(not checked)",
+                    rs_summary, len_src);
+        } else {
+            fprintf(stdout, "AX100: golay_errors=%d  rs=%s  len=%s\n",
+                    golay_errs, rs_summary, len_src);
+        }
     }
-    fprintf(stdout, "CSP v1: src=%u dst=%u dport=%u sport=%u prio=%u flags=0x%02x\n",
-            hdr.src, hdr.dst, hdr.dport, hdr.sport, hdr.prio, hdr.flags);
-    fprintf(stdout, "payload (%zu bytes):\n", payload_len);
-    if (payload_len > 0) {
-        print_hex_ascii(payload, payload_len);
+    // Per-byte error positions from the RS solver. Sorted so the operator
+    // can see at a glance whether errors cluster late in the block (clock
+    // drift) or scatter (channel noise). Last 32 indices are RS parity.
+    if (show_packet_headers && rs_errs > 0) {
+        size_t on_wire_len = (size_t)packet_len + (use_hmac ? 4 : 0) + 32;
+        int sorted[32];
+        int n = rs_errs > 32 ? 32 : rs_errs;
+        for (int i = 0; i < n; ++i) sorted[i] = rs_locs[i];
+        for (int i = 1; i < n; ++i) {
+            int v = sorted[i], j = i - 1;
+            while (j >= 0 && sorted[j] > v) { sorted[j+1] = sorted[j]; --j; }
+            sorted[j+1] = v;
+        }
+        fprintf(stdout, "rs_locs: corrected=%d of %zu on-wire bytes:",
+                rs_errs, on_wire_len);
+        for (int i = 0; i < n; ++i) fprintf(stdout, " %d", sorted[i]);
+        fputc('\n', stdout);
+    }
+    // Reference comparison: byte positions where the decoded frame
+    // differs from a known-good reference. Lets the operator see where
+    // bit errors landed in a partial-RS-rescued (uncorrected) frame
+    // when they have a clean copy of the same beacon to diff against.
+    if (show_packet_headers && ref_buf_len > 0) {
+        const uint8_t *cmp = NULL;
+        size_t cmp_len = 0;
+        const char *what = NULL;
+        if (ref_buf_len == (size_t)packet_len) {
+            cmp = packet; cmp_len = (size_t)packet_len; what = "packet";
+        } else if (ref_buf_len == payload_len) {
+            cmp = payload; cmp_len = payload_len; what = "payload";
+        }
+        if (cmp != NULL) {
+            int diffs[256];
+            int n_diff = 0;
+            for (size_t i = 0; i < cmp_len; ++i) {
+                if (cmp[i] != ref_buf[i]) {
+                    if (n_diff < (int)(sizeof diffs / sizeof diffs[0])) {
+                        diffs[n_diff] = (int)i;
+                    }
+                    ++n_diff;
+                }
+            }
+            int shown = n_diff > (int)(sizeof diffs / sizeof diffs[0])
+                ? (int)(sizeof diffs / sizeof diffs[0]) : n_diff;
+            fprintf(stdout, "ref_diff: %d of %zu %s bytes differ:",
+                    n_diff, cmp_len, what);
+            for (int i = 0; i < shown; ++i) fprintf(stdout, " %d", diffs[i]);
+            if (shown < n_diff) fprintf(stdout, " ...");
+            fputc('\n', stdout);
+        } else {
+            fprintf(stdout, "ref_diff: skipped (ref %zu bytes, packet %zd, "
+                    "payload %zu)\n",
+                    ref_buf_len, packet_len, payload_len);
+        }
+    }
+    if (show_packet_headers) {
+        fprintf(stdout, "CSP v1: src=%u dst=%u dport=%u sport=%u prio=%u flags=0x%02x\n",
+                hdr.src, hdr.dst, hdr.dport, hdr.sport, hdr.prio, hdr.flags);
+    }
+    if (force_beacon) {
+        // Pad/truncate the payload to the 130-byte beacon size and print.
+        // Lets the operator pry telemetry out of frames whose magic bytes
+        // got mangled or whose Golay length header misdecoded.
+        uint8_t buf[sizeof(COMMS_beacon_basic_packet_t)] = {0};
+        size_t copy = payload_len < sizeof buf ? payload_len : sizeof buf;
+        if (copy > 0) memcpy(buf, payload, copy);
+        fprintf(stdout, "force_beacon: padded %zu->130 bytes "
+                "(zero-fill from byte %zu)\n", payload_len, copy);
+        beacon_print(stdout, NULL, buf, sizeof buf);
+    } else {
+        cts1_packet_print(stdout, NULL, payload, payload_len);
+    }
+    if (show_packet_headers) {
+        fprintf(stdout, "payload (%zu bytes):\n", payload_len);
+        if (payload_len > 0) {
+            print_hex_ascii(payload, payload_len);
+        }
     }
 
     return (hmac_ok == 0) ? 2 : 0;

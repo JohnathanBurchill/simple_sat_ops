@@ -27,6 +27,7 @@
 #include "state.h"
 #include "prediction.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,9 +43,15 @@
 #define DOWNLINK_FREQ_MHZ 436.150000
 #define REFERENCE_DOWNLINK_FREQ_MHZ 432.325000
 
-// Update the radio's frequencies when the change 
-// associated with Doppler shift exceeds this amount
-#define DOPPLER_SHIFT_RESOLUTION_KHZ 1.0
+// Update the radio's frequencies when the change
+// associated with Doppler shift exceeds this amount.
+// 0.2 kHz keeps the residual offset well inside the
+// 9600 GFSK clean-eye band (~±3 kHz tolerance) even
+// at the peak ~100 Hz/s slew near TCA, where the
+// threshold is crossed every ~2 s — comfortable for
+// the 2 Hz UI loop and the FT-991A's ~100 ms FA;
+// settling time.
+#define DOPPLER_SHIFT_RESOLUTION_KHZ 0.2
 
 // Antenna rotator max angle from target 
 #define MAX_DELTA_AZIMUTH_DEGREES 1.0
@@ -54,7 +61,6 @@
 #define MAX_MINUTES_TO_PREDICT ((7 * 1440))
 
 #define UPDATE_INTERVAL_MICROSEC 500000
-#define KEYBOARD_UNLOCK_DURATION_TICKS (1000000 / UPDATE_INTERVAL_MICROSEC * 5)
 
 void start_tracking(state_t *state);
 void stop_tracking(state_t *state);
@@ -73,6 +79,17 @@ static speed_t speed_from_bps(int bps)
         case 115200: return B115200;
         default:     return 0;
     }
+}
+
+static int bps_from_speed(speed_t s)
+{
+    if (s == B4800)   return 4800;
+    if (s == B9600)   return 9600;
+    if (s == B19200)  return 19200;
+    if (s == B38400)  return 38400;
+    if (s == B57600)  return 57600;
+    if (s == B115200) return 115200;
+    return 0;
 }
 
 void usage(FILE *dest, const char *name, int full)
@@ -126,6 +143,10 @@ void usage(FILE *dest, const char *name, int full)
         "  --no-doppler-correction      Disable runtime Doppler retuning\n"
         "\n"
         "Rotator overrides:\n"
+        "  --rotator-device=<path>           SPID Rot2Prog tty. Default\n"
+        "                                    /dev/ttyUSB0 (Linux). On macOS\n"
+        "                                    pass the actual port, e.g.\n"
+        "                                    /dev/cu.usbserial-XXXXXXXX.\n"
         "  --rotator-target-azimuth=<deg>    Park on a fixed azimuth\n"
         "  --rotator-target-elevation=<deg>  Park on a fixed elevation\n"
         "\n"
@@ -160,9 +181,9 @@ void usage(FILE *dest, const char *name, int full)
 
     fprintf(dest,
         "\n"
-        "KEYBOARD (locked by default, press K to unlock for ~5 s)\n"
+        "KEYBOARD (unlocked by default, press K to toggle lock state)\n"
         "\n"
-        "  K         Unlock keyboard for ~5 seconds\n"
+        "  K         Toggle keyboard lock\n"
         "  T         Start tracking the current satellite\n"
         "  s         Stop tracking\n"
         "  r         Reset rotator to az=0, el=0\n"
@@ -364,13 +385,24 @@ void report_status(state_t *state, int *print_row, int print_col)
     if (state->have_antenna_rotator) {
         double azimuth = 0.0;
         double elevation = 0.0;
-        antenna_rotator_command(&state->antenna_rotator, ANTENNA_ROTATOR_STATUS, &azimuth, &elevation);
-        if (azimuth < 0) {
-            azimuth += 360.0;
+        if (antenna_rotator_command(&state->antenna_rotator, ANTENNA_ROTATOR_STATUS, &azimuth, &elevation) == ANTENNA_ROTATOR_OK) {
+            state->antenna_rotator.azimuth = azimuth;
+            state->antenna_rotator.elevation = elevation;
+        } else {
+            azimuth = state->antenna_rotator.azimuth;
+            elevation = state->antenna_rotator.elevation;
         }
-        mvprintw(row++, col, "%15s   %.1f deg", "target azimuth", state->antenna_rotator.target_azimuth);
+        double az_display = azimuth;
+        if (az_display < 0) {
+            az_display += 360.0;
+        }
+        double target_az_display = state->antenna_rotator.target_azimuth;
+        if (target_az_display < 0) {
+            target_az_display += 360.0;
+        }
+        mvprintw(row++, col, "%15s   %.1f deg", "target azimuth", target_az_display);
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.1f deg", "azimuth", azimuth);
+        mvprintw(row++, col, "%15s   %.1f deg", "azimuth", az_display);
         clrtoeol();
         mvprintw(row++, col, "%15s   %.1f deg", "target elevation", state->antenna_rotator.target_elevation);
         clrtoeol();
@@ -446,6 +478,17 @@ int main(int argc, char **argv)
         state.radio.nominal_downlink_frequency = state.radio.satellite_downlink_frequency;
         state.radio.nominal_uplink_frequency = state.radio.satellite_uplink_frequency;
         state.radio.tx_inhibit_cleared = state.allow_tx;
+        // Show the resolved device + speed so the operator can sanity-
+        // check against `radio_ctl identify`. Printed before ncurses
+        // takes over the screen so it lands in the shell.
+        fprintf(stderr, "simple_sat_ops: radio device=%s speed=%dbps "
+                "backend=%s\n",
+                state.radio.device_filename ? state.radio.device_filename : "(null)",
+                bps_from_speed(state.radio.serial_speed),
+                state.radio_backend == RADIO_BACKEND_YAESU_CAT ? "yaesu-cat"
+                : state.radio_backend == RADIO_BACKEND_ICOM_CIV ? "icom-civ"
+                : state.radio_backend == RADIO_BACKEND_USRP_B210 ? "usrp-b210"
+                : "?");
         if (radio_backend_select(&state.radio, state.radio_backend) != RADIO_OK) {
             return EXIT_FAILURE;
         }
@@ -514,15 +557,13 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
         state.have_antenna_rotator = 1;
-        // Check that we can control the antenna position
-        // antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_STATUS, NULL, NULL);
-        // if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
-        //     fprintf(stderr, "Error commanding the antenna rotator: response %d\n", antenna_rotator_result);
-        //     fprintf(stderr, "Check that the SPID Rot2ProG is in 'A' mode\n");
-        //     state.have_antenna_rotator = 0;
-        // } else {
-        //     state.have_antenna_rotator = 1;
-        // }
+        // Adopt whatever extended position the SPID is already at so the
+        // unwrapped accumulator starts grounded in reality. If this fails,
+        // the rotator is likely not in 'A' mode; tracking and 'r' will
+        // re-attempt the seed before issuing any motion command.
+        if (antenna_rotator_seed_from_status(&state.antenna_rotator) != ANTENNA_ROTATOR_OK) {
+            fprintf(stderr, "Warning: could not read SPID position; check that the Rot2ProG is in 'A' mode\n");
+        }
     }
 
     /* Tracking loop */
@@ -555,16 +596,24 @@ int main(int argc, char **argv)
     state.antenna_rotator.antenna_should_be_controlled = state.run_with_antenna_rotator && state.have_antenna_rotator;
     state.antenna_rotator.antenna_is_under_control = state.antenna_rotator.antenna_should_be_controlled;
 
-    int keyboard_unlocked = 0;
+    // Boots unlocked so the operator can drive the rig the moment the
+    // UI comes up. Press K to toggle the lock when stepping away.
+    int keyboard_unlocked = 1;
     int keyboard_info_row = 20;
 
-    mvprintw(keyboard_info_row++, 3, "%s", "T - Track satellite");
+    mvprintw(keyboard_info_row++, 3, "%s", "T  - Track satellite");
     clrtoeol();
-    mvprintw(keyboard_info_row++, 3, "%s", "s - Stop tracking satellite");
+    mvprintw(keyboard_info_row++, 3, "%s", "s  - Stop antenna immediately (halts jog or tracking)");
     clrtoeol();
-    mvprintw(keyboard_info_row++, 3, "%s", "r - Reset to az=0 el=0");
+    mvprintw(keyboard_info_row++, 3, "%s", "r  - Reset to az=0 el=0 (unwinds along the way it came in)");
     clrtoeol();
-    mvprintw(keyboard_info_row++, 3, "%s", "q - quit");
+    mvprintw(keyboard_info_row++, 3, "%s", "[  - Jog azimuth -5 deg (one step per press)");
+    clrtoeol();
+    mvprintw(keyboard_info_row++, 3, "%s", "]  - Jog azimuth +5 deg (one step per press)");
+    clrtoeol();
+    mvprintw(keyboard_info_row++, 3, "%s", "K  - Lock/unlock keyboard");
+    clrtoeol();
+    mvprintw(keyboard_info_row++, 3, "%s", "q  - Quit");
     clrtoeol();
 
     double current_az = 0;
@@ -589,13 +638,29 @@ int main(int argc, char **argv)
         // TODO check for passes that reach a minimum elevation
         current_az = state.antenna_rotator.azimuth;
         current_el = state.antenna_rotator.elevation;
-        // check if antenna reached its target 
+        // check if antenna reached its target
         if (state.antenna_rotator.antenna_is_moving) {
             if (fabs(current_az - last_az) == 0 && fabs(current_el - last_el) == 0) {
                 state.antenna_rotator.antenna_is_moving = 0;
             }
             last_az = current_az;
             last_el = current_el;
+        }
+
+        // Drive the second leg of a two-step home once the first leg has stopped.
+        // Used when the unwrap delta from the current position to home exceeds
+        // 180 deg, where a single SET would leave the SPID's direction-of-rotation
+        // ambiguous (and risk wrapping coax around the tower).
+        if (state.antenna_rotator.homing_in_progress
+            && !state.antenna_rotator.antenna_is_moving
+            && state.have_antenna_rotator) {
+            double final_az = state.antenna_rotator.home_pending_final_az;
+            int rc = antenna_rotator_set_unwrapped(&state.antenna_rotator, final_az, 0.0);
+            if (rc == ANTENNA_ROTATOR_OK) {
+                state.antenna_rotator.antenna_is_moving = 1;
+            }
+            state.antenna_rotator.homing_in_progress = 0;
+            state.antenna_rotator.home_pending_final_az = 0.0;
         }
         if (state.satellite_tracking && state.prediction.predicted_minutes_until_visible < state.antenna_rotator.tracking_prep_time_minutes) {
             if (!state.in_pass) {
@@ -610,50 +675,43 @@ int main(int argc, char **argv)
             // Point antenna at satellite or fixed target
             // TODO remove lag bias by anticipating direction
             if (state.antenna_rotator.tracking && state.antenna_rotator.antenna_is_under_control) {
-                if (!state.antenna_rotator.antenna_is_moving) {
-                    delta_az = state.prediction.satellite_ephem.azimuth - state.antenna_rotator.target_azimuth;
+                if (!state.antenna_rotator.unwrapped_target_valid) {
+                    // Try to recover; refuse to issue motion until grounded.
+                    if (antenna_rotator_seed_from_status(&state.antenna_rotator) != ANTENNA_ROTATOR_OK) {
+                        state.antenna_rotator.tracking = 0;
+                    }
+                } else if (!state.antenna_rotator.antenna_is_moving) {
+                    double prev_unwrapped = state.antenna_rotator.target_azimuth_unwrapped;
+                    double next_az = antenna_rotator_accumulate_unwrapped(prev_unwrapped, state.prediction.satellite_ephem.azimuth);
+                    double next_el = state.prediction.satellite_ephem.elevation;
+                    if (next_el < ANTENNA_ROTATOR_MINIMUM_ELEVATION) {
+                        next_el = ANTENNA_ROTATOR_MINIMUM_ELEVATION;
+                    } else if (next_el > ANTENNA_ROTATOR_MAXIMUM_ELEVATION) {
+                        next_el = ANTENNA_ROTATOR_MAXIMUM_ELEVATION;
+                    }
+                    delta_az = next_az - prev_unwrapped;
                     if (state.prediction.satellite_ephem.elevation >= 0) {
-                        delta_el = state.prediction.satellite_ephem.elevation - state.antenna_rotator.target_elevation;
+                        delta_el = next_el - state.antenna_rotator.target_elevation;
                     } else {
                         delta_el = 0.0;
                     }
 
                     if (fabs(delta_az) >= MAX_DELTA_AZIMUTH_DEGREES || fabs(delta_el) >= MAX_DELTA_ELEVATION_DEGREES) {
-                        state.antenna_rotator.target_azimuth = state.prediction.satellite_ephem.azimuth;
-                        state.antenna_rotator.target_elevation = state.prediction.satellite_ephem.elevation;
-                        if (state.antenna_rotator.target_elevation < ANTENNA_ROTATOR_MINIMUM_ELEVATION) {
-                            state.antenna_rotator.target_elevation = ANTENNA_ROTATOR_MINIMUM_ELEVATION;
-                        } else if (state.antenna_rotator.target_elevation > ANTENNA_ROTATOR_MAXIMUM_ELEVATION) {
-                            state.antenna_rotator.target_elevation = ANTENNA_ROTATOR_MAXIMUM_ELEVATION;
-                        }
-                        if (state.antenna_rotator.target_azimuth < ANTENNA_ROTATOR_MINIMUM_AZIMUTH) {
-                            state.antenna_rotator.target_azimuth = ANTENNA_ROTATOR_MINIMUM_AZIMUTH;
-                        } else if (state.antenna_rotator.target_azimuth > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
-                            state.antenna_rotator.target_azimuth = ANTENNA_ROTATOR_MAXIMUM_AZIMUTH;
-                        }
-                        azimuth = state.antenna_rotator.target_azimuth;
-                        elevation = state.antenna_rotator.target_elevation;
-                        antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_SET, &azimuth, &elevation);
-                        if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
-                            fprintf(stderr, "Error setting antenna rotator position\n");
+                        if (next_az < ANTENNA_ROTATOR_MINIMUM_AZIMUTH || next_az > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
+                            // Continuous unwrap would carry the rotator past its mechanical
+                            // limits. Stop tracking and let the operator decide whether to
+                            // re-seed from the opposite hemisphere.
+                            state.antenna_rotator.tracking = 0;
                         } else {
-                            state.antenna_rotator.antenna_is_moving = 1;
+                            int rc = antenna_rotator_set_unwrapped(&state.antenna_rotator, next_az, next_el);
+                            if (rc != ANTENNA_ROTATOR_OK) {
+                                fprintf(stderr, "Error setting antenna rotator position\n");
+                            } else {
+                                state.antenna_rotator.antenna_is_moving = 1;
+                            }
                         }
                     }
                 }
-            }
-
-            // Simplex UHF: Doppler-tune Main only. Sub stays parked; never
-            // retune it here or we risk a same-band collision on the 9700.
-            if (state.have_radio && state.run_with_radio && doppler_delta_downlink > doppler_max_delta) {
-                current_downlink_frequency = state.radio.doppler_downlink_frequency;
-                current_uplink_frequency = state.radio.doppler_downlink_frequency;
-                ret = radio_set_frequency(&state.radio, state.radio.doppler_downlink_frequency);
-                if (ret != RADIO_OK) {
-                    fprintf(stderr, "Error setting carrier frequency on VFO Main\n");
-                }
-                state.radio.vfo_main_actual_frequency = radio_get_frequency(&state.radio);
-                clrtoeol();
             }
 
             jul_idle_start = 0;  // Reset idle timer
@@ -665,6 +723,27 @@ int main(int argc, char **argv)
             if (state.antenna_rotator.tracking) {
                 state.antenna_rotator.tracking = 0;
             }
+        }
+
+        // Doppler retune Main whenever tracking is on. Used to be gated
+        // on the prep-window block above (rotator's "<5 min from pass"
+        // rule), which meant the radio's actual frequency lagged the
+        // CARRIER readout for a long time and the operator couldn't tell
+        // whether retunes were happening at all. The rotator gating is
+        // intentional (no point pointing at horizon) but the radio is
+        // happy to be retuned any time, so this block now follows
+        // satellite_tracking only. Sub VFO untouched (simplex UHF; would
+        // collide on the IC-9700 if both were retuned).
+        if (state.satellite_tracking && state.have_radio && state.run_with_radio
+            && doppler_delta_downlink > doppler_max_delta) {
+            current_downlink_frequency = state.radio.doppler_downlink_frequency;
+            current_uplink_frequency = state.radio.doppler_downlink_frequency;
+            ret = radio_set_frequency(&state.radio, state.radio.doppler_downlink_frequency);
+            if (ret != RADIO_OK) {
+                // stderr would scribble across curses; the UI's CARRIER
+                // vs VFO Main divergence is enough of a tell. Silenced.
+            }
+            state.radio.vfo_main_actual_frequency = radio_get_frequency(&state.radio);
         }
 
         // Update predictions
@@ -692,68 +771,61 @@ int main(int argc, char **argv)
 
         clrtoeol();
 
-        key = getch(); 
+        key = getch();
         if (key == 'K') {
-            keyboard_unlocked = KEYBOARD_UNLOCK_DURATION_TICKS;
+            keyboard_unlocked = !keyboard_unlocked;
         } else if (keyboard_unlocked) {
             switch(key) {
                 case 'q':
                     state.running = 0;
-                    keyboard_unlocked = 0;
                     break;
                 case 'T':
                     start_tracking(&state);
-                    keyboard_unlocked = 0;
                     break;
                 case 's':
                     stop_tracking(&state);
-                    keyboard_unlocked = 0;
                     break;
                 case 'r':
                     stop_tracking(&state);
                     point_to_stationary_target(&state, 0.0, 0.0);
-                    keyboard_unlocked = 0;
                     break;
                 case '[':
-                    // Decrease azimuth 5 degrees
+                    // Decrease azimuth 5 degrees, then drop any further queued
+                    // jog keystrokes so a held key or fast taps can't stack into
+                    // a runaway slew the operator can't easily stop.
                     state.satellite_tracking = 0;
                     state.antenna_rotator.antenna_is_under_control = 0;
                     antenna_rotator_result = antenna_rotator_increase_azimuth(&state.antenna_rotator, -5.0);
                     if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
                         state.antenna_rotator.antenna_is_moving = 1;
                     }
-                    keyboard_unlocked = 0;
+                    flushinp();
                     break;
                 case ']':
-                    // Increase azimuth 5 degrees
+                    // Increase azimuth 5 degrees; same rationale as above.
                     state.satellite_tracking = 0;
                     state.antenna_rotator.antenna_is_under_control = 0;
                     antenna_rotator_result = antenna_rotator_increase_azimuth(&state.antenna_rotator, 5.0);
                     if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
                         state.antenna_rotator.antenna_is_moving = 1;
                     }
-                    keyboard_unlocked = 0;
+                    flushinp();
                     break;
                 case 'w':
-                    // Broken: waterfall data messes with responses to other commands 
+                    // Broken: waterfall data messes with responses to other commands
                     // radio_result = radio_toggle_waterfall(&state.radio);
                     // if (radio_result != RADIO_OK) {
                     //     fprintf(stderr, "Waterfall error: %d\n", radio_result);
                     // }
-                    keyboard_unlocked = 0;
                     break;
                 case '*':
                     // Wildrose reference station, CW, 432.325 MHz
                     stop_tracking(&state);
                     enable_wildrose_mode(&state);
-                    keyboard_unlocked = 0;
                     break;
                 default:
                     break;
             }
-        }
-        if (keyboard_unlocked > 0) {
-            --keyboard_unlocked;
         }
 
         mvprintw(keyboard_info_row, 3, "%s : %s", "Keyboard", keyboard_unlocked ? "unlocked" : "LOCKED");
@@ -875,8 +947,15 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->antenna_rotator.serial_speed = B600;
     state->antenna_rotator.fixed_target = 0;
 
-    // Default to recording audio
+    // Default to recording audio on hosts that have ALSA. On Mac (no
+    // ALSA, audio.c replaced with audio_stub.c) skip the capture path
+    // so an operator on a laptop doesn't have to pass --without-audio
+    // every time just to drive the rotator + radio.
+#ifdef SSO_HAVE_ALSA
     state->audio.audio_record = 1;
+#else
+    state->audio.audio_record = 0;
+#endif
     state->audio.audio_output_file_basename = "session/session_pcm_audio";
     // state->audio.audio_device = AUDIO_DEVICE_MAIN;
 
@@ -954,10 +1033,17 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strncmp("--radio-device=", argv[i], 15) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 16) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]); 
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
                 return EXIT_FAILURE;
-            } 
+            }
             state->radio.device_filename = argv[i] + 15;
+        } else if (strncmp("--rotator-device=", argv[i], 17) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 18) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state->antenna_rotator.device_filename = argv[i] + 17;
         } else if (strcmp("--without-audio", argv[i]) == 0) {
             state->n_options++;
             state->audio.audio_record = 0;
@@ -1055,18 +1141,21 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             }
             state->antenna_rotator.fixed_target = 1;
         } else if (strncmp("--rotator-target-azimuth=", argv[i], 25) == 0) {
-            state->n_options++; 
+            state->n_options++;
             if (strlen(argv[i]) < 26) {
                 fprintf(stderr, "Unable to parse %s\n", argv[i]);
                 return EXIT_FAILURE;
             }
-            state->antenna_rotator.target_azimuth = atof(argv[i] + 25);
-            state->antenna_rotator.fixed_target = 1;
-            if (state->antenna_rotator.target_azimuth < -180.0) {
-                state->antenna_rotator.target_azimuth = 180.0;
-            } else if (state->antenna_rotator.target_azimuth > 540.0) {
-                state->antenna_rotator.target_azimuth = 540.0;
+            double az = atof(argv[i] + 25);
+            if (az < ANTENNA_ROTATOR_MINIMUM_AZIMUTH) {
+                az = ANTENNA_ROTATOR_MINIMUM_AZIMUTH;
+            } else if (az > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
+                az = ANTENNA_ROTATOR_MAXIMUM_AZIMUTH;
             }
+            state->antenna_rotator.target_azimuth = az;
+            state->antenna_rotator.target_azimuth_unwrapped = az;
+            state->antenna_rotator.unwrapped_target_valid = 1;
+            state->antenna_rotator.fixed_target = 1;
         } else if (strncmp("--lat=", argv[i], 6) == 0) {
             state->n_options++; 
             if (strlen(argv[i]) < 7) {
@@ -1226,22 +1315,23 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
 void start_tracking(state_t *state)
 {
     int antenna_rotator_result = 0;
-    double azimuth = 0.0;
-    double elevation = 0.0;
 
     state->satellite_tracking = 1;
     state->radio.nominal_downlink_frequency = state->radio.satellite_downlink_frequency;
     state->radio.doppler_correction_enabled = 1;
 
-    // Simplex UHF: only Main is used on-air. Sub remains parked where
-    // radio_init left it; do not touch it here or we risk a same-band clash.
-    radio_set_vfo(&state->radio, VFOMain);
-    radio_set_mode(&state->radio, RADIO_MODE_FM, RADIO_FILTER_FIL1);
+    // Don't touch mode / VFO / DATA / MOD source here. The operator
+    // configures all that with radio_ctl (uplink-prep, set-mode,
+    // set-mod-input) before launching simple_sat_ops; this tool's job
+    // during a pass is Doppler retuning, not radio reconfiguration.
+    // Anything mode-changing belongs in radio_uplink_prep (--uplink-ready)
+    // or the explicit '*' (Wildrose) keystroke.
     state->antenna_rotator.antenna_is_under_control = state->antenna_rotator.antenna_should_be_controlled;
     if (state->antenna_rotator.fixed_target) {
-        azimuth = state->antenna_rotator.target_azimuth;
-        elevation = state->antenna_rotator.target_elevation;
-        antenna_rotator_result = antenna_rotator_command(&state->antenna_rotator, ANTENNA_ROTATOR_SET, &azimuth, &elevation);
+        antenna_rotator_result = antenna_rotator_set_unwrapped(
+            &state->antenna_rotator,
+            state->antenna_rotator.target_azimuth_unwrapped,
+            state->antenna_rotator.target_elevation);
         if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
             fprintf(stderr, "Error setting antenna rotator position\n");
         } else {
@@ -1267,8 +1357,17 @@ void stop_tracking(state_t *state)
         if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
             fprintf(stderr, "Error stopping the antenna rotator\n");
         }
+        // After a halt the antenna is wherever STOP caught it, not at the
+        // last commanded target. Re-read so the next jog or track starts
+        // from physical reality instead of a stale runaway target.
+        if (antenna_rotator_seed_from_status(&state->antenna_rotator) != ANTENNA_ROTATOR_OK) {
+            // leave unwrapped_target_valid as it was; next motion will
+            // try the seed again before issuing a SET
+        }
     }
     state->antenna_rotator.antenna_is_moving = 0;
+    state->antenna_rotator.homing_in_progress = 0;
+    state->antenna_rotator.home_pending_final_az = 0.0;
 
     return;
 }
@@ -1305,10 +1404,40 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
 {
     state->satellite_tracking = 0;
     state->antenna_rotator.antenna_is_under_control = 0;
-    int antenna_rotator_status = antenna_rotator_point_to_target(&state->antenna_rotator, azimuth, elevation);
 
-    return antenna_rotator_status;
+    if (!state->antenna_rotator.unwrapped_target_valid) {
+        if (antenna_rotator_seed_from_status(&state->antenna_rotator) != ANTENNA_ROTATOR_OK) {
+            return ANTENNA_ROTATOR_BAD_RESPONSE;
+        }
+    }
 
+    double prev = state->antenna_rotator.target_azimuth_unwrapped;
+    double final_az = antenna_rotator_home_unwrapped_target(prev, azimuth);
+    double delta = final_az - prev;
+
+    if (fabs(delta) > 180.0) {
+        // Send a halfway waypoint first to disambiguate the direction of
+        // rotation, then finish on a later main-loop tick once the antenna
+        // has stopped at the intermediate.
+        double mid = prev + delta / 2.0;
+        if (mid < ANTENNA_ROTATOR_MINIMUM_AZIMUTH) mid = ANTENNA_ROTATOR_MINIMUM_AZIMUTH;
+        if (mid > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) mid = ANTENNA_ROTATOR_MAXIMUM_AZIMUTH;
+        state->antenna_rotator.home_pending_final_az = final_az;
+        state->antenna_rotator.homing_in_progress = 1;
+        int rc = antenna_rotator_set_unwrapped(&state->antenna_rotator, mid, elevation);
+        if (rc == ANTENNA_ROTATOR_OK) {
+            state->antenna_rotator.antenna_is_moving = 1;
+        }
+        return rc;
+    }
+
+    state->antenna_rotator.homing_in_progress = 0;
+    state->antenna_rotator.home_pending_final_az = 0.0;
+    int rc = antenna_rotator_set_unwrapped(&state->antenna_rotator, final_az, elevation);
+    if (rc == ANTENNA_ROTATOR_OK) {
+        state->antenna_rotator.antenna_is_moving = 1;
+    }
+    return rc;
 }
 
 void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, double downlink_freq)

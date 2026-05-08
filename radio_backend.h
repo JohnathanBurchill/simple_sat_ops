@@ -62,14 +62,32 @@ typedef struct radio_backend_ops {
     int    (*set_mode)(radio_t *r, int mode, int filter);
     int    (*set_data_mode)(radio_t *r, int on, int filter);
     int    (*set_data_mod_source)(radio_t *r, int source);
-    // RX-side prep for data decode: turn off DSPs that mangle bit
-    // transitions (NB, NR, notch, contour) and force a flat AGC profile.
-    // Backends that lack the concept can leave this NULL — the dispatcher
-    // returns RADIO_NOT_SUPPORTED.
+    // RX-side prep for data decode. Each backend defines its own
+    // checklist; the FT-991A path is the most extensive (DSPs off,
+    // wide IF, max RF sensitivity, IF shift / repeater shift / CTCSS
+    // cleared, etc.). Backends that lack the concept can leave this
+    // NULL — the dispatcher returns RADIO_NOT_SUPPORTED.
     int    (*set_rx_clean)(radio_t *r);
     int    (*set_usb_mod_level)(radio_t *r, int level_0_to_255);
     int    (*set_moni_level)(radio_t *r, int level_0_to_255);
     int    (*set_rf_power)(radio_t *r, int level_0_to_255);
+    // Carrier squelch threshold, 0..100 (0 = open / always pass audio).
+    // For FrontierSat AX100 RX we want this at 0 so the discriminator
+    // output is unmuted regardless of signal strength — frame detection
+    // happens downstream and the radio's CSQ would only mask the start
+    // of a burst. Backends without a single-knob squelch (or where the
+    // concept is mode-coupled) leave these NULL.
+    int    (*set_squelch)(radio_t *r, int level_0_to_100);
+    int    (*get_squelch)(radio_t *r);
+    // ASCII CAT passthrough — for backends that speak a semicolon-
+    // terminated text protocol (FT-991A). Caller writes the bytes
+    // verbatim (terminator included). If reply != NULL, the backend
+    // reads until the protocol's terminator (or timeout) and NUL-
+    // terminates. Returns RADIO_OK on success including "no reply
+    // received" — callers distinguish via reply[0] == '\0'. Backends
+    // whose protocol isn't text (IC-9700, B210) leave this NULL; the
+    // CI-V backend has its own binary `command` escape hatch.
+    int    (*cat_send)(radio_t *r, const char *cmd, char *reply, int reply_cap);
     // Set RF power in absolute watts. Backends clamp to their hardware
     // minimum (printing a warning if the request was below it). Returns
     // RADIO_NOT_SUPPORTED if the backend can't honour an absolute-watts

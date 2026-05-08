@@ -40,13 +40,53 @@
 #include "decode_loop.h"
 #include "hmac_keyfile.h"
 #include "modem.h"
+#include "rx_tui.h"
 #include "wav_read.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static volatile sig_atomic_t g_stop = 0;
+
+static void on_signal(int sig)
+{
+    (void)sig;
+    g_stop = 1;
+    // Also nudge the TUI in case we're sitting in rx_tui_hold_until_quit.
+    // The stub for non-ncurses builds is a no-op.
+    rx_tui_request_quit();
+}
+
+// REPL handler used in --ui mode. See rx_live.c for rationale; the
+// implementation is identical (registering this disables the
+// q-as-quit shortcut, so a `quit` verb is wired in alongside).
+static void rx_replay_cmd_handler(const char *cmd, void *ctx)
+{
+    (void)ctx;
+    char status[128];
+    if (decode_loop_try_command(cmd, status, sizeof status)) {
+        rx_tui_set_status(status);
+        return;
+    }
+    while (*cmd == ' ' || *cmd == '\t') cmd++;
+    if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0
+        || strcmp(cmd, "exit") == 0) {
+        g_stop = 1;
+        rx_tui_request_quit();
+        return;
+    }
+    if (cmd[0] != '\0') {
+        char m[160];
+        snprintf(m, sizeof m,
+                 "unknown: `%.80s` — try `packetheaders on|off` or `quit`",
+                 cmd);
+        rx_tui_set_status(m);
+    }
+}
 
 static int starts_with(const char *s, const char *prefix)
 {
@@ -122,12 +162,37 @@ static void usage(FILE *dest, const char *name)
         "                           header decoded with 0 errors but whose\n"
         "                           RS(255,223) was uncorrectable still\n"
         "                           emits, marked rs=UNCORRECTABLE.\n"
+        "  --ref-hex=<hex>          Compare each decoded packet (or payload,\n"
+        "                           auto-detected by length) against this\n"
+        "                           reference and print byte positions that\n"
+        "                           differ. Whitespace and ':' in the hex\n"
+        "                           string are ignored.\n"
+        "  --force-beacon           Pad each decoded payload with zeros up\n"
+        "                           to 130 bytes and print it as a beacon\n"
+        "                           regardless of length or dispatch result.\n"
+        "                           Last-ditch view of heavily corrupted\n"
+        "                           frames. Ignored in --ui mode.\n"
         "\n"
         "Output:\n"
         "  --log=<path>             Append decode lines to <path> in\n"
         "                           addition to stdout. Re-opened per frame\n"
         "                           so log rotation works.\n"
         "  --quiet                  Skip stdout output (log-only mode).\n"
+        "  --ui                     Switch from streaming text to a curses\n"
+        "                           panel display (latest beacon broken\n"
+        "                           out by subsystem, scrolling list of\n"
+        "                           recent telecommand responses, frame\n"
+        "                           counters). After the file is replayed\n"
+        "                           the screen holds until you press q.\n"
+        "                           File logging continues. Default off.\n"
+        "  --packet-headers         Show the AX100 framing line, CSP v1\n"
+        "                           header line, and per-frame hex/ascii\n"
+        "                           dumps. Default off — only the\n"
+        "                           interpreted body and error conditions\n"
+        "                           print. In --ui mode, the REPL accepts\n"
+        "                           `packetheaders on|off` (or `ph on|off`)\n"
+        "                           to flip the toggle mid-replay.\n"
+        "  --no-packet-headers      Default; kept as a no-op for scripts.\n"
         "  --help                   Show this help.\n",
         name, HMAC_KEYFILE_DEFAULT_RELPATH);
 }
@@ -151,6 +216,12 @@ int main(int argc, char **argv)
     int csp_crc32 = 0;
     int allow_partial_rs = 1;
     int quiet = 0;
+    int use_tui = 0;
+    const char *ref_hex_arg = NULL;
+    uint8_t ref_buf[4100];
+    size_t ref_buf_len = 0;
+    int force_beacon = 0;
+    int show_packet_headers = 0;
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
@@ -182,8 +253,13 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--no-csp-crc32") == 0)     csp_crc32 = 0;
         else if (strcmp(a, "--no-partial-rs") == 0)    allow_partial_rs = 0;
         else if (strcmp(a, "--quiet") == 0)            quiet = 1;
+        else if (strcmp(a, "--ui") == 0)               use_tui = 1;
         else if (starts_with(a, "--keyfile="))         keyfile_path = a + 10;
         else if (starts_with(a, "--log="))             log_path = a + 6;
+        else if (starts_with(a, "--ref-hex="))         ref_hex_arg = a + 10;
+        else if (strcmp(a, "--force-beacon") == 0)     force_beacon = 1;
+        else if (strcmp(a, "--packet-headers") == 0)   show_packet_headers = 1;
+        else if (strcmp(a, "--no-packet-headers") == 0) show_packet_headers = 0;
         else if (a[0] == '-') {
             fprintf(stderr, "rx_replay: unknown option '%s'\n", a);
             usage(stderr, argv[0]);
@@ -199,6 +275,41 @@ int main(int argc, char **argv)
         fprintf(stderr, "rx_replay: missing <path>\n");
         usage(stderr, argv[0]);
         return 1;
+    }
+    if (ref_hex_arg != NULL) {
+        size_t n = 0;
+        int high = -1;
+        for (const char *p = ref_hex_arg; *p; ++p) {
+            char c = *p;
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ':') continue;
+            int v = (c >= '0' && c <= '9') ? c - '0'
+                  : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+                  : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+            if (v < 0) {
+                fprintf(stderr, "rx_replay: --ref-hex: bad char '%c'\n", c);
+                return 1;
+            }
+            if (high < 0) {
+                high = v;
+            } else {
+                if (n >= sizeof ref_buf) {
+                    fprintf(stderr, "rx_replay: --ref-hex too long (>%zu bytes)\n",
+                            sizeof ref_buf);
+                    return 1;
+                }
+                ref_buf[n++] = (uint8_t)((high << 4) | v);
+                high = -1;
+            }
+        }
+        if (high >= 0) {
+            fprintf(stderr, "rx_replay: --ref-hex: odd number of hex digits\n");
+            return 1;
+        }
+        if (n == 0) {
+            fprintf(stderr, "rx_replay: --ref-hex: empty\n");
+            return 1;
+        }
+        ref_buf_len = n;
     }
     if (slide_s > window_s) slide_s = window_s;
     if (!raw_mode_explicit) {
@@ -286,6 +397,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    decode_loop_set_show_headers(show_packet_headers);
+
     // Position-quantised dedup ring (mirrors rx_live).
     enum { DEDUP_RING_SZ = 64 };
     enum { DEDUP_QUANT_SAMPLES = 4800 };
@@ -293,20 +406,48 @@ int main(int argc, char **argv)
     int recent_idx = 0;
     int recent_count = 0;
 
-    fprintf(stderr,
-            "rx_replay: %s  rate=%d Hz  channels=%d  bit_rate=%d  "
-            "window=%.2fs  slide=%.2fs  sync_thr=%d  rs=%s  hmac=%s  "
-            "partial=%s  duration=%.3fs\n",
-            input_path, samp_rate, channels, bit_rate,
-            window_s, slide_s, sync_max_ham,
-            use_rs ? "on" : "off",
-            use_hmac ? "on" : "off",
-            allow_partial_rs ? "on" : "off",
-            (double)n_frames / (double)samp_rate);
+    // Same sizing rationale as rx_live: input_path can be long; the
+    // TUI truncates to terminal width on render, so oversized is fine.
+    char tui_header[512];
+    if (use_tui) {
+        if (rx_tui_init() != 0) {
+            fprintf(stderr, "rx_replay: --ui requested but ncurses is not "
+                    "built in (rebuild with libncurses-dev installed).\n");
+            free(bits_scratch); free(bytes_scratch); free(samples);
+            return 1;
+        }
+        snprintf(tui_header, sizeof tui_header,
+                 "rx_replay | %s | rate=%dHz win=%.2fs slide=%.2fs "
+                 "rs=%s hmac=%s | dur=%.1fs",
+                 input_path, samp_rate, window_s, slide_s,
+                 use_rs ? "on" : "off",
+                 use_hmac ? "on" : "off",
+                 (double)n_frames / (double)samp_rate);
+        rx_tui_set_header(tui_header);
+        rx_tui_set_command_handler(rx_replay_cmd_handler, NULL);
+        quiet = 1;
+    } else {
+        fprintf(stderr,
+                "rx_replay: %s  rate=%d Hz  channels=%d  bit_rate=%d  "
+                "window=%.2fs  slide=%.2fs  sync_thr=%d  rs=%s  hmac=%s  "
+                "partial=%s  duration=%.3fs\n",
+                input_path, samp_rate, channels, bit_rate,
+                window_s, slide_s, sync_max_ham,
+                use_rs ? "on" : "off",
+                use_hmac ? "on" : "off",
+                allow_partial_rs ? "on" : "off",
+                (double)n_frames / (double)samp_rate);
+    }
+
+    struct sigaction sa = {0};
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
     int n_emitted = 0;
     for (size_t window_start = 0;
-         window_start + window_samples <= n_frames;
+         window_start + window_samples <= n_frames && !g_stop;
          window_start += slide_samples)
     {
         const int16_t *win = samples + window_start;
@@ -315,6 +456,7 @@ int main(int argc, char **argv)
             ssize_t plen = -1;
             int golay_errs = 0, hmac_ok = -1;
             int rs_errs = -1, used_golay_len = -1;
+            int rs_locs[32];
             size_t sync_off_local = 0;
             if (!try_decode_window(win, window_samples, &mp, &opts,
                                    sync_max_ham, use_hmac,
@@ -325,7 +467,8 @@ int main(int argc, char **argv)
                                    packet, sizeof packet,
                                    &plen, &golay_errs, &hmac_ok,
                                    &rs_errs, &used_golay_len,
-                                   &sync_off_local)) break;
+                                   &sync_off_local,
+                                   rs_locs)) break;
             inner_min_offset = sync_off_local + 1;
             if (plen < 4 || (size_t)plen > sizeof packet) continue;
 
@@ -373,11 +516,30 @@ int main(int argc, char **argv)
                        packet, (size_t)plen,
                        golay_errs, hmac_ok, use_hmac,
                        rs_errs, used_golay_len,
-                       crc_status, crc_computed, crc_le, crc_be);
+                       crc_status, crc_computed, crc_le, crc_be,
+                       rs_locs,
+                       ref_buf_len > 0 ? ref_buf : NULL, ref_buf_len,
+                       force_beacon);
+            if (use_tui) {
+                rx_tui_observe_frame(ts, packet, (size_t)plen,
+                                     golay_errs, hmac_ok, use_hmac,
+                                     rs_errs, crc_status);
+            }
             ++n_emitted;
         }
+        if (use_tui && rx_tui_tick()) goto done;
     }
 
+done:
+    if (use_tui) {
+        // Replay finished but the operator may want to read the panels;
+        // hold the screen until they press q (skipped if a SIGINT
+        // already asked us to quit). Tear down ncurses before printing
+        // the final stderr summary so it lands in the shell rather
+        // than getting clobbered by curses cleanup.
+        if (!g_stop) rx_tui_hold_until_quit();
+        rx_tui_close();
+    }
     fprintf(stderr, "rx_replay: %d frame(s) emitted.\n", n_emitted);
     free(bits_scratch);
     free(bytes_scratch);

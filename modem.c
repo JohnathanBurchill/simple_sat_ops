@@ -32,7 +32,13 @@ void modem_params_defaults(modem_params_t *p)
     p->samp_rate = 48000;
     p->bit_rate = 9600;
     p->gain_db = 0.0;
-    p->gauss_bt = 0.5;
+    // gauss_bt = 0 disables the Gaussian filter entirely (rectangular NRZ
+    // pulses). The gold-reference gr-satellites TX chain in
+    // gnu_radio/usrp_b210_gnu_radio/radio_ax100.py uses NRZ FSK
+    // (chunks_to_symbols_bf([-1,1]) with no pulse shaping) and its
+    // fsk_demodulator is matched to that. Callers that want GMSK can
+    // override gauss_bt back to 0.5 explicitly.
+    p->gauss_bt = 0.0;
     p->gauss_symbol_span = 4;
     p->rx_disable_dc_block = 0;
 }
@@ -272,6 +278,29 @@ static size_t find_u32_pattern_best(const uint8_t *bits, size_t n_bits,
     return best_off;
 }
 
+// Demod chain (independent of gr-satellites; equivalent in shape to its
+// fsk_demodulator):
+//
+//   PCM int16  →  DC-block (existing 1-pole HPF, optional)
+//              →  AGC: divide by signal RMS so downstream gains are scale-free
+//              →  Matched filter: sliding boxcar of length sps. For
+//                 rectangular NRZ pulses this is the integrate-and-dump
+//                 optimum filter; gives ~10·log10(sps) dB of SNR gain
+//                 over single-sample slicing (~7 dB at sps=5).
+//              →  Mueller-Müller decision-directed symbol-timing recovery:
+//                 strobe one sample per symbol via linear interpolation,
+//                 update the strobe position with TED = sgn(y[k-1])·y[k]
+//                 - sgn(y[k])·y[k-1], proportional loop filter. M&M is
+//                 sign-invariant under polarity flip, so a single timing
+//                 loop produces the strobe samples that we then slice
+//                 under each polarity.
+//              →  Hard slicer at 0 (sign of the strobe sample)
+//              →  ASM (0x930B51DE) search in the bit stream
+//
+// The change vs. the prior phase-search slicer: about 7 dB of bit-error
+// rate margin, which is the difference between RS-correctable and
+// RS-uncorrectable on a real-RF capture.
+
 int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
                         const modem_params_t *p,
                         int invert_polarity,
@@ -289,15 +318,15 @@ int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
         return -1;
     }
     int sps = p->samp_rate / p->bit_rate;
-    if (sps <= 0 || n_samples < (size_t)sps * 32u) {
+    if (sps <= 1 || n_samples < (size_t)sps * 32u) {
         return -1;
     }
 
-    // DC-block: 1-pole HPF, y[n] = x[n] - x[n-1] + α·y[n-1].
-    // α close to 1 → narrow low-cut. 0.995 at 48 kHz ≈ 40 Hz -3dB.
-    // Skipped (samples copied through) when p->rx_disable_dc_block is set —
-    // useful for radio paths with no DC offset, where the HPF only adds
-    // baseline transients and group delay.
+    // 1. DC-block: 1-pole HPF, y[n] = x[n] - x[n-1] + α·y[n-1].
+    //    α close to 1 → narrow low-cut. 0.995 at 48 kHz ≈ 40 Hz -3dB.
+    //    Skipped when p->rx_disable_dc_block is set — useful for radio
+    //    paths with no DC offset, where the HPF only adds baseline
+    //    transients and group delay.
     float *dc_blocked = (float *)malloc(n_samples * sizeof(float));
     if (dc_blocked == NULL) return -1;
     if (p->rx_disable_dc_block) {
@@ -316,93 +345,131 @@ int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
         }
     }
 
-    // Pre-slice into per-sample bits for each of the `sps` possible mid-bit
-    // phase offsets. The actual bit stream is every sps-th sample starting
-    // at (phase + sps/2) for phase in [0, sps).
-    size_t max_bits = n_samples / (size_t)sps;
-    uint8_t *tmp_bits = (uint8_t *)malloc(max_bits);
-    if (tmp_bits == NULL) {
+    // 2. AGC: compute RMS over the whole window, normalize so the matched
+    //    filter and timing-error detector both see roughly unit-scale signals.
+    //    A small floor prevents division blow-ups on near-silent input.
+    double sum_sq = 0.0;
+    for (size_t i = 0; i < n_samples; ++i) {
+        sum_sq += (double)dc_blocked[i] * (double)dc_blocked[i];
+    }
+    double rms = sqrt(sum_sq / (double)n_samples);
+    if (rms < 1.0) rms = 1.0;
+    double agc_inv = 1.0 / rms;
+
+    // 3. Matched filter: sliding boxcar of length sps, output normalized
+    //    so a perfectly-aligned in-symbol strobe lands at amplitude ~ ±1
+    //    after AGC. Implemented as an O(N) running sum.
+    size_t mf_len = n_samples - (size_t)sps + 1;
+    float *mf = (float *)malloc(mf_len * sizeof(float));
+    if (mf == NULL) {
         free(dc_blocked);
         return -1;
     }
+    {
+        double inv_sps = 1.0 / (double)sps;
+        double window = 0.0;
+        for (int k = 0; k < sps; ++k) window += (double)dc_blocked[k];
+        mf[0] = (float)(window * agc_inv * inv_sps);
+        for (size_t i = 1; i < mf_len; ++i) {
+            window -= (double)dc_blocked[i - 1];
+            window += (double)dc_blocked[i + (size_t)sps - 1];
+            mf[i] = (float)(window * agc_inv * inv_sps);
+        }
+    }
+    free(dc_blocked);
 
-    // Search over both polarity conventions unless the caller forced one
-    // (invert_polarity=0 tries normal first then inverted; =1 tries
-    // inverted first then normal). FM-discriminator polarity is a
-    // radio-side convention — IC-9700 MONI differs from RTL-SDR, for
-    // example — so it's easier to brute-force than document.
+    // 4. Mueller-Müller timing recovery + strobe collection.
+    //    Loop gain 0.10 — fast pull-in (the AX100 0x55 preamble has a
+    //    transition every bit, so M&M typically locks within ~5 symbols),
+    //    small enough to keep tracking jitter ~5 % of a symbol period at
+    //    moderate SNR. Per-step adjustment is clamped to ±sps/4 so a
+    //    pathological TED can't make the strobe skip or repeat a symbol.
+    //
+    //    The strobe sample at fractional sample position `pos` is linearly
+    //    interpolated from the matched-filter output. We start one symbol
+    //    in so M&M has valid history for its first TED computation.
+    size_t max_strobes = mf_len / (size_t)sps + 1;
+    float *strobe = (float *)malloc(max_strobes * sizeof(float));
+    if (strobe == NULL) {
+        free(mf);
+        return -1;
+    }
+    {
+        const double sps_d = (double)sps;
+        const double Kp = 0.10;
+        const double max_step = sps_d * 0.25;
+        double pos = sps_d;
+        double prev_y = 0.0, prev_dec = 0.0;
+        int have_prev = 0;
+        size_t n = 0;
+        while (pos + 1.0 < (double)mf_len && n < max_strobes) {
+            size_t i = (size_t)pos;
+            double frac = pos - (double)i;
+            double y = (double)mf[i] * (1.0 - frac) + (double)mf[i + 1] * frac;
+            double dec = (y >= 0.0) ? 1.0 : -1.0;
+            strobe[n++] = (float)y;
+
+            double advance = sps_d;
+            if (have_prev) {
+                double ted = prev_dec * y - dec * prev_y;
+                double adj = Kp * ted;
+                if      (adj >  max_step) adj =  max_step;
+                else if (adj < -max_step) adj = -max_step;
+                advance += adj;
+            }
+            pos += advance;
+            prev_y = y;
+            prev_dec = dec;
+            have_prev = 1;
+        }
+        max_strobes = n;
+    }
+    free(mf);
+
+    // 5. Slice strobe samples under each polarity and ASM-search.
+    //    FM-discriminator polarity is a radio-side convention (IC-9700
+    //    MONI vs. RTL-SDR, etc.), so we brute-force both. Normal-first
+    //    when invert_polarity=0; preserves the prior preference of
+    //    accepting any normal-polarity match before falling back to
+    //    inverted, even if inverted gave a lower-Hamming match.
+    uint8_t *tmp_bits = (uint8_t *)malloc(max_strobes ? max_strobes : 1);
+    if (tmp_bits == NULL) {
+        free(strobe);
+        return -1;
+    }
     int polarities[2];
     polarities[0] = invert_polarity ? 1 : 0;
     polarities[1] = invert_polarity ? 0 : 1;
 
     size_t best_sync = (size_t)-1;
-    int best_phase = -1;
     int best_polarity = -1;
 
-    // Per-polarity, search ALL phases and return the LOWEST-HAMMING match
-    // (ties broken by earliest position). Old behaviour was "first match
-    // in phase order", which is fine at sync_max_ham=0 but at >= 4 lets
-    // random noise in phase 0 hide a real Hamming-1 ASM in phase 4
-    // behind a wall of false-positive advances. Polarity preference is
-    // preserved: if normal polarity has any qualifying match, it wins
-    // (we only fall through to inverted if normal returned nothing at
-    // all in [min_offset, end]).
-    for (int pi = 0; pi < 2 && best_phase < 0; ++pi) {
+    for (int pi = 0; pi < 2 && best_polarity < 0; ++pi) {
         int this_invert = polarities[pi];
-        int local_best_ham = 33;
-        int local_best_phase = -1;
-        size_t local_best_off = (size_t)-1;
-        for (int phase = 0; phase < sps; ++phase) {
-            size_t mid_offset = (size_t)phase + (size_t)sps / 2u;
-            size_t n_bits = 0;
-            for (size_t i = mid_offset; i < n_samples; i += (size_t)sps) {
-                int bit;
-                if (this_invert) {
-                    bit = (dc_blocked[i] < 0.0f) ? 1 : 0;
-                } else {
-                    bit = (dc_blocked[i] > 0.0f) ? 1 : 0;
-                }
-                tmp_bits[n_bits++] = (uint8_t)bit;
-            }
-            int this_ham = 33;
-            size_t off = find_u32_pattern_best(tmp_bits, n_bits,
-                                               ASM_BIG_ENDIAN_U32, sync_max_ham,
-                                               min_bit_offset, &this_ham);
-            if (off != (size_t)-1 && this_ham < local_best_ham) {
-                local_best_ham = this_ham;
-                local_best_phase = phase;
-                local_best_off = off;
-            }
+        for (size_t i = 0; i < max_strobes; ++i) {
+            int bit;
+            if (this_invert) bit = (strobe[i] < 0.0f) ? 1 : 0;
+            else             bit = (strobe[i] > 0.0f) ? 1 : 0;
+            tmp_bits[i] = (uint8_t)bit;
         }
-        if (local_best_phase >= 0) {
-            // Recompute the winning phase's bit stream and copy into
-            // out_bits (tmp_bits got overwritten by later phases'
-            // sweeps; cheap to rebuild for one phase).
-            size_t mid_offset = (size_t)local_best_phase + (size_t)sps / 2u;
-            size_t n_bits = 0;
-            for (size_t i = mid_offset; i < n_samples; i += (size_t)sps) {
-                int bit;
-                if (this_invert) {
-                    bit = (dc_blocked[i] < 0.0f) ? 1 : 0;
-                } else {
-                    bit = (dc_blocked[i] > 0.0f) ? 1 : 0;
-                }
-                tmp_bits[n_bits++] = (uint8_t)bit;
-            }
-            size_t copy_bits = n_bits - local_best_off;
-            memcpy(out_bits, tmp_bits + local_best_off, copy_bits);
+        int this_ham = 33;
+        size_t off = find_u32_pattern_best(tmp_bits, max_strobes,
+                                           ASM_BIG_ENDIAN_U32, sync_max_ham,
+                                           min_bit_offset, &this_ham);
+        if (off != (size_t)-1) {
+            size_t copy_bits = max_strobes - off;
+            memcpy(out_bits, tmp_bits + off, copy_bits);
             *n_bits_out = copy_bits;
-            best_sync = local_best_off;
-            best_phase = local_best_phase;
+            best_sync = off;
             best_polarity = this_invert;
         }
     }
     if (polarity_used) *polarity_used = best_polarity;
 
     free(tmp_bits);
-    free(dc_blocked);
+    free(strobe);
 
-    if (best_phase < 0) {
+    if (best_polarity < 0) {
         if (sync_bit_offset) *sync_bit_offset = (size_t)-1;
         return -1;
     }

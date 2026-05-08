@@ -153,15 +153,27 @@ int radio_set_satellite_mode(radio_t *radio, int sat_mode);
 int radio_set_mode(radio_t *radio, int mode, int filter);
 int radio_set_data_mode(radio_t *radio, int on, int filter);
 int radio_set_data_mod_source(radio_t *radio, int source);
-// Prep the radio for clean data RX: NB / NR / notch / contour off,
-// AGC FAST. Yaesu also pins Menu 079 = 9600 so the rear DATA-OUT is the
-// wide pre-de-emphasis path. Issued before rx_capture / rx_live to keep
-// 9600-baud bit transitions undistorted.
+// Prep the radio for clean data RX. Yaesu drives the full FT-991A
+// downlink-prep checklist: auto-info off, wide IF, all DSPs off
+// (NB / NR / auto-notch / manual-notch / contour), AGC FAST, RF
+// front-end at max sensitivity (preamp on, attenuator off, RF gain
+// max), IF shift centred, repeater shift / CTCSS cleared, and
+// Menu 079 = 9600 so the rear DATA-OUT carries the wide pre-de-
+// emphasis discriminator output. Issued before rx_capture / rx_live
+// to keep 9600-baud bit transitions undistorted.
 int radio_set_rx_clean(radio_t *radio);
 int radio_set_usb_mod_level(radio_t *radio, int level_0_to_255);
 int radio_set_moni_level(radio_t *radio, int level_0_to_255);
 int radio_set_rf_power(radio_t *radio, int level_0_to_255);
 int radio_set_rf_power_watts(radio_t *radio, int watts);
+// Carrier squelch level, 0..100. radio_get_squelch returns the level on
+// success or -1 on error / unsupported.
+int radio_set_squelch(radio_t *radio, int level_0_to_100);
+int radio_get_squelch(radio_t *radio);
+// Send raw ASCII CAT bytes (caller includes the protocol terminator) and
+// optionally read any reply. Returns RADIO_OK including the no-reply
+// case; reply[0] == '\0' means "command sent, nothing came back".
+int radio_cat_send(radio_t *radio, const char *cmd, char *reply, int reply_cap);
 int radio_uplink_prep(radio_t *radio);
 int radio_ptt(radio_t *radio, int on);
 int radio_power(radio_t *radio, int on);

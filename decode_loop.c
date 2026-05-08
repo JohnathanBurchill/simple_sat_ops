@@ -20,10 +20,75 @@
 
 #include "decode_loop.h"
 
+#include "beacon_cts1.h"
 #include "csp.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
+
+// Process-global because emit_frame is called from rx_live, rx_replay,
+// b210_rx_live, and rx_decode. The alternative — a parameter on
+// emit_frame — would touch every caller site for no real gain. The flag
+// is read-mostly (set once at startup or via a REPL command) so the
+// no-locking single-int approach is fine.
+static int g_show_headers = 0;
+
+void decode_loop_set_show_headers(int on)
+{
+    g_show_headers = on ? 1 : 0;
+}
+
+int decode_loop_show_headers(void)
+{
+    return g_show_headers;
+}
+
+static const char *skip_ws(const char *s)
+{
+    while (*s == ' ' || *s == '\t') s++;
+    return s;
+}
+
+int decode_loop_try_command(const char *cmd, char *status_buf, size_t cap)
+{
+    if (cap > 0 && status_buf != NULL) status_buf[0] = '\0';
+    if (cmd == NULL) return 0;
+    const char *p = skip_ws(cmd);
+    // "packetheaders" or shorthand "ph"
+    const char *rest = NULL;
+    if (strncmp(p, "packetheaders", 13) == 0
+        && (p[13] == ' ' || p[13] == '\t')) {
+        rest = p + 13;
+    } else if (strncmp(p, "ph", 2) == 0
+               && (p[2] == ' ' || p[2] == '\t')) {
+        rest = p + 2;
+    } else {
+        return 0;
+    }
+    rest = skip_ws(rest);
+    if (strcmp(rest, "on") == 0) {
+        decode_loop_set_show_headers(1);
+        if (status_buf != NULL && cap > 0) {
+            snprintf(status_buf, cap, "packetheaders: on");
+        }
+        return 1;
+    }
+    if (strcmp(rest, "off") == 0) {
+        decode_loop_set_show_headers(0);
+        if (status_buf != NULL && cap > 0) {
+            snprintf(status_buf, cap, "packetheaders: off");
+        }
+        return 1;
+    }
+    if (status_buf != NULL && cap > 0) {
+        snprintf(status_buf, cap,
+                 "packetheaders: usage `packetheaders on|off`");
+    }
+    // Returned 1 because we recognised the verb — caller shouldn't
+    // fall through and try its own parse; we already wrote a usage hint.
+    return 1;
+}
 
 int try_decode_window(const int16_t *samples, size_t n_samples,
                       const modem_params_t *mp,
@@ -37,7 +102,8 @@ int try_decode_window(const int16_t *samples, size_t n_samples,
                       ssize_t *out_packet_len,
                       int *out_golay_errs, int *out_hmac_ok,
                       int *out_rs_errs, int *out_used_golay_len,
-                      size_t *out_sync_off)
+                      size_t *out_sync_off,
+                      int *out_rs_locs)
 {
     (void)bits_cap;  // sized by the caller; we honour bytes_cap explicitly
     // Was 32; bumped to 256 because the cross-phase best-Hamming search
@@ -72,7 +138,8 @@ int try_decode_window(const int16_t *samples, size_t n_samples,
         ssize_t plen = ax100_unframe(bytes_scratch, n_bytes, opts,
                                      packet, packet_cap,
                                      out_golay_errs, out_hmac_ok,
-                                     out_rs_errs, out_used_golay_len);
+                                     out_rs_errs, out_used_golay_len,
+                                     out_rs_locs);
         (void)polarity_used;
         if (plen < 0) {
             // Partial-decode rescue: RS(255,223) gives up at >16 byte
@@ -95,7 +162,8 @@ int try_decode_window(const int16_t *samples, size_t n_samples,
                                            &partial_opts,
                                            packet, packet_cap,
                                            &p_golay, &p_hmac,
-                                           &p_rs, &p_lensrc);
+                                           &p_rs, &p_lensrc,
+                                           NULL);
                 // Strip the trailing 32-byte RS parity (it's noise to
                 // the operator and would push the apparent length up
                 // by 32 vs. the as-transmitted packet). Anything <=32
@@ -129,7 +197,10 @@ void emit_frame(const char *log_path, int quiet, const char *ts,
                 int golay_errs, int hmac_ok, int use_hmac,
                 int rs_errs, int used_golay_len,
                 int crc_status,
-                uint32_t crc_computed, uint32_t crc_le, uint32_t crc_be)
+                uint32_t crc_computed, uint32_t crc_le, uint32_t crc_be,
+                const int *rs_locs,
+                const uint8_t *ref_buf, size_t ref_len,
+                int force_beacon)
 {
     char rs_buf[32];
     if (rs_errs == -2)      snprintf(rs_buf, sizeof rs_buf, "UNCORRECTABLE");
@@ -148,27 +219,91 @@ void emit_frame(const char *log_path, int quiet, const char *ts,
         if (log_fp != NULL) streams[1] = log_fp;
     }
 
+    int show_headers = decode_loop_show_headers();
+    int hmac_bad = use_hmac && hmac_ok == 0;
+    int rs_bad = rs_errs == -2;
+    // Always-show framing line when something went wrong — operator needs
+    // the rs/hmac state even in terse mode. Otherwise gate on the toggle.
+    int show_ax100 = show_headers || hmac_bad || rs_bad;
+
     const char *len_src =
         used_golay_len == 1 ? "golay-header"
         : used_golay_len == 0 ? "brute-forced" : "(n/a)";
     for (int s = 0; s < 2; s++) {
         FILE *fp = streams[s];
         if (fp == NULL) continue;
-        if (use_hmac) {
-            fprintf(fp, "[%s] AX100: golay_errors=%d hmac=%s rs=%s len=%s "
-                    "len_bytes=%zu\n",
-                    ts, golay_errs,
-                    hmac_ok == 1 ? "ok" : hmac_ok == 0 ? "MISMATCH" : "(off)",
-                    rs_buf, len_src, packet_len);
-        } else {
-            fprintf(fp, "[%s] AX100: golay_errors=%d rs=%s len=%s "
-                    "len_bytes=%zu\n",
-                    ts, golay_errs, rs_buf, len_src, packet_len);
+        if (show_ax100) {
+            if (use_hmac) {
+                fprintf(fp, "[%s] AX100: golay_errors=%d hmac=%s rs=%s len=%s "
+                        "len_bytes=%zu\n",
+                        ts, golay_errs,
+                        hmac_ok == 1 ? "ok" : hmac_ok == 0 ? "MISMATCH" : "(off)",
+                        rs_buf, len_src, packet_len);
+            } else {
+                fprintf(fp, "[%s] AX100: golay_errors=%d rs=%s len=%s "
+                        "len_bytes=%zu\n",
+                        ts, golay_errs, rs_buf, len_src, packet_len);
+            }
+        }
+        // Per-byte error positions from the RS solver. Forensic detail —
+        // gated on the toggle since terse-mode operators don't care.
+        if (show_headers && rs_errs > 0 && rs_locs != NULL) {
+            size_t on_wire_len = packet_len + (use_hmac ? 4 : 0) + 32;
+            int sorted[32];
+            int n = rs_errs > 32 ? 32 : rs_errs;
+            for (int i = 0; i < n; ++i) sorted[i] = rs_locs[i];
+            // Insertion sort — n <= 16 in practice, often < 8.
+            for (int i = 1; i < n; ++i) {
+                int v = sorted[i], j = i - 1;
+                while (j >= 0 && sorted[j] > v) { sorted[j+1] = sorted[j]; --j; }
+                sorted[j+1] = v;
+            }
+            fprintf(fp, "[%s] rs_locs: corrected=%d of %zu on-wire bytes:",
+                    ts, rs_errs, on_wire_len);
+            for (int i = 0; i < n; ++i) fprintf(fp, " %d", sorted[i]);
+            fputc('\n', fp);
+        }
+        // Reference comparison: byte positions where the decoded frame
+        // differs from a known-good reference. Useful when RS gave up
+        // (rs_errs == -2) and we want to see where the bit errors
+        // landed in the recovered (uncorrected) bytes.
+        if (show_headers && ref_buf != NULL && ref_len > 0) {
+            const uint8_t *cmp = NULL;
+            size_t cmp_len = 0;
+            const char *what = NULL;
+            if (ref_len == packet_len) {
+                cmp = packet; cmp_len = packet_len; what = "packet";
+            } else if (csp_ok && ref_len == payload_len) {
+                cmp = payload; cmp_len = payload_len; what = "payload";
+            }
+            if (cmp != NULL) {
+                int diffs[256];
+                int n_diff = 0;
+                for (size_t i = 0; i < cmp_len; ++i) {
+                    if (cmp[i] != ref_buf[i]) {
+                        if (n_diff < (int)(sizeof diffs / sizeof diffs[0])) {
+                            diffs[n_diff] = (int)i;
+                        }
+                        ++n_diff;
+                    }
+                }
+                int shown = n_diff > (int)(sizeof diffs / sizeof diffs[0])
+                    ? (int)(sizeof diffs / sizeof diffs[0]) : n_diff;
+                fprintf(fp, "[%s] ref_diff: %d of %zu %s bytes differ:",
+                        ts, n_diff, cmp_len, what);
+                for (int i = 0; i < shown; ++i) fprintf(fp, " %d", diffs[i]);
+                if (shown < n_diff) fprintf(fp, " ...");
+                fputc('\n', fp);
+            } else {
+                fprintf(fp, "[%s] ref_diff: skipped (ref %zu bytes, "
+                        "packet %zu, payload %zu)\n",
+                        ts, ref_len, packet_len, payload_len);
+            }
         }
         // CRC notice (only when --csp-crc32 was active for this frame).
-        // Mismatch never drops the frame; the trailer stays in payload
-        // so the operator can inspect what was received.
-        if (crc_status == 1) {
+        // Mismatch always prints — it's an error condition the operator
+        // must see regardless of mode. The success line is gated.
+        if (crc_status == 1 && show_headers) {
             fprintf(fp, "[%s] csp_crc32: ok (0x%08x, 4-byte trailer "
                     "stripped)\n", ts, crc_computed);
         } else if (crc_status == 0) {
@@ -178,22 +313,41 @@ void emit_frame(const char *log_path, int quiet, const char *ts,
                     ts, crc_computed, crc_le, crc_be);
         }
         if (csp_ok) {
-            fprintf(fp, "[%s] CSP v1: src=%u dst=%u dport=%u sport=%u "
-                    "prio=%u flags=0x%02x\n",
-                    ts, hdr.src, hdr.dst, hdr.dport, hdr.sport, hdr.prio,
-                    hdr.flags);
-            fprintf(fp, "[%s] hex:   ", ts);
-            for (size_t i = 0; i < payload_len; i++) {
-                fprintf(fp, "%02x", payload[i]);
+            if (show_headers) {
+                fprintf(fp, "[%s] CSP v1: src=%u dst=%u dport=%u sport=%u "
+                        "prio=%u flags=0x%02x\n",
+                        ts, hdr.src, hdr.dst, hdr.dport, hdr.sport, hdr.prio,
+                        hdr.flags);
             }
-            fputc('\n', fp);
-            fprintf(fp, "[%s] ascii: ", ts);
-            for (size_t i = 0; i < payload_len; i++) {
-                char c = (payload[i] >= 0x20 && payload[i] < 0x7F)
-                    ? (char)payload[i] : '.';
-                fputc(c, fp);
+            if (force_beacon) {
+                // Build a 130-byte buffer: payload bytes first, zero-pad
+                // the rest. Truncate if longer. Operator opt-in for
+                // prying telemetry out of mangled frames.
+                uint8_t buf[sizeof(COMMS_beacon_basic_packet_t)] = {0};
+                size_t copy = payload_len < sizeof buf ? payload_len : sizeof buf;
+                if (copy > 0) memcpy(buf, payload, copy);
+                fprintf(fp,
+                        "[%s] force_beacon: padded %zu->130 bytes "
+                        "(zero-fill from byte %zu)\n",
+                        ts, payload_len, copy);
+                beacon_print(fp, ts, buf, sizeof buf);
+            } else {
+                cts1_packet_print(fp, ts, payload, payload_len);
             }
-            fputc('\n', fp);
+            if (show_headers) {
+                fprintf(fp, "[%s] hex:   ", ts);
+                for (size_t i = 0; i < payload_len; i++) {
+                    fprintf(fp, "%02x", payload[i]);
+                }
+                fputc('\n', fp);
+                fprintf(fp, "[%s] ascii: ", ts);
+                for (size_t i = 0; i < payload_len; i++) {
+                    char c = (payload[i] >= 0x20 && payload[i] < 0x7F)
+                        ? (char)payload[i] : '.';
+                    fputc(c, fp);
+                }
+                fputc('\n', fp);
+            }
         }
         fflush(fp);
     }

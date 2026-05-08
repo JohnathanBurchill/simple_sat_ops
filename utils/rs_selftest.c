@@ -124,7 +124,7 @@ static void test_clean_decode(void)
     uint8_t cw[RS_N];
     rs_encode(data, cw);
 
-    int errs = rs_decode(cw);
+    int errs = rs_decode(cw, NULL);
     check(errs == 0, "clean decode returns 0 errors");
     check(bytes_equal(cw, data, RS_K), "clean decode preserves data");
 }
@@ -150,12 +150,28 @@ static void test_correct_up_to_t(void)
             corrupt[pos] ^= 0xA5;
         }
 
-        int errs = rs_decode(corrupt);
+        int locs[RS_NROOTS];
+        int errs = rs_decode(corrupt, locs);
         char name[64];
         snprintf(name, sizeof name, "correct %d byte error(s) (count)", t);
         check(errs == t, name);
         snprintf(name, sizeof name, "correct %d byte error(s) (data)", t);
         check(bytes_equal(corrupt, data, RS_K), name);
+        // Verify the reported locations match the positions we flipped
+        // (3, 18, 33, ...). Order isn't guaranteed by Forney, so sort first.
+        int sorted[RS_NROOTS];
+        for (int i = 0; i < t; ++i) sorted[i] = locs[i];
+        for (int i = 1; i < t; ++i) {
+            int v = sorted[i], j = i - 1;
+            while (j >= 0 && sorted[j] > v) { sorted[j+1] = sorted[j]; --j; }
+            sorted[j+1] = v;
+        }
+        int locs_match = 1;
+        for (int i = 0; i < t; ++i) {
+            if (sorted[i] != i * 15 + 3) { locs_match = 0; break; }
+        }
+        snprintf(name, sizeof name, "correct %d byte error(s) (locs)", t);
+        check(locs_match, name);
     }
 }
 
@@ -177,7 +193,7 @@ static void test_beyond_capacity(void)
         int pos = (i * 13 + 7) % RS_N;
         corrupt[pos] ^= 0x5A;
     }
-    int errs = rs_decode(corrupt);
+    int errs = rs_decode(corrupt, NULL);
     int ok = (errs < 0) || bytes_equal(corrupt, data, RS_K);
     check(ok, "17-byte corruption either fails cleanly or somehow recovers");
 }
@@ -199,11 +215,27 @@ static void test_pycsp_wrapper(void)
 
     uint8_t decoded[256];
     int errs = -1;
+    int locs[RS_NROOTS];
     ssize_t dec_len = rs_pycsp_decode(encoded, (size_t)enc_len,
-                                      decoded, sizeof decoded, &errs);
+                                      decoded, sizeof decoded, &errs, locs);
     check(dec_len == (ssize_t)msg_len, "pycsp decode length = out_len");
     check(errs == 10, "pycsp decode reports 10 errors corrected");
     check(memcmp(decoded, msg, msg_len) == 0, "pycsp decode recovers message");
+    // Locations must match the on-wire byte indices we flipped: i*3+1 for
+    // i in 0..9. pycsp decode returns positions relative to the start of
+    // `encoded` (length enc_len); indices should be 1, 4, 7, ..., 28.
+    int sorted[RS_NROOTS];
+    for (int i = 0; i < errs; ++i) sorted[i] = locs[i];
+    for (int i = 1; i < errs; ++i) {
+        int v = sorted[i], j = i - 1;
+        while (j >= 0 && sorted[j] > v) { sorted[j+1] = sorted[j]; --j; }
+        sorted[j+1] = v;
+    }
+    int locs_ok = 1;
+    for (int i = 0; i < errs; ++i) {
+        if (sorted[i] != i * 3 + 1) { locs_ok = 0; break; }
+    }
+    check(locs_ok, "pycsp decode reports correct on-wire byte offsets");
 }
 
 int main(void)
