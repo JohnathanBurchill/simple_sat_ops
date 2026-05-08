@@ -71,6 +71,18 @@ typedef struct {
     const char *source_run;
     double      audio_offset_s;
     const char *decoded_summary;
+    // Observer-frame state. NaN means "not known"; that maps to NULL
+    // in the DB. Populated by b210_rx_live (live) or rx_replay (when
+    // run with --tle for backfill); other receivers leave them NaN.
+    double      az_deg;
+    double      el_deg;
+    double      range_km;
+    double      range_rate_km_s;
+    double      doppler_hz_offset;
+    // tle_id from packet_db_register_tle. 0 means "not known".
+    long long   tle_id;
+    // Run cwd / WAV directory. NULL means not known.
+    const char *session_dir;
 } packet_db_record_t;
 
 // Open the DB at `path`, creating it (with schema) if missing. Sets WAL
@@ -84,6 +96,35 @@ packet_db_t *packet_db_open(const char *path);
 // the same capture don't double-count. Returns 0 on success or silent
 // dedup, -1 on real DB errors.
 int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec);
+
+// Register a TLE (3-line: name, line1, line2) and return its row id.
+// Idempotent — same TLE bytes produce the same id across runs (UNIQUE
+// constraint on the SHA1 of the canonical "line1\nline2" form). The
+// catalog number, epoch year, and epoch day are parsed out of line1
+// for queryability; if parsing fails the row still gets stored with
+// NULLs in those columns. Returns >0 (the id) on success, 0 on
+// failure.
+long long packet_db_register_tle(packet_db_t *db,
+                                 const char *satellite,
+                                 const char *line1,
+                                 const char *line2);
+
+// Backfill the observer / tle / session_dir columns on rows whose
+// payload matches the supplied bytes (matched by SHA1). When `force`
+// is 0, only NULL columns are updated (the default rx_replay --update
+// behaviour: fill the gaps, don't trample). When `force` is non-zero,
+// every column is overwritten. NaN inputs map to NULL the same way
+// packet_db_insert handles them. tle_id == 0 means "leave as-is" in
+// gaps mode; in force mode it sets the column to NULL. Returns the
+// number of rows updated, or -1 on real DB errors.
+int packet_db_update_observer(packet_db_t *db,
+                              const uint8_t *payload, size_t payload_len,
+                              double az_deg, double el_deg,
+                              double range_km, double range_rate_km_s,
+                              double doppler_hz_offset,
+                              long long tle_id,
+                              const char *session_dir,
+                              int force);
 
 void packet_db_close(packet_db_t *db);
 

@@ -28,6 +28,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 // /dev/urandom-backed run-id: 8 random bytes, hex-encoded. Not strong
@@ -134,9 +135,27 @@ int packet_db_default_path(char *buf, size_t cap)
 struct packet_db {
     sqlite3      *db;
     sqlite3_stmt *insert_stmt;
+    sqlite3_stmt *update_gaps_stmt;
+    sqlite3_stmt *update_force_stmt;
+    sqlite3_stmt *register_tle_stmt;
+    sqlite3_stmt *select_tle_id_stmt;
 };
 
+// Fresh-DB schema. Existing DBs from user_version=1 get the new columns
+// via the ALTER TABLE migration in packet_db_open after this CREATE
+// runs.
 static const char SCHEMA_SQL[] =
+    "CREATE TABLE IF NOT EXISTS tle (\n"
+    "  id              INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "  satellite       TEXT NOT NULL,\n"
+    "  catalog_number  INTEGER,\n"
+    "  epoch_year      INTEGER,\n"
+    "  epoch_day       REAL,\n"
+    "  line1           TEXT NOT NULL,\n"
+    "  line2           TEXT NOT NULL,\n"
+    "  sha1            BLOB NOT NULL UNIQUE,\n"
+    "  first_seen      TEXT NOT NULL\n"
+    ");\n"
     "CREATE TABLE IF NOT EXISTS packet (\n"
     "  id              INTEGER PRIMARY KEY AUTOINCREMENT,\n"
     "  ts_received     TEXT NOT NULL,\n"
@@ -156,12 +175,32 @@ static const char SCHEMA_SQL[] =
     "  source_run      TEXT,\n"
     "  audio_offset_s  REAL,\n"
     "  decoded_summary TEXT,\n"
+    "  az_deg            REAL,\n"
+    "  el_deg            REAL,\n"
+    "  range_km          REAL,\n"
+    "  range_rate_km_s   REAL,\n"
+    "  doppler_hz_offset REAL,\n"
+    "  tle_id            INTEGER REFERENCES tle(id),\n"
+    "  session_dir       TEXT,\n"
     "  UNIQUE (payload_sha1, source_tool, source_run)\n"
     ");\n"
     "CREATE INDEX IF NOT EXISTS idx_packet_ts        ON packet(ts_received);\n"
     "CREATE INDEX IF NOT EXISTS idx_packet_type      ON packet(packet_type);\n"
-    "CREATE INDEX IF NOT EXISTS idx_packet_satellite ON packet(satellite);\n"
-    "PRAGMA user_version = 1;\n";
+    "CREATE INDEX IF NOT EXISTS idx_packet_satellite ON packet(satellite);\n";
+
+// Idempotent ALTERs for existing DBs created at schema version 1.
+// "duplicate column name" errors are caught and ignored — re-running
+// is a no-op.
+static const char *const MIGRATION_V2_ALTERS[] = {
+    "ALTER TABLE packet ADD COLUMN az_deg            REAL",
+    "ALTER TABLE packet ADD COLUMN el_deg            REAL",
+    "ALTER TABLE packet ADD COLUMN range_km          REAL",
+    "ALTER TABLE packet ADD COLUMN range_rate_km_s   REAL",
+    "ALTER TABLE packet ADD COLUMN doppler_hz_offset REAL",
+    "ALTER TABLE packet ADD COLUMN tle_id            INTEGER REFERENCES tle(id)",
+    "ALTER TABLE packet ADD COLUMN session_dir       TEXT",
+    NULL
+};
 
 static const char INSERT_SQL[] =
     "INSERT OR IGNORE INTO packet ("
@@ -169,14 +208,50 @@ static const char INSERT_SQL[] =
     "  csp_src, csp_dst, csp_dport, csp_sport, csp_prio, csp_flags,"
     "  payload, payload_sha1,"
     "  golay_errs, rs_errs, hmac_ok, crc_status,"
-    "  source_tool, source_run, audio_offset_s, decoded_summary"
+    "  source_tool, source_run, audio_offset_s, decoded_summary,"
+    "  az_deg, el_deg, range_km, range_rate_km_s, doppler_hz_offset,"
+    "  tle_id, session_dir"
     ") VALUES ("
     "  ?1, ?2, ?3, ?4,"
     "  ?5, ?6, ?7, ?8, ?9, ?10,"
     "  ?11, ?12,"
     "  ?13, ?14, ?15, ?16,"
-    "  ?17, ?18, ?19, ?20"
+    "  ?17, ?18, ?19, ?20,"
+    "  ?21, ?22, ?23, ?24, ?25,"
+    "  ?26, ?27"
     ");";
+
+// UPDATE for the rx_replay backfill path. Fills observer / tle / dir
+// columns on the row matching payload_sha1, ONLY when those columns are
+// currently NULL (default), or unconditionally when force is non-zero.
+// Multiple rows may match (different source_tool / source_run) — we
+// update all of them, since the observer state is a property of the
+// physical packet, not of which tool decoded it.
+static const char UPDATE_OBSERVER_GAPS_SQL[] =
+    "UPDATE packet SET"
+    "  az_deg = COALESCE(az_deg, ?1),"
+    "  el_deg = COALESCE(el_deg, ?2),"
+    "  range_km = COALESCE(range_km, ?3),"
+    "  range_rate_km_s = COALESCE(range_rate_km_s, ?4),"
+    "  doppler_hz_offset = COALESCE(doppler_hz_offset, ?5),"
+    "  tle_id = COALESCE(tle_id, ?6),"
+    "  session_dir = COALESCE(session_dir, ?7)"
+    " WHERE payload_sha1 = ?8;";
+static const char UPDATE_OBSERVER_FORCE_SQL[] =
+    "UPDATE packet SET"
+    "  az_deg = ?1, el_deg = ?2, range_km = ?3,"
+    "  range_rate_km_s = ?4, doppler_hz_offset = ?5,"
+    "  tle_id = ?6, session_dir = ?7"
+    " WHERE payload_sha1 = ?8;";
+
+static const char REGISTER_TLE_SQL[] =
+    "INSERT OR IGNORE INTO tle ("
+    "  satellite, catalog_number, epoch_year, epoch_day,"
+    "  line1, line2, sha1, first_seen"
+    ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);";
+
+static const char SELECT_TLE_ID_SQL[] =
+    "SELECT id FROM tle WHERE sha1 = ?1;";
 
 packet_db_t *packet_db_open(const char *path)
 {
@@ -210,6 +285,33 @@ packet_db_t *packet_db_open(const char *path)
         return NULL;
     }
 
+    // V1 -> V2 migration: idempotent ALTER TABLE ADD COLUMNs. SQLite
+    // returns "duplicate column name" when the column already exists;
+    // those are caught and silently ignored so re-running is safe.
+    for (int i = 0; MIGRATION_V2_ALTERS[i] != NULL; i++) {
+        char *m_err = NULL;
+        if (sqlite3_exec(raw, MIGRATION_V2_ALTERS[i], NULL, NULL, &m_err)
+            != SQLITE_OK) {
+            int dup = (m_err != NULL
+                       && strstr(m_err, "duplicate column name") != NULL);
+            if (!dup) {
+                fprintf(stderr, "packet_db: migration step '%s' failed: "
+                        "%s\n", MIGRATION_V2_ALTERS[i],
+                        m_err ? m_err : "(unknown)");
+                sqlite3_free(m_err);
+                sqlite3_close(raw);
+                errno = EIO;
+                return NULL;
+            }
+            sqlite3_free(m_err);
+        }
+    }
+    if (sqlite3_exec(raw, "PRAGMA user_version = 2;", NULL, NULL, NULL)
+        != SQLITE_OK) {
+        // Non-fatal. The PRAGMA failure just means future opens re-run
+        // the (idempotent) migration, which is fine.
+    }
+
     packet_db_t *db = (packet_db_t *)calloc(1, sizeof *db);
     if (db == NULL) {
         sqlite3_close(raw);
@@ -217,14 +319,23 @@ packet_db_t *packet_db_open(const char *path)
         return NULL;
     }
     db->db = raw;
-    if (sqlite3_prepare_v2(raw, INSERT_SQL, sizeof INSERT_SQL,
-                           &db->insert_stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "packet_db: prepare failed: %s\n",
-                sqlite3_errmsg(raw));
-        sqlite3_close(raw);
-        free(db);
-        errno = EIO;
-        return NULL;
+
+    struct { const char *sql; sqlite3_stmt **out; } stmts[] = {
+        { INSERT_SQL,                &db->insert_stmt        },
+        { UPDATE_OBSERVER_GAPS_SQL,  &db->update_gaps_stmt   },
+        { UPDATE_OBSERVER_FORCE_SQL, &db->update_force_stmt  },
+        { REGISTER_TLE_SQL,          &db->register_tle_stmt  },
+        { SELECT_TLE_ID_SQL,         &db->select_tle_id_stmt },
+    };
+    for (size_t i = 0; i < sizeof stmts / sizeof stmts[0]; i++) {
+        if (sqlite3_prepare_v2(raw, stmts[i].sql, -1, stmts[i].out, NULL)
+            != SQLITE_OK) {
+            fprintf(stderr, "packet_db: prepare '%s' failed: %s\n",
+                    stmts[i].sql, sqlite3_errmsg(raw));
+            packet_db_close(db);
+            errno = EIO;
+            return NULL;
+        }
     }
     return db;
 }
@@ -239,6 +350,12 @@ static void bind_int_or_null(sqlite3_stmt *s, int idx, int v, int valid)
 {
     if (valid) sqlite3_bind_int(s, idx, v);
     else sqlite3_bind_null(s, idx);
+}
+
+static void bind_double_or_null(sqlite3_stmt *s, int idx, double v)
+{
+    if (isnan(v)) sqlite3_bind_null(s, idx);
+    else sqlite3_bind_double(s, idx, v);
 }
 
 int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec)
@@ -278,9 +395,16 @@ int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec)
     sqlite3_bind_int (s, 16, rec->crc_status);
     bind_text_or_null(s, 17, rec->source_tool);
     bind_text_or_null(s, 18, rec->source_run);
-    if (isnan(rec->audio_offset_s)) sqlite3_bind_null(s, 19);
-    else sqlite3_bind_double(s, 19, rec->audio_offset_s);
+    bind_double_or_null(s, 19, rec->audio_offset_s);
     bind_text_or_null(s, 20, rec->decoded_summary);
+    bind_double_or_null(s, 21, rec->az_deg);
+    bind_double_or_null(s, 22, rec->el_deg);
+    bind_double_or_null(s, 23, rec->range_km);
+    bind_double_or_null(s, 24, rec->range_rate_km_s);
+    bind_double_or_null(s, 25, rec->doppler_hz_offset);
+    if (rec->tle_id > 0) sqlite3_bind_int64(s, 26, rec->tle_id);
+    else sqlite3_bind_null(s, 26);
+    bind_text_or_null(s, 27, rec->session_dir);
 
     int rc = sqlite3_step(s);
     if (rc != SQLITE_DONE) {
@@ -294,9 +418,149 @@ int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec)
 void packet_db_close(packet_db_t *db)
 {
     if (db == NULL) return;
-    if (db->insert_stmt != NULL) sqlite3_finalize(db->insert_stmt);
+    if (db->insert_stmt        != NULL) sqlite3_finalize(db->insert_stmt);
+    if (db->update_gaps_stmt   != NULL) sqlite3_finalize(db->update_gaps_stmt);
+    if (db->update_force_stmt  != NULL) sqlite3_finalize(db->update_force_stmt);
+    if (db->register_tle_stmt  != NULL) sqlite3_finalize(db->register_tle_stmt);
+    if (db->select_tle_id_stmt != NULL) sqlite3_finalize(db->select_tle_id_stmt);
     if (db->db != NULL) sqlite3_close(db->db);
     free(db);
+}
+
+// Compute SHA1 of "line1\nline2" — the canonical TLE identity. SHA1 is
+// already used elsewhere in this file (for the payload dedup); not
+// adding any new dependency.
+static void tle_sha1(const char *line1, const char *line2, uint8_t out[20])
+{
+    SHA_CTX ctx;
+    SHA1_Init(&ctx);
+    SHA1_Update(&ctx, line1, strlen(line1));
+    SHA1_Update(&ctx, "\n", 1);
+    SHA1_Update(&ctx, line2, strlen(line2));
+    SHA1_Final(out, &ctx);
+}
+
+// Parse line1's catalog-number / epoch fields. TLE line 1 layout (NORAD):
+//   col 0     '1'
+//   col 2-6   5-digit catalog number (decimal)
+//   col 18-19 epoch year (last two digits)
+//   col 20-31 epoch day-of-year + fractional day
+// All as ASCII text. Returns 0 on success, -1 if the line doesn't look
+// like a TLE.
+static int parse_tle_line1(const char *line1,
+                           int *out_catalog,
+                           int *out_epoch_year,
+                           double *out_epoch_day)
+{
+    if (line1 == NULL || strlen(line1) < 32 || line1[0] != '1') return -1;
+    char buf[16];
+    memcpy(buf, line1 + 2, 5); buf[5] = '\0';
+    *out_catalog = atoi(buf);
+    memcpy(buf, line1 + 18, 2); buf[2] = '\0';
+    int yy = atoi(buf);
+    *out_epoch_year = (yy < 57) ? 2000 + yy : 1900 + yy;
+    memcpy(buf, line1 + 20, 12); buf[12] = '\0';
+    *out_epoch_day = atof(buf);
+    return 0;
+}
+
+long long packet_db_register_tle(packet_db_t *db,
+                                 const char *satellite,
+                                 const char *line1,
+                                 const char *line2)
+{
+    if (db == NULL || db->register_tle_stmt == NULL || db->select_tle_id_stmt == NULL
+        || satellite == NULL || line1 == NULL || line2 == NULL) {
+        return 0;
+    }
+    uint8_t sha[SHA_DIGEST_LENGTH];
+    tle_sha1(line1, line2, sha);
+
+    // Try to find existing row first — saves an INSERT round-trip in
+    // the steady state where the same TLE is reused for many packets.
+    sqlite3_reset(db->select_tle_id_stmt);
+    sqlite3_clear_bindings(db->select_tle_id_stmt);
+    sqlite3_bind_blob(db->select_tle_id_stmt, 1, sha, sizeof sha,
+                      SQLITE_TRANSIENT);
+    if (sqlite3_step(db->select_tle_id_stmt) == SQLITE_ROW) {
+        long long id = sqlite3_column_int64(db->select_tle_id_stmt, 0);
+        return id;
+    }
+
+    int catalog = 0, epoch_year = 0;
+    double epoch_day = 0.0;
+    int parsed = (parse_tle_line1(line1, &catalog, &epoch_year, &epoch_day) == 0);
+
+    char ts_buf[40];
+    time_t now = time(NULL);
+    struct tm utc;
+    gmtime_r(&now, &utc);
+    strftime(ts_buf, sizeof ts_buf, "%Y-%m-%dT%H:%M:%SZ", &utc);
+
+    sqlite3_stmt *s = db->register_tle_stmt;
+    sqlite3_reset(s);
+    sqlite3_clear_bindings(s);
+    sqlite3_bind_text(s, 1, satellite, -1, SQLITE_TRANSIENT);
+    if (parsed) sqlite3_bind_int(s, 2, catalog);   else sqlite3_bind_null(s, 2);
+    if (parsed) sqlite3_bind_int(s, 3, epoch_year); else sqlite3_bind_null(s, 3);
+    if (parsed) sqlite3_bind_double(s, 4, epoch_day); else sqlite3_bind_null(s, 4);
+    sqlite3_bind_text(s, 5, line1, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 6, line2, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(s, 7, sha, sizeof sha, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 8, ts_buf, -1, SQLITE_TRANSIENT);
+
+    if (sqlite3_step(s) != SQLITE_DONE) {
+        fprintf(stderr, "packet_db: register_tle failed: %s\n",
+                sqlite3_errmsg(db->db));
+        return 0;
+    }
+    // INSERT OR IGNORE may have done nothing if a concurrent writer
+    // beat us to it. Look up the row id either way.
+    sqlite3_reset(db->select_tle_id_stmt);
+    sqlite3_clear_bindings(db->select_tle_id_stmt);
+    sqlite3_bind_blob(db->select_tle_id_stmt, 1, sha, sizeof sha,
+                      SQLITE_TRANSIENT);
+    if (sqlite3_step(db->select_tle_id_stmt) == SQLITE_ROW) {
+        return sqlite3_column_int64(db->select_tle_id_stmt, 0);
+    }
+    return 0;
+}
+
+int packet_db_update_observer(packet_db_t *db,
+                              const uint8_t *payload, size_t payload_len,
+                              double az_deg, double el_deg,
+                              double range_km, double range_rate_km_s,
+                              double doppler_hz_offset,
+                              long long tle_id,
+                              const char *session_dir,
+                              int force)
+{
+    if (db == NULL || payload == NULL) return 0;
+    sqlite3_stmt *s = force ? db->update_force_stmt : db->update_gaps_stmt;
+    if (s == NULL) return -1;
+
+    uint8_t sha[SHA_DIGEST_LENGTH];
+    SHA1(payload, payload_len, sha);
+
+    sqlite3_reset(s);
+    sqlite3_clear_bindings(s);
+    bind_double_or_null(s, 1, az_deg);
+    bind_double_or_null(s, 2, el_deg);
+    bind_double_or_null(s, 3, range_km);
+    bind_double_or_null(s, 4, range_rate_km_s);
+    bind_double_or_null(s, 5, doppler_hz_offset);
+    if (tle_id > 0) sqlite3_bind_int64(s, 6, tle_id);
+    else sqlite3_bind_null(s, 6);
+    bind_text_or_null(s, 7, session_dir);
+    sqlite3_bind_blob(s, 8, sha, sizeof sha, SQLITE_TRANSIENT);
+
+    int rc = sqlite3_step(s);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "packet_db: update_observer failed: %s\n",
+                sqlite3_errmsg(db->db));
+        return -1;
+    }
+    return sqlite3_changes(db->db);
 }
 
 #else // WITH_SQLITE3 not defined — stub mode
@@ -312,6 +576,31 @@ packet_db_t *packet_db_open(const char *path)
 int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec)
 {
     (void)db; (void)rec;
+    return 0;
+}
+
+long long packet_db_register_tle(packet_db_t *db,
+                                 const char *satellite,
+                                 const char *line1,
+                                 const char *line2)
+{
+    (void)db; (void)satellite; (void)line1; (void)line2;
+    return 0;
+}
+
+int packet_db_update_observer(packet_db_t *db,
+                              const uint8_t *payload, size_t payload_len,
+                              double az_deg, double el_deg,
+                              double range_km, double range_rate_km_s,
+                              double doppler_hz_offset,
+                              long long tle_id,
+                              const char *session_dir,
+                              int force)
+{
+    (void)db; (void)payload; (void)payload_len;
+    (void)az_deg; (void)el_deg; (void)range_km;
+    (void)range_rate_km_s; (void)doppler_hz_offset;
+    (void)tle_id; (void)session_dir; (void)force;
     return 0;
 }
 

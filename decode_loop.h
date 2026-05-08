@@ -167,4 +167,21 @@ void decode_loop_record_packet(const char *ts,
                                int golay_errs, int hmac_ok,
                                int rs_errs, int crc_status);
 
+// Observer-frame state for the next packets to be recorded. Pass NaN
+// for any unknown component. Initial state (before the first call) is
+// all-NaN, so receivers that don't track the satellite (rx_live,
+// rx_decode, replay-without-TLE) leave the DB columns NULL.
+void decode_loop_set_observer(double az_deg, double el_deg,
+                              double range_km, double range_rate_km_s,
+                              double doppler_hz_offset);
+
+// Tag subsequent records with this TLE row id (returned by
+// packet_db_register_tle). Pass 0 to clear.
+void decode_loop_set_tle_id(long long tle_id);
+
+// Tag subsequent records with this session directory (where the run's
+// WAV / log / spectrogram live). Pointer is borrowed and must remain
+// valid for the rest of the process. Pass NULL to clear.
+void decode_loop_set_session_dir(const char *path);
+
 #endif // DECODE_LOOP_H

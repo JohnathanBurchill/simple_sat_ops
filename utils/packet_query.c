@@ -317,7 +317,9 @@ int main(int argc, char **argv)
         "SELECT id, ts_received, satellite, packet_type, packet_type_name, "
         "csp_src, csp_dst, csp_dport, csp_sport, csp_prio, csp_flags, "
         "payload, golay_errs, rs_errs, hmac_ok, crc_status, "
-        "source_tool, source_run, audio_offset_s, decoded_summary "
+        "source_tool, source_run, audio_offset_s, decoded_summary, "
+        "az_deg, el_deg, range_km, range_rate_km_s, doppler_hz_offset, "
+        "tle_id, session_dir "
         "FROM packet WHERE 1=1");
 
     // Slot 0..n_params-1 in these arrays mirror SQL ?1..?n_params.
@@ -402,7 +404,9 @@ int main(int argc, char **argv)
         printf("id,ts_received,satellite,packet_type,packet_type_name,"
                "csp_src,csp_dst,csp_dport,csp_sport,csp_prio,csp_flags,"
                "golay_errs,rs_errs,hmac_ok,crc_status,"
-               "source_tool,source_run,audio_offset_s,payload_hex,decoded_summary\n");
+               "source_tool,source_run,audio_offset_s,"
+               "az_deg,el_deg,range_km,range_rate_km_s,doppler_hz_offset,"
+               "tle_id,session_dir,payload_hex,decoded_summary\n");
     }
     if (fmt == FMT_TABLE) {
         printf("%-7s %-26s %-13s %-15s %-9s %-7s\n",
@@ -432,12 +436,29 @@ int main(int argc, char **argv)
         int has_offset   = sqlite3_column_type(stmt, 18) != SQLITE_NULL;
         double aoff      = has_offset ? sqlite3_column_double(stmt, 18) : 0.0;
         const char *summary = (const char *)sqlite3_column_text(stmt, 19);
+        int has_az = sqlite3_column_type(stmt, 20) != SQLITE_NULL;
+        double az  = has_az ? sqlite3_column_double(stmt, 20) : 0.0;
+        int has_el = sqlite3_column_type(stmt, 21) != SQLITE_NULL;
+        double el  = has_el ? sqlite3_column_double(stmt, 21) : 0.0;
+        int has_range = sqlite3_column_type(stmt, 22) != SQLITE_NULL;
+        double range_km = has_range ? sqlite3_column_double(stmt, 22) : 0.0;
+        int has_rrate = sqlite3_column_type(stmt, 23) != SQLITE_NULL;
+        double range_rate = has_rrate ? sqlite3_column_double(stmt, 23) : 0.0;
+        int has_dop = sqlite3_column_type(stmt, 24) != SQLITE_NULL;
+        double doppler_hz = has_dop ? sqlite3_column_double(stmt, 24) : 0.0;
+        int has_tle = sqlite3_column_type(stmt, 25) != SQLITE_NULL;
+        long long tle_id = has_tle ? sqlite3_column_int64(stmt, 25) : 0;
+        const char *session_dir = (const char *)sqlite3_column_text(stmt, 26);
 
         switch (fmt) {
         case FMT_TABLE: {
-            printf("%-7lld %-26s %-13s %-15s %-9s %d\n",
+            char azel[40] = "";
+            if (has_az && has_el) {
+                snprintf(azel, sizeof azel, "  az=%.1f° el=%+.1f°", az, el);
+            }
+            printf("%-7lld %-26s %-13s %-15s %-9s %d%s\n",
                    id, ts ? ts : "?", tool ? tool : "?",
-                   pname ? pname : "?", sat ? sat : "-", rs_errs);
+                   pname ? pname : "?", sat ? sat : "-", rs_errs, azel);
             if (summary != NULL) {
                 // Indent each line of summary under the row header.
                 const char *p = summary;
@@ -483,6 +504,22 @@ int main(int argc, char **argv)
                    rs_errs, golay_errs, hmac_ok, crc_status);
             if (has_offset) printf("\"audio_offset_s\":%.3f,", aoff);
             else            printf("\"audio_offset_s\":null,");
+            printf("\"observer\":{");
+            if (has_az)    printf("\"az_deg\":%.3f,", az); else printf("\"az_deg\":null,");
+            if (has_el)    printf("\"el_deg\":%.3f,", el); else printf("\"el_deg\":null,");
+            if (has_range) printf("\"range_km\":%.3f,", range_km); else printf("\"range_km\":null,");
+            if (has_rrate) printf("\"range_rate_km_s\":%.4f,", range_rate); else printf("\"range_rate_km_s\":null,");
+            if (has_dop)   printf("\"doppler_hz_offset\":%.1f", doppler_hz); else printf("\"doppler_hz_offset\":null");
+            printf("},");
+            if (has_tle) printf("\"tle_id\":%lld,", tle_id);
+            else         printf("\"tle_id\":null,");
+            if (session_dir) {
+                char sd_e[512];
+                json_escape(session_dir, sd_e, sizeof sd_e);
+                printf("\"session_dir\":\"%s\",", sd_e);
+            } else {
+                printf("\"session_dir\":null,");
+            }
             printf("\"payload_hex\":\"%s\",", payload_hex);
             printf("\"summary\":\"%s\"", summary_e);
             printf("}");
@@ -508,8 +545,16 @@ int main(int argc, char **argv)
                    csp_prio, csp_flags,
                    golay_errs, rs_errs, hmac_ok, crc_status,
                    tool_q, run_q);
-            if (has_offset) printf("%.3f,", aoff);
-            else            printf(",");
+            if (has_offset) printf("%.3f,", aoff); else printf(",");
+            if (has_az)     printf("%.4f,", az); else printf(",");
+            if (has_el)     printf("%.4f,", el); else printf(",");
+            if (has_range)  printf("%.3f,", range_km); else printf(",");
+            if (has_rrate)  printf("%.4f,", range_rate); else printf(",");
+            if (has_dop)    printf("%.1f,", doppler_hz); else printf(",");
+            if (has_tle)    printf("%lld,", tle_id); else printf(",");
+            char sd_q[512];
+            csv_escape(session_dir ? session_dir : "", sd_q, sizeof sd_q);
+            printf("%s,", sd_q);
             printf("%s,%s\n", payload_hex, summary_q);
             break;
         }

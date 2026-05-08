@@ -46,6 +46,19 @@ static packet_db_t *g_packet_db = NULL;
 static const char  *g_db_source_tool = NULL;
 static const char  *g_db_source_run  = NULL;
 
+// Observer-frame state pushed in by the receiver each time it changes
+// (typically: once per Doppler tick from b210_rx_live; rx_replay sets
+// it per-packet during backfill). NaN means "not known". Other
+// receivers never call the setter; they read NaN and the DB row gets
+// NULL in those columns.
+static double g_obs_az_deg            = (0.0 / 0.0);
+static double g_obs_el_deg            = (0.0 / 0.0);
+static double g_obs_range_km          = (0.0 / 0.0);
+static double g_obs_range_rate_km_s   = (0.0 / 0.0);
+static double g_obs_doppler_hz_offset = (0.0 / 0.0);
+static long long g_obs_tle_id         = 0;
+static const char *g_obs_session_dir  = NULL;
+
 void decode_loop_set_packet_db(packet_db_t *db,
                                const char *source_tool,
                                const char *source_run)
@@ -53,6 +66,29 @@ void decode_loop_set_packet_db(packet_db_t *db,
     g_packet_db = db;
     g_db_source_tool = source_tool;
     g_db_source_run  = source_run;
+}
+
+void decode_loop_set_observer(double az_deg, double el_deg,
+                              double range_km, double range_rate_km_s,
+                              double doppler_hz_offset)
+{
+    g_obs_az_deg            = az_deg;
+    g_obs_el_deg            = el_deg;
+    g_obs_range_km          = range_km;
+    g_obs_range_rate_km_s   = range_rate_km_s;
+    g_obs_doppler_hz_offset = doppler_hz_offset;
+}
+
+void decode_loop_set_tle_id(long long tle_id)
+{
+    g_obs_tle_id = tle_id;
+}
+
+void decode_loop_set_session_dir(const char *path)
+{
+    // String is borrowed; caller keeps it alive (typically a static
+    // buffer or argv pointer in the receiver's main()).
+    g_obs_session_dir = path;
 }
 
 void decode_loop_set_show_headers(int on)
@@ -472,6 +508,16 @@ void decode_loop_record_packet(const char *ts,
         .source_run       = g_db_source_run,
         .audio_offset_s   = offset_s,
         .decoded_summary  = summary_buf[0] ? summary_buf : NULL,
+        // Observer-frame state pulled from the setters. NaN sentinels
+        // (the initial value when no setter has been called) map to
+        // NULL in the DB.
+        .az_deg            = g_obs_az_deg,
+        .el_deg            = g_obs_el_deg,
+        .range_km          = g_obs_range_km,
+        .range_rate_km_s   = g_obs_range_rate_km_s,
+        .doppler_hz_offset = g_obs_doppler_hz_offset,
+        .tle_id            = g_obs_tle_id,
+        .session_dir       = g_obs_session_dir,
     };
     (void)packet_db_insert(g_packet_db, &rec);
 }

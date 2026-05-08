@@ -274,6 +274,45 @@ typedef struct {
 // gate replaced — the new logic gates on the same data-band /
 // noise-band ratio that beacon_detect uses post-pass.
 
+// Read the three lines (name + line1 + line2) of the requested
+// satellite out of a TLE file, returning them as plain C strings. Used
+// to register the TLE in the packet DB at startup. Returns 0 on
+// success, -1 if the file couldn't be read or the satellite name
+// wasn't found. The match is a case-sensitive prefix (same convention
+// load_tle uses), so passing "CTS1" matches a line "CTS1 (FRONTIER)".
+static int read_tle_lines(const char *path, const char *sat_prefix,
+                          char *out_name,  size_t name_n,
+                          char *out_line1, size_t line1_n,
+                          char *out_line2, size_t line2_n)
+{
+    if (path == NULL || sat_prefix == NULL) return -1;
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return -1;
+    char a[128], b[128], c[128];
+    int rc = -1;
+    while (fgets(a, sizeof a, f) != NULL) {
+        // Strip trailing newline.
+        size_t n = strlen(a);
+        while (n > 0 && (a[n-1] == '\n' || a[n-1] == '\r')) a[--n] = '\0';
+        if (n == 0 || a[0] == '#') continue;
+        if (strncmp(a, sat_prefix, strlen(sat_prefix)) != 0) continue;
+        if (fgets(b, sizeof b, f) == NULL) break;
+        n = strlen(b);
+        while (n > 0 && (b[n-1] == '\n' || b[n-1] == '\r')) b[--n] = '\0';
+        if (fgets(c, sizeof c, f) == NULL) break;
+        n = strlen(c);
+        while (n > 0 && (c[n-1] == '\n' || c[n-1] == '\r')) c[--n] = '\0';
+        if (b[0] != '1' || c[0] != '2') break;
+        snprintf(out_name,  name_n,  "%s", a);
+        snprintf(out_line1, line1_n, "%s", b);
+        snprintf(out_line2, line2_n, "%s", c);
+        rc = 0;
+        break;
+    }
+    fclose(f);
+    return rc;
+}
+
 // Format the current post-FIR IQ level into " peak=±X.XdBFS rms=±X.XdBFS".
 // `peak` is the fast-attack / slow-release envelope kept inside the core
 // — rises instantly on incoming RF, decays at ~0.5 s. `rms` is the 30 ms-
@@ -1385,6 +1424,26 @@ int main(int argc, char **argv)
         snprintf(db_run_id, sizeof db_run_id, "%s", source_run_override);
     }
     decode_loop_set_packet_db(db, "b210_rx_live", db_run_id);
+
+    // Register the TLE with the DB and stamp every recorded packet
+    // with the resulting tle_id. Also record the session directory
+    // (cwd at startup — same place the WAV / log / spectrogram land)
+    // so the operator can chase a packet back to its capture artifacts.
+    if (db != NULL && tle_path != NULL && sat_name != NULL) {
+        char tle_name[128], tle_line1[128], tle_line2[128];
+        if (read_tle_lines(tle_path, sat_name,
+                           tle_name,  sizeof tle_name,
+                           tle_line1, sizeof tle_line1,
+                           tle_line2, sizeof tle_line2) == 0) {
+            long long tle_id = packet_db_register_tle(db, tle_name,
+                                                      tle_line1, tle_line2);
+            if (tle_id > 0) decode_loop_set_tle_id(tle_id);
+        }
+    }
+    static char session_dir_buf[1024];
+    if (getcwd(session_dir_buf, sizeof session_dir_buf) != NULL) {
+        decode_loop_set_session_dir(session_dir_buf);
+    }
 #ifdef WITH_ALSA
     monitor_active = (alsa != NULL);
 #endif
@@ -1761,6 +1820,16 @@ doppler_tick:
                     last_el_deg          = pred.satellite_ephem.elevation;
                     double doppler_freq = nominal_freq_hz
                         * (1.0 - range_rate_km_s / 299792.458);
+
+                    // Push the just-computed observer state into the
+                    // decode-loop globals so any packets decoded
+                    // before the next Doppler tick land in the DB
+                    // tagged with this az/el/range/range_rate/doppler.
+                    decode_loop_set_observer(
+                        last_az_deg, last_el_deg,
+                        pred.satellite_ephem.range_km,
+                        last_range_rate_km_s,
+                        doppler_freq - nominal_freq_hz);
                     if (fabs(doppler_freq - actual_freq) >= doppler_thr_hz) {
                         double prev_freq = actual_freq;
                         if (b210_rx_core_set_freq(core, doppler_freq) == 0) {
