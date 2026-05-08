@@ -361,14 +361,21 @@ static void format_tui_status(char *out, size_t outn,
                  sqsuffix, lvldesc);
         return;
     }
+    // ASCII-only on purpose. mvaddnstr in narrow ncurses counts bytes,
+    // the terminal renders columns. Multi-byte chars (a degree sign, a
+    // capital delta, etc.) make the two diverge by a column per char,
+    // and after a few renders of text with different multi-byte counts
+    // the terminal accumulates stale tail chars where ncurses thinks
+    // it already cleared.
     char rrate[64];
     if (isnan(range_rate_km_s)) {
         snprintf(rrate, sizeof rrate,
-                 "nominal=%.6f MHz | range_rate=---", nominal_freq_hz / 1e6);
+                 "nominal=%.6f MHz | range_rate=---",
+                 nominal_freq_hz / 1e6);
     } else {
         double off_hz = actual_freq - nominal_freq_hz;
         snprintf(rrate, sizeof rrate,
-                 "(Δ=%+.0f Hz from %.6f MHz) | range_rate=%+.3f km/s",
+                 "(off=%+.0f Hz from %.6f MHz) | range_rate=%+.3f km/s",
                  off_hz, nominal_freq_hz / 1e6, range_rate_km_s);
     }
     char azel[40];
@@ -376,7 +383,7 @@ static void format_tui_status(char *out, size_t outn,
         snprintf(azel, sizeof azel, "az=--- el=---");
     } else {
         snprintf(azel, sizeof azel,
-                 "az=%5.1f° el=%+5.1f°", az_deg, el_deg);
+                 "az=%5.1f el=%+5.1f deg", az_deg, el_deg);
     }
     snprintf(out, outn,
              "freq=%.6f MHz %s | %s | rs=%s fb=%s%s | %s | sat=%s",
@@ -559,7 +566,7 @@ static void cmd_handler(const char *cmd, void *ctx_v)
         j->active = 1;
         char msg[1024];
         snprintf(msg, sizeof msg,
-                 "spectrum: rendering %.1fs (%s..%s) → %s",
+                 "spectrum: rendering %.1fs (%s..%s) -> %s",
                  (double)want / (double)j->sample_rate,
                  ts_start, ts_end, j->png_out);
         rx_tui_set_status(msg);
@@ -1463,7 +1470,7 @@ int main(int argc, char **argv)
         // REPL) and shown in the live status row instead so the
         // operator sees it flip the moment they type `rs on/off`.
         snprintf(tui_header, sizeof tui_header,
-                 "b210_rx_live | %.0f→%d S/s (M=%u) | doppler=%s | "
+                 "b210_rx_live | %.0f->%d S/s (M=%u) | doppler=%s | "
                  "win=%.2fs slide=%.2fs sync_thr=%d hmac=%s | log=%s",
                  input_rate, samp_rate, decim_factor,
                  do_doppler ? sat_name : "off",

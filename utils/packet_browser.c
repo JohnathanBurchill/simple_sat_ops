@@ -431,7 +431,10 @@ static void draw_bottom_bar(int cols, int rows_total, int searching)
     for (int i = 0; i < cols; i++) addch(' ');
     const char *hint = searching
         ? " enter accept   esc cancel   backspace edits "
-        : " q quit   ↑↓ scroll   PgUp/PgDn page   t type   / search   r reload ";
+        // ASCII only — narrow ncurses' mvaddnstr counts bytes while
+        // the terminal renders columns, so multi-byte chars cause
+        // stale tail content on the next render.
+        : " q quit   up/down scroll   PgUp/PgDn page   t type   / search   r reload ";
     mvaddnstr(rows_total - 1, 0, hint, cols);
     if (g_have_color) attroff(COLOR_PAIR(PAIR_BAR));
     else              attroff(A_REVERSE);
