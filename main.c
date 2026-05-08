@@ -317,7 +317,14 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
             printw("%.1f minutes", -state->prediction.predicted_minutes_until_visible);
         }
         if (state->prediction.predicted_max_elevation == -180.0) {
-            update_pass_predictions(&state->prediction, jul_utc - state->prediction.predicted_minutes_until_visible / 1440.0, 0.1);
+            // Starting simple_sat_ops mid-pass: predicted_minutes_until_visible
+            // is negative (= minutes since AOS). Adding it to jul_utc puts us
+            // at (or just before) AOS so update_pass_predictions walks the
+            // whole pass and captures the true max elevation. The earlier
+            // form subtracted, which put the start time the same amount in
+            // the future and missed everything before that point -- including
+            // the apex when launched early in a pass.
+            update_pass_predictions(&state->prediction, jul_utc + state->prediction.predicted_minutes_until_visible / 1440.0, 0.1);
         }
         attroff(COLOR_PAIR(3));
         clrtoeol();
