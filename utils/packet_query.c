@@ -86,6 +86,8 @@ static void usage(FILE *out, const char *argv0)
         "    csv:   header row + data rows (decoded_summary collapsed)\n"
         "    raw:   payload bytes to stdout. Requires --limit=1; useful\n"
         "           piped to xxd or rx_decode --ref-hex.\n"
+        "  --local-time             render ts in the operator's local TZ\n"
+        "                           (filtering / sorting still UTC)\n"
         "\n"
         "Database:\n"
         "  --db=<path>              override default DB path. Default:\n"
@@ -93,6 +95,43 @@ static void usage(FILE *out, const char *argv0)
         "                           $HOME/.local/share/simple_sat_ops/packets.db\n"
         "  --help                   this message\n",
         argv0);
+}
+
+// Convert a stored ISO-8601 UTC timestamp into the operator's local
+// time. Accepts both the millisecond ("YYYY-MM-DDTHH:MM:SS.fffZ") and
+// second-precision forms; anything else falls through unchanged so a
+// malformed cell is still visible in the output.
+static void format_display_ts(const char *iso, int local,
+                              char *out, size_t outn)
+{
+    if (iso == NULL || iso[0] == '\0') {
+        if (outn > 0) out[0] = '\0';
+        return;
+    }
+    if (!local) {
+        snprintf(out, outn, "%s", iso);
+        return;
+    }
+    int yr, mo, dd, hh, mm, ss, ms = 0;
+    int got = sscanf(iso, "%4d-%2d-%2dT%2d:%2d:%2d.%3d",
+                     &yr, &mo, &dd, &hh, &mm, &ss, &ms);
+    if (got < 6) { snprintf(out, outn, "%s", iso); return; }
+    struct tm utc = {0};
+    utc.tm_year = yr - 1900;
+    utc.tm_mon  = mo - 1;
+    utc.tm_mday = dd;
+    utc.tm_hour = hh;
+    utc.tm_min  = mm;
+    utc.tm_sec  = ss;
+    time_t epoch = timegm(&utc);
+    if (epoch == (time_t)-1) { snprintf(out, outn, "%s", iso); return; }
+    struct tm lt;
+    localtime_r(&epoch, &lt);
+    char base[40];
+    strftime(base, sizeof base, "%Y-%m-%d %H:%M:%S", &lt);
+    const char *tz = tzname[lt.tm_isdst > 0 ? 1 : 0];
+    if (tz == NULL) tz = "";
+    snprintf(out, outn, "%s.%03d %s", base, ms, tz);
 }
 
 // Parse a "since/until" spec into ISO-8601 UTC for SQL comparison.
@@ -239,6 +278,7 @@ int main(int argc, char **argv)
     long limit = 100;
     int order_desc = 1;
     enum format fmt = FMT_TABLE;
+    int local_time = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -261,6 +301,7 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--format=json") == 0)    fmt = FMT_JSON;
         else if (strcmp(a, "--format=csv") == 0)     fmt = FMT_CSV;
         else if (strcmp(a, "--format=raw") == 0)     fmt = FMT_RAW;
+        else if (strcmp(a, "--local-time") == 0)     local_time = 1;
         else {
             fprintf(stderr, "packet_query: unknown option '%s'\n", a);
             usage(stderr, argv[0]);
@@ -409,8 +450,10 @@ int main(int argc, char **argv)
                "tle_id,session_dir,payload_hex,decoded_summary\n");
     }
     if (fmt == FMT_TABLE) {
-        printf("%-7s %-26s %-13s %-15s %-9s %-7s\n",
-               "ID", "TIMESTAMP", "TOOL", "TYPE", "SATELLITE", "RS");
+        printf("%-7s %-30s %-13s %-15s %-9s %-7s\n",
+               "ID",
+               local_time ? "TIMESTAMP (LOCAL)" : "TIMESTAMP (UTC)",
+               "TOOL", "TYPE", "SATELLITE", "RS");
     }
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -450,14 +493,17 @@ int main(int argc, char **argv)
         long long tle_id = has_tle ? sqlite3_column_int64(stmt, 25) : 0;
         const char *session_dir = (const char *)sqlite3_column_text(stmt, 26);
 
+        char ts_disp[64];
+        format_display_ts(ts, local_time, ts_disp, sizeof ts_disp);
+
         switch (fmt) {
         case FMT_TABLE: {
             char azel[40] = "";
             if (has_az && has_el) {
                 snprintf(azel, sizeof azel, "  az=%.1f° el=%+.1f°", az, el);
             }
-            printf("%-7lld %-26s %-13s %-15s %-9s %d%s\n",
-                   id, ts ? ts : "?", tool ? tool : "?",
+            printf("%-7lld %-30s %-13s %-15s %-9s %d%s\n",
+                   id, ts_disp[0] ? ts_disp : "?", tool ? tool : "?",
                    pname ? pname : "?", sat ? sat : "-", rs_errs, azel);
             if (summary != NULL) {
                 // Indent each line of summary under the row header.
@@ -477,7 +523,7 @@ int main(int argc, char **argv)
             char ts_e[64], tool_e[64], pname_e[32], sat_e[32];
             char run_e[64], summary_e[3072];
             char payload_hex[1024];
-            json_escape(ts ? ts : "", ts_e, sizeof ts_e);
+            json_escape(ts_disp[0] ? ts_disp : "", ts_e, sizeof ts_e);
             json_escape(tool ? tool : "", tool_e, sizeof tool_e);
             json_escape(pname ? pname : "", pname_e, sizeof pname_e);
             json_escape(sat ? sat : "", sat_e, sizeof sat_e);
@@ -528,7 +574,7 @@ int main(int argc, char **argv)
         case FMT_CSV: {
             char ts_q[80], tool_q[40], pname_q[40], sat_q[40], run_q[40];
             char summary_q[3072], payload_hex[1024];
-            csv_escape(ts ? ts : "", ts_q, sizeof ts_q);
+            csv_escape(ts_disp[0] ? ts_disp : "", ts_q, sizeof ts_q);
             csv_escape(tool ? tool : "", tool_q, sizeof tool_q);
             csv_escape(pname ? pname : "", pname_q, sizeof pname_q);
             csv_escape(sat ? sat : "", sat_q, sizeof sat_q);

@@ -650,6 +650,13 @@ int main(int argc, char **argv)
                     "not set; falling back to file mtime\n");
         }
     }
+    // Plumb the anchor into decode_loop so emit_frame's "t=NN.NNNs"
+    // entry stamps ts_received with the actual transmission UTC
+    // (anchor + offset) rather than wall-clock-of-decode. NaN tells
+    // record_packet "no anchor — fall back to wall clock."
+    decode_loop_set_audio_clock_anchor(have_start_utc
+                                       ? start_utc_seconds
+                                       : (0.0 / 0.0));
 
     // Session dir — explicit flag wins, else dirname of input file.
     static char session_dir_buf[1024];
@@ -864,6 +871,32 @@ int main(int argc, char **argv)
                                           tle_id,
                                           session_dir_buf,
                                           /*force=*/0);
+                // Rewrite ts_received on existing rx_replay rows that
+                // were stamped with wall-clock-of-decode. Scoped to
+                // source_tool='rx_replay' inside the update so live
+                // rows (correctly stamped at reception) don't get
+                // trampled. Only meaningful when we have a UT anchor.
+                if (have_start_utc) {
+                    double abs_t = start_utc_seconds + t_sec;
+                    time_t epoch = (time_t)floor(abs_t);
+                    double frac = abs_t - (double)epoch;
+                    long ms_long = (long)(frac * 1000.0 + 0.5);
+                    if (ms_long >= 1000) { ms_long = 0; epoch += 1; }
+                    struct tm utc;
+                    gmtime_r(&epoch, &utc);
+                    char ts_iso[40];
+                    snprintf(ts_iso, sizeof ts_iso,
+                             "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+                             (utc.tm_year + 1900) % 10000,
+                             (utc.tm_mon + 1) % 100,
+                             utc.tm_mday % 100,
+                             utc.tm_hour % 100,
+                             utc.tm_min  % 100,
+                             utc.tm_sec  % 100,
+                             (int)(ms_long % 1000));
+                    packet_db_update_replay_ts(db, packet + 4, pl - 4,
+                                               ts_iso, t_sec);
+                }
             }
             if (use_tui) {
                 rx_tui_observe_frame(ts, packet, (size_t)plen,

@@ -59,6 +59,18 @@ static double g_obs_doppler_hz_offset = (0.0 / 0.0);
 static long long g_obs_tle_id         = 0;
 static const char *g_obs_session_dir  = NULL;
 
+// Absolute-UTC anchor for "t=NN.NNNs" relative timestamps. NaN means
+// no anchor; record_packet then falls back to wall-clock-now for
+// ts_received (the legacy behaviour, kept so receivers that never
+// resolve a UT base — e.g. rx_decode on a stripped WAV — still
+// produce a sortable timestamp).
+static double g_audio_anchor_unix     = (0.0 / 0.0);
+
+void decode_loop_set_audio_clock_anchor(double unix_seconds)
+{
+    g_audio_anchor_unix = unix_seconds;
+}
+
 void decode_loop_set_packet_db(packet_db_t *db,
                                const char *source_tool,
                                const char *source_run)
@@ -459,12 +471,11 @@ void decode_loop_record_packet(const char *ts,
 
     // ts_received uses the ISO-8601 form when emit_frame's caller
     // produces one (rx_live / b210_rx_live / rx_decode). rx_replay
-    // passes a "t=NN.NNNs" relative offset; in that case parse the
-    // offset out for audio_offset_s and stamp ts_received with
-    // wall-clock-now so the column stays sortable as a real
-    // timestamp. Lossy compared to "the moment the satellite
-    // actually transmitted," but the recording's filename usually
-    // carries the absolute UTC anchor for that.
+    // passes a "t=NN.NNNs" relative offset; if an audio-clock anchor
+    // is set, ts_received = (anchor + offset_s) so the column carries
+    // the actual transmission UTC. Without an anchor, fall back to
+    // wall-clock-now — sortable but loses the "when the satellite
+    // really sent it" semantics.
     char ts_iso[40];
     const char *ts_for_db = ts;
     double offset_s = (0.0 / 0.0);  // NaN
@@ -474,21 +485,32 @@ void decode_loop_record_packet(const char *ts,
         if (endp != NULL && *endp == 's') {
             offset_s = v;
         }
-        struct timespec now;
-        clock_gettime(CLOCK_REALTIME, &now);
+        time_t epoch;
+        long ms_long;
+        if (!isnan(g_audio_anchor_unix) && !isnan(offset_s)) {
+            double abs_t = g_audio_anchor_unix + offset_s;
+            epoch = (time_t)floor(abs_t);
+            double frac = abs_t - (double)epoch;
+            ms_long = (long)(frac * 1000.0 + 0.5);
+            // Round-up edge case: 999.5 ms rounds to 1000 → carry.
+            if (ms_long >= 1000) { ms_long = 0; epoch += 1; }
+        } else {
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            epoch = now.tv_sec;
+            ms_long = (now.tv_nsec / 1000000) % 1000;
+        }
         struct tm utc;
-        gmtime_r(&now.tv_sec, &utc);
+        gmtime_r(&epoch, &utc);
         // Mask each field into the range its format slot allows so
-        // gcc -Wformat-truncation= can prove no overrun. Without the
-        // masks gcc sees plain `int`s and computes a worst-case 88-
-        // byte expansion that doesn't fit ts_iso.
+        // gcc -Wformat-truncation= can prove no overrun.
         int yr = (utc.tm_year + 1900) % 10000;
         int mo = (utc.tm_mon + 1) % 100;
         int da = utc.tm_mday % 100;
         int hh = utc.tm_hour % 100;
         int mm = utc.tm_min  % 100;
         int ss = utc.tm_sec  % 100;
-        int ms = (int)((now.tv_nsec / 1000000) % 1000);
+        int ms = (int)(ms_long % 1000);
         snprintf(ts_iso, sizeof ts_iso,
                  "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
                  yr, mo, da, hh, mm, ss, ms);

@@ -126,6 +126,19 @@ int packet_db_update_observer(packet_db_t *db,
                               const char *session_dir,
                               int force);
 
+// Rewrite ts_received and audio_offset_s on rows whose payload SHA1
+// matches AND source_tool = 'rx_replay'. Used by rx_replay --update
+// to fix the stale wall-clock-of-decode timestamp that prior runs
+// stamped before the audio-clock anchor existed; the new value is
+// the actual transmission UTC (anchor + offset) supplied here.
+// Scoped to rx_replay rows so live-decode rows (whose ts_received is
+// already correct) aren't trampled. Returns rows updated, -1 on
+// error.
+int packet_db_update_replay_ts(packet_db_t *db,
+                               const uint8_t *payload, size_t payload_len,
+                               const char *ts_iso,
+                               double audio_offset_s);
+
 void packet_db_close(packet_db_t *db);
 
 // Resolve the default DB path into `buf`. Order of preference:

@@ -184,4 +184,14 @@ void decode_loop_set_tle_id(long long tle_id);
 // valid for the rest of the process. Pass NULL to clear.
 void decode_loop_set_session_dir(const char *path);
 
+// Anchor for "t=NN.NNNs" relative timestamps. When set (Unix seconds,
+// UTC), decode_loop_record_packet computes ts_received as
+// (anchor + offset_s) so rows from a re-decoded WAV carry the actual
+// transmission time rather than the wall-clock moment of re-decode.
+// rx_replay calls this with start_utc parsed from --start-utc, the
+// "UT=YYYYMMDDTHHMMSS.sss" stamp in the WAV filename, or the file
+// mtime (in that order). Pass NaN to clear and revert to the
+// wall-clock-now fallback.
+void decode_loop_set_audio_clock_anchor(double unix_seconds);
+
 #endif // DECODE_LOOP_H

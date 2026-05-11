@@ -152,6 +152,7 @@ struct packet_db {
     sqlite3_stmt *insert_stmt;
     sqlite3_stmt *update_gaps_stmt;
     sqlite3_stmt *update_force_stmt;
+    sqlite3_stmt *update_replay_ts_stmt;
     sqlite3_stmt *register_tle_stmt;
     sqlite3_stmt *select_tle_id_stmt;
 };
@@ -202,6 +203,9 @@ static const char SCHEMA_SQL[] =
     "CREATE INDEX IF NOT EXISTS idx_packet_ts        ON packet(ts_received);\n"
     "CREATE INDEX IF NOT EXISTS idx_packet_type      ON packet(packet_type);\n"
     "CREATE INDEX IF NOT EXISTS idx_packet_satellite ON packet(satellite);\n";
+// The (payload_sha1, source_tool) UNIQUE INDEX is added by the V3
+// migration step below — putting it here would fail on an existing V2
+// DB whose duplicates haven't been collapsed yet.
 
 // Idempotent ALTERs for existing DBs created at schema version 1.
 // "duplicate column name" errors are caught and ignored — re-running
@@ -214,6 +218,24 @@ static const char *const MIGRATION_V2_ALTERS[] = {
     "ALTER TABLE packet ADD COLUMN doppler_hz_offset REAL",
     "ALTER TABLE packet ADD COLUMN tle_id            INTEGER REFERENCES tle(id)",
     "ALTER TABLE packet ADD COLUMN session_dir       TEXT",
+    NULL
+};
+
+// V2 -> V3 migration: tighten dedup to (payload_sha1, source_tool).
+// The original schema's UNIQUE(payload_sha1, source_tool, source_run)
+// allowed a re-run of the same capture (different random source_run)
+// to insert duplicate rows. Step 1 deletes the duplicates, keeping
+// the row with the smallest id (the first one observed). Step 2 adds
+// a UNIQUE INDEX that future INSERT OR IGNOREs will collide against,
+// so the dedup is now per-tool rather than per-run. The original
+// table-level UNIQUE constraint stays in place (subset of the new
+// index, harmless).
+static const char *const MIGRATION_V3_STEPS[] = {
+    "DELETE FROM packet WHERE id NOT IN ("
+    "  SELECT MIN(id) FROM packet GROUP BY payload_sha1, source_tool"
+    ")",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_packet_sha1_tool "
+    "  ON packet(payload_sha1, source_tool)",
     NULL
 };
 
@@ -258,6 +280,15 @@ static const char UPDATE_OBSERVER_FORCE_SQL[] =
     "  range_rate_km_s = ?4, doppler_hz_offset = ?5,"
     "  tle_id = ?6, session_dir = ?7"
     " WHERE payload_sha1 = ?8;";
+
+// Targeted rewrite of ts_received and audio_offset_s on rx_replay
+// rows. Scoped to source_tool = 'rx_replay' so live-decode rows
+// (where ts_received already reflects the moment of reception) don't
+// get clobbered by a backfill that's merely "WAV anchor + offset."
+static const char UPDATE_REPLAY_TS_SQL[] =
+    "UPDATE packet SET"
+    "  ts_received = ?1, audio_offset_s = ?2"
+    " WHERE payload_sha1 = ?3 AND source_tool = 'rx_replay';";
 
 static const char REGISTER_TLE_SQL[] =
     "INSERT OR IGNORE INTO tle ("
@@ -327,6 +358,28 @@ packet_db_t *packet_db_open(const char *path)
         // the (idempotent) migration, which is fine.
     }
 
+    // V2 -> V3: collapse same-payload/same-tool duplicates and lock in
+    // the tighter UNIQUE so future re-runs don't re-create them. Both
+    // steps are idempotent — DELETE on a deduped table removes nothing
+    // and CREATE UNIQUE INDEX IF NOT EXISTS is a no-op.
+    for (int i = 0; MIGRATION_V3_STEPS[i] != NULL; i++) {
+        char *m_err = NULL;
+        if (sqlite3_exec(raw, MIGRATION_V3_STEPS[i], NULL, NULL, &m_err)
+            != SQLITE_OK) {
+            fprintf(stderr, "packet_db: migration step '%s' failed: "
+                    "%s\n", MIGRATION_V3_STEPS[i],
+                    m_err ? m_err : "(unknown)");
+            sqlite3_free(m_err);
+            sqlite3_close(raw);
+            errno = EIO;
+            return NULL;
+        }
+    }
+    if (sqlite3_exec(raw, "PRAGMA user_version = 3;", NULL, NULL, NULL)
+        != SQLITE_OK) {
+        // Non-fatal as above.
+    }
+
     packet_db_t *db = (packet_db_t *)calloc(1, sizeof *db);
     if (db == NULL) {
         sqlite3_close(raw);
@@ -336,11 +389,12 @@ packet_db_t *packet_db_open(const char *path)
     db->db = raw;
 
     struct { const char *sql; sqlite3_stmt **out; } stmts[] = {
-        { INSERT_SQL,                &db->insert_stmt        },
-        { UPDATE_OBSERVER_GAPS_SQL,  &db->update_gaps_stmt   },
-        { UPDATE_OBSERVER_FORCE_SQL, &db->update_force_stmt  },
-        { REGISTER_TLE_SQL,          &db->register_tle_stmt  },
-        { SELECT_TLE_ID_SQL,         &db->select_tle_id_stmt },
+        { INSERT_SQL,                &db->insert_stmt           },
+        { UPDATE_OBSERVER_GAPS_SQL,  &db->update_gaps_stmt      },
+        { UPDATE_OBSERVER_FORCE_SQL, &db->update_force_stmt     },
+        { UPDATE_REPLAY_TS_SQL,      &db->update_replay_ts_stmt },
+        { REGISTER_TLE_SQL,          &db->register_tle_stmt     },
+        { SELECT_TLE_ID_SQL,         &db->select_tle_id_stmt    },
     };
     for (size_t i = 0; i < sizeof stmts / sizeof stmts[0]; i++) {
         if (sqlite3_prepare_v2(raw, stmts[i].sql, -1, stmts[i].out, NULL)
@@ -433,11 +487,12 @@ int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec)
 void packet_db_close(packet_db_t *db)
 {
     if (db == NULL) return;
-    if (db->insert_stmt        != NULL) sqlite3_finalize(db->insert_stmt);
-    if (db->update_gaps_stmt   != NULL) sqlite3_finalize(db->update_gaps_stmt);
-    if (db->update_force_stmt  != NULL) sqlite3_finalize(db->update_force_stmt);
-    if (db->register_tle_stmt  != NULL) sqlite3_finalize(db->register_tle_stmt);
-    if (db->select_tle_id_stmt != NULL) sqlite3_finalize(db->select_tle_id_stmt);
+    if (db->insert_stmt           != NULL) sqlite3_finalize(db->insert_stmt);
+    if (db->update_gaps_stmt      != NULL) sqlite3_finalize(db->update_gaps_stmt);
+    if (db->update_force_stmt     != NULL) sqlite3_finalize(db->update_force_stmt);
+    if (db->update_replay_ts_stmt != NULL) sqlite3_finalize(db->update_replay_ts_stmt);
+    if (db->register_tle_stmt     != NULL) sqlite3_finalize(db->register_tle_stmt);
+    if (db->select_tle_id_stmt    != NULL) sqlite3_finalize(db->select_tle_id_stmt);
     if (db->db != NULL) sqlite3_close(db->db);
     free(db);
 }
@@ -541,6 +596,33 @@ long long packet_db_register_tle(packet_db_t *db,
     return 0;
 }
 
+int packet_db_update_replay_ts(packet_db_t *db,
+                               const uint8_t *payload, size_t payload_len,
+                               const char *ts_iso,
+                               double audio_offset_s)
+{
+    if (db == NULL || payload == NULL || ts_iso == NULL) return 0;
+    sqlite3_stmt *s = db->update_replay_ts_stmt;
+    if (s == NULL) return -1;
+
+    uint8_t sha[PACKET_DB_SHA1_LEN];
+    sha1_digest(payload, payload_len, sha);
+
+    sqlite3_reset(s);
+    sqlite3_clear_bindings(s);
+    sqlite3_bind_text(s, 1, ts_iso, -1, SQLITE_TRANSIENT);
+    bind_double_or_null(s, 2, audio_offset_s);
+    sqlite3_bind_blob(s, 3, sha, sizeof sha, SQLITE_TRANSIENT);
+
+    int rc = sqlite3_step(s);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "packet_db: update_replay_ts failed: %s\n",
+                sqlite3_errmsg(db->db));
+        return -1;
+    }
+    return sqlite3_changes(db->db);
+}
+
 int packet_db_update_observer(packet_db_t *db,
                               const uint8_t *payload, size_t payload_len,
                               double az_deg, double el_deg,
@@ -616,6 +698,16 @@ int packet_db_update_observer(packet_db_t *db,
     (void)az_deg; (void)el_deg; (void)range_km;
     (void)range_rate_km_s; (void)doppler_hz_offset;
     (void)tle_id; (void)session_dir; (void)force;
+    return 0;
+}
+
+int packet_db_update_replay_ts(packet_db_t *db,
+                               const uint8_t *payload, size_t payload_len,
+                               const char *ts_iso,
+                               double audio_offset_s)
+{
+    (void)db; (void)payload; (void)payload_len;
+    (void)ts_iso; (void)audio_offset_s;
     return 0;
 }
 

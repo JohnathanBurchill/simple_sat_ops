@@ -109,6 +109,11 @@ static int     sel    = 0;
 static int     top    = 0;
 static int     type_idx = 0;
 static char    like_text[128] = "";
+// Display mode: 0 = UTC (storage form, ISO-8601 Z), 1 = local time
+// (parsed back to time_t and re-formatted with tzname). Filtering and
+// sorting still happens server-side against the UTC strings; only the
+// rendered cells change. Toggle with `L`.
+static int     show_local_time = 0;
 
 static int     g_have_color = 0;
 enum {
@@ -229,6 +234,51 @@ static void run_query(sqlite3 *db)
     if (sel >= n_rows) sel = n_rows > 0 ? n_rows - 1 : 0;
 }
 
+// Render a stored ISO-8601 UTC timestamp into the user's chosen
+// display mode. UTC mode is a passthrough; local mode parses the
+// "YYYY-MM-DDTHH:MM:SS[.fff]Z" form back to a time_t (via timegm)
+// then re-formats with localtime_r. Garbage that doesn't match the
+// pattern falls through unchanged so the operator can still see what
+// the column actually contains. The width is intentionally fixed
+// across modes (the list column is sized for it).
+static void format_ts(const char *iso, char *out, size_t outn)
+{
+    if (iso == NULL || iso[0] == '\0') {
+        if (outn > 0) out[0] = '\0';
+        return;
+    }
+    if (!show_local_time) {
+        snprintf(out, outn, "%s", iso);
+        return;
+    }
+    int yr, mo, dd, hh, mm, ss, ms = 0;
+    int got = sscanf(iso, "%4d-%2d-%2dT%2d:%2d:%2d.%3d",
+                     &yr, &mo, &dd, &hh, &mm, &ss, &ms);
+    if (got < 6) {
+        snprintf(out, outn, "%s", iso);
+        return;
+    }
+    struct tm utc = {0};
+    utc.tm_year = yr - 1900;
+    utc.tm_mon  = mo - 1;
+    utc.tm_mday = dd;
+    utc.tm_hour = hh;
+    utc.tm_min  = mm;
+    utc.tm_sec  = ss;
+    time_t epoch = timegm(&utc);
+    if (epoch == (time_t)-1) {
+        snprintf(out, outn, "%s", iso);
+        return;
+    }
+    struct tm local;
+    localtime_r(&epoch, &local);
+    char base[40];
+    strftime(base, sizeof base, "%Y-%m-%d %H:%M:%S", &local);
+    const char *tz = tzname[local.tm_isdst > 0 ? 1 : 0];
+    if (tz == NULL) tz = "";
+    snprintf(out, outn, "%s.%03d %s", base, ms, tz);
+}
+
 static int color_for_type(const char *name)
 {
     if (!g_have_color || name == NULL) return 0;
@@ -261,8 +311,10 @@ static void format_list_line(const row_t *r, char *out, size_t outn)
     }
     const char *eol = strchr(summary_first, '\n');
     int body_len = eol ? (int)(eol - summary_first) : (int)strlen(summary_first);
-    snprintf(out, outn, "%-23.23s  %-13s  %-13s  %-9s  %.*s",
-             r->ts, r->tool, r->type_name,
+    char ts_disp[40];
+    format_ts(r->ts, ts_disp, sizeof ts_disp);
+    snprintf(out, outn, "%-30.30s  %-13s  %-13s  %-9s  %.*s",
+             ts_disp, r->tool, r->type_name,
              r->satellite[0] ? r->satellite : "-",
              body_len, summary_first);
 }
@@ -289,8 +341,9 @@ static void draw_list(int list_top, int list_h, int cols)
     if (g_have_color) attron(A_DIM);
     char header[256];
     snprintf(header, sizeof header,
-             "  %-23s  %-13s  %-13s  %-9s  %s",
-             "TIMESTAMP", "TOOL", "TYPE", "SATELLITE", "SUMMARY");
+             "  %-30s  %-13s  %-13s  %-9s  %s",
+             show_local_time ? "TIMESTAMP (LOCAL)" : "TIMESTAMP (UTC)",
+             "TOOL", "TYPE", "SATELLITE", "SUMMARY");
     mvaddnstr(list_top, 0, header, cols);
     if (g_have_color) attroff(A_DIM);
 
@@ -359,9 +412,11 @@ static void draw_detail(int top_y, int height, int cols)
 
     // Header row in detail panel.
     char head[512];
+    char ts_disp[40];
+    format_ts(r->ts, ts_disp, sizeof ts_disp);
     snprintf(head, sizeof head,
              "id=%lld  ts=%s  type=%s  tool=%s  run=%s",
-             (long long)r->id, r->ts, r->type_name, r->tool, r->run);
+             (long long)r->id, ts_disp, r->type_name, r->tool, r->run);
     move(y, 0); clrtoeol();
     if (g_have_color) attron(A_BOLD);
     mvaddnstr(y, 2, head, cols - 2);
@@ -434,7 +489,7 @@ static void draw_bottom_bar(int cols, int rows_total, int searching)
         // ASCII only — narrow ncurses' mvaddnstr counts bytes while
         // the terminal renders columns, so multi-byte chars cause
         // stale tail content on the next render.
-        : " q quit   up/down scroll   PgUp/PgDn page   t type   / search   r reload ";
+        : " q quit   up/down scroll   PgUp/PgDn page   t type   / search   L utc/lt   r reload ";
     mvaddnstr(rows_total - 1, 0, hint, cols);
     if (g_have_color) attroff(COLOR_PAIR(PAIR_BAR));
     else              attroff(A_REVERSE);
@@ -508,6 +563,7 @@ static void usage(FILE *out, const char *argv0)
         "                   → log → bulk_file → all)\n"
         "  /                start a substring search against the firmware-\n"
         "                   interpreted text. Enter applies, Esc cancels.\n"
+        "  L                toggle timestamp display: UTC (storage) ↔ local\n"
         "\n"
         "Options:\n"
         "  --db=<path>      override default DB path. Default:\n"
@@ -619,6 +675,9 @@ int main(int argc, char **argv)
                 type_idx = (type_idx + 1) % TYPE_CYCLE_N;
                 run_query(db);
                 last_query = monotonic_seconds();
+                break;
+            case 'L': case 'l':
+                show_local_time = !show_local_time;
                 break;
             case '/':
                 if (prompt_search(rows_total, cols)) {
