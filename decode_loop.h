@@ -184,6 +184,12 @@ void decode_loop_set_tle_id(long long tle_id);
 // valid for the rest of the process. Pass NULL to clear.
 void decode_loop_set_session_dir(const char *path);
 
+// Tag subsequent records with the audio's provenance: "cts_ground"
+// for our B210 captures, "satnogs" for a SatNOGS archive .ogg.
+// Distinct from source_tool, which identifies the decoder. Pointer
+// is borrowed; pass NULL to clear back to "unknown" (column NULL).
+void decode_loop_set_capture_origin(const char *origin);
+
 // Anchor for "t=NN.NNNs" relative timestamps. When set (Unix seconds,
 // UTC), decode_loop_record_packet computes ts_received as
 // (anchor + offset_s) so rows from a re-decoded WAV carry the actual

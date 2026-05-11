@@ -198,6 +198,7 @@ static const char SCHEMA_SQL[] =
     "  doppler_hz_offset REAL,\n"
     "  tle_id            INTEGER REFERENCES tle(id),\n"
     "  session_dir       TEXT,\n"
+    "  capture_origin    TEXT,\n"
     "  UNIQUE (payload_sha1, source_tool, source_run)\n"
     ");\n"
     "CREATE INDEX IF NOT EXISTS idx_packet_ts        ON packet(ts_received);\n"
@@ -239,6 +240,27 @@ static const char *const MIGRATION_V3_STEPS[] = {
     NULL
 };
 
+// V3 -> V4 migration: add capture_origin and widen the dedup key to
+// include it. Without the widening, the same beacon decoded from our
+// local WAV and from a SatNOGS .ogg would collide and one of the two
+// rows would be dropped on insert — but we explicitly want both,
+// since the point of pulling in SatNOGS audio is to compare what each
+// site heard. Step 1 adds the column (idempotent — caught by
+// "duplicate column name"). Step 2 backfills legacy NULLs to
+// 'cts_ground' so re-running over the same captures with the new
+// --capture-origin=cts_ground flag doesn't conflict with the old
+// NULL-tagged row. Steps 3-4 swap the V3 (sha1, tool) index for the
+// new (sha1, tool, capture_origin) one.
+static const char *const MIGRATION_V4_STEPS[] = {
+    "ALTER TABLE packet ADD COLUMN capture_origin TEXT",
+    "UPDATE packet SET capture_origin = 'cts_ground' "
+    "  WHERE capture_origin IS NULL",
+    "DROP INDEX IF EXISTS idx_packet_sha1_tool",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_packet_sha1_tool_origin "
+    "  ON packet(payload_sha1, source_tool, capture_origin)",
+    NULL
+};
+
 static const char INSERT_SQL[] =
     "INSERT OR IGNORE INTO packet ("
     "  ts_received, satellite, packet_type, packet_type_name,"
@@ -247,7 +269,7 @@ static const char INSERT_SQL[] =
     "  golay_errs, rs_errs, hmac_ok, crc_status,"
     "  source_tool, source_run, audio_offset_s, decoded_summary,"
     "  az_deg, el_deg, range_km, range_rate_km_s, doppler_hz_offset,"
-    "  tle_id, session_dir"
+    "  tle_id, session_dir, capture_origin"
     ") VALUES ("
     "  ?1, ?2, ?3, ?4,"
     "  ?5, ?6, ?7, ?8, ?9, ?10,"
@@ -255,7 +277,7 @@ static const char INSERT_SQL[] =
     "  ?13, ?14, ?15, ?16,"
     "  ?17, ?18, ?19, ?20,"
     "  ?21, ?22, ?23, ?24, ?25,"
-    "  ?26, ?27"
+    "  ?26, ?27, ?28"
     ");";
 
 // UPDATE for the rx_replay backfill path. Fills observer / tle / dir
@@ -380,6 +402,33 @@ packet_db_t *packet_db_open(const char *path)
         // Non-fatal as above.
     }
 
+    // V3 -> V4: add capture_origin column, backfill legacy rows to
+    // 'cts_ground', and widen the dedup index to include origin. The
+    // ALTER step's "duplicate column name" error is caught and
+    // ignored so a re-run is a no-op.
+    for (int i = 0; MIGRATION_V4_STEPS[i] != NULL; i++) {
+        char *m_err = NULL;
+        if (sqlite3_exec(raw, MIGRATION_V4_STEPS[i], NULL, NULL, &m_err)
+            != SQLITE_OK) {
+            int dup = (m_err != NULL
+                       && strstr(m_err, "duplicate column name") != NULL);
+            if (!dup) {
+                fprintf(stderr, "packet_db: migration step '%s' failed: "
+                        "%s\n", MIGRATION_V4_STEPS[i],
+                        m_err ? m_err : "(unknown)");
+                sqlite3_free(m_err);
+                sqlite3_close(raw);
+                errno = EIO;
+                return NULL;
+            }
+            sqlite3_free(m_err);
+        }
+    }
+    if (sqlite3_exec(raw, "PRAGMA user_version = 4;", NULL, NULL, NULL)
+        != SQLITE_OK) {
+        // Non-fatal as above.
+    }
+
     packet_db_t *db = (packet_db_t *)calloc(1, sizeof *db);
     if (db == NULL) {
         sqlite3_close(raw);
@@ -474,6 +523,7 @@ int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec)
     if (rec->tle_id > 0) sqlite3_bind_int64(s, 26, rec->tle_id);
     else sqlite3_bind_null(s, 26);
     bind_text_or_null(s, 27, rec->session_dir);
+    bind_text_or_null(s, 28, rec->capture_origin);
 
     int rc = sqlite3_step(s);
     if (rc != SQLITE_DONE) {

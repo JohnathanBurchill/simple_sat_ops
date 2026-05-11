@@ -58,6 +58,10 @@ static double g_obs_range_rate_km_s   = (0.0 / 0.0);
 static double g_obs_doppler_hz_offset = (0.0 / 0.0);
 static long long g_obs_tle_id         = 0;
 static const char *g_obs_session_dir  = NULL;
+// Provenance of the audio under decode. Set once at startup by the
+// receiver (e.g. rx_replay --capture-origin=satnogs). NULL means
+// "not supplied"; the DB column stays NULL for those rows.
+static const char *g_obs_capture_origin = NULL;
 
 // Absolute-UTC anchor for "t=NN.NNNs" relative timestamps. NaN means
 // no anchor; record_packet then falls back to wall-clock-now for
@@ -101,6 +105,13 @@ void decode_loop_set_session_dir(const char *path)
     // String is borrowed; caller keeps it alive (typically a static
     // buffer or argv pointer in the receiver's main()).
     g_obs_session_dir = path;
+}
+
+void decode_loop_set_capture_origin(const char *origin)
+{
+    // Borrowed pointer; caller must keep the string alive for the
+    // process lifetime (typically argv or a static buffer).
+    g_obs_capture_origin = origin;
 }
 
 void decode_loop_set_show_headers(int on)
@@ -549,6 +560,7 @@ void decode_loop_record_packet(const char *ts,
         .doppler_hz_offset = g_obs_doppler_hz_offset,
         .tle_id            = g_obs_tle_id,
         .session_dir       = g_obs_session_dir,
+        .capture_origin    = g_obs_capture_origin,
     };
     (void)packet_db_insert(g_packet_db, &rec);
 }

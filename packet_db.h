@@ -83,6 +83,11 @@ typedef struct {
     long long   tle_id;
     // Run cwd / WAV directory. NULL means not known.
     const char *session_dir;
+    // Provenance of the source audio: "cts_ground" for our B210
+    // capture, "satnogs" for a SatNOGS-archive .ogg, NULL when
+    // unknown (legacy rows / no flag supplied). Distinct from
+    // source_tool, which identifies the decoder.
+    const char *capture_origin;
 } packet_db_record_t;
 
 // Open the DB at `path`, creating it (with schema) if missing. Sets WAL

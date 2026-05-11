@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # decode_passes.sh
 #
-# Walk a directory tree, find every .wav, run rx_replay on the 48 kHz mono
-# captures, and summarise what was decoded. Beacons are printed as readable
-# telemetry. Anything that isn't a beacon (TCMD responses, or CSP frames
-# that don't match either format) is called out so post-uplink replies and
-# oddities don't hide in a long batch.
+# Walk a directory tree, find every .wav and .ogg, run rx_replay on the
+# 48 kHz mono captures (resampling .ogg via ffmpeg first), and summarise
+# what was decoded. Beacons are printed as readable telemetry. Anything
+# that isn't a beacon (TCMD responses, or CSP frames that don't match
+# either format) is called out so post-uplink replies and oddities
+# don't hide in a long batch.
+#
+# Origin tagging — each DB row carries a capture_origin column so
+# cross-site decodes (our B210 vs SatNOGS) stay visible side-by-side:
+#   - filenames matching satnogs_*.ogg get --capture-origin=satnogs
+#   - everything else gets --capture-origin=cts_ground
 #
 # Run from the FrontierSat folder on the server, or pass --root.
 #
@@ -63,6 +69,62 @@ if [[ ! -d "$ROOT" ]]; then
     exit 2
 fi
 
+# ffmpeg is only required when an .ogg shows up in the tree; check
+# lazily so a pure-WAV run on a host without ffmpeg still works.
+have_ffmpeg=""
+if command -v ffmpeg >/dev/null 2>&1; then
+    have_ffmpeg=1
+fi
+
+# Derive capture_origin from filename. SatNOGS archive downloads
+# follow `satnogs_<obs-id>_*` (case-insensitive); anything else is
+# treated as our local B210 capture. Returns the value to pass to
+# rx_replay --capture-origin=.
+origin_for_filename() {
+    local base
+    base="$(basename "$1")"
+    shopt -s nocasematch
+    if [[ "$base" == satnogs_* ]]; then
+        shopt -u nocasematch
+        echo "satnogs"
+    else
+        shopt -u nocasematch
+        echo "cts_ground"
+    fi
+}
+
+# Convert an .ogg to a temp 48 kHz mono S16LE WAV that rx_replay can
+# eat. Echoes the temp path to stdout; caller is responsible for rm.
+# Returns non-zero on ffmpeg failure.
+ogg_to_wav() {
+    local in="$1"
+    local out
+    out="$(mktemp -t decode_passes_XXXXXX.wav)" || return 1
+    if ! ffmpeg -loglevel error -y -i "$in" \
+                -ar 48000 -ac 1 -f wav -acodec pcm_s16le \
+                "$out" </dev/null; then
+        rm -f "$out"
+        return 1
+    fi
+    printf '%s' "$out"
+}
+
+# Pull a UTC ISO-8601 timestamp out of a SatNOGS-style filename, e.g.
+# satnogs_<obs-id>_..._YYYY-MM-DDTHH-MM-SS.ogg → YYYY-MM-DDTHH:MM:SSZ.
+# (Hyphens in the time portion are SatNOGS's filesystem-safe choice.)
+# Echoes the ISO form on hit; empty on miss.
+satnogs_start_utc() {
+    local base
+    base="$(basename "$1")"
+    if [[ "$base" =~ ([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{2})-([0-9]{2})-([0-9]{2}) ]]; then
+        printf '%sT%s:%s:%sZ' \
+            "${BASH_REMATCH[1]}" \
+            "${BASH_REMATCH[2]}" \
+            "${BASH_REMATCH[3]}" \
+            "${BASH_REMATCH[4]}"
+    fi
+}
+
 # Validate WAV format. rx_replay expects 48 kHz mono s16, which is what
 # b210_rx_live writes by default. Returns "OK <rate>" if usable, or
 # "SKIP <reason>" otherwise.
@@ -90,25 +152,68 @@ t_beacons=0
 t_tcmd=0
 t_other=0
 
-while IFS= read -r -d '' wav; do
+while IFS= read -r -d '' src; do
     t_files=$((t_files + 1))
-    chk="$(wav_check "$wav")"
-    case "$chk" in
-        "OK "*)
+    origin="$(origin_for_filename "$src")"
+    decode_path="$src"
+    cleanup_path=""
+
+    case "${src,,}" in
+        *.ogg)
+            if [[ -z "$have_ffmpeg" ]]; then
+                echo "[skip] $src  (ffmpeg not on PATH; install to decode .ogg)"
+                t_skip_open=$((t_skip_open + 1))
+                continue
+            fi
+            tmp_wav="$(ogg_to_wav "$src")"
+            if [[ -z "$tmp_wav" ]]; then
+                echo "[skip] $src  (ffmpeg conversion failed)"
+                t_skip_open=$((t_skip_open + 1))
+                continue
+            fi
+            decode_path="$tmp_wav"
+            cleanup_path="$tmp_wav"
             ;;
-        "SKIP not_wav")
-            echo "[skip] $wav  (not a readable WAV)"
-            t_skip_open=$((t_skip_open + 1))
-            continue
-            ;;
-        SKIP*)
-            echo "[skip] $wav  (${chk#SKIP })"
-            t_skip_fmt=$((t_skip_fmt + 1))
-            continue
+        *)
+            chk="$(wav_check "$src")"
+            case "$chk" in
+                "OK "*)
+                    ;;
+                "SKIP not_wav")
+                    echo "[skip] $src  (not a readable WAV)"
+                    t_skip_open=$((t_skip_open + 1))
+                    continue
+                    ;;
+                SKIP*)
+                    echo "[skip] $src  (${chk#SKIP })"
+                    t_skip_fmt=$((t_skip_fmt + 1))
+                    continue
+                    ;;
+            esac
             ;;
     esac
 
-    out="$("$RX_REPLAY" "$wav" --sync-threshold="$SYNC_THR" 2>&1 || true)"
+    # Build the rx_replay command. The temp WAV from an .ogg conversion
+    # loses whatever timestamp lived in the source filename, so for the
+    # SatNOGS path we extract it here and feed --start-utc; otherwise
+    # rx_replay's UT=...filename / mtime fallbacks already cover the
+    # cts_ground case.
+    rx_args=( --sync-threshold="$SYNC_THR"
+              --capture-origin="$origin"
+              --session-dir="$(dirname "$src")" )
+    if [[ "$origin" == "satnogs" ]]; then
+        sat_utc="$(satnogs_start_utc "$src")"
+        if [[ -n "$sat_utc" ]]; then
+            rx_args+=( --start-utc="$sat_utc" )
+        fi
+    fi
+    out="$("$RX_REPLAY" "$decode_path" "${rx_args[@]}" 2>&1 || true)"
+    [[ -n "$cleanup_path" ]] && rm -f "$cleanup_path"
+
+    # Rename `src` back to the user-facing path the rest of this loop
+    # already prints under, so the WAV-skip and decoded headers line
+    # up regardless of the source format.
+    wav="$src"
 
     frames=$(printf '%s\n' "$out" | awk '/^rx_replay: [0-9]+ frame\(s\) emitted/{print $2; exit}')
     [[ -z "$frames" ]] && frames=0
@@ -140,7 +245,7 @@ while IFS= read -r -d '' wav; do
         # can spot what actually landed.
         printf '%s\n' "$out" | grep -E '^\[t=[^]]*\] (AX100|CSP v1|hex|ascii):'
     fi
-done < <(find "$ROOT" -type f -iname '*.wav' -print0 | sort -z)
+done < <(find "$ROOT" -type f \( -iname '*.wav' -o -iname '*.ogg' \) -print0 | sort -z)
 
 echo
 echo "=== summary"

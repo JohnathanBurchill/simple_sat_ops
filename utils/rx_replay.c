@@ -350,6 +350,14 @@ static void usage(FILE *dest, const char *name)
         "                           fresh row group).\n"
         "  --no-db                  Skip DB writes.\n"
         "  --source-run=<id>        Override the per-launch run-id.\n"
+        "  --capture-origin=<name>  Tag rows with the audio's provenance,\n"
+        "                           e.g. cts_ground or satnogs. Distinct\n"
+        "                           from --source-run (which identifies\n"
+        "                           one launch) and source_tool (the\n"
+        "                           decoder). Same packet captured at\n"
+        "                           multiple sites keeps one row per\n"
+        "                           origin so cross-site decodes are\n"
+        "                           visible. Default: unset (NULL).\n"
         "  --help                   Show this help.\n",
         name, HMAC_KEYFILE_DEFAULT_RELPATH);
 }
@@ -386,6 +394,7 @@ int main(int argc, char **argv)
     const char *sat_arg  = NULL;
     const char *start_utc_arg = NULL;
     const char *session_dir_arg = NULL;
+    const char *capture_origin = NULL;
     int update_mode = 0;
     double obs_lat_deg = 50.8688;   // RAO defaults; overridden by flags
     double obs_lon_deg = -114.2910;
@@ -436,6 +445,7 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--satellite="))       sat_arg = a + 12;
         else if (starts_with(a, "--start-utc="))       start_utc_arg = a + 12;
         else if (starts_with(a, "--session-dir="))     session_dir_arg = a + 14;
+        else if (starts_with(a, "--capture-origin="))  capture_origin = a + 17;
         else if (strcmp(a, "--update") == 0)           update_mode = 1;
         else if (starts_with(a, "--lat="))             obs_lat_deg = atof(a + 6);
         else if (starts_with(a, "--lon="))             obs_lon_deg = atof(a + 6);
@@ -668,6 +678,7 @@ int main(int argc, char **argv)
         snprintf(session_dir_buf, sizeof session_dir_buf, "%s", dirname(tmp));
     }
     if (db != NULL) decode_loop_set_session_dir(session_dir_buf);
+    if (db != NULL) decode_loop_set_capture_origin(capture_origin);
 
 #ifdef WITH_SGP4SDP4
     // SGP4 propagation state, only used when --tle was given (or
