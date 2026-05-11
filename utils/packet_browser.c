@@ -85,6 +85,7 @@ typedef struct {
     char tool[20];
     char type_name[20];
     char satellite[12];
+    char origin[16];
     char run[24];
     int  packet_type;
     int  csp_src, csp_dst, csp_dport, csp_sport, csp_prio, csp_flags;
@@ -103,11 +104,20 @@ static const char *const TYPE_CYCLE[] = {
 };
 static const int TYPE_CYCLE_N = sizeof TYPE_CYCLE / sizeof TYPE_CYCLE[0];
 
+// Origin cycle: NULL = all, otherwise filter on capture_origin.
+// Mirrors the V4 schema's capture_origin column values; new origins
+// (e.g. another partner ground station) get added here.
+static const char *const ORIGIN_CYCLE[] = {
+    NULL, "cts_ground", "satnogs"
+};
+static const int ORIGIN_CYCLE_N = sizeof ORIGIN_CYCLE / sizeof ORIGIN_CYCLE[0];
+
 static row_t   rows[MAX_ROWS];
 static int     n_rows = 0;
 static int     sel    = 0;
 static int     top    = 0;
 static int     type_idx = 0;
+static int     origin_idx = 0;
 static char    like_text[128] = "";
 // Display mode: 0 = UTC (storage form, ISO-8601 Z), 1 = local time
 // (parsed back to time_t and re-formatted with tzname). Filtering and
@@ -137,6 +147,11 @@ static const char *type_filter(void)
     return TYPE_CYCLE[type_idx];
 }
 
+static const char *origin_filter(void)
+{
+    return ORIGIN_CYCLE[origin_idx];
+}
+
 // Run the current filter against the DB and refresh `rows` / `n_rows`.
 // Selection (`sel`) is preserved by row id where possible — feeling
 // like the row "stays in place" across reloads is more important than
@@ -151,7 +166,8 @@ static void run_query(sqlite3 *db)
         "SELECT id, ts_received, satellite, packet_type, packet_type_name, "
         "csp_src, csp_dst, csp_dport, csp_sport, csp_prio, csp_flags, "
         "payload, golay_errs, rs_errs, hmac_ok, crc_status, "
-        "source_tool, source_run, audio_offset_s, decoded_summary "
+        "source_tool, source_run, audio_offset_s, decoded_summary, "
+        "capture_origin "
         "FROM packet WHERE 1=1");
     int n_params = 0;
     const char *param_text[4] = {0};
@@ -160,6 +176,11 @@ static void run_query(sqlite3 *db)
         off += snprintf(sql + off, sizeof sql - off,
                         " AND packet_type_name = ?%d", n_params + 1);
         param_text[n_params++] = type_filter();
+    }
+    if (origin_filter() != NULL) {
+        off += snprintf(sql + off, sizeof sql - off,
+                        " AND capture_origin = ?%d", n_params + 1);
+        param_text[n_params++] = origin_filter();
     }
     if (like_text[0] != '\0') {
         snprintf(like_pattern, sizeof like_pattern, "%%%s%%", like_text);
@@ -205,6 +226,7 @@ static void run_query(sqlite3 *db)
         r->has_offset  = sqlite3_column_type(stmt, 18) != SQLITE_NULL;
         r->audio_offset_s = r->has_offset ? sqlite3_column_double(stmt, 18) : 0.0;
         const char *sm = (const char *)sqlite3_column_text(stmt, 19);
+        const char *og = (const char *)sqlite3_column_text(stmt, 20);
 
         snprintf(r->ts,        sizeof r->ts,        "%s", ts ? ts : "");
         snprintf(r->satellite, sizeof r->satellite, "%s", sat ? sat : "");
@@ -212,6 +234,7 @@ static void run_query(sqlite3 *db)
         snprintf(r->tool,      sizeof r->tool,      "%s", tl ? tl : "");
         snprintf(r->run,       sizeof r->run,       "%s", rn ? rn : "");
         snprintf(r->summary,   sizeof r->summary,   "%s", sm ? sm : "");
+        snprintf(r->origin,    sizeof r->origin,    "%s", og ? og : "");
 
         r->payload_len_total = pln;
         int cap = pln < MAX_PAYLOAD_PREVIEW ? pln : MAX_PAYLOAD_PREVIEW;
@@ -313,8 +336,10 @@ static void format_list_line(const row_t *r, char *out, size_t outn)
     int body_len = eol ? (int)(eol - summary_first) : (int)strlen(summary_first);
     char ts_disp[40];
     format_ts(r->ts, ts_disp, sizeof ts_disp);
-    snprintf(out, outn, "%-30.30s  %-13s  %-13s  %-9s  %.*s",
-             ts_disp, r->tool, r->type_name,
+    snprintf(out, outn, "%-30.30s  %-13s  %-10s  %-13s  %-9s  %.*s",
+             ts_disp, r->tool,
+             r->origin[0] ? r->origin : "-",
+             r->type_name,
              r->satellite[0] ? r->satellite : "-",
              body_len, summary_first);
 }
@@ -327,8 +352,9 @@ static void draw_top_bar(int cols)
     for (int i = 0; i < cols; i++) addch(' ');
     char buf[256];
     snprintf(buf, sizeof buf,
-             " packet_browser  filter: type=%-13s  search=\"%s\"  | %d row%s",
+             " packet_browser  filter: type=%-13s origin=%-10s  search=\"%s\"  | %d row%s",
              type_filter() ? type_filter() : "all",
+             origin_filter() ? origin_filter() : "all",
              like_text, n_rows, n_rows == 1 ? "" : "s");
     mvaddnstr(0, 0, buf, cols);
     if (g_have_color) attroff(COLOR_PAIR(PAIR_BAR));
@@ -341,9 +367,9 @@ static void draw_list(int list_top, int list_h, int cols)
     if (g_have_color) attron(A_DIM);
     char header[256];
     snprintf(header, sizeof header,
-             "  %-30s  %-13s  %-13s  %-9s  %s",
+             "  %-30s  %-13s  %-10s  %-13s  %-9s  %s",
              show_local_time ? "TIMESTAMP (LOCAL)" : "TIMESTAMP (UTC)",
-             "TOOL", "TYPE", "SATELLITE", "SUMMARY");
+             "TOOL", "ORIGIN", "TYPE", "SATELLITE", "SUMMARY");
     mvaddnstr(list_top, 0, header, cols);
     if (g_have_color) attroff(A_DIM);
 
@@ -415,8 +441,9 @@ static void draw_detail(int top_y, int height, int cols)
     char ts_disp[40];
     format_ts(r->ts, ts_disp, sizeof ts_disp);
     snprintf(head, sizeof head,
-             "id=%lld  ts=%s  type=%s  tool=%s  run=%s",
-             (long long)r->id, ts_disp, r->type_name, r->tool, r->run);
+             "id=%lld  ts=%s  type=%s  tool=%s  origin=%s  run=%s",
+             (long long)r->id, ts_disp, r->type_name, r->tool,
+             r->origin[0] ? r->origin : "-", r->run);
     move(y, 0); clrtoeol();
     if (g_have_color) attron(A_BOLD);
     mvaddnstr(y, 2, head, cols - 2);
@@ -489,7 +516,7 @@ static void draw_bottom_bar(int cols, int rows_total, int searching)
         // ASCII only — narrow ncurses' mvaddnstr counts bytes while
         // the terminal renders columns, so multi-byte chars cause
         // stale tail content on the next render.
-        : " q quit   up/down scroll   PgUp/PgDn page   t type   / search   L utc/lt   r reload ";
+        : " q quit   up/down scroll   t type   o origin   / search   L utc/lt   r reload ";
     mvaddnstr(rows_total - 1, 0, hint, cols);
     if (g_have_color) attroff(COLOR_PAIR(PAIR_BAR));
     else              attroff(A_REVERSE);
@@ -561,6 +588,8 @@ static void usage(FILE *out, const char *argv0)
         "  r                reload the list now\n"
         "  t                cycle type filter (all → beacon → tcmd_response\n"
         "                   → log → bulk_file → all)\n"
+        "  o                cycle capture-origin filter (all → cts_ground\n"
+        "                   → satnogs → all)\n"
         "  /                start a substring search against the firmware-\n"
         "                   interpreted text. Enter applies, Esc cancels.\n"
         "  L                toggle timestamp display: UTC (storage) ↔ local\n"
@@ -673,6 +702,11 @@ int main(int argc, char **argv)
                 break;
             case 't':
                 type_idx = (type_idx + 1) % TYPE_CYCLE_N;
+                run_query(db);
+                last_query = monotonic_seconds();
+                break;
+            case 'o': case 'O':
+                origin_idx = (origin_idx + 1) % ORIGIN_CYCLE_N;
                 run_query(db);
                 last_query = monotonic_seconds();
                 break;

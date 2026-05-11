@@ -72,6 +72,7 @@ static void usage(FILE *out, const char *argv0)
         "  --type=<name|0xNN>       beacon|log|tcmd_response|bulk_file|0xNN\n"
         "  --satellite=<name>       e.g. CTS1\n"
         "  --source-tool=<tool>     rx_live|rx_replay|b210_rx_live|rx_decode\n"
+        "  --capture-origin=<name>  cts_ground|satnogs (audio provenance)\n"
         "  --like=<pattern>         SQL LIKE pattern matched against the\n"
         "                           decoded_summary text. Use %% as the\n"
         "                           wildcard. Example: --like='%%eps_mode=SAFETY%%'\n"
@@ -274,6 +275,7 @@ int main(int argc, char **argv)
     const char *type_arg = NULL;
     const char *satellite = NULL;
     const char *source_tool = NULL;
+    const char *capture_origin = NULL;
     const char *like_arg = NULL;
     long limit = 100;
     int order_desc = 1;
@@ -289,6 +291,7 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--type="))         type_arg    = a + 7;
         else if (starts_with(a, "--satellite="))    satellite   = a + 12;
         else if (starts_with(a, "--source-tool="))  source_tool = a + 14;
+        else if (starts_with(a, "--capture-origin=")) capture_origin = a + 17;
         else if (starts_with(a, "--like="))         like_arg    = a + 7;
         else if (starts_with(a, "--limit=")) {
             limit = strtol(a + 8, NULL, 10);
@@ -360,7 +363,7 @@ int main(int argc, char **argv)
         "payload, golay_errs, rs_errs, hmac_ok, crc_status, "
         "source_tool, source_run, audio_offset_s, decoded_summary, "
         "az_deg, el_deg, range_km, range_rate_km_s, doppler_hz_offset, "
-        "tle_id, session_dir "
+        "tle_id, session_dir, capture_origin "
         "FROM packet WHERE 1=1");
 
     // Slot 0..n_params-1 in these arrays mirror SQL ?1..?n_params.
@@ -409,6 +412,11 @@ int main(int argc, char **argv)
                             " AND source_tool = ?%d", n_params + 1);
         ADD_PARAM_TXT(source_tool);
     }
+    if (capture_origin != NULL) {
+        sql_off += snprintf(sql + sql_off, sizeof sql - sql_off,
+                            " AND capture_origin = ?%d", n_params + 1);
+        ADD_PARAM_TXT(capture_origin);
+    }
     if (like_arg != NULL) {
         sql_off += snprintf(sql + sql_off, sizeof sql - sql_off,
                             " AND decoded_summary LIKE ?%d", n_params + 1);
@@ -447,13 +455,13 @@ int main(int argc, char **argv)
                "golay_errs,rs_errs,hmac_ok,crc_status,"
                "source_tool,source_run,audio_offset_s,"
                "az_deg,el_deg,range_km,range_rate_km_s,doppler_hz_offset,"
-               "tle_id,session_dir,payload_hex,decoded_summary\n");
+               "tle_id,session_dir,capture_origin,payload_hex,decoded_summary\n");
     }
     if (fmt == FMT_TABLE) {
-        printf("%-7s %-30s %-13s %-15s %-9s %-7s\n",
+        printf("%-7s %-30s %-13s %-10s %-15s %-9s %-7s\n",
                "ID",
                local_time ? "TIMESTAMP (LOCAL)" : "TIMESTAMP (UTC)",
-               "TOOL", "TYPE", "SATELLITE", "RS");
+               "TOOL", "ORIGIN", "TYPE", "SATELLITE", "RS");
     }
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -492,6 +500,7 @@ int main(int argc, char **argv)
         int has_tle = sqlite3_column_type(stmt, 25) != SQLITE_NULL;
         long long tle_id = has_tle ? sqlite3_column_int64(stmt, 25) : 0;
         const char *session_dir = (const char *)sqlite3_column_text(stmt, 26);
+        const char *capture_origin_row = (const char *)sqlite3_column_text(stmt, 27);
 
         char ts_disp[64];
         format_display_ts(ts, local_time, ts_disp, sizeof ts_disp);
@@ -502,8 +511,9 @@ int main(int argc, char **argv)
             if (has_az && has_el) {
                 snprintf(azel, sizeof azel, "  az=%.1f° el=%+.1f°", az, el);
             }
-            printf("%-7lld %-30s %-13s %-15s %-9s %d%s\n",
+            printf("%-7lld %-30s %-13s %-10s %-15s %-9s %d%s\n",
                    id, ts_disp[0] ? ts_disp : "?", tool ? tool : "?",
+                   capture_origin_row ? capture_origin_row : "-",
                    pname ? pname : "?", sat ? sat : "-", rs_errs, azel);
             if (summary != NULL) {
                 // Indent each line of summary under the row header.
@@ -566,6 +576,13 @@ int main(int argc, char **argv)
             } else {
                 printf("\"session_dir\":null,");
             }
+            if (capture_origin_row) {
+                char co_e[64];
+                json_escape(capture_origin_row, co_e, sizeof co_e);
+                printf("\"capture_origin\":\"%s\",", co_e);
+            } else {
+                printf("\"capture_origin\":null,");
+            }
             printf("\"payload_hex\":\"%s\",", payload_hex);
             printf("\"summary\":\"%s\"", summary_e);
             printf("}");
@@ -601,6 +618,9 @@ int main(int argc, char **argv)
             char sd_q[512];
             csv_escape(session_dir ? session_dir : "", sd_q, sizeof sd_q);
             printf("%s,", sd_q);
+            char co_q[64];
+            csv_escape(capture_origin_row ? capture_origin_row : "", co_q, sizeof co_q);
+            printf("%s,", co_q);
             printf("%s,%s\n", payload_hex, summary_q);
             break;
         }
