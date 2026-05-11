@@ -35,10 +35,14 @@
 #   --out=<dir>             Output root (default $HOME/satnogs_archive)
 #   --since=<spec>          24h | 30m | 7d | ISO-8601-Z. Default: pick up
 #                           where the last run left off — uses the latest
-#                           downloaded observation's start (minus a 1 h
-#                           overlap) stored in
-#                           <out>/.latest_start.<norad>.txt; falls back
-#                           to 24h on first run.
+#                           downloaded observation's start from
+#                           <out>/.latest_start.<norad>.txt, capped at
+#                           --lookback-cap so a stale or absent state
+#                           file can't trigger a multi-year API walk.
+#                           Falls back to --lookback-cap on first run.
+#   --lookback-cap=<spec>   Floor on the resolved --since when it would
+#                           otherwise be older. Default 24h. Use 0 to
+#                           disable.
 #   --until=<spec>          Same syntax as --since (default: now)
 #   --status=<csv>          Comma-separated list of accepted statuses
 #                           (good|bad|failed|future|unknown). Default
@@ -78,10 +82,11 @@ DECODE_PASSES_BIN=""
 DB_PATH=""
 TLE_DIR="$HOME/FrontierSat/TLEs"
 USE_LOCAL_TLE=1
-# Overlap subtracted from the cursor in the state file when no explicit
-# --since is given. Covers observations that flipped from "future" to
-# "good" in the meantime, and any clock drift.
-SINCE_OVERLAP_S=3600
+# Maximum reach-back when --since is auto-resolved from the state file.
+# Caps the API window even when the cursor is stale (e.g. on a fresh
+# host or after the state file was wiped). Override with
+# --lookback-cap=<spec>; 0 disables the cap (use cursor verbatim).
+LOOKBACK_CAP_SPEC="24h"
 
 usage() {
     sed -n '2,/^# Usage:/p' "$0" | sed 's/^# \{0,1\}//'
@@ -103,6 +108,7 @@ while [[ $# -gt 0 ]]; do
         --db=*)             DB_PATH="${1#--db=}";;
         --tle-dir=*)        TLE_DIR="${1#--tle-dir=}";;
         --no-local-tle)     USE_LOCAL_TLE=0;;
+        --lookback-cap=*)   LOOKBACK_CAP_SPEC="${1#--lookback-cap=}";;
         -h|--help)          usage; exit 0;;
         *)                  echo "unknown arg: $1" >&2; usage >&2; exit 2;;
     esac
@@ -168,24 +174,61 @@ iso_to_epoch() {
         || return 1
 }
 
-# Default --since: if the user didn't pass one, pick up from where the
-# last run left off (cursor minus a 1 h overlap). Falls back to 24h on
-# first run.
+epoch_to_iso() {
+    local secs="$1"
+    date -u -d "@$secs" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+        || date -u -r "$secs" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+        || return 1
+}
+
+# Translate a duration spec (90s|30m|24h|7d) to seconds. Returns 0 if
+# the spec is "0" (cap disabled) or empty. Errors out on garbage so a
+# typo in --lookback-cap surfaces before the API call.
+spec_to_seconds() {
+    local spec="$1"
+    if [[ -z "$spec" || "$spec" == "0" ]]; then echo 0; return 0; fi
+    local n unit
+    n="${spec%[smhd]}"
+    unit="${spec: -1}"
+    case "$spec" in
+        ''|*[!0-9smhd]*) return 1;;
+    esac
+    case "$unit" in
+        s) echo "$n";;
+        m) echo $((n * 60));;
+        h) echo $((n * 3600));;
+        d) echo $((n * 86400));;
+        *) return 1;;
+    esac
+}
+
+# Default --since: pick up from the cursor in the state file with no
+# overlap (status=good observations don't ever appear with a start
+# earlier than a previously-good observation, so the API's start>=since
+# filter catches the boundary cleanly), but clip to --lookback-cap so
+# a stale / absent state file doesn't trigger a multi-year API walk.
 if [[ -z "$SINCE_SPEC" ]]; then
+    NOW_EPOCH="$(date -u +%s)"
+    if ! LOOKBACK_S="$(spec_to_seconds "$LOOKBACK_CAP_SPEC")"; then
+        echo "error: bad --lookback-cap='$LOOKBACK_CAP_SPEC'" >&2
+        exit 2
+    fi
+    CAP_EPOCH=$((NOW_EPOCH - LOOKBACK_S))
+
+    CURSOR_EPOCH=""
     if [[ -s "$STATE_FILE" ]]; then
         LATEST="$(head -n 1 "$STATE_FILE")"
-        if EPOCH="$(iso_to_epoch "$LATEST")"; then
-            ADJ=$((EPOCH - SINCE_OVERLAP_S))
-            if SINCE_SPEC="$(date -u -d "@$ADJ" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)"; then
-                :
-            elif SINCE_SPEC="$(date -u -r "$ADJ" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)"; then
-                :
-            else
-                SINCE_SPEC="24h"
-            fi
+        CURSOR_EPOCH="$(iso_to_epoch "$LATEST" 2>/dev/null || true)"
+    fi
+
+    if [[ -n "$CURSOR_EPOCH" ]]; then
+        if [[ "$LOOKBACK_S" -gt 0 && "$CURSOR_EPOCH" -lt "$CAP_EPOCH" ]]; then
+            SINCE_SPEC="$(epoch_to_iso "$CAP_EPOCH")"
         else
-            SINCE_SPEC="24h"
+            SINCE_SPEC="$(epoch_to_iso "$CURSOR_EPOCH")"
         fi
+    elif [[ "$LOOKBACK_S" -gt 0 ]]; then
+        SINCE_SPEC="$(epoch_to_iso "$CAP_EPOCH")"
     else
         SINCE_SPEC="24h"
     fi
@@ -200,18 +243,20 @@ if [[ -n "$UNTIL_SPEC" ]]; then
 fi
 
 # Newest local TLE — used to override the SatNOGS-shipped per-obs TLE
-# when --tle-dir has at least one .tle. Pick mtime-newest. Empty means
-# fall back to whatever SatNOGS shipped.
+# when --tle-dir has at least one .tle. Walks the whole tree so the
+# operator's typical layout (~/FrontierSat/TLEs/YYYYMMDD/tle-*.tle)
+# works without a flag. Mtime-newest wins. Empty means fall back to
+# whatever SatNOGS shipped for the observation.
 LOCAL_TLE=""
 if [[ "$USE_LOCAL_TLE" -eq 1 && -d "$TLE_DIR" ]]; then
-    # Use find + sort by mtime so this works on macOS (where ls -t
-    # behavior across symlinks can surprise).
-    LOCAL_TLE="$(find "$TLE_DIR" -maxdepth 1 -type f -name '*.tle' \
+    # BSD stat (macOS) first, then GNU find -printf fallback. The order
+    # matters because stat's `-f` flag has different meanings on each
+    # platform, so we just try both and take the first that yields a hit.
+    LOCAL_TLE="$(find "$TLE_DIR" -type f -name '*.tle' \
                     -exec stat -f '%m %N' {} \; 2>/dev/null \
                 | sort -nr | head -n 1 | cut -d ' ' -f 2-)"
     if [[ -z "$LOCAL_TLE" ]]; then
-        # GNU stat fallback
-        LOCAL_TLE="$(find "$TLE_DIR" -maxdepth 1 -type f -name '*.tle' \
+        LOCAL_TLE="$(find "$TLE_DIR" -type f -name '*.tle' \
                         -printf '%T@ %p\n' 2>/dev/null \
                     | sort -nr | head -n 1 | cut -d ' ' -f 2-)"
     fi
