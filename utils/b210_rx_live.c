@@ -717,8 +717,11 @@ static void usage(FILE *dest, const char *name)
         "\n"
         "Live monitor (Linux only — requires this binary be built with ALSA):\n"
         "  --monitor                  Pipe the FM-demoded audio to ALSA so\n"
-        "                             you hear it in real time. Decode and\n"
-        "                             WAV write are upstream and never gated.\n"
+        "                             you hear it in real time. DEFAULT ON;\n"
+        "                             Decode and WAV write are upstream and\n"
+        "                             never gated.\n"
+        "  --no-monitor               Skip ALSA playback. Squelch still runs\n"
+        "                             so the TUI activity ribbon stays live.\n"
         "  --monitor-device=<name>    ALSA device for --monitor (default\n"
         "                             \"default\")\n"
         "  --monitor-squelch=<a|off|N>  Squelch mode for the monitor audio.\n"
@@ -858,7 +861,7 @@ int main(int argc, char **argv)
     //           ratio > mean + auto_offset_db (default +3 dB)
     //   off     pass everything through
     //   <dB>    fixed: open when ratio > <dB>
-    int         want_monitor      = 0;
+    int         want_monitor      = 1;
     const char *monitor_device    = "default";
     msq_mode_t  monitor_sq_init   = MSQ_AUTO_BOOTSTRAPPING;
     double      monitor_sq_user_db = 0.0;     // for MSQ_FIXED
@@ -960,6 +963,7 @@ int main(int argc, char **argv)
         }
 
         else if (strcmp(a, "--monitor") == 0)               want_monitor = 1;
+        else if (strcmp(a, "--no-monitor") == 0)            want_monitor = 0;
         else if (starts_with(a, "--monitor-device="))       monitor_device = a + 17;
         else if (starts_with(a, "--monitor-squelch=")) {
             const char *v = a + 18;
@@ -1252,13 +1256,28 @@ int main(int argc, char **argv)
     }
 #ifdef WITH_ALSA
     snd_pcm_t *alsa = NULL;
-    int16_t   *monitor_chunk = NULL;
+    // The squelch detector always runs (so the TUI activity ribbon
+    // reflects link strength regardless of whether the operator
+    // wanted speaker playback), so the scratch output buffer is
+    // allocated unconditionally. ALSA opening below remains gated on
+    // --monitor / --no-monitor — without ALSA we just don't writei the
+    // gated audio anywhere.
+    int16_t *monitor_chunk = NULL;
+    {
+        size_t mc = b210_rx_core_max_chunk(core);
+        if (mc == 0) mc = 2040;
+        monitor_chunk = (int16_t *)malloc(mc * sizeof(int16_t));
+        if (monitor_chunk == NULL) {
+            fprintf(stderr, "b210_rx_live: out of memory for monitor "
+                            "scratch buffer\n");
+        }
+    }
     if (want_monitor) {
         int aerr = snd_pcm_open(&alsa, monitor_device,
                                 SND_PCM_STREAM_PLAYBACK, 0);
         if (aerr < 0) {
             fprintf(stderr, "b210_rx_live: snd_pcm_open(%s): %s "
-                            "— monitor disabled\n",
+                            "— audio playback disabled, squelch still runs\n",
                     monitor_device, snd_strerror(aerr));
             alsa = NULL;
         } else {
@@ -1276,34 +1295,19 @@ int main(int argc, char **argv)
                                       latency_us);
             if (aerr < 0) {
                 fprintf(stderr, "b210_rx_live: snd_pcm_set_params"
-                                "(%d Hz mono S16_LE): %s — monitor disabled\n",
+                                "(%d Hz mono S16_LE): %s — playback disabled\n",
                         samp_rate, snd_strerror(aerr));
                 snd_pcm_close(alsa);
                 alsa = NULL;
             } else {
-                size_t mc = b210_rx_core_max_chunk(core);
-                if (mc == 0) mc = 2040;
-                monitor_chunk = (int16_t *)malloc(mc * sizeof(int16_t));
-                if (monitor_chunk == NULL) {
-                    fprintf(stderr, "b210_rx_live: out of memory for "
-                                    "monitor buffer — monitor disabled\n");
-                    snd_pcm_close(alsa);
-                    alsa = NULL;
-                } else {
-                    char sqdesc[128];
-                    monitor_squelch_status(&sq, sqdesc, sizeof sqdesc);
-                    fprintf(stderr,
-                            "b210_rx_live: monitor on %s @ %d Hz mono "
-                            "(squelch=%s)\n",
-                            monitor_device, samp_rate, sqdesc);
-                }
+                char sqdesc[128];
+                monitor_squelch_status(&sq, sqdesc, sizeof sqdesc);
+                fprintf(stderr,
+                        "b210_rx_live: monitor on %s @ %d Hz mono "
+                        "(squelch=%s)\n",
+                        monitor_device, samp_rate, sqdesc);
             }
         }
-    }
-#else
-    if (want_monitor) {
-        fprintf(stderr, "b210_rx_live: --monitor requires ALSA support; "
-                        "this binary was built without it.\n");
     }
 #endif
 
@@ -1687,22 +1691,37 @@ int main(int argc, char **argv)
         }
 
 #ifdef WITH_ALSA
-        // Live monitor: squelch + ALSA playback. Bootstrap completion
-        // bumps the status row so the operator sees "auto(boot)" flip
-        // to "auto(thr=...)". snd_pcm_recover handles XRUNs silently.
-        if (alsa != NULL && monitor_chunk != NULL) {
+        // Run the squelch detector every chunk regardless of whether
+        // ALSA playback opened — the TUI activity ribbon reads
+        // sq.ratio_db / sq.thresh_db / sq.hold_samples_remaining off
+        // the detector's internal state, and the operator wants to
+        // see link strength even with --no-monitor (or when the ALSA
+        // device couldn't open). Bootstrap completion bumps the
+        // status row so the operator sees "auto(boot)" flip to
+        // "auto(thr=...)".
+        if (monitor_chunk != NULL) {
             msq_mode_t prev_mode = sq.mode;
             monitor_squelch_process(&sq, pcm_chunk, monitor_chunk, (size_t)n);
             if (prev_mode == MSQ_AUTO_BOOTSTRAPPING
                 && sq.mode == MSQ_AUTO_ENGAGED) {
                 want_status_refresh = 1;
             }
-            snd_pcm_sframes_t w = snd_pcm_writei(alsa, monitor_chunk, (size_t)n);
-            if (w < 0) {
-                int rerr = snd_pcm_recover(alsa, (int)w, /*silent=*/1);
-                if (rerr < 0) {
-                    fprintf(stderr, "b210_rx_live: snd_pcm_writei recover: %s\n",
-                            snd_strerror(rerr));
+            if (use_tui) {
+                rx_tui_observe_signal(sq.ratio_db, sq.thresh_db,
+                                      sq.hold_samples_remaining > 0);
+            }
+            // Playback is the only step that needs ALSA; snd_pcm_recover
+            // handles XRUNs silently.
+            if (alsa != NULL) {
+                snd_pcm_sframes_t w = snd_pcm_writei(alsa, monitor_chunk,
+                                                     (size_t)n);
+                if (w < 0) {
+                    int rerr = snd_pcm_recover(alsa, (int)w, /*silent=*/1);
+                    if (rerr < 0) {
+                        fprintf(stderr,
+                                "b210_rx_live: snd_pcm_writei recover: %s\n",
+                                snd_strerror(rerr));
+                    }
                 }
             }
         }

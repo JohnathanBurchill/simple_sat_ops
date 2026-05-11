@@ -183,6 +183,78 @@ static struct {
     uint64_t crc_mismatch;
 } g_counters;
 
+// ---- activity ribbon --------------------------------------------------
+//
+// Per-1-second bucket history of signal-to-noise ratio + frame events
+// so the operator can see beacon cadence and link strength at a glance
+// even when frames don't decode. Driven by rx_tui_observe_signal
+// (per-audio-chunk from b210_rx_live's monitor_squelch tap) and
+// rx_tui_observe_frame. Hidden until the first observe_signal call —
+// receivers that don't tap squelch (rx_live, rx_replay) keep their
+// existing layout.
+typedef struct {
+    double  peak_ratio_db;  // best SNR seen in this bucket
+    int     samples;        // # of observe_signal pushes
+    int     gate_open;      // 1 if the gate opened any time this bucket
+    int     frames;         // any decoded frame
+    int     beacons;        // beacons specifically
+    int     errors;         // RS uncorrectable / HMAC mismatch / CRC mismatch
+} activity_bucket_t;
+
+#define ACTIVITY_RING       240
+#define ACTIVITY_ROWS       3
+#define ACTIVITY_MIN_COLS   20
+
+static activity_bucket_t g_act[ACTIVITY_RING];
+static int      g_act_head           = 0;   // newest bucket
+static int64_t  g_act_head_epoch_s   = 0;   // monotonic-second of head
+static int      g_act_enabled        = 0;
+static double   g_act_last_ratio_db  = 0.0;
+static double   g_act_last_thresh_db = 0.0;
+static int      g_act_gate_open      = 0;
+static int64_t  g_act_last_beacon_s  = 0;
+static double   g_act_interval_sum_s = 0.0;
+static int      g_act_interval_n     = 0;
+
+static int64_t monotonic_seconds_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec;
+}
+
+// Advance the head forward to `now`, zeroing any buckets we skip over.
+// Skipped buckets render as silence, so a gap with no signal samples
+// shows up as visible empty columns in the ribbon.
+static void activity_advance_to(int64_t now_s)
+{
+    if (g_act_head_epoch_s == 0) {
+        g_act_head_epoch_s = now_s;
+        memset(&g_act[g_act_head], 0, sizeof g_act[g_act_head]);
+        return;
+    }
+    int gap = (int)(now_s - g_act_head_epoch_s);
+    if (gap <= 0) return;
+    if (gap >= ACTIVITY_RING) {
+        // Lost more history than we hold; reset cleanly.
+        memset(g_act, 0, sizeof g_act);
+        g_act_head = 0;
+        g_act_head_epoch_s = now_s;
+        return;
+    }
+    for (int i = 0; i < gap; i++) {
+        g_act_head = (g_act_head + 1) % ACTIVITY_RING;
+        memset(&g_act[g_act_head], 0, sizeof g_act[g_act_head]);
+    }
+    g_act_head_epoch_s = now_s;
+}
+
+static activity_bucket_t *activity_current(void)
+{
+    activity_advance_to(monotonic_seconds_s());
+    return &g_act[g_act_head];
+}
+
 // Color pairs (only used when has_colors()).
 enum {
     PAIR_TITLE = 1,
@@ -560,6 +632,101 @@ static int draw_other_panel(int top, int left, int rows, int cols)
     return max;
 }
 
+// ---- activity ribbon renderer ----------------------------------------
+//
+// Three stacked rows at the bottom of the screen:
+//   row 0: header line with live SNR / threshold / gate state /
+//          last-beacon age + running average interval
+//   row 1: SNR strip — one column per second of history, ASCII chars
+//          mapped to dB ranges (`.` `-` `=` `+` `#` `@`), colored to
+//          mirror the existing OK/WARN/ALERT palette
+//   row 2: event strip — `.` quiet, `f` frame emitted, `B` beacon
+//          decoded, `E` error (RS uncorrectable / HMAC / CRC bad)
+//
+// Newest column is at the right edge; older history scrolls left.
+static char snr_char_for(double r, int *out_pair)
+{
+    if (r < -3)      { *out_pair = PAIR_LABEL; return '.'; }
+    if (r <  3)      { *out_pair = PAIR_LABEL; return '-'; }
+    if (r <  6)      { *out_pair = PAIR_WARN;  return '='; }
+    if (r < 12)      { *out_pair = PAIR_OK;    return '+'; }
+    if (r < 18)      { *out_pair = PAIR_OK;    return '#'; }
+                       *out_pair = PAIR_OK;    return '@';
+}
+
+static void draw_activity_ribbon(int top, int left, int rows, int cols)
+{
+    if (rows < 1 || cols < ACTIVITY_MIN_COLS) return;
+    int right = left + cols;
+
+    // Header row.
+    char hdr[300];
+    char last_s[96] = "no beacons yet";
+    int64_t now_s = monotonic_seconds_s();
+    if (g_act_last_beacon_s != 0) {
+        long age = (long)(now_s - g_act_last_beacon_s);
+        if (g_act_interval_n > 0) {
+            double avg = g_act_interval_sum_s / (double)g_act_interval_n;
+            snprintf(last_s, sizeof last_s,
+                     "last=%lds  avg=%.1fs  n=%d", age, avg,
+                     g_act_interval_n + 1);
+        } else {
+            snprintf(last_s, sizeof last_s, "last=%lds", age);
+        }
+    }
+    snprintf(hdr, sizeof hdr,
+             "ACTIVITY  snr=%+.1fdB thr=%+.1fdB  %s  %s",
+             g_act_last_ratio_db, g_act_last_thresh_db,
+             g_act_gate_open ? "OPEN" : "----",
+             last_s);
+    if (g_have_color) attron(COLOR_PAIR(PAIR_LABEL) | A_BOLD);
+    else              attron(A_BOLD);
+    mvhline(top, left, ' ', cols);
+    put_line(top, left, right, hdr);
+    if (g_have_color) attroff(COLOR_PAIR(PAIR_LABEL) | A_BOLD);
+    else              attroff(A_BOLD);
+
+    // SNR strip — newest at the right edge so the eye reads time
+    // backwards naturally.
+    if (rows < 2) return;
+    int snr_row = top + 1;
+    move(snr_row, left); clrtoeol();
+    for (int i = 0; i < cols; i++) {
+        int col_from_right = cols - 1 - i;
+        int idx = ((g_act_head - col_from_right) % ACTIVITY_RING
+                   + ACTIVITY_RING) % ACTIVITY_RING;
+        const activity_bucket_t *b = &g_act[idx];
+        char ch = ' ';
+        int pair = 0;
+        if (b->samples > 0) {
+            ch = snr_char_for(b->peak_ratio_db, &pair);
+        }
+        if (pair && g_have_color) attron(COLOR_PAIR(pair));
+        mvaddch(snr_row, left + i, ch);
+        if (pair && g_have_color) attroff(COLOR_PAIR(pair));
+    }
+
+    if (rows < 3) return;
+    int evt_row = top + 2;
+    move(evt_row, left); clrtoeol();
+    for (int i = 0; i < cols; i++) {
+        int col_from_right = cols - 1 - i;
+        int idx = ((g_act_head - col_from_right) % ACTIVITY_RING
+                   + ACTIVITY_RING) % ACTIVITY_RING;
+        const activity_bucket_t *b = &g_act[idx];
+        char ch = '.';
+        int pair = PAIR_LABEL;
+        if (b->beacons > 0)      { ch = 'B'; pair = PAIR_OK; }
+        else if (b->frames > 0)  { ch = 'f'; pair = PAIR_WARN; }
+        else if (b->errors > 0)  { ch = 'E'; pair = PAIR_ALERT; }
+        if (g_have_color) attron(COLOR_PAIR(pair));
+        else if (pair == PAIR_ALERT) attron(A_BOLD);
+        mvaddch(evt_row, left + i, ch);
+        if (g_have_color) attroff(COLOR_PAIR(pair));
+        else if (pair == PAIR_ALERT) attroff(A_BOLD);
+    }
+}
+
 // ---- top-level render -------------------------------------------------
 
 static void render(void)
@@ -615,10 +782,16 @@ static void render(void)
         title_rows = 2;
     }
 
-    // ---- main split (subtract one extra row when the REPL input is on)
+    // ---- main split (subtract one extra row when the REPL input is on,
+    // plus the activity ribbon's rows when a receiver has signalled it
+    // wants one).
     int main_top  = title_rows;
+    int repl_rows = (g_cmd_fn != NULL) ? 1 : 0;
+    int act_rows  = (g_act_enabled
+                     && rows >= title_rows + 1 + repl_rows + ACTIVITY_ROWS + 4
+                     && cols >= ACTIVITY_MIN_COLS) ? ACTIVITY_ROWS : 0;
     int input_row = (g_cmd_fn != NULL) ? rows - 2 : -1;
-    int main_rows = rows - title_rows - 1 - (g_cmd_fn != NULL ? 1 : 0);
+    int main_rows = rows - title_rows - 1 - repl_rows - act_rows;
     int side_by_side = (cols >= 100);
     if (side_by_side) {
         // beacon | (tcmd over others). The right column is split
@@ -672,6 +845,17 @@ static void render(void)
                 draw_other_panel(other_top, 0, other_rows, cols);
             }
         }
+    }
+
+    // ---- activity ribbon (above REPL/footer, when enabled)
+    if (act_rows > 0) {
+        int act_top = main_top + main_rows;
+        // Advance the ring even when no signal samples have arrived in
+        // the last second so the ribbon scrolls visibly during silence.
+        if (g_act_head_epoch_s != 0) {
+            activity_advance_to(monotonic_seconds_s());
+        }
+        draw_activity_ribbon(act_top, 0, act_rows, cols);
     }
 
     // ---- REPL input row (above the footer, when active)
@@ -796,6 +980,21 @@ void rx_tui_set_history_path(const char *path)
     hist_load_from_disk();
 }
 
+void rx_tui_observe_signal(double ratio_db, double thresh_db, int gate_open)
+{
+    if (!g_init) return;
+    g_act_enabled        = 1;
+    g_act_last_ratio_db  = ratio_db;
+    g_act_last_thresh_db = thresh_db;
+    g_act_gate_open      = gate_open ? 1 : 0;
+    activity_bucket_t *b = activity_current();
+    if (b->samples == 0 || ratio_db > b->peak_ratio_db) {
+        b->peak_ratio_db = ratio_db;
+    }
+    b->samples++;
+    if (gate_open) b->gate_open = 1;
+}
+
 void rx_tui_observe_frame(const char *ts,
                           const uint8_t *packet, size_t packet_len,
                           int golay_errs, int hmac_ok, int use_hmac,
@@ -813,6 +1012,17 @@ void rx_tui_observe_frame(const char *ts,
     if (rs_errs == -2) g_counters.rs_uncorrectable++;
     if (crc_status == 0) g_counters.crc_mismatch++;
 
+    // Activity ribbon: count this frame against the current bucket so
+    // the operator can see decode events lined up with the squelch
+    // ribbon above. Errored frames still count as "frame seen" but
+    // also bump the errors slot.
+    activity_bucket_t *act_b = activity_current();
+    act_b->frames++;
+    int frame_error = (rs_errs == -2)
+                   || (use_hmac && hmac_ok == 0)
+                   || (crc_status == 0);
+    if (frame_error) act_b->errors++;
+
     csp_v1_header_t hdr = {0};
     int csp_ok = (packet_len >= 4) && (csp_v1_decode(packet, &hdr) == 0);
     const uint8_t *payload = csp_ok ? packet + 4 : NULL;
@@ -823,6 +1033,20 @@ void rx_tui_observe_frame(const char *ts,
         snprintf(g_beacon_ts, sizeof g_beacon_ts, "%s", ts ? ts : "?");
         g_have_beacon = 1;
         g_counters.beacon++;
+        // Activity ring: tag the bucket and update the running
+        // beacon-interval average so the header line stays useful.
+        act_b->beacons++;
+        int64_t now = monotonic_seconds_s();
+        if (g_act_last_beacon_s != 0) {
+            double iv = (double)(now - g_act_last_beacon_s);
+            // Drop implausibly long gaps so a multi-minute outage
+            // doesn't poison the running mean for the next pass.
+            if (iv > 0.0 && iv < 600.0) {
+                g_act_interval_sum_s += iv;
+                g_act_interval_n++;
+            }
+        }
+        g_act_last_beacon_s = now;
     } else if (csp_ok && tcmd_response_is(payload, payload_len)) {
         COMMS_tcmd_response_packet_t r;
         memcpy(&r, payload, COMMS_TCMD_RESPONSE_HEADER_SIZE);
@@ -1020,6 +1244,10 @@ void rx_tui_observe_frame(const char *ts, const uint8_t *packet,
     (void)hmac_ok; (void)use_hmac; (void)rs_errs; (void)crc_status;
 }
 int  rx_tui_tick(void) { return 0; }
+void rx_tui_observe_signal(double ratio_db, double thresh_db, int gate_open)
+{
+    (void)ratio_db; (void)thresh_db; (void)gate_open;
+}
 void rx_tui_hold_until_quit(void) {}
 void rx_tui_request_quit(void) {}
 

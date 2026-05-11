@@ -68,6 +68,15 @@ void rx_tui_observe_frame(const char *ts,
                           int rs_errs,
                           int crc_status);
 
+// Push one signal-presence sample (called every audio chunk, typically
+// 10..50 Hz). ratio_db is monitor_squelch's instantaneous signal/noise
+// ratio; thresh_db is the gate-open threshold for visual context;
+// gate_open is non-zero when the squelch is currently passing audio.
+// First call switches on the activity ribbon at the bottom of the TUI;
+// receivers that don't track signal (rx_replay, plain rx_live) never
+// call this and the ribbon stays hidden.
+void rx_tui_observe_signal(double ratio_db, double thresh_db, int gate_open);
+
 // Pump input (q/Q -> quit requested, KEY_RESIZE -> redraw) and refresh
 // the display. Returns 1 if quit was requested, 0 otherwise. Cheap
 // enough to call every audio chunk.
