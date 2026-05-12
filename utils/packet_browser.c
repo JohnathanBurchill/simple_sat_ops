@@ -556,9 +556,6 @@ static void draw_list(int list_top, int list_h, int cols)
         if (is_sel) {
             if (g_have_color) attron(COLOR_PAIR(sel_pair));
             else              attron(A_REVERSE);
-            // Bold on every highlighted row — punchier against the
-            // white background and helps yellow stay legible.
-            attron(A_BOLD);
         } else if (has_err && g_have_color) {
             attron(COLOR_PAIR(PAIR_ERROR));
         } else if (color != 0) {
@@ -575,7 +572,6 @@ static void draw_list(int list_top, int list_h, int cols)
         addnstr(line, cols - 2);
 
         if (is_sel) {
-            attroff(A_BOLD);
             if (g_have_color) attroff(COLOR_PAIR(sel_pair));
             else              attroff(A_REVERSE);
         } else if (has_err && g_have_color) {
@@ -867,10 +863,10 @@ int main(int argc, char **argv)
         init_pair(PAIR_SEL,    COLOR_BLACK,  COLOR_WHITE);
         init_pair(PAIR_SEL_ERR,    COLOR_RED,     COLOR_WHITE);
         // Per-type selection pairs preserve the row's type-colour
-        // foreground while applying the highlight background. Yellow
-        // on white is the weakest pair contrast-wise; A_BOLD on
-        // selection (applied in draw_list) usually rescues it on
-        // terminals that render bold-yellow as bright orange.
+        // foreground while applying the highlight background. No
+        // A_BOLD on selection — bold cyan/yellow get rendered as
+        // their bright-palette siblings on many terminals, which
+        // wash out against the COLOR_WHITE (often light-gray) bg.
         init_pair(PAIR_SEL_BEACON, COLOR_CYAN,    COLOR_WHITE);
         init_pair(PAIR_SEL_TCMD,   COLOR_YELLOW,  COLOR_WHITE);
         init_pair(PAIR_SEL_LOG,    COLOR_GREEN,   COLOR_WHITE);
