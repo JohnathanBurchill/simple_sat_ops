@@ -300,7 +300,9 @@ static int json_get_string(const char *json, const char *key,
     int r = json_get_field(json, key, &is_str, &vs, &ve);
     if (r <= 0) return r;
     if (!is_str) return -1;
-    return json_unescape_into(vs, (size_t) (ve - vs), out, out_size);
+    if (json_unescape_into(vs, (size_t) (ve - vs), out, out_size) < 0)
+        return -1;
+    return 1;
 }
 
 static int json_get_int(const char *json, const char *key, long *out) {

@@ -839,20 +839,47 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
     g_viewer_has_state = 1;
 }
 
-// Count entries in the JSON roster array by counting `"user":`
-// occurrences. The roster is always emitted by sso_event_set_roster
-// with that exact key, and the events don't carry any other field
-// named "user" at the array-element level, so a substring count is
-// safe enough for a header line.
-static int viewer_roster_count(void)
+// Format the roster array into "alice,bob,carol" for the header bar,
+// skipping the operator (already shown separately) and any entry whose
+// user is empty. The roster JSON is built by sso_event_set_roster with
+// the schema [{"user":"...","role":"...","since":"..."},...], so we
+// can scan for "user":"..." and "role":"..." pairs.
+static void viewer_roster_users(char *out, size_t out_size)
 {
-    int n = 0;
+    if (out_size == 0) return;
+    out[0] = '\0';
     const char *p = g_viewer_roster_json;
-    while ((p = strstr(p, "\"user\"")) != NULL) {
-        n++;
-        p += 6;
+    size_t written = 0;
+    while ((p = strstr(p, "\"user\":\"")) != NULL) {
+        p += 8;
+        const char *uend = strchr(p, '"');
+        if (!uend) break;
+        char name[64];
+        size_t nlen = (size_t)(uend - p);
+        if (nlen >= sizeof name) nlen = sizeof name - 1;
+        memcpy(name, p, nlen);
+        name[nlen] = '\0';
+        const char *q = strstr(uend, "\"role\":\"");
+        const char *next = strstr(uend, "\"user\":\"");
+        // role must belong to this object (before the next "user")
+        int is_op = 0;
+        if (q && (!next || q < next)) {
+            q += 8;
+            const char *rend = strchr(q, '"');
+            if (rend && (size_t)(rend - q) == 8
+                && memcmp(q, "operator", 8) == 0) {
+                is_op = 1;
+            }
+        }
+        p = uend;
+        if (is_op || nlen == 0) continue;
+        size_t need = nlen + (written > 0 ? 1 : 0);
+        if (written + need + 1 >= out_size) break;
+        if (written > 0) out[written++] = ',';
+        memcpy(out + written, name, nlen);
+        written += nlen;
+        out[written] = '\0';
     }
-    return n;
 }
 
 static void viewer_render(int connected)
@@ -873,12 +900,13 @@ static void viewer_render(int connected)
                                     : (stale_s < 0 ? "WAITING"
                                                    : (stale_s > 5 ? "STALE"
                                                                   : "LIVE"));
-    int n_roster = viewer_roster_count();
+    char viewers[160];
+    viewer_roster_users(viewers, sizeof viewers);
     snprintf(head, sizeof head,
-             " VIEWER  operator=%s  status: %s  roster: %d ",
+             " VIEWER  operator=%s  status: %s  viewers: %s ",
              g_viewer_operator[0] ? g_viewer_operator : "?",
              status,
-             n_roster);
+             viewers[0] ? viewers : "(none)");
     int hlen = (int)strlen(head);
     if (hlen > cols) hlen = cols;
     mvaddnstr(0, 0, head, hlen);
