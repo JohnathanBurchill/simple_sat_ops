@@ -101,6 +101,7 @@ typedef struct {
     int    geom_range_valid, geom_range_rate_valid, geom_doppler_valid;
     double geom_az_deg, geom_el_deg;
     double geom_range_km, geom_range_rate_km_s, geom_doppler_hz;
+    char   session_dir[256];
     char summary[2048];
     int  payload_len_total;
     int  payload_len_preview;
@@ -135,6 +136,18 @@ static char    like_text[128] = "";
 static int     show_local_time = 0;
 
 static int     g_have_color = 0;
+// Toggled by `s`: when on, draw_detail adds a "station: ..." line for
+// satnogs rows, pulling station_lat/lng/alt out of the obs's
+// meta.json on demand. One-entry cache keyed by session_dir keeps the
+// fopen/parse off the hot path when the operator dwells on a row.
+static int     g_show_station = 0;
+static char    g_station_cache_dir[256] = "";
+static int     g_station_cache_ok = 0;
+static char    g_station_cache_name[64] = "";
+static int     g_station_cache_id = 0;
+static double  g_station_cache_lat = 0.0;
+static double  g_station_cache_lng = 0.0;
+static double  g_station_cache_alt = 0.0;
 enum {
     PAIR_BAR    = 1,
     PAIR_BEACON,
@@ -150,6 +163,102 @@ enum {
 static int starts_with(const char *s, const char *prefix)
 {
     return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+// Minimal JSON helpers — good enough for the flat top-level fields
+// of a SatNOGS observation detail JSON (station_lat, station_lng,
+// station_alt, station_name, ground_station). Naive strstr matching
+// works here because the keys aren't substrings of each other and the
+// JSON has no nested object that re-uses the same key names.
+static int json_extract_number(const char *json, const char *key,
+                               double *out)
+{
+    char needle[64];
+    int n = snprintf(needle, sizeof needle, "\"%s\"", key);
+    if (n < 0 || (size_t)n >= sizeof needle) return -1;
+    const char *p = strstr(json, needle);
+    if (p == NULL) return -1;
+    p += n;
+    while (*p == ' ' || *p == ':' || *p == '\t'
+        || *p == '\n' || *p == '\r') p++;
+    if (*p == '\0') return -1;
+    char *endp = NULL;
+    double v = strtod(p, &endp);
+    if (endp == p) return -1;
+    *out = v;
+    return 0;
+}
+
+static int json_extract_string(const char *json, const char *key,
+                               char *out, size_t cap)
+{
+    char needle[64];
+    int n = snprintf(needle, sizeof needle, "\"%s\"", key);
+    if (n < 0 || (size_t)n >= sizeof needle) return -1;
+    const char *p = strstr(json, needle);
+    if (p == NULL) return -1;
+    p += n;
+    while (*p == ' ' || *p == ':' || *p == '\t'
+        || *p == '\n' || *p == '\r') p++;
+    if (*p != '"') return -1;
+    p++;
+    size_t i = 0;
+    while (*p != '\0' && *p != '"' && i + 1 < cap) {
+        if (*p == '\\' && *(p + 1) != '\0') p++;
+        out[i++] = *p++;
+    }
+    out[i] = '\0';
+    return 0;
+}
+
+// Refresh g_station_cache_* for `session_dir` if it's not already
+// the cached entry. Returns 1 if the cache is populated and valid,
+// 0 otherwise (no meta.json, unparseable, or missing fields).
+static int station_cache_for(const char *session_dir)
+{
+    if (session_dir == NULL || session_dir[0] == '\0') return 0;
+    if (strcmp(g_station_cache_dir, session_dir) == 0) {
+        return g_station_cache_ok;
+    }
+    snprintf(g_station_cache_dir, sizeof g_station_cache_dir,
+             "%s", session_dir);
+    g_station_cache_ok = 0;
+
+    // Find the obs id from the session dir tail and assemble the
+    // meta.json filename satnogs_pull writes.
+    const char *base = strrchr(session_dir, '/');
+    base = base ? base + 1 : session_dir;
+    if (base[0] == '\0') return 0;
+
+    char meta[512];
+    int rc = snprintf(meta, sizeof meta, "%s/satnogs_%s.meta.json",
+                      session_dir, base);
+    if (rc < 0 || (size_t)rc >= sizeof meta) return 0;
+
+    FILE *f = fopen(meta, "rb");
+    if (f == NULL) return 0;
+    char buf[16384];
+    size_t got = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[got] = '\0';
+
+    double lat = 0.0, lng = 0.0, alt = 0.0, sid = 0.0;
+    if (json_extract_number(buf, "station_lat", &lat) != 0) return 0;
+    if (json_extract_number(buf, "station_lng", &lng) != 0) return 0;
+    if (json_extract_number(buf, "station_alt", &alt) != 0) return 0;
+    if (json_extract_number(buf, "ground_station", &sid) != 0) sid = 0.0;
+    if (json_extract_string(buf, "station_name",
+                            g_station_cache_name,
+                            sizeof g_station_cache_name) != 0) {
+        snprintf(g_station_cache_name,
+                 sizeof g_station_cache_name, "?");
+    }
+    g_station_cache_id  = (int)sid;
+    g_station_cache_lat = lat;
+    g_station_cache_lng = lng;
+    g_station_cache_alt = alt;
+    g_station_cache_ok  = 1;
+    return 1;
 }
 
 static const char *type_filter(void)
@@ -178,7 +287,7 @@ static void run_query(sqlite3 *db)
         "payload, golay_errs, rs_errs, hmac_ok, crc_status, "
         "source_tool, source_run, audio_offset_s, decoded_summary, "
         "capture_origin, az_deg, el_deg, range_km, range_rate_km_s, "
-        "doppler_hz_offset "
+        "doppler_hz_offset, session_dir "
         "FROM packet WHERE 1=1");
     int n_params = 0;
     const char *param_text[4] = {0};
@@ -252,6 +361,8 @@ static void run_query(sqlite3 *db)
         r->has_geom = r->geom_az_valid || r->geom_el_valid
                    || r->geom_range_valid || r->geom_range_rate_valid
                    || r->geom_doppler_valid;
+        const char *sd = (const char *)sqlite3_column_text(stmt, 26);
+        snprintf(r->session_dir, sizeof r->session_dir, "%s", sd ? sd : "");
 
         snprintf(r->ts,        sizeof r->ts,        "%s", ts ? ts : "");
         snprintf(r->satellite, sizeof r->satellite, "%s", sat ? sat : "");
@@ -529,6 +640,26 @@ static void draw_detail(int top_y, int height, int cols)
         mvaddnstr(y, 2, geom, cols - 2);
         y++;
     }
+    // station line — only when the operator toggled it on (`s`) and
+    // the row is a satnogs capture (others have no meta.json to read).
+    if (g_show_station && strcmp(r->origin, "satnogs") == 0) {
+        char st[256];
+        if (station_cache_for(r->session_dir)) {
+            snprintf(st, sizeof st,
+                     "station: %s (id=%d) lat=%.4f° lng=%.4f° alt=%dm",
+                     g_station_cache_name[0] ? g_station_cache_name : "?",
+                     g_station_cache_id,
+                     g_station_cache_lat, g_station_cache_lng,
+                     (int)g_station_cache_alt);
+        } else {
+            snprintf(st, sizeof st,
+                     "station: (no meta.json under %s)",
+                     r->session_dir[0] ? r->session_dir : "?");
+        }
+        move(y, 0); clrtoeol();
+        mvaddnstr(y, 2, st, cols - 2);
+        y++;
+    }
 
     // Decoded body, line by line.
     const char *p = r->summary;
@@ -650,7 +781,10 @@ static void usage(FILE *out, const char *argv0)
         "                   → satnogs → all)\n"
         "  /                start a substring search against the firmware-\n"
         "                   interpreted text. Enter applies, Esc cancels.\n"
-        "  L                toggle timestamp display: UTC (storage) ↔ local\n"
+        "  l                toggle timestamp display: UTC (storage) ↔ local\n"
+        "  s                toggle the recording-station summary in the\n"
+        "                   detail panel (satnogs rows only; the values\n"
+        "                   come from <session>/satnogs_<id>.meta.json).\n"
         "\n"
         "Options:\n"
         "  --db=<path>      override default DB path. Default:\n"
@@ -832,6 +966,9 @@ int main(int argc, char **argv)
                 break;
             case 'l':
                 show_local_time = !show_local_time;
+                break;
+            case 's':
+                g_show_station = !g_show_station;
                 break;
             case 'L': {  // bottom of viewport (vim convention)
                 int data_h = list_h - 1;
