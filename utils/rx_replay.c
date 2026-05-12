@@ -146,12 +146,9 @@ static int read_tle_lines(const char *path, const char *sat_prefix,
 // If the input file's directory contains exactly one *.tle file,
 // return its absolute-or-relative path in `out`. Returns 0 on hit, -1
 // on zero or multiple matches.
-static int autodiscover_tle(const char *input_path, char *out, size_t outn)
+static int autodiscover_tle_in_dir(const char *dir, char *out, size_t outn)
 {
-    if (input_path == NULL) return -1;
-    char buf[1024];
-    snprintf(buf, sizeof buf, "%s", input_path);
-    const char *dir = dirname(buf);
+    if (dir == NULL) return -1;
     DIR *d = opendir(dir);
     if (d == NULL) return -1;
     struct dirent *de;
@@ -605,12 +602,23 @@ int main(int argc, char **argv)
     // duplicate rx_replay rows in the DB.
     decode_loop_set_packet_db(update_mode ? NULL : db, "rx_replay", db_run_id);
 
-    // Auto-discover TLE in the input file's directory if --tle wasn't
-    // given. Single-TLE-per-folder is the b210_rx_live convention so
-    // this Just Works on a captured pass folder.
+    // Auto-discover TLE in the pass folder if --tle wasn't given.
+    // Prefer --session-dir when the caller set it (decode_passes.sh
+    // does, even when the input file is a temp WAV from an ogg
+    // conversion that sits in /tmp), and fall back to the input file's
+    // own directory for the b210_rx_live single-TLE-per-folder layout.
     char tle_path_buf[1024];
+    char search_dir_buf[1024];
+    const char *search_dir;
+    if (session_dir_arg != NULL) {
+        search_dir = session_dir_arg;
+    } else {
+        snprintf(search_dir_buf, sizeof search_dir_buf, "%s", input_path);
+        search_dir = dirname(search_dir_buf);
+    }
     if (tle_path == NULL && db != NULL) {
-        if (autodiscover_tle(input_path, tle_path_buf, sizeof tle_path_buf) == 0) {
+        if (autodiscover_tle_in_dir(search_dir, tle_path_buf,
+                                    sizeof tle_path_buf) == 0) {
             tle_path = tle_path_buf;
             fprintf(stderr, "rx_replay: auto-discovered TLE %s\n", tle_path);
         }
