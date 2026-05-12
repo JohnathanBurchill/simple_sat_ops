@@ -97,6 +97,12 @@ static double g_last_state_az        = 0.0;
 static double g_last_state_el        = 0.0;
 static long   g_last_state_freq_hz   = 0;
 static double g_last_state_doppler   = 0.0;
+static char   g_last_state_tle[256]  = "";
+static double g_last_state_tgt_az    = 0.0;
+static double g_last_state_tgt_el    = 0.0;
+static int    g_last_state_flip      = 0;
+static int    g_last_state_in_pass   = 0;
+static int    g_last_state_tracking  = 0;
 
 static void ipc_broadcast_state(state_t *s,
                                   double az, double el,
@@ -122,6 +128,15 @@ static void ipc_broadcast_state(state_t *s,
         snprintf(evt.pass_folder, sizeof(evt.pass_folder), "%s",
                  g_pass_folder);
     }
+    if (s->prediction.tles_filename) {
+        snprintf(evt.tle_path, sizeof(evt.tle_path), "%s",
+                 s->prediction.tles_filename);
+    }
+    evt.target_az = s->antenna_rotator.target_azimuth;
+    evt.target_el = s->antenna_rotator.target_elevation;
+    evt.flip      = s->antenna_rotator.flip_mode_pass;
+    evt.in_pass   = s->in_pass;
+    evt.tracking  = s->antenna_rotator.tracking;
     sso_roster_entry_t entries[SSO_IPC_MAX_CLIENTS_FOR_ROSTER];
     size_t n = 0;
     if (n < sizeof(entries) / sizeof(entries[0])) {
@@ -155,10 +170,16 @@ static void ipc_broadcast_state(state_t *s,
     // Cache for WELCOME replies so a viewer doesn't have to wait for
     // the next periodic broadcast to see anything.
     snprintf(g_last_state_sat, sizeof g_last_state_sat, "%s", evt.satellite);
+    snprintf(g_last_state_tle, sizeof g_last_state_tle, "%s", evt.tle_path);
     g_last_state_az      = evt.az;
     g_last_state_el      = evt.el;
     g_last_state_freq_hz = evt.freq_hz;
     g_last_state_doppler = evt.doppler_hz;
+    g_last_state_tgt_az  = evt.target_az;
+    g_last_state_tgt_el  = evt.target_el;
+    g_last_state_flip    = evt.flip;
+    g_last_state_in_pass = evt.in_pass;
+    g_last_state_tracking= evt.tracking;
     g_last_state_valid   = 1;
 }
 
@@ -180,10 +201,17 @@ static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
         welcome.has_state   = 1;
         snprintf(welcome.satellite, sizeof welcome.satellite,
                  "%s", g_last_state_sat);
+        snprintf(welcome.tle_path, sizeof welcome.tle_path,
+                 "%s", g_last_state_tle);
         welcome.az          = g_last_state_az;
         welcome.el          = g_last_state_el;
         welcome.freq_hz     = g_last_state_freq_hz;
         welcome.doppler_hz  = g_last_state_doppler;
+        welcome.target_az   = g_last_state_tgt_az;
+        welcome.target_el   = g_last_state_tgt_el;
+        welcome.flip        = g_last_state_flip;
+        welcome.in_pass     = g_last_state_in_pass;
+        welcome.tracking    = g_last_state_tracking;
         // Roster — operator first, then the existing clients we know
         // of. The newly-connecting client is already in the slot table
         // (slot_dispatch_line ran first) but its role isn't populated
@@ -683,73 +711,107 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
     *print_row = row;
 }
 
-void report_status(state_t *state, int *print_row, int print_col)
+// Render the operator/carrier/rotator status block. Caller supplies
+// the values so this function works for both the operator (who reads
+// the rotator from hardware) and the viewer (who pulls them from the
+// IPC broadcast).
+typedef struct {
+    int    control_mode;     // 1 = "OPERATOR <user>"; 0 = viewer header
+    const  char *operator_user;
+    size_t n_viewers;
+    double carrier_hz;
+    int    have_rotator;     // 1 -> render az/el block; 0 -> "not initialized"
+    double current_az;
+    double current_el;
+    double target_az;
+    double target_el;
+    int    flip;
+    const  char *viewer_user;  // viewer-only: name of this viewer
+} status_panel_t;
+
+static void render_status_panel(const status_panel_t *p,
+                                int *print_row, int print_col)
 {
-    if (print_row == NULL) {
-        return;
-    }
+    if (print_row == NULL) return;
     int row = *print_row;
     int col = print_col;
 
-    // Header line: operator + viewer count (replaces the old radio status).
-    if (g_control_mode) {
-        size_t nc = sso_ipc_server_client_count(g_ipc);
+    if (p->control_mode) {
         mvprintw(0, 0, "%-15s %s   viewers: %zu",
                  "OPERATOR",
-                 g_operator_user ? g_operator_user : "?",
-                 nc);
-        clrtoeol();
+                 p->operator_user ? p->operator_user : "?",
+                 p->n_viewers);
     } else {
-        mvprintw(0, 0, "%-15s %s (no --control)", "OPERATOR",
-                 g_operator_user ? g_operator_user : "?");
-        clrtoeol();
+        mvprintw(0, 0, "%-15s %s   viewing as: %s",
+                 "OPERATOR",
+                 p->operator_user ? p->operator_user : "?",
+                 p->viewer_user ? p->viewer_user : "?");
     }
+    clrtoeol();
 
-    // Doppler-shifted display freqs (carrier the simplex link is on).
-    double display_dl_hz = state->doppler_downlink_frequency_hz;
-    if (display_dl_hz == 0.0) display_dl_hz = state->nominal_downlink_frequency_hz;
-    mvprintw(row++, col, "%15s   %.6f MHz", "CARRIER",
-             display_dl_hz / 1e6);
+    mvprintw(row++, col, "%15s   %.6f MHz", "CARRIER", p->carrier_hz / 1e6);
     clrtoeol();
     row++;
 
-    if (state->have_antenna_rotator) {
-        double azimuth = 0.0;
-        double elevation = 0.0;
-        if (antenna_rotator_command(&state->antenna_rotator,
-                                    ANTENNA_ROTATOR_STATUS,
-                                    &azimuth, &elevation) == ANTENNA_ROTATOR_OK) {
-            state->antenna_rotator.azimuth = azimuth;
-            state->antenna_rotator.elevation = elevation;
-        } else {
-            azimuth = state->antenna_rotator.azimuth;
-            elevation = state->antenna_rotator.elevation;
-        }
-        double az_display = azimuth;
-        if (az_display < 0) {
-            az_display += 360.0;
-        }
-        double target_az_display = state->antenna_rotator.target_azimuth;
-        if (target_az_display < 0) {
-            target_az_display += 360.0;
-        }
-        const char *flip_tag = state->antenna_rotator.flip_mode_pass ? " (flip)" : "";
+    if (p->have_rotator) {
+        double az_display = p->current_az;
+        if (az_display < 0) az_display += 360.0;
+        double target_az_display = p->target_az;
+        if (target_az_display < 0) target_az_display += 360.0;
+        const char *flip_tag = p->flip ? " (flip)" : "";
         mvprintw(row++, col, "%15s   %.1f deg%s", "target azimuth",
                  target_az_display, flip_tag);
         clrtoeol();
         mvprintw(row++, col, "%15s   %.1f deg", "azimuth", az_display);
         clrtoeol();
         mvprintw(row++, col, "%15s   %.1f deg%s", "target elevation",
-                 state->antenna_rotator.target_elevation, flip_tag);
+                 p->target_el, flip_tag);
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.1f deg", "elevation", elevation);
+        mvprintw(row++, col, "%15s   %.1f deg", "elevation", p->current_el);
         clrtoeol();
     } else {
-        mvprintw(row++, col, "%15s   %s", "antenna rotator", "* not initialized *");
+        mvprintw(row++, col, "%15s   %s",
+                 "antenna rotator", "* not initialized *");
         clrtoeol();
     }
 
     *print_row = row;
+}
+
+void report_status(state_t *state, int *print_row, int print_col)
+{
+    if (print_row == NULL) return;
+
+    status_panel_t p;
+    memset(&p, 0, sizeof p);
+    p.control_mode  = g_control_mode;
+    p.operator_user = g_operator_user;
+    p.n_viewers     = g_control_mode ? sso_ipc_server_client_count(g_ipc) : 0;
+
+    double display_dl_hz = state->doppler_downlink_frequency_hz;
+    if (display_dl_hz == 0.0) display_dl_hz = state->nominal_downlink_frequency_hz;
+    p.carrier_hz = display_dl_hz;
+
+    p.have_rotator = state->have_antenna_rotator;
+    if (state->have_antenna_rotator) {
+        double azimuth = 0.0, elevation = 0.0;
+        if (antenna_rotator_command(&state->antenna_rotator,
+                                    ANTENNA_ROTATOR_STATUS,
+                                    &azimuth, &elevation) == ANTENNA_ROTATOR_OK) {
+            state->antenna_rotator.azimuth   = azimuth;
+            state->antenna_rotator.elevation = elevation;
+        } else {
+            azimuth   = state->antenna_rotator.azimuth;
+            elevation = state->antenna_rotator.elevation;
+        }
+        p.current_az = azimuth;
+        p.current_el = elevation;
+        p.target_az  = state->antenna_rotator.target_azimuth;
+        p.target_el  = state->antenna_rotator.target_elevation;
+        p.flip       = state->antenna_rotator.flip_mode_pass;
+    }
+
+    render_status_panel(&p, print_row, print_col);
 }
 
 void report_position(state_t *state, int *print_row, int print_col)
@@ -790,22 +852,35 @@ void report_position(state_t *state, int *print_row, int print_col)
 
 // --- Viewer mode --------------------------------------------------
 //
-// Read-only mirror of the operator instance: connects to the
-// sso_ipc socket as a viewer, stashes the latest STATE event from
-// the operator, and renders a small ncurses panel. No hardware,
-// no SGP4, no rotator — every value on screen comes from the
-// operator's broadcast.
+// Read-only mirror of the operator instance. The viewer keeps its own
+// state_t and runs SGP4 locally against the TLE the operator is using
+// (broadcast as `tle_path`), so it can render the same prediction +
+// position panels as the operator. Hardware-specific values
+// (current/target azimuth and elevation, in-pass flag, tracking flag,
+// carrier frequency) come from the broadcast — viewer has no rotator
+// or radio of its own.
 
-static int    g_viewer_has_state = 0;
+static int    g_viewer_has_state          = 0;
 static char   g_viewer_sat[64]            = "";
 static double g_viewer_az                 = 0.0;
 static double g_viewer_el                 = 0.0;
 static long   g_viewer_freq_hz            = 0;
 static double g_viewer_doppler_hz         = 0.0;
+static double g_viewer_target_az          = 0.0;
+static double g_viewer_target_el          = 0.0;
+static int    g_viewer_flip               = 0;
+static int    g_viewer_in_pass            = 0;
+static int    g_viewer_tracking           = 0;
+static char   g_viewer_tle_path[256]      = "";
 static char   g_viewer_operator[64]       = "";
 static char   g_viewer_roster_json[1024]  = "";
 static time_t g_viewer_last_event         = 0;
 static int    g_viewer_running            = 1;
+// state_t the viewer drives with its local SGP4. Lives across renders
+// so we can re-run update_satellite_position each tick.
+static state_t g_viewer_state;
+static int     g_viewer_tle_loaded        = 0;
+static char    g_viewer_loaded_tle[256]   = "";
 
 static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
                             void *user)
@@ -815,13 +890,7 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
     if (evt->type != SSO_EVT_STATE && evt->type != SSO_EVT_WELCOME) {
         return;
     }
-    // Stamp last-event on any operator message, so STALE / LIVE means
-    // what it says (otherwise we'd stay "LIVE" forever even with no
-    // traffic, since stale_s is -1 when has_state is 0).
     g_viewer_last_event = time(NULL);
-    // Operator identity is in every WELCOME and STATE, regardless of
-    // whether the event carries the live state snapshot — pick it up
-    // even from a state-less WELCOME so the header bar stops showing "?".
     if (evt->operator_user[0]) {
         snprintf(g_viewer_operator, sizeof g_viewer_operator, "%s",
                  evt->operator_user);
@@ -832,11 +901,42 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
     }
     if (!evt->has_state) return;
     snprintf(g_viewer_sat, sizeof g_viewer_sat, "%s", evt->satellite);
-    g_viewer_az = evt->az;
-    g_viewer_el = evt->el;
-    g_viewer_freq_hz = evt->freq_hz;
-    g_viewer_doppler_hz = evt->doppler_hz;
+    g_viewer_az          = evt->az;
+    g_viewer_el          = evt->el;
+    g_viewer_freq_hz     = evt->freq_hz;
+    g_viewer_doppler_hz  = evt->doppler_hz;
+    g_viewer_target_az   = evt->target_az;
+    g_viewer_target_el   = evt->target_el;
+    g_viewer_flip        = evt->flip;
+    g_viewer_in_pass     = evt->in_pass;
+    g_viewer_tracking    = evt->tracking;
+    if (evt->tle_path[0]) {
+        snprintf(g_viewer_tle_path, sizeof g_viewer_tle_path, "%s",
+                 evt->tle_path);
+    }
     g_viewer_has_state = 1;
+}
+
+// Load (or reload, if the operator switched TLEs) the broadcast TLE
+// into the viewer's state. Returns 1 if the local state now has a
+// valid TLE to propagate, 0 otherwise.
+static int viewer_ensure_tle_loaded(void)
+{
+    if (!g_viewer_tle_path[0]) return g_viewer_tle_loaded;
+    if (g_viewer_tle_loaded
+        && strcmp(g_viewer_tle_path, g_viewer_loaded_tle) == 0) {
+        return 1;
+    }
+    if (!g_viewer_sat[0]) return g_viewer_tle_loaded;
+    g_viewer_state.prediction.tles_filename = g_viewer_tle_path;
+    g_viewer_state.prediction.satellite_ephem.name = g_viewer_sat;
+    if (load_tle(&g_viewer_state.prediction) != 0) return 0;
+    ClearFlag(ALL_FLAGS);
+    select_ephemeris(&g_viewer_state.prediction.satellite_ephem.tle);
+    snprintf(g_viewer_loaded_tle, sizeof g_viewer_loaded_tle, "%s",
+             g_viewer_tle_path);
+    g_viewer_tle_loaded = 1;
+    return 1;
 }
 
 // Format the roster array into "alice,bob,carol" for the header bar,
@@ -882,16 +982,64 @@ static void viewer_roster_users(char *out, size_t out_size)
     }
 }
 
-static void viewer_render(int connected)
+static void viewer_render(int connected, const char *viewer_user)
 {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
     (void) rows;
     erase();
 
-    // Top bar — reverse video, matches the operator's "OPERATOR ..." bar.
+    int row = 1, col = 1;
+    int have_tle = viewer_ensure_tle_loaded();
+
+    // Drive local SGP4 against the operator's TLE — same code path the
+    // operator's loop runs, so report_predictions / report_position
+    // render identical values.
+    struct tm utc;
+    struct timeval tv;
+    UTC_Calendar_Now(&utc, &tv);
+    double jul_utc = Julian_Date(&utc, &tv);
+    if (have_tle) {
+        update_satellite_position(&g_viewer_state.prediction, jul_utc);
+        g_viewer_state.in_pass = g_viewer_in_pass;
+        g_viewer_state.antenna_rotator.tracking = g_viewer_tracking;
+        report_predictions(&g_viewer_state, jul_utc, &row, col);
+    } else {
+        mvprintw(row++, col, "(waiting for TLE path from operator...)");
+    }
+
+    // Status panel: pull rotator + carrier from the broadcast (the
+    // viewer has no hardware), reusing the same renderer the operator
+    // calls so the layout matches.
+    int srow = row + 1;
+    double display_dl_hz = g_viewer_doppler_hz != 0.0
+        ? (double)g_viewer_freq_hz + g_viewer_doppler_hz
+        : (double)g_viewer_freq_hz;
+    int have_rotator_data = g_viewer_has_state
+        && (g_viewer_az != 0.0 || g_viewer_el != 0.0
+            || g_viewer_target_az != 0.0 || g_viewer_target_el != 0.0);
+    status_panel_t sp;
+    memset(&sp, 0, sizeof sp);
+    sp.control_mode  = 0;
+    sp.operator_user = g_viewer_operator;
+    sp.viewer_user   = viewer_user;
+    sp.carrier_hz    = display_dl_hz;
+    sp.have_rotator  = have_rotator_data;
+    sp.current_az    = g_viewer_az;
+    sp.current_el    = g_viewer_el;
+    sp.target_az     = g_viewer_target_az;
+    sp.target_el     = g_viewer_target_el;
+    sp.flip          = g_viewer_flip;
+    render_status_panel(&sp, &srow, col);
+
+    if (have_tle) {
+        int prow = 5;
+        report_position(&g_viewer_state, &prow, 50);
+    }
+
+    // Footer: connection status + viewers + quit hint.
     attron(A_REVERSE);
-    char head[512];
+    char foot[512];
     time_t now = time(NULL);
     long stale_s = g_viewer_last_event > 0
         ? (long)(now - g_viewer_last_event)
@@ -902,39 +1050,10 @@ static void viewer_render(int connected)
                                                                   : "LIVE"));
     char viewers[160];
     viewer_roster_users(viewers, sizeof viewers);
-    snprintf(head, sizeof head,
-             " VIEWER  operator=%s  status: %s  viewers: %s ",
-             g_viewer_operator[0] ? g_viewer_operator : "?",
+    snprintf(foot, sizeof foot,
+             " %s   viewers: %s     q : quit ",
              status,
              viewers[0] ? viewers : "(none)");
-    int hlen = (int)strlen(head);
-    if (hlen > cols) hlen = cols;
-    mvaddnstr(0, 0, head, hlen);
-    for (int i = hlen; i < cols; i++) mvaddch(0, i, ' ');
-    attroff(A_REVERSE);
-
-    int row = 2, col = 2;
-    if (!g_viewer_has_state) {
-        mvprintw(row++, col, "(waiting for state from the operator...)");
-    } else {
-        mvprintw(row++, col, "%15s   %s", "satellite",
-                 g_viewer_sat[0] ? g_viewer_sat : "?");
-        mvprintw(row++, col, "%15s   %.2f deg", "azimuth", g_viewer_az);
-        mvprintw(row++, col, "%15s   %.2f deg", "elevation", g_viewer_el);
-        mvprintw(row++, col, "%15s   %.6f MHz",
-                 "downlink", g_viewer_freq_hz / 1.0e6);
-        mvprintw(row++, col, "%15s   %+.0f Hz",
-                 "doppler", g_viewer_doppler_hz);
-        if (stale_s >= 0) {
-            mvprintw(row++, col, "%15s   %lds",
-                     "last event", stale_s);
-        }
-    }
-
-    // Footer bar — key hints, reverse video.
-    attron(A_REVERSE);
-    char foot[80];
-    snprintf(foot, sizeof foot, " q : quit ");
     int flen = (int)strlen(foot);
     if (flen > cols) flen = cols;
     mvaddnstr(LINES - 1, 0, foot, flen);
@@ -955,17 +1074,25 @@ static int run_viewer(void)
     }
     sso_ipc_client_on_event(cli, viewer_on_event, NULL);
 
-    // Announce ourselves as a viewer so the operator's roster line
-    // counts us. The HELLO event is otherwise informational; the
-    // operator's ipc_on_event replies with a WELCOME carrying the
-    // current state snapshot.
+    // Mirror the operator's observer + nominal frequencies so
+    // local SGP4 + the rendered status block use the same constants.
+    memset(&g_viewer_state, 0, sizeof g_viewer_state);
+    g_viewer_state.prediction.observer_ephem.position_geodetic.lat =
+        RAO_LATITUDE * M_PI / 180.0;
+    g_viewer_state.prediction.observer_ephem.position_geodetic.lon =
+        RAO_LONGITUDE * M_PI / 180.0;
+    g_viewer_state.prediction.observer_ephem.position_geodetic.alt =
+        RAO_ALTITUDE / 1000.0;
+    g_viewer_state.nominal_uplink_frequency_hz   = UPLINK_FREQ_MHZ * 1e6;
+    g_viewer_state.nominal_downlink_frequency_hz = DOWNLINK_FREQ_MHZ * 1e6;
+    g_viewer_state.prediction.predicted_max_elevation = -180.0;
+
     sso_event_t hello;
     sso_event_init(&hello, SSO_EVT_HELLO);
     snprintf(hello.role, sizeof hello.role, "viewer");
     const char *me = getenv("USER");
-    if (me && me[0]) {
-        snprintf(hello.user, sizeof hello.user, "%s", me);
-    }
+    if (!me || !me[0]) me = sso_unix_user();
+    snprintf(hello.user, sizeof hello.user, "%s", me ? me : "?");
     char buf[1024];
     if (sso_event_encode(&hello, buf, sizeof buf) == 0) {
         sso_ipc_client_send(cli, buf);
@@ -976,7 +1103,7 @@ static int run_viewer(void)
         int rc = sso_ipc_client_step(cli, 100);
         if (rc < 0) break;
         int connected = sso_ipc_client_is_connected(cli);
-        viewer_render(connected);
+        viewer_render(connected, me ? me : "?");
         int key = getch();
         if (key == 'q' || key == 'Q' || key == 27 /* Esc */) {
             g_viewer_running = 0;

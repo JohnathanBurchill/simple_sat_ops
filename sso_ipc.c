@@ -451,6 +451,18 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
         }
         if (json_field_str(&p, end, &first, "rx_status", evt->rx_status) < 0) return -1;
         if (json_field_str(&p, end, &first, "tx_status", evt->tx_status) < 0) return -1;
+        if (json_field_str(&p, end, &first, "tle_path", evt->tle_path) < 0) return -1;
+        if (json_field_double(&p, end, &first, "target_az", evt->target_az) < 0) return -1;
+        if (json_field_double(&p, end, &first, "target_el", evt->target_el) < 0) return -1;
+        if (evt->flip) {
+            if (json_field_bool(&p, end, &first, "flip", 1) < 0) return -1;
+        }
+        if (evt->in_pass) {
+            if (json_field_bool(&p, end, &first, "in_pass", 1) < 0) return -1;
+        }
+        if (evt->tracking) {
+            if (json_field_bool(&p, end, &first, "tracking", 1) < 0) return -1;
+        }
         if (evt->roster_json[0]) {
             if (json_field_raw(&p, end, &first, "roster", evt->roster_json) < 0) return -1;
         }
@@ -503,6 +515,13 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
     if (json_get_double(line, "doppler", &evt->doppler_hz) > 0) evt->has_state = 1;
     if (json_get_string(line, "rx_status", evt->rx_status, sizeof(evt->rx_status)) > 0) evt->has_state = 1;
     if (json_get_string(line, "tx_status", evt->tx_status, sizeof(evt->tx_status)) > 0) evt->has_state = 1;
+    if (json_get_string(line, "tle_path", evt->tle_path, sizeof(evt->tle_path)) > 0) evt->has_state = 1;
+    if (json_get_double(line, "target_az", &evt->target_az) > 0) evt->has_state = 1;
+    if (json_get_double(line, "target_el", &evt->target_el) > 0) evt->has_state = 1;
+    int flag = 0;
+    if (json_get_bool(line, "flip",     &flag) > 0) evt->flip = flag;
+    if (json_get_bool(line, "in_pass",  &flag) > 0) evt->in_pass = flag;
+    if (json_get_bool(line, "tracking", &flag) > 0) evt->tracking = flag;
     if (json_get_raw(line, "roster", evt->roster_json, sizeof(evt->roster_json)) > 0) {
         evt->has_state = 1;
     }

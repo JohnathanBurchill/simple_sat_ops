@@ -58,12 +58,18 @@ typedef struct {
     // state snapshot (also embedded in welcome)
     int has_state;
     char satellite[64];
-    double az, el;
+    double az, el;         // current rotator az/el (hardware-reported)
     long freq_hz;
     double doppler_hz;
     char rx_status[160];
     char tx_status[160];
     char roster_json[1024];  // serialized array of {user,role,since}
+    char tle_path[256];      // operator's active TLE file (viewer mirrors)
+    double target_az;        // commanded rotator target
+    double target_el;
+    int flip;                // flip_mode_pass
+    int in_pass;
+    int tracking;
 
     // rx-stats
     double snr_db;
