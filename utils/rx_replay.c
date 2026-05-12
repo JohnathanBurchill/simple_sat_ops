@@ -873,6 +873,30 @@ int main(int argc, char **argv)
                 range_rate_km_s = pred.satellite_ephem.range_rate_km_s;
                 doppler_hz = nominal_freq_hz
                            * (-range_rate_km_s / 299792.458);
+                // Plausibility gate. SGP4 occasionally diverges (very
+                // stale TLE, mode-flip near the deep-space boundary,
+                // etc.) and emits range values like 1e17 km. Drop the
+                // whole geometry row in that case so packet_browser
+                // doesn't show garbage; lunar distance (~400 000 km)
+                // is a comfortable upper bound for the Earth-orbit
+                // satellites this stack tracks. Comparisons against
+                // NaN are always false, so an already-NaN result
+                // (no_observer, or no TLE) is left alone.
+                int finite_ok = isfinite(az_deg) && isfinite(el_deg)
+                             && isfinite(range_km)
+                             && isfinite(range_rate_km_s)
+                             && isfinite(doppler_hz);
+                int bounds_ok = (range_km >= 0.0 && range_km < 5.0e5)
+                             && (el_deg >= -90.0 && el_deg <= 90.0)
+                             && (az_deg >= -360.0 && az_deg <= 720.0);
+                if (!finite_ok || !bounds_ok) {
+                    fprintf(stderr,
+                        "rx_replay: implausible geometry (az=%.2f "
+                        "el=%.2f range=%.1f rate=%.3f) — dropping\n",
+                        az_deg, el_deg, range_km, range_rate_km_s);
+                    az_deg = el_deg = range_km = (0.0/0.0);
+                    range_rate_km_s = doppler_hz = (0.0/0.0);
+                }
             }
 #endif
             decode_loop_set_observer(az_deg, el_deg, range_km,
