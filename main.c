@@ -322,14 +322,20 @@ static void setup_pass_folder(state_t *state, double jul_utc_now)
     minutes_until_visible(&state->prediction, jul_utc_now,
                           jul_utc_now + MAX_MINUTES_TO_PREDICT / 1440.0,
                           1.0);
-    double aos_jul = state->prediction.predicted_ascension_jul_utc;
-    if (!(aos_jul > 0.0)) {
+    // minutes_until_visible sets predicted_minutes_until_visible and
+    // uses -9999.0 as the "no AOS in this window" sentinel. Positive
+    // values are minutes until AOS; negatives are minutes since AOS
+    // when we started mid-pass — either way (now + N) lands on the
+    // current pass's AOS, which is what we want for the folder name.
+    double minutes = state->prediction.predicted_minutes_until_visible;
+    if (minutes <= -9000.0) {
         fprintf(stderr,
                 "simple_sat_ops: no AOS in the next %d minutes — "
                 "pass folder not created\n",
                 MAX_MINUTES_TO_PREDICT);
         return;
     }
+    double aos_jul = jul_utc_now + minutes / 1440.0;
     time_t aos = jul_to_unix(aos_jul);
     struct tm aos_local;
     localtime_r(&aos, &aos_local);
