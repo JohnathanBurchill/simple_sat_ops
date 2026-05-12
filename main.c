@@ -406,8 +406,8 @@ void usage(FILE *dest, const char *name, int full)
         "  %s --control                 Operator: opens the sso_ipc server,\n"
         "                               drives the rotator. With no\n"
         "                               <satellite_id>, the newest *.tle under\n"
-        "                               /FrontierSat/TLEs/ is copied to the\n"
-        "                               active.tle slot and tracked.\n"
+        "                               /FrontierSat/TLEs/ is loaded directly\n"
+        "                               and pinned into the pass folder.\n"
         "  %s <satellite_id>            Standalone tracker (legacy / dev).\n"
         "  %s                           No args: connects to the running\n"
         "                               operator and shows its state\n"
@@ -1489,12 +1489,13 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         site_altitude / 1000.0;
 
     // --control with no positional: auto-discover the newest TLE
-    // under /FrontierSat/TLEs/, copy it to the per-user active.tle
-    // slot, and read the satellite name out of it.
+    // under /FrontierSat/TLEs/ and load it directly. setup_pass_folder
+    // pins this source file (under its original tle-YYYYMMDD.tle name)
+    // into the pass folder once AOS is known.
     if (n_positional == 0 && g_control_mode) {
         if (state->prediction.tles_filename == NULL) {
             const char *tles_root = sso_tles_dir();
-            char src_tle[1024];
+            static char src_tle[1024];
             time_t src_mtime = 0;
             if (find_newest_tle_recursive(tles_root, src_tle, sizeof src_tle,
                                           &src_mtime) != 0) {
@@ -1504,21 +1505,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                     "(or pass --tle=<path>).\n", tles_root);
                 return EXIT_FAILURE;
             }
-            static char active_tle[1024];
-            if (tle_default_path(active_tle, sizeof active_tle) != 0) {
-                fprintf(stderr,
-                    "HOME unset or path too long; pass --tle=<path>\n");
-                return EXIT_FAILURE;
-            }
-            if (copy_file(src_tle, active_tle) != 0) {
-                fprintf(stderr,
-                    "simple_sat_ops: copy %s -> %s failed: %s\n",
-                    src_tle, active_tle, strerror(errno));
-                return EXIT_FAILURE;
-            }
-            fprintf(stderr, "simple_sat_ops: promoted %s -> %s\n",
-                    src_tle, active_tle);
-            state->prediction.tles_filename = active_tle;
+            fprintf(stderr, "simple_sat_ops: using TLE %s\n", src_tle);
+            state->prediction.tles_filename = src_tle;
         }
         static char sat_name[64];
         if (read_tle_name(state->prediction.tles_filename,
