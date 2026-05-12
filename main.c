@@ -28,11 +28,15 @@
 #include "sso_paths.h"
 
 #include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
 #include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 #include <ncurses.h>
 #include <unistd.h>
@@ -153,12 +157,125 @@ int  point_to_stationary_target(state_t *state, double azimuth, double elevation
 void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, double downlink_freq);
 int  apply_args(state_t *state, int argc, char **argv, double jul_utc);
 
+// --- TLE auto-discovery helpers (used by --control with no
+//     positional satellite name) ------------------------------------
+
+// Recursively scan `dir` for *.tle files, return the path with the
+// newest mtime via out_path. Returns 0 on success, -1 if dir is
+// unreadable or no .tle file exists in the tree. Caller-allocated
+// buffer must be at least PATH_MAX-ish.
+static int find_newest_tle_recursive(const char *dir,
+                                     char *out_path, size_t out_cap,
+                                     time_t *out_mtime)
+{
+    DIR *d = opendir(dir);
+    if (d == NULL) return -1;
+    int found = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char child[1024];
+        int n = snprintf(child, sizeof child, "%s/%s", dir, de->d_name);
+        if (n < 0 || (size_t)n >= sizeof child) continue;
+        struct stat st;
+        if (stat(child, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            char nested[1024];
+            time_t nested_mtime = 0;
+            if (find_newest_tle_recursive(child, nested, sizeof nested,
+                                          &nested_mtime) == 0) {
+                if (!found || nested_mtime > *out_mtime) {
+                    snprintf(out_path, out_cap, "%s", nested);
+                    *out_mtime = nested_mtime;
+                    found = 1;
+                }
+            }
+        } else if (S_ISREG(st.st_mode)) {
+            size_t nlen = strlen(de->d_name);
+            if (nlen < 4) continue;
+            if (strcmp(de->d_name + nlen - 4, ".tle") != 0) continue;
+            if (!found || st.st_mtime > *out_mtime) {
+                snprintf(out_path, out_cap, "%s", child);
+                *out_mtime = st.st_mtime;
+                found = 1;
+            }
+        }
+    }
+    closedir(d);
+    return found ? 0 : -1;
+}
+
+// Pull the satellite name out of a 3-line TLE — the first non-blank
+// line that doesn't begin with "1 " or "2 ". Trims trailing
+// whitespace. Returns 0 on success, -1 if the file is unreadable or
+// has no name line.
+static int read_tle_name(const char *tle_path,
+                         char *out_name, size_t out_cap)
+{
+    FILE *f = fopen(tle_path, "r");
+    if (f == NULL) return -1;
+    char line[256];
+    int rc = -1;
+    while (fgets(line, sizeof line, f) != NULL) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'
+                      || line[n - 1] == ' '  || line[n - 1] == '\t')) {
+            line[--n] = '\0';
+        }
+        if (n == 0) continue;
+        if ((line[0] == '1' || line[0] == '2') && line[1] == ' ') continue;
+        snprintf(out_name, out_cap, "%s", line);
+        rc = 0;
+        break;
+    }
+    fclose(f);
+    return rc;
+}
+
+// mkdir -p for the parent of `path`. Used before copy_file to make
+// sure ~/.local/state/simple_sat_ops/ exists.
+static int mkdir_p_for_file(const char *path)
+{
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", path);
+    for (char *p = buf + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (mkdir(buf, 0755) != 0 && errno != EEXIST) {
+            *p = '/';
+            return -1;
+        }
+        *p = '/';
+    }
+    return 0;
+}
+
+// Plain byte-copy. Returns 0 on success, -1 on any I/O error.
+static int copy_file(const char *src, const char *dst)
+{
+    FILE *in = fopen(src, "rb");
+    if (in == NULL) return -1;
+    if (mkdir_p_for_file(dst) != 0) { fclose(in); return -1; }
+    FILE *out = fopen(dst, "wb");
+    if (out == NULL) { fclose(in); return -1; }
+    char buf[4096];
+    size_t n;
+    int rc = 0;
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { rc = -1; break; }
+    }
+    if (ferror(in)) rc = -1;
+    fclose(in);
+    if (fclose(out) != 0) rc = -1;
+    return rc;
+}
+
 // --- Usage ---------------------------------------------------------
 
 void usage(FILE *dest, const char *name, int full)
 {
     fprintf(dest,
-        "usage: %s <satellite_id> [options]\n"
+        "usage: %s [--control] [<satellite_id>] [options]\n"
         "\n"
         "Live satellite tracker for the FrontierSat ground station. Predicts\n"
         "passes, drives the SPID rotator, computes Doppler-shifted simplex\n"
@@ -166,13 +283,26 @@ void usage(FILE *dest, const char *name, int full)
         "coordinator over the sso_ipc socket so b210_rx_live and tx_frame_sdr\n"
         "verify they're owned by the right Unix user.\n"
         "\n"
+        "Modes:\n"
+        "  %s --control                 Operator: opens the sso_ipc server,\n"
+        "                               drives the rotator. With no\n"
+        "                               <satellite_id>, the newest *.tle under\n"
+        "                               /FrontierSat/TLEs/ is copied to the\n"
+        "                               active.tle slot and tracked.\n"
+        "  %s <satellite_id>            Standalone tracker (legacy / dev).\n"
+        "  %s                           No args: probes for a running operator\n"
+        "                               and exits with a hint either way.\n"
+        "\n"
         "Positional arguments:\n"
         "  <satellite_id>               Name prefix to match in the TLE, or `next`\n"
-        "                               to auto-select the next visible pass\n"
+        "                               to auto-select the next visible pass.\n"
+        "                               Optional when --control is given.\n"
         "\n"
         "TLE source:\n"
         "  --tle=<path>                 Path to a TLE file (2 or 3-line format).\n"
         "                               Default: $HOME/.local/state/simple_sat_ops/active.tle\n"
+        "                               (auto-populated by --control without a\n"
+        "                               positional satellite_id).\n"
         "\n"
         "Hardware (rotator only — the radio is now the B210, driven\n"
         "externally; there is no audio path in this binary):\n"
@@ -216,7 +346,7 @@ void usage(FILE *dest, const char *name, int full)
         "  --verbose=<level>            Verbosity integer\n"
         "  --help                       Short help (this message)\n"
         "  --help-full                  Detailed help with keyboard layout\n",
-        name,
+        name, name, name, name,
         UPLINK_FREQ_MHZ, DOWNLINK_FREQ_MHZ);
 
     if (!full) return;
@@ -1018,9 +1148,39 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             return 3;
         }
     }
-    if (argc - state->n_options != 2) {
+    int n_positional = argc - state->n_options - 1;  // -1 for argv[0]
+    if (n_positional > 1) {
         usage(stderr, argv[0], 0);
         return 1;
+    }
+
+    // Find the (single) positional, if any. Existing convention is
+    // "positional at argv[1]" but loop is robust to options-before /
+    // options-after orderings.
+    char *positional = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strncmp("--", argv[i], 2) == 0) continue;
+        positional = argv[i];
+        break;
+    }
+
+    // Bare invocation (no satellite_id, no --control): the standalone
+    // tracker is being phased out in favour of the operator+viewer
+    // split. Probe for the running operator and bail with a hint
+    // either way.
+    if (n_positional == 0 && !g_control_mode) {
+        sso_ipc_client_t *probe = sso_ipc_client_connect("simple_sat_ops");
+        if (probe == NULL) {
+            fprintf(stderr,
+                "operator not found: try `simple_sat_ops --control` "
+                "to operate FrontierSat\n");
+            return 1;
+        }
+        sso_ipc_client_close(probe);
+        fprintf(stderr,
+            "simple_sat_ops: operator already running; viewer mode "
+            "is not implemented yet — nothing to do here.\n");
+        return 0;
     }
 
     state->prediction.observer_ephem.position_geodetic.lat =
@@ -1030,15 +1190,61 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->prediction.observer_ephem.position_geodetic.alt =
         site_altitude / 1000.0;
 
-    if (state->prediction.tles_filename == NULL) {
-        static char default_tle[1024];
-        if (tle_default_path(default_tle, sizeof(default_tle)) != 0) {
-            fprintf(stderr, "HOME unset or path too long; pass --tle=<path>\n");
+    // --control with no positional: auto-discover the newest TLE
+    // under /FrontierSat/TLEs/, copy it to the per-user active.tle
+    // slot, and read the satellite name out of it.
+    if (n_positional == 0 && g_control_mode) {
+        if (state->prediction.tles_filename == NULL) {
+            const char *tles_root = sso_tles_dir();
+            char src_tle[1024];
+            time_t src_mtime = 0;
+            if (find_newest_tle_recursive(tles_root, src_tle, sizeof src_tle,
+                                          &src_mtime) != 0) {
+                fprintf(stderr,
+                    "simple_sat_ops: --control wants a TLE under %s, "
+                    "but no *.tle was found there. Drop one in "
+                    "(or pass --tle=<path>).\n", tles_root);
+                return EXIT_FAILURE;
+            }
+            static char active_tle[1024];
+            if (tle_default_path(active_tle, sizeof active_tle) != 0) {
+                fprintf(stderr,
+                    "HOME unset or path too long; pass --tle=<path>\n");
+                return EXIT_FAILURE;
+            }
+            if (copy_file(src_tle, active_tle) != 0) {
+                fprintf(stderr,
+                    "simple_sat_ops: copy %s -> %s failed: %s\n",
+                    src_tle, active_tle, strerror(errno));
+                return EXIT_FAILURE;
+            }
+            fprintf(stderr, "simple_sat_ops: promoted %s -> %s\n",
+                    src_tle, active_tle);
+            state->prediction.tles_filename = active_tle;
+        }
+        static char sat_name[64];
+        if (read_tle_name(state->prediction.tles_filename,
+                          sat_name, sizeof sat_name) != 0) {
+            fprintf(stderr,
+                "simple_sat_ops: %s has no name line (2-line TLE?); "
+                "pass the satellite name explicitly\n",
+                state->prediction.tles_filename);
             return EXIT_FAILURE;
         }
-        state->prediction.tles_filename = default_tle;
+        state->prediction.satellite_ephem.name = sat_name;
+        fprintf(stderr, "simple_sat_ops: tracking '%s'\n", sat_name);
+    } else {
+        if (state->prediction.tles_filename == NULL) {
+            static char default_tle[1024];
+            if (tle_default_path(default_tle, sizeof(default_tle)) != 0) {
+                fprintf(stderr,
+                    "HOME unset or path too long; pass --tle=<path>\n");
+                return EXIT_FAILURE;
+            }
+            state->prediction.tles_filename = default_tle;
+        }
+        state->prediction.satellite_ephem.name = positional;
     }
-    state->prediction.satellite_ephem.name = argv[1];
 
     if (strcmp(state->prediction.satellite_ephem.name, "next") == 0) {
         state->prediction.auto_sat = 1;
