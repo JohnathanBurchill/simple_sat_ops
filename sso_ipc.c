@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -567,6 +568,22 @@ static int set_nonblock(int fd) {
     return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
+// Ignore SIGPIPE process-wide the first time any IPC handle is opened.
+// Without this, writing to a viewer socket that has just been closed by
+// the peer kills the operator with the default SIGPIPE action — and
+// since simple_sat_ops is in raw curses mode, that leaves the terminal
+// in an unusable state. EPIPE is already handled by the write paths.
+static void sigpipe_ignore_once(void) {
+    static int done = 0;
+    if (done) return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGPIPE, &sa, NULL);
+    done = 1;
+}
+
 static void slot_close(sso_ipc_client_slot_t *slot) {
     if (slot->fd >= 0) close(slot->fd);
     slot->fd = -1;
@@ -580,6 +597,7 @@ static void slot_close(sso_ipc_client_slot_t *slot) {
 
 sso_ipc_server_t *sso_ipc_server_open(const char *tool) {
     if (!tool || !tool[0]) return NULL;
+    sigpipe_ignore_once();
     if (sso_ipc_ensure_runtime_dir() != 0) return NULL;
 
     sso_ipc_server_t *srv = calloc(1, sizeof(*srv));
@@ -892,6 +910,7 @@ struct sso_ipc_client {
 
 sso_ipc_client_t *sso_ipc_client_connect(const char *tool) {
     if (!tool || !tool[0]) return NULL;
+    sigpipe_ignore_once();
     char path[256];
     if (sso_ipc_socket_path(path, sizeof(path), tool) != 0) return NULL;
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
