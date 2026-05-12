@@ -1100,7 +1100,10 @@ static int run_viewer(void)
 
     init_window();
     while (g_viewer_running) {
-        int rc = sso_ipc_client_step(cli, 100);
+        // Match the operator's ~2 Hz cadence. poll returns sooner when
+        // a STATE broadcast arrives, so the render still happens within
+        // a frame of any incoming event.
+        int rc = sso_ipc_client_step(cli, 500);
         if (rc < 0) break;
         int connected = sso_ipc_client_is_connected(cli);
         viewer_render(connected, me ? me : "?");
