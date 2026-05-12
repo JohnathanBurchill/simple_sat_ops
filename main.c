@@ -71,6 +71,7 @@
 // (b210_rx_live --control, tx_frame_sdr) verify the operator's Unix
 // user matches their own via this socket.
 static int g_control_mode = 0;
+static int g_viewer_mode = 0;  // bare invocation found a running operator
 static sso_ipc_server_t *g_ipc = NULL;
 static const char *g_operator_user = NULL;
 // SIGUSR1 sets this — used by the force-claim takeover path to nudge
@@ -290,8 +291,10 @@ void usage(FILE *dest, const char *name, int full)
         "                               /FrontierSat/TLEs/ is copied to the\n"
         "                               active.tle slot and tracked.\n"
         "  %s <satellite_id>            Standalone tracker (legacy / dev).\n"
-        "  %s                           No args: probes for a running operator\n"
-        "                               and exits with a hint either way.\n"
+        "  %s                           No args: connects to the running\n"
+        "                               operator and shows its state\n"
+        "                               read-only. Errors out if no\n"
+        "                               operator is running.\n"
         "\n"
         "Positional arguments:\n"
         "  <satellite_id>               Name prefix to match in the TLE, or `next`\n"
@@ -611,6 +614,166 @@ void report_position(state_t *state, int *print_row, int print_col)
     *print_row = row;
 }
 
+// --- Viewer mode --------------------------------------------------
+//
+// Read-only mirror of the operator instance: connects to the
+// sso_ipc socket as a viewer, stashes the latest STATE event from
+// the operator, and renders a small ncurses panel. No hardware,
+// no SGP4, no rotator — every value on screen comes from the
+// operator's broadcast.
+
+static int    g_viewer_has_state = 0;
+static char   g_viewer_sat[64]            = "";
+static double g_viewer_az                 = 0.0;
+static double g_viewer_el                 = 0.0;
+static long   g_viewer_freq_hz            = 0;
+static double g_viewer_doppler_hz         = 0.0;
+static char   g_viewer_operator[64]       = "";
+static char   g_viewer_roster_json[1024]  = "";
+static time_t g_viewer_last_event         = 0;
+static int    g_viewer_running            = 1;
+
+static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
+                            void *user)
+{
+    (void) cli;
+    (void) user;
+    if (evt->type != SSO_EVT_STATE && evt->type != SSO_EVT_WELCOME) {
+        return;
+    }
+    if (!evt->has_state) return;
+    snprintf(g_viewer_sat, sizeof g_viewer_sat, "%s", evt->satellite);
+    g_viewer_az = evt->az;
+    g_viewer_el = evt->el;
+    g_viewer_freq_hz = evt->freq_hz;
+    g_viewer_doppler_hz = evt->doppler_hz;
+    snprintf(g_viewer_operator, sizeof g_viewer_operator, "%s",
+             evt->operator_user);
+    snprintf(g_viewer_roster_json, sizeof g_viewer_roster_json, "%s",
+             evt->roster_json);
+    g_viewer_last_event = time(NULL);
+    g_viewer_has_state = 1;
+}
+
+// Count entries in the JSON roster array by counting `"user":`
+// occurrences. The roster is always emitted by sso_event_set_roster
+// with that exact key, and the events don't carry any other field
+// named "user" at the array-element level, so a substring count is
+// safe enough for a header line.
+static int viewer_roster_count(void)
+{
+    int n = 0;
+    const char *p = g_viewer_roster_json;
+    while ((p = strstr(p, "\"user\"")) != NULL) {
+        n++;
+        p += 6;
+    }
+    return n;
+}
+
+static void viewer_render(int connected)
+{
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    (void) rows;
+    erase();
+
+    // Top bar — reverse video, matches the operator's "OPERATOR …" bar.
+    attron(A_REVERSE);
+    char head[256];
+    time_t now = time(NULL);
+    long stale_s = g_viewer_has_state
+        ? (long)(now - g_viewer_last_event)
+        : -1;
+    const char *status = !connected ? "DISCONNECTED"
+                                    : (stale_s > 5 ? "STALE" : "LIVE");
+    int n_roster = viewer_roster_count();
+    snprintf(head, sizeof head,
+             " VIEWER  operator=%s  status: %s  roster: %d ",
+             g_viewer_operator[0] ? g_viewer_operator : "?",
+             status,
+             n_roster);
+    int hlen = (int)strlen(head);
+    if (hlen > cols) hlen = cols;
+    mvaddnstr(0, 0, head, hlen);
+    for (int i = hlen; i < cols; i++) mvaddch(0, i, ' ');
+    attroff(A_REVERSE);
+
+    int row = 2, col = 2;
+    if (!g_viewer_has_state) {
+        mvprintw(row++, col, "(waiting for state from the operator…)");
+    } else {
+        mvprintw(row++, col, "%15s   %s", "satellite",
+                 g_viewer_sat[0] ? g_viewer_sat : "?");
+        mvprintw(row++, col, "%15s   %.2f deg", "azimuth", g_viewer_az);
+        mvprintw(row++, col, "%15s   %.2f deg", "elevation", g_viewer_el);
+        mvprintw(row++, col, "%15s   %.6f MHz",
+                 "downlink", g_viewer_freq_hz / 1.0e6);
+        mvprintw(row++, col, "%15s   %+.0f Hz",
+                 "doppler", g_viewer_doppler_hz);
+        if (stale_s >= 0) {
+            mvprintw(row++, col, "%15s   %lds",
+                     "last event", stale_s);
+        }
+    }
+
+    // Footer bar — key hints, reverse video.
+    attron(A_REVERSE);
+    char foot[80];
+    snprintf(foot, sizeof foot, " q : quit ");
+    int flen = (int)strlen(foot);
+    if (flen > cols) flen = cols;
+    mvaddnstr(LINES - 1, 0, foot, flen);
+    for (int i = flen; i < cols; i++) mvaddch(LINES - 1, i, ' ');
+    attroff(A_REVERSE);
+
+    refresh();
+}
+
+static int run_viewer(void)
+{
+    sso_ipc_client_t *cli = sso_ipc_client_connect("simple_sat_ops");
+    if (cli == NULL) {
+        fprintf(stderr,
+                "simple_sat_ops viewer: connect failed: %s\n",
+                strerror(errno));
+        return EXIT_FAILURE;
+    }
+    sso_ipc_client_on_event(cli, viewer_on_event, NULL);
+
+    // Announce ourselves as a viewer so the operator's roster line
+    // counts us. The HELLO event is otherwise informational; the
+    // operator's ipc_on_event replies with a WELCOME carrying the
+    // current state snapshot.
+    sso_event_t hello;
+    sso_event_init(&hello, SSO_EVT_HELLO);
+    snprintf(hello.role, sizeof hello.role, "viewer");
+    const char *me = getenv("USER");
+    if (me && me[0]) {
+        snprintf(hello.user, sizeof hello.user, "%s", me);
+    }
+    char buf[1024];
+    if (sso_event_encode(&hello, buf, sizeof buf) == 0) {
+        sso_ipc_client_send(cli, buf);
+    }
+
+    init_window();
+    while (g_viewer_running) {
+        int rc = sso_ipc_client_step(cli, 100);
+        if (rc < 0) break;
+        int connected = sso_ipc_client_is_connected(cli);
+        viewer_render(connected);
+        int key = getch();
+        if (key == 'q' || key == 'Q' || key == 27 /* Esc */) {
+            g_viewer_running = 0;
+        }
+    }
+
+    endwin();
+    sso_ipc_client_close(cli);
+    return 0;
+}
+
 // --- main ---------------------------------------------------------
 
 int main(int argc, char **argv)
@@ -625,6 +788,12 @@ int main(int argc, char **argv)
     int status = apply_args(&state, argc, argv, jul_utc);
     if (status != 0) {
         return status;
+    }
+
+    // Bare invocation found a running operator — run as a read-only
+    // viewer and skip the rest of the operator/standalone bring-up.
+    if (g_viewer_mode) {
+        return run_viewer();
     }
 
     // Audit + operator IPC bring-up.
@@ -1177,9 +1346,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             return 1;
         }
         sso_ipc_client_close(probe);
-        fprintf(stderr,
-            "simple_sat_ops: operator already running; viewer mode "
-            "is not implemented yet — nothing to do here.\n");
+        // Operator is up — main() will dispatch into run_viewer()
+        // instead of the standalone-tracker path.
+        g_viewer_mode = 1;
         return 0;
     }
 
