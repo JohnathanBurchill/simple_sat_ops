@@ -322,8 +322,11 @@ static int row_has_error(const row_t *r)
 // One-line summary for the list. ~80-column friendly; bigger terminals
 // just show more whitespace at the end. The decoded_summary's first
 // line, after the leading "<type>: " prefix, is the most useful body
-// preview to show inline.
-static void format_list_line(const row_t *r, char *out, size_t outn)
+// preview to show inline. `index_1based` is the row's position in the
+// current sorted view (1 = newest, n_rows = oldest) so the operator
+// can read off the total without computing it.
+static void format_list_line(const row_t *r, int index_1based,
+                              char *out, size_t outn)
 {
     const char *summary_first = r->summary;
     size_t prefix_n = strlen(r->type_name);
@@ -336,7 +339,8 @@ static void format_list_line(const row_t *r, char *out, size_t outn)
     int body_len = eol ? (int)(eol - summary_first) : (int)strlen(summary_first);
     char ts_disp[40];
     format_ts(r->ts, ts_disp, sizeof ts_disp);
-    snprintf(out, outn, "%-30.30s  %-13s  %-10s  %-13s  %-9s  %.*s",
+    snprintf(out, outn, "%6d  %-30.30s  %-13s  %-10s  %-13s  %-9s  %.*s",
+             index_1based,
              ts_disp, r->tool,
              r->origin[0] ? r->origin : "-",
              r->type_name,
@@ -367,7 +371,8 @@ static void draw_list(int list_top, int list_h, int cols)
     if (g_have_color) attron(A_DIM);
     char header[256];
     snprintf(header, sizeof header,
-             "  %-30s  %-13s  %-10s  %-13s  %-9s  %s",
+             "%6s  %-30s  %-13s  %-10s  %-13s  %-9s  %s",
+             "#",
              show_local_time ? "TIMESTAMP (LOCAL)" : "TIMESTAMP (UTC)",
              "TOOL", "ORIGIN", "TYPE", "SATELLITE", "SUMMARY");
     mvaddnstr(list_top, 0, header, cols);
@@ -386,7 +391,7 @@ static void draw_list(int list_top, int list_h, int cols)
         if (ridx >= n_rows) continue;
         row_t *r = &rows[ridx];
         char line[512];
-        format_list_line(r, line, sizeof line);
+        format_list_line(r, ridx + 1, line, sizeof line);
 
         int is_sel = (ridx == sel);
         int color = color_for_type(r->type_name);
