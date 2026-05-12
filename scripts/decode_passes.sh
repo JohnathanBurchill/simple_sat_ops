@@ -15,9 +15,17 @@
 #
 # Run from the FrontierSat folder on the server, or pass --root.
 #
+# Incremental by default: after rx_replay returns, a sibling
+# `<audio>.decoded` marker is touched. Subsequent runs skip files whose
+# marker is at least as new as the audio, so a tree of N files stays an
+# O(new-arrivals) operation instead of O(N). Pass --force-redecode to
+# ignore markers (e.g., after changing rx_replay flags). Deleting a
+# marker forces just that one file to be re-decoded.
+#
 # Usage:
 #   decode_passes.sh [--root <dir>] [--sync-threshold N] [--rx-replay <path>]
-# Defaults: root=., sync-threshold=4.
+#                    [--force-redecode]
+# Defaults: root=., sync-threshold=4, skip already-decoded files.
 
 set -uo pipefail
 
@@ -35,12 +43,14 @@ export LC_ALL=C
 ROOT="$FRONTIERSAT_ROOT"
 SYNC_THR=4
 RX_REPLAY=""
+SKIP_DECODED=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --root)             ROOT="$2"; shift 2 ;;
         --sync-threshold)   SYNC_THR="$2"; shift 2 ;;
         --rx-replay)        RX_REPLAY="$2"; shift 2 ;;
+        --force-redecode)   SKIP_DECODED=0; shift ;;
         -h|--help)
             sed -n '2,/^# Defaults/p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
@@ -151,6 +161,7 @@ PY
 t_files=0
 t_skip_open=0
 t_skip_fmt=0
+t_skip_done=0
 t_decoded=0
 t_frames=0
 t_beacons=0
@@ -159,6 +170,13 @@ t_other=0
 
 while IFS= read -r -d '' src; do
     t_files=$((t_files + 1))
+    if [[ "$SKIP_DECODED" -eq 1 ]]; then
+        marker="${src}.decoded"
+        if [[ -f "$marker" && ! "$src" -nt "$marker" ]]; then
+            t_skip_done=$((t_skip_done + 1))
+            continue
+        fi
+    fi
     origin="$(origin_for_filename "$src")"
     decode_path="$src"
     cleanup_path=""
@@ -250,11 +268,18 @@ while IFS= read -r -d '' src; do
         # can spot what actually landed.
         printf '%s\n' "$out" | grep -E '^\[t=[^]]*\] (AX100|CSP v1|hex|ascii):'
     fi
+
+    if [[ "$SKIP_DECODED" -eq 1 ]]; then
+        # The marker's mtime is the skip-test key — its presence alone
+        # doesn't guarantee freshness if the audio is later overwritten.
+        touch "${src}.decoded"
+    fi
 done < <(find "$ROOT" -type f \( -iname '*.wav' -o -iname '*.ogg' \) -print0 | sort -z)
 
 echo
 echo "=== summary"
 printf "    %-26s %d\n" "files seen:"             "$t_files"
+printf "    %-26s %d\n" "skipped (already done):" "$t_skip_done"
 printf "    %-26s %d\n" "skipped (not WAV):"      "$t_skip_open"
 printf "    %-26s %d\n" "skipped (wrong format):" "$t_skip_fmt"
 printf "    %-26s %d\n" "decoded:"                "$t_decoded"

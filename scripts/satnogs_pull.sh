@@ -581,7 +581,7 @@ fi
 
 echo "satnogs_pull: done.  seen=${COUNT_SEEN}  fetched=${COUNT_FETCHED}  skipped=${COUNT_SKIPPED}  failed=${COUNT_FAILED}${NEWEST_START:+  cursor=${NEWEST_START}}  out=${OUT}"
 
-if [[ "$DECODE_AFTER" -eq 1 && "$COUNT_FETCHED" -gt 0 ]]; then
+if [[ "$DECODE_AFTER" -eq 1 ]]; then
     if [[ -z "$DECODE_PASSES_BIN" ]]; then
         for cand in \
             "$HOME/bin/decode_passes.sh" \
