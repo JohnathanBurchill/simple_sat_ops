@@ -20,9 +20,27 @@
 
 #include "beacon_cts1.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+
+// The EPS firmware reports INT*_MAX in a temperature field when the
+// underlying sensor isn't returning a valid reading (on our model the
+// first battery thermistor is the typical offender). Treating it as a
+// real value gave operators a constant "327.67C" in the beacon line.
+static const char *fmt_cC_i16(char *buf, size_t cap, int16_t v)
+{
+    if (v == INT16_MAX || v == INT16_MIN) snprintf(buf, cap, "n/a");
+    else                                  snprintf(buf, cap, "%.2fC", v / 100.0);
+    return buf;
+}
+static const char *fmt_cC_i32(char *buf, size_t cap, int32_t v)
+{
+    if (v == INT32_MAX || v == INT32_MIN) snprintf(buf, cap, "n/a");
+    else                                  snprintf(buf, cap, "%.2fC", v / 100.0);
+    return buf;
+}
 
 int beacon_is_basic(const uint8_t *payload, size_t len)
 {
@@ -261,14 +279,15 @@ void beacon_print(FILE *fp, const char *ts,
             "%sbeacon: uptime=%s since_uplink=%s epoch=%s\n",
             prefix, uptime_buf, since_uplink_buf, epoch_buf);
 
+    char t0[16], t1[16], obc[16];
     fprintf(fp,
-            "%sbeacon: batt=%.3fV %u%% temps=%.2fC/%.2fC obc=%.2fC\n",
+            "%sbeacon: batt=%.3fV %u%% temps=%s/%s obc=%s\n",
             prefix,
             b.eps_battery_voltage_mV / 1000.0,
             (unsigned)b.eps_battery_percent,
-            b.eps_battery_temperature_0_cC / 100.0,
-            b.eps_battery_temperature_1_cC / 100.0,
-            b.obc_temperature_cC / 100.0);
+            fmt_cC_i16(t0,  sizeof t0,  b.eps_battery_temperature_0_cC),
+            fmt_cC_i16(t1,  sizeof t1,  b.eps_battery_temperature_1_cC),
+            fmt_cC_i32(obc, sizeof obc, b.obc_temperature_cC));
 
     fprintf(fp,
             "%sbeacon: pcu in/out=%.2fW/%.2fW avg=%.2fW/%.2fW faults=%d channels=0x%x\n",
