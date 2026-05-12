@@ -1,0 +1,16 @@
+# /etc/logrotate.d/sso
+#
+# Daily rotation of the sso audit log. Keeps 90 days of history. The
+# log captures every invocation of simple_sat_ops, b210_rx_live,
+# tx_frame_sdr, and rx_replay — start, end, exit code, plus
+# force-claim and operator-rejected events.
+
+/var/log/sso/runs.log {
+    daily
+    rotate 90
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0664 root sso-ops
+}

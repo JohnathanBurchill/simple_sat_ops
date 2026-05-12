@@ -22,8 +22,6 @@
 #define STATE_H
 
 #include "antenna_rotator.h"
-#include "audio.h"
-#include "radio.h"
 #include "prediction.h"
 #include "telemetry.h"
 
@@ -33,39 +31,41 @@
 #define MAX_TLE_LINE_LENGTH 128
 #define TRACKING_PREP_TIME_MINUTES 5.0
 
-typedef struct state 
+// SDR-only state. The CAT-radio + ALSA-audio fields are gone; the B210
+// is now driven externally by b210_rx_live / tx_frame_sdr, which talk
+// to simple_sat_ops over the sso_ipc socket for operator coordination.
+// What remains here is the satellite tracker, the rotator, and the
+// nominal/Doppler-shifted frequency outputs computed for display + IPC
+// broadcast.
+typedef struct state
 {
-    // General state
+    // General
     int n_options;
     int running;
     int verbose_level;
     int in_pass;
+
     // Tracking
     int satellite_tracking;
     prediction_t prediction;
-    // Radio control
-    radio_t radio;
-    int run_with_radio;
-    int have_radio;
-    // Apply the IC-9700 FM+DATA+USB-MOD uplink-prep sequence after radio_init.
-    int prepare_uplink;
-    // Requested USB MOD level 0..255, or -1 to leave untouched.
-    int uplink_mod_level;
-    // Requested RF power as a percentage 0..100, or -1 to leave untouched.
-    int tx_power_pct;
-    // Required when tx_power_pct > 10 to actually apply.
-    int allow_high_power;
-    // Required to clear the per-process TX-inhibit (radio_t.tx_inhibit_cleared).
-    int allow_tx;
-    // Selected backend (--radio-type=). Default = ICOM_CIV.
-    radio_backend_type_t radio_backend;
-    // Antenna control
+
+    // Nominal + Doppler-corrected frequencies (Hz). Computed each tick
+    // by main.c from the prediction's range-rate. simple_sat_ops no
+    // longer drives a radio directly — these are display-only and get
+    // published into the IPC state events for any subscriber
+    // (tx_frame_sdr can pick up the current uplink freq this way).
+    double nominal_uplink_frequency_hz;
+    double nominal_downlink_frequency_hz;
+    double doppler_uplink_frequency_hz;
+    double doppler_downlink_frequency_hz;
+    int doppler_correction_enabled;
+
+    // Antenna rotator
     antenna_rotator_t antenna_rotator;
     int run_with_antenna_rotator;
     int have_antenna_rotator;
-    // Audio
-    audio_t audio;
-    // Telemetry 
+
+    // Telemetry overlay (still rendered alongside the prediction).
     telemetry_t telemetry;
 } state_t;
 

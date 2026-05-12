@@ -70,7 +70,12 @@ export LC_ALL=C
 # Default to FrontierSat — current best-guess NORAD ID. Override with
 # --norad-id=<n> for other satellites.
 NORAD_ID="69015"
-OUT="$HOME/satnogs_archive"
+# FrontierSat shared data root: /FrontierSat on the ground machine,
+# $HOME/FrontierSat on dev hosts. Override with the FRONTIERSAT_ROOT
+# env var or run /FrontierSat-setup first. See etc/tmpfiles.d/sso.conf
+# and scripts/sso_setup_root.sh for the one-time root setup.
+: "${FRONTIERSAT_ROOT:=$([[ -d /FrontierSat ]] && echo /FrontierSat || echo "$HOME/FrontierSat")}"
+OUT="$FRONTIERSAT_ROOT/satnogs_archive"
 SINCE_SPEC=""              # empty => resolve from state file or 24h fallback
 UNTIL_SPEC=""
 STATUS_FILTER="good"
@@ -80,7 +85,7 @@ RATE_LIMIT_MS=250
 USER_AGENT="sso-satnogs-pull/1.0"
 DECODE_PASSES_BIN=""
 DB_PATH=""
-TLE_DIR="$HOME/FrontierSat/TLEs"
+TLE_DIR="$FRONTIERSAT_ROOT/TLEs"
 USE_LOCAL_TLE=1
 # Maximum reach-back when --since is auto-resolved from the state file.
 # Caps the API window even when the cursor is stale (e.g. on a fresh

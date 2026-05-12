@@ -27,7 +27,12 @@ set -uo pipefail
 # which made per-file frame counts come back as 0 even when beacons decoded.
 export LC_ALL=C
 
-ROOT="."
+# FrontierSat shared data root: /FrontierSat on the ground machine,
+# $HOME/FrontierSat on dev hosts. Defaults --root to it so cron-driven
+# decodes don't need an absolute path. Override with --root or the
+# FRONTIERSAT_ROOT env var.
+: "${FRONTIERSAT_ROOT:=$([[ -d /FrontierSat ]] && echo /FrontierSat || echo "$HOME/FrontierSat")}"
+ROOT="$FRONTIERSAT_ROOT"
 SYNC_THR=4
 RX_REPLAY=""
 

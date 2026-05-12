@@ -1,0 +1,28 @@
+# /etc/udev/rules.d/99-sso-hardware.rules
+#
+# Give the `sso-ops` group access to the radio + rotator + B210 device
+# nodes so operators don't need to be in `dialout`/`uucp` and don't
+# need root for /dev/bus/usb/* on the B210.
+#
+# Verify the vendor/product IDs against `lsusb` on the ground machine
+# before applying — these are the typical values for the FrontierSat
+# rig but USB peripherals are easy to swap.
+#
+# Install with:
+#   sudo install -m 0644 etc/udev/rules.d/99-sso-hardware.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# After install, unplug + replug each device (or reboot) so the new
+# group ownership takes effect.
+
+# FT-991A — Silicon Labs CP2105 dual-USB-to-UART (CAT + RX audio path).
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea70", GROUP="sso-ops", MODE="0660"
+
+# SPID Rot2Prog — typically an FTDI FT232 USB-to-serial bridge. The
+# narrowest match would pin idProduct as well; the broad ATTRS{idVendor}
+# rule covers any FTDI-based serial adapter used as a rotator link.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", GROUP="sso-ops", MODE="0660"
+
+# Ettus / NI USRP B210 — appears on the USB bus as 2500:0020. UHD
+# accesses it via libusb so the rule targets the usb subsystem.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2500", ATTRS{idProduct}=="0020", GROUP="sso-ops", MODE="0660"

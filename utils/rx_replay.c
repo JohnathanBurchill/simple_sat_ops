@@ -42,6 +42,7 @@
 #include "modem.h"
 #include "packet_db.h"
 #include "rx_tui.h"
+#include "sso_audit.h"
 #include "wav_read.h"
 
 #ifdef WITH_SGP4SDP4
@@ -467,6 +468,7 @@ int main(int argc, char **argv)
         usage(stderr, argv[0]);
         return 1;
     }
+    sso_audit_start("rx_replay", input_path);
     if (ref_hex_arg != NULL) {
         size_t n = 0;
         int high = -1;

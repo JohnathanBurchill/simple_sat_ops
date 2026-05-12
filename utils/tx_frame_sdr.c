@@ -41,7 +41,10 @@
 #include "ax100.h"
 #include "modem.h"
 #include "hmac_keyfile.h"
-#include "radio.h"  // FRONTIERSAT_CARRIER_HZ for help text only
+#include "frontiersat.h"  // FRONTIERSAT_CARRIER_HZ for help text only
+#include "sso_audit.h"
+#include "sso_ipc.h"
+#include "sso_operator.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -288,6 +291,11 @@ int main(int argc, char **argv)
     int use_rs = 1;
     int allow_tx = 0;
     int dry_run = 0;
+    // Operator gating: tx_frame_sdr keys the PA, so it refuses to run
+    // unless simple_sat_ops is in operator mode with $USER == that
+    // operator's user. --no-control-check skips the gate (dev/test
+    // only; logged as such in runs.log).
+    int no_control_check = 0;
     int repeat = 1;
     int gap_ms = 200;
     int preroll_ms = 100;
@@ -351,6 +359,7 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--joke") == 0)              joke = 1;
         else if (strcmp(a, "--allow-tx") == 0)          allow_tx = 1;
         else if (strcmp(a, "--dry-run") == 0)           dry_run = 1;
+        else if (strcmp(a, "--no-control-check") == 0)  no_control_check = 1;
         else { fprintf(stderr, "tx_frame_sdr: unknown arg '%s'\n", a); usage(stderr, argv[0]); return 1; }
     }
 
@@ -369,6 +378,43 @@ int main(int argc, char **argv)
     }
     if (repeat < 1) repeat = 1;
     if (gap_ms < 0) gap_ms = 0;
+
+    // --- Operator gate + audit ---
+    sso_audit_start("tx_frame_sdr",
+                    no_control_check ? "no-control-check" :
+                    (dry_run ? "dry-run" : "tx"));
+
+    char pass_folder[256] = "";
+    char op_user[64] = "";
+    if (!no_control_check) {
+        int rc = sso_operator_verify("external", pass_folder, sizeof(pass_folder),
+                                       op_user, sizeof(op_user));
+        if (rc != SSO_OP_OK) {
+            const char *reason = "unknown";
+            switch (rc) {
+                case SSO_OP_NO_OPERATOR:
+                    reason = "no operator: simple_sat_ops is not running in --control mode";
+                    break;
+                case SSO_OP_MISMATCH:
+                    reason = "operator mismatch: simple_sat_ops operator is not you";
+                    break;
+                case SSO_OP_PROTOCOL:
+                    reason = "operator handshake failed";
+                    break;
+            }
+            fprintf(stderr, "tx_frame_sdr: refused (%s%s%s). "
+                            "Run simple_sat_ops --control, or use "
+                            "--no-control-check for bench testing.\n",
+                            reason,
+                            op_user[0] ? " — operator=" : "",
+                            op_user[0] ? op_user : "");
+            sso_audit_event("rejected", reason);
+            sso_audit_set_exit_code(2);
+            return 2;
+        }
+        fprintf(stderr, "tx_frame_sdr: operator=%s pass_folder=%s\n",
+                op_user, pass_folder[0] ? pass_folder : "(none)");
+    }
 
     // --- Build the wire frame ---
 
@@ -725,6 +771,34 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "tx_frame_sdr: sent %zu IQ samples (%.3f s on-air).\n",
             sent_total, (double)sent_total / tx_rate);
+
+    // --- Notify simple_sat_ops so the TX status line updates ---
+    if (!no_control_check && !dry_run) {
+        sso_event_t evt;
+        sso_event_init(&evt, SSO_EVT_TX_COMMAND_SENT);
+        snprintf(evt.from, sizeof(evt.from), "%s", sso_unix_user());
+        // Short human-readable summary. Prefer ASCII payload verbatim;
+        // for hex payloads, show the first 16 bytes as hex with an
+        // ellipsis when truncated.
+        if (payload_ascii != NULL) {
+            snprintf(evt.ascii, sizeof(evt.ascii), "%s", payload_ascii);
+        } else {
+            char hexbuf[160];
+            size_t hex_max = sizeof(hexbuf) - 8;
+            size_t cap = (size_t) payload_len;
+            if (cap > 16) cap = 16;
+            size_t k = 0;
+            for (size_t i = 0; i < cap; ++i) {
+                k += (size_t) snprintf(hexbuf + k, hex_max - k, "%02x",
+                                        (unsigned) payload[i]);
+            }
+            if ((size_t) payload_len > cap) {
+                snprintf(hexbuf + k, hex_max - k, "...");
+            }
+            snprintf(evt.ascii, sizeof(evt.ascii), "hex:%s", hexbuf);
+        }
+        sso_operator_publish(&evt);
+    }
 
 done_md:
     if (md != NULL) uhd_tx_metadata_free(&md);

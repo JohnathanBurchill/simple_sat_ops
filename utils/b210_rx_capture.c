@@ -46,7 +46,7 @@
 //   comfortable working point.
 
 #include "modem.h"   // pcm16_write_wav
-#include "radio.h"   // FRONTIERSAT_CARRIER_HZ
+#include "frontiersat.h"   // FRONTIERSAT_CARRIER_HZ
 
 #include <ctype.h>
 #include <math.h>

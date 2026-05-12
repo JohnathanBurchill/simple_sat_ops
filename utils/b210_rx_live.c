@@ -36,8 +36,11 @@
 #include "modem.h"
 #include "monitor_squelch.h"
 #include "packet_db.h"
-#include "radio.h"
+#include "frontiersat.h"
 #include "rx_tui.h"
+#include "sso_audit.h"
+#include "sso_ipc.h"
+#include "sso_operator.h"
 
 #ifdef WITH_SGP4SDP4
 #include "prediction.h"
@@ -902,6 +905,15 @@ int main(int argc, char **argv)
     int         use_tui_explicit = 0;
     double      duration_s   = 0.0;   // 0 = run until signal/q
 
+    // Multi-operator control: --control gates the run on a matching
+    // simple_sat_ops operator-mode instance owned by $USER, and turns
+    // on periodic rx-stats fan-out to that instance so its display
+    // surfaces an RX status line. --no-control-check skips the gate
+    // (bench / dev only). When neither flag is set, b210_rx_live runs
+    // standalone as before — no IPC, no operator coupling.
+    int         control_mode    = 0;
+    int         no_control_check = 0;
+
     // Parse positional args first (TLE path + satellite name). If the
     // first non-flag arg looks like a path, treat it as the TLE; the
     // next non-flag is the satellite name. Both are optional; without
@@ -1030,6 +1042,8 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--ui") == 0)                  { use_tui = 1; use_tui_explicit = 1; }
         else if (strcmp(a, "--no-ui") == 0)                 use_tui = 0;
         else if (starts_with(a, "--duration-s="))           duration_s = atof(a + 13);
+        else if (strcmp(a, "--control") == 0)               control_mode = 1;
+        else if (strcmp(a, "--no-control-check") == 0)      no_control_check = 1;
 
         else {
             fprintf(stderr, "b210_rx_live: unknown option '%s'\n", a);
@@ -1042,6 +1056,44 @@ int main(int argc, char **argv)
     if (bit_rate <= 0) {
         fprintf(stderr, "b210_rx_live: --bit-rate must be > 0\n");
         return EXIT_FAILURE;
+    }
+
+    // Audit hook + operator gate. The gate only fires when --control is
+    // explicitly passed; without it, b210_rx_live runs standalone like
+    // a regular receiver (preserves the historic behavior for bench
+    // tests / replays).
+    sso_audit_start("b210_rx_live",
+                    control_mode ? (no_control_check ? "control no-check" : "control")
+                                  : "standalone");
+    char ssoop_pass_folder[256] = "";
+    char ssoop_user[64] = "";
+    if (control_mode && !no_control_check) {
+        int rc = sso_operator_verify("external",
+                                       ssoop_pass_folder, sizeof(ssoop_pass_folder),
+                                       ssoop_user, sizeof(ssoop_user));
+        if (rc != SSO_OP_OK) {
+            const char *reason = "unknown";
+            switch (rc) {
+                case SSO_OP_NO_OPERATOR:
+                    reason = "no operator: simple_sat_ops is not running in --control mode";
+                    break;
+                case SSO_OP_MISMATCH:
+                    reason = "operator mismatch: simple_sat_ops operator is not you";
+                    break;
+                case SSO_OP_PROTOCOL:
+                    reason = "operator handshake failed";
+                    break;
+            }
+            fprintf(stderr, "b210_rx_live: refused (%s%s%s).\n",
+                            reason,
+                            ssoop_user[0] ? " — operator=" : "",
+                            ssoop_user[0] ? ssoop_user : "");
+            sso_audit_event("rejected", reason);
+            sso_audit_set_exit_code(2);
+            return 2;
+        }
+        fprintf(stderr, "b210_rx_live: operator=%s pass_folder=%s\n",
+                ssoop_user, ssoop_pass_folder[0] ? ssoop_pass_folder : "(none)");
     }
 
 #ifndef WITH_SGP4SDP4
@@ -1650,6 +1702,22 @@ int main(int argc, char **argv)
                             ts, lvldesc);
                     last_level_print = t_lvl;
                 }
+            }
+            // Per-second rx-stats fan-out to simple_sat_ops when running
+            // under --control. Keeps the operator's UI live without
+            // depending on the CSV path (which is optional).
+            if (control_mode && !no_control_check && t_lvl - last_csv_tick >= 1.0) {
+                double peak_pub = 0.0, rms_sq_pub = 0.0;
+                b210_rx_core_iq_levels(core, &peak_pub, &rms_sq_pub);
+                double rms_pub = sqrt(rms_sq_pub);
+                double rms_dbfs_pub = (rms_pub < 1.0) ? -90.0
+                                       : 20.0 * log10(rms_pub / 32768.0);
+                sso_event_t evt;
+                sso_event_init(&evt, SSO_EVT_RX_STATS);
+                snprintf(evt.from, sizeof(evt.from), "%s", sso_unix_user());
+                evt.snr_db = rms_dbfs_pub;
+                evt.packets = (long) frames_total;
+                sso_operator_publish(&evt);
             }
             // Per-second CSV row. Independent of level-print cadence so
             // the CSV stays consistent across TUI / non-TUI / quiet runs.
