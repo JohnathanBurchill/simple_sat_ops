@@ -657,7 +657,7 @@ static void draw_detail(int top_y, int height, int cols)
             obs_id = obs_id ? obs_id + 1
                             : (r->session_dir[0] ? r->session_dir : "?");
             snprintf(st, sizeof st,
-                     "station: (no meta.json for obs %s)", obs_id);
+                     "station: (no meta.json for obs %.64s)", obs_id);
         }
         move(y, 0); clrtoeol();
         mvaddnstr(y, 2, st, cols - 2);
