@@ -92,6 +92,15 @@ typedef struct {
     int  golay_errs, rs_errs, hmac_ok, crc_status;
     int  has_offset;
     double audio_offset_s;
+    // Observer-frame geometry at the moment of reception. Any of these
+    // can be NULL in the DB (e.g. when the decoder didn't have a TLE
+    // bound for the run), so has_geom records whether at least one
+    // value was non-NULL — that gates the detail panel line.
+    int    has_geom;
+    int    geom_az_valid, geom_el_valid;
+    int    geom_range_valid, geom_range_rate_valid, geom_doppler_valid;
+    double geom_az_deg, geom_el_deg;
+    double geom_range_km, geom_range_rate_km_s, geom_doppler_hz;
     char summary[2048];
     int  payload_len_total;
     int  payload_len_preview;
@@ -168,7 +177,8 @@ static void run_query(sqlite3 *db)
         "csp_src, csp_dst, csp_dport, csp_sport, csp_prio, csp_flags, "
         "payload, golay_errs, rs_errs, hmac_ok, crc_status, "
         "source_tool, source_run, audio_offset_s, decoded_summary, "
-        "capture_origin "
+        "capture_origin, az_deg, el_deg, range_km, range_rate_km_s, "
+        "doppler_hz_offset "
         "FROM packet WHERE 1=1");
     int n_params = 0;
     const char *param_text[4] = {0};
@@ -228,6 +238,20 @@ static void run_query(sqlite3 *db)
         r->audio_offset_s = r->has_offset ? sqlite3_column_double(stmt, 18) : 0.0;
         const char *sm = (const char *)sqlite3_column_text(stmt, 19);
         const char *og = (const char *)sqlite3_column_text(stmt, 20);
+
+        r->geom_az_valid         = sqlite3_column_type(stmt, 21) != SQLITE_NULL;
+        r->geom_el_valid         = sqlite3_column_type(stmt, 22) != SQLITE_NULL;
+        r->geom_range_valid      = sqlite3_column_type(stmt, 23) != SQLITE_NULL;
+        r->geom_range_rate_valid = sqlite3_column_type(stmt, 24) != SQLITE_NULL;
+        r->geom_doppler_valid    = sqlite3_column_type(stmt, 25) != SQLITE_NULL;
+        r->geom_az_deg           = r->geom_az_valid         ? sqlite3_column_double(stmt, 21) : 0.0;
+        r->geom_el_deg           = r->geom_el_valid         ? sqlite3_column_double(stmt, 22) : 0.0;
+        r->geom_range_km         = r->geom_range_valid      ? sqlite3_column_double(stmt, 23) : 0.0;
+        r->geom_range_rate_km_s  = r->geom_range_rate_valid ? sqlite3_column_double(stmt, 24) : 0.0;
+        r->geom_doppler_hz       = r->geom_doppler_valid    ? sqlite3_column_double(stmt, 25) : 0.0;
+        r->has_geom = r->geom_az_valid || r->geom_el_valid
+                   || r->geom_range_valid || r->geom_range_rate_valid
+                   || r->geom_doppler_valid;
 
         snprintf(r->ts,        sizeof r->ts,        "%s", ts ? ts : "");
         snprintf(r->satellite, sizeof r->satellite, "%s", sat ? sat : "");
@@ -485,6 +509,24 @@ static void draw_detail(int top_y, int height, int cols)
         snprintf(ofs, sizeof ofs, "audio_offset_s=%.3f", r->audio_offset_s);
         move(y, 0); clrtoeol();
         mvaddnstr(y, 2, ofs, cols - 2);
+        y++;
+    }
+    if (r->has_geom) {
+        char geom[256];
+        int gp = 0;
+        gp += snprintf(geom + gp, sizeof geom - gp, "geom:");
+        if (r->geom_az_valid)
+            gp += snprintf(geom + gp, sizeof geom - gp, " az=%.2f°", r->geom_az_deg);
+        if (r->geom_el_valid)
+            gp += snprintf(geom + gp, sizeof geom - gp, " el=%.2f°", r->geom_el_deg);
+        if (r->geom_range_valid)
+            gp += snprintf(geom + gp, sizeof geom - gp, " range=%.1fkm", r->geom_range_km);
+        if (r->geom_range_rate_valid)
+            gp += snprintf(geom + gp, sizeof geom - gp, " rate=%+.3fkm/s", r->geom_range_rate_km_s);
+        if (r->geom_doppler_valid)
+            gp += snprintf(geom + gp, sizeof geom - gp, " doppler=%+.0fHz", r->geom_doppler_hz);
+        move(y, 0); clrtoeol();
+        mvaddnstr(y, 2, geom, cols - 2);
         y++;
     }
 
