@@ -815,17 +815,27 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
     if (evt->type != SSO_EVT_STATE && evt->type != SSO_EVT_WELCOME) {
         return;
     }
+    // Stamp last-event on any operator message, so STALE / LIVE means
+    // what it says (otherwise we'd stay "LIVE" forever even with no
+    // traffic, since stale_s is -1 when has_state is 0).
+    g_viewer_last_event = time(NULL);
+    // Operator identity is in every WELCOME and STATE, regardless of
+    // whether the event carries the live state snapshot — pick it up
+    // even from a state-less WELCOME so the header bar stops showing "?".
+    if (evt->operator_user[0]) {
+        snprintf(g_viewer_operator, sizeof g_viewer_operator, "%s",
+                 evt->operator_user);
+    }
+    if (evt->roster_json[0]) {
+        snprintf(g_viewer_roster_json, sizeof g_viewer_roster_json, "%s",
+                 evt->roster_json);
+    }
     if (!evt->has_state) return;
     snprintf(g_viewer_sat, sizeof g_viewer_sat, "%s", evt->satellite);
     g_viewer_az = evt->az;
     g_viewer_el = evt->el;
     g_viewer_freq_hz = evt->freq_hz;
     g_viewer_doppler_hz = evt->doppler_hz;
-    snprintf(g_viewer_operator, sizeof g_viewer_operator, "%s",
-             evt->operator_user);
-    snprintf(g_viewer_roster_json, sizeof g_viewer_roster_json, "%s",
-             evt->roster_json);
-    g_viewer_last_event = time(NULL);
     g_viewer_has_state = 1;
 }
 
@@ -852,15 +862,17 @@ static void viewer_render(int connected)
     (void) rows;
     erase();
 
-    // Top bar — reverse video, matches the operator's "OPERATOR …" bar.
+    // Top bar — reverse video, matches the operator's "OPERATOR ..." bar.
     attron(A_REVERSE);
     char head[256];
     time_t now = time(NULL);
-    long stale_s = g_viewer_has_state
+    long stale_s = g_viewer_last_event > 0
         ? (long)(now - g_viewer_last_event)
         : -1;
     const char *status = !connected ? "DISCONNECTED"
-                                    : (stale_s > 5 ? "STALE" : "LIVE");
+                                    : (stale_s < 0 ? "WAITING"
+                                                   : (stale_s > 5 ? "STALE"
+                                                                  : "LIVE"));
     int n_roster = viewer_roster_count();
     snprintf(head, sizeof head,
              " VIEWER  operator=%s  status: %s  roster: %d ",
