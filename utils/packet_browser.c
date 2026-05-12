@@ -690,17 +690,78 @@ int main(int argc, char **argv)
             case KEY_UP:   case 'k': if (sel > 0) sel--; break;
             case KEY_DOWN: case 'j': if (sel < n_rows - 1) sel++; break;
             case KEY_PPAGE:
+            case 2:  // Ctrl-B — vim page up
                 sel -= list_h - 1;
                 if (sel < 0) sel = 0;
                 break;
             case KEY_NPAGE:
+            case 6:  // Ctrl-F — vim page down
                 sel += list_h - 1;
                 if (sel >= n_rows) sel = n_rows - 1;
                 if (sel < 0) sel = 0;
                 break;
+            case 4:  // Ctrl-D — half page down
+                sel += (list_h - 1) / 2;
+                if (sel >= n_rows) sel = n_rows - 1;
+                if (sel < 0) sel = 0;
+                break;
+            case 21: // Ctrl-U — half page up
+                sel -= (list_h - 1) / 2;
+                if (sel < 0) sel = 0;
+                break;
+            case 5:  // Ctrl-E — scroll viewport down (keep sel in view)
+                if (top < n_rows - 1) {
+                    top++;
+                    if (sel < top) sel = top;
+                }
+                break;
+            case 25: // Ctrl-Y — scroll viewport up
+                if (top > 0) {
+                    top--;
+                    int data_h = list_h - 1;
+                    if (sel >= top + data_h) sel = top + data_h - 1;
+                }
+                break;
+            case 'H': {  // top of viewport
+                int data_h = list_h - 1;
+                (void) data_h;
+                sel = top;
+                if (sel >= n_rows) sel = n_rows - 1;
+                if (sel < 0) sel = 0;
+                break;
+            }
+            case 'M': {  // middle of viewport
+                int data_h = list_h - 1;
+                sel = top + data_h / 2;
+                if (sel >= n_rows) sel = n_rows - 1;
+                if (sel < 0) sel = 0;
+                break;
+            }
             case KEY_HOME: case 'g': sel = 0; break;
             case KEY_END:  case 'G':
                 sel = n_rows > 0 ? n_rows - 1 : 0; break;
+            case 'z': {
+                // vim z-prefix: zz center, zt top, zb bottom (of viewport).
+                // Brief blocking wait so the next keystroke is captured;
+                // restore non-blocking mode afterwards.
+                timeout(500);
+                int next = getch();
+                timeout(0);
+                int data_h = list_h - 1;
+                if (data_h < 1) break;
+                if (next == 'z') {
+                    top = sel - data_h / 2;
+                } else if (next == 't') {
+                    top = sel;
+                } else if (next == 'b') {
+                    top = sel - data_h + 1;
+                } else {
+                    break;
+                }
+                if (top < 0) top = 0;
+                if (top > n_rows - 1) top = n_rows > 0 ? n_rows - 1 : 0;
+                break;
+            }
             case 'r': case 'R': case 18: // Ctrl-R
                 run_query(db);
                 last_query = monotonic_seconds();
@@ -715,9 +776,16 @@ int main(int argc, char **argv)
                 run_query(db);
                 last_query = monotonic_seconds();
                 break;
-            case 'L': case 'l':
+            case 'l':
                 show_local_time = !show_local_time;
                 break;
+            case 'L': {  // bottom of viewport (vim convention)
+                int data_h = list_h - 1;
+                sel = top + data_h - 1;
+                if (sel >= n_rows) sel = n_rows - 1;
+                if (sel < 0) sel = 0;
+                break;
+            }
             case '/':
                 if (prompt_search(rows_total, cols)) {
                     run_query(db);
