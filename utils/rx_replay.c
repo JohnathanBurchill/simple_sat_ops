@@ -397,6 +397,12 @@ int main(int argc, char **argv)
     double obs_lat_deg = 50.8688;   // RAO defaults; overridden by flags
     double obs_lon_deg = -114.2910;
     double obs_alt_m   = 1279.0;
+    // --no-observer leaves geometry NULL in the DB instead of falling
+    // back to obs_lat/lon/alt. Used by decode_passes.sh on satnogs obs
+    // whose recording-station coords aren't known — better to record
+    // "we don't know where it was heard from" than to silently
+    // attribute the pass to RAO.
+    int no_observer = 0;
     double nominal_freq_hz = 436150000.0; // FrontierSat carrier
 
     for (int i = 1; i < argc; ++i) {
@@ -448,6 +454,7 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--lat="))             obs_lat_deg = atof(a + 6);
         else if (starts_with(a, "--lon="))             obs_lon_deg = atof(a + 6);
         else if (starts_with(a, "--alt="))             obs_alt_m   = atof(a + 6);
+        else if (strcmp(a, "--no-observer") == 0)      no_observer = 1;
         else if (starts_with(a, "--carrier-mhz="))     nominal_freq_hz = atof(a + 14) * 1e6;
         else if (a[0] == '-') {
             fprintf(stderr, "rx_replay: unknown option '%s'\n", a);
@@ -692,10 +699,11 @@ int main(int argc, char **argv)
 
 #ifdef WITH_SGP4SDP4
     // SGP4 propagation state, only used when --tle was given (or
-    // auto-discovered) and a start-utc could be resolved.
+    // auto-discovered), a start-utc could be resolved, and the caller
+    // didn't explicitly opt out with --no-observer.
     prediction_t pred;
     int have_pred = 0;
-    if (tle_id > 0 && have_start_utc) {
+    if (!no_observer && tle_id > 0 && have_start_utc) {
         memset(&pred, 0, sizeof pred);
         pred.observer_ephem.position_geodetic.lat = obs_lat_deg * (M_PI / 180.0);
         pred.observer_ephem.position_geodetic.lon = obs_lon_deg * (M_PI / 180.0);

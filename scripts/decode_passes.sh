@@ -229,6 +229,25 @@ while IFS= read -r -d '' src; do
         if [[ -n "$sat_utc" ]]; then
             rx_args+=( --start-utc="$sat_utc" )
         fi
+        # Geometry should be relative to the recording SatNOGS station,
+        # not RAO. satnogs_pull writes the obs detail JSON next to the
+        # audio, which carries station_lat/lng/alt from the SatNOGS
+        # API. If those fields aren't present we use --no-observer
+        # rather than silently letting rx_replay fall back to RAO.
+        obs_dir="$(dirname "$src")"
+        obs_id="$(basename "$obs_dir")"
+        meta="$obs_dir/satnogs_$obs_id.meta.json"
+        sat_lat=""; sat_lng=""; sat_alt=""
+        if [[ -r "$meta" ]]; then
+            sat_lat="$(jq -r '.station_lat // empty' "$meta" 2>/dev/null)"
+            sat_lng="$(jq -r '.station_lng // empty' "$meta" 2>/dev/null)"
+            sat_alt="$(jq -r '.station_alt // empty' "$meta" 2>/dev/null)"
+        fi
+        if [[ -n "$sat_lat" && -n "$sat_lng" && -n "$sat_alt" ]]; then
+            rx_args+=( --lat="$sat_lat" --lon="$sat_lng" --alt="$sat_alt" )
+        else
+            rx_args+=( --no-observer )
+        fi
     fi
     out="$("$RX_REPLAY" "$decode_path" "${rx_args[@]}" 2>&1 || true)"
     [[ -n "$cleanup_path" ]] && rm -f "$cleanup_path"
