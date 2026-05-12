@@ -44,9 +44,13 @@
 #                           otherwise be older. Default 24h. Use 0 to
 #                           disable.
 #   --until=<spec>          Same syntax as --since (default: now)
-#   --status=<csv>          Comma-separated list of accepted statuses
+#   --status=<value>        Filter by SatNOGS observation status
 #                           (good|bad|failed|future|unknown). Default
-#                           "good". Pass an empty value to disable.
+#                           is empty (any status); the payload check
+#                           still skips obs without audio, so `future`
+#                           and `failed`-without-recording fall away
+#                           naturally. The SatNOGS API only takes a
+#                           single status, not a CSV.
 #   --max=<n>               Cap total new downloads per run (default 200)
 #   --tle-dir=<dir>         Override per-observation TLE with the newest
 #                           *.tle file in this directory (default
@@ -78,7 +82,12 @@ NORAD_ID="69015"
 OUT="$FRONTIERSAT_ROOT/satnogs_archive"
 SINCE_SPEC=""              # empty => resolve from state file or 24h fallback
 UNTIL_SPEC=""
-STATUS_FILTER="good"
+# Default to no status filter — FrontierSat uses a custom protocol that
+# SatNOGS can't decode, so the auto-classifier leaves our obs at
+# `unknown` indefinitely and `status=good` would silently drop them.
+# The payload-empty check below skips passes that haven't uploaded
+# audio yet, so `future` and `failed`-without-recording still fall away.
+STATUS_FILTER=""
 MAX_OBS=200
 DECODE_AFTER=0
 RATE_LIMIT_MS=250
@@ -207,11 +216,13 @@ spec_to_seconds() {
     esac
 }
 
-# Default --since: pick up from the cursor in the state file with no
-# overlap (status=good observations don't ever appear with a start
-# earlier than a previously-good observation, so the API's start>=since
-# filter catches the boundary cleanly), but clip to --lookback-cap so
-# a stale / absent state file doesn't trigger a multi-year API walk.
+# Default --since: pick up from the cursor in the state file, but
+# clip to --lookback-cap so a stale / absent state file doesn't trigger
+# a multi-year API walk. The cursor itself is held back past any obs
+# that was still pending audio at the end of the previous run (see the
+# EARLIEST_PENDING_START handling near the end of this script), which
+# is what stops SatNOGS out-of-order uploads from being missed by the
+# start>=since filter on the next tick.
 if [[ -z "$SINCE_SPEC" ]]; then
     NOW_EPOCH="$(date -u +%s)"
     if ! LOOKBACK_S="$(spec_to_seconds "$LOOKBACK_CAP_SPEC")"; then
@@ -381,6 +392,12 @@ COUNT_SKIPPED=0
 COUNT_FAILED=0
 COUNT_SEEN=0
 NEWEST_START=""
+# Earliest already-happened obs (start < now) we saw without an audio
+# payload yet. Used at the end to clamp the cursor so the next run's
+# start>=since query still includes it, even if SatNOGS uploaded a
+# newer pass's audio first.
+EARLIEST_PENDING_START=""
+NOW_ISO_FOR_PENDING="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if [[ -s "$STATE_FILE" ]]; then
     # Carry the existing cursor forward so a run that downloads nothing
     # still seeds the same state file value (no regressions on disk).
@@ -448,6 +465,13 @@ while [[ -n "$URL" && "$COUNT_FETCHED" -lt "$MAX_OBS" ]]; do
             # cron tick re-checks the detail endpoint and grabs the
             # audio once it's there. For low-volume sats like
             # FrontierSat the extra detail GET per tick is negligible.
+            # Only track obs whose pass should already be over; future
+            # passes shouldn't hold the cursor back for hours/days.
+            if [[ -n "$START" && "$START" < "$NOW_ISO_FOR_PENDING" ]]; then
+                if [[ -z "$EARLIEST_PENDING_START" || "$START" < "$EARLIEST_PENDING_START" ]]; then
+                    EARLIEST_PENDING_START="$START"
+                fi
+            fi
             COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
             polite_sleep
             continue
@@ -540,6 +564,16 @@ while [[ -n "$URL" && "$COUNT_FETCHED" -lt "$MAX_OBS" ]]; do
 
     URL="$NEXT"
 done
+
+if [[ -n "$EARLIEST_PENDING_START" ]]; then
+    # SatNOGS sometimes uploads a newer pass's audio before an older
+    # one's. Without this clamp the cursor would walk past the older
+    # obs after we successfully fetched the newer one, and the next
+    # start>=since query would miss it forever.
+    if [[ -z "$NEWEST_START" || "$EARLIEST_PENDING_START" < "$NEWEST_START" ]]; then
+        NEWEST_START="$EARLIEST_PENDING_START"
+    fi
+fi
 
 if [[ -n "$NEWEST_START" ]]; then
     printf '%s\n' "$NEWEST_START" > "$STATE_FILE"
