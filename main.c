@@ -891,7 +891,7 @@ static void viewer_render(int connected)
 
     // Top bar — reverse video, matches the operator's "OPERATOR ..." bar.
     attron(A_REVERSE);
-    char head[256];
+    char head[512];
     time_t now = time(NULL);
     long stale_s = g_viewer_last_event > 0
         ? (long)(now - g_viewer_last_event)
