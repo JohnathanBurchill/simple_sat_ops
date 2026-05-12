@@ -783,8 +783,11 @@ int main(int argc, char **argv)
         if (payload_ascii != NULL) {
             snprintf(evt.ascii, sizeof(evt.ascii), "%s", payload_ascii);
         } else {
-            char hexbuf[160];
-            size_t hex_max = sizeof(hexbuf) - 8;
+            // 16 bytes -> 32 hex chars + "..." + null = 36; size hexbuf
+            // tight so GCC -Wformat-truncation can prove the final
+            // "hex:%s" copy fits in evt.ascii (160).
+            char hexbuf[64];
+            size_t hex_max = sizeof(hexbuf) - 4;
             size_t cap = (size_t) payload_len;
             if (cap > 16) cap = 16;
             size_t k = 0;
