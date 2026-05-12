@@ -77,7 +77,7 @@ typedef struct {
     // Pre-computed prediction snapshot — the viewer renders these
     // verbatim, no local SGP4. Every field is the value the operator
     // is showing on its own screen right now.
-    char idesg[16];
+    char idesg[9];           // matches TLE struct exactly
     double epoch_min;        // minutes_since_epoch
     double min_visible;      // predicted_minutes_until_visible
     double min_above_0;
