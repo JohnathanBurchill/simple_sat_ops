@@ -88,6 +88,16 @@ static void on_sigusr1(int sig) {
     g_yield_requested = 1;
 }
 
+// Latest broadcast snapshot, kept so a newly-connecting viewer gets
+// state in its WELCOME response without having to wait up to 500 ms
+// for the next periodic STATE broadcast.
+static int    g_last_state_valid     = 0;
+static char   g_last_state_sat[64]   = "";
+static double g_last_state_az        = 0.0;
+static double g_last_state_el        = 0.0;
+static long   g_last_state_freq_hz   = 0;
+static double g_last_state_doppler   = 0.0;
+
 static void ipc_broadcast_state(state_t *s,
                                   double az, double el,
                                   double downlink_freq,
@@ -141,6 +151,15 @@ static void ipc_broadcast_state(state_t *s,
     if (sso_event_encode(&evt, buf, sizeof(buf)) == 0) {
         sso_ipc_server_broadcast(g_ipc, buf);
     }
+
+    // Cache for WELCOME replies so a viewer doesn't have to wait for
+    // the next periodic broadcast to see anything.
+    snprintf(g_last_state_sat, sizeof g_last_state_sat, "%s", evt.satellite);
+    g_last_state_az      = evt.az;
+    g_last_state_el      = evt.el;
+    g_last_state_freq_hz = evt.freq_hz;
+    g_last_state_doppler = evt.doppler_hz;
+    g_last_state_valid   = 1;
 }
 
 static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
@@ -157,7 +176,44 @@ static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
         snprintf(welcome.pass_folder, sizeof(welcome.pass_folder), "%s",
                  g_pass_folder);
     }
-    char buf[1024];
+    if (g_last_state_valid) {
+        welcome.has_state   = 1;
+        snprintf(welcome.satellite, sizeof welcome.satellite,
+                 "%s", g_last_state_sat);
+        welcome.az          = g_last_state_az;
+        welcome.el          = g_last_state_el;
+        welcome.freq_hz     = g_last_state_freq_hz;
+        welcome.doppler_hz  = g_last_state_doppler;
+        // Roster — operator first, then the existing clients we know
+        // of. The newly-connecting client is already in the slot table
+        // (slot_dispatch_line ran first) but its role isn't populated
+        // until HELLO is processed; that's why we iterate via
+        // sso_ipc_server_next_client, which surfaces what HELLO set.
+        sso_roster_entry_t entries[SSO_IPC_MAX_CLIENTS_FOR_ROSTER];
+        size_t n = 0;
+        snprintf(entries[n].user, sizeof(entries[n].user), "%s",
+                 g_operator_user ? g_operator_user : "?");
+        snprintf(entries[n].role, sizeof(entries[n].role), "operator");
+        entries[n].since[0] = '\0';
+        n++;
+        sso_ipc_iter_t it = {0};
+        sso_client_id_t cid;
+        char ruser[64], rrole[16], rsince[40];
+        while (n < sizeof(entries) / sizeof(entries[0])
+               && sso_ipc_server_next_client(srv, &it, &cid,
+                                              ruser, sizeof(ruser),
+                                              rrole, sizeof(rrole),
+                                              rsince, sizeof(rsince)) == 0) {
+            if (!ruser[0]) continue;
+            snprintf(entries[n].user,  sizeof(entries[n].user),  "%s", ruser);
+            snprintf(entries[n].role,  sizeof(entries[n].role),  "%s",
+                     rrole[0] ? rrole : "viewer");
+            snprintf(entries[n].since, sizeof(entries[n].since), "%s", rsince);
+            n++;
+        }
+        sso_event_set_roster(&welcome, entries, n);
+    }
+    char buf[4096];
     if (sso_event_encode(&welcome, buf, sizeof(buf)) == 0) {
         sso_ipc_server_send(srv, id, buf);
     }
@@ -819,7 +875,7 @@ static void viewer_render(int connected)
 
     int row = 2, col = 2;
     if (!g_viewer_has_state) {
-        mvprintw(row++, col, "(waiting for state from the operator…)");
+        mvprintw(row++, col, "(waiting for state from the operator...)");
     } else {
         mvprintw(row++, col, "%15s   %s", "satellite",
                  g_viewer_sat[0] ? g_viewer_sat : "?");
