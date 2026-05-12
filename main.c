@@ -74,6 +74,11 @@ static int g_control_mode = 0;
 static int g_viewer_mode = 0;  // bare invocation found a running operator
 static sso_ipc_server_t *g_ipc = NULL;
 static const char *g_operator_user = NULL;
+// /FrontierSat/Operations/<yyyymmdd>/<hhmmLT>/ for the upcoming
+// pass — created in main() once the AOS prediction is in, then
+// broadcast on every STATE event so b210_rx_live and tx_frame_sdr
+// can drop their captures/logs in the same spot. Empty until set.
+static char g_pass_folder[256] = "";
 // SIGUSR1 sets this — used by the force-claim takeover path to nudge
 // the operator-mode loop into a graceful exit. (Full in-place
 // demotion is a follow-up; for now SIGUSR1 = quit.)
@@ -103,6 +108,10 @@ static void ipc_broadcast_state(state_t *s,
     evt.el = el;
     evt.freq_hz = (long) downlink_freq;
     evt.doppler_hz = doppler_delta_dl;
+    if (g_pass_folder[0]) {
+        snprintf(evt.pass_folder, sizeof(evt.pass_folder), "%s",
+                 g_pass_folder);
+    }
     sso_roster_entry_t entries[SSO_IPC_MAX_CLIENTS_FOR_ROSTER];
     size_t n = 0;
     if (n < sizeof(entries) / sizeof(entries[0])) {
@@ -144,6 +153,10 @@ static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
              g_operator_user ? g_operator_user : "?");
     snprintf(welcome.operator_user, sizeof(welcome.operator_user), "%s",
              g_operator_user ? g_operator_user : "?");
+    if (g_pass_folder[0]) {
+        snprintf(welcome.pass_folder, sizeof(welcome.pass_folder), "%s",
+                 g_pass_folder);
+    }
     char buf[1024];
     if (sso_event_encode(&welcome, buf, sizeof(buf)) == 0) {
         sso_ipc_server_send(srv, id, buf);
@@ -269,6 +282,80 @@ static int copy_file(const char *src, const char *dst)
     fclose(in);
     if (fclose(out) != 0) rc = -1;
     return rc;
+}
+
+// --- Pass folder for the upcoming pass -----------------------------
+
+// Julian Date -> Unix epoch seconds. Reference: JD 2440587.5 is
+// 1970-01-01 00:00:00 UTC, which is what time_t counts from.
+static time_t jul_to_unix(double jd)
+{
+    return (time_t)((jd - 2440587.5) * 86400.0 + 0.5);
+}
+
+// Refresh /FrontierSat/Operations/current so it points at `target`.
+// Atomic-ish: unlink the old link, symlink the new one. If the
+// symlink call fails we log and carry on — the pass folder itself is
+// still created and broadcast over IPC, the symlink is just a
+// convenience.
+static void update_operations_current_symlink(const char *target)
+{
+    const char *link = sso_operations_current_symlink();
+    if (link == NULL || link[0] == '\0') return;
+    // Make sure /FrontierSat/Operations/ exists for the symlink slot.
+    sso_mkdir_p_for_file(link);
+    unlink(link);
+    if (symlink(target, link) != 0) {
+        fprintf(stderr,
+                "simple_sat_ops: symlink %s -> %s failed: %s "
+                "(non-fatal; pass folder still set)\n",
+                link, target, strerror(errno));
+    }
+}
+
+// Compute a fresh AOS prediction off `state`'s current position and
+// build /FrontierSat/Operations/<yyyymmdd>/<hhmmLT>/. Stashes the
+// result in g_pass_folder so ipc_broadcast_state can publish it on
+// every tick.
+static void setup_pass_folder(state_t *state, double jul_utc_now)
+{
+    minutes_until_visible(&state->prediction, jul_utc_now,
+                          jul_utc_now + MAX_MINUTES_TO_PREDICT / 1440.0,
+                          1.0);
+    double aos_jul = state->prediction.predicted_ascension_jul_utc;
+    if (!(aos_jul > 0.0)) {
+        fprintf(stderr,
+                "simple_sat_ops: no AOS in the next %d minutes — "
+                "pass folder not created\n",
+                MAX_MINUTES_TO_PREDICT);
+        return;
+    }
+    time_t aos = jul_to_unix(aos_jul);
+    struct tm aos_local;
+    localtime_r(&aos, &aos_local);
+    char folder[256];
+    int n = snprintf(folder, sizeof folder,
+                     "%s/%04d%02d%02d/%02d%02dLT",
+                     sso_operations_dir(),
+                     aos_local.tm_year + 1900,
+                     aos_local.tm_mon + 1,
+                     aos_local.tm_mday,
+                     aos_local.tm_hour,
+                     aos_local.tm_min);
+    if (n <= 0 || (size_t)n >= sizeof folder) {
+        fprintf(stderr,
+                "simple_sat_ops: pass folder name too long; skipping\n");
+        return;
+    }
+    if (sso_mkdir_p(folder) != 0) {
+        fprintf(stderr,
+                "simple_sat_ops: mkdir -p %s failed: %s\n",
+                folder, strerror(errno));
+        return;
+    }
+    snprintf(g_pass_folder, sizeof g_pass_folder, "%s", folder);
+    update_operations_current_symlink(folder);
+    fprintf(stderr, "simple_sat_ops: pass folder %s\n", folder);
 }
 
 // --- Usage ---------------------------------------------------------
@@ -827,6 +914,17 @@ int main(int argc, char **argv)
     }
     ClearFlag(ALL_FLAGS);
     select_ephemeris(&state.prediction.satellite_ephem.tle);
+
+    // With a fresh TLE loaded, find the upcoming pass and stand up
+    // /FrontierSat/Operations/<yyyymmdd>/<hhmmLT>/ for it before the
+    // tracking loop opens ncurses. Only on --control — the
+    // standalone-tracker / dev path leaves Operations/ alone.
+    if (g_control_mode) {
+        UTC_Calendar_Now(&utc, &tv);
+        double jul_now = Julian_Date(&utc, &tv);
+        update_satellite_position(&state.prediction, jul_now);
+        setup_pass_folder(&state, jul_now);
+    }
 
     int antenna_rotator_result = 0;
     if (state.run_with_antenna_rotator) {
