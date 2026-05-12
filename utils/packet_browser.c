@@ -157,6 +157,10 @@ enum {
     PAIR_ERROR,
     PAIR_SEL,
     PAIR_SEL_ERR,
+    PAIR_SEL_BEACON,
+    PAIR_SEL_TCMD,
+    PAIR_SEL_LOG,
+    PAIR_SEL_BULK,
     PAIR_DIM,
 };
 
@@ -533,13 +537,28 @@ static void draw_list(int list_top, int list_h, int cols)
         int color = color_for_type(r->type_name);
         int has_err = row_has_error(r);
 
-        int sel_pair = has_err ? PAIR_SEL_ERR : PAIR_SEL;
+        // Selection pair: error wins over type, type wins over the
+        // plain black-on-white fallback. Keeps the per-type colour
+        // visible when the cursor is on the row, instead of forcing
+        // every highlighted row to read as plain black-on-white.
+        int sel_pair = PAIR_SEL;
+        if (has_err) {
+            sel_pair = PAIR_SEL_ERR;
+        } else {
+            switch (color) {
+                case PAIR_BEACON: sel_pair = PAIR_SEL_BEACON; break;
+                case PAIR_TCMD:   sel_pair = PAIR_SEL_TCMD;   break;
+                case PAIR_LOG:    sel_pair = PAIR_SEL_LOG;    break;
+                case PAIR_BULK:   sel_pair = PAIR_SEL_BULK;   break;
+                default: /* PAIR_SEL — black on white */ break;
+            }
+        }
         if (is_sel) {
             if (g_have_color) attron(COLOR_PAIR(sel_pair));
             else              attron(A_REVERSE);
-            // Bold helps the bad-decode case stay legible on mono
-            // terminals where there's no PAIR_SEL_ERR to fall back on.
-            if (has_err)      attron(A_BOLD);
+            // Bold on every highlighted row — punchier against the
+            // white background and helps yellow stay legible.
+            attron(A_BOLD);
         } else if (has_err && g_have_color) {
             attron(COLOR_PAIR(PAIR_ERROR));
         } else if (color != 0) {
@@ -556,7 +575,7 @@ static void draw_list(int list_top, int list_h, int cols)
         addnstr(line, cols - 2);
 
         if (is_sel) {
-            if (has_err)      attroff(A_BOLD);
+            attroff(A_BOLD);
             if (g_have_color) attroff(COLOR_PAIR(sel_pair));
             else              attroff(A_REVERSE);
         } else if (has_err && g_have_color) {
@@ -846,7 +865,16 @@ int main(int argc, char **argv)
         init_pair(PAIR_BULK,   COLOR_MAGENTA, -1);
         init_pair(PAIR_ERROR,  COLOR_RED,    -1);
         init_pair(PAIR_SEL,    COLOR_BLACK,  COLOR_WHITE);
-        init_pair(PAIR_SEL_ERR, COLOR_RED,   COLOR_WHITE);
+        init_pair(PAIR_SEL_ERR,    COLOR_RED,     COLOR_WHITE);
+        // Per-type selection pairs preserve the row's type-colour
+        // foreground while applying the highlight background. Yellow
+        // on white is the weakest pair contrast-wise; A_BOLD on
+        // selection (applied in draw_list) usually rescues it on
+        // terminals that render bold-yellow as bright orange.
+        init_pair(PAIR_SEL_BEACON, COLOR_CYAN,    COLOR_WHITE);
+        init_pair(PAIR_SEL_TCMD,   COLOR_YELLOW,  COLOR_WHITE);
+        init_pair(PAIR_SEL_LOG,    COLOR_GREEN,   COLOR_WHITE);
+        init_pair(PAIR_SEL_BULK,   COLOR_MAGENTA, COLOR_WHITE);
         g_have_color = 1;
     }
 
