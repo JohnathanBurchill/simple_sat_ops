@@ -652,9 +652,12 @@ static void draw_detail(int top_y, int height, int cols)
                      g_station_cache_lat, g_station_cache_lng,
                      (int)g_station_cache_alt);
         } else {
+            const char *obs_id = r->session_dir[0]
+                ? strrchr(r->session_dir, '/') : NULL;
+            obs_id = obs_id ? obs_id + 1
+                            : (r->session_dir[0] ? r->session_dir : "?");
             snprintf(st, sizeof st,
-                     "station: (no meta.json under %s)",
-                     r->session_dir[0] ? r->session_dir : "?");
+                     "station: (no meta.json for obs %s)", obs_id);
         }
         move(y, 0); clrtoeol();
         mvaddnstr(y, 2, st, cols - 2);
