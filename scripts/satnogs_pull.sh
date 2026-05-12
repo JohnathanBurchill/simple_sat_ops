@@ -442,11 +442,12 @@ while [[ -n "$URL" && "$COUNT_FETCHED" -lt "$MAX_OBS" ]]; do
         STATION_NAME="$(echo "$OBS" | jq -r '.station_name // ""')"
 
         if [[ -z "$PAYLOAD" || "$PAYLOAD" == "null" || "$PAYLOAD" == */ ]]; then
-            # No audio file yet (just the directory placeholder), or
-            # SatNOGS hasn't uploaded — mark the id seen so we don't keep
-            # re-asking, then move on.
-            echo "$OBS_ID" >> "$FETCHED_FILE"
-            FETCHED["$OBS_ID"]=1
+            # SatNOGS knows about the observation but hasn't uploaded
+            # the audio yet — typical for the first ~30 min after a
+            # pass ends. DON'T pin the id in .fetched.txt; the next
+            # cron tick re-checks the detail endpoint and grabs the
+            # audio once it's there. For low-volume sats like
+            # FrontierSat the extra detail GET per tick is negligible.
             COUNT_SKIPPED=$((COUNT_SKIPPED + 1))
             polite_sleep
             continue
