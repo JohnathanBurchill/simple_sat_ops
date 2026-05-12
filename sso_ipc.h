@@ -64,15 +64,33 @@ typedef struct {
     char rx_status[160];
     char tx_status[160];
     char roster_json[1024];  // serialized array of {user,role,since}
-    char tle_path[256];      // operator's active TLE file (viewer mirrors)
+    char tle_path[256];      // operator's active TLE file (informational;
+                             // viewer no longer loads it)
     double target_az;        // commanded rotator target
     double target_el;
     int flip;                // flip_mode_pass
     int in_pass;
     int tracking;
+    int has_rotator;         // operator's have_antenna_rotator
     double jul_utc;          // operator's SGP4 epoch for this tick
-                             // — viewer uses it to propagate at the
-                             // same instant so values match exactly
+
+    // Pre-computed prediction snapshot — the viewer renders these
+    // verbatim, no local SGP4. Every field is the value the operator
+    // is showing on its own screen right now.
+    char idesg[16];
+    double epoch_min;        // minutes_since_epoch
+    double min_visible;      // predicted_minutes_until_visible
+    double min_above_0;
+    double min_above_30;
+    double max_el;
+    double pred_az;          // satellite_ephem.azimuth (SGP4, not rotator)
+    double pred_el;
+    double alt_km;
+    double lat_deg;
+    double lon_deg;
+    double speed_kms;
+    double range_km;
+    double range_rate_kms;
 
     // rx-stats
     double snr_db;

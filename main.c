@@ -103,7 +103,22 @@ static double g_last_state_tgt_el    = 0.0;
 static int    g_last_state_flip      = 0;
 static int    g_last_state_in_pass   = 0;
 static int    g_last_state_tracking  = 0;
+static int    g_last_state_has_rot   = 0;
 static double g_last_state_jul       = 0.0;
+static char   g_last_state_idesg[16] = "";
+static double g_last_state_epoch_min   = 0.0;
+static double g_last_state_min_visible = 0.0;
+static double g_last_state_min_above_0 = 0.0;
+static double g_last_state_min_above_30 = 0.0;
+static double g_last_state_max_el      = 0.0;
+static double g_last_state_pred_az     = 0.0;
+static double g_last_state_pred_el     = 0.0;
+static double g_last_state_alt_km      = 0.0;
+static double g_last_state_lat_deg     = 0.0;
+static double g_last_state_lon_deg     = 0.0;
+static double g_last_state_speed_kms   = 0.0;
+static double g_last_state_range_km    = 0.0;
+static double g_last_state_rrate_kms   = 0.0;
 
 static void ipc_broadcast_state(state_t *s,
                                   double az, double el,
@@ -139,7 +154,25 @@ static void ipc_broadcast_state(state_t *s,
     evt.flip      = s->antenna_rotator.flip_mode_pass;
     evt.in_pass   = s->in_pass;
     evt.tracking  = s->antenna_rotator.tracking;
+    evt.has_rotator = s->have_antenna_rotator;
     evt.jul_utc   = jul_utc;
+
+    // Prediction snapshot — viewer renders these verbatim.
+    snprintf(evt.idesg, sizeof evt.idesg, "%s",
+             s->prediction.satellite_ephem.tle.idesg);
+    evt.epoch_min      = s->prediction.minutes_since_epoch;
+    evt.min_visible    = s->prediction.predicted_minutes_until_visible;
+    evt.min_above_0    = s->prediction.predicted_minutes_above_0_degrees;
+    evt.min_above_30   = s->prediction.predicted_minutes_above_30_degrees;
+    evt.max_el         = s->prediction.predicted_max_elevation;
+    evt.pred_az        = s->prediction.satellite_ephem.azimuth;
+    evt.pred_el        = s->prediction.satellite_ephem.elevation;
+    evt.alt_km         = s->prediction.satellite_ephem.altitude_km;
+    evt.lat_deg        = s->prediction.satellite_ephem.latitude;
+    evt.lon_deg        = s->prediction.satellite_ephem.longitude;
+    evt.speed_kms      = s->prediction.satellite_ephem.speed_km_s;
+    evt.range_km       = s->prediction.satellite_ephem.range_km;
+    evt.range_rate_kms = s->prediction.satellite_ephem.range_rate_km_s;
     sso_roster_entry_t entries[SSO_IPC_MAX_CLIENTS_FOR_ROSTER];
     size_t n = 0;
     if (n < sizeof(entries) / sizeof(entries[0])) {
@@ -183,7 +216,22 @@ static void ipc_broadcast_state(state_t *s,
     g_last_state_flip    = evt.flip;
     g_last_state_in_pass = evt.in_pass;
     g_last_state_tracking= evt.tracking;
+    g_last_state_has_rot = evt.has_rotator;
     g_last_state_jul     = evt.jul_utc;
+    snprintf(g_last_state_idesg, sizeof g_last_state_idesg, "%s", evt.idesg);
+    g_last_state_epoch_min    = evt.epoch_min;
+    g_last_state_min_visible  = evt.min_visible;
+    g_last_state_min_above_0  = evt.min_above_0;
+    g_last_state_min_above_30 = evt.min_above_30;
+    g_last_state_max_el       = evt.max_el;
+    g_last_state_pred_az      = evt.pred_az;
+    g_last_state_pred_el      = evt.pred_el;
+    g_last_state_alt_km       = evt.alt_km;
+    g_last_state_lat_deg      = evt.lat_deg;
+    g_last_state_lon_deg      = evt.lon_deg;
+    g_last_state_speed_kms    = evt.speed_kms;
+    g_last_state_range_km     = evt.range_km;
+    g_last_state_rrate_kms    = evt.range_rate_kms;
     g_last_state_valid   = 1;
 }
 
@@ -216,7 +264,22 @@ static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
         welcome.flip        = g_last_state_flip;
         welcome.in_pass     = g_last_state_in_pass;
         welcome.tracking    = g_last_state_tracking;
+        welcome.has_rotator = g_last_state_has_rot;
         welcome.jul_utc     = g_last_state_jul;
+        snprintf(welcome.idesg, sizeof welcome.idesg, "%s", g_last_state_idesg);
+        welcome.epoch_min      = g_last_state_epoch_min;
+        welcome.min_visible    = g_last_state_min_visible;
+        welcome.min_above_0    = g_last_state_min_above_0;
+        welcome.min_above_30   = g_last_state_min_above_30;
+        welcome.max_el         = g_last_state_max_el;
+        welcome.pred_az        = g_last_state_pred_az;
+        welcome.pred_el        = g_last_state_pred_el;
+        welcome.alt_km         = g_last_state_alt_km;
+        welcome.lat_deg        = g_last_state_lat_deg;
+        welcome.lon_deg        = g_last_state_lon_deg;
+        welcome.speed_kms      = g_last_state_speed_kms;
+        welcome.range_km       = g_last_state_range_km;
+        welcome.range_rate_kms = g_last_state_rrate_kms;
         // Roster — operator first, then the existing clients we know
         // of. The newly-connecting client is already in the slot table
         // (slot_dispatch_line ran first) but its role isn't populated
@@ -604,11 +667,15 @@ void init_window(void)
 
 // --- Reports -------------------------------------------------------
 
-void report_predictions(state_t *state, double jul_utc, int *print_row, int print_col)
+// Pure-render predictions panel — operator runs the SGP4 search
+// upstream, viewer fills state.prediction from broadcast. No SGP4
+// calls inside, no current-time reads, so both sides paint the same
+// thing for the same input state.
+static void render_predictions_panel(state_t *state, double jul_utc,
+                                     int *print_row, int print_col)
 {
-    if (print_row == NULL) {
-        return;
-    }
+    if (print_row == NULL) return;
+    (void) jul_utc;
     int row = *print_row;
     int col = print_col;
 
@@ -650,15 +717,6 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
     }
     clrtoeol();
 
-    minutes_until_visible(&state->prediction, jul_utc,
-                          jul_utc + MAX_MINUTES_TO_PREDICT / 1440.0, 1.0);
-    if (fabs(state->prediction.predicted_minutes_until_visible) < 1) {
-        minutes_until_visible(&state->prediction, jul_utc,
-                              jul_utc + 2.0 / 1440.0, 1. / 120.0);
-    } else if (fabs(state->prediction.predicted_minutes_until_visible) < 10) {
-        minutes_until_visible(&state->prediction, jul_utc,
-                              jul_utc + 20.0 / 1440.0, 0.1);
-    }
     if (state->prediction.predicted_minutes_until_visible > 0) {
         if (state->prediction.predicted_minutes_until_visible < 1) {
             mvprintw(row++, col, "%15s   ", "next pass in");
@@ -674,15 +732,6 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
                      state->prediction.predicted_minutes_until_visible);
         }
         clrtoeol();
-        update_pass_predictions(&state->prediction,
-            jul_utc + state->prediction.predicted_minutes_until_visible / 1440.0,
-            0.1);
-        mvprintw(row++, col, "%15s   %.1f minutes", "duration",
-                 state->prediction.predicted_minutes_above_0_degrees);
-        clrtoeol();
-        mvprintw(row++, col, "%15s   %.1f minutes", "el>30",
-                 state->prediction.predicted_minutes_above_30_degrees);
-        clrtoeol();
     } else {
         mvprintw(row++, col, "%15s   ", "elapsed time");
         attron(COLOR_PAIR(3));
@@ -693,27 +742,53 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
             printw("%.1f minutes",
                    -state->prediction.predicted_minutes_until_visible);
         }
-        if (state->prediction.predicted_max_elevation == -180.0) {
-            // Started mid-pass: walk back to AOS so update_pass_predictions
-            // captures the true max elevation rather than just the remainder.
-            update_pass_predictions(&state->prediction,
-                jul_utc + state->prediction.predicted_minutes_until_visible / 1440.0,
-                0.1);
-        }
         attroff(COLOR_PAIR(3));
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.1f minutes", "duration",
-                 state->prediction.predicted_minutes_above_0_degrees);
-        clrtoeol();
-        mvprintw(row++, col, "%15s   %.1f minutes", "el>30",
-                 state->prediction.predicted_minutes_above_30_degrees);
-        clrtoeol();
     }
+    mvprintw(row++, col, "%15s   %.1f minutes", "duration",
+             state->prediction.predicted_minutes_above_0_degrees);
+    clrtoeol();
+    mvprintw(row++, col, "%15s   %.1f minutes", "el>30",
+             state->prediction.predicted_minutes_above_30_degrees);
+    clrtoeol();
     mvprintw(row++, col, "%15s   %.1f deg", "max elevation",
              state->prediction.predicted_max_elevation);
     clrtoeol();
 
     *print_row = row;
+}
+
+// SGP4 work that report_predictions used to do inline. Operator calls
+// this each tick so its state->prediction.predicted_* fields are
+// fresh before render + broadcast.
+static void compute_predictions(state_t *state, double jul_utc)
+{
+    minutes_until_visible(&state->prediction, jul_utc,
+                          jul_utc + MAX_MINUTES_TO_PREDICT / 1440.0, 1.0);
+    if (fabs(state->prediction.predicted_minutes_until_visible) < 1) {
+        minutes_until_visible(&state->prediction, jul_utc,
+                              jul_utc + 2.0 / 1440.0, 1. / 120.0);
+    } else if (fabs(state->prediction.predicted_minutes_until_visible) < 10) {
+        minutes_until_visible(&state->prediction, jul_utc,
+                              jul_utc + 20.0 / 1440.0, 0.1);
+    }
+    if (state->prediction.predicted_minutes_until_visible > 0) {
+        update_pass_predictions(&state->prediction,
+            jul_utc + state->prediction.predicted_minutes_until_visible / 1440.0,
+            0.1);
+    } else if (state->prediction.predicted_max_elevation == -180.0) {
+        // Started mid-pass: walk back to AOS so update_pass_predictions
+        // captures the true max elevation rather than just the remainder.
+        update_pass_predictions(&state->prediction,
+            jul_utc + state->prediction.predicted_minutes_until_visible / 1440.0,
+            0.1);
+    }
+}
+
+void report_predictions(state_t *state, double jul_utc, int *print_row, int print_col)
+{
+    compute_predictions(state, jul_utc);
+    render_predictions_panel(state, jul_utc, print_row, print_col);
 }
 
 // Render the operator/carrier/rotator status block. Caller supplies
@@ -879,37 +954,22 @@ void report_position(state_t *state, int *print_row, int print_col)
 
 // --- Viewer mode --------------------------------------------------
 //
-// Read-only mirror of the operator instance. The viewer keeps its own
-// state_t and runs SGP4 locally against the TLE the operator is using
-// (broadcast as `tle_path`), so it can render the same prediction +
-// position panels as the operator. Hardware-specific values
-// (current/target azimuth and elevation, in-pass flag, tracking flag,
-// carrier frequency) come from the broadcast — viewer has no rotator
-// or radio of its own.
+// Read-only mirror of the operator instance. The viewer does NOT run
+// SGP4 and does NOT load a TLE — it just deposits every broadcast
+// field into a state_t and calls the same render helpers the operator
+// uses, so the two displays are byte-identical except for the help text.
 
 static int    g_viewer_event_pending      = 0;
 static int    g_viewer_has_state          = 0;
-static char   g_viewer_sat[64]            = "";
-static double g_viewer_az                 = 0.0;
-static double g_viewer_el                 = 0.0;
-static long   g_viewer_freq_hz            = 0;
-static double g_viewer_doppler_hz         = 0.0;
-static double g_viewer_target_az          = 0.0;
-static double g_viewer_target_el          = 0.0;
-static int    g_viewer_flip               = 0;
-static int    g_viewer_in_pass            = 0;
-static int    g_viewer_tracking           = 0;
-static double g_viewer_op_jul             = 0.0;
-static char   g_viewer_tle_path[256]      = "";
 static char   g_viewer_operator[64]       = "";
 static char   g_viewer_roster_json[1024]  = "";
 static time_t g_viewer_last_event         = 0;
 static int    g_viewer_running            = 1;
-// state_t the viewer drives with its local SGP4. Lives across renders
-// so we can re-run update_satellite_position each tick.
+// state_t whose fields the viewer mirrors from the broadcast each tick.
 static state_t g_viewer_state;
-static int     g_viewer_tle_loaded        = 0;
-static char    g_viewer_loaded_tle[256]   = "";
+static double  g_viewer_carrier_hz        = 0.0;
+static double  g_viewer_jul_utc           = 0.0;
+static int     g_viewer_has_rotator       = 0;
 
 static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
                             void *user)
@@ -929,45 +989,42 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
                  evt->roster_json);
     }
     if (!evt->has_state) return;
-    snprintf(g_viewer_sat, sizeof g_viewer_sat, "%s", evt->satellite);
-    g_viewer_az          = evt->az;
-    g_viewer_el          = evt->el;
-    g_viewer_freq_hz     = evt->freq_hz;
-    g_viewer_doppler_hz  = evt->doppler_hz;
-    g_viewer_target_az   = evt->target_az;
-    g_viewer_target_el   = evt->target_el;
-    g_viewer_flip        = evt->flip;
-    g_viewer_in_pass     = evt->in_pass;
-    g_viewer_tracking    = evt->tracking;
-    if (evt->jul_utc != 0.0) g_viewer_op_jul = evt->jul_utc;
-    if (evt->tle_path[0]) {
-        snprintf(g_viewer_tle_path, sizeof g_viewer_tle_path, "%s",
-                 evt->tle_path);
-    }
-    g_viewer_has_state = 1;
-    g_viewer_event_pending = 1;
-}
 
-// Load (or reload, if the operator switched TLEs) the broadcast TLE
-// into the viewer's state. Returns 1 if the local state now has a
-// valid TLE to propagate, 0 otherwise.
-static int viewer_ensure_tle_loaded(void)
-{
-    if (!g_viewer_tle_path[0]) return g_viewer_tle_loaded;
-    if (g_viewer_tle_loaded
-        && strcmp(g_viewer_tle_path, g_viewer_loaded_tle) == 0) {
-        return 1;
-    }
-    if (!g_viewer_sat[0]) return g_viewer_tle_loaded;
-    g_viewer_state.prediction.tles_filename = g_viewer_tle_path;
-    g_viewer_state.prediction.satellite_ephem.name = g_viewer_sat;
-    if (load_tle(&g_viewer_state.prediction) != 0) return 0;
-    ClearFlag(ALL_FLAGS);
-    select_ephemeris(&g_viewer_state.prediction.satellite_ephem.tle);
-    snprintf(g_viewer_loaded_tle, sizeof g_viewer_loaded_tle, "%s",
-             g_viewer_tle_path);
-    g_viewer_tle_loaded = 1;
-    return 1;
+    state_t *s = &g_viewer_state;
+    snprintf(s->prediction.satellite_ephem.tle.sat_name,
+             sizeof s->prediction.satellite_ephem.tle.sat_name, "%s",
+             evt->satellite);
+    snprintf(s->prediction.satellite_ephem.tle.idesg,
+             sizeof s->prediction.satellite_ephem.tle.idesg, "%s",
+             evt->idesg);
+    s->prediction.minutes_since_epoch              = evt->epoch_min;
+    s->prediction.predicted_minutes_until_visible  = evt->min_visible;
+    s->prediction.predicted_minutes_above_0_degrees  = evt->min_above_0;
+    s->prediction.predicted_minutes_above_30_degrees = evt->min_above_30;
+    s->prediction.predicted_max_elevation          = evt->max_el;
+    s->prediction.satellite_ephem.azimuth          = evt->pred_az;
+    s->prediction.satellite_ephem.elevation        = evt->pred_el;
+    s->prediction.satellite_ephem.altitude_km      = evt->alt_km;
+    s->prediction.satellite_ephem.latitude         = evt->lat_deg;
+    s->prediction.satellite_ephem.longitude        = evt->lon_deg;
+    s->prediction.satellite_ephem.speed_km_s       = evt->speed_kms;
+    s->prediction.satellite_ephem.range_km         = evt->range_km;
+    s->prediction.satellite_ephem.range_rate_km_s  = evt->range_rate_kms;
+    s->in_pass                                     = evt->in_pass;
+    s->antenna_rotator.tracking                    = evt->tracking;
+    s->antenna_rotator.azimuth                     = evt->az;
+    s->antenna_rotator.elevation                   = evt->el;
+    s->antenna_rotator.target_azimuth              = evt->target_az;
+    s->antenna_rotator.target_elevation            = evt->target_el;
+    s->antenna_rotator.flip_mode_pass              = evt->flip;
+
+    g_viewer_has_rotator = evt->has_rotator;
+    g_viewer_jul_utc     = evt->jul_utc;
+    g_viewer_carrier_hz  = (evt->doppler_hz != 0.0)
+        ? (double)evt->freq_hz + evt->doppler_hz
+        : (double)evt->freq_hz;
+    g_viewer_has_state   = 1;
+    g_viewer_event_pending = 1;
 }
 
 // Format the roster array into "alice,bob,carol" for the header bar,
@@ -1015,64 +1072,37 @@ static void viewer_roster_users(char *out, size_t out_size)
 
 static void viewer_render(int connected)
 {
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
-    (void) rows;
+    int cols = COLS;
     erase();
 
-    int row = 1, col = 1;
-    int have_tle = viewer_ensure_tle_loaded();
-
-    // Use the operator's tick timestamp so SGP4 propagation matches
-    // the operator's display exactly (no "viewer a few seconds ahead").
-    // Fall back to local now if we haven't received a timestamp yet.
-    double jul_utc;
-    if (g_viewer_op_jul != 0.0) {
-        jul_utc = g_viewer_op_jul;
+    if (!g_viewer_has_state) {
+        mvprintw(2, 2, "(waiting for state from the operator...)");
     } else {
-        struct tm utc;
-        struct timeval tv;
-        UTC_Calendar_Now(&utc, &tv);
-        jul_utc = Julian_Date(&utc, &tv);
-    }
-    if (have_tle) {
-        update_satellite_position(&g_viewer_state.prediction, jul_utc);
-        g_viewer_state.in_pass = g_viewer_in_pass;
-        g_viewer_state.antenna_rotator.tracking = g_viewer_tracking;
-        report_predictions(&g_viewer_state, jul_utc, &row, col);
-    } else {
-        mvprintw(row++, col, "(waiting for TLE path from operator...)");
-    }
+        int row = 1, col = 1;
+        render_predictions_panel(&g_viewer_state, g_viewer_jul_utc,
+                                 &row, col);
 
-    int srow = row + 1;
-    double display_dl_hz = g_viewer_doppler_hz != 0.0
-        ? (double)g_viewer_freq_hz + g_viewer_doppler_hz
-        : (double)g_viewer_freq_hz;
-    int have_rotator_data = g_viewer_has_state
-        && (g_viewer_az != 0.0 || g_viewer_el != 0.0
-            || g_viewer_target_az != 0.0 || g_viewer_target_el != 0.0);
-    char viewers[160];
-    viewer_roster_users(viewers, sizeof viewers);
-    status_panel_t sp;
-    memset(&sp, 0, sizeof sp);
-    sp.control_mode  = 0;
-    sp.operator_user = g_viewer_operator;
-    sp.viewers       = viewers[0] ? viewers : "(none)";
-    sp.carrier_hz    = display_dl_hz;
-    sp.have_rotator  = have_rotator_data;
-    sp.current_az    = g_viewer_az;
-    sp.current_el    = g_viewer_el;
-    sp.target_az     = g_viewer_target_az;
-    sp.target_el     = g_viewer_target_el;
-    sp.flip          = g_viewer_flip;
-    render_status_panel(&sp, &srow, col);
+        char viewers[160];
+        viewer_roster_users(viewers, sizeof viewers);
+        int srow = row + 1;
+        status_panel_t sp;
+        memset(&sp, 0, sizeof sp);
+        sp.control_mode  = 0;
+        sp.operator_user = g_viewer_operator;
+        sp.viewers       = viewers[0] ? viewers : "(none)";
+        sp.carrier_hz    = g_viewer_carrier_hz;
+        sp.have_rotator  = g_viewer_has_rotator;
+        sp.current_az    = g_viewer_state.antenna_rotator.azimuth;
+        sp.current_el    = g_viewer_state.antenna_rotator.elevation;
+        sp.target_az     = g_viewer_state.antenna_rotator.target_azimuth;
+        sp.target_el     = g_viewer_state.antenna_rotator.target_elevation;
+        sp.flip          = g_viewer_state.antenna_rotator.flip_mode_pass;
+        render_status_panel(&sp, &srow, col);
 
-    if (have_tle) {
         int prow = 5;
         report_position(&g_viewer_state, &prow, 50);
     }
 
-    // Footer: connection status + quit hint.
     attron(A_REVERSE);
     char foot[160];
     time_t now = time(NULL);
@@ -1104,18 +1134,10 @@ static int run_viewer(void)
     }
     sso_ipc_client_on_event(cli, viewer_on_event, NULL);
 
-    // Mirror the operator's observer + nominal frequencies so
-    // local SGP4 + the rendered status block use the same constants.
+    // Viewer doesn't run SGP4 or load a TLE — it deposits every
+    // displayed value into g_viewer_state from the broadcast and uses
+    // the same render helpers the operator does. zero-init is enough.
     memset(&g_viewer_state, 0, sizeof g_viewer_state);
-    g_viewer_state.prediction.observer_ephem.position_geodetic.lat =
-        RAO_LATITUDE * M_PI / 180.0;
-    g_viewer_state.prediction.observer_ephem.position_geodetic.lon =
-        RAO_LONGITUDE * M_PI / 180.0;
-    g_viewer_state.prediction.observer_ephem.position_geodetic.alt =
-        RAO_ALTITUDE / 1000.0;
-    g_viewer_state.nominal_uplink_frequency_hz   = UPLINK_FREQ_MHZ * 1e6;
-    g_viewer_state.nominal_downlink_frequency_hz = DOWNLINK_FREQ_MHZ * 1e6;
-    g_viewer_state.prediction.predicted_max_elevation = -180.0;
 
     sso_event_t hello;
     sso_event_init(&hello, SSO_EVT_HELLO);

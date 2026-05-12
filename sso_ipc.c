@@ -466,6 +466,23 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
         if (evt->jul_utc != 0.0) {
             if (json_field_double(&p, end, &first, "jul", evt->jul_utc) < 0) return -1;
         }
+        if (evt->has_rotator) {
+            if (json_field_bool(&p, end, &first, "has_rot", 1) < 0) return -1;
+        }
+        if (json_field_str(&p, end, &first, "idesg", evt->idesg) < 0) return -1;
+        if (json_field_double(&p, end, &first, "ep_min",  evt->epoch_min) < 0) return -1;
+        if (json_field_double(&p, end, &first, "mv",      evt->min_visible) < 0) return -1;
+        if (json_field_double(&p, end, &first, "ma0",     evt->min_above_0) < 0) return -1;
+        if (json_field_double(&p, end, &first, "ma30",    evt->min_above_30) < 0) return -1;
+        if (json_field_double(&p, end, &first, "max_el",  evt->max_el) < 0) return -1;
+        if (json_field_double(&p, end, &first, "p_az",    evt->pred_az) < 0) return -1;
+        if (json_field_double(&p, end, &first, "p_el",    evt->pred_el) < 0) return -1;
+        if (json_field_double(&p, end, &first, "alt",     evt->alt_km) < 0) return -1;
+        if (json_field_double(&p, end, &first, "lat",     evt->lat_deg) < 0) return -1;
+        if (json_field_double(&p, end, &first, "lon",     evt->lon_deg) < 0) return -1;
+        if (json_field_double(&p, end, &first, "spd",     evt->speed_kms) < 0) return -1;
+        if (json_field_double(&p, end, &first, "rng",     evt->range_km) < 0) return -1;
+        if (json_field_double(&p, end, &first, "rrate",   evt->range_rate_kms) < 0) return -1;
         if (evt->roster_json[0]) {
             if (json_field_raw(&p, end, &first, "roster", evt->roster_json) < 0) return -1;
         }
@@ -526,6 +543,23 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
     if (json_get_bool(line, "in_pass",  &flag) > 0) evt->in_pass = flag;
     if (json_get_bool(line, "tracking", &flag) > 0) evt->tracking = flag;
     if (json_get_double(line, "jul", &evt->jul_utc) > 0) evt->has_state = 1;
+    int rotflag = 0;
+    if (json_get_bool(line, "has_rot", &rotflag) > 0) evt->has_rotator = rotflag;
+    if (json_get_string(line, "idesg", evt->idesg, sizeof evt->idesg) > 0)
+        evt->has_state = 1;
+    if (json_get_double(line, "ep_min", &evt->epoch_min)    > 0) evt->has_state = 1;
+    if (json_get_double(line, "mv",     &evt->min_visible)  > 0) evt->has_state = 1;
+    if (json_get_double(line, "ma0",    &evt->min_above_0)  > 0) evt->has_state = 1;
+    if (json_get_double(line, "ma30",   &evt->min_above_30) > 0) evt->has_state = 1;
+    if (json_get_double(line, "max_el", &evt->max_el)       > 0) evt->has_state = 1;
+    if (json_get_double(line, "p_az",   &evt->pred_az)      > 0) evt->has_state = 1;
+    if (json_get_double(line, "p_el",   &evt->pred_el)      > 0) evt->has_state = 1;
+    if (json_get_double(line, "alt",    &evt->alt_km)       > 0) evt->has_state = 1;
+    if (json_get_double(line, "lat",    &evt->lat_deg)      > 0) evt->has_state = 1;
+    if (json_get_double(line, "lon",    &evt->lon_deg)      > 0) evt->has_state = 1;
+    if (json_get_double(line, "spd",    &evt->speed_kms)    > 0) evt->has_state = 1;
+    if (json_get_double(line, "rng",    &evt->range_km)     > 0) evt->has_state = 1;
+    if (json_get_double(line, "rrate",  &evt->range_rate_kms) > 0) evt->has_state = 1;
     if (json_get_raw(line, "roster", evt->roster_json, sizeof(evt->roster_json)) > 0) {
         evt->has_state = 1;
     }
