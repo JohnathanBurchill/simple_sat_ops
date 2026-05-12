@@ -20,6 +20,8 @@
 
 #include "packet_db.h"
 
+#include "sso_paths.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -115,6 +117,21 @@ int packet_db_default_path(char *buf, size_t cap)
         memcpy(buf, override, strlen(override) + 1);
         return 0;
     }
+    // Shared FrontierSat tree first — operators all see the same DB
+    // when the ground machine has /FrontierSat/ set up (or
+    // FRONTIERSAT_ROOT pointing at it). sso_packet_db_path() handles
+    // the dev-host fallback ($HOME/FrontierSat/packet_db.sqlite), so
+    // this branch covers both production and bench use cases.
+    const char *shared = sso_packet_db_path();
+    if (shared != NULL && shared[0] != '\0') {
+        if (strlen(shared) + 1 > cap) return -1;
+        sso_mkdir_p_for_file(shared);
+        memcpy(buf, shared, strlen(shared) + 1);
+        return 0;
+    }
+    // Legacy per-user fallback for hosts where sso_paths can't resolve
+    // anything (no $HOME, no /FrontierSat). Preserves the old layout
+    // so we don't regress single-user dev setups.
     const char *home = getenv("HOME");
     if (home == NULL || home[0] == '\0') return -1;
     char dir[1024];

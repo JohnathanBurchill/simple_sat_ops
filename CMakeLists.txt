@@ -129,6 +129,7 @@ if (OPENSSL_FOUND)
     target_link_directories(packet_query PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(packet_query PRIVATE ${OPENSSL_LIBRARIES} m)
     target_link_packet_db(packet_query)
+    target_link_sso_core(packet_query)
     list(APPEND SSO_TARGETS packet_query)
 
     # Curses TUI sibling of packet_query.
@@ -144,6 +145,7 @@ if (OPENSSL_FOUND)
         target_link_libraries(packet_browser PRIVATE
             ${OPENSSL_LIBRARIES} ${NCURSES_LIBRARIES} m)
         target_link_packet_db(packet_browser)
+        target_link_sso_core(packet_browser)
         list(APPEND SSO_TARGETS packet_browser)
     endif()
 
