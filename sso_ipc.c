@@ -611,7 +611,18 @@ sso_ipc_server_t *sso_ipc_server_open(const char *tool) {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", srv->sock_path);
+    // sun_path is 108 bytes on Linux. Our sock_path buffer is wider, so
+    // bound-check before copying — GCC's -Wformat-truncation flags an
+    // snprintf here otherwise, and the underlying ENAMETOOLONG is a
+    // real failure mode worth surfacing.
+    size_t sp_len = strlen(srv->sock_path);
+    if (sp_len >= sizeof(addr.sun_path)) {
+        errno = ENAMETOOLONG;
+        close(fd);
+        free(srv);
+        return NULL;
+    }
+    memcpy(addr.sun_path, srv->sock_path, sp_len + 1);
 
     if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
         close(fd);
@@ -892,7 +903,17 @@ sso_ipc_client_t *sso_ipc_client_connect(const char *tool) {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+    size_t path_len = strlen(path);
+    if (path_len >= sizeof(addr.sun_path)) {
+        // Linux's sun_path is 108 bytes; our path buffer is 256. Reject
+        // overlong paths up front rather than letting snprintf silently
+        // truncate (and rather than letting GCC -Wformat-truncation
+        // complain about it).
+        errno = ENAMETOOLONG;
+        close(fd);
+        return NULL;
+    }
+    memcpy(addr.sun_path, path, path_len + 1);
     if (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
         if (errno != EINPROGRESS) {
             close(fd);
