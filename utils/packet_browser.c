@@ -134,6 +134,7 @@ enum {
     PAIR_BULK,
     PAIR_ERROR,
     PAIR_SEL,
+    PAIR_SEL_ERR,
     PAIR_DIM,
 };
 
@@ -397,21 +398,31 @@ static void draw_list(int list_top, int list_h, int cols)
         int color = color_for_type(r->type_name);
         int has_err = row_has_error(r);
 
+        int sel_pair = has_err ? PAIR_SEL_ERR : PAIR_SEL;
         if (is_sel) {
-            if (g_have_color) attron(COLOR_PAIR(PAIR_SEL));
+            if (g_have_color) attron(COLOR_PAIR(sel_pair));
             else              attron(A_REVERSE);
+            // Bold helps the bad-decode case stay legible on mono
+            // terminals where there's no PAIR_SEL_ERR to fall back on.
+            if (has_err)      attron(A_BOLD);
         } else if (has_err && g_have_color) {
             attron(COLOR_PAIR(PAIR_ERROR));
         } else if (color != 0) {
             attron(COLOR_PAIR(color));
         }
 
-        // First two cols get a "▶" marker for the selected row.
-        mvaddstr(data_top + i, 0, is_sel ? "> " : "  ");
+        // Col 0: "> " marker for the selected row. Col 1: "!" whenever
+        // the row decoded with rs/hmac/crc trouble — visible regardless
+        // of selection state or whether the terminal has colour.
+        char marker[3] = { is_sel ? '>' : ' ',
+                           has_err ? '!' : ' ',
+                           '\0' };
+        mvaddstr(data_top + i, 0, marker);
         addnstr(line, cols - 2);
 
         if (is_sel) {
-            if (g_have_color) attroff(COLOR_PAIR(PAIR_SEL));
+            if (has_err)      attroff(A_BOLD);
+            if (g_have_color) attroff(COLOR_PAIR(sel_pair));
             else              attroff(A_REVERSE);
         } else if (has_err && g_have_color) {
             attroff(COLOR_PAIR(PAIR_ERROR));
@@ -656,6 +667,7 @@ int main(int argc, char **argv)
         init_pair(PAIR_BULK,   COLOR_MAGENTA, -1);
         init_pair(PAIR_ERROR,  COLOR_RED,    -1);
         init_pair(PAIR_SEL,    COLOR_BLACK,  COLOR_WHITE);
+        init_pair(PAIR_SEL_ERR, COLOR_RED,   COLOR_WHITE);
         g_have_color = 1;
     }
 
