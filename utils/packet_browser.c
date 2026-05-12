@@ -854,23 +854,25 @@ int main(int argc, char **argv)
     if (has_colors()) {
         start_color();
         use_default_colors();
-        init_pair(PAIR_BAR,    COLOR_WHITE,  COLOR_BLUE);
-        init_pair(PAIR_BEACON, COLOR_CYAN,   -1);
-        init_pair(PAIR_TCMD,   COLOR_YELLOW, -1);
-        init_pair(PAIR_LOG,    COLOR_GREEN,  -1);
+        // Selection background: prefer a mid-tone gray from the
+        // xterm 256-colour ramp (index 240 ~ Grey35) when the
+        // terminal supports it; fall back to COLOR_WHITE on
+        // 8/16-colour terminals where there's no gray slot.
+        short sel_bg = (COLORS >= 256) ? 240 : COLOR_WHITE;
+        init_pair(PAIR_BAR,    COLOR_WHITE,   COLOR_BLUE);
+        init_pair(PAIR_BEACON, COLOR_CYAN,    -1);
+        init_pair(PAIR_TCMD,   COLOR_YELLOW,  -1);
+        init_pair(PAIR_LOG,    COLOR_GREEN,   -1);
         init_pair(PAIR_BULK,   COLOR_MAGENTA, -1);
-        init_pair(PAIR_ERROR,  COLOR_RED,    -1);
-        init_pair(PAIR_SEL,    COLOR_BLACK,  COLOR_WHITE);
-        init_pair(PAIR_SEL_ERR,    COLOR_RED,     COLOR_WHITE);
+        init_pair(PAIR_ERROR,  COLOR_RED,     -1);
+        init_pair(PAIR_SEL,        COLOR_WHITE,   sel_bg);
+        init_pair(PAIR_SEL_ERR,    COLOR_RED,     sel_bg);
         // Per-type selection pairs preserve the row's type-colour
-        // foreground while applying the highlight background. No
-        // A_BOLD on selection — bold cyan/yellow get rendered as
-        // their bright-palette siblings on many terminals, which
-        // wash out against the COLOR_WHITE (often light-gray) bg.
-        init_pair(PAIR_SEL_BEACON, COLOR_CYAN,    COLOR_WHITE);
-        init_pair(PAIR_SEL_TCMD,   COLOR_YELLOW,  COLOR_WHITE);
-        init_pair(PAIR_SEL_LOG,    COLOR_GREEN,   COLOR_WHITE);
-        init_pair(PAIR_SEL_BULK,   COLOR_MAGENTA, COLOR_WHITE);
+        // foreground while applying the highlight background.
+        init_pair(PAIR_SEL_BEACON, COLOR_CYAN,    sel_bg);
+        init_pair(PAIR_SEL_TCMD,   COLOR_YELLOW,  sel_bg);
+        init_pair(PAIR_SEL_LOG,    COLOR_GREEN,   sel_bg);
+        init_pair(PAIR_SEL_BULK,   COLOR_MAGENTA, sel_bg);
         g_have_color = 1;
     }
 
