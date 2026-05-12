@@ -463,6 +463,9 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
         if (evt->tracking) {
             if (json_field_bool(&p, end, &first, "tracking", 1) < 0) return -1;
         }
+        if (evt->jul_utc != 0.0) {
+            if (json_field_double(&p, end, &first, "jul", evt->jul_utc) < 0) return -1;
+        }
         if (evt->roster_json[0]) {
             if (json_field_raw(&p, end, &first, "roster", evt->roster_json) < 0) return -1;
         }
@@ -522,6 +525,7 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
     if (json_get_bool(line, "flip",     &flag) > 0) evt->flip = flag;
     if (json_get_bool(line, "in_pass",  &flag) > 0) evt->in_pass = flag;
     if (json_get_bool(line, "tracking", &flag) > 0) evt->tracking = flag;
+    if (json_get_double(line, "jul", &evt->jul_utc) > 0) evt->has_state = 1;
     if (json_get_raw(line, "roster", evt->roster_json, sizeof(evt->roster_json)) > 0) {
         evt->has_state = 1;
     }

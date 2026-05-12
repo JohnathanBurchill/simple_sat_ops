@@ -103,11 +103,13 @@ static double g_last_state_tgt_el    = 0.0;
 static int    g_last_state_flip      = 0;
 static int    g_last_state_in_pass   = 0;
 static int    g_last_state_tracking  = 0;
+static double g_last_state_jul       = 0.0;
 
 static void ipc_broadcast_state(state_t *s,
                                   double az, double el,
                                   double downlink_freq,
-                                  double doppler_delta_dl) {
+                                  double doppler_delta_dl,
+                                  double jul_utc) {
     if (!g_ipc) return;
     sso_event_t evt;
     sso_event_init(&evt, SSO_EVT_STATE);
@@ -137,6 +139,7 @@ static void ipc_broadcast_state(state_t *s,
     evt.flip      = s->antenna_rotator.flip_mode_pass;
     evt.in_pass   = s->in_pass;
     evt.tracking  = s->antenna_rotator.tracking;
+    evt.jul_utc   = jul_utc;
     sso_roster_entry_t entries[SSO_IPC_MAX_CLIENTS_FOR_ROSTER];
     size_t n = 0;
     if (n < sizeof(entries) / sizeof(entries[0])) {
@@ -180,6 +183,7 @@ static void ipc_broadcast_state(state_t *s,
     g_last_state_flip    = evt.flip;
     g_last_state_in_pass = evt.in_pass;
     g_last_state_tracking= evt.tracking;
+    g_last_state_jul     = evt.jul_utc;
     g_last_state_valid   = 1;
 }
 
@@ -212,6 +216,7 @@ static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
         welcome.flip        = g_last_state_flip;
         welcome.in_pass     = g_last_state_in_pass;
         welcome.tracking    = g_last_state_tracking;
+        welcome.jul_utc     = g_last_state_jul;
         // Roster — operator first, then the existing clients we know
         // of. The newly-connecting client is already in the slot table
         // (slot_dispatch_line ran first) but its role isn't populated
@@ -716,9 +721,9 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
 // the rotator from hardware) and the viewer (who pulls them from the
 // IPC broadcast).
 typedef struct {
-    int    control_mode;     // 1 = "OPERATOR <user>"; 0 = viewer header
+    int    control_mode;     // 1 = operator process; 0 = viewer process
     const  char *operator_user;
-    size_t n_viewers;
+    const  char *viewers;    // comma-separated viewer names, or "(none)"
     double carrier_hz;
     int    have_rotator;     // 1 -> render az/el block; 0 -> "not initialized"
     double current_az;
@@ -726,7 +731,6 @@ typedef struct {
     double target_az;
     double target_el;
     int    flip;
-    const  char *viewer_user;  // viewer-only: name of this viewer
 } status_panel_t;
 
 static void render_status_panel(const status_panel_t *p,
@@ -736,17 +740,10 @@ static void render_status_panel(const status_panel_t *p,
     int row = *print_row;
     int col = print_col;
 
-    if (p->control_mode) {
-        mvprintw(0, 0, "%-15s %s   viewers: %zu",
-                 "OPERATOR",
-                 p->operator_user ? p->operator_user : "?",
-                 p->n_viewers);
-    } else {
-        mvprintw(0, 0, "%-15s %s   viewing as: %s",
-                 "OPERATOR",
-                 p->operator_user ? p->operator_user : "?",
-                 p->viewer_user ? p->viewer_user : "?");
-    }
+    mvprintw(0, 0, "%-15s %s   viewers: %s",
+             "OPERATOR",
+             p->operator_user ? p->operator_user : "?",
+             p->viewers && p->viewers[0] ? p->viewers : "(none)");
     clrtoeol();
 
     mvprintw(row++, col, "%15s   %.6f MHz", "CARRIER", p->carrier_hz / 1e6);
@@ -778,15 +775,45 @@ static void render_status_panel(const status_panel_t *p,
     *print_row = row;
 }
 
+// Build a comma-separated list of currently-connected viewer/external
+// clients. Skips anonymous (no-name) slots and is bounded by the
+// caller's buffer.
+static void operator_viewers_list(char *out, size_t out_size)
+{
+    if (out_size == 0) return;
+    out[0] = '\0';
+    if (!g_ipc) return;
+    sso_ipc_iter_t it = {0};
+    sso_client_id_t cid;
+    char user[64], role[16], since[40];
+    size_t written = 0;
+    while (sso_ipc_server_next_client(g_ipc, &it, &cid,
+                                       user, sizeof user,
+                                       role, sizeof role,
+                                       since, sizeof since) == 0) {
+        if (!user[0]) continue;
+        size_t nlen = strlen(user);
+        size_t need = nlen + (written > 0 ? 1 : 0);
+        if (written + need + 1 >= out_size) break;
+        if (written > 0) out[written++] = ',';
+        memcpy(out + written, user, nlen);
+        written += nlen;
+        out[written] = '\0';
+    }
+}
+
 void report_status(state_t *state, int *print_row, int print_col)
 {
     if (print_row == NULL) return;
+
+    static char viewers[256];
+    operator_viewers_list(viewers, sizeof viewers);
 
     status_panel_t p;
     memset(&p, 0, sizeof p);
     p.control_mode  = g_control_mode;
     p.operator_user = g_operator_user;
-    p.n_viewers     = g_control_mode ? sso_ipc_server_client_count(g_ipc) : 0;
+    p.viewers       = viewers[0] ? viewers : "(none)";
 
     double display_dl_hz = state->doppler_downlink_frequency_hz;
     if (display_dl_hz == 0.0) display_dl_hz = state->nominal_downlink_frequency_hz;
@@ -860,6 +887,7 @@ void report_position(state_t *state, int *print_row, int print_col)
 // carrier frequency) come from the broadcast — viewer has no rotator
 // or radio of its own.
 
+static int    g_viewer_event_pending      = 0;
 static int    g_viewer_has_state          = 0;
 static char   g_viewer_sat[64]            = "";
 static double g_viewer_az                 = 0.0;
@@ -871,6 +899,7 @@ static double g_viewer_target_el          = 0.0;
 static int    g_viewer_flip               = 0;
 static int    g_viewer_in_pass            = 0;
 static int    g_viewer_tracking           = 0;
+static double g_viewer_op_jul             = 0.0;
 static char   g_viewer_tle_path[256]      = "";
 static char   g_viewer_operator[64]       = "";
 static char   g_viewer_roster_json[1024]  = "";
@@ -910,11 +939,13 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
     g_viewer_flip        = evt->flip;
     g_viewer_in_pass     = evt->in_pass;
     g_viewer_tracking    = evt->tracking;
+    if (evt->jul_utc != 0.0) g_viewer_op_jul = evt->jul_utc;
     if (evt->tle_path[0]) {
         snprintf(g_viewer_tle_path, sizeof g_viewer_tle_path, "%s",
                  evt->tle_path);
     }
     g_viewer_has_state = 1;
+    g_viewer_event_pending = 1;
 }
 
 // Load (or reload, if the operator switched TLEs) the broadcast TLE
@@ -982,7 +1013,7 @@ static void viewer_roster_users(char *out, size_t out_size)
     }
 }
 
-static void viewer_render(int connected, const char *viewer_user)
+static void viewer_render(int connected)
 {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
@@ -992,13 +1023,18 @@ static void viewer_render(int connected, const char *viewer_user)
     int row = 1, col = 1;
     int have_tle = viewer_ensure_tle_loaded();
 
-    // Drive local SGP4 against the operator's TLE — same code path the
-    // operator's loop runs, so report_predictions / report_position
-    // render identical values.
-    struct tm utc;
-    struct timeval tv;
-    UTC_Calendar_Now(&utc, &tv);
-    double jul_utc = Julian_Date(&utc, &tv);
+    // Use the operator's tick timestamp so SGP4 propagation matches
+    // the operator's display exactly (no "viewer a few seconds ahead").
+    // Fall back to local now if we haven't received a timestamp yet.
+    double jul_utc;
+    if (g_viewer_op_jul != 0.0) {
+        jul_utc = g_viewer_op_jul;
+    } else {
+        struct tm utc;
+        struct timeval tv;
+        UTC_Calendar_Now(&utc, &tv);
+        jul_utc = Julian_Date(&utc, &tv);
+    }
     if (have_tle) {
         update_satellite_position(&g_viewer_state.prediction, jul_utc);
         g_viewer_state.in_pass = g_viewer_in_pass;
@@ -1008,9 +1044,6 @@ static void viewer_render(int connected, const char *viewer_user)
         mvprintw(row++, col, "(waiting for TLE path from operator...)");
     }
 
-    // Status panel: pull rotator + carrier from the broadcast (the
-    // viewer has no hardware), reusing the same renderer the operator
-    // calls so the layout matches.
     int srow = row + 1;
     double display_dl_hz = g_viewer_doppler_hz != 0.0
         ? (double)g_viewer_freq_hz + g_viewer_doppler_hz
@@ -1018,11 +1051,13 @@ static void viewer_render(int connected, const char *viewer_user)
     int have_rotator_data = g_viewer_has_state
         && (g_viewer_az != 0.0 || g_viewer_el != 0.0
             || g_viewer_target_az != 0.0 || g_viewer_target_el != 0.0);
+    char viewers[160];
+    viewer_roster_users(viewers, sizeof viewers);
     status_panel_t sp;
     memset(&sp, 0, sizeof sp);
     sp.control_mode  = 0;
     sp.operator_user = g_viewer_operator;
-    sp.viewer_user   = viewer_user;
+    sp.viewers       = viewers[0] ? viewers : "(none)";
     sp.carrier_hz    = display_dl_hz;
     sp.have_rotator  = have_rotator_data;
     sp.current_az    = g_viewer_az;
@@ -1037,9 +1072,9 @@ static void viewer_render(int connected, const char *viewer_user)
         report_position(&g_viewer_state, &prow, 50);
     }
 
-    // Footer: connection status + viewers + quit hint.
+    // Footer: connection status + quit hint.
     attron(A_REVERSE);
-    char foot[512];
+    char foot[160];
     time_t now = time(NULL);
     long stale_s = g_viewer_last_event > 0
         ? (long)(now - g_viewer_last_event)
@@ -1048,12 +1083,7 @@ static void viewer_render(int connected, const char *viewer_user)
                                     : (stale_s < 0 ? "WAITING"
                                                    : (stale_s > 5 ? "STALE"
                                                                   : "LIVE"));
-    char viewers[160];
-    viewer_roster_users(viewers, sizeof viewers);
-    snprintf(foot, sizeof foot,
-             " %s   viewers: %s     q : quit ",
-             status,
-             viewers[0] ? viewers : "(none)");
+    snprintf(foot, sizeof foot, " %s     q : quit ", status);
     int flen = (int)strlen(foot);
     if (flen > cols) flen = cols;
     mvaddnstr(LINES - 1, 0, foot, flen);
@@ -1099,14 +1129,28 @@ static int run_viewer(void)
     }
 
     init_window();
+    int last_connected = -1;
+    time_t last_render = 0;
+    // Initial paint so the user sees something before the first event.
+    viewer_render(sso_ipc_client_is_connected(cli));
+    last_render = time(NULL);
     while (g_viewer_running) {
-        // Match the operator's ~2 Hz cadence. poll returns sooner when
-        // a STATE broadcast arrives, so the render still happens within
-        // a frame of any incoming event.
-        int rc = sso_ipc_client_step(cli, 500);
+        // Short poll so 'q' is responsive; events drive the render.
+        int rc = sso_ipc_client_step(cli, 200);
         if (rc < 0) break;
         int connected = sso_ipc_client_is_connected(cli);
-        viewer_render(connected, me ? me : "?");
+        time_t now = time(NULL);
+        // Re-render when a new broadcast arrives, on a connection state
+        // change, or once every 5 s as a heartbeat so STALE/etc. show
+        // up even without traffic.
+        if (g_viewer_event_pending
+            || connected != last_connected
+            || (now - last_render) >= 5) {
+            viewer_render(connected);
+            g_viewer_event_pending = 0;
+            last_connected = connected;
+            last_render = now;
+        }
         int key = getch();
         if (key == 'q' || key == 'Q' || key == 27 /* Esc */) {
             g_viewer_running = 0;
@@ -1464,7 +1508,8 @@ int main(int argc, char **argv)
             sso_ipc_server_step(g_ipc, 0);
             ipc_broadcast_state(&state, current_az, current_el,
                                  current_downlink_frequency,
-                                 doppler_delta_downlink);
+                                 doppler_delta_downlink,
+                                 jul_utc);
         }
         if (g_yield_requested) {
             sso_audit_event("yield-requested",

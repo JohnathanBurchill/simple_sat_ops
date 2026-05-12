@@ -70,6 +70,9 @@ typedef struct {
     int flip;                // flip_mode_pass
     int in_pass;
     int tracking;
+    double jul_utc;          // operator's SGP4 epoch for this tick
+                             // — viewer uses it to propagate at the
+                             // same instant so values match exactly
 
     // rx-stats
     double snr_db;
