@@ -174,9 +174,12 @@ void usage(FILE *dest, const char *name, int full)
         "  --tle=<path>                 Path to a TLE file (2 or 3-line format).\n"
         "                               Default: $HOME/.local/state/simple_sat_ops/active.tle\n"
         "\n"
-        "Hardware (rotator only — the radio is now the B210, driven externally):\n"
-        "  --with-rotator               Initialise and command the SPID Rot2Prog\n"
-        "  --with-hardware              Synonym for --with-rotator (kept for muscle memory)\n"
+        "Hardware (rotator only — the radio is now the B210, driven\n"
+        "externally; there is no audio path in this binary):\n"
+        "  --without-rotator            Skip the SPID Rot2Prog. Default is on:\n"
+        "                               the tracker initialises and commands\n"
+        "                               the rotator unless this flag is given.\n"
+        "  --without-hardware           Synonym for --without-rotator\n"
         "\n"
         "Operator coordination:\n"
         "  --control                    Open the sso_ipc server (operator mode).\n"
@@ -232,14 +235,14 @@ void usage(FILE *dest, const char *name, int full)
         "\n"
         "EXAMPLES\n"
         "\n"
-        "  # Dry-run prediction (default TLE)\n"
-        "  %s 'ISS (ZARYA)'\n"
+        "  # Auto-pick next visible pass above 10 deg (rotator is on by default)\n"
+        "  %s next --min-elevation=10 --min-minutes=10 --max-minutes=45\n"
         "\n"
-        "  # Auto-pick the next 10-45 min visible pass above 10 deg, with rotator\n"
-        "  %s next --min-elevation=10 --min-minutes=10 --max-minutes=45 --with-rotator\n"
+        "  # Dry-run prediction on a dev host (no rotator hardware)\n"
+        "  %s 'ISS (ZARYA)' --without-rotator\n"
         "\n"
         "  # Operator coordination (broadcasts state to b210_rx_live + tx_frame_sdr)\n"
-        "  %s next --with-rotator --control\n",
+        "  %s next --control\n",
         name, name, name);
 }
 
@@ -856,7 +859,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->doppler_downlink_frequency_hz = state->nominal_downlink_frequency_hz;
     state->doppler_correction_enabled = 1;
 
-    state->run_with_antenna_rotator = 0;
+    state->run_with_antenna_rotator = 1;
     state->antenna_rotator.device_filename = "/dev/ttyUSB0";
     state->antenna_rotator.serial_speed = B600;
     state->antenna_rotator.fixed_target = 0;
@@ -869,14 +872,17 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 return EXIT_FAILURE;
             }
             state->verbose_level = atoi(argv[i] + 10);
-        } else if (strcmp("--with-rotator", argv[i]) == 0) {
+        } else if (strcmp("--with-rotator", argv[i]) == 0
+                || strcmp("--with-hardware", argv[i]) == 0) {
+            // Rotator is on by default now. These flags survive as
+            // silent no-ops so existing scripts and muscle memory
+            // keep working.
             state->n_options++;
             state->run_with_antenna_rotator = 1;
-        } else if (strcmp("--with-hardware", argv[i]) == 0) {
-            // Legacy alias — used to enable both radio and rotator. The
-            // radio half is gone; this is now equivalent to --with-rotator.
+        } else if (strcmp("--without-rotator", argv[i]) == 0
+                || strcmp("--without-hardware", argv[i]) == 0) {
             state->n_options++;
-            state->run_with_antenna_rotator = 1;
+            state->run_with_antenna_rotator = 0;
         } else if (strncmp("--tle=", argv[i], 6) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 7) {

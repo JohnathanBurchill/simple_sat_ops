@@ -5,11 +5,11 @@
     Synthesise a CTS1 OBC beacon recording: fill the firmware-canonical
     COMMS_beacon_basic_packet_t with deterministic plausible values,
     wrap with CSP+AX100, and write a 48 kHz mono S16_LE WAV that matches
-    what a Yaesu DATA jack would emit during a perfect-signal downlink.
+    what an FM discriminator would emit during a perfect-signal downlink.
 
-    Drop the WAV into rx_decode / rx_replay / rx_live to exercise the
-    decode chain (and the new beacon parser in beacon_cts1.c) without
-    waiting for a satellite pass.
+    Drop the WAV into rx_decode / rx_replay / b210_rx_live to exercise
+    the decode chain (and the new beacon parser in beacon_cts1.c)
+    without waiting for a satellite pass.
 
     --repeats=N writes N beacons in one WAV with --gap-seconds=S
     silence between them; per-beacon, uptime_ms / eps_uptime_sec /
@@ -50,7 +50,7 @@ static void usage(FILE *out, const char *argv0)
         "Fill a CTS1 firmware-canonical downlink packet with deterministic\n"
         "plausible values, frame for the AX100, and write a 48 kHz mono\n"
         "16-bit WAV that decodes round-trip via rx_decode / rx_replay /\n"
-        "rx_live.\n"
+        "b210_rx_live.\n"
         "\n"
         "Required:\n"
         "  --out=<file.wav>          Output WAV path\n"

@@ -4,13 +4,12 @@
 
    Live B210 RX + AX100 decoder + Doppler retune driver. Captures IQ
    from a USRP B210 via libuhd, FM-demodulates, runs the same sliding-
-   window decode loop as rx_live and rx_replay, and (when built with
-   SGP4) re-tunes the SDR every ~1 s based on range-rate from the
-   tracked TLE.
+   window decode loop as rx_replay, and (when built with SGP4) re-tunes
+   the SDR every ~1 s based on range-rate from the tracked TLE.
 
    Single-process owner of the B210 — the device cannot be shared with
-   another UHD program. simple_sat_ops continues to drive the FT-991A
-   and rotator; b210_rx_live is the parallel scientific receiver.
+   another UHD program. simple_sat_ops drives the rotator; b210_rx_live
+   is the parallel scientific receiver.
 
    Copyright (C) 2026  Johnathan K Burchill
 
@@ -642,8 +641,7 @@ static void usage(FILE *dest, const char *name)
         "\n"
         "Live AX100 decoder over a USRP B210, with optional Doppler retuning\n"
         "from a TLE-tracked satellite. Single-process owner of the B210.\n"
-        "Sibling of rx_live (FT-991A audio path) and b210_rx_capture\n"
-        "(record-only).\n"
+        "Sibling of b210_rx_capture (record-only).\n"
         "\n"
         "When the positional <tle_path> <satellite_name> are given (and the\n"
         "binary is built with SGP4SDP4), the tool re-tunes the B210 every\n"
@@ -671,8 +669,7 @@ static void usage(FILE *dest, const char *name)
         "this stage a 9600-baud GMSK carrier is buried in 230+ kHz of\n"
         "out-of-band noise and never decodes):\n"
         "  --decim-factor=<int>        Integer decimation factor (default 5;\n"
-        "                              240 kHz → 48 kHz, 5 sps at 9600 baud,\n"
-        "                              matching rx_live's audio path)\n"
+        "                              240 kHz → 48 kHz, 5 sps at 9600 baud)\n"
         "  --no-decim                  Disable decimation (==--decim-factor=1).\n"
         "                              Useful for diagnostics; not for decode.\n"
         "  --decim-cutoff-hz=<hz>      FIR -6 dB cutoff at the input rate\n"
@@ -691,13 +688,13 @@ static void usage(FILE *dest, const char *name)
         "  --reed-solomon              RS(255,223) decode (DEFAULT)\n"
         "  --no-reed-solomon           Skip RS decode\n"
         "  --partial-rs                Emit RS-uncorrectable bytes for inspection\n"
-        "                              (default; same as rx_live)\n"
+        "                              (default)\n"
         "  --dc-block / --no-dc-block  α=0.995 IIR HP on the FM-demoded PCM\n"
-        "                              (~40 Hz cutoff at 48 kHz). DEFAULT ON,\n"
-        "                              matching rx_live. Disable only if you\n"
-        "                              know the discriminator output has no\n"
-        "                              DC offset and you want to skip the IIR\n"
-        "                              startup transient.\n"
+        "                              (~40 Hz cutoff at 48 kHz). DEFAULT ON.\n"
+        "                              Disable only if you know the\n"
+        "                              discriminator output has no DC offset\n"
+        "                              and you want to skip the IIR startup\n"
+        "                              transient.\n"
         "  --csp-crc32                 Validate + strip a trailing CSP zlib CRC32\n"
         "  --force-beacon              Pad each decoded payload with zeros up\n"
         "                              to 130 bytes and print as a beacon\n"

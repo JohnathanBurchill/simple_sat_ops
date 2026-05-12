@@ -6,7 +6,7 @@
     from rtl_fm) captured over the air or produced synthetically by
     uplink_test, and recovers the CSP packet that was transmitted.
 
-    Reverse of tx_frame:
+    Reverse of the uplink frame pipeline:
 
         WAV/RAW samples
           -> modem_pcm16_to_bits  (DC-block, phase search, ASM detect)
@@ -155,8 +155,8 @@ static void usage(FILE *out, const char *argv0)
         "  --reed-solomon             RS(255,223) decode (DEFAULT for uplink)\n"
         "  --no-reed-solomon          Disable RS decode. Use when talking to\n"
         "                             a TX that did not RS-encode (e.g.,\n"
-        "                             legacy tx_frame output, or downlink\n"
-        "                             which uses CRC instead per pycsplink).\n"
+        "                             downlink which uses CRC instead per\n"
+        "                             pycsplink).\n"
         "  --hmac                     Enable HMAC verification. AX100\n"
         "                             downlink frames do NOT use HMAC, so\n"
         "                             this is OFF by default. Use when\n"
@@ -226,7 +226,7 @@ static void usage(FILE *out, const char *argv0)
         "                             — rx_decode is a forensic tool and\n"
         "                             ships with full headers. The same\n"
         "                             toggle is `--no-packet-headers` for\n"
-        "                             consistency with rx_live/rx_replay.\n"
+        "                             consistency with rx_replay.\n"
         "  --packet-headers           Default; show every field. Kept as\n"
         "                             a no-op for scripts.\n"
         "  --db=<path>                Append decoded packets to a SQLite\n"
@@ -245,14 +245,14 @@ static void usage(FILE *out, const char *argv0)
         "  --no-dc-block              Skip the modem's DC-block IIR (alpha=0.995)\n"
         "                             on RX. Default-ON setting was added for\n"
         "                             rtl_fm's discriminator drift; for radio\n"
-        "                             paths with no DC offset (FT-991A\n"
-        "                             discriminator) the HPF only adds baseline\n"
-        "                             transients across burst boundaries that\n"
-        "                             cost a few bits in the ASM detector. If\n"
-        "                             the failure-path diagnostic shows ASM\n"
-        "                             at HD=2-4 in the raw slicer but the\n"
-        "                             modem reports 'no valid AX100 frame',\n"
-        "                             this flag often closes the gap.\n"
+        "                             paths with no DC offset the HPF only adds\n"
+        "                             baseline transients across burst\n"
+        "                             boundaries that cost a few bits in the\n"
+        "                             ASM detector. If the failure-path\n"
+        "                             diagnostic shows ASM at HD=2-4 in the raw\n"
+        "                             slicer but the modem reports 'no valid\n"
+        "                             AX100 frame', this flag often closes the\n"
+        "                             gap.\n"
         "  --help                     This message\n",
         argv0, argv0, HMAC_KEYFILE_DEFAULT_RELPATH);
 }

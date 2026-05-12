@@ -2,10 +2,10 @@
 
     Simple Satellite Operations  utils/rx_replay.c
 
-    Offline equivalent of rx_live: same sliding-window AX100 decoder,
-    same partial-RS rescue, same position-quantised dedup — but the
-    samples come from a WAV or headerless S16_LE PCM file rather than
-    ALSA. Use it to re-process the .raw / .wav companions rx_live
+    Offline equivalent of b210_rx_live: same sliding-window AX100
+    decoder, same partial-RS rescue, same position-quantised dedup — but
+    the samples come from a WAV or headerless S16_LE PCM file rather
+    than live IQ. Use it to re-process the .wav companion b210_rx_live
     leaves on disk after a pass, or to debug the decoder against a
     capture from rtl_fm / a different SDR pipeline.
 
@@ -280,9 +280,9 @@ static void usage(FILE *dest, const char *name)
         "usage: %s <path> [options]\n"
         "\n"
         "Offline AX100 sliding-window decoder. Reads a WAV or headerless\n"
-        "S16_LE raw PCM recording (e.g. rx_live's .wav / .raw companion)\n"
-        "and applies the same window/slide/decode loop rx_live runs on\n"
-        "live ALSA capture.\n"
+        "S16_LE raw PCM recording (e.g. b210_rx_live's .wav companion)\n"
+        "and applies the same window/slide/decode loop b210_rx_live runs\n"
+        "on live IQ capture.\n"
         "\n"
         "Input:\n"
         "  --raw                    Treat <path> as headerless S16_LE PCM\n"
@@ -291,7 +291,7 @@ static void usage(FILE *dest, const char *name)
         "  --channels=<n>           Channels for --raw (default 2; ch 0 used).\n"
         "                           Pass --channels=1 for rtl_fm captures.\n"
         "\n"
-        "Decoder (same defaults as rx_live):\n"
+        "Decoder (same defaults as b210_rx_live):\n"
         "  --bit-rate=<bps>         Default 9600.\n"
         "  --window-s=<seconds>     Decoder window size (default 1.5).\n"
         "  --slide-s=<seconds>      Slide between decode attempts (default 0.5).\n"
