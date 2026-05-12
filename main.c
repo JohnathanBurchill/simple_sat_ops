@@ -359,6 +359,31 @@ static void setup_pass_folder(state_t *state, double jul_utc_now)
                 folder, strerror(errno));
         return;
     }
+
+    // Pin the TLE the operator just loaded into the pass folder so
+    // any post-pass analysis (rx_replay, packet_browser session-dir
+    // lookups, whoever shows up later) can find the exact ephemeris
+    // that was being tracked, even if active.tle gets rewritten on
+    // the next --control startup.
+    if (state->prediction.tles_filename
+        && state->prediction.tles_filename[0]) {
+        const char *src = state->prediction.tles_filename;
+        const char *base = strrchr(src, '/');
+        base = (base != NULL) ? base + 1 : src;
+        char dst[512];
+        int rc = snprintf(dst, sizeof dst, "%s/%s", folder, base);
+        if (rc > 0 && (size_t)rc < sizeof dst) {
+            if (copy_file(src, dst) != 0) {
+                fprintf(stderr,
+                        "simple_sat_ops: warning: TLE copy %s -> %s "
+                        "failed: %s\n",
+                        src, dst, strerror(errno));
+            } else {
+                fprintf(stderr, "simple_sat_ops: pinned TLE %s\n", dst);
+            }
+        }
+    }
+
     snprintf(g_pass_folder, sizeof g_pass_folder, "%s", folder);
     update_operations_current_symlink(folder);
     fprintf(stderr, "simple_sat_ops: pass folder %s\n", folder);
