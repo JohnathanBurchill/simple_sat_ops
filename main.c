@@ -25,6 +25,7 @@
 #include "prediction.h"
 #include "sso_audit.h"
 #include "sso_ipc.h"
+#include "sso_ipc_paths.h"
 #include "sso_paths.h"
 
 #include <ctype.h>
@@ -471,6 +472,20 @@ static void update_operations_current_symlink(const char *target)
 // every tick.
 static void setup_pass_folder(state_t *state, double jul_utc_now)
 {
+    // Handoff case: --pass-folder seeded g_pass_folder before we got
+    // here. Honour it — make sure the dir exists, refresh the
+    // "current" symlink, and skip AOS-discovery entirely.
+    if (g_pass_folder[0]) {
+        if (sso_mkdir_p(g_pass_folder) != 0) {
+            fprintf(stderr,
+                "simple_sat_ops: mkdir -p %s failed: %s\n",
+                g_pass_folder, strerror(errno));
+        }
+        update_operations_current_symlink(g_pass_folder);
+        fprintf(stderr, "simple_sat_ops: using inherited pass folder %s\n",
+                g_pass_folder);
+        return;
+    }
     minutes_until_visible(&state->prediction, jul_utc_now,
                           jul_utc_now + MAX_MINUTES_TO_PREDICT / 1440.0,
                           1.0);
@@ -970,6 +985,12 @@ static state_t g_viewer_state;
 static double  g_viewer_carrier_hz        = 0.0;
 static double  g_viewer_jul_utc           = 0.0;
 static int     g_viewer_has_rotator       = 0;
+static char    g_viewer_tle_path[256]     = "";
+static char    g_viewer_pass_folder[256]  = "";
+// Take-control confirmation. Press 'c' once to arm, 'y' within
+// CONFIRM_WINDOW_S seconds to commit. Anything else cancels.
+#define VIEWER_CONFIRM_WINDOW_S 5
+static time_t  g_viewer_confirm_until     = 0;
 
 static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
                             void *user)
@@ -1023,6 +1044,14 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
     g_viewer_carrier_hz  = (evt->doppler_hz != 0.0)
         ? (double)evt->freq_hz + evt->doppler_hz
         : (double)evt->freq_hz;
+    if (evt->tle_path[0]) {
+        snprintf(g_viewer_tle_path, sizeof g_viewer_tle_path,
+                 "%s", evt->tle_path);
+    }
+    if (evt->pass_folder[0]) {
+        snprintf(g_viewer_pass_folder, sizeof g_viewer_pass_folder,
+                 "%s", evt->pass_folder);
+    }
     g_viewer_has_state   = 1;
     g_viewer_event_pending = 1;
 }
@@ -1070,6 +1099,102 @@ static void viewer_roster_users(char *out, size_t out_size)
     }
 }
 
+// Read the operator's PID from /run/sso/simple_sat_ops.pid. Returns 0
+// and sets *out_pid on success; -1 on missing/unreadable file.
+static int read_operator_pid(pid_t *out_pid)
+{
+    char path[256];
+    if (sso_ipc_pid_path(path, sizeof path, "simple_sat_ops") != 0)
+        return -1;
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int pid = 0;
+    int got = fscanf(f, "%d", &pid);
+    fclose(f);
+    if (got != 1 || pid <= 0) return -1;
+    *out_pid = (pid_t) pid;
+    return 0;
+}
+
+// Hand-off: send SIGUSR1 to the running operator, wait until its
+// socket file goes away (= the process has finished cleanup), then
+// re-exec this process as `simple_sat_ops --control` with the
+// inherited TLE + pass folder so the new operator picks up where the
+// old one left off. Does not return on success.
+static void viewer_take_control(sso_ipc_client_t *cli, const char *argv0)
+{
+    if (!g_viewer_tle_path[0]) {
+        fprintf(stderr,
+            "simple_sat_ops viewer: no TLE path from operator yet — "
+            "wait for a state broadcast and try again.\n");
+        return;
+    }
+    pid_t op_pid = 0;
+    if (read_operator_pid(&op_pid) != 0) {
+        fprintf(stderr,
+            "simple_sat_ops viewer: couldn't read operator pid file.\n");
+        return;
+    }
+    if (kill(op_pid, SIGUSR1) != 0) {
+        fprintf(stderr,
+            "simple_sat_ops viewer: kill(%d, SIGUSR1) failed: %s\n",
+            (int) op_pid, strerror(errno));
+        return;
+    }
+
+    // Wait for the old operator to clean up and remove its socket.
+    char sock[256];
+    if (sso_ipc_socket_path(sock, sizeof sock, "simple_sat_ops") != 0) {
+        fprintf(stderr,
+            "simple_sat_ops viewer: socket path lookup failed.\n");
+        return;
+    }
+    int waited_ms = 0;
+    for (;;) {
+        struct stat st;
+        if (stat(sock, &st) != 0 && errno == ENOENT) break;
+        if (waited_ms >= 5000) {
+            fprintf(stderr,
+                "simple_sat_ops viewer: timed out waiting for operator "
+                "to release the socket (%s)\n", sock);
+            return;
+        }
+        usleep(100000);
+        waited_ms += 100;
+    }
+
+    // Close our viewer IPC + curses cleanly before exec'ing.
+    sso_ipc_client_close(cli);
+    endwin();
+
+    // Re-exec self as --control with inherited TLE and pass folder.
+    char tle_arg[280];
+    char pass_arg[280];
+    snprintf(tle_arg,  sizeof tle_arg,  "--tle=%s",         g_viewer_tle_path);
+    snprintf(pass_arg, sizeof pass_arg, "--pass-folder=%s", g_viewer_pass_folder);
+    char self_path[1024];
+    ssize_t n = readlink("/proc/self/exe", self_path, sizeof self_path - 1);
+    const char *exe = (n > 0) ? (self_path[n] = '\0', self_path) : argv0;
+    char *new_argv[8];
+    int ai = 0;
+    new_argv[ai++] = (char *) exe;
+    new_argv[ai++] = "--control";
+    new_argv[ai++] = tle_arg;
+    if (g_viewer_pass_folder[0]) new_argv[ai++] = pass_arg;
+    new_argv[ai] = NULL;
+    fprintf(stderr,
+        "simple_sat_ops: taking control with %s%s%s\n",
+        tle_arg,
+        g_viewer_pass_folder[0] ? "  " : "",
+        g_viewer_pass_folder[0] ? pass_arg : "");
+    execv(exe, new_argv);
+    // If we got here exec failed — best to bail loudly.
+    fprintf(stderr,
+        "simple_sat_ops viewer: execv %s failed: %s\n",
+        exe, strerror(errno));
+    exit(EXIT_FAILURE);
+}
+
 static void viewer_render(int connected)
 {
     int cols = COLS;
@@ -1104,7 +1229,7 @@ static void viewer_render(int connected)
     }
 
     attron(A_REVERSE);
-    char foot[160];
+    char foot[200];
     time_t now = time(NULL);
     long stale_s = g_viewer_last_event > 0
         ? (long)(now - g_viewer_last_event)
@@ -1113,7 +1238,15 @@ static void viewer_render(int connected)
                                     : (stale_s < 0 ? "WAITING"
                                                    : (stale_s > 5 ? "STALE"
                                                                   : "LIVE"));
-    snprintf(foot, sizeof foot, " %s     q : quit ", status);
+    if (g_viewer_confirm_until > 0 && now < g_viewer_confirm_until) {
+        snprintf(foot, sizeof foot,
+            " %s     Take control from %s? y/N ",
+            status,
+            g_viewer_operator[0] ? g_viewer_operator : "?");
+    } else {
+        snprintf(foot, sizeof foot,
+            " %s     c : take control   q : quit ", status);
+    }
     int flen = (int)strlen(foot);
     if (flen > cols) flen = cols;
     mvaddnstr(LINES - 1, 0, foot, flen);
@@ -1123,7 +1256,7 @@ static void viewer_render(int connected)
     refresh();
 }
 
-static int run_viewer(void)
+static int run_viewer(const char *argv0)
 {
     sso_ipc_client_t *cli = sso_ipc_client_connect("simple_sat_ops");
     if (cli == NULL) {
@@ -1153,18 +1286,21 @@ static int run_viewer(void)
     init_window();
     int last_connected = -1;
     time_t last_render = 0;
-    // Initial paint so the user sees something before the first event.
     viewer_render(sso_ipc_client_is_connected(cli));
     last_render = time(NULL);
+    int confirm_was_armed = 0;
     while (g_viewer_running) {
-        // Short poll so 'q' is responsive; events drive the render.
         int rc = sso_ipc_client_step(cli, 200);
         if (rc < 0) break;
         int connected = sso_ipc_client_is_connected(cli);
         time_t now = time(NULL);
-        // Re-render when a new broadcast arrives, on a connection state
-        // change, or once every 5 s as a heartbeat so STALE/etc. show
-        // up even without traffic.
+        int confirm_armed = (g_viewer_confirm_until > 0
+                             && now < g_viewer_confirm_until);
+        if (!confirm_armed && confirm_was_armed) {
+            // Window just expired — re-render to drop the confirm footer.
+            g_viewer_event_pending = 1;
+        }
+        confirm_was_armed = confirm_armed;
         if (g_viewer_event_pending
             || connected != last_connected
             || (now - last_render) >= 5) {
@@ -1174,8 +1310,27 @@ static int run_viewer(void)
             last_render = now;
         }
         int key = getch();
+        if (key == ERR) continue;
+        if (confirm_armed) {
+            if (key == 'y' || key == 'Y') {
+                // Commits: viewer_take_control re-execs on success and
+                // doesn't return; if it returns, the operator wasn't
+                // reachable and we just stay as a viewer.
+                viewer_take_control(cli, argv0);
+                g_viewer_confirm_until = 0;
+                g_viewer_event_pending = 1;
+            } else {
+                // Anything else cancels the confirm window.
+                g_viewer_confirm_until = 0;
+                g_viewer_event_pending = 1;
+            }
+            continue;
+        }
         if (key == 'q' || key == 'Q' || key == 27 /* Esc */) {
             g_viewer_running = 0;
+        } else if (key == 'c' || key == 'C') {
+            g_viewer_confirm_until = now + VIEWER_CONFIRM_WINDOW_S;
+            g_viewer_event_pending = 1;
         }
     }
 
@@ -1203,7 +1358,7 @@ int main(int argc, char **argv)
     // Bare invocation found a running operator — run as a read-only
     // viewer and skip the rest of the operator/standalone bring-up.
     if (g_viewer_mode) {
-        return run_viewer();
+        return run_viewer(argv[0]);
     }
 
     // Audit + operator IPC bring-up.
@@ -1611,6 +1766,17 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 return EXIT_FAILURE;
             }
             state->prediction.tles_filename = argv[i] + 6;
+        } else if (strncmp("--pass-folder=", argv[i], 14) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 15) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            // Pre-seed g_pass_folder; setup_pass_folder() then skips
+            // its AOS-driven auto-discovery and uses the inherited
+            // path (handoff case: new operator picks up the previous
+            // operator's pass folder).
+            snprintf(g_pass_folder, sizeof g_pass_folder, "%s", argv[i] + 14);
         } else if (strncmp("--rotator-device=", argv[i], 17) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 18) {
