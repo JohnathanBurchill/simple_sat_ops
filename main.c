@@ -96,6 +96,17 @@ static void on_sigusr1(int sig) {
     g_yield_requested = 1;
 }
 
+// Loop pacing helper. With the B210 attached, the main loop runs at
+// UHD-chunk cadence (~120 Hz at 240 kHz / 2040-sample chunks); slow-
+// cadence work (IPC broadcast, ncurses redraw) is timestamp-gated so
+// it stays at its historical 2 Hz / 10 Hz rates.
+static double monotonic_seconds(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double) ts.tv_sec + (double) ts.tv_nsec * 1e-9;
+}
+
 // B210 ownership lives here now — simple_sat_ops is the single process
 // that opens the SDR. --without-b210 (or a non-WITH_USRP_B210 build)
 // leaves g_b210_core NULL and the loop falls through cleanly.
@@ -2218,6 +2229,13 @@ int main(int argc, char **argv)
     double last_az = 0;
     double last_el = 0;
 
+    // Slow-cadence work is timestamp-gated so the fast UHD-pump loop
+    // doesn't spam viewers or burn CPU on ncurses redraws.
+    double t_last_ipc_broadcast = 0.0;
+    double t_last_redraw        = 0.0;
+    const double IPC_BROADCAST_PERIOD_S = 0.5;   // 2 Hz
+    const double REDRAW_PERIOD_S        = 0.1;   // 10 Hz
+
     while (state.running) {
         UTC_Calendar_Now(&utc, &tv);
         jul_utc = Julian_Date(&utc, &tv);
@@ -2360,25 +2378,29 @@ int main(int argc, char **argv)
         }
         (void) jul_idle_start;  // reserved for any future idle-window behavior
 
-        row = 1;
-        col = 1;
-        report_predictions(&state, jul_utc, &row, col);
+        double t_now = monotonic_seconds();
+        int redraw_due = (t_now - t_last_redraw) >= REDRAW_PERIOD_S;
+        if (redraw_due) {
+            row = 1;
+            col = 1;
+            report_predictions(&state, jul_utc, &row, col);
 
-        row++;
-        report_status(&state, &row, col);
-        row = 5;
-        col = 50;
-        report_position(&state, &row, col);
-        row++;
-        render_rx_panel(&row, 50);
+            row++;
+            report_status(&state, &row, col);
+            row = 5;
+            col = 50;
+            report_position(&state, &row, col);
+            row++;
+            render_rx_panel(&row, 50);
 
-        clrtoeol();
+            clrtoeol();
 
-        // TX log lives below the keyboard info / antenna status if the
-        // terminal is tall enough to host it without colliding.
-        int tx_log_row = LINES - TX_LOG_SIZE - 2;
-        if (tx_log_row >= keyboard_info_row + 4) {
-            render_tx_log_panel(tx_log_row, 1);
+            // TX log lives below the keyboard info / antenna status if
+            // the terminal is tall enough to host it without colliding.
+            int tx_log_row = LINES - TX_LOG_SIZE - 2;
+            if (tx_log_row >= keyboard_info_row + 4) {
+                render_tx_log_panel(tx_log_row, 1);
+            }
         }
 
         key = getch();
@@ -2427,18 +2449,21 @@ int main(int argc, char **argv)
             }
         }
 
-        mvprintw(keyboard_info_row, 3, "%s : %s", "Keyboard",
-                 keyboard_unlocked ? "unlocked" : "LOCKED");
-        clrtoeol();
-        if (state.antenna_rotator.antenna_is_moving) {
-            mvprintw(keyboard_info_row + 2, 0, "%s", "Antenna moving");
+        if (redraw_due) {
+            mvprintw(keyboard_info_row, 3, "%s : %s", "Keyboard",
+                     keyboard_unlocked ? "unlocked" : "LOCKED");
             clrtoeol();
-        } else {
-            mvprintw(keyboard_info_row + 2, 0, "%s", "Antenna stationary");
-            clrtoeol();
-        }
+            if (state.antenna_rotator.antenna_is_moving) {
+                mvprintw(keyboard_info_row + 2, 0, "%s", "Antenna moving");
+                clrtoeol();
+            } else {
+                mvprintw(keyboard_info_row + 2, 0, "%s", "Antenna stationary");
+                clrtoeol();
+            }
 
-        refresh();
+            refresh();
+            t_last_redraw = t_now;
+        }
 
 #ifdef WITH_USRP_B210
         // Doppler retune — the operator UI's prediction already moved
@@ -2484,12 +2509,18 @@ int main(int argc, char **argv)
 #endif
 
         // --- IPC: serve clients, fan out state, honour SIGUSR1 yield ---
+        // Always service the socket (cheap; accepts new viewers) but
+        // throttle STATE broadcasts to 2 Hz so viewers don't get
+        // hammered when the loop is running at UHD-chunk cadence.
         if (g_ipc) {
             sso_ipc_server_step(g_ipc, 0);
-            ipc_broadcast_state(&state, current_az, current_el,
-                                 current_downlink_frequency,
-                                 doppler_delta_downlink,
-                                 jul_utc);
+            if ((t_now - t_last_ipc_broadcast) >= IPC_BROADCAST_PERIOD_S) {
+                ipc_broadcast_state(&state, current_az, current_el,
+                                     current_downlink_frequency,
+                                     doppler_delta_downlink,
+                                     jul_utc);
+                t_last_ipc_broadcast = t_now;
+            }
         }
         if (g_yield_requested) {
             sso_audit_event("yield-requested",
@@ -2498,7 +2529,19 @@ int main(int argc, char **argv)
         }
 
         if (state.running) {
+#ifdef WITH_USRP_B210
+            // With the B210 feeding us, rx_session_pump's blocking
+            // UHD recv already paces the loop at chunk cadence (~8 ms
+            // at 240 kHz). A 500 ms sleep here would starve the stream
+            // and trigger ERROR_CODE_OVERFLOW. Without a core, fall
+            // back to the historical 2 Hz cadence so the rotator + UI
+            // don't burn CPU.
+            if (g_b210_core == NULL) {
+                usleep(UPDATE_INTERVAL_MICROSEC);
+            }
+#else
             usleep(UPDATE_INTERVAL_MICROSEC);
+#endif
         }
     }
 
