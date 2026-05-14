@@ -119,6 +119,11 @@ static rx_session_t      *g_rx_session  = NULL;
 static tx_request_slot_t  g_tx_request  = {0};
 #endif
 
+// CLI gate: --no-tx blocks the compose modal from actually committing
+// a burst. Typing + preview broadcast still work so the operator can
+// rehearse / get advice from viewers without keying the PA.
+static int g_no_tx = 0;
+
 // TX log ring buffer — last few PREVIEW/SENT/ACK events for display.
 // Shared by operator and viewer renderers.
 typedef struct {
@@ -601,8 +606,9 @@ static void tx_compose_draw(WINDOW *w, const tx_compose_t *c) {
     if (payload_w > (int) sizeof c->payload - 1)
         payload_w = (int) sizeof c->payload - 1;
 
-    mvwprintw(w, 0, 2, " TX compose (operator: %s) ",
-              g_operator_user ? g_operator_user : "?");
+    mvwprintw(w, 0, 2, " TX compose (operator: %s)%s ",
+              g_operator_user ? g_operator_user : "?",
+              g_no_tx ? "  [--no-tx]" : "");
 #ifdef WITH_USRP_B210
     mvwprintw(w, 1, 2,
               "B210: %s",
@@ -681,6 +687,11 @@ static void tx_compose_broadcast_preview(const tx_compose_t *c) {
 
 static int tx_compose_commit(const tx_compose_t *c, char *err, size_t err_size) {
 #ifdef WITH_USRP_B210
+    if (g_no_tx) {
+        snprintf(err, err_size,
+                 "TX disabled by --no-tx (preview still goes to viewers)");
+        return -1;
+    }
     if (g_tx_request.pending) {
         snprintf(err, err_size, "previous burst still in flight");
         return -1;
@@ -1107,6 +1118,12 @@ void usage(FILE *dest, const char *name, int full)
         "  --without-b210               Skip the USRP B210 (dev hosts that\n"
         "                               have UHD but no device, or any time\n"
         "                               you just want the UI + rotator).\n"
+        "  --no-tx                      Open the B210 for RX, but block the\n"
+        "                               TX compose modal from actually keying\n"
+        "                               the PA. Typing + preview broadcast to\n"
+        "                               viewers still work, so the operator\n"
+        "                               can rehearse a telecommand and get\n"
+        "                               eyes on it without going on air.\n"
         "\n"
         "Operator coordination:\n"
         "  --control                    Open the sso_ipc server (operator mode).\n"
@@ -2516,6 +2533,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strcmp("--without-b210", argv[i]) == 0) {
             state->n_options++;
             g_without_b210 = 1;
+        } else if (strcmp("--no-tx", argv[i]) == 0) {
+            state->n_options++;
+            g_no_tx = 1;
         } else if (strncmp("--tle=", argv[i], 6) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 7) {
