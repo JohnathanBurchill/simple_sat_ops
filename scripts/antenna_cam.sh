@@ -37,6 +37,7 @@ if command -v mpv >/dev/null 2>&1; then
             --no-osc --no-osd-bar --no-input-default-bindings
             --untimed --profile=low-latency --cache=no
             --demuxer=lavf --demuxer-lavf-format=mjpeg
+            --no-correct-pts --container-fps-override=25
             -)
 elif command -v ffplay >/dev/null 2>&1; then
     viewer=(ffplay
@@ -51,9 +52,14 @@ else
     exit 1
 fi
 
-# -tt: pseudo-tty so a stray Ctrl-C on the laptop tears down ffmpeg
-#      on rao cleanly. -o ServerAliveInterval keeps long sessions up.
-ssh -tt \
+# -T: NO pseudo-tty. ssh stdout stays in raw mode so MJPEG bytes go
+#     through binary-clean. (-tt cooks the channel and mangles \n
+#     bytes inside JPEG payloads, which breaks the decoder.)
+# -e none: disable the SSH escape char so a literal '~' byte in the
+#     stream doesn't get interpreted.
+# Remote ffmpeg exits on SIGPIPE when the local viewer closes, so we
+# don't need a tty just for teardown.
+ssh -T -e none \
     -o ServerAliveInterval=30 \
     "$REMOTE" "ffmpeg -nostdin -loglevel error \
         -f v4l2 -input_format mjpeg -video_size $SIZE -i $DEV \
