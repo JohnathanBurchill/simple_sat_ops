@@ -34,8 +34,13 @@ if command -v mpv >/dev/null 2>&1; then
             --title="$TITLE"
             --ontop
             --geometry=480x360+100%+0
+            --no-audio
+            --force-window=immediate
+            --video-sync=desync
+            --untimed
+            --cache=no
+            --demuxer-readahead-secs=0
             --no-osc --no-osd-bar --no-input-default-bindings
-            --untimed --profile=low-latency --cache=no
             --demuxer=lavf --demuxer-lavf-format=mjpeg
             --no-correct-pts --container-fps-override=25
             -)
