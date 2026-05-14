@@ -387,7 +387,8 @@ static void try_decode_at_window(rx_session_t *rxs)
                    rxs->force_beacon);
         rxs->frames_total++;
         if (rxs->frames_in_window < UINT_MAX) rxs->frames_in_window++;
-        snprintf(rxs->last_frame_ts, sizeof rxs->last_frame_ts, "%s", ts);
+        snprintf(rxs->last_frame_ts, sizeof rxs->last_frame_ts,
+                 "%.*s", (int)(sizeof rxs->last_frame_ts - 1), ts);
         rxs->last_frame_len = (int) plen;
     }
 }

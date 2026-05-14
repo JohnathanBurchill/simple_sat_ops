@@ -659,7 +659,7 @@ static void tx_compose_draw(WINDOW *w, const tx_compose_t *c) {
     mvwprintw(w, 3, 38, "(Space toggles hex/ascii)");
     wclrtoeol(w);
 
-    snprintf(buf, sizeof buf, "%-44s",
+    snprintf(buf, sizeof buf, "%-44.44s",
              c->payload[0] ? c->payload : " ");
     tx_draw_field(w, 4, 2, c->focus == TXF_PAYLOAD,
                   "Payload  ", buf);
@@ -903,11 +903,15 @@ static void run_tx_compose(void) {
             if (ch == 27) {  // Esc
                 active = 0; break;
             } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
-                char err[160];
+                char err[120];
                 if (tx_compose_validate(&c, err, sizeof err) != 0) {
-                    snprintf(c.status_msg, sizeof c.status_msg, "rejected: %s", err);
+                    snprintf(c.status_msg, sizeof c.status_msg,
+                             "rejected: %.*s",
+                             (int)(sizeof c.status_msg - 16), err);
                 } else if (tx_compose_commit(&c, err, sizeof err) != 0) {
-                    snprintf(c.status_msg, sizeof c.status_msg, "commit failed: %s", err);
+                    snprintf(c.status_msg, sizeof c.status_msg,
+                             "commit failed: %.*s",
+                             (int)(sizeof c.status_msg - 20), err);
                 } else {
                     active = 0; break;
                 }
