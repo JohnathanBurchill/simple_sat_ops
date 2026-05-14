@@ -62,11 +62,14 @@ fi
 #     bytes inside JPEG payloads, which breaks the decoder.)
 # -e none: disable the SSH escape char so a literal '~' byte in the
 #     stream doesn't get interpreted.
-# Remote ffmpeg exits on SIGPIPE when the local viewer closes, so we
-# don't need a tty just for teardown.
+# 'exec ffmpeg ...': replace the remote shell so ffmpeg IS the
+#     session leader and gets SIGHUP directly when this side
+#     disconnects. Without exec, a parent bash sits between SSH and
+#     ffmpeg, ignores SIGHUP, and ffmpeg keeps /dev/video0 open
+#     after we exit — the next run hits "Device or resource busy".
 ssh -T -e none \
     -o ServerAliveInterval=30 \
-    "$REMOTE" "ffmpeg -nostdin -loglevel error \
+    "$REMOTE" "exec ffmpeg -nostdin -loglevel error \
         -f v4l2 -input_format mjpeg -video_size $SIZE -i $DEV \
         -c copy -f mjpeg pipe:1" \
   | "${viewer[@]}"
