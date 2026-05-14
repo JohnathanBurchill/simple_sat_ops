@@ -367,6 +367,20 @@ int main(int argc, char **argv)
         fprintf(stderr, "tx_frame_sdr: pass exactly one of --payload-hex or --payload-ascii\n");
         return 1;
     }
+
+    // Live RF streaming moved to b210_rx_tx (driven by simple_sat_ops's
+    // TX compose modal). tx_frame_sdr is now an offline IQ-rendering
+    // tool: --dry-run prints frame sizes, --dump-iq writes the sc16 IQ
+    // buffer to disk. The streamer path is intentionally disabled so
+    // tx_frame_sdr can't race b210_rx_tx for the B210 device.
+    if (!dry_run && dump_iq_path == NULL) {
+        fprintf(stderr,
+            "tx_frame_sdr: live streaming has moved to b210_rx_tx.\n"
+            "  Use simple_sat_ops's TX compose modal (press 't' while the\n"
+            "  keyboard is unlocked) to send a frame on the air.\n"
+            "  This tool now requires --dry-run or --dump-iq=<path>.\n");
+        return 2;
+    }
     mp.samp_rate = (int)tx_rate;
     if (deviation_hz < 0.0) {
         deviation_hz = (double)mp.bit_rate / 4.0;
@@ -379,42 +393,11 @@ int main(int argc, char **argv)
     if (repeat < 1) repeat = 1;
     if (gap_ms < 0) gap_ms = 0;
 
-    // --- Operator gate + audit ---
+    // tx_frame_sdr is now offline-only — no operator gate. Audit so
+    // the runs.log still records dump-iq / dry-run invocations.
     sso_audit_start("tx_frame_sdr",
-                    no_control_check ? "no-control-check" :
-                    (dry_run ? "dry-run" : "tx"));
-
-    char pass_folder[256] = "";
-    char op_user[64] = "";
-    if (!no_control_check) {
-        int rc = sso_operator_verify("external", pass_folder, sizeof(pass_folder),
-                                       op_user, sizeof(op_user));
-        if (rc != SSO_OP_OK) {
-            const char *reason = "unknown";
-            switch (rc) {
-                case SSO_OP_NO_OPERATOR:
-                    reason = "no operator: simple_sat_ops is not running in --control mode";
-                    break;
-                case SSO_OP_MISMATCH:
-                    reason = "operator mismatch: simple_sat_ops operator is not you";
-                    break;
-                case SSO_OP_PROTOCOL:
-                    reason = "operator handshake failed";
-                    break;
-            }
-            fprintf(stderr, "tx_frame_sdr: refused (%s%s%s). "
-                            "Run simple_sat_ops --control, or use "
-                            "--no-control-check for bench testing.\n",
-                            reason,
-                            op_user[0] ? " — operator=" : "",
-                            op_user[0] ? op_user : "");
-            sso_audit_event("rejected", reason);
-            sso_audit_set_exit_code(2);
-            return 2;
-        }
-        fprintf(stderr, "tx_frame_sdr: operator=%s pass_folder=%s\n",
-                op_user, pass_folder[0] ? pass_folder : "(none)");
-    }
+                    dump_iq_path != NULL ? "dump-iq" : "dry-run");
+    (void) no_control_check;  // --no-control-check is a no-op now
 
     // --- Build the wire frame ---
 
@@ -657,158 +640,13 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    if (!allow_tx) {
-        fprintf(stderr,
-                "tx_frame_sdr: refusing to TX without --allow-tx. Add --allow-tx to "
-                "actually emit RF (or --dry-run / --dump-iq= to bench-test).\n");
-        free(iq); free(preroll_pcm); free(pcm);
-        return 1;
-    }
-
-    // --- Open device, configure, get streamer, send burst ---
-
-    uhd_usrp_handle dev = NULL;
-    if (uhd_check(uhd_usrp_make(&dev, device_args), "uhd_usrp_make")) {
-        free(iq); free(preroll_pcm); free(pcm); return 1;
-    }
-    int rc = 0;
-
-    if (uhd_check(uhd_usrp_set_tx_rate(dev, tx_rate, 0), "set_tx_rate")) { rc = 1; goto done; }
-    if (uhd_check(uhd_usrp_set_tx_gain(dev, gain_db, 0, ""), "set_tx_gain")) { rc = 1; goto done; }
-    // Reset device clock to 0 so the absolute time_spec on the first
-    // chunk's metadata (start_delay_s seconds in the future) gives the
-    // FPGA a window to buffer the whole pre-roll before TX actually
-    // begins. Without this, the FPGA can start emitting samples from
-    // a half-filled FIFO and we lose the bit-clock-recovery preamble.
-    if (uhd_check(uhd_usrp_set_time_now(dev, 0, 0.0, 0), "set_time_now")) { rc = 1; goto done; }
-    {
-        uhd_tune_request_t req = {
-            .target_freq     = freq_hz,
-            .rf_freq_policy  = UHD_TUNE_REQUEST_POLICY_AUTO,
-            .rf_freq         = 0.0,
-            .dsp_freq_policy = UHD_TUNE_REQUEST_POLICY_AUTO,
-            .dsp_freq        = 0.0,
-            .args            = NULL,
-        };
-        uhd_tune_result_t res = {0};
-        if (uhd_check(uhd_usrp_set_tx_freq(dev, &req, 0, &res), "set_tx_freq")) { rc = 1; goto done; }
-    }
-    // Pin the TX antenna explicitly. UHD's default for the B210 TX is
-    // already "TX/RX" (the only TX-capable port — RX2 is RX-only), but
-    // the gold-reference flowgraph (radio_ax100.py:144) sets it
-    // explicitly, and pinning it is robust across UHD versions and
-    // device-args strings.
-    if (uhd_check(uhd_usrp_set_tx_antenna(dev, "TX/RX", 0), "set_tx_antenna")) { rc = 1; goto done; }
-
-    uhd_tx_streamer_handle stream = NULL;
-    if (uhd_check(uhd_tx_streamer_make(&stream), "tx_streamer_make")) { rc = 1; goto done; }
-    {
-        size_t channels[1] = { 0 };
-        uhd_stream_args_t args = {
-            .cpu_format   = "sc16",   // host-side: int16 IQ
-            .otw_format   = "sc16",   // wire-side: int16 IQ
-            .args         = "",
-            .channel_list = channels,
-            .n_channels   = 1,
-        };
-        if (uhd_check(uhd_usrp_get_tx_stream(dev, &args, stream),
-                      "get_tx_stream")) { rc = 1; goto done_stream; }
-    }
-
-    size_t max_per_buff = 0;
-    if (uhd_check(uhd_tx_streamer_max_num_samps(stream, &max_per_buff),
-                  "max_num_samps")) { rc = 1; goto done_stream; }
-    if (max_per_buff == 0) max_per_buff = 1024;
-
-    // Push the IQ buffer in chunks. SOB (start-of-burst) on the first
-    // chunk, EOB (end-of-burst) on the last; intermediate chunks stay
-    // false-false. The metadata handle is reused — uhd_tx_streamer_send
-    // doesn't take ownership.
-    uhd_tx_metadata_handle md = NULL;
-    if (uhd_check(uhd_tx_metadata_make(&md, false, 0, 0.0, true, false),
-                  "tx_metadata_make")) { rc = 1; goto done_stream; }
-
-    size_t sent_total = 0;
-    while (sent_total < n_iq_total) {
-        size_t remaining = n_iq_total - sent_total;
-        size_t this_chunk = remaining < max_per_buff ? remaining : max_per_buff;
-        int is_first = (sent_total == 0);
-        int is_last = (this_chunk == remaining);
-        // Rebuild the metadata for each chunk. Only the first chunk
-        // carries a time_spec (the absolute start time of the whole
-        // burst on the device clock); subsequent chunks continue from
-        // there. Only the last chunk carries EOB.
-        uhd_tx_metadata_free(&md);
-        if (uhd_check(uhd_tx_metadata_make(&md,
-                          /*has_time_spec=*/is_first ? true : false,
-                          /*full_secs=*/(int64_t)start_delay_s,
-                          /*frac_secs=*/start_delay_s - (double)(int64_t)start_delay_s,
-                          /*start_of_burst=*/is_first,
-                          /*end_of_burst=*/is_last ? true : false),
-                      "tx_metadata_make (loop)")) { rc = 1; goto done_md; }
-
-        const void *bufs[1] = { iq + sent_total * 2 };
-        size_t items_sent = 0;
-        // Timeout has to comfortably exceed start_delay_s — once the
-        // FPGA TX FIFO fills, the host send blocks until the device
-        // clock reaches the scheduled start time and samples drain.
-        double timeout = start_delay_s + 1.0;
-        if (timeout < 1.0) timeout = 1.0;
-        uhd_error e = uhd_tx_streamer_send(stream, bufs, this_chunk, &md,
-                                           timeout, &items_sent);
-        if (e != UHD_ERROR_NONE) {
-            uhd_check(e, "tx_streamer_send");
-            rc = 1;
-            goto done_md;
-        }
-        if (items_sent == 0) {
-            fprintf(stderr, "tx_frame_sdr: streamer accepted 0 samples — backpressure?\n");
-            rc = 1;
-            goto done_md;
-        }
-        sent_total += items_sent;
-    }
-
-    fprintf(stderr, "tx_frame_sdr: sent %zu IQ samples (%.3f s on-air).\n",
-            sent_total, (double)sent_total / tx_rate);
-
-    // --- Notify simple_sat_ops so the TX status line updates ---
-    if (!no_control_check && !dry_run) {
-        sso_event_t evt;
-        sso_event_init(&evt, SSO_EVT_TX_COMMAND_SENT);
-        snprintf(evt.from, sizeof(evt.from), "%s", sso_unix_user());
-        // Short human-readable summary. Prefer ASCII payload verbatim;
-        // for hex payloads, show the first 16 bytes as hex with an
-        // ellipsis when truncated.
-        if (payload_ascii != NULL) {
-            snprintf(evt.ascii, sizeof(evt.ascii), "%s", payload_ascii);
-        } else {
-            // 16 bytes -> 32 hex chars + "..." + null = 36; size hexbuf
-            // tight so GCC -Wformat-truncation can prove the final
-            // "hex:%s" copy fits in evt.ascii (160).
-            char hexbuf[64];
-            size_t hex_max = sizeof(hexbuf) - 4;
-            size_t cap = (size_t) payload_len;
-            if (cap > 16) cap = 16;
-            size_t k = 0;
-            for (size_t i = 0; i < cap; ++i) {
-                k += (size_t) snprintf(hexbuf + k, hex_max - k, "%02x",
-                                        (unsigned) payload[i]);
-            }
-            if ((size_t) payload_len > cap) {
-                snprintf(hexbuf + k, hex_max - k, "...");
-            }
-            snprintf(evt.ascii, sizeof(evt.ascii), "hex:%s", hexbuf);
-        }
-        sso_operator_publish(&evt);
-    }
-
-done_md:
-    if (md != NULL) uhd_tx_metadata_free(&md);
-done_stream:
-    if (stream != NULL) uhd_tx_streamer_free(&stream);
-done:
-    if (dev != NULL) uhd_usrp_free(&dev);
+    // Live streaming has moved to b210_rx_tx (driven by
+    // simple_sat_ops's TX compose modal). The earlier --dry-run /
+    // --dump-iq gate already short-circuited any path that would
+    // reach this point; the unreachable streamer code that used to
+    // live here was removed as dead. tx_frame_sdr now exists purely
+    // for offline IQ rendering / replay.
+    (void) allow_tx;  // accepted on the CLI for backwards compatibility
     free(iq); free(preroll_pcm); free(pcm);
-    return rc;
+    return 0;
 }
