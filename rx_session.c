@@ -360,24 +360,23 @@ static void worker_wav_start(rx_session_t *rxs)
     if (auto_name_wav(rxs->pass_folder[0] ? rxs->pass_folder : NULL,
                       rxs->wav_path, sizeof rxs->wav_path) != 0
         || wav_w_open(&rxs->wav, rxs->wav_path, rxs->samp_rate) != 0) {
-        fprintf(stderr,
-            "rx_session: WAV open failed (%s): %s\n",
-            rxs->wav_path, strerror(errno));
+        // Can't write to stderr while ncurses owns the screen — it
+        // corrupts the operator UI. The wav_path[0]='\0' below leaves
+        // wav.fp NULL, so the next snapshot reports wav_active = 0 and
+        // the operator's [REC] indicator stays dark, which is the
+        // visible signal that the open failed.
         rxs->wav_path[0] = '\0';
         return;
     }
-    fprintf(stderr, "rx_session: recording -> %s\n", rxs->wav_path);
+    // No stderr print on success either — operator sees [REC] in the
+    // UI, and the WAV path is auto-named from the same UTC stamp as
+    // every other artifact in the pass folder.
 }
 
 static void worker_wav_stop(rx_session_t *rxs)
 {
     if (rxs->wav.fp == NULL) return;
-    size_t n = rxs->wav.n_samples;
     wav_w_close(&rxs->wav);
-    fprintf(stderr,
-        "rx_session: closed %s (%zu samples, %.1f s @ %d Hz)\n",
-        rxs->wav_path, n, (double) n / (double) rxs->samp_rate,
-        rxs->samp_rate);
 }
 
 void rx_session_request_wav_start(rx_session_t *rxs)

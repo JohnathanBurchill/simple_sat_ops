@@ -2143,21 +2143,26 @@ int main(int argc, char **argv)
 
 #ifdef WITH_USRP_B210
         // Auto-record per pass: open the WAV 1 min before AOS (or as
-        // soon as we're in-pass, in case simple_sat_ops started mid-
-        // pass), keep it open through the pass, close it 1 min after
-        // LOS. Each pass gets its own auto-named file in the pass
-        // folder.
+        // soon as we're above the horizon, in case simple_sat_ops
+        // started mid-pass), keep it open while the satellite is up,
+        // close 1 min after LOS. Each pass gets its own auto-named
+        // file in the pass folder. Note: this deliberately keys off the
+        // satellite geometry (elevation + time-until-AOS) rather than
+        // state.in_pass — the latter flips several minutes before AOS
+        // (tracking_prep_time_minutes) so the rotator can pre-position,
+        // which is far too early to start the WAV.
         if (g_rx_session) {
             double sec_to_aos =
                 state.prediction.predicted_minutes_until_visible * 60.0;
-            int in_window = state.in_pass
-                || (sec_to_aos > 0.0 && sec_to_aos <= RECORDING_PREROLL_S);
+            int visible   = (state.prediction.satellite_ephem.elevation > 0.0);
+            int in_preroll = (sec_to_aos > 0.0
+                              && sec_to_aos <= RECORDING_PREROLL_S);
             int active = rx_session_wav_active(g_rx_session);
-            if (!active && in_window) {
+            if (!active && (visible || in_preroll)) {
                 rx_session_request_wav_start(g_rx_session);
                 t_recording_close_at = 0.0;
             } else if (active) {
-                if (state.in_pass) {
+                if (visible) {
                     t_recording_close_at = 0.0;  // cancel any pending close
                 } else if (t_recording_close_at == 0.0) {
                     t_recording_close_at = t_now + RECORDING_POSTROLL_S;
