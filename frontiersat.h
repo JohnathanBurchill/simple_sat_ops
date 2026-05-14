@@ -1,6 +1,6 @@
 // frontiersat.h — single source of truth for the FrontierSat link
 // constants now that radio.h is gone. The B210-side tools
-// (tx_frame_sdr, b210_rx_capture, b210_rx_live) included radio.h only
+// (tx_frame_sdr, b210_rx_capture, b210_rx_tx) included radio.h only
 // for FRONTIERSAT_CARRIER_HZ; this header replaces that.
 
 #ifndef FRONTIERSAT_H

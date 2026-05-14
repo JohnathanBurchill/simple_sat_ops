@@ -71,7 +71,7 @@ static void usage(FILE *out, const char *argv0)
         "  --until=<spec>           same syntax as --since (default: now)\n"
         "  --type=<name|0xNN>       beacon|log|tcmd_response|bulk_file|0xNN\n"
         "  --satellite=<name>       e.g. CTS1\n"
-        "  --source-tool=<tool>     rx_live|rx_replay|b210_rx_live|rx_decode\n"
+        "  --source-tool=<tool>     rx_live|rx_replay|b210_rx_tx|rx_decode\n"
         "  --capture-origin=<name>  cts_ground|satnogs (audio provenance)\n"
         "  --like=<pattern>         SQL LIKE pattern matched against the\n"
         "                           decoded_summary text. Use %% as the\n"

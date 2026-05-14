@@ -2,10 +2,10 @@
 
     Simple Satellite Operations  utils/rx_replay.c
 
-    Offline equivalent of b210_rx_live: same sliding-window AX100
+    Offline equivalent of b210_rx_tx: same sliding-window AX100
     decoder, same partial-RS rescue, same position-quantised dedup — but
     the samples come from a WAV or headerless S16_LE PCM file rather
-    than live IQ. Use it to re-process the .wav companion b210_rx_live
+    than live IQ. Use it to re-process the .wav companion b210_rx_tx
     leaves on disk after a pass, or to debug the decoder against a
     capture from rtl_fm / a different SDR pipeline.
 
@@ -277,8 +277,8 @@ static void usage(FILE *dest, const char *name)
         "usage: %s <path> [options]\n"
         "\n"
         "Offline AX100 sliding-window decoder. Reads a WAV or headerless\n"
-        "S16_LE raw PCM recording (e.g. b210_rx_live's .wav companion)\n"
-        "and applies the same window/slide/decode loop b210_rx_live runs\n"
+        "S16_LE raw PCM recording (e.g. b210_rx_tx's .wav companion)\n"
+        "and applies the same window/slide/decode loop b210_rx_tx runs\n"
         "on live IQ capture.\n"
         "\n"
         "Input:\n"
@@ -288,7 +288,7 @@ static void usage(FILE *dest, const char *name)
         "  --channels=<n>           Channels for --raw (default 2; ch 0 used).\n"
         "                           Pass --channels=1 for rtl_fm captures.\n"
         "\n"
-        "Decoder (same defaults as b210_rx_live):\n"
+        "Decoder (same defaults as b210_rx_tx):\n"
         "  --bit-rate=<bps>         Default 9600.\n"
         "  --window-s=<seconds>     Decoder window size (default 1.5).\n"
         "  --slide-s=<seconds>      Slide between decode attempts (default 0.5).\n"
@@ -604,7 +604,7 @@ int main(int argc, char **argv)
     }
     // In --update mode, suppress emit_frame's INSERT — we manually
     // call packet_db_update_observer per packet so existing rows
-    // (typically from the original b210_rx_live capture) get the
+    // (typically from the original b210_rx_tx capture) get the
     // observer / TLE / session_dir gaps filled in without piling up
     // duplicate rx_replay rows in the DB.
     decode_loop_set_packet_db(update_mode ? NULL : db, "rx_replay", db_run_id);
@@ -613,7 +613,7 @@ int main(int argc, char **argv)
     // Prefer --session-dir when the caller set it (decode_passes.sh
     // does, even when the input file is a temp WAV from an ogg
     // conversion that sits in /tmp), and fall back to the input file's
-    // own directory for the b210_rx_live single-TLE-per-folder layout.
+    // own directory for the b210_rx_tx single-TLE-per-folder layout.
     char tle_path_buf[1024];
     char search_dir_buf[1024];
     const char *search_dir;
@@ -913,7 +913,7 @@ int main(int argc, char **argv)
 
             // --update mode: emit_frame's INSERT was suppressed (db
             // passed as NULL above), so backfill the existing rows
-            // for this payload — typically the b210_rx_live row from
+            // for this payload — typically the b210_rx_tx row from
             // the original capture — with whatever observer state we
             // have now.
             if (update_mode && db != NULL && plen >= 4) {

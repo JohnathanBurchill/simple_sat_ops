@@ -1,6 +1,6 @@
 /*
 
-   Simple Satellite Operations  b210_rx_core.c
+   Simple Satellite Operations  b210_rx_tx_core.c
 
    Copyright (C) 2026  Johnathan K Burchill
 
@@ -10,13 +10,14 @@
    (at your option) any later version.
 */
 
-#include "b210_rx_core.h"
+#include "b210_rx_tx_core.h"
 #include "fir_decim.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <uhd.h>
 #include <uhd/usrp/usrp.h>
@@ -24,10 +25,17 @@
 #include <uhd/types/metadata.h>
 #include <uhd/error.h>
 
-struct b210_rx_core {
+struct b210_rx_tx_core {
     uhd_usrp_handle         dev;
     uhd_rx_streamer_handle  stream;
     uhd_rx_metadata_handle  md;
+
+    // Lazy-built TX streamer. Cached for the daemon's lifetime so
+    // repeated bursts during one pass don't pay the rebuild tax.
+    uhd_tx_streamer_handle  tx_stream;
+    size_t                  tx_max_per_buff;
+    double                  tx_rate_cached;
+    double                  tx_gain_cached;
 
     // UHD streamer side
     int16_t                *iq_chunk;        // sc16 interleaved, max_iq_in pairs
@@ -68,14 +76,14 @@ static int log_uhd(uhd_error e, const char *what)
     if (e == UHD_ERROR_NONE) return 0;
     char errbuf[256] = {0};
     (void)uhd_get_last_error(errbuf, sizeof errbuf);
-    fprintf(stderr, "b210_rx_core: %s: UHD error %d: %s\n",
+    fprintf(stderr, "b210_rx_tx_core: %s: UHD error %d: %s\n",
             what, (int)e, errbuf[0] ? errbuf : "(no detail)");
     return 1;
 }
 
 // Pull the actual freq from UHD (after a tune) and update the cached value.
 // Best-effort; on UHD failure leave the cache unchanged.
-static void refresh_actual_freq(b210_rx_core_t *c)
+static void refresh_actual_freq(b210_rx_tx_core_t *c)
 {
     double f = c->actual_freq;
     if (uhd_usrp_get_rx_freq(c->dev, 0, &f) == UHD_ERROR_NONE) {
@@ -83,7 +91,7 @@ static void refresh_actual_freq(b210_rx_core_t *c)
     }
 }
 
-int b210_rx_core_open(const b210_rx_core_params_t *p, b210_rx_core_t **out)
+int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **out)
 {
     if (out == NULL || p == NULL) return -1;
     *out = NULL;
@@ -95,9 +103,9 @@ int b210_rx_core_open(const b210_rx_core_params_t *p, b210_rx_core_t **out)
     unsigned decim_M     = (p->decim_factor >= 1u) ? p->decim_factor : 1u;
     unsigned decim_taps  = p->decim_taps  > 0u   ? p->decim_taps    : 96u;
 
-    b210_rx_core_t *c = (b210_rx_core_t *)calloc(1, sizeof(*c));
+    b210_rx_tx_core_t *c = (b210_rx_tx_core_t *)calloc(1, sizeof(*c));
     if (c == NULL) {
-        fprintf(stderr, "b210_rx_core: out of memory\n");
+        fprintf(stderr, "b210_rx_tx_core: out of memory\n");
         return -1;
     }
     c->fm_fullscale_hz = fm_fullscale;
@@ -108,7 +116,7 @@ int b210_rx_core_open(const b210_rx_core_params_t *p, b210_rx_core_t **out)
     c->input_rate = p->rate_hz;
     (void)uhd_usrp_get_rx_rate(c->dev, 0, &c->input_rate);
     if (fabs(c->input_rate - p->rate_hz) / p->rate_hz > 0.01) {
-        fprintf(stderr, "b210_rx_core: requested %.0f S/s, got %.0f S/s "
+        fprintf(stderr, "b210_rx_tx_core: requested %.0f S/s, got %.0f S/s "
                         "(B210 coerced)\n", p->rate_hz, c->input_rate);
     }
     // actual_rate (post-decimation) is what the FM demod runs at, so it
@@ -161,7 +169,7 @@ int b210_rx_core_open(const b210_rx_core_params_t *p, b210_rx_core_t **out)
 
     c->iq_chunk = (int16_t *)malloc(c->max_iq_in * 2 * sizeof(int16_t));
     if (c->iq_chunk == NULL) {
-        fprintf(stderr, "b210_rx_core: out of memory for IQ chunk buf\n");
+        fprintf(stderr, "b210_rx_tx_core: out of memory for IQ chunk buf\n");
         goto fail;
     }
 
@@ -171,7 +179,7 @@ int b210_rx_core_open(const b210_rx_core_params_t *p, b210_rx_core_t **out)
             : 0.4 * c->actual_rate;
         c->decim = fir_decim_iq_new(c->input_rate, fc_hz, decim_taps, decim_M);
         if (c->decim == NULL) {
-            fprintf(stderr, "b210_rx_core: failed to build IQ decimator "
+            fprintf(stderr, "b210_rx_tx_core: failed to build IQ decimator "
                             "(fs=%.0f fc=%.0f taps=%u M=%u)\n",
                     c->input_rate, fc_hz, decim_taps, decim_M);
             goto fail;
@@ -182,7 +190,7 @@ int b210_rx_core_open(const b210_rx_core_params_t *p, b210_rx_core_t **out)
         c->max_iq_out = c->max_iq_in / decim_M + 1u;
         c->iq_decim = (int16_t *)malloc(c->max_iq_out * 2 * sizeof(int16_t));
         if (c->iq_decim == NULL) {
-            fprintf(stderr, "b210_rx_core: out of memory for decim IQ buf\n");
+            fprintf(stderr, "b210_rx_tx_core: out of memory for decim IQ buf\n");
             goto fail;
         }
     } else {
@@ -208,11 +216,11 @@ int b210_rx_core_open(const b210_rx_core_params_t *p, b210_rx_core_t **out)
     return 0;
 
 fail:
-    b210_rx_core_close(c);
+    b210_rx_tx_core_close(c);
     return -1;
 }
 
-void b210_rx_core_close(b210_rx_core_t *c)
+void b210_rx_tx_core_close(b210_rx_tx_core_t *c)
 {
     if (c == NULL) return;
     if (c->stream_running && c->stream != NULL) {
@@ -223,16 +231,17 @@ void b210_rx_core_close(b210_rx_core_t *c)
         };
         (void)uhd_rx_streamer_issue_stream_cmd(c->stream, &cmd);
     }
-    if (c->md     != NULL) uhd_rx_metadata_free(&c->md);
-    if (c->stream != NULL) uhd_rx_streamer_free(&c->stream);
-    if (c->dev    != NULL) uhd_usrp_free(&c->dev);
-    if (c->decim  != NULL) fir_decim_iq_free(c->decim);
+    if (c->md        != NULL) uhd_rx_metadata_free(&c->md);
+    if (c->stream    != NULL) uhd_rx_streamer_free(&c->stream);
+    if (c->tx_stream != NULL) uhd_tx_streamer_free(&c->tx_stream);
+    if (c->dev       != NULL) uhd_usrp_free(&c->dev);
+    if (c->decim     != NULL) fir_decim_iq_free(c->decim);
     free(c->iq_chunk);
     free(c->iq_decim);
     free(c);
 }
 
-ssize_t b210_rx_core_pump(b210_rx_core_t *c, int16_t *pcm_out, size_t pcm_cap)
+ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *c, int16_t *pcm_out, size_t pcm_cap)
 {
     if (c == NULL || pcm_out == NULL || pcm_cap == 0) return -1;
 
@@ -268,7 +277,7 @@ ssize_t b210_rx_core_pump(b210_rx_core_t *c, int16_t *pcm_out, size_t pcm_cap)
         && mderr != UHD_RX_METADATA_ERROR_CODE_NONE) {
         char errbuf[128] = {0};
         (void)uhd_rx_metadata_strerror(c->md, errbuf, sizeof errbuf);
-        fprintf(stderr, "b210_rx_core: RX metadata error %d: %s\n",
+        fprintf(stderr, "b210_rx_tx_core: RX metadata error %d: %s\n",
                 (int)mderr, errbuf[0] ? errbuf : "(no detail)");
         // Overflow / late-packet are non-fatal — keep going. The samples
         // we DID get this round are already in iq_chunk; demod them as
@@ -343,7 +352,7 @@ ssize_t b210_rx_core_pump(b210_rx_core_t *c, int16_t *pcm_out, size_t pcm_cap)
     return (ssize_t)out_n;
 }
 
-int b210_rx_core_set_freq(b210_rx_core_t *c, double freq_hz)
+int b210_rx_tx_core_set_freq(b210_rx_tx_core_t *c, double freq_hz)
 {
     if (c == NULL) return -1;
     uhd_tune_request_t req = {
@@ -360,16 +369,198 @@ int b210_rx_core_set_freq(b210_rx_core_t *c, double freq_hz)
     return 0;
 }
 
-double b210_rx_core_actual_rate(const b210_rx_core_t *c) { return c ? c->actual_rate : 0.0; }
-double b210_rx_core_input_rate (const b210_rx_core_t *c) { return c ? c->input_rate  : 0.0; }
-double b210_rx_core_actual_freq(const b210_rx_core_t *c) { return c ? c->actual_freq : 0.0; }
-size_t b210_rx_core_max_chunk  (const b210_rx_core_t *c) { return c ? c->max_iq_out  : 0; }
+double b210_rx_tx_core_actual_rate(const b210_rx_tx_core_t *c) { return c ? c->actual_rate : 0.0; }
+double b210_rx_tx_core_input_rate (const b210_rx_tx_core_t *c) { return c ? c->input_rate  : 0.0; }
+double b210_rx_tx_core_actual_freq(const b210_rx_tx_core_t *c) { return c ? c->actual_freq : 0.0; }
+size_t b210_rx_tx_core_max_chunk  (const b210_rx_tx_core_t *c) { return c ? c->max_iq_out  : 0; }
 
-int b210_rx_core_iq_levels(const b210_rx_core_t *c,
+int b210_rx_tx_core_iq_levels(const b210_rx_tx_core_t *c,
                            double *peak_env_out, double *rms_sq_out)
 {
     if (c == NULL) return -1;
     if (peak_env_out != NULL) *peak_env_out = c->iq_peak_env;
     if (rms_sq_out   != NULL) *rms_sq_out   = c->iq_rms_sq;
     return 0;
+}
+
+// Tear the RX streamer down to idle. Drain any in-flight packet so the
+// next START_CONTINUOUS doesn't pick up a stale chunk. FM-demod phase
+// state is cleared as well so the post-TX RX seam doesn't pop.
+static int rx_pause_for_tx(b210_rx_tx_core_t *c)
+{
+    if (c == NULL) return -1;
+    if (c->stream_running) {
+        uhd_stream_cmd_t stop = {
+            .stream_mode = UHD_STREAM_MODE_STOP_CONTINUOUS,
+            .num_samps   = 0,
+            .stream_now  = true,
+        };
+        if (log_uhd(uhd_rx_streamer_issue_stream_cmd(c->stream, &stop),
+                    "rx_stop_for_tx")) return -1;
+        c->stream_running = 0;
+    }
+    // Drain residual packets so the next START_CONTINUOUS sees a clean queue.
+    if (c->iq_chunk != NULL && c->stream != NULL && c->md != NULL) {
+        void *bufs[1] = { c->iq_chunk };
+        for (int i = 0; i < 16; ++i) {
+            size_t n_recv = 0;
+            uhd_error e = uhd_rx_streamer_recv(c->stream, bufs, c->max_iq_in,
+                                               &c->md, 0.1, false, &n_recv);
+            if (e != UHD_ERROR_NONE) break;
+            if (n_recv == 0) break;
+        }
+    }
+    c->have_prev   = 0;
+    c->iq_peak_env = 0.0;
+    c->iq_rms_sq   = 0.0;
+    return 0;
+}
+
+static int rx_resume_after_tx(b210_rx_tx_core_t *c, double rx_freq_hz)
+{
+    if (c == NULL || c->stream == NULL) return -1;
+    if (rx_freq_hz > 0.0) {
+        if (b210_rx_tx_core_set_freq(c, rx_freq_hz) != 0) return -1;
+    }
+    uhd_stream_cmd_t start = {
+        .stream_mode         = UHD_STREAM_MODE_START_CONTINUOUS,
+        .num_samps           = 0,
+        .stream_now          = true,
+        .time_spec_full_secs = 0,
+        .time_spec_frac_secs = 0.0,
+    };
+    if (log_uhd(uhd_rx_streamer_issue_stream_cmd(c->stream, &start),
+                "rx_resume_after_tx")) return -1;
+    c->stream_running = 1;
+    return 0;
+}
+
+// Build the TX streamer on first use, cache rate/gain so subsequent
+// bursts only retune freq+gain when they actually changed.
+static int tx_streamer_lazy_build(b210_rx_tx_core_t *c, double tx_rate_hz)
+{
+    if (c->tx_stream != NULL && fabs(c->tx_rate_cached - tx_rate_hz) < 1.0) {
+        return 0;
+    }
+    if (c->tx_stream != NULL) {
+        // Rate changed — rebuild. UHD doesn't let us retune the rate on
+        // a live streamer.
+        uhd_tx_streamer_free(&c->tx_stream);
+        c->tx_stream = NULL;
+        c->tx_max_per_buff = 0;
+    }
+    if (log_uhd(uhd_usrp_set_tx_antenna(c->dev, "TX/RX", 0),
+                "set_tx_antenna")) return -1;
+    if (log_uhd(uhd_usrp_set_tx_rate(c->dev, tx_rate_hz, 0),
+                "set_tx_rate")) return -1;
+    c->tx_rate_cached = tx_rate_hz;
+    if (log_uhd(uhd_tx_streamer_make(&c->tx_stream),
+                "tx_streamer_make")) return -1;
+    size_t channels[1] = { 0 };
+    uhd_stream_args_t args = {
+        .cpu_format   = "sc16",
+        .otw_format   = "sc16",
+        .args         = "",
+        .channel_list = channels,
+        .n_channels   = 1,
+    };
+    if (log_uhd(uhd_usrp_get_tx_stream(c->dev, &args, c->tx_stream),
+                "get_tx_stream")) return -1;
+    if (log_uhd(uhd_tx_streamer_max_num_samps(c->tx_stream,
+                                               &c->tx_max_per_buff),
+                "tx_max_num_samps")) return -1;
+    if (c->tx_max_per_buff == 0) c->tx_max_per_buff = 1024;
+    c->tx_gain_cached = -1.0;  // force a set on first burst
+    return 0;
+}
+
+int b210_rx_tx_core_burst(b210_rx_tx_core_t *c,
+                          const b210_rx_tx_core_burst_params_t *p)
+{
+    if (c == NULL || p == NULL || p->iq == NULL || p->n_samps == 0) return -1;
+
+    int rc = -1;
+    if (rx_pause_for_tx(c) != 0) goto resume;
+    if (tx_streamer_lazy_build(c, p->tx_rate_hz) != 0) goto resume;
+
+    if (fabs(c->tx_gain_cached - p->tx_gain_db) > 0.05) {
+        if (log_uhd(uhd_usrp_set_tx_gain(c->dev, p->tx_gain_db, 0, ""),
+                    "set_tx_gain")) goto resume;
+        c->tx_gain_cached = p->tx_gain_db;
+    }
+    // Reset the device clock so the time_spec on the first chunk gives
+    // the FPGA TX FIFO room to buffer before the scheduled start.
+    if (log_uhd(uhd_usrp_set_time_now(c->dev, 0, 0.0, 0),
+                "tx_set_time_now")) goto resume;
+    {
+        uhd_tune_request_t req = {
+            .target_freq     = p->tx_freq_hz,
+            .rf_freq_policy  = UHD_TUNE_REQUEST_POLICY_AUTO, .rf_freq = 0.0,
+            .dsp_freq_policy = UHD_TUNE_REQUEST_POLICY_AUTO, .dsp_freq = 0.0,
+            .args            = NULL,
+        };
+        uhd_tune_result_t res = {0};
+        if (log_uhd(uhd_usrp_set_tx_freq(c->dev, &req, 0, &res),
+                    "set_tx_freq")) goto resume;
+    }
+
+    uhd_tx_metadata_handle md = NULL;
+    if (log_uhd(uhd_tx_metadata_make(&md, false, 0, 0.0, true, false),
+                "tx_metadata_make")) goto resume;
+
+    size_t sent_total = 0;
+    while (sent_total < p->n_samps) {
+        size_t remaining  = p->n_samps - sent_total;
+        size_t this_chunk = (remaining < c->tx_max_per_buff)
+                          ? remaining : c->tx_max_per_buff;
+        int is_first = (sent_total == 0);
+        int is_last  = (this_chunk == remaining);
+        uhd_tx_metadata_free(&md);
+        if (log_uhd(uhd_tx_metadata_make(&md,
+                          /*has_time_spec=*/is_first ? true : false,
+                          /*full_secs=*/(int64_t) p->start_delay_s,
+                          /*frac_secs=*/p->start_delay_s
+                                        - (double)(int64_t) p->start_delay_s,
+                          /*start_of_burst=*/is_first ? true : false,
+                          /*end_of_burst=*/is_last ? true : false),
+                    "tx_metadata_make (loop)")) {
+            uhd_tx_metadata_free(&md);
+            goto resume;
+        }
+        const void *bufs[1] = { p->iq + sent_total * 2 };
+        size_t items_sent = 0;
+        double timeout = p->start_delay_s + 1.0;
+        if (timeout < 1.0) timeout = 1.0;
+        uhd_error e = uhd_tx_streamer_send(c->tx_stream, bufs, this_chunk,
+                                           &md, timeout, &items_sent);
+        if (e != UHD_ERROR_NONE) {
+            log_uhd(e, "tx_streamer_send");
+            uhd_tx_metadata_free(&md);
+            goto resume;
+        }
+        if (items_sent == 0) {
+            fprintf(stderr, "b210_rx_tx_core: TX accepted 0 samples — backpressure?\n");
+            uhd_tx_metadata_free(&md);
+            goto resume;
+        }
+        sent_total += items_sent;
+    }
+    if (md != NULL) uhd_tx_metadata_free(&md);
+
+    // Let the FPGA FIFO drain — the host call returned when the FIFO
+    // accepted the last sample, not when the antenna stopped emitting.
+    double on_air_s = (double) p->n_samps / p->tx_rate_hz;
+    double drain_s  = p->start_delay_s + on_air_s + 0.05;
+    if (drain_s > 0.0) {
+        usleep((useconds_t) (drain_s * 1e6));
+    }
+    rc = 0;
+
+resume:
+    // Always try to put RX back into service, even if the TX leg failed.
+    if (rx_resume_after_tx(c, p->rx_resume_freq_hz) != 0) {
+        fprintf(stderr,
+            "b210_rx_tx_core: WARNING — RX did not resume after TX burst\n");
+    }
+    return rc;
 }

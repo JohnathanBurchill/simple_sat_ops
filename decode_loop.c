@@ -32,7 +32,7 @@
 #include <time.h>
 
 // Process-global because emit_frame is called from rx_live, rx_replay,
-// b210_rx_live, and rx_decode. The alternative — a parameter on
+// b210_rx_tx, and rx_decode. The alternative — a parameter on
 // emit_frame — would touch every caller site for no real gain. The flag
 // is read-mostly (set once at startup or via a REPL command) so the
 // no-locking single-int approach is fine.
@@ -47,7 +47,7 @@ static const char  *g_db_source_tool = NULL;
 static const char  *g_db_source_run  = NULL;
 
 // Observer-frame state pushed in by the receiver each time it changes
-// (typically: once per Doppler tick from b210_rx_live; rx_replay sets
+// (typically: once per Doppler tick from b210_rx_tx; rx_replay sets
 // it per-packet during backfill). NaN means "not known". Other
 // receivers never call the setter; they read NaN and the DB row gets
 // NULL in those columns.
@@ -481,7 +481,7 @@ void decode_loop_record_packet(const char *ts,
     }
 
     // ts_received uses the ISO-8601 form when emit_frame's caller
-    // produces one (rx_live / b210_rx_live / rx_decode). rx_replay
+    // produces one (rx_live / b210_rx_tx / rx_decode). rx_replay
     // passes a "t=NN.NNNs" relative offset; if an audio-clock anchor
     // is set, ts_received = (anchor + offset_s) so the column carries
     // the actual transmission UTC. Without an anchor, fall back to

@@ -1,6 +1,6 @@
 /*
 
-   Simple Satellite Operations  utils/b210_rx_live.c
+   Simple Satellite Operations  utils/b210_rx_tx.c
 
    Live B210 RX + AX100 decoder + Doppler retune driver. Captures IQ
    from a USRP B210 via libuhd, FM-demodulates, runs the same sliding-
@@ -8,7 +8,7 @@
    the SDR every ~1 s based on range-rate from the tracked TLE.
 
    Single-process owner of the B210 — the device cannot be shared with
-   another UHD program. simple_sat_ops drives the rotator; b210_rx_live
+   another UHD program. simple_sat_ops drives the rotator; b210_rx_tx
    is the parallel scientific receiver.
 
    Copyright (C) 2026  Johnathan K Burchill
@@ -28,7 +28,7 @@
 */
 
 #include "ax100.h"
-#include "b210_rx_core.h"
+#include "b210_rx_tx_core.h"
 #include "csp.h"
 #include "decode_loop.h"
 #include "hmac_keyfile.h"
@@ -72,6 +72,17 @@ static void on_signal(int sig)
     g_stop = 1;
     rx_tui_request_quit();
 }
+
+// ---- TX request servicing (daemon role) ---------------------------
+//
+// The daemon connects to simple_sat_ops as a long-lived IPC client and
+// announces itself with HELLO role="b210_rx_tx". simple_sat_ops then
+// sends targeted TX_REQUEST events to this client; the on-event callback
+// stashes the request here and the main loop services it between RX
+// pumps. ACK + COMMAND_SENT replies go back through the same socket.
+static sso_ipc_client_t *g_ctrl_cli         = NULL;
+static int               g_tx_request_pending = 0;
+static sso_event_t       g_tx_request_evt;
 
 static void fmt_utc(char *buf, size_t cap)
 {
@@ -125,7 +136,7 @@ static int generate_spectrogram(const char *wav_path)
 
     pid_t pid = fork();
     if (pid < 0) {
-        fprintf(stderr, "b210_rx_live: fork() for ffmpeg failed: %s\n",
+        fprintf(stderr, "b210_rx_tx: fork() for ffmpeg failed: %s\n",
                 strerror(errno));
         return -1;
     }
@@ -140,14 +151,14 @@ static int generate_spectrogram(const char *wav_path)
             NULL,
         };
         execvp("ffmpeg", args);
-        fprintf(stderr, "b210_rx_live: ffmpeg not on PATH; "
+        fprintf(stderr, "b210_rx_tx: ffmpeg not on PATH; "
                 "skipping spectrogram for %s\n", wav_path);
         _exit(127);
     }
     int status = 0;
     if (waitpid(pid, &status, 0) < 0) return -1;
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-        fprintf(stderr, "b210_rx_live: spectrogram -> %s\n", png_path);
+        fprintf(stderr, "b210_rx_tx: spectrogram -> %s\n", png_path);
         return 0;
     }
     return -1;
@@ -326,12 +337,12 @@ static int read_tle_lines(const char *path, const char *sat_prefix,
 // smoothed magnitude. Both are referenced to sc16 full-scale (±32767).
 // The B210 has no internal RSSI calibration, so this is dBFS not dBm —
 // to read it as dBm, subtract --gain-db plus the LNA gain in the chain.
-static void iq_level_format(const b210_rx_core_t *core,
+static void iq_level_format(const b210_rx_tx_core_t *core,
                             char *buf, size_t cap)
 {
     double peak = 0.0, rms_sq = 0.0;
     if (core == NULL
-        || b210_rx_core_iq_levels(core, &peak, &rms_sq) != 0) {
+        || b210_rx_tx_core_iq_levels(core, &peak, &rms_sq) != 0) {
         snprintf(buf, cap, "n/a");
         return;
     }
@@ -346,7 +357,7 @@ static void iq_level_format(const b210_rx_core_t *core,
 // flickering between two different formats. NaN inputs render as "---"
 // — the operator sees az/el and range_rate appear as soon as the first
 // Doppler tick populates them. az/el are the SGP4-predicted satellite
-// position; b210_rx_live doesn't talk to the rotator, so the line shows
+// position; b210_rx_tx doesn't talk to the rotator, so the line shows
 // where the satellite *should* be, not where the dish is actually
 // pointing.
 static void format_tui_status(char *out, size_t outn,
@@ -742,10 +753,10 @@ static void usage(FILE *dest, const char *name)
         "\n"
         "Output:\n"
         "  --log=<path>                Append decoded-frame summaries (default:\n"
-        "                              auto-name b210_rx_live_UT=...log)\n"
+        "                              auto-name b210_rx_tx_UT=...log)\n"
         "  --no-log                    Skip the decode log\n"
         "  --wav=<path>                Tee demoded PCM to a WAV. Default: ON,\n"
-        "                              auto-named b210_rx_live_UT=...wav in\n"
+        "                              auto-named b210_rx_tx_UT=...wav in\n"
         "                              CWD so every run leaves a replayable\n"
         "                              breadcrumb. Header rate = post-decim\n"
         "                              rate (~5.7 MB/min at the default 48 kHz).\n"
@@ -798,6 +809,339 @@ static void usage(FILE *dest, const char *name)
         HMAC_KEYFILE_DEFAULT_RELPATH);
 }
 
+// ---- IQ-building helpers (lifted from utils/tx_frame_sdr.c) -------
+
+static int tx_hex_digit(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static ssize_t tx_parse_payload_hex(const char *hex, uint8_t *out, size_t out_cap)
+{
+    size_t n = 0;
+    int hi = -1;
+    for (const char *p = hex; *p != '\0'; p++) {
+        unsigned char c = (unsigned char) *p;
+        if (c == ' ' || c == '\t' || c == ':') continue;
+        int d = tx_hex_digit((char) c);
+        if (d < 0) return -1;
+        if (hi < 0) hi = d;
+        else {
+            if (n >= out_cap) return -1;
+            out[n++] = (uint8_t)((hi << 4) | d);
+            hi = -1;
+        }
+    }
+    if (hi >= 0) return -1;
+    return (ssize_t) n;
+}
+
+static void tx_fm_modulate(const int16_t *pcm, size_t n_pcm,
+                            double dev_hz, double fs, int16_t *iq_out)
+{
+    static double phi = 0.0;
+    const double k = 2.0 * M_PI * dev_hz / fs;
+    const double inv_full_scale = 1.0 / 32767.0;
+    for (size_t i = 0; i < n_pcm; i++) {
+        double x = (double) pcm[i] * inv_full_scale;
+        phi += k * x;
+        if (phi >  M_PI) phi -= 2.0 * M_PI;
+        if (phi < -M_PI) phi += 2.0 * M_PI;
+        double ci = cos(phi);
+        double cq = sin(phi);
+        iq_out[2 * i + 0] = (int16_t) lround(ci * 22937.0);
+        iq_out[2 * i + 1] = (int16_t) lround(cq * 22937.0);
+    }
+}
+
+static void tx_apply_envelope_ramp(int16_t *iq, size_t n_samps, size_t ramp_n)
+{
+    if (ramp_n == 0) return;
+    if (ramp_n > n_samps / 2) ramp_n = n_samps / 2;
+    for (size_t i = 0; i < ramp_n; i++) {
+        double env_in  = 0.5 * (1.0 - cos(M_PI * (double) i / (double) ramp_n));
+        double env_out = 0.5 * (1.0 + cos(M_PI * (double) i / (double) ramp_n));
+        iq[2 * i + 0] = (int16_t) lround((double) iq[2 * i + 0] * env_in);
+        iq[2 * i + 1] = (int16_t) lround((double) iq[2 * i + 1] * env_in);
+        size_t k = n_samps - ramp_n + i;
+        iq[2 * k + 0] = (int16_t) lround((double) iq[2 * k + 0] * env_out);
+        iq[2 * k + 1] = (int16_t) lround((double) iq[2 * k + 1] * env_out);
+    }
+}
+
+// Build a single CSP+AX100 frame from `payload`, FM-modulate it into a
+// freshly-allocated IQ buffer. Caller must free *out_iq. Returns 0 on
+// success and fills *out_iq, *out_n, *out_rate; -1 on error.
+static int tx_build_iq(const uint8_t *payload, size_t payload_len,
+                       const csp_v1_header_t *csp_hdr,
+                       int use_hmac, const uint8_t *hmac_key, size_t hmac_key_len,
+                       int use_rs,
+                       int bit_rate, int tx_rate_hz, double deviation_hz,
+                       int repeat, int gap_ms,
+                       int preroll_ms, int postroll_ms, double ramp_ms,
+                       int16_t **out_iq, size_t *out_n)
+{
+    if (out_iq == NULL || out_n == NULL) return -1;
+    *out_iq = NULL;
+    *out_n  = 0;
+
+    uint8_t csp_packet[4096];
+    ssize_t csp_len = csp_v1_encode(csp_hdr, payload, payload_len,
+                                    csp_packet, sizeof csp_packet);
+    if (csp_len < 0) {
+        fprintf(stderr, "b210_rx_tx: csp_v1_encode failed\n");
+        return -1;
+    }
+
+    ax100_opts_t opts;
+    ax100_opts_defaults(&opts);
+    if (use_hmac && hmac_key != NULL) {
+        opts.hmac_key = hmac_key;
+        opts.hmac_key_len = hmac_key_len;
+    }
+    opts.reed_solomon = use_rs;
+    uint8_t frame[4200];
+    ssize_t frame_len = ax100_frame(csp_packet, (size_t) csp_len, &opts,
+                                    frame, sizeof frame);
+    if (frame_len < 0) {
+        fprintf(stderr, "b210_rx_tx: ax100_frame failed\n");
+        return -1;
+    }
+
+    modem_params_t mp;
+    modem_params_defaults(&mp);
+    mp.bit_rate  = bit_rate;
+    mp.samp_rate = tx_rate_hz;
+    if (mp.samp_rate <= 0 || mp.bit_rate <= 0
+        || mp.samp_rate % mp.bit_rate != 0) {
+        fprintf(stderr,
+            "b210_rx_tx: tx_rate %d must be a positive multiple of "
+            "bit_rate %d\n", mp.samp_rate, mp.bit_rate);
+        return -1;
+    }
+    int sps = mp.samp_rate / mp.bit_rate;
+    size_t n_pcm = (size_t) frame_len * 8u * (size_t) sps;
+    int16_t *pcm = (int16_t *) malloc(n_pcm * sizeof(int16_t));
+    if (pcm == NULL) return -1;
+    ssize_t got = modem_bytes_to_pcm16(frame, (size_t) frame_len, &mp,
+                                        pcm, n_pcm);
+    if (got < 0) { free(pcm); return -1; }
+
+    size_t preroll_bytes  = ((size_t) preroll_ms * (size_t) mp.samp_rate / 1000)
+                            / (8 * (size_t) sps);
+    size_t preroll_samps  = preroll_bytes * 8 * (size_t) sps;
+    size_t postroll_samps = (size_t)((double) mp.samp_rate
+                                      * (double) postroll_ms / 1000.0);
+    size_t ramp_samps     = (size_t)((double) mp.samp_rate * ramp_ms / 1000.0);
+
+    int16_t *preroll_pcm = NULL;
+    if (preroll_samps > 0) {
+        uint8_t *pre_bytes = (uint8_t *) malloc(preroll_bytes);
+        if (pre_bytes == NULL) { free(pcm); return -1; }
+        memset(pre_bytes, 0xAA, preroll_bytes);
+        preroll_pcm = (int16_t *) malloc(preroll_samps * sizeof(int16_t));
+        if (preroll_pcm == NULL) { free(pre_bytes); free(pcm); return -1; }
+        ssize_t pgot = modem_bytes_to_pcm16(pre_bytes, preroll_bytes, &mp,
+                                             preroll_pcm, preroll_samps);
+        free(pre_bytes);
+        if (pgot < 0) { free(preroll_pcm); free(pcm); return -1; }
+    }
+
+    if (repeat < 1) repeat = 1;
+    if (gap_ms < 0) gap_ms = 0;
+    size_t gap_samps = (size_t)((double) mp.samp_rate
+                                  * (double) gap_ms / 1000.0);
+    size_t per_rep   = n_pcm + gap_samps;
+    size_t n_iq_total = preroll_samps + per_rep * (size_t) repeat + postroll_samps;
+    int16_t *iq = (int16_t *) calloc(n_iq_total * 2, sizeof(int16_t));
+    if (iq == NULL) { free(preroll_pcm); free(pcm); return -1; }
+
+    if (preroll_pcm != NULL) {
+        tx_fm_modulate(preroll_pcm, preroll_samps, deviation_hz,
+                       (double) mp.samp_rate, iq);
+    }
+    for (int r = 0; r < repeat; r++) {
+        size_t off = preroll_samps + (size_t) r * per_rep;
+        tx_fm_modulate(pcm, n_pcm, deviation_hz, (double) mp.samp_rate,
+                       iq + off * 2);
+        size_t burst_start = (r == 0) ? 0 : off;
+        size_t burst_n     = (r == 0) ? (preroll_samps + n_pcm) : n_pcm;
+        tx_apply_envelope_ramp(iq + burst_start * 2, burst_n, ramp_samps);
+    }
+
+    free(preroll_pcm);
+    free(pcm);
+    *out_iq = iq;
+    *out_n  = n_iq_total;
+    return 0;
+}
+
+// Build a "hex:abcd..." or "ascii:HELLO" summary for the SENT broadcast.
+static void tx_summarize_payload(const uint8_t *payload, size_t n,
+                                  int is_hex, char *out, size_t out_size)
+{
+    if (out_size == 0) return;
+    if (!is_hex) {
+        size_t cap = n + 7;  // "ascii:" + payload
+        if (cap >= out_size) cap = out_size - 1;
+        snprintf(out, out_size, "ascii:%.*s", (int)(cap - 6), (const char *) payload);
+        return;
+    }
+    char hexbuf[64];
+    size_t cap_bytes = n > 16 ? 16 : n;
+    size_t k = 0;
+    for (size_t i = 0; i < cap_bytes && k + 3 < sizeof hexbuf; ++i) {
+        k += (size_t) snprintf(hexbuf + k, sizeof hexbuf - k, "%02x",
+                                (unsigned) payload[i]);
+    }
+    if (n > cap_bytes) {
+        snprintf(hexbuf + k, sizeof hexbuf - k, "...");
+    }
+    snprintf(out, out_size, "hex:%s", hexbuf);
+}
+
+static void daemon_publish(sso_event_type_t type,
+                            const char *ack_status,
+                            const char *summary)
+{
+    if (g_ctrl_cli == NULL) return;
+    sso_event_t evt;
+    sso_event_init(&evt, type);
+    snprintf(evt.from, sizeof evt.from, "%s", sso_unix_user());
+    if (summary && summary[0]) {
+        snprintf(evt.ascii, sizeof evt.ascii, "%s", summary);
+    }
+    if (ack_status && ack_status[0]) {
+        snprintf(evt.tx_ack_status, sizeof evt.tx_ack_status, "%s", ack_status);
+    }
+    char buf[2048];
+    if (sso_event_encode(&evt, buf, sizeof buf) == 0) {
+        sso_ipc_client_send(g_ctrl_cli, buf);
+    }
+}
+
+// Service a pending TX_REQUEST: validate payload, build the IQ, run the
+// burst, then publish ACK + COMMAND_SENT (or a rejection). The actual
+// RF rate / bit-rate / preroll / postroll / ramp / HMAC defaults stay
+// hard-coded here (the same defaults tx_frame_sdr ships with) — the
+// request only carries the variable bits (payload, CSP, freq, gain).
+static void daemon_service_tx_request(b210_rx_tx_core_t *core,
+                                       const sso_event_t *evt,
+                                       const uint8_t *hmac_key,
+                                       ssize_t hmac_key_len,
+                                       double rx_resume_freq_hz)
+{
+    if (core == NULL || evt == NULL) return;
+    int is_hex = (evt->tx_payload_kind[0] && strcmp(evt->tx_payload_kind, "hex") == 0);
+    uint8_t payload[2048];
+    ssize_t payload_len = 0;
+    if (is_hex) {
+        payload_len = tx_parse_payload_hex(evt->tx_payload, payload, sizeof payload);
+        if (payload_len < 0) {
+            daemon_publish(SSO_EVT_TX_ACK, "rejected: bad hex payload",
+                            evt->ascii);
+            return;
+        }
+    } else {
+        size_t n = strlen(evt->tx_payload);
+        if (n == 0) {
+            daemon_publish(SSO_EVT_TX_ACK, "rejected: empty payload",
+                            evt->ascii);
+            return;
+        }
+        if (n > sizeof payload) n = sizeof payload;
+        memcpy(payload, evt->tx_payload, n);
+        payload_len = (ssize_t) n;
+    }
+    if (!evt->tx_allow_tx) {
+        daemon_publish(SSO_EVT_TX_ACK, "rejected: --allow-tx off",
+                        evt->ascii);
+        return;
+    }
+
+    csp_v1_header_t csp_hdr = {
+        .prio  = evt->tx_csp_prio ? evt->tx_csp_prio : CSP_PRIO_NORM,
+        .src   = evt->tx_csp_src   ? evt->tx_csp_src   : 10,
+        .dst   = evt->tx_csp_dst   ? evt->tx_csp_dst   : 1,
+        .dport = evt->tx_csp_dport ? evt->tx_csp_dport : 7,
+        .sport = evt->tx_csp_sport ? evt->tx_csp_sport : 16,
+        .flags = 0,
+    };
+    int bit_rate     = 9600;
+    int tx_rate_hz   = 480000;
+    double deviation = (double) bit_rate / 4.0;
+    int repeat       = evt->tx_repeat > 0 ? evt->tx_repeat : 1;
+    int gap_ms       = evt->tx_gap_ms > 0 ? evt->tx_gap_ms : 200;
+    int preroll_ms   = 100;
+    int postroll_ms  = 50;
+    double ramp_ms   = 1.0;
+    double start_delay_s = 0.5;
+    double tx_gain_db    = evt->tx_gain_db > 0 ? evt->tx_gain_db : 30.0;
+    long   tx_freq_hz    = evt->tx_freq_hz > 0 ? evt->tx_freq_hz
+                                                : (long) FRONTIERSAT_CARRIER_HZ;
+
+    int16_t *iq = NULL;
+    size_t n_samps = 0;
+    if (tx_build_iq(payload, (size_t) payload_len, &csp_hdr,
+                    (hmac_key_len > 0), hmac_key, (size_t) (hmac_key_len > 0 ? hmac_key_len : 0),
+                    /*use_rs=*/1,
+                    bit_rate, tx_rate_hz, deviation,
+                    repeat, gap_ms, preroll_ms, postroll_ms, ramp_ms,
+                    &iq, &n_samps) != 0) {
+        daemon_publish(SSO_EVT_TX_ACK, "rejected: frame build failed",
+                        evt->ascii);
+        return;
+    }
+
+    char summary[160];
+    tx_summarize_payload(payload, (size_t) payload_len, is_hex,
+                          summary, sizeof summary);
+
+    b210_rx_tx_core_burst_params_t bp = {
+        .iq                 = iq,
+        .n_samps            = n_samps,
+        .tx_rate_hz         = (double) tx_rate_hz,
+        .tx_freq_hz         = (double) tx_freq_hz,
+        .tx_gain_db         = tx_gain_db,
+        .start_delay_s      = start_delay_s,
+        .rx_resume_freq_hz  = rx_resume_freq_hz,
+    };
+    int rc = b210_rx_tx_core_burst(core, &bp);
+    free(iq);
+    if (rc != 0) {
+        daemon_publish(SSO_EVT_TX_ACK, "uhd-err", summary);
+        return;
+    }
+    daemon_publish(SSO_EVT_TX_ACK,         "ok",   summary);
+    daemon_publish(SSO_EVT_TX_COMMAND_SENT, NULL,  summary);
+}
+
+static void daemon_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
+                             void *user)
+{
+    (void) cli; (void) user;
+    if (evt->type != SSO_EVT_TX_REQUEST) return;
+    if (g_tx_request_pending) {
+        // Already queued — drop the new one with an explicit rejection.
+        sso_event_t reject;
+        sso_event_init(&reject, SSO_EVT_TX_ACK);
+        snprintf(reject.from, sizeof reject.from, "%s", sso_unix_user());
+        snprintf(reject.ascii, sizeof reject.ascii, "%s", evt->ascii);
+        snprintf(reject.tx_ack_status, sizeof reject.tx_ack_status,
+                  "rejected: previous burst in flight");
+        char buf[2048];
+        if (sso_event_encode(&reject, buf, sizeof buf) == 0) {
+            sso_ipc_client_send(g_ctrl_cli, buf);
+        }
+        return;
+    }
+    g_tx_request_evt     = *evt;
+    g_tx_request_pending = 1;
+}
+
 // load_tle in prediction.c handles the file-scan + name-prefix-match +
 // SGP4 conversion already; we just plug in the name and path. It does
 // case-sensitive prefix matching, same convention as simple_sat_ops.
@@ -836,7 +1180,7 @@ int main(int argc, char **argv)
     const char *device_args  = "type=b200";
     double fm_fullscale_hz   = 25000.0;
 
-    // IQ decimator (digital narrowband filter inside b210_rx_core).
+    // IQ decimator (digital narrowband filter inside b210_rx_tx_core).
     // Default: 240 kHz UHD → 48 kHz post-decim → 5 sps at 9600 baud,
     // matching rx_live's audio path. Without this stage the FM
     // discriminator runs on raw 240 kHz IQ and drowns a ~10 kHz-wide
@@ -884,13 +1228,13 @@ int main(int argc, char **argv)
 
     const char *log_path     = NULL;
     int         want_log     = 1;
-    char        auto_log_path[300] = {0};
+    char        auto_log_path[512] = {0};
     const char *wav_path     = NULL;
     int         want_wav     = 1;
-    char        auto_wav_path[300] = {0};
+    char        auto_wav_path[512] = {0};
     const char *csv_path     = NULL;
     int         want_csv     = 1;
-    char        auto_csv_path[300] = {0};
+    char        auto_csv_path[512] = {0};
     int         want_spectrogram = 1;
     int         quiet        = 0;
     // ncurses TUI is the default — the operator wants to see the live
@@ -906,7 +1250,7 @@ int main(int argc, char **argv)
     // simple_sat_ops operator-mode instance owned by $USER, and turns
     // on periodic rx-stats fan-out to that instance so its display
     // surfaces an RX status line. --no-control-check skips the gate
-    // (bench / dev only). When neither flag is set, b210_rx_live runs
+    // (bench / dev only). When neither flag is set, b210_rx_tx runs
     // standalone as before — no IPC, no operator coupling.
     int         control_mode    = 0;
     int         no_control_check = 0;
@@ -923,7 +1267,7 @@ int main(int argc, char **argv)
         if (posn == 0) tle_path = a;
         else if (posn == 1) sat_name = a;
         else {
-            fprintf(stderr, "b210_rx_live: unexpected positional arg '%s'\n", a);
+            fprintf(stderr, "b210_rx_tx: unexpected positional arg '%s'\n", a);
             usage(stderr, argv[0]);
             return EXIT_FAILURE;
         }
@@ -934,7 +1278,7 @@ int main(int argc, char **argv)
         // target for this tool. Operator can override by passing it as
         // a second positional arg.
         sat_name = "FrontierSat";
-        fprintf(stderr, "b210_rx_live: defaulting satellite name to '%s'\n",
+        fprintf(stderr, "b210_rx_tx: defaulting satellite name to '%s'\n",
                 sat_name);
     }
 
@@ -982,7 +1326,7 @@ int main(int argc, char **argv)
                 char *endp = NULL;
                 double th = strtod(v, &endp);
                 if (endp == v) {
-                    fprintf(stderr, "b210_rx_live: --monitor-squelch must be "
+                    fprintf(stderr, "b210_rx_tx: --monitor-squelch must be "
                                     "'auto', 'off', or a number (sig/noise dB) "
                                     "(got '%s')\n", v);
                     return EXIT_FAILURE;
@@ -1008,7 +1352,7 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--sync-threshold=")) {
             sync_max_ham = atoi(a + 17);
             if (sync_max_ham < 0 || sync_max_ham > 8) {
-                fprintf(stderr, "b210_rx_live: --sync-threshold out of range [0,8]\n");
+                fprintf(stderr, "b210_rx_tx: --sync-threshold out of range [0,8]\n");
                 return EXIT_FAILURE;
             }
         }
@@ -1043,7 +1387,7 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--no-control-check") == 0)      no_control_check = 1;
 
         else {
-            fprintf(stderr, "b210_rx_live: unknown option '%s'\n", a);
+            fprintf(stderr, "b210_rx_tx: unknown option '%s'\n", a);
             usage(stderr, argv[0]);
             return EXIT_FAILURE;
         }
@@ -1051,15 +1395,15 @@ int main(int argc, char **argv)
 
     if (slide_s > window_s) slide_s = window_s;
     if (bit_rate <= 0) {
-        fprintf(stderr, "b210_rx_live: --bit-rate must be > 0\n");
+        fprintf(stderr, "b210_rx_tx: --bit-rate must be > 0\n");
         return EXIT_FAILURE;
     }
 
     // Audit hook + operator gate. The gate only fires when --control is
-    // explicitly passed; without it, b210_rx_live runs standalone like
+    // explicitly passed; without it, b210_rx_tx runs standalone like
     // a regular receiver (preserves the historic behavior for bench
     // tests / replays).
-    sso_audit_start("b210_rx_live",
+    sso_audit_start("b210_rx_tx",
                     control_mode ? (no_control_check ? "control no-check" : "control")
                                   : "standalone");
     char ssoop_pass_folder[256] = "";
@@ -1081,7 +1425,7 @@ int main(int argc, char **argv)
                     reason = "operator handshake failed";
                     break;
             }
-            fprintf(stderr, "b210_rx_live: refused (%s%s%s).\n",
+            fprintf(stderr, "b210_rx_tx: refused (%s%s%s).\n",
                             reason,
                             ssoop_user[0] ? " — operator=" : "",
                             ssoop_user[0] ? ssoop_user : "");
@@ -1089,13 +1433,36 @@ int main(int argc, char **argv)
             sso_audit_set_exit_code(2);
             return 2;
         }
-        fprintf(stderr, "b210_rx_live: operator=%s pass_folder=%s\n",
+        fprintf(stderr, "b210_rx_tx: operator=%s pass_folder=%s\n",
                 ssoop_user, ssoop_pass_folder[0] ? ssoop_pass_folder : "(none)");
+
+        // Long-lived control client: simple_sat_ops's HELLO peer-uid
+        // check pins this connection to the operator's uid, then the
+        // operator's compose modal targets this slot with TX_REQUEST.
+        g_ctrl_cli = sso_ipc_client_connect("simple_sat_ops");
+        if (g_ctrl_cli != NULL) {
+            sso_ipc_client_on_event(g_ctrl_cli, daemon_on_event, NULL);
+            sso_event_t hello;
+            sso_event_init(&hello, SSO_EVT_HELLO);
+            snprintf(hello.role, sizeof hello.role, "b210_rx_tx");
+            snprintf(hello.user, sizeof hello.user, "%s", ssoop_user);
+            char hbuf[1024];
+            if (sso_event_encode(&hello, hbuf, sizeof hbuf) == 0) {
+                sso_ipc_client_send(g_ctrl_cli, hbuf);
+            }
+            fprintf(stderr,
+                "b210_rx_tx: control client attached "
+                "(role=b210_rx_tx) — waiting for TX_REQUEST\n");
+        } else {
+            fprintf(stderr,
+                "b210_rx_tx: control client connect failed: %s\n",
+                strerror(errno));
+        }
     }
 
 #ifndef WITH_SGP4SDP4
     if (tle_path != NULL && !no_doppler) {
-        fprintf(stderr, "b210_rx_live: this build has no SGP4SDP4 — Doppler\n"
+        fprintf(stderr, "b210_rx_tx: this build has no SGP4SDP4 — Doppler\n"
                         "tracking is unavailable. Re-run with --no-doppler,\n"
                         "or rebuild on a host with libsgp4sdp4 installed.\n");
         return EXIT_FAILURE;
@@ -1121,26 +1488,37 @@ int main(int argc, char **argv)
         // simple_sat_ops's main.c does the same right after load_tle.
         // Without this the propagator reads stale flag state and
         // range_rate comes back as 0, which is why a freshly-built
-        // b210_rx_live would tune to nominal and never budge.
+        // b210_rx_tx would tune to nominal and never budge.
         ClearFlag(ALL_FLAGS);
         select_ephemeris(&pred.satellite_ephem.tle);
     }
 #endif
 
     // Auto-name log + wav + csv with a shared UTC stamp so they group
-    // together in directory listings. Same convention as rx_live.
+    // together in directory listings. Drop the files into the operator's
+    // pass folder when we have one (--control mode after verify); fall
+    // back to the current directory for standalone / dev runs.
     if ((want_log && log_path == NULL) ||
         (want_wav && wav_path == NULL) ||
         (want_csv && csv_path == NULL)) {
         struct timeval tv;
         struct tm utc;
         if (gettimeofday(&tv, NULL) == 0 && gmtime_r(&tv.tv_sec, &utc) != NULL) {
-            char base[200];
-            snprintf(base, sizeof base,
-                     "b210_rx_live_UT=%04d%02d%02dT%02d%02d%02d.%03ld",
-                     utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
-                     utc.tm_hour, utc.tm_min, utc.tm_sec,
-                     (long)(tv.tv_usec / 1000));
+            char base[280];
+            if (ssoop_pass_folder[0]) {
+                snprintf(base, sizeof base,
+                         "%s/b210_rx_tx_UT=%04d%02d%02dT%02d%02d%02d.%03ld",
+                         ssoop_pass_folder,
+                         utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                         utc.tm_hour, utc.tm_min, utc.tm_sec,
+                         (long)(tv.tv_usec / 1000));
+            } else {
+                snprintf(base, sizeof base,
+                         "b210_rx_tx_UT=%04d%02d%02dT%02d%02d%02d.%03ld",
+                         utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                         utc.tm_hour, utc.tm_min, utc.tm_sec,
+                         (long)(tv.tv_usec / 1000));
+            }
             if (want_log && log_path == NULL) {
                 snprintf(auto_log_path, sizeof auto_log_path, "%s.log", base);
                 log_path = auto_log_path;
@@ -1168,7 +1546,7 @@ int main(int argc, char **argv)
         if (path == NULL) {
             if (hmac_keyfile_default_path(default_path,
                                           sizeof default_path) != 0) {
-                fprintf(stderr, "b210_rx_live: HOME unset; pass --keyfile=<path>\n");
+                fprintf(stderr, "b210_rx_tx: HOME unset; pass --keyfile=<path>\n");
                 return EXIT_FAILURE;
             }
             path = default_path;
@@ -1181,7 +1559,7 @@ int main(int argc, char **argv)
     // initial freq. If Doppler is on we'd ideally compute the very first
     // freq from the prediction here; the simpler thing is to start at
     // nominal and let the first 1 s tick correct it.
-    b210_rx_core_params_t cp = {
+    b210_rx_tx_core_params_t cp = {
         .freq_hz         = nominal_freq_hz,
         .rate_hz         = rate_hz,
         .gain_db         = gain_db,
@@ -1193,20 +1571,20 @@ int main(int argc, char **argv)
         .decim_cutoff_hz = decim_cutoff_hz,
         .decim_taps      = decim_taps,
     };
-    b210_rx_core_t *core = NULL;
-    if (b210_rx_core_open(&cp, &core) != 0) {
+    b210_rx_tx_core_t *core = NULL;
+    if (b210_rx_tx_core_open(&cp, &core) != 0) {
         return EXIT_FAILURE;
     }
-    double actual_rate = b210_rx_core_actual_rate(core);
-    double input_rate  = b210_rx_core_input_rate(core);
-    double actual_freq = b210_rx_core_actual_freq(core);
+    double actual_rate = b210_rx_tx_core_actual_rate(core);
+    double input_rate  = b210_rx_tx_core_input_rate(core);
+    double actual_freq = b210_rx_tx_core_actual_freq(core);
     int    samp_rate   = (int)actual_rate;
     if (samp_rate <= 0 || (samp_rate % bit_rate) != 0) {
-        fprintf(stderr, "b210_rx_live: post-decim rate %d S/s isn't a multiple "
+        fprintf(stderr, "b210_rx_tx: post-decim rate %d S/s isn't a multiple "
                         "of bit_rate %d — adjust --rate or --decim-factor so "
                         "(rate / decim_factor) divides bit_rate cleanly\n",
                 samp_rate, bit_rate);
-        b210_rx_core_close(core);
+        b210_rx_tx_core_close(core);
         return EXIT_FAILURE;
     }
 
@@ -1215,13 +1593,13 @@ int main(int argc, char **argv)
     if (log_path != NULL) {
         FILE *lf = fopen(log_path, "a");
         if (lf == NULL) {
-            fprintf(stderr, "b210_rx_live: fopen(%s, a): %s\n",
+            fprintf(stderr, "b210_rx_tx: fopen(%s, a): %s\n",
                     log_path, strerror(errno));
         } else {
             char ts[64];
             fmt_utc(ts, sizeof ts);
             fprintf(lf,
-                    "[%s] b210_rx_live: session start freq=%.0f "
+                    "[%s] b210_rx_tx: session start freq=%.0f "
                     "input_rate=%.0f decim=%u (post-decim rate=%d) "
                     "decim_cutoff=%.0f decim_taps=%u "
                     "antenna=%s gain=%.1f window=%.2fs slide=%.2fs "
@@ -1246,9 +1624,9 @@ int main(int argc, char **argv)
     wav_w_t wav = {0};
     if (wav_path != NULL) {
         if (wav_w_open(&wav, wav_path, samp_rate) != 0) {
-            fprintf(stderr, "b210_rx_live: fopen(%s): %s\n",
+            fprintf(stderr, "b210_rx_tx: fopen(%s): %s\n",
                     wav_path, strerror(errno));
-            b210_rx_core_close(core);
+            b210_rx_tx_core_close(core);
             return EXIT_FAILURE;
         }
     }
@@ -1262,14 +1640,14 @@ int main(int argc, char **argv)
     if (csv_path != NULL) {
         csv = fopen(csv_path, "w");
         if (csv == NULL) {
-            fprintf(stderr, "b210_rx_live: fopen(%s): %s\n",
+            fprintf(stderr, "b210_rx_tx: fopen(%s): %s\n",
                     csv_path, strerror(errno));
             if (wav.fp) wav_w_close(&wav);
-            b210_rx_core_close(core);
+            b210_rx_tx_core_close(core);
             return EXIT_FAILURE;
         }
         fprintf(csv,
-                "# b210_rx_live session start utc=%s nominal_freq_hz=%.0f "
+                "# b210_rx_tx session start utc=%s nominal_freq_hz=%.0f "
                 "input_rate=%.0f post_rate=%d decim=%u decim_cutoff_hz=%.0f "
                 "antenna=%s gain_db=%.1f window_s=%.2f slide_s=%.2f "
                 "sync_thr=%d rs=%s hmac=%s dc_block=%s doppler=%s\n",
@@ -1313,11 +1691,11 @@ int main(int argc, char **argv)
     // gated audio anywhere.
     int16_t *monitor_chunk = NULL;
     {
-        size_t mc = b210_rx_core_max_chunk(core);
+        size_t mc = b210_rx_tx_core_max_chunk(core);
         if (mc == 0) mc = 2040;
         monitor_chunk = (int16_t *)malloc(mc * sizeof(int16_t));
         if (monitor_chunk == NULL) {
-            fprintf(stderr, "b210_rx_live: out of memory for monitor "
+            fprintf(stderr, "b210_rx_tx: out of memory for monitor "
                             "scratch buffer\n");
         }
     }
@@ -1325,7 +1703,7 @@ int main(int argc, char **argv)
         int aerr = snd_pcm_open(&alsa, monitor_device,
                                 SND_PCM_STREAM_PLAYBACK, 0);
         if (aerr < 0) {
-            fprintf(stderr, "b210_rx_live: snd_pcm_open(%s): %s "
+            fprintf(stderr, "b210_rx_tx: snd_pcm_open(%s): %s "
                             "— audio playback disabled, squelch still runs\n",
                     monitor_device, snd_strerror(aerr));
             alsa = NULL;
@@ -1343,7 +1721,7 @@ int main(int argc, char **argv)
                                       1,                    // soft_resample
                                       latency_us);
             if (aerr < 0) {
-                fprintf(stderr, "b210_rx_live: snd_pcm_set_params"
+                fprintf(stderr, "b210_rx_tx: snd_pcm_set_params"
                                 "(%d Hz mono S16_LE): %s — playback disabled\n",
                         samp_rate, snd_strerror(aerr));
                 snd_pcm_close(alsa);
@@ -1352,7 +1730,7 @@ int main(int argc, char **argv)
                 char sqdesc[128];
                 monitor_squelch_status(&sq, sqdesc, sizeof sqdesc);
                 fprintf(stderr,
-                        "b210_rx_live: monitor on %s @ %d Hz mono "
+                        "b210_rx_tx: monitor on %s @ %d Hz mono "
                         "(squelch=%s)\n",
                         monitor_device, samp_rate, sqdesc);
             }
@@ -1369,7 +1747,7 @@ int main(int argc, char **argv)
 
     int16_t *window = calloc(window_samples, sizeof(int16_t));
     if (window == NULL) {
-        fprintf(stderr, "b210_rx_live: out of memory for window (%zu samples)\n",
+        fprintf(stderr, "b210_rx_tx: out of memory for window (%zu samples)\n",
                 window_samples);
         if (wav.fp) wav_w_close(&wav);
         if (csv != NULL) fclose(csv);
@@ -1377,14 +1755,14 @@ int main(int argc, char **argv)
         if (alsa != NULL) snd_pcm_close(alsa);
         free(monitor_chunk);
 #endif
-        b210_rx_core_close(core);
+        b210_rx_tx_core_close(core);
         return EXIT_FAILURE;
     }
     size_t window_filled = 0;
 
     // Pump-output buffer sized to UHD's max recv chunk so each pump fits
     // in one call.
-    size_t   max_chunk = b210_rx_core_max_chunk(core);
+    size_t   max_chunk = b210_rx_tx_core_max_chunk(core);
     if (max_chunk == 0) max_chunk = 2040;
     int16_t *pcm_chunk = malloc(max_chunk * sizeof(int16_t));
     if (pcm_chunk == NULL) {
@@ -1395,7 +1773,7 @@ int main(int argc, char **argv)
         if (alsa != NULL) snd_pcm_close(alsa);
         free(monitor_chunk);
 #endif
-        b210_rx_core_close(core);
+        b210_rx_tx_core_close(core);
         return EXIT_FAILURE;
     }
 
@@ -1415,7 +1793,7 @@ int main(int argc, char **argv)
         if (alsa != NULL) snd_pcm_close(alsa);
         free(monitor_chunk);
 #endif
-        b210_rx_core_close(core);
+        b210_rx_tx_core_close(core);
         return EXIT_FAILURE;
     }
 
@@ -1457,7 +1835,7 @@ int main(int argc, char **argv)
             // the operator explicitly asked for --ui and the build
             // can't honour it.
             if (use_tui_explicit) {
-                fprintf(stderr, "b210_rx_live: --ui requested but ncurses is "
+                fprintf(stderr, "b210_rx_tx: --ui requested but ncurses is "
                         "not built in (rebuild with libncurses-dev "
                         "installed).\n");
                 free(bits_scratch); free(bytes_scratch);
@@ -1468,10 +1846,10 @@ int main(int argc, char **argv)
                 if (alsa != NULL) snd_pcm_close(alsa);
                 free(monitor_chunk);
 #endif
-                b210_rx_core_close(core);
+                b210_rx_tx_core_close(core);
                 return EXIT_FAILURE;
             }
-            fprintf(stderr, "b210_rx_live: ncurses not built in, falling "
+            fprintf(stderr, "b210_rx_tx: ncurses not built in, falling "
                     "back to streaming stderr output (pass --no-ui to "
                     "silence this notice).\n");
             use_tui = 0;
@@ -1488,7 +1866,7 @@ int main(int argc, char **argv)
     if (source_run_override != NULL) {
         snprintf(db_run_id, sizeof db_run_id, "%s", source_run_override);
     }
-    decode_loop_set_packet_db(db, "b210_rx_live", db_run_id);
+    decode_loop_set_packet_db(db, "b210_rx_tx", db_run_id);
 
     // Register the TLE with the DB and stamp every recorded packet
     // with the resulting tle_id. Also record the session directory
@@ -1528,7 +1906,7 @@ int main(int argc, char **argv)
         // REPL) and shown in the live status row instead so the
         // operator sees it flip the moment they type `rs on/off`.
         snprintf(tui_header, sizeof tui_header,
-                 "b210_rx_live | %.0f->%d S/s (M=%u) | doppler=%s | "
+                 "b210_rx_tx | %.0f->%d S/s (M=%u) | doppler=%s | "
                  "win=%.2fs slide=%.2fs sync_thr=%d hmac=%s | log=%s",
                  input_rate, samp_rate, decim_factor,
                  do_doppler ? sat_name : "off",
@@ -1555,13 +1933,13 @@ int main(int argc, char **argv)
                           sqsuffix, lvldesc, sat_name);
         rx_tui_set_status(tui_status);
         // Persistent REPL history: $HOME/.local/state/simple_sat_ops/
-        // b210_rx_live_history. mkdir -p the parent best-effort.
+        // b210_rx_tx_history. mkdir -p the parent best-effort.
         const char *home = getenv("HOME");
         if (home != NULL && home[0] != '\0') {
             ensure_state_dir(home);
             char hist_path[512];
             snprintf(hist_path, sizeof hist_path,
-                     "%s/.local/state/simple_sat_ops/b210_rx_live_history",
+                     "%s/.local/state/simple_sat_ops/b210_rx_tx_history",
                      home);
             rx_tui_set_history_path(hist_path);
         }
@@ -1573,7 +1951,7 @@ int main(int argc, char **argv)
             monitor_squelch_status(&sq, sqdesc_init, sizeof sqdesc_init);
         }
         fprintf(stderr,
-                "b210_rx_live: freq=%.6f MHz input_rate=%.0f decim=%u "
+                "b210_rx_tx: freq=%.6f MHz input_rate=%.0f decim=%u "
                 "post=%d gain=%.1f bw=%.0f "
                 "window=%.2fs slide=%.2fs sync_thr=%d rs=%s hmac=%s "
                 "dc_block=%s force-beacon=%s monitor=%s sq=%s doppler=%s log=%s\n",
@@ -1657,14 +2035,38 @@ int main(int argc, char **argv)
             pthread_join(spec_job.thr, NULL);
             spec_job.active = 0;
             if (use_tui) rx_tui_set_status(spec_job.status_msg);
-            else fprintf(stderr, "b210_rx_live: %s\n", spec_job.status_msg);
+            else fprintf(stderr, "b210_rx_tx: %s\n", spec_job.status_msg);
         }
         if (duration_s > 0.0 && (monotonic_seconds() - t_start) >= duration_s) break;
 
+        // Drain control-client events into g_tx_request_pending. The
+        // call also flushes any queued sends (TX_ACK / COMMAND_SENT)
+        // from the last burst. Non-blocking.
+        if (g_ctrl_cli != NULL) {
+            sso_ipc_client_step(g_ctrl_cli, 0);
+        }
+        if (g_tx_request_pending) {
+            daemon_service_tx_request(core, &g_tx_request_evt,
+                                       use_hmac ? hmac_key : NULL,
+                                       use_hmac ? hmac_key_len : 0,
+                                       actual_freq);
+            g_tx_request_pending = 0;
+            // Drain the post-burst publish queue.
+            if (g_ctrl_cli != NULL) {
+                sso_ipc_client_step(g_ctrl_cli, 0);
+            }
+            // The burst paused the RX stream; resume_after_tx already
+            // set actual_freq back to its pre-burst value, but we drop
+            // any in-flight prediction stamps so the next Doppler tick
+            // re-arms cleanly.
+            last_az_deg = (0.0/0.0);
+            last_el_deg = (0.0/0.0);
+        }
+
         // Pump one UHD chunk.
-        ssize_t n = b210_rx_core_pump(core, pcm_chunk, max_chunk);
+        ssize_t n = b210_rx_tx_core_pump(core, pcm_chunk, max_chunk);
         if (n < 0) {
-            fprintf(stderr, "b210_rx_live: b210_rx_core_pump fatal\n");
+            fprintf(stderr, "b210_rx_tx: b210_rx_tx_core_pump fatal\n");
             break;
         }
         if (n == 0) {
@@ -1678,7 +2080,7 @@ int main(int argc, char **argv)
         }
 
         // Drive the level-meter display. The envelope itself was
-        // updated inside b210_rx_core_pump on the post-FIR IQ stream;
+        // updated inside b210_rx_tx_core_pump on the post-FIR IQ stream;
         // here we just decide when to redraw. 100 ms refresh in TUI
         // mode is fast enough to see beacon-burst rises; 1 s stderr
         // cadence in non-TUI mode keeps logs readable.
@@ -1695,7 +2097,7 @@ int main(int argc, char **argv)
                     iq_level_format(core, lvldesc, sizeof lvldesc);
                     fmt_utc(ts, sizeof ts);
                     fprintf(stderr,
-                            "[%s] b210_rx_live: %s\n",
+                            "[%s] b210_rx_tx: %s\n",
                             ts, lvldesc);
                     last_level_print = t_lvl;
                 }
@@ -1705,7 +2107,7 @@ int main(int argc, char **argv)
             // depending on the CSV path (which is optional).
             if (control_mode && !no_control_check && t_lvl - last_csv_tick >= 1.0) {
                 double peak_pub = 0.0, rms_sq_pub = 0.0;
-                b210_rx_core_iq_levels(core, &peak_pub, &rms_sq_pub);
+                b210_rx_tx_core_iq_levels(core, &peak_pub, &rms_sq_pub);
                 double rms_pub = sqrt(rms_sq_pub);
                 double rms_dbfs_pub = (rms_pub < 1.0) ? -90.0
                                        : 20.0 * log10(rms_pub / 32768.0);
@@ -1720,7 +2122,7 @@ int main(int argc, char **argv)
             // the CSV stays consistent across TUI / non-TUI / quiet runs.
             if (csv != NULL && t_lvl - last_csv_tick >= 1.0) {
                 double peak = 0.0, rms_sq = 0.0;
-                b210_rx_core_iq_levels(core, &peak, &rms_sq);
+                b210_rx_tx_core_iq_levels(core, &peak, &rms_sq);
                 double rms = sqrt(rms_sq);
                 double peak_dbfs = (peak < 1.0) ? -90.0 : 20.0 * log10(peak / 32768.0);
                 double rms_dbfs  = (rms  < 1.0) ? -90.0 : 20.0 * log10(rms  / 32768.0);
@@ -1784,7 +2186,7 @@ int main(int argc, char **argv)
                     int rerr = snd_pcm_recover(alsa, (int)w, /*silent=*/1);
                     if (rerr < 0) {
                         fprintf(stderr,
-                                "b210_rx_live: snd_pcm_writei recover: %s\n",
+                                "b210_rx_tx: snd_pcm_writei recover: %s\n",
                                 snd_strerror(rerr));
                     }
                 }
@@ -1928,8 +2330,8 @@ doppler_tick:
                         doppler_freq - nominal_freq_hz);
                     if (fabs(doppler_freq - actual_freq) >= doppler_thr_hz) {
                         double prev_freq = actual_freq;
-                        if (b210_rx_core_set_freq(core, doppler_freq) == 0) {
-                            actual_freq = b210_rx_core_actual_freq(core);
+                        if (b210_rx_tx_core_set_freq(core, doppler_freq) == 0) {
+                            actual_freq = b210_rx_tx_core_actual_freq(core);
                             // Both target (what we asked UHD for) and
                             // actual (what UHD coerced to) — useful for
                             // diagnosing flip-flop where UHD's coerced
@@ -1939,7 +2341,7 @@ doppler_tick:
                                 char ts[64];
                                 fmt_utc(ts, sizeof ts);
                                 fprintf(stderr,
-                                        "[%s] b210_rx_live: retune target=%.6f "
+                                        "[%s] b210_rx_tx: retune target=%.6f "
                                         "actual=%.6f MHz (was %.6f, coerce=%+.0f Hz, "
                                         "range_rate=%+.3f km/s)\n",
                                         ts, doppler_freq / 1e6,
@@ -1982,7 +2384,7 @@ doppler_tick:
 
     if (use_tui) rx_tui_close();
     if (g_stop) {
-        fprintf(stderr, "b210_rx_live: stopped on signal\n");
+        fprintf(stderr, "b210_rx_tx: stopped on signal\n");
     }
 
     free(bits_scratch);
@@ -2002,7 +2404,7 @@ doppler_tick:
         pthread_join(spec_job.thr, NULL);
         spec_job.active = 0;
         if (spec_job.status_msg[0]) {
-            fprintf(stderr, "b210_rx_live: %s\n", spec_job.status_msg);
+            fprintf(stderr, "b210_rx_tx: %s\n", spec_job.status_msg);
         }
     }
     if (wav.fp) {
@@ -2016,6 +2418,10 @@ doppler_tick:
         }
     }
     if (csv != NULL) fclose(csv);
-    b210_rx_core_close(core);
+    if (g_ctrl_cli != NULL) {
+        sso_ipc_client_close(g_ctrl_cli);
+        g_ctrl_cli = NULL;
+    }
+    b210_rx_tx_core_close(core);
     return 0;
 }

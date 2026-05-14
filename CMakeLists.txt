@@ -36,7 +36,7 @@ pkg_check_modules(SQLITE3 sqlite3)
 find_library(SGP4SDP4_LIB sgp4sdp4)
 
 # packet_db is a shared dependency of every receiver: rx_decode,
-# rx_replay, b210_rx_live all tap emit_frame and write each decoded
+# rx_replay, b210_rx_tx all tap emit_frame and write each decoded
 # packet into a project-wide SQLite store.
 if (NOT SQLITE3_FOUND)
     message(WARNING "sqlite3 not found via pkg-config; packet_db will "
@@ -53,7 +53,7 @@ function(target_link_packet_db target)
     endif()
 endfunction()
 
-# UHD is required for the B210-side tools (b210_rx_capture, b210_rx_live,
+# UHD is required for the B210-side tools (b210_rx_capture, b210_rx_tx,
 # tx_frame_sdr). Mac dev hosts that don't have UHD can skip those with
 # `cmake .. -DWITH_USRP_B210=OFF`.
 option(WITH_USRP_B210 "Build USRP B210 tools (requires UHD)" ON)
@@ -203,31 +203,33 @@ if (OPENSSL_FOUND)
         target_link_sso_core(b210_rx_capture)
         list(APPEND SSO_TARGETS b210_rx_capture)
 
-        # Live B210 RX + AX100 decoder + Doppler retune driver.
-        add_executable(b210_rx_live utils/b210_rx_live.c b210_rx_core.c
+        # Unified B210 RX + TX daemon. RX continuous; on TX_REQUEST from
+        # simple_sat_ops, RX pauses, the TX streamer transmits one or more
+        # AX100 frames, then RX re-arms. Single-process owner of the B210.
+        add_executable(b210_rx_tx utils/b210_rx_tx.c b210_rx_tx_core.c
                        fir_decim.c biquad.c monitor_squelch.c
                        decode_loop.c modem.c ax100.c rs.c golay24.c csp.c
                        hmac_keyfile.c beacon_cts1.c rx_tui.c)
-        target_include_directories(b210_rx_live PRIVATE
+        target_include_directories(b210_rx_tx PRIVATE
             ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS} ${UHD_INCLUDE_DIRS})
-        target_link_directories(b210_rx_live PRIVATE
+        target_link_directories(b210_rx_tx PRIVATE
             ${OPENSSL_LIBRARY_DIRS} ${UHD_LIBRARY_DIRS})
-        target_link_libraries(b210_rx_live PRIVATE
+        target_link_libraries(b210_rx_tx PRIVATE
             ${OPENSSL_LIBRARIES} ${UHD_LIBRARIES} m pthread)
         if (SGP4SDP4_LIB)
-            target_compile_definitions(b210_rx_live PRIVATE WITH_SGP4SDP4)
-            target_sources(b210_rx_live PRIVATE prediction.c oem.c)
-            target_link_libraries(b210_rx_live PRIVATE ${SGP4SDP4_LIB})
+            target_compile_definitions(b210_rx_tx PRIVATE WITH_SGP4SDP4)
+            target_sources(b210_rx_tx PRIVATE prediction.c oem.c)
+            target_link_libraries(b210_rx_tx PRIVATE ${SGP4SDP4_LIB})
         endif()
         if (NCURSES_FOUND)
-            target_compile_definitions(b210_rx_live PRIVATE RX_TUI_AVAILABLE)
-            target_include_directories(b210_rx_live PRIVATE ${NCURSES_INCLUDE_DIRS})
-            target_link_directories(b210_rx_live PRIVATE ${NCURSES_LIBRARY_DIRS})
-            target_link_libraries(b210_rx_live PRIVATE ${NCURSES_LIBRARIES})
+            target_compile_definitions(b210_rx_tx PRIVATE RX_TUI_AVAILABLE)
+            target_include_directories(b210_rx_tx PRIVATE ${NCURSES_INCLUDE_DIRS})
+            target_link_directories(b210_rx_tx PRIVATE ${NCURSES_LIBRARY_DIRS})
+            target_link_libraries(b210_rx_tx PRIVATE ${NCURSES_LIBRARIES})
         endif()
-        target_link_packet_db(b210_rx_live)
-        target_link_sso_core(b210_rx_live)
-        list(APPEND SSO_TARGETS b210_rx_live)
+        target_link_packet_db(b210_rx_tx)
+        target_link_sso_core(b210_rx_tx)
+        list(APPEND SSO_TARGETS b210_rx_tx)
     endif()
 else()
     message(STATUS "libcrypto not found; uplink_test and rx_decode will not be built.")

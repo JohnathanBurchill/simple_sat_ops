@@ -3,7 +3,7 @@
     Simple Satellite Operations  packet_db.h
 
     Append-only SQLite store for decoded AX100 packets. Every receiver
-    (rx_live, rx_replay, b210_rx_live, rx_decode) writes one row per
+    (rx_live, rx_replay, b210_rx_tx, rx_decode) writes one row per
     decoded packet into a project-wide DB so cross-pass queries are
     possible without re-parsing per-session log files.
 
@@ -72,7 +72,7 @@ typedef struct {
     double      audio_offset_s;
     const char *decoded_summary;
     // Observer-frame state. NaN means "not known"; that maps to NULL
-    // in the DB. Populated by b210_rx_live (live) or rx_replay (when
+    // in the DB. Populated by b210_rx_tx (live) or rx_replay (when
     // run with --tle for backfill); other receivers leave them NaN.
     double      az_deg;
     double      el_deg;

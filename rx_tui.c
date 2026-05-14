@@ -41,7 +41,7 @@ static int  g_have_color = 0;
 static char g_header[256] = "rx_tui";
 // Optional second title-bar row. Hidden (row collapsed) when empty —
 // rx_live / rx_replay never call rx_tui_set_status so they keep their
-// existing layout. b210_rx_live drives this with the live Doppler
+// existing layout. b210_rx_tx drives this with the live Doppler
 // frequency so the operator always sees what the SDR is tuned to.
 static char g_status[256] = "";
 
@@ -188,7 +188,7 @@ static struct {
 // Per-1-second bucket history of signal-to-noise ratio + frame events
 // so the operator can see beacon cadence and link strength at a glance
 // even when frames don't decode. Driven by rx_tui_observe_signal
-// (per-audio-chunk from b210_rx_live's monitor_squelch tap) and
+// (per-audio-chunk from b210_rx_tx's monitor_squelch tap) and
 // rx_tui_observe_frame. Hidden until the first observe_signal call —
 // receivers that don't tap squelch (rx_live, rx_replay) keep their
 // existing layout.

@@ -1,6 +1,6 @@
 // sso_operator.h — high-level helpers layered on sso_ipc.
 //
-// tx_frame_sdr and b210_rx_live both need the same dance: connect to
+// tx_frame_sdr and b210_rx_tx both need the same dance: connect to
 // simple_sat_ops.sock, send `hello`, wait for `welcome`, verify the
 // running operator's Unix user matches our own, fish out the
 // pass-folder path. This module factors that into one call.
@@ -24,7 +24,7 @@ typedef enum {
 // Connect to simple_sat_ops.sock, do the hello/welcome handshake, and
 // verify the operator's Unix user matches getenv("USER").
 //
-// role: "external" (typical for tx_frame_sdr / b210_rx_live operator
+// role: "external" (typical for tx_frame_sdr / b210_rx_tx operator
 // mode) or "viewer".
 //
 // out_pass_folder / out_operator_user are filled from the welcome reply

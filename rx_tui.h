@@ -55,7 +55,7 @@ void rx_tui_set_header(const char *header);
 // the same reverse-video treatment. When the buffer is empty (NULL or
 // ""), the row is hidden and the main panels reclaim the space — so
 // callers that don't need it (rx_live, rx_replay) are unaffected.
-// Used by b210_rx_live to keep the live Doppler-tracked frequency in
+// Used by b210_rx_tx to keep the live Doppler-tracked frequency in
 // a stable on-screen location across the run.
 void rx_tui_set_status(const char *status);
 

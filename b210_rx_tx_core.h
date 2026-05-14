@@ -1,12 +1,12 @@
 /*
 
-   Simple Satellite Operations  b210_rx_core.h
+   Simple Satellite Operations  b210_rx_tx_core.h
 
    USRP B210 RX core: UHD streamer + FM-discriminator demod, packaged
    so a binary just pumps demoded PCM and asks for retunes when the
    orbit math says the carrier moved.
 
-   Used by utils/b210_rx_live.c. Designed so simple_sat_ops can pull
+   Used by utils/b210_rx_tx.c. Designed so simple_sat_ops can pull
    it in later without the live binary's CLI / decode-loop scaffolding
    coming along for the ride.
 
@@ -30,14 +30,14 @@
    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-#ifndef B210_RX_CORE_H
-#define B210_RX_CORE_H
+#ifndef B210_RX_TX_CORE_H
+#define B210_RX_TX_CORE_H
 
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
 
-typedef struct b210_rx_core_params {
+typedef struct b210_rx_tx_core_params {
     double      freq_hz;          // initial center freq
     double      rate_hz;          // requested sample rate (UHD will coerce)
     double      gain_db;          // RX gain
@@ -60,36 +60,36 @@ typedef struct b210_rx_core_params {
     unsigned    decim_factor;
     double      decim_cutoff_hz;
     unsigned    decim_taps;
-} b210_rx_core_params_t;
+} b210_rx_tx_core_params_t;
 
-typedef struct b210_rx_core b210_rx_core_t;
+typedef struct b210_rx_tx_core b210_rx_tx_core_t;
 
 // Open the device, set rate/gain/bw/antenna/freq, build the RX streamer,
 // and issue START_CONTINUOUS. On success *out is non-NULL; on failure
 // any partial state is cleaned up and *out is NULL.
 //
 // Return: 0 on success, -1 on UHD error (stderr already has detail).
-int b210_rx_core_open(const b210_rx_core_params_t *p, b210_rx_core_t **out);
+int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **out);
 
 // Stop the continuous stream and release all UHD handles.
-void b210_rx_core_close(b210_rx_core_t *core);
+void b210_rx_tx_core_close(b210_rx_tx_core_t *core);
 
 // Pump up to one UHD recv chunk and FM-demod it into pcm_out. Maintains
 // the prev-IQ phase reference across calls. pcm_cap should be at least
-// b210_rx_core_max_chunk(core) — short caps just truncate the chunk.
+// b210_rx_tx_core_max_chunk(core) — short caps just truncate the chunk.
 //
 // Return:
 //   > 0  number of PCM samples written
 //   = 0  transient UHD error (overflow / timeout) — keep looping
 //   < 0  fatal UHD error — bail
-ssize_t b210_rx_core_pump(b210_rx_core_t *core,
+ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *core,
                           int16_t *pcm_out, size_t pcm_cap);
 
 // Issue a tune request on RX channel 0. The streamer keeps running.
 // Return: 0 on success, -1 on UHD error.
-int b210_rx_core_set_freq(b210_rx_core_t *core, double freq_hz);
+int b210_rx_tx_core_set_freq(b210_rx_tx_core_t *core, double freq_hz);
 
-// Read-back accessors (after b210_rx_core_open succeeded).
+// Read-back accessors (after b210_rx_tx_core_open succeeded).
 //
 // actual_rate:  post-decimation rate (== input_rate when decim_factor is
 //               <=1). This is what the FM-demodded PCM stream is at, so
@@ -98,10 +98,10 @@ int b210_rx_core_set_freq(b210_rx_core_t *core, double freq_hz);
 //               actual_rate when no decimation is configured.
 // max_chunk:    upper bound on PCM samples produced by one pump call.
 //               Already accounts for decimation.
-double b210_rx_core_actual_rate(const b210_rx_core_t *core);
-double b210_rx_core_input_rate (const b210_rx_core_t *core);
-double b210_rx_core_actual_freq(const b210_rx_core_t *core);
-size_t b210_rx_core_max_chunk  (const b210_rx_core_t *core);
+double b210_rx_tx_core_actual_rate(const b210_rx_tx_core_t *core);
+double b210_rx_tx_core_input_rate (const b210_rx_tx_core_t *core);
+double b210_rx_tx_core_actual_freq(const b210_rx_tx_core_t *core);
+size_t b210_rx_tx_core_max_chunk  (const b210_rx_tx_core_t *core);
 
 // Post-FIR IQ level snapshot. Both values are sc16-scale (full-scale
 // PCM amplitude at ±32767), updated every pump:
@@ -115,7 +115,26 @@ size_t b210_rx_core_max_chunk  (const b210_rx_core_t *core);
 //                  for an RMS magnitude in PCM units.
 //
 // Either pointer may be NULL. Returns 0 on success, -1 if core is NULL.
-int b210_rx_core_iq_levels(const b210_rx_core_t *core,
+int b210_rx_tx_core_iq_levels(const b210_rx_tx_core_t *core,
                            double *peak_env_out, double *rms_sq_out);
 
-#endif // B210_RX_CORE_H
+typedef struct b210_rx_tx_core_burst_params {
+    const int16_t *iq;          // pre-built sc16 interleaved, n_samps pairs
+    size_t         n_samps;
+    double         tx_rate_hz;
+    double         tx_freq_hz;
+    double         tx_gain_db;
+    double         start_delay_s;
+    double         rx_resume_freq_hz;  // RX center freq to restore after TX
+} b210_rx_tx_core_burst_params_t;
+
+// Half-duplex switch-over: stop RX, drain residue, lazy-build the TX
+// streamer (cached for the daemon lifetime), set freq/gain/rate, send
+// the IQ burst in max-chunk pieces with SOB on the first and EOB on
+// the last, drain the FPGA FIFO, restore RX freq, restart the RX
+// stream. Returns 0 on success, -1 on UHD/streamer error (stderr has
+// detail). RX is left running on return regardless of outcome.
+int b210_rx_tx_core_burst(b210_rx_tx_core_t *core,
+                          const b210_rx_tx_core_burst_params_t *p);
+
+#endif // B210_RX_TX_CORE_H

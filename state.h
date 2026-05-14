@@ -32,7 +32,7 @@
 #define TRACKING_PREP_TIME_MINUTES 5.0
 
 // SDR-only state. The CAT-radio + ALSA-audio fields are gone; the B210
-// is now driven externally by b210_rx_live / tx_frame_sdr, which talk
+// is now driven externally by b210_rx_tx / tx_frame_sdr, which talk
 // to simple_sat_ops over the sso_ipc socket for operator coordination.
 // What remains here is the satellite tracker, the rotator, and the
 // nominal/Doppler-shifted frequency outputs computed for display + IPC

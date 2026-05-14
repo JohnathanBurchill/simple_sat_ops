@@ -7,7 +7,7 @@
     wrap with CSP+AX100, and write a 48 kHz mono S16_LE WAV that matches
     what an FM discriminator would emit during a perfect-signal downlink.
 
-    Drop the WAV into rx_decode / rx_replay / b210_rx_live to exercise
+    Drop the WAV into rx_decode / rx_replay / b210_rx_tx to exercise
     the decode chain (and the new beacon parser in beacon_cts1.c)
     without waiting for a satellite pass.
 
@@ -50,7 +50,7 @@ static void usage(FILE *out, const char *argv0)
         "Fill a CTS1 firmware-canonical downlink packet with deterministic\n"
         "plausible values, frame for the AX100, and write a 48 kHz mono\n"
         "16-bit WAV that decodes round-trip via rx_decode / rx_replay /\n"
-        "b210_rx_live.\n"
+        "b210_rx_tx.\n"
         "\n"
         "Required:\n"
         "  --out=<file.wav>          Output WAV path\n"

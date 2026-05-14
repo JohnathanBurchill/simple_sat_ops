@@ -1,6 +1,6 @@
 // sso_audit.h — append-only invocation log for the sso tools.
 //
-// Each major tool (simple_sat_ops, b210_rx_live, tx_frame_sdr,
+// Each major tool (simple_sat_ops, b210_rx_tx, tx_frame_sdr,
 // rx_replay, and any other hardware-touching binary) calls
 // sso_audit_start() once at process entry. That writes one line to
 // /var/log/sso/runs.log:

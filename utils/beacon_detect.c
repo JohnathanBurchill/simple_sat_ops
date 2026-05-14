@@ -200,7 +200,7 @@ static void usage(FILE *dest, const char *prog)
         "                           be on PATH.\n"
         "  --window-s=<f>           Render half-window (default 0.5)\n"
         "  --gate-wav=<path>        Run the input through the same\n"
-        "                           carrier-presence squelch b210_rx_live\n"
+        "                           carrier-presence squelch b210_rx_tx\n"
         "                           uses live, write the gated audio to\n"
         "                           <path>. Use this to listen-test the\n"
         "                           squelch on a recorded WAV before a\n"
@@ -223,7 +223,7 @@ static int starts_with(const char *s, const char *p)
 }
 
 // Minimal RIFF/WAVE writer for 16-bit mono PCM. Same on-disk format
-// the modem and b210_rx_live emit. Used only by --gate-wav.
+// the modem and b210_rx_tx emit. Used only by --gate-wav.
 static int write_wav_pcm16_mono(const char *path,
                                 const int16_t *samples, size_t n,
                                 int sample_rate)

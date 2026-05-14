@@ -18,7 +18,7 @@ extern "C" {
 const char *sso_ipc_runtime_dir(void);
 
 // Compose path of the operator socket for `tool` ("simple_sat_ops",
-// "b210_rx_live"). Writes <runtime_dir>/<tool>.sock into out. Returns
+// "b210_rx_tx"). Writes <runtime_dir>/<tool>.sock into out. Returns
 // 0 on success, -1 on overflow.
 int sso_ipc_socket_path(char *out, size_t out_size, const char *tool);
 

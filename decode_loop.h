@@ -120,7 +120,7 @@ void emit_frame(const char *log_path, int quiet, const char *ts,
 // mismatch, rs=UNCORRECTABLE) are always shown either way.
 //
 // rx_decode (offline forensic CLI) defaults this ON; rx_live, rx_replay,
-// b210_rx_live default it OFF and expose --packet-headers / `packetheaders
+// b210_rx_tx default it OFF and expose --packet-headers / `packetheaders
 // on` to flip it. Flag is process-global because emit_frame is called
 // from many sites and threading the bool through every call site would
 // be churn for no benefit.
