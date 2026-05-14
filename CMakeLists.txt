@@ -88,6 +88,16 @@ add_executable(rs_selftest utils/rs_selftest.c rs.c)
 target_include_directories(rs_selftest PRIVATE ${CMAKE_SOURCE_DIR})
 list(APPEND SSO_TARGETS rs_selftest)
 
+# Antenna rotator self-test: covers the pure math helpers in
+# antenna_rotator.c (wrap_to_pm180, accumulate_unwrapped,
+# home_unwrapped_target, to_mech_coords). No serial/UHD/ncurses deps;
+# builds on every host.
+add_executable(antenna_rotator_selftest
+               utils/antenna_rotator_selftest.c antenna_rotator.c)
+target_include_directories(antenna_rotator_selftest PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(antenna_rotator_selftest PRIVATE m)
+list(APPEND SSO_TARGETS antenna_rotator_selftest)
+
 # FM-audio preview tool: baseband WAV -> audible FM-modulated WAV
 add_executable(fm_preview utils/fm_preview.c utils/wav_read.c modem.c)
 target_include_directories(fm_preview PRIVATE ${CMAKE_SOURCE_DIR})

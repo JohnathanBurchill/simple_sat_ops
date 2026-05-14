@@ -259,25 +259,20 @@ void antenna_rotator_to_mech_coords(int flip, double aos_az,
         if (out_half) *out_half = 0;
         return;
     }
-    double az_diff = sat_az - aos_az;
-    while (az_diff > 180.0) az_diff -= 360.0;
-    while (az_diff <= -180.0) az_diff += 360.0;
-    if (fabs(az_diff) <= 90.0) {
-        // First half: sat is on AOS side, boom tracks it directly.
-        *out_az = sat_az;
-        *out_el = sat_el;
-        if (out_half) *out_half = 0;
-    } else {
-        // Second half: sat has crossed to the back hemisphere. Boom stays
-        // roughly on the AOS meridian; mech_el continues past 90 to point
-        // backwards through the rotator.
-        double az = sat_az + 180.0;
-        while (az >= 360.0) az -= 360.0;
-        while (az < 0.0)    az += 360.0;
-        *out_az = az;
-        *out_el = 180.0 - sat_el;
-        if (out_half) *out_half = 1;
-    }
+    // Hold mech_az at aos_az; project the sat direction onto the boom's
+    // meridian. y is the along-meridian component (forward = +y, back =
+    // -y), z is up. mech_el = atan2(z, y) sweeps continuously 0..180
+    // deg as the sat passes from AOS through zenith to LOS, with values
+    // past 90 deg interpreted by the rotator as back-pointing. The
+    // off-meridian (east-of-boom) component is the un-correctable
+    // pointing error and shows up nowhere in the output.
+    double daz_rad = (sat_az - aos_az) * M_PI / 180.0;
+    double el_rad  = sat_el * M_PI / 180.0;
+    double y = cos(el_rad) * cos(daz_rad);
+    double z = sin(el_rad);
+    *out_az = aos_az;
+    *out_el = atan2(z, y) * 180.0 / M_PI;
+    if (out_half) *out_half = 0;
 }
 
 int antenna_rotator_set_unwrapped(antenna_rotator_t *antenna_rotator, double az_unwrapped, double elevation)

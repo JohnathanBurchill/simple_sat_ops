@@ -113,14 +113,24 @@ double antenna_rotator_accumulate_unwrapped(double prev_unwrapped, double predic
 double antenna_rotator_home_unwrapped_target(double prev_unwrapped, double home_az_wrapped);
 int antenna_rotator_seed_from_status(antenna_rotator_t *antenna_rotator);
 int antenna_rotator_set_unwrapped(antenna_rotator_t *antenna_rotator, double az_unwrapped, double elevation);
-// Map a predicted sky direction (sat az/el, both in standard convention) to
-// the mechanical (az, el) the rotator should drive. With flip == 0 it's a
-// pass-through. With flip != 0 (and MAXIMUM_ELEVATION > 90) it splits the
-// pass into halves around aos_az: first half (|sat_az - aos_az| <= 90 deg)
-// tracks normally; second half (|...| > 90 deg) returns ((sat_az + 180) mod
-// 360, 180 - sat_el) so the boom stays roughly on the AOS meridian and
-// sweeps mech_el 0..180 instead of slewing AZ fast at the apex. *out_half
-// gets 0 or 1 so the caller can detect the transition.
+// Map a predicted sky direction (sat az/el, both in standard convention)
+// to the mechanical (az, el) the rotator should drive.
+//
+// With flip == 0 or ANTENNA_ROTATOR_MAXIMUM_ELEVATION <= 90 the mapping
+// is a pass-through.
+//
+// With flip != 0 and MAXIMUM_ELEVATION > 90, mech_az is held at aos_az
+// for the entire pass and the sat direction is projected orthogonally
+// onto the boom's meridian (the great circle through (aos_az, 0) up
+// through zenith and back down to (aos_az+180, 0)). mech_el comes out
+// in 0..180 deg; values past 90 deg are the rotator's back-pointing
+// representation. This trades a small off-meridian pointing error --
+// bounded by (90 deg - sat_el) at the sat's daz=90 deg crossing -- for
+// zero azimuth slew at apex. There's no AZ axis we can drive to fix
+// the off-meridian component without a roll axis, so we accept it.
+//
+// *out_half is retained for caller compatibility but is now always 0:
+// the new mapping is continuous, with no half-transition.
 void antenna_rotator_to_mech_coords(int flip, double aos_az,
                                     double sat_az, double sat_el,
                                     double *out_az, double *out_el,
