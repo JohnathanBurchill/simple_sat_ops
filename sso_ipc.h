@@ -1,6 +1,6 @@
 // sso_ipc.h — Unix domain socket server/client for the in-band IPC.
 //
-// Each operator-mode tool (simple_sat_ops, b210_rx_live) opens an
+// Each operator-mode tool (simple_sat_ops, b210_rx_tx) opens an
 // sso_ipc_server bound to its tool socket; viewers and external
 // producers connect via sso_ipc_client.
 //
@@ -16,6 +16,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,6 +37,9 @@ typedef enum {
     SSO_EVT_TX_COMMAND_SENT,
     SSO_EVT_BYE,
     SSO_EVT_YIELD_REQUEST,  // sent by force-claim path; recipient yields
+    SSO_EVT_TX_COMMAND_PREVIEW, // operator -> all viewers (debounced draft)
+    SSO_EVT_TX_REQUEST,         // operator -> b210_rx_tx (commit)
+    SSO_EVT_TX_ACK,             // b210_rx_tx -> operator (queued/ok/rejected)
 } sso_event_type_t;
 
 typedef struct {
@@ -98,8 +102,27 @@ typedef struct {
     char last_packet_ts[40];
     char last_packet_summary[160];
 
-    // tx-command-sent
+    // tx-command-sent / tx-preview / tx-request / tx-ack
     char ascii[160];
+
+    // Carried by tx-preview, tx-request, tx-command-sent (raw payload
+    // the operator typed; viewers re-render this verbatim). tx_status is
+    // only filled on tx-ack.
+    char    tx_payload_kind[8];   // "hex" | "ascii"
+    char    tx_payload[160];
+    uint8_t tx_csp_src;
+    uint8_t tx_csp_dst;
+    uint8_t tx_csp_dport;
+    uint8_t tx_csp_sport;
+    uint8_t tx_csp_prio;
+    long    tx_freq_hz;
+    double  tx_gain_db;
+    int     tx_allow_tx;
+    int     tx_allow_high_power;
+    int     tx_allow_hf_tx;
+    int     tx_repeat;
+    int     tx_gap_ms;
+    char    tx_ack_status[24];    // tx-ack only: "ok" | "rejected: <reason>"
 } sso_event_t;
 
 void sso_event_init(sso_event_t *evt, sso_event_type_t type);
@@ -180,6 +203,11 @@ int sso_ipc_server_next_client(const sso_ipc_server_t *srv,
                                 char *out_role, size_t out_role_size,
                                 char *out_since, size_t out_since_size);
 
+// Peer credential captured at accept(). Returns 0 with *out filled on
+// success, -1 if the slot is unknown / dead / peer-cred unavailable.
+int sso_ipc_server_peer_uid(const sso_ipc_server_t *srv,
+                             sso_client_id_t id, uid_t *out);
+
 // ---------- Client ----------
 
 struct sso_ipc_client;
@@ -187,7 +215,7 @@ typedef struct sso_ipc_client sso_ipc_client_t;
 
 // Connect to the server socket for `tool`. Returns a client handle, or
 // NULL if the socket isn't bound / connection refused (errno set).
-// `tool` is e.g. "simple_sat_ops" or "b210_rx_live".
+// `tool` is e.g. "simple_sat_ops" or "b210_rx_tx".
 sso_ipc_client_t *sso_ipc_client_connect(const char *tool);
 
 // Close. Safe with NULL.

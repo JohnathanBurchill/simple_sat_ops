@@ -1,3 +1,4 @@
+#define _GNU_SOURCE  // SO_PEERCRED / struct ucred on glibc
 #include "sso_ipc.h"
 
 #include "sso_ipc_paths.h"
@@ -394,6 +395,9 @@ static const struct {
     { SSO_EVT_TX_COMMAND_SENT,   "tx-command-sent" },
     { SSO_EVT_BYE,               "bye" },
     { SSO_EVT_YIELD_REQUEST,     "yield-request" },
+    { SSO_EVT_TX_COMMAND_PREVIEW,"tx-preview" },
+    { SSO_EVT_TX_REQUEST,        "tx-request" },
+    { SSO_EVT_TX_ACK,            "tx-ack" },
     { SSO_EVT_UNKNOWN,           NULL },
 };
 
@@ -494,8 +498,50 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
         if (json_field_str(&p, end, &first, "last_packet_ts", evt->last_packet_ts) < 0) return -1;
         if (json_field_str(&p, end, &first, "last_packet_summary", evt->last_packet_summary) < 0) return -1;
     }
-    if (evt->type == SSO_EVT_TX_COMMAND_SENT) {
+    if (evt->type == SSO_EVT_TX_COMMAND_SENT
+     || evt->type == SSO_EVT_TX_COMMAND_PREVIEW
+     || evt->type == SSO_EVT_TX_REQUEST
+     || evt->type == SSO_EVT_TX_ACK) {
         if (json_field_str(&p, end, &first, "ascii", evt->ascii) < 0) return -1;
+        if (json_field_str(&p, end, &first, "tx_kind", evt->tx_payload_kind) < 0) return -1;
+        if (json_field_str(&p, end, &first, "tx_pl",   evt->tx_payload) < 0) return -1;
+        if (evt->tx_csp_src) {
+            if (json_field_int(&p, end, &first, "tx_src", evt->tx_csp_src) < 0) return -1;
+        }
+        if (evt->tx_csp_dst) {
+            if (json_field_int(&p, end, &first, "tx_dst", evt->tx_csp_dst) < 0) return -1;
+        }
+        if (evt->tx_csp_dport) {
+            if (json_field_int(&p, end, &first, "tx_dp", evt->tx_csp_dport) < 0) return -1;
+        }
+        if (evt->tx_csp_sport) {
+            if (json_field_int(&p, end, &first, "tx_sp", evt->tx_csp_sport) < 0) return -1;
+        }
+        if (evt->tx_csp_prio) {
+            if (json_field_int(&p, end, &first, "tx_prio", evt->tx_csp_prio) < 0) return -1;
+        }
+        if (evt->tx_freq_hz) {
+            if (json_field_int(&p, end, &first, "tx_freq", evt->tx_freq_hz) < 0) return -1;
+        }
+        if (evt->tx_gain_db != 0.0) {
+            if (json_field_double(&p, end, &first, "tx_gain", evt->tx_gain_db) < 0) return -1;
+        }
+        if (evt->tx_allow_tx) {
+            if (json_field_bool(&p, end, &first, "tx_allow", 1) < 0) return -1;
+        }
+        if (evt->tx_allow_high_power) {
+            if (json_field_bool(&p, end, &first, "tx_hp", 1) < 0) return -1;
+        }
+        if (evt->tx_allow_hf_tx) {
+            if (json_field_bool(&p, end, &first, "tx_hf", 1) < 0) return -1;
+        }
+        if (evt->tx_repeat) {
+            if (json_field_int(&p, end, &first, "tx_rep", evt->tx_repeat) < 0) return -1;
+        }
+        if (evt->tx_gap_ms) {
+            if (json_field_int(&p, end, &first, "tx_gap", evt->tx_gap_ms) < 0) return -1;
+        }
+        if (json_field_str(&p, end, &first, "tx_st", evt->tx_ack_status) < 0) return -1;
     }
     if (json_append(&p, end + 2, "}\n") < 0) return -1;
     *p = '\0';
@@ -568,6 +614,23 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
     json_get_string(line, "last_packet_ts", evt->last_packet_ts, sizeof(evt->last_packet_ts));
     json_get_string(line, "last_packet_summary", evt->last_packet_summary, sizeof(evt->last_packet_summary));
     json_get_string(line, "ascii", evt->ascii, sizeof(evt->ascii));
+    json_get_string(line, "tx_kind", evt->tx_payload_kind, sizeof(evt->tx_payload_kind));
+    json_get_string(line, "tx_pl", evt->tx_payload, sizeof(evt->tx_payload));
+    long tx_int = 0;
+    if (json_get_int(line, "tx_src",  &tx_int) > 0) evt->tx_csp_src   = (uint8_t) tx_int;
+    if (json_get_int(line, "tx_dst",  &tx_int) > 0) evt->tx_csp_dst   = (uint8_t) tx_int;
+    if (json_get_int(line, "tx_dp",   &tx_int) > 0) evt->tx_csp_dport = (uint8_t) tx_int;
+    if (json_get_int(line, "tx_sp",   &tx_int) > 0) evt->tx_csp_sport = (uint8_t) tx_int;
+    if (json_get_int(line, "tx_prio", &tx_int) > 0) evt->tx_csp_prio  = (uint8_t) tx_int;
+    if (json_get_int(line, "tx_freq", &tx_int) > 0) evt->tx_freq_hz   = tx_int;
+    json_get_double(line, "tx_gain", &evt->tx_gain_db);
+    int tx_flag = 0;
+    if (json_get_bool(line, "tx_allow", &tx_flag) > 0) evt->tx_allow_tx         = tx_flag;
+    if (json_get_bool(line, "tx_hp",    &tx_flag) > 0) evt->tx_allow_high_power = tx_flag;
+    if (json_get_bool(line, "tx_hf",    &tx_flag) > 0) evt->tx_allow_hf_tx      = tx_flag;
+    if (json_get_int(line, "tx_rep", &tx_int) > 0) evt->tx_repeat = (int) tx_int;
+    if (json_get_int(line, "tx_gap", &tx_int) > 0) evt->tx_gap_ms = (int) tx_int;
+    json_get_string(line, "tx_st", evt->tx_ack_status, sizeof(evt->tx_ack_status));
     return 0;
 }
 
@@ -609,6 +672,8 @@ typedef struct {
     char user[64];
     char role[16];
     char since[40];
+    uid_t peer_uid;
+    int   peer_uid_valid;
 } sso_ipc_client_slot_t;
 
 struct sso_ipc_server {
@@ -652,6 +717,27 @@ static void slot_close(sso_ipc_client_slot_t *slot) {
     slot->user[0] = '\0';
     slot->role[0] = '\0';
     slot->since[0] = '\0';
+    slot->peer_uid = 0;
+    slot->peer_uid_valid = 0;
+}
+
+static void slot_capture_peer_uid(sso_ipc_client_slot_t *slot) {
+    slot->peer_uid_valid = 0;
+#if defined(__linux__) && defined(SO_PEERCRED)
+    struct ucred cred;
+    socklen_t len = sizeof(cred);
+    if (getsockopt(slot->fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0) {
+        slot->peer_uid = cred.uid;
+        slot->peer_uid_valid = 1;
+    }
+#else
+    uid_t uid;
+    gid_t gid;
+    if (getpeereid(slot->fd, &uid, &gid) == 0) {
+        slot->peer_uid = uid;
+        slot->peer_uid_valid = 1;
+    }
+#endif
 }
 
 sso_ipc_server_t *sso_ipc_server_open(const char *tool) {
@@ -774,6 +860,7 @@ static void server_accept(sso_ipc_server_t *srv) {
         slot->user[0] = '\0';
         slot->role[0] = '\0';
         iso_utc_now(slot->since, sizeof(slot->since));
+        slot_capture_peer_uid(slot);
     }
 }
 
@@ -947,6 +1034,20 @@ int sso_ipc_server_next_client(const sso_ipc_server_t *srv,
         if (out_role && out_role_size) snprintf(out_role, out_role_size, "%s", s->role);
         if (out_since && out_since_size) snprintf(out_since, out_since_size, "%s", s->since);
         iter->cursor++;
+        return 0;
+    }
+    return -1;
+}
+
+int sso_ipc_server_peer_uid(const sso_ipc_server_t *srv,
+                             sso_client_id_t id, uid_t *out) {
+    if (!srv || !out) return -1;
+    for (size_t i = 0; i < SSO_IPC_MAX_CLIENTS; ++i) {
+        const sso_ipc_client_slot_t *s = &srv->clients[i];
+        if (s->fd < 0 || s->dead) continue;
+        if (s->id != id) continue;
+        if (!s->peer_uid_valid) return -1;
+        *out = s->peer_uid;
         return 0;
     }
     return -1;
