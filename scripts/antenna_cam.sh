@@ -10,7 +10,7 @@
 # latency and lets us pin the window to the top-right of the screen.
 #
 # Overrides (env vars or positional args):
-#   REMOTE   ssh target              (default: va6raogndstn)
+#   REMOTE   ssh target              (default: va6)
 #   DEV      v4l2 device on rao      (default: /dev/video0)
 #   SIZE     ffmpeg -video_size      (default: 640x480)
 #   TITLE    window title            (default: antenna-cam)
@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-REMOTE="${1:-${REMOTE:-va6raogndstn}}"
+REMOTE="${1:-${REMOTE:-rao}}"
 DEV="${2:-${DEV:-/dev/video0}}"
 SIZE="${3:-${SIZE:-640x480}}"
 TITLE="${TITLE:-antenna-cam}"
