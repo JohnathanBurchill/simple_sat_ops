@@ -27,6 +27,7 @@
 #include "sso_ipc.h"
 #include "sso_ipc_paths.h"
 #include "sso_paths.h"
+#include "tle_csv.h"
 
 #ifdef WITH_USRP_B210
 #include "b210_rx_tx_core.h"
@@ -2542,7 +2543,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 fprintf(stderr, "Unable to parse %s\n", argv[i]);
                 return EXIT_FAILURE;
             }
-            state->prediction.tles_filename = argv[i] + 6;
+            state->prediction.tles_filename = tle_path_resolve(argv[i] + 6);
         } else if (strncmp("--pass-folder=", argv[i], 14) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 15) {
@@ -2742,7 +2743,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 return EXIT_FAILURE;
             }
             fprintf(stderr, "simple_sat_ops: using TLE %s\n", src_tle);
-            state->prediction.tles_filename = src_tle;
+            state->prediction.tles_filename = tle_path_resolve(src_tle);
         }
         static char sat_name[64];
         if (read_tle_name(state->prediction.tles_filename,
@@ -2763,7 +2764,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                     "HOME unset or path too long; pass --tle=<path>\n");
                 return EXIT_FAILURE;
             }
-            state->prediction.tles_filename = default_tle;
+            state->prediction.tles_filename = tle_path_resolve(default_tle);
         }
         state->prediction.satellite_ephem.name = positional;
     }

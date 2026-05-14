@@ -152,7 +152,7 @@ if (OPENSSL_FOUND)
     # Offline sliding-window decoder for WAV / raw S16_LE files.
     add_executable(rx_replay utils/rx_replay.c utils/wav_read.c decode_loop.c
                    modem.c ax100.c rs.c golay24.c csp.c hmac_keyfile.c
-                   beacon_cts1.c rx_tui.c)
+                   beacon_cts1.c rx_tui.c tle_csv.c)
     target_include_directories(rx_replay PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(rx_replay PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(rx_replay PRIVATE ${OPENSSL_LIBRARIES} m)
@@ -218,12 +218,12 @@ endif()
 
 if (SGP4SDP4_LIB)
     # Next-pass scheduling tool
-    add_executable(next_in_queue next_in_queue.c prediction.c satellite_status.c oem.c)
+    add_executable(next_in_queue next_in_queue.c prediction.c satellite_status.c oem.c tle_csv.c)
     target_link_libraries(next_in_queue PRIVATE ${SGP4SDP4_LIB} m)
     list(APPEND SSO_TARGETS next_in_queue)
 
     # Toy orbit-decay estimator
-    add_executable(lifetime lifetime.c prediction.c oem.c)
+    add_executable(lifetime lifetime.c prediction.c oem.c tle_csv.c)
     target_link_libraries(lifetime PRIVATE ${SGP4SDP4_LIB} m)
     list(APPEND SSO_TARGETS lifetime)
 else()
@@ -239,7 +239,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
     add_executable(simple_sat_ops main.c prediction.c
                    antenna_rotator.c telemetry.c oem.c
                    decode_loop.c modem.c ax100.c rs.c golay24.c csp.c
-                   hmac_keyfile.c beacon_cts1.c
+                   hmac_keyfile.c beacon_cts1.c tle_csv.c
                    biquad.c monitor_squelch.c)
     target_include_directories(simple_sat_ops PRIVATE
         ${CMAKE_SOURCE_DIR} ${NCURSES_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})

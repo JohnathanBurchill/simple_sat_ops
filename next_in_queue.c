@@ -22,6 +22,7 @@
 #include "prediction.h"
 #include "oem.h"
 #include "satellite_status.h"
+#include "tle_csv.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -278,7 +279,7 @@ int main(int argc, char **argv)
                 fprintf(stderr, "Unable to parse %s\n", argv[i]);
                 return EXIT_FAILURE;
             }
-            state.prediction.tles_filename = argv[i] + 6;
+            state.prediction.tles_filename = tle_path_resolve(argv[i] + 6);
             tle_explicit = 1;
         } else if (strncmp("--trajectory-id=", argv[i], 16) == 0) {
             state.n_options++;
@@ -375,7 +376,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "HOME unset or path too long; pass --tle=<path>\n");
             return EXIT_FAILURE;
         }
-        state.prediction.tles_filename = default_tle;
+        state.prediction.tles_filename = tle_path_resolve(default_tle);
     }
 
     // Load OEM if --trajectory-id was given. Table lives on the stack and

@@ -19,6 +19,7 @@
 */
 
 #include "prediction.h"
+#include "tle_csv.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -133,7 +134,7 @@ int main(int argc, char **argv)
                 fprintf(stderr, "Unable to parse %s\n", argv[i]);
                 return EXIT_FAILURE;
             }
-            prediction.tles_filename = argv[i] + 6;
+            prediction.tles_filename = tle_path_resolve(argv[i] + 6);
         } else if (strncmp("--", argv[i], 2) == 0) {
             fprintf(stderr, "Unable to parse option '%s'\n", argv[i]);
             return 1;
@@ -151,7 +152,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "HOME unset or path too long; pass --tle=<path>\n");
             return EXIT_FAILURE;
         }
-        prediction.tles_filename = default_tle;
+        prediction.tles_filename = tle_path_resolve(default_tle);
     }
     prediction.satellite_ephem.name = argv[1];
     double max_years = atof(argv[2]);

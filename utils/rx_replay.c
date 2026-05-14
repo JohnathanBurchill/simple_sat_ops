@@ -43,6 +43,7 @@
 #include "packet_db.h"
 #include "rx_tui.h"
 #include "sso_audit.h"
+#include "tle_csv.h"
 #include "wav_read.h"
 
 #ifdef WITH_SGP4SDP4
@@ -445,7 +446,7 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--db="))              db_path = a + 5;
         else if (strcmp(a, "--no-db") == 0)            no_db = 1;
         else if (starts_with(a, "--source-run="))      source_run_override = a + 13;
-        else if (starts_with(a, "--tle="))             tle_path = a + 6;
+        else if (starts_with(a, "--tle="))             tle_path = tle_path_resolve(a + 6);
         else if (starts_with(a, "--satellite="))       sat_arg = a + 12;
         else if (starts_with(a, "--start-utc="))       start_utc_arg = a + 12;
         else if (starts_with(a, "--session-dir="))     session_dir_arg = a + 14;
@@ -626,7 +627,7 @@ int main(int argc, char **argv)
     if (tle_path == NULL && db != NULL) {
         if (autodiscover_tle_in_dir(search_dir, tle_path_buf,
                                     sizeof tle_path_buf) == 0) {
-            tle_path = tle_path_buf;
+            tle_path = tle_path_resolve(tle_path_buf);
             fprintf(stderr, "rx_replay: auto-discovered TLE %s\n", tle_path);
         }
     }
