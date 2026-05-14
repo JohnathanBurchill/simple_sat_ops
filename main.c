@@ -1588,8 +1588,10 @@ static void render_rx_panel(int *print_row, int print_col)
 #ifdef WITH_USRP_B210
     int row = *print_row;
     int col = print_col;
-    mvprintw(row++, col, "%15s   %s", "B210",
-             g_b210_core ? "active" : "(offline)");
+    int rec_active = rx_session_wav_active(g_rx_session);
+    mvprintw(row++, col, "%15s   %s%s", "B210",
+             g_b210_core ? "active" : "(offline)",
+             rec_active ? "  [REC]" : "");
     clrtoeol();
     if (g_b210_core) {
         mvprintw(row++, col, "%15s   %.6f MHz", "RX freq",
@@ -2236,7 +2238,15 @@ int main(int argc, char **argv)
     const double IPC_BROADCAST_PERIOD_S = 0.5;   // 2 Hz
     const double REDRAW_PERIOD_S        = 0.1;   // 10 Hz
 
+    // Per-pass WAV recording: arm 1 min before AOS, hold open through
+    // the pass, close 1 min after LOS. Multiple passes during one
+    // simple_sat_ops run each get their own file under the pass folder.
+    const double RECORDING_PREROLL_S  = 60.0;
+    const double RECORDING_POSTROLL_S = 60.0;
+    double t_recording_close_at = 0.0;  // monotonic deadline; 0 = unset
+
     while (state.running) {
+        double t_now = monotonic_seconds();
         UTC_Calendar_Now(&utc, &tv);
         jul_utc = Julian_Date(&utc, &tv);
         update_satellite_position(&state.prediction, jul_utc);
@@ -2253,6 +2263,34 @@ int main(int argc, char **argv)
             current_uplink_frequency   = state.doppler_uplink_frequency_hz;
             current_downlink_frequency = state.doppler_downlink_frequency_hz;
         }
+
+#ifdef WITH_USRP_B210
+        // Auto-record per pass: open the WAV 1 min before AOS (or as
+        // soon as we're in-pass, in case simple_sat_ops started mid-
+        // pass), keep it open through the pass, close it 1 min after
+        // LOS. Each pass gets its own auto-named file in the pass
+        // folder.
+        if (g_rx_session) {
+            double sec_to_aos =
+                state.prediction.predicted_minutes_until_visible * 60.0;
+            int in_window = state.in_pass
+                || (sec_to_aos > 0.0 && sec_to_aos <= RECORDING_PREROLL_S);
+            int active = rx_session_wav_active(g_rx_session);
+            if (!active && in_window) {
+                rx_session_wav_start(g_rx_session);
+                t_recording_close_at = 0.0;
+            } else if (active) {
+                if (state.in_pass) {
+                    t_recording_close_at = 0.0;  // cancel any pending close
+                } else if (t_recording_close_at == 0.0) {
+                    t_recording_close_at = t_now + RECORDING_POSTROLL_S;
+                } else if (t_now >= t_recording_close_at) {
+                    rx_session_wav_stop(g_rx_session);
+                    t_recording_close_at = 0.0;
+                }
+            }
+        }
+#endif
 
         current_az = state.antenna_rotator.azimuth;
         current_el = state.antenna_rotator.elevation;
@@ -2378,7 +2416,6 @@ int main(int argc, char **argv)
         }
         (void) jul_idle_start;  // reserved for any future idle-window behavior
 
-        double t_now = monotonic_seconds();
         int redraw_due = (t_now - t_last_redraw) >= REDRAW_PERIOD_S;
         if (redraw_due) {
             row = 1;
@@ -2552,6 +2589,7 @@ int main(int argc, char **argv)
     }
 #ifdef WITH_USRP_B210
     if (g_rx_session) {
+        rx_session_wav_stop(g_rx_session);  // explicit on quit
         rx_session_close(g_rx_session);
         g_rx_session = NULL;
     }

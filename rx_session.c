@@ -192,6 +192,8 @@ struct rx_session {
     wav_w_t  wav;
     char     wav_path[512];
     char     log_path[512];
+    char     pass_folder[256];
+    int      want_wav;
 
     // Frame counters + last-decoded summary.
     uint64_t frames_total;
@@ -283,20 +285,49 @@ int rx_session_open(rx_session_t **out, const rx_session_params_t *p,
         decode_loop_set_session_dir(p->session_dir);
     }
 
-    // WAV in pass folder (or cwd).
-    if (p->want_wav) {
-        if (auto_name_wav(p->pass_folder,
-                          rxs->wav_path, sizeof rxs->wav_path) != 0
-            || wav_w_open(&rxs->wav, rxs->wav_path, rxs->samp_rate) != 0) {
-            fprintf(stderr,
-                "rx_session: WAV open failed (%s): %s — continuing without WAV\n",
-                rxs->wav_path, strerror(errno));
-            rxs->wav_path[0] = '\0';
-        }
+    // Defer the WAV open until the caller arms a pass with
+    // rx_session_wav_start(). Keeps the disk idle between passes.
+    rxs->want_wav = p->want_wav;
+    if (p->pass_folder && p->pass_folder[0]) {
+        snprintf(rxs->pass_folder, sizeof rxs->pass_folder,
+                 "%s", p->pass_folder);
     }
 
     *out = rxs;
     return 0;
+}
+
+int rx_session_wav_start(rx_session_t *rxs)
+{
+    if (rxs == NULL || !rxs->want_wav) return -1;
+    if (rxs->wav.fp != NULL) return 0;  // already recording
+    if (auto_name_wav(rxs->pass_folder[0] ? rxs->pass_folder : NULL,
+                      rxs->wav_path, sizeof rxs->wav_path) != 0
+        || wav_w_open(&rxs->wav, rxs->wav_path, rxs->samp_rate) != 0) {
+        fprintf(stderr,
+            "rx_session: WAV open failed (%s): %s\n",
+            rxs->wav_path, strerror(errno));
+        rxs->wav_path[0] = '\0';
+        return -1;
+    }
+    fprintf(stderr, "rx_session: recording -> %s\n", rxs->wav_path);
+    return 0;
+}
+
+void rx_session_wav_stop(rx_session_t *rxs)
+{
+    if (rxs == NULL || rxs->wav.fp == NULL) return;
+    size_t n = rxs->wav.n_samples;
+    wav_w_close(&rxs->wav);
+    fprintf(stderr,
+        "rx_session: closed %s (%zu samples, %.1f s @ %d Hz)\n",
+        rxs->wav_path, n, (double) n / (double) rxs->samp_rate,
+        rxs->samp_rate);
+}
+
+int rx_session_wav_active(const rx_session_t *rxs)
+{
+    return rxs != NULL && rxs->wav.fp != NULL;
 }
 
 void rx_session_close(rx_session_t *rxs)

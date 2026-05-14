@@ -38,7 +38,7 @@ typedef struct {
     const char    *db_path;
     int            no_db;
     const char    *pass_folder; // base dir for WAV / log; NULL = cwd
-    int            want_wav;
+    int            want_wav;    // 1 = honour rx_session_wav_start; 0 = stub
     const char    *tle_path;
     const char    *sat_name;
     const char    *session_dir; // for packet_db (typically pass_folder)
@@ -53,6 +53,18 @@ void rx_session_close(rx_session_t *rxs);
 // Returns 0 on success / transient, -1 on UHD fatal.
 int  rx_session_pump(rx_session_t *rxs, b210_rx_tx_core_t *core,
                      double budget_s);
+
+// Open a fresh auto-named WAV under the configured pass folder so the
+// pump's PCM starts landing on disk. No-op if want_wav was 0, or if a
+// WAV is already recording. Returns 0 on success, -1 on error.
+int  rx_session_wav_start(rx_session_t *rxs);
+
+// Close any open WAV. No-op when not recording. Safe to call any
+// number of times; rx_session_close() also calls this implicitly.
+void rx_session_wav_stop(rx_session_t *rxs);
+
+// 1 when a WAV is currently being written, 0 otherwise.
+int  rx_session_wav_active(const rx_session_t *rxs);
 
 // Snapshot for the UI. Any out-pointer may be NULL.
 void rx_session_snapshot(const rx_session_t *rxs,
