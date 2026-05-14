@@ -35,15 +35,26 @@ static int hex_value(char c)
 
 int hmac_keyfile_default_path(char *out_path, size_t out_cap)
 {
+    // Prefer the shared keyfile under /FrontierSat/HMAC. If it doesn't
+    // exist or isn't a regular file, fall back to the per-user path
+    // under $HOME. The actual mode/group-readability check happens in
+    // hmac_keyfile_load — this resolver is purely "which path?".
+    struct stat st;
+    if (stat(HMAC_KEYFILE_SHARED_PATH, &st) == 0 && S_ISREG(st.st_mode)) {
+        int n = snprintf(out_path, out_cap, "%s", HMAC_KEYFILE_SHARED_PATH);
+        if (n < 0 || (size_t) n >= out_cap) return -1;
+        return 0;
+    }
     const char *home = getenv("HOME");
     if (home == NULL || home[0] == '\0') {
+        fprintf(stderr,
+            "hmac_keyfile: %s not found and $HOME unset; pass --keyfile=\n",
+            HMAC_KEYFILE_SHARED_PATH);
         return -1;
     }
     int n = snprintf(out_path, out_cap, "%s/%s", home,
-                     HMAC_KEYFILE_DEFAULT_RELPATH);
-    if (n < 0 || (size_t)n >= out_cap) {
-        return -1;
-    }
+                     HMAC_KEYFILE_USER_RELPATH);
+    if (n < 0 || (size_t) n >= out_cap) return -1;
     return 0;
 }
 
@@ -62,11 +73,14 @@ ssize_t hmac_keyfile_load(const char *path, uint8_t *out, size_t out_cap)
         fprintf(stderr, "hmac_keyfile: %s is not a regular file\n", path);
         return -1;
     }
-    // Owner read/write only; no group, no other.
-    if ((st.st_mode & 0777) != 0600) {
+    // 0600 (personal) or 0640 (shared, group-readable). Reject any
+    // world bits — even world-read is a no-go for an HMAC key.
+    unsigned mode = st.st_mode & 0777;
+    if (mode != 0600 && mode != 0640) {
         fprintf(stderr,
-                "hmac_keyfile: %s must be chmod 0600 (got 0%03o); run: chmod 600 %s\n",
-                path, st.st_mode & 0777, path);
+                "hmac_keyfile: %s must be chmod 0600 or 0640 (got 0%03o); "
+                "run: chmod 640 %s   (or 600 for personal)\n",
+                path, mode, path);
         return -1;
     }
 

@@ -4,8 +4,9 @@
 
     Strict loader for the FrontierSat HMAC key file. Expected format:
     a single line of plain uppercase hexadecimal characters, no spaces,
-    no separators, optionally followed by a single newline. The file must
-    be chmod 0600 (owner read/write only).
+    no separators, optionally followed by a single newline. The file
+    must be chmod 0600 (personal) or 0640 (shared with the sso-ops
+    group); any world bits are rejected.
 
     Copyright (C) 2025  Johnathan K Burchill
 
@@ -30,19 +31,30 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-// Default location under $HOME.
-#define HMAC_KEYFILE_DEFAULT_RELPATH ".local/state/simple_sat_ops/frontiersat_hmac"
+// Shared keyfile path on the ground machine. Sysadmin chowns it
+// root:sso-ops and chmods 0640 so every operator account can read but
+// nobody else can. Per-user fallback (HMAC_KEYFILE_USER_RELPATH under
+// $HOME) is used when the shared file is absent — useful on dev hosts.
+#define HMAC_KEYFILE_SHARED_PATH      "/FrontierSat/HMAC/frontiersat_hmac"
+#define HMAC_KEYFILE_USER_RELPATH     ".local/state/simple_sat_ops/frontiersat_hmac"
+
+// Back-compat alias: existing tool help text (uplink_test, rx_decode,
+// rx_replay, tx_frame_sdr) prints this. Now resolves to the per-user
+// fallback path, since the primary default is HMAC_KEYFILE_SHARED_PATH.
+#define HMAC_KEYFILE_DEFAULT_RELPATH  HMAC_KEYFILE_USER_RELPATH
 
 // Loads the HMAC key from `path`. On success writes the decoded bytes
 // to `out` and returns the number of bytes written. On error prints a
 // diagnostic to stderr and returns -1.
 //
-// Enforces: regular file, mode 0600 exactly (no group/other bits),
+// Enforces: regular file, mode 0600 or 0640 (any world bits → reject),
 // non-empty, even-length, uppercase-hex-only.
 ssize_t hmac_keyfile_load(const char *path, uint8_t *out, size_t out_cap);
 
-// Fills out_path with "$HOME/" + HMAC_KEYFILE_DEFAULT_RELPATH. Returns 0
-// on success, -1 if $HOME is unset or the buffer is too small.
+// Resolves the keyfile path to use when the operator hasn't passed
+// --keyfile=. Prefers the shared HMAC_KEYFILE_SHARED_PATH; falls back
+// to "$HOME/" + HMAC_KEYFILE_USER_RELPATH if the shared file isn't
+// readable. Returns 0 on success, -1 if neither location resolves.
 int hmac_keyfile_default_path(char *out_path, size_t out_cap);
 
 #endif // HMAC_KEYFILE_H
