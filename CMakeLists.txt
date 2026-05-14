@@ -203,33 +203,12 @@ if (OPENSSL_FOUND)
         target_link_sso_core(b210_rx_capture)
         list(APPEND SSO_TARGETS b210_rx_capture)
 
-        # Unified B210 RX + TX daemon. RX continuous; on TX_REQUEST from
-        # simple_sat_ops, RX pauses, the TX streamer transmits one or more
-        # AX100 frames, then RX re-arms. Single-process owner of the B210.
-        add_executable(b210_rx_tx utils/b210_rx_tx.c b210_rx_tx_core.c
-                       fir_decim.c biquad.c monitor_squelch.c
-                       decode_loop.c modem.c ax100.c rs.c golay24.c csp.c
-                       hmac_keyfile.c beacon_cts1.c rx_tui.c)
-        target_include_directories(b210_rx_tx PRIVATE
-            ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS} ${UHD_INCLUDE_DIRS})
-        target_link_directories(b210_rx_tx PRIVATE
-            ${OPENSSL_LIBRARY_DIRS} ${UHD_LIBRARY_DIRS})
-        target_link_libraries(b210_rx_tx PRIVATE
-            ${OPENSSL_LIBRARIES} ${UHD_LIBRARIES} m pthread)
-        if (SGP4SDP4_LIB)
-            target_compile_definitions(b210_rx_tx PRIVATE WITH_SGP4SDP4)
-            target_sources(b210_rx_tx PRIVATE prediction.c oem.c)
-            target_link_libraries(b210_rx_tx PRIVATE ${SGP4SDP4_LIB})
-        endif()
-        if (NCURSES_FOUND)
-            target_compile_definitions(b210_rx_tx PRIVATE RX_TUI_AVAILABLE)
-            target_include_directories(b210_rx_tx PRIVATE ${NCURSES_INCLUDE_DIRS})
-            target_link_directories(b210_rx_tx PRIVATE ${NCURSES_LIBRARY_DIRS})
-            target_link_libraries(b210_rx_tx PRIVATE ${NCURSES_LIBRARIES})
-        endif()
-        target_link_packet_db(b210_rx_tx)
-        target_link_sso_core(b210_rx_tx)
-        list(APPEND SSO_TARGETS b210_rx_tx)
+        # Live B210 RX + TX is no longer a separate target — the
+        # daemon was folded into simple_sat_ops (FLYUFLS), which now
+        # owns the device end-to-end. b210_rx_capture survives for
+        # offline IQ recording; tx_frame_sdr survives for offline IQ
+        # rendering. b210_rx_tx_core.c links into simple_sat_ops via
+        # the WITH_USRP_B210 block below.
     endif()
 else()
     message(STATUS "libcrypto not found; uplink_test and rx_decode will not be built.")
@@ -251,18 +230,36 @@ else()
     message(STATUS "libsgp4sdp4 not found; next_in_queue, lifetime, simple_sat_ops will not be built.")
 endif()
 
-# ----- Full operator UI (needs ncurses + SGP4) ------------------------------
+# ----- Full operator UI (needs ncurses + SGP4 + OpenSSL) --------------------
+# simple_sat_ops now owns the live RF chain too: B210 RX + AX100 decode +
+# in-process TX bursts. The framing / decode / squelch / HMAC sources are
+# linked directly; the UHD-dependent pieces sit behind WITH_USRP_B210.
 
-if (NCURSES_FOUND AND SGP4SDP4_LIB)
+if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
     add_executable(simple_sat_ops main.c prediction.c
-                   antenna_rotator.c telemetry.c oem.c)
-    target_include_directories(simple_sat_ops PRIVATE ${CMAKE_SOURCE_DIR} ${NCURSES_INCLUDE_DIRS})
-    target_link_directories(simple_sat_ops PRIVATE ${NCURSES_LIBRARY_DIRS})
-    target_link_libraries(simple_sat_ops PRIVATE ${SGP4SDP4_LIB} ${NCURSES_LIBRARIES} m pthread)
+                   antenna_rotator.c telemetry.c oem.c
+                   decode_loop.c modem.c ax100.c rs.c golay24.c csp.c
+                   hmac_keyfile.c beacon_cts1.c
+                   biquad.c monitor_squelch.c)
+    target_include_directories(simple_sat_ops PRIVATE
+        ${CMAKE_SOURCE_DIR} ${NCURSES_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(simple_sat_ops PRIVATE
+        ${NCURSES_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(simple_sat_ops PRIVATE
+        ${SGP4SDP4_LIB} ${NCURSES_LIBRARIES} ${OPENSSL_LIBRARIES} m pthread)
+    if (WITH_USRP_B210)
+        target_compile_definitions(simple_sat_ops PRIVATE WITH_USRP_B210)
+        target_sources(simple_sat_ops PRIVATE
+                       b210_rx_tx_core.c fir_decim.c rx_session.c tx_burst.c)
+        target_include_directories(simple_sat_ops PRIVATE ${UHD_INCLUDE_DIRS})
+        target_link_directories(simple_sat_ops PRIVATE ${UHD_LIBRARY_DIRS})
+        target_link_libraries(simple_sat_ops PRIVATE ${UHD_LIBRARIES})
+    endif()
+    target_link_packet_db(simple_sat_ops)
     target_link_sso_core(simple_sat_ops)
     list(APPEND SSO_TARGETS simple_sat_ops)
 else()
-    message(STATUS "simple_sat_ops requires ncurses + sgp4sdp4; skipping.")
+    message(STATUS "simple_sat_ops requires ncurses + sgp4sdp4 + libcrypto; skipping.")
 endif()
 
 # ----- Install --------------------------------------------------------------

@@ -28,6 +28,13 @@
 #include "sso_ipc_paths.h"
 #include "sso_paths.h"
 
+#ifdef WITH_USRP_B210
+#include "b210_rx_tx_core.h"
+#include "frontiersat.h"
+#include "rx_session.h"
+#include "tx_burst.h"
+#endif
+
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -89,11 +96,16 @@ static void on_sigusr1(int sig) {
     g_yield_requested = 1;
 }
 
-// IPC slot id for the b210_rx_tx daemon (set by the HELLO peer-uid
-// check in commit-3; -1 = no daemon connected). The compose modal
-// commit path targets this slot with sso_ipc_server_send so the daemon
-// is the only recipient of TX_REQUEST events.
-static sso_client_id_t g_tx_daemon_slot = -1;
+// B210 ownership lives here now — simple_sat_ops is the single process
+// that opens the SDR. --without-b210 (or a non-WITH_USRP_B210 build)
+// leaves g_b210_core NULL and the loop falls through cleanly.
+static int  g_without_b210 = 0;
+#ifdef WITH_USRP_B210
+static b210_rx_tx_core_t *g_b210_core   = NULL;
+static rx_session_t      *g_rx_session  = NULL;
+static double g_b210_actual_freq        = 0.0;
+static tx_request_slot_t  g_tx_request  = {0};
+#endif
 
 // TX log ring buffer — last few PREVIEW/SENT/ACK events for display.
 // Shared by operator and viewer renderers.
@@ -354,43 +366,7 @@ static void ipc_broadcast_state(state_t *s,
 static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
                          const sso_event_t *evt, void *user) {
     (void) user;
-    if (evt->type == SSO_EVT_TX_COMMAND_SENT
-     || evt->type == SSO_EVT_TX_ACK) {
-        // Daemon-side confirmation — log locally and fan out to viewers
-        // so the viewer's TX log reflects what the operator sees too.
-        tx_log_push(evt);
-        char buf[1024];
-        if (sso_event_encode(evt, buf, sizeof buf) == 0) {
-            sso_ipc_server_broadcast(srv, buf);
-        }
-        return;
-    }
     if (evt->type != SSO_EVT_HELLO) return;
-
-    // b210_rx_tx daemon attach: peer uid must match the operator's
-    // effective uid. SO_PEERCRED / getpeereid is captured at accept;
-    // a HELLO claiming role="b210_rx_tx" from a different uid is
-    // recorded and ignored.
-    if (evt->role[0] && strcmp(evt->role, "b210_rx_tx") == 0) {
-        uid_t peer_uid = 0;
-        int ok = (sso_ipc_server_peer_uid(srv, id, &peer_uid) == 0
-                  && peer_uid == geteuid());
-        if (ok) {
-            g_tx_daemon_slot = id;
-            sso_audit_event("tx-daemon-attached",
-                            evt->user[0] ? evt->user : "?");
-            fprintf(stderr,
-                "simple_sat_ops: b210_rx_tx attached (slot=%d, user=%s)\n",
-                (int) id, evt->user[0] ? evt->user : "?");
-        } else {
-            sso_audit_event("tx-daemon-uid-mismatch",
-                            evt->user[0] ? evt->user : "?");
-            fprintf(stderr,
-                "simple_sat_ops: rejecting b210_rx_tx claim (uid mismatch); "
-                "claimant=%s\n",
-                evt->user[0] ? evt->user : "?");
-        }
-    }
     sso_event_t welcome;
     sso_event_init(&welcome, SSO_EVT_WELCOME);
     snprintf(welcome.from, sizeof(welcome.from), "%s",
@@ -472,10 +448,10 @@ static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
 // Opened with `t` from the operator's main UI when the keyboard is
 // unlocked. As the operator edits a field the modal broadcasts a
 // debounced SSO_EVT_TX_COMMAND_PREVIEW so viewers see the draft and
-// can call out typos. On Enter the modal builds a TX_REQUEST and
-// sends it via sso_ipc_server_send to g_tx_daemon_slot (the b210_rx_tx
-// daemon). If the daemon isn't connected the commit short-circuits
-// with an error and the modal stays open.
+// can call out typos. On Enter the modal stashes the parsed request in
+// g_tx_request; the main loop runs it inline via tx_burst_run (no IPC
+// round-trip, since the B210 now lives in this process). ACK +
+// COMMAND_SENT events are published locally for viewer fan-out.
 
 typedef enum {
     TXF_KIND = 0,
@@ -667,9 +643,13 @@ static void tx_compose_draw(WINDOW *w, const tx_compose_t *c) {
     box(w, 0, 0);
     mvwprintw(w, 0, 2, " TX compose (operator: %s) ",
               g_operator_user ? g_operator_user : "?");
+#ifdef WITH_USRP_B210
     mvwprintw(w, 1, 2,
-              "daemon: %s",
-              g_tx_daemon_slot >= 0 ? "connected" : "(not connected)");
+              "B210: %s",
+              g_b210_core ? "in-process (this binary)" : "(offline)");
+#else
+    mvwprintw(w, 1, 2, "B210: (this build has no UHD)");
+#endif
     wclrtoeol(w);
 
     char buf[64];
@@ -791,54 +771,107 @@ static void tx_compose_broadcast_preview(const tx_compose_t *c) {
 }
 
 static int tx_compose_commit(const tx_compose_t *c, char *err, size_t err_size) {
-    if (!g_ipc) {
-        snprintf(err, err_size, "no IPC server (--control not active)");
+#ifdef WITH_USRP_B210
+    if (g_tx_request.pending) {
+        snprintf(err, err_size, "previous burst still in flight");
         return -1;
     }
-    if (g_tx_daemon_slot < 0) {
-        snprintf(err, err_size, "b210_rx_tx daemon not connected");
-        return -1;
+    // Parse the payload into the request slot. Hex / ASCII are parsed
+    // here so the main-loop burst-service path doesn't need to know
+    // about the compose buffer layout.
+    if (c->is_hex) {
+        ssize_t n = tx_burst_parse_hex(c->payload, g_tx_request.payload,
+                                        sizeof g_tx_request.payload);
+        if (n < 0) {
+            snprintf(err, err_size, "bad hex payload");
+            return -1;
+        }
+        g_tx_request.payload_len = (size_t) n;
+    } else {
+        size_t n = strlen(c->payload);
+        if (n == 0) {
+            snprintf(err, err_size, "empty payload");
+            return -1;
+        }
+        if (n > sizeof g_tx_request.payload) n = sizeof g_tx_request.payload;
+        memcpy(g_tx_request.payload, c->payload, n);
+        g_tx_request.payload_len = n;
     }
-    // Re-check peer uid right before send (paranoia against a slot id
-    // being reused for a different process between accept and now).
-    uid_t puid = 0;
-    if (sso_ipc_server_peer_uid(g_ipc, g_tx_daemon_slot, &puid) != 0
-        || puid != geteuid()) {
-        g_tx_daemon_slot = -1;
-        snprintf(err, err_size, "daemon peer-uid changed; rejected");
-        return -1;
-    }
-    sso_event_t evt;
-    sso_event_init(&evt, SSO_EVT_TX_REQUEST);
-    tx_compose_fill_event(c, &evt);
-    char buf[2048];
-    if (sso_event_encode(&evt, buf, sizeof buf) != 0) {
-        snprintf(err, err_size, "event encode failed");
-        return -1;
-    }
-    if (sso_ipc_server_send(g_ipc, g_tx_daemon_slot, buf) != 0) {
-        snprintf(err, err_size, "send to daemon slot failed");
-        return -1;
-    }
+    g_tx_request.is_hex   = c->is_hex;
+    g_tx_request.csp_hdr  = (csp_v1_header_t){
+        .prio  = (uint8_t) atoi(c->prio),
+        .src   = (uint8_t) atoi(c->src),
+        .dst   = (uint8_t) atoi(c->dst),
+        .dport = (uint8_t) atoi(c->dport),
+        .sport = (uint8_t) atoi(c->sport),
+        .flags = 0,
+    };
+    g_tx_request.tx_freq_hz       = atol(c->freq);
+    g_tx_request.tx_gain_db       = atof(c->gain);
+    g_tx_request.repeat           = atoi(c->repeat);
+    g_tx_request.gap_ms           = atoi(c->gap);
+    g_tx_request.allow_high_power = c->allow_high_power;
+    g_tx_request.allow_hf_tx      = c->allow_hf_tx;
+    tx_compose_summary(c, g_tx_request.summary, sizeof g_tx_request.summary);
+    g_tx_request.pending = 1;
     return 0;
+#else
+    (void) c;
+    snprintf(err, err_size, "this build has no B210 support");
+    return -1;
+#endif
 }
 
-// Walk the live slot list; if g_tx_daemon_slot no longer resolves to
-// an open slot, the daemon dropped — forget it so the compose modal
-// reports "not connected" again.
-static void prune_tx_daemon_slot(void) {
-    if (!g_ipc || g_tx_daemon_slot < 0) return;
-    sso_ipc_iter_t it = {0};
-    sso_client_id_t cid;
-    char user[64], role[16], since[40];
-    while (sso_ipc_server_next_client(g_ipc, &it, &cid,
-                                       user, sizeof user,
-                                       role, sizeof role,
-                                       since, sizeof since) == 0) {
-        if (cid == g_tx_daemon_slot) return;
+#ifdef WITH_USRP_B210
+// Emit a TX event locally: push into the operator's own TX log and
+// broadcast to viewers via the IPC server.
+static void emit_tx_event_local(sso_event_type_t type,
+                                 const char *summary,
+                                 const char *ack_status)
+{
+    sso_event_t evt;
+    sso_event_init(&evt, type);
+    snprintf(evt.from, sizeof evt.from, "%s",
+             g_operator_user ? g_operator_user : "?");
+    if (summary && summary[0]) {
+        snprintf(evt.ascii, sizeof evt.ascii, "%s", summary);
     }
-    g_tx_daemon_slot = -1;
+    if (ack_status && ack_status[0]) {
+        snprintf(evt.tx_ack_status, sizeof evt.tx_ack_status, "%s", ack_status);
+    }
+    tx_log_push(&evt);
+    if (g_ipc) {
+        char buf[2048];
+        if (sso_event_encode(&evt, buf, sizeof buf) == 0) {
+            sso_ipc_server_broadcast(g_ipc, buf);
+        }
+    }
 }
+
+// Service the pending TX request from the main loop: run the burst,
+// publish ACK + COMMAND_SENT to the operator's own log + viewers.
+static void service_tx_burst_locally(void)
+{
+    if (!g_tx_request.pending) return;
+    char summary[160];
+    tx_burst_result_t rc = tx_burst_run(g_b210_core, &g_tx_request,
+                                         g_b210_actual_freq,
+                                         /*hmac_key=*/NULL, /*hmac_key_len=*/0,
+                                         summary, sizeof summary);
+    const char *ack_status = "ok";
+    switch (rc) {
+        case TX_BURST_OK:                                       break;
+        case TX_BURST_NO_CORE:            ack_status = "rejected: no B210"; break;
+        case TX_BURST_FRAME_BUILD_FAILED: ack_status = "rejected: frame build"; break;
+        case TX_BURST_UHD_ERROR:          ack_status = "uhd-err"; break;
+    }
+    emit_tx_event_local(SSO_EVT_TX_ACK, summary, ack_status);
+    if (rc == TX_BURST_OK) {
+        emit_tx_event_local(SSO_EVT_TX_COMMAND_SENT, summary, NULL);
+    }
+    g_tx_request.pending = 0;
+}
+#endif
 
 static long ts_now_ns(void) {
     struct timespec ts;
@@ -896,9 +929,8 @@ static void run_tx_compose(void) {
                 tx_compose_draw(w, &c);
             }
         }
-        // Pump operator IPC so HELLO from a late-joining daemon updates
-        // g_tx_daemon_slot, and any ACK from a prior TX request comes
-        // through. Quick poll (no blocking).
+        // Pump operator IPC so viewers stay connected while the
+        // operator is sitting in the modal. Non-blocking.
         if (g_ipc) sso_ipc_server_step(g_ipc, 0);
         // Debounced preview broadcast.
         if (c.preview_dirty
@@ -1164,9 +1196,9 @@ void usage(FILE *dest, const char *name, int full)
         "\n"
         "Live satellite tracker for the FrontierSat ground station. Predicts\n"
         "passes, drives the SPID rotator, computes Doppler-shifted simplex\n"
-        "frequencies for display, and (with --control) acts as the operator\n"
-        "coordinator over the sso_ipc socket so b210_rx_tx and tx_frame_sdr\n"
-        "verify they're owned by the right Unix user.\n"
+        "frequencies, and (with --control) owns the USRP B210 directly:\n"
+        "RX + AX100 decode + in-process TX bursts via the 't' compose modal.\n"
+        "One process for everything live. Viewers connect over sso_ipc.\n"
         "\n"
         "Modes:\n"
         "  %s --control                 Operator: opens the sso_ipc server,\n"
@@ -1191,12 +1223,14 @@ void usage(FILE *dest, const char *name, int full)
         "                               (auto-populated by --control without a\n"
         "                               positional satellite_id).\n"
         "\n"
-        "Hardware (rotator only — the radio is now the B210, driven\n"
-        "externally; there is no audio path in this binary):\n"
+        "Hardware (rotator + B210):\n"
         "  --without-rotator            Skip the SPID Rot2Prog. Default is on:\n"
         "                               the tracker initialises and commands\n"
         "                               the rotator unless this flag is given.\n"
         "  --without-hardware           Synonym for --without-rotator\n"
+        "  --without-b210               Skip the USRP B210 (dev hosts that\n"
+        "                               have UHD but no device, or any time\n"
+        "                               you just want the UI + rotator).\n"
         "\n"
         "Operator coordination:\n"
         "  --control                    Open the sso_ipc server (operator mode).\n"
@@ -1528,6 +1562,48 @@ void report_status(state_t *state, int *print_row, int print_col)
     }
 
     render_status_panel(&p, print_row, print_col);
+}
+
+// Render the B210 RX panel: live freq, IQ level meter, decoded-frame
+// count, last decoded frame summary. No-op when there's no B210 in
+// this build / run.
+static void render_rx_panel(int *print_row, int print_col)
+{
+    if (print_row == NULL) return;
+#ifdef WITH_USRP_B210
+    int row = *print_row;
+    int col = print_col;
+    mvprintw(row++, col, "%15s   %s", "B210",
+             g_b210_core ? "active" : "(offline)");
+    clrtoeol();
+    if (g_b210_core) {
+        mvprintw(row++, col, "%15s   %.6f MHz", "RX freq",
+                 g_b210_actual_freq / 1e6);
+        clrtoeol();
+        double peak = 0.0, rms_sq = 0.0;
+        b210_rx_tx_core_iq_levels(g_b210_core, &peak, &rms_sq);
+        double rms = sqrt(rms_sq);
+        double peak_dbfs = (peak < 1.0) ? -90.0 : 20.0 * log10(peak / 32768.0);
+        double rms_dbfs  = (rms  < 1.0) ? -90.0 : 20.0 * log10(rms  / 32768.0);
+        mvprintw(row++, col, "%15s   peak %+5.1f  rms %+5.1f dBFS",
+                 "level", peak_dbfs, rms_dbfs);
+        clrtoeol();
+        uint64_t frames = 0;
+        char     last[80] = "";
+        rx_session_snapshot(g_rx_session, &frames, NULL, NULL,
+                            last, sizeof last);
+        mvprintw(row++, col, "%15s   %llu",
+                 "frames", (unsigned long long) frames);
+        clrtoeol();
+        if (last[0]) {
+            mvprintw(row++, col, "%15s   %s", "last frame", last);
+            clrtoeol();
+        }
+    }
+    *print_row = row;
+#else
+    (void) print_row; (void) print_col;
+#endif
 }
 
 void report_position(state_t *state, int *print_row, int print_col)
@@ -2033,6 +2109,60 @@ int main(int argc, char **argv)
         }
     }
 
+#ifdef WITH_USRP_B210
+    // Open the B210 once, here, before ncurses init — soft-fail on any
+    // UHD error so a dev host without a device can still run the UI.
+    if (g_control_mode && !g_without_b210) {
+        b210_rx_tx_core_params_t cp = {
+            .freq_hz         = state.nominal_downlink_frequency_hz,
+            .rate_hz         = 240000.0,
+            .gain_db         = 50.0,
+            .bw_hz           = -1.0,
+            .fm_fullscale_hz = 25000.0,
+            .device_args     = "type=b200",
+            .rx_antenna      = "RX2",
+            .decim_factor    = 5u,
+            .decim_cutoff_hz = 18000.0,
+            .decim_taps      = 96u,
+        };
+        if (b210_rx_tx_core_open(&cp, &g_b210_core) != 0) {
+            fprintf(stderr,
+                "simple_sat_ops: B210 open failed — continuing without RF "
+                "(rotator + UI only). Pass --without-b210 to silence.\n");
+            g_b210_core = NULL;
+        } else {
+            g_b210_actual_freq = b210_rx_tx_core_actual_freq(g_b210_core);
+            fprintf(stderr,
+                "simple_sat_ops: B210 open at %.6f MHz (post-decim rate %.0f)\n",
+                g_b210_actual_freq / 1e6,
+                b210_rx_tx_core_actual_rate(g_b210_core));
+            rx_session_params_t rxp = {
+                .bit_rate          = 9600,
+                .window_s          = 1.5,
+                .slide_s           = 0.5,
+                .sync_max_ham      = 4,
+                .use_hmac          = 0,
+                .use_rs            = 1,
+                .force_beacon      = 0,
+                .show_packet_headers = 0,
+                .csp_crc32         = 0,
+                .pass_folder       = g_pass_folder[0] ? g_pass_folder : NULL,
+                .want_wav          = 1,
+                .tle_path          = state.prediction.tles_filename,
+                .sat_name          = state.prediction.satellite_ephem.tle.sat_name[0]
+                                     ? state.prediction.satellite_ephem.tle.sat_name
+                                     : NULL,
+                .session_dir       = g_pass_folder[0] ? g_pass_folder : NULL,
+            };
+            if (rx_session_open(&g_rx_session, &rxp, g_b210_core) != 0) {
+                fprintf(stderr,
+                    "simple_sat_ops: rx_session_open failed — "
+                    "B210 will idle, no decode\n");
+            }
+        }
+    }
+#endif
+
     /* Tracking loop */
     double jul_idle_start = 0;  // last-tracked timestamp
 
@@ -2235,6 +2365,8 @@ int main(int argc, char **argv)
         row = 5;
         col = 50;
         report_position(&state, &row, col);
+        row++;
+        render_rx_panel(&row, 50);
 
         clrtoeol();
 
@@ -2304,10 +2436,52 @@ int main(int argc, char **argv)
 
         refresh();
 
+#ifdef WITH_USRP_B210
+        // Doppler retune — the operator UI's prediction already moved
+        // doppler_downlink_frequency_hz this tick; if the delta is past
+        // the threshold, hand it to the B210 so the post-FIR passband
+        // tracks the carrier. decode_loop_set_observer carries az/el +
+        // range_rate into the packet DB rows.
+        if (g_b210_core
+            && state.doppler_correction_enabled
+            && fabs(state.doppler_downlink_frequency_hz - g_b210_actual_freq)
+                   >= DOPPLER_SHIFT_RESOLUTION_KHZ * 1000.0) {
+            if (b210_rx_tx_core_set_freq(g_b210_core,
+                    state.doppler_downlink_frequency_hz) == 0) {
+                g_b210_actual_freq = b210_rx_tx_core_actual_freq(g_b210_core);
+            }
+        }
+        if (g_rx_session) {
+            double doppler_offset =
+                state.doppler_downlink_frequency_hz
+                - state.nominal_downlink_frequency_hz;
+            rx_session_update_observer(g_rx_session,
+                state.antenna_rotator.target_azimuth,
+                state.antenna_rotator.target_elevation,
+                state.prediction.satellite_ephem.range_km,
+                state.prediction.satellite_ephem.range_rate_km_s,
+                doppler_offset);
+        }
+
+        // Pump the B210 — bounded so a steady stream can't starve
+        // rotator commands or the keyboard. ~200 ms budget is well
+        // above UHD's typical chunk delivery of ~8.5 ms at 240 kHz.
+        if (g_rx_session && g_b210_core) {
+            rx_session_pump(g_rx_session, g_b210_core, 0.2);
+        }
+#endif
+
+#ifdef WITH_USRP_B210
+        // Service a pending TX request inline. Pauses RX inside the
+        // core burst, then resumes — no IPC round-trip.
+        if (g_tx_request.pending) {
+            service_tx_burst_locally();
+        }
+#endif
+
         // --- IPC: serve clients, fan out state, honour SIGUSR1 yield ---
         if (g_ipc) {
             sso_ipc_server_step(g_ipc, 0);
-            prune_tx_daemon_slot();
             ipc_broadcast_state(&state, current_az, current_el,
                                  current_downlink_frequency,
                                  doppler_delta_downlink,
@@ -2329,6 +2503,16 @@ int main(int argc, char **argv)
         sso_ipc_server_close(g_ipc);
         g_ipc = NULL;
     }
+#ifdef WITH_USRP_B210
+    if (g_rx_session) {
+        rx_session_close(g_rx_session);
+        g_rx_session = NULL;
+    }
+    if (g_b210_core) {
+        b210_rx_tx_core_close(g_b210_core);
+        g_b210_core = NULL;
+    }
+#endif
 
     if (state.prediction.auto_sat) {
         free_passes();
@@ -2384,6 +2568,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 || strcmp("--without-hardware", argv[i]) == 0) {
             state->n_options++;
             state->run_with_antenna_rotator = 0;
+        } else if (strcmp("--without-b210", argv[i]) == 0) {
+            state->n_options++;
+            g_without_b210 = 1;
         } else if (strncmp("--tle=", argv[i], 6) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 7) {
