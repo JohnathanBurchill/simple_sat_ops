@@ -10,6 +10,8 @@
 #ifndef RX_SESSION_H
 #define RX_SESSION_H
 
+#include "tx_burst.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -21,6 +23,15 @@ struct b210_rx_tx_core;
 typedef struct b210_rx_tx_core b210_rx_tx_core_t;
 
 typedef struct rx_session rx_session_t;
+
+// Mirrors tx_burst.h's tx_burst_result_t so callers don't need that
+// header just to interpret the result.
+typedef enum {
+    RX_BURST_OK = 0,
+    RX_BURST_NO_CORE,
+    RX_BURST_FRAME_BUILD_FAILED,
+    RX_BURST_UHD_ERROR,
+} rx_burst_result_t;
 
 typedef struct {
     int    bit_rate;            // default 9600
@@ -44,33 +55,45 @@ typedef struct {
     const char    *session_dir; // for packet_db (typically pass_folder)
 } rx_session_params_t;
 
+// rx_session takes ownership of `core` and spawns a worker thread that
+// owns the UHD device end-to-end. The main thread interacts via the
+// request-* helpers below; it must not touch `core` directly afterwards.
 int  rx_session_open(rx_session_t **out,
                      const rx_session_params_t *p,
                      b210_rx_tx_core_t *core);
 void rx_session_close(rx_session_t *rxs);
 
-// Drain UHD chunks (bounded by budget_s) → WAV → decode → emit_frame.
-// Returns 0 on success / transient, -1 on UHD fatal.
-int  rx_session_pump(rx_session_t *rxs, b210_rx_tx_core_t *core,
-                     double budget_s);
+// Async: queue a centre-freq retune. Picked up on the next worker
+// iteration (sub-10 ms typically). Fire-and-forget.
+void rx_session_request_freq(rx_session_t *rxs, double freq_hz);
 
-// Open a fresh auto-named WAV under the configured pass folder so the
-// pump's PCM starts landing on disk. No-op if want_wav was 0, or if a
-// WAV is already recording. Returns 0 on success, -1 on error.
-int  rx_session_wav_start(rx_session_t *rxs);
+// Async: ask the worker to start recording the post-FIR PCM to a
+// fresh auto-named WAV under the configured pass folder. No-op if
+// already recording.
+void rx_session_request_wav_start(rx_session_t *rxs);
 
-// Close any open WAV. No-op when not recording. Safe to call any
-// number of times; rx_session_close() also calls this implicitly.
-void rx_session_wav_stop(rx_session_t *rxs);
+// Async: close the currently-recording WAV. No-op when not recording.
+void rx_session_request_wav_stop(rx_session_t *rxs);
 
-// 1 when a WAV is currently being written, 0 otherwise.
+// 1 when a WAV is currently being written, 0 otherwise. (Snapshot.)
 int  rx_session_wav_active(const rx_session_t *rxs);
+
+// Sync: hand a TX burst request to the worker, block until it pauses
+// RX, transmits, and resumes RX. Returns the burst's outcome plus a
+// short one-line summary suitable for the operator's TX log.
+// hmac_key may be NULL.
+rx_burst_result_t rx_session_request_burst_sync(
+    rx_session_t *rxs,
+    const tx_request_slot_t *req,
+    const uint8_t *hmac_key, size_t hmac_key_len,
+    char *out_summary, size_t summary_n);
 
 // Snapshot for the UI. Any out-pointer may be NULL.
 void rx_session_snapshot(const rx_session_t *rxs,
                          uint64_t *out_frames_total,
                          double   *out_peak_dbfs,
                          double   *out_rms_dbfs,
+                         double   *out_actual_freq_hz,
                          char     *out_last_summary, size_t summary_n);
 
 // Tell the decoder where the satellite was at the last Doppler tick so

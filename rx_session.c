@@ -9,10 +9,12 @@
 #include "decode_loop.h"
 #include "modem.h"
 #include "packet_db.h"
+#include "tx_burst.h"
 
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -204,7 +206,44 @@ struct rx_session {
     // packet_db handle (owned).
     packet_db_t *db;
     char         db_run_id[24];
+
+    // --- Threading ---
+    // The worker thread owns `core` and runs the UHD pump + decode +
+    // wav writer + TX burst. Main thread interacts via the request
+    // flags and the snapshot, both protected by `mu`.
+    b210_rx_tx_core_t *core;
+    pthread_t          thread;
+    int                thread_started;
+    pthread_mutex_t    mu;
+    pthread_cond_t     cv;
+    volatile int       stop_requested;
+
+    // Requests from main thread (set under mu, picked up by worker).
+    int     freq_req_pending;
+    double  freq_req_hz;
+    int     wav_start_req;
+    int     wav_stop_req;
+
+    // TX burst handoff (synchronous).
+    int                burst_req_pending;
+    int                burst_complete;
+    tx_request_slot_t  burst_req;
+    uint8_t            burst_hmac_key[128];
+    size_t             burst_hmac_key_len;
+    rx_burst_result_t  burst_result;
+    char               burst_summary[160];
+
+    // Snapshot (updated by worker, read by main under mu).
+    uint64_t snap_frames_total;
+    double   snap_peak;
+    double   snap_rms_sq;
+    double   snap_actual_freq_hz;
+    char     snap_last_frame_ts[24];
+    int      snap_last_frame_len;
+    int      snap_wav_active;
 };
+
+static void *rx_session_thread_fn(void *arg);
 
 int rx_session_open(rx_session_t **out, const rx_session_params_t *p,
                     b210_rx_tx_core_t *core)
@@ -285,22 +324,39 @@ int rx_session_open(rx_session_t **out, const rx_session_params_t *p,
         decode_loop_set_session_dir(p->session_dir);
     }
 
-    // Defer the WAV open until the caller arms a pass with
-    // rx_session_wav_start(). Keeps the disk idle between passes.
+    // Defer the WAV open until the caller arms a pass.
     rxs->want_wav = p->want_wav;
     if (p->pass_folder && p->pass_folder[0]) {
         snprintf(rxs->pass_folder, sizeof rxs->pass_folder,
                  "%s", p->pass_folder);
     }
 
+    // Threading: rx_session takes ownership of the core. The worker
+    // pumps UHD continuously and services freq retunes / WAV
+    // start-stops / TX bursts queued by the main thread.
+    rxs->core = core;
+    rxs->snap_actual_freq_hz = b210_rx_tx_core_actual_freq(core);
+    pthread_mutex_init(&rxs->mu, NULL);
+    pthread_cond_init (&rxs->cv, NULL);
+    if (pthread_create(&rxs->thread, NULL, rx_session_thread_fn, rxs) != 0) {
+        fprintf(stderr, "rx_session: pthread_create failed\n");
+        pthread_cond_destroy (&rxs->cv);
+        pthread_mutex_destroy(&rxs->mu);
+        rxs->core = NULL;
+        rx_session_close(rxs);
+        return -1;
+    }
+    rxs->thread_started = 1;
+
     *out = rxs;
     return 0;
 }
 
-int rx_session_wav_start(rx_session_t *rxs)
+// Worker-internal: open/close the WAV file. Called only from the
+// thread, so no locking needed for the wav_w_t itself.
+static void worker_wav_start(rx_session_t *rxs)
 {
-    if (rxs == NULL || !rxs->want_wav) return -1;
-    if (rxs->wav.fp != NULL) return 0;  // already recording
+    if (!rxs->want_wav || rxs->wav.fp != NULL) return;
     if (auto_name_wav(rxs->pass_folder[0] ? rxs->pass_folder : NULL,
                       rxs->wav_path, sizeof rxs->wav_path) != 0
         || wav_w_open(&rxs->wav, rxs->wav_path, rxs->samp_rate) != 0) {
@@ -308,15 +364,14 @@ int rx_session_wav_start(rx_session_t *rxs)
             "rx_session: WAV open failed (%s): %s\n",
             rxs->wav_path, strerror(errno));
         rxs->wav_path[0] = '\0';
-        return -1;
+        return;
     }
     fprintf(stderr, "rx_session: recording -> %s\n", rxs->wav_path);
-    return 0;
 }
 
-void rx_session_wav_stop(rx_session_t *rxs)
+static void worker_wav_stop(rx_session_t *rxs)
 {
-    if (rxs == NULL || rxs->wav.fp == NULL) return;
+    if (rxs->wav.fp == NULL) return;
     size_t n = rxs->wav.n_samples;
     wav_w_close(&rxs->wav);
     fprintf(stderr,
@@ -325,16 +380,93 @@ void rx_session_wav_stop(rx_session_t *rxs)
         rxs->samp_rate);
 }
 
+void rx_session_request_wav_start(rx_session_t *rxs)
+{
+    if (rxs == NULL || !rxs->want_wav) return;
+    pthread_mutex_lock(&rxs->mu);
+    rxs->wav_start_req = 1;
+    rxs->wav_stop_req  = 0;
+    pthread_cond_broadcast(&rxs->cv);
+    pthread_mutex_unlock(&rxs->mu);
+}
+
+void rx_session_request_wav_stop(rx_session_t *rxs)
+{
+    if (rxs == NULL) return;
+    pthread_mutex_lock(&rxs->mu);
+    rxs->wav_stop_req  = 1;
+    rxs->wav_start_req = 0;
+    pthread_cond_broadcast(&rxs->cv);
+    pthread_mutex_unlock(&rxs->mu);
+}
+
 int rx_session_wav_active(const rx_session_t *rxs)
 {
-    return rxs != NULL && rxs->wav.fp != NULL;
+    if (rxs == NULL) return 0;
+    pthread_mutex_lock((pthread_mutex_t *) &rxs->mu);
+    int v = rxs->snap_wav_active;
+    pthread_mutex_unlock((pthread_mutex_t *) &rxs->mu);
+    return v;
+}
+
+void rx_session_request_freq(rx_session_t *rxs, double freq_hz)
+{
+    if (rxs == NULL) return;
+    pthread_mutex_lock(&rxs->mu);
+    rxs->freq_req_pending = 1;
+    rxs->freq_req_hz      = freq_hz;
+    pthread_cond_broadcast(&rxs->cv);
+    pthread_mutex_unlock(&rxs->mu);
+}
+
+rx_burst_result_t rx_session_request_burst_sync(
+    rx_session_t *rxs,
+    const tx_request_slot_t *req,
+    const uint8_t *hmac_key, size_t hmac_key_len,
+    char *out_summary, size_t summary_n)
+{
+    if (out_summary && summary_n) out_summary[0] = '\0';
+    if (rxs == NULL || req == NULL) return RX_BURST_NO_CORE;
+
+    pthread_mutex_lock(&rxs->mu);
+    rxs->burst_req            = *req;
+    rxs->burst_hmac_key_len   = (hmac_key && hmac_key_len > 0
+                                  && hmac_key_len <= sizeof rxs->burst_hmac_key)
+                                  ? hmac_key_len : 0;
+    if (rxs->burst_hmac_key_len > 0) {
+        memcpy(rxs->burst_hmac_key, hmac_key, rxs->burst_hmac_key_len);
+    }
+    rxs->burst_complete    = 0;
+    rxs->burst_req_pending = 1;
+    pthread_cond_broadcast(&rxs->cv);
+    while (!rxs->burst_complete && !rxs->stop_requested) {
+        pthread_cond_wait(&rxs->cv, &rxs->mu);
+    }
+    rx_burst_result_t res = rxs->burst_result;
+    if (out_summary && summary_n) {
+        snprintf(out_summary, summary_n, "%s", rxs->burst_summary);
+    }
+    pthread_mutex_unlock(&rxs->mu);
+    return res;
 }
 
 void rx_session_close(rx_session_t *rxs)
 {
     if (rxs == NULL) return;
+    if (rxs->thread_started) {
+        pthread_mutex_lock(&rxs->mu);
+        rxs->stop_requested = 1;
+        pthread_cond_broadcast(&rxs->cv);
+        pthread_mutex_unlock(&rxs->mu);
+        pthread_join(rxs->thread, NULL);
+        rxs->thread_started = 0;
+        pthread_cond_destroy (&rxs->cv);
+        pthread_mutex_destroy(&rxs->mu);
+    }
+    // Worker exited, so we own the wav/core/db scratch outright.
     if (rxs->wav.fp) wav_w_close(&rxs->wav);
-    if (rxs->db) packet_db_close(rxs->db);
+    if (rxs->core)   b210_rx_tx_core_close(rxs->core);
+    if (rxs->db)     packet_db_close(rxs->db);
     free(rxs->pcm_chunk);
     free(rxs->window);
     free(rxs->bits_scratch);
@@ -424,61 +556,147 @@ static void try_decode_at_window(rx_session_t *rxs)
     }
 }
 
-int rx_session_pump(rx_session_t *rxs, b210_rx_tx_core_t *core,
-                    double budget_s)
+// Worker-internal: pump UHD until it returns 0 (transient), feeding
+// PCM into the WAV and the decode window.
+static int worker_pump_once(rx_session_t *rxs)
 {
-    if (rxs == NULL || core == NULL) return -1;
-    double t_start = monotonic_seconds();
-    for (;;) {
-        ssize_t n = b210_rx_tx_core_pump(core, rxs->pcm_chunk, rxs->max_chunk);
-        if (n < 0) return -1;
-        if (n == 0) break;
-        if (rxs->wav.fp) wav_w_append(&rxs->wav, rxs->pcm_chunk, (size_t) n);
+    ssize_t n = b210_rx_tx_core_pump(rxs->core, rxs->pcm_chunk,
+                                     rxs->max_chunk);
+    if (n < 0) return -1;
+    if (n == 0) return 0;
+    if (rxs->wav.fp) wav_w_append(&rxs->wav, rxs->pcm_chunk, (size_t) n);
 
-        // Slide the decode window across the pump's PCM, calling
-        // try_decode_at_window each time it fills.
-        for (ssize_t i = 0; i < n; i++) {
-            rxs->window[rxs->window_filled++] = rxs->pcm_chunk[i];
-            rxs->total_window_samples++;
-            if (rxs->window_filled < rxs->window_samples) continue;
-            try_decode_at_window(rxs);
-            memmove(rxs->window, rxs->window + rxs->slide_samples,
-                    (rxs->window_samples - rxs->slide_samples)
-                        * sizeof(int16_t));
-            rxs->window_filled = rxs->window_samples - rxs->slide_samples;
-        }
-        if (budget_s > 0.0 && monotonic_seconds() - t_start >= budget_s) break;
+    for (ssize_t i = 0; i < n; i++) {
+        rxs->window[rxs->window_filled++] = rxs->pcm_chunk[i];
+        rxs->total_window_samples++;
+        if (rxs->window_filled < rxs->window_samples) continue;
+        try_decode_at_window(rxs);
+        memmove(rxs->window, rxs->window + rxs->slide_samples,
+                (rxs->window_samples - rxs->slide_samples) * sizeof(int16_t));
+        rxs->window_filled = rxs->window_samples - rxs->slide_samples;
     }
-    return 0;
+    return (int) n;
+}
+
+static void worker_update_snapshot(rx_session_t *rxs)
+{
+    double peak = 0.0, rms_sq = 0.0;
+    b210_rx_tx_core_iq_levels(rxs->core, &peak, &rms_sq);
+    double freq = b210_rx_tx_core_actual_freq(rxs->core);
+    int wav_active = (rxs->wav.fp != NULL);
+    pthread_mutex_lock(&rxs->mu);
+    rxs->snap_frames_total   = rxs->frames_total;
+    rxs->snap_peak           = peak;
+    rxs->snap_rms_sq         = rms_sq;
+    rxs->snap_actual_freq_hz = freq;
+    rxs->snap_wav_active     = wav_active;
+    snprintf(rxs->snap_last_frame_ts, sizeof rxs->snap_last_frame_ts,
+             "%.*s", (int)(sizeof rxs->snap_last_frame_ts - 1),
+             rxs->last_frame_ts);
+    rxs->snap_last_frame_len = rxs->last_frame_len;
+    pthread_mutex_unlock(&rxs->mu);
+}
+
+static void *rx_session_thread_fn(void *arg)
+{
+    rx_session_t *rxs = arg;
+    while (1) {
+        // Take any pending requests off the queue.
+        pthread_mutex_lock(&rxs->mu);
+        int stop          = rxs->stop_requested;
+        int freq_change   = rxs->freq_req_pending;
+        double new_freq   = rxs->freq_req_hz;
+        int do_wav_start  = rxs->wav_start_req;
+        int do_wav_stop   = rxs->wav_stop_req;
+        int do_burst      = rxs->burst_req_pending && !rxs->burst_complete;
+        tx_request_slot_t burst_local;
+        uint8_t           hmac_local[128];
+        size_t            hmac_local_len = 0;
+        if (do_burst) {
+            burst_local    = rxs->burst_req;
+            hmac_local_len = rxs->burst_hmac_key_len;
+            if (hmac_local_len > 0)
+                memcpy(hmac_local, rxs->burst_hmac_key, hmac_local_len);
+        }
+        rxs->freq_req_pending = 0;
+        rxs->wav_start_req    = 0;
+        rxs->wav_stop_req     = 0;
+        pthread_mutex_unlock(&rxs->mu);
+
+        if (stop) break;
+
+        if (freq_change) {
+            b210_rx_tx_core_set_freq(rxs->core, new_freq);
+        }
+        if (do_wav_start) worker_wav_start(rxs);
+        if (do_wav_stop)  worker_wav_stop(rxs);
+
+        if (do_burst) {
+            char summary[160];
+            tx_burst_result_t br = tx_burst_run(
+                rxs->core, &burst_local,
+                b210_rx_tx_core_actual_freq(rxs->core),
+                hmac_local_len > 0 ? hmac_local : NULL, hmac_local_len,
+                summary, sizeof summary);
+            pthread_mutex_lock(&rxs->mu);
+            rxs->burst_result = (rx_burst_result_t) br;
+            snprintf(rxs->burst_summary, sizeof rxs->burst_summary,
+                     "%s", summary);
+            rxs->burst_complete    = 1;
+            rxs->burst_req_pending = 0;
+            pthread_cond_broadcast(&rxs->cv);
+            pthread_mutex_unlock(&rxs->mu);
+        }
+
+        // Pump UHD. recv blocks ~chunk-cadence; that's our pacing.
+        if (worker_pump_once(rxs) < 0) {
+            fprintf(stderr, "rx_session: UHD pump fatal — worker exiting\n");
+            break;
+        }
+        worker_update_snapshot(rxs);
+    }
+    return NULL;
 }
 
 void rx_session_snapshot(const rx_session_t *rxs,
                          uint64_t *out_frames_total,
                          double   *out_peak_dbfs,
                          double   *out_rms_dbfs,
+                         double   *out_actual_freq_hz,
                          char     *out_last_summary, size_t summary_n)
 {
     if (rxs == NULL) {
-        if (out_frames_total) *out_frames_total = 0;
-        if (out_peak_dbfs)    *out_peak_dbfs    = -90.0;
-        if (out_rms_dbfs)     *out_rms_dbfs     = -90.0;
+        if (out_frames_total)   *out_frames_total   = 0;
+        if (out_peak_dbfs)      *out_peak_dbfs      = -90.0;
+        if (out_rms_dbfs)       *out_rms_dbfs       = -90.0;
+        if (out_actual_freq_hz) *out_actual_freq_hz = 0.0;
         if (out_last_summary && summary_n) out_last_summary[0] = '\0';
         return;
     }
-    if (out_frames_total) *out_frames_total = rxs->frames_total;
-    if (out_last_summary && summary_n) {
-        if (rxs->last_frame_ts[0]) {
-            snprintf(out_last_summary, summary_n,
-                     "%s  %d bytes",
-                     rxs->last_frame_ts, rxs->last_frame_len);
-        } else {
-            out_last_summary[0] = '\0';
-        }
+    pthread_mutex_lock((pthread_mutex_t *) &rxs->mu);
+    uint64_t frames = rxs->snap_frames_total;
+    double   peak   = rxs->snap_peak;
+    double   rms_sq = rxs->snap_rms_sq;
+    double   freq   = rxs->snap_actual_freq_hz;
+    char     ts[24]; int len;
+    snprintf(ts, sizeof ts, "%s", rxs->snap_last_frame_ts);
+    len = rxs->snap_last_frame_len;
+    pthread_mutex_unlock((pthread_mutex_t *) &rxs->mu);
+
+    if (out_frames_total) *out_frames_total = frames;
+    if (out_actual_freq_hz) *out_actual_freq_hz = freq;
+    if (out_peak_dbfs) {
+        *out_peak_dbfs = (peak < 1.0) ? -90.0 : 20.0 * log10(peak / 32768.0);
     }
-    // Level meter — tap b210_rx_tx_core_iq_levels via a snapshot helper.
-    // We don't have a core pointer here, so the caller fills those in.
-    if (out_peak_dbfs) *out_peak_dbfs = -90.0;
-    if (out_rms_dbfs)  *out_rms_dbfs  = -90.0;
+    if (out_rms_dbfs) {
+        double rms = sqrt(rms_sq);
+        *out_rms_dbfs = (rms < 1.0) ? -90.0 : 20.0 * log10(rms / 32768.0);
+    }
+    if (out_last_summary && summary_n) {
+        if (ts[0]) snprintf(out_last_summary, summary_n,
+                            "%s  %d bytes", ts, len);
+        else       out_last_summary[0] = '\0';
+    }
 }
 
 void rx_session_update_observer(rx_session_t *rxs,

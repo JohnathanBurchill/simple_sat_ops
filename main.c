@@ -109,12 +109,13 @@ static double monotonic_seconds(void)
 
 // B210 ownership lives here now — simple_sat_ops is the single process
 // that opens the SDR. --without-b210 (or a non-WITH_USRP_B210 build)
-// leaves g_b210_core NULL and the loop falls through cleanly.
+// leaves g_rx_session NULL and the loop falls through cleanly.
 static int  g_without_b210 = 0;
 #ifdef WITH_USRP_B210
-static b210_rx_tx_core_t *g_b210_core   = NULL;
+// rx_session owns the b210 core + the worker thread. main.c only
+// keeps a local handle long enough to open the device and hand it
+// over.
 static rx_session_t      *g_rx_session  = NULL;
-static double g_b210_actual_freq        = 0.0;
 static tx_request_slot_t  g_tx_request  = {0};
 #endif
 
@@ -464,80 +465,68 @@ static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
 // round-trip, since the B210 now lives in this process). ACK +
 // COMMAND_SENT events are published locally for viewer fan-out.
 
+// Compose modal is intentionally minimal: a single payload line
+// (always ASCII, prefilled with "CTS1+"), a TX-power-in-dB field,
+// and the --allow-tx checkbox. CSP src/dst/dport/sport/prio, freq,
+// repeat/gap, and the secondary allow-flags are hard-coded to the
+// FrontierSat defaults inside tx_compose_fill_event.
 typedef enum {
-    TXF_KIND = 0,
-    TXF_PAYLOAD,
-    TXF_SRC,
-    TXF_DST,
-    TXF_DPORT,
-    TXF_SPORT,
-    TXF_PRIO,
-    TXF_FREQ,
-    TXF_GAIN,
-    TXF_REPEAT,
-    TXF_GAP,
+    TXF_PAYLOAD = 0,
+    TXF_POWER,
     TXF_ALLOW_TX,
-    TXF_ALLOW_HP,
-    TXF_ALLOW_HF,
     TXF_COUNT,
 } tx_field_t;
 
 typedef struct {
-    int  is_hex;
     char payload[160];
-    char src[8], dst[8], dport[8], sport[8], prio[8];
-    char freq[16];
-    char gain[12];
-    char repeat[8];
-    char gap[8];
+    char power[12];           // TX power in dB
     int  allow_tx;
-    int  allow_high_power;
-    int  allow_hf_tx;
     tx_field_t focus;
     int  preview_dirty;
     struct timespec last_edit;
     char status_msg[160];
 } tx_compose_t;
 
+// Survives Esc / commit so the operator can reopen and pick up the
+// previous typed string. First open seeds it with "CTS1+" — the OBC's
+// CTS1 telecommand prefix.
+static char g_tx_last_payload[160] = "CTS1+";
+static char g_tx_last_power[12]    = "30.0";
+
 static void tx_compose_init(tx_compose_t *c) {
     memset(c, 0, sizeof *c);
-    snprintf(c->src,    sizeof c->src,    "10");
-    snprintf(c->dst,    sizeof c->dst,    "1");
-    snprintf(c->dport,  sizeof c->dport,  "7");
-    snprintf(c->sport,  sizeof c->sport,  "16");
-    snprintf(c->prio,   sizeof c->prio,   "2");
-    snprintf(c->freq,   sizeof c->freq,   "145150000");
-    snprintf(c->gain,   sizeof c->gain,   "30.0");
-    snprintf(c->repeat, sizeof c->repeat, "1");
-    snprintf(c->gap,    sizeof c->gap,    "200");
+    snprintf(c->payload, sizeof c->payload, "%s", g_tx_last_payload);
+    snprintf(c->power,   sizeof c->power,   "%s", g_tx_last_power);
     snprintf(c->status_msg, sizeof c->status_msg,
              "edit; viewers see drafts ~200 ms after you stop typing");
 }
 
+static void tx_compose_remember(const tx_compose_t *c) {
+    snprintf(g_tx_last_payload, sizeof g_tx_last_payload, "%s", c->payload);
+    snprintf(g_tx_last_power,   sizeof g_tx_last_power,   "%s", c->power);
+}
+
 static void tx_compose_summary(const tx_compose_t *c, char *out, size_t out_size) {
     if (out_size == 0) return;
-    snprintf(out, out_size, "%s:%s @%ld src=%s dst=%s dp=%s",
-             c->is_hex ? "hex" : "ascii",
-             c->payload[0] ? c->payload : "(empty)",
-             atol(c->freq), c->src, c->dst, c->dport);
+    snprintf(out, out_size, "%s", c->payload[0] ? c->payload : "(empty)");
 }
 
 static void tx_compose_fill_event(const tx_compose_t *c, sso_event_t *evt) {
-    snprintf(evt->tx_payload_kind, sizeof evt->tx_payload_kind, "%s",
-             c->is_hex ? "hex" : "ascii");
+    snprintf(evt->tx_payload_kind, sizeof evt->tx_payload_kind, "ascii");
     snprintf(evt->tx_payload, sizeof evt->tx_payload, "%s", c->payload);
-    evt->tx_csp_src   = (uint8_t) atoi(c->src);
-    evt->tx_csp_dst   = (uint8_t) atoi(c->dst);
-    evt->tx_csp_dport = (uint8_t) atoi(c->dport);
-    evt->tx_csp_sport = (uint8_t) atoi(c->sport);
-    evt->tx_csp_prio  = (uint8_t) atoi(c->prio);
-    evt->tx_freq_hz   = atol(c->freq);
-    evt->tx_gain_db   = atof(c->gain);
-    evt->tx_repeat    = atoi(c->repeat);
-    evt->tx_gap_ms    = atoi(c->gap);
+    // CSP defaults match cts_send -> FrontierSat OBC (CTS1 cmd handler).
+    evt->tx_csp_src   = 10;
+    evt->tx_csp_dst   = 1;
+    evt->tx_csp_dport = 7;
+    evt->tx_csp_sport = 16;
+    evt->tx_csp_prio  = 2;
+    evt->tx_freq_hz   = (long) FRONTIERSAT_CARRIER_HZ;
+    evt->tx_gain_db   = atof(c->power);
+    evt->tx_repeat    = 1;
+    evt->tx_gap_ms    = 200;
     evt->tx_allow_tx         = c->allow_tx;
-    evt->tx_allow_high_power = c->allow_high_power;
-    evt->tx_allow_hf_tx      = c->allow_hf_tx;
+    evt->tx_allow_high_power = 0;
+    evt->tx_allow_hf_tx      = 0;
     char summary[160];
     tx_compose_summary(c, summary, sizeof summary);
     snprintf(evt->ascii, sizeof evt->ascii, "%s", summary);
@@ -545,35 +534,14 @@ static void tx_compose_fill_event(const tx_compose_t *c, sso_event_t *evt) {
              g_operator_user ? g_operator_user : "?");
 }
 
-// Mark the focused field and append a char (for text/numeric inputs).
-// Numeric fields silently drop non-digit chars (period only allowed
-// for the gain field). Hex payload mode accepts [0-9a-fA-F].
-static int tx_field_is_text(tx_field_t f) {
-    return f == TXF_PAYLOAD;
-}
-static int tx_field_is_numeric(tx_field_t f) {
-    return f == TXF_SRC || f == TXF_DST || f == TXF_DPORT
-        || f == TXF_SPORT || f == TXF_PRIO || f == TXF_FREQ
-        || f == TXF_REPEAT || f == TXF_GAP;
-}
-static int tx_field_is_decimal(tx_field_t f) { return f == TXF_GAIN; }
-static int tx_field_is_toggle(tx_field_t f) {
-    return f == TXF_KIND || f == TXF_ALLOW_TX
-        || f == TXF_ALLOW_HP || f == TXF_ALLOW_HF;
-}
+static int tx_field_is_text(tx_field_t f) { return f == TXF_PAYLOAD; }
+static int tx_field_is_decimal(tx_field_t f) { return f == TXF_POWER; }
+static int tx_field_is_toggle(tx_field_t f) { return f == TXF_ALLOW_TX; }
 
 static char *tx_field_buf(tx_compose_t *c, tx_field_t f, size_t *cap) {
     switch (f) {
         case TXF_PAYLOAD: *cap = sizeof c->payload; return c->payload;
-        case TXF_SRC:     *cap = sizeof c->src;     return c->src;
-        case TXF_DST:     *cap = sizeof c->dst;     return c->dst;
-        case TXF_DPORT:   *cap = sizeof c->dport;   return c->dport;
-        case TXF_SPORT:   *cap = sizeof c->sport;   return c->sport;
-        case TXF_PRIO:    *cap = sizeof c->prio;    return c->prio;
-        case TXF_FREQ:    *cap = sizeof c->freq;    return c->freq;
-        case TXF_GAIN:    *cap = sizeof c->gain;    return c->gain;
-        case TXF_REPEAT:  *cap = sizeof c->repeat;  return c->repeat;
-        case TXF_GAP:     *cap = sizeof c->gap;     return c->gap;
+        case TXF_POWER:   *cap = sizeof c->power;   return c->power;
         default:          *cap = 0; return NULL;
     }
 }
@@ -586,15 +554,7 @@ static void tx_field_append(tx_compose_t *c, int ch) {
     if (n + 1 >= cap) return;
     int accept = 0;
     if (tx_field_is_text(c->focus)) {
-        if (c->is_hex) {
-            accept = (ch >= '0' && ch <= '9')
-                  || (ch >= 'a' && ch <= 'f')
-                  || (ch >= 'A' && ch <= 'F');
-        } else {
-            accept = (ch >= 32 && ch < 127);
-        }
-    } else if (tx_field_is_numeric(c->focus)) {
-        accept = (ch >= '0' && ch <= '9');
+        accept = (ch >= 32 && ch < 127);
     } else if (tx_field_is_decimal(c->focus)) {
         accept = (ch >= '0' && ch <= '9') || ch == '.' || ch == '-';
     }
@@ -615,27 +575,10 @@ static void tx_field_backspace(tx_compose_t *c) {
 }
 
 static void tx_field_toggle(tx_compose_t *c) {
-    switch (c->focus) {
-        case TXF_KIND:
-            c->is_hex = !c->is_hex;
-            // Hex/ascii change can invalidate prior payload characters;
-            // truncate to the longest leading run that remains valid.
-            for (size_t i = 0; c->payload[i]; ++i) {
-                int ch = (unsigned char) c->payload[i];
-                int ok = c->is_hex
-                    ? ((ch >= '0' && ch <= '9')
-                       || (ch >= 'a' && ch <= 'f')
-                       || (ch >= 'A' && ch <= 'F'))
-                    : (ch >= 32 && ch < 127);
-                if (!ok) { c->payload[i] = '\0'; break; }
-            }
-            break;
-        case TXF_ALLOW_TX: c->allow_tx         = !c->allow_tx;         break;
-        case TXF_ALLOW_HP: c->allow_high_power = !c->allow_high_power; break;
-        case TXF_ALLOW_HF: c->allow_hf_tx      = !c->allow_hf_tx;      break;
-        default: return;
+    if (c->focus == TXF_ALLOW_TX) {
+        c->allow_tx = !c->allow_tx;
+        c->preview_dirty = 1;
     }
-    c->preview_dirty = 1;
 }
 
 // Single-line redraw helper: prints a label + value, applies A_REVERSE
@@ -652,116 +595,71 @@ static void tx_draw_field(WINDOW *w, int row, int col, int focused,
 static void tx_compose_draw(WINDOW *w, const tx_compose_t *c) {
     werase(w);
     box(w, 0, 0);
+    int width = getmaxx(w);
+    int payload_w = width - 14;
+    if (payload_w < 32) payload_w = 32;
+    if (payload_w > (int) sizeof c->payload - 1)
+        payload_w = (int) sizeof c->payload - 1;
+
     mvwprintw(w, 0, 2, " TX compose (operator: %s) ",
               g_operator_user ? g_operator_user : "?");
 #ifdef WITH_USRP_B210
     mvwprintw(w, 1, 2,
               "B210: %s",
-              g_b210_core ? "in-process (this binary)" : "(offline)");
+              g_rx_session ? "in-process (this binary)" : "(offline)");
 #else
     mvwprintw(w, 1, 2, "B210: (this build has no UHD)");
 #endif
     wclrtoeol(w);
 
-    char buf[64];
-    snprintf(buf, sizeof buf, "%-6s", c->is_hex ? "hex" : "ascii");
-    tx_draw_field(w, 3, 2, c->focus == TXF_KIND,
-                  "Kind     ", buf);
-    mvwprintw(w, 3, 38, "(Space toggles hex/ascii)");
-    wclrtoeol(w);
-
-    snprintf(buf, sizeof buf, "%-44.44s",
+    char buf[256];
+    // Payload spans most of the modal width so a long telecommand
+    // doesn't scroll off the right edge.
+    snprintf(buf, sizeof buf, "%-*.*s", payload_w, payload_w,
              c->payload[0] ? c->payload : " ");
-    tx_draw_field(w, 4, 2, c->focus == TXF_PAYLOAD,
+    tx_draw_field(w, 3, 2, c->focus == TXF_PAYLOAD,
                   "Payload  ", buf);
 
-    snprintf(buf, sizeof buf, "%-4s", c->src);
-    tx_draw_field(w, 6, 2, c->focus == TXF_SRC,
-                  "CSP src  ", buf);
-    snprintf(buf, sizeof buf, "%-4s", c->dst);
-    tx_draw_field(w, 6, 22, c->focus == TXF_DST,
-                  "dst  ", buf);
-    snprintf(buf, sizeof buf, "%-4s", c->dport);
-    tx_draw_field(w, 6, 36, c->focus == TXF_DPORT,
-                  "dport ", buf);
-    snprintf(buf, sizeof buf, "%-4s", c->sport);
-    tx_draw_field(w, 6, 52, c->focus == TXF_SPORT,
-                  "sport ", buf);
-    snprintf(buf, sizeof buf, "%-3s", c->prio);
-    tx_draw_field(w, 6, 68, c->focus == TXF_PRIO,
-                  "prio ", buf);
-
-    snprintf(buf, sizeof buf, "%-12s", c->freq);
-    tx_draw_field(w, 7, 2, c->focus == TXF_FREQ,
-                  "Freq Hz  ", buf);
-    snprintf(buf, sizeof buf, "%-8s", c->gain);
-    tx_draw_field(w, 7, 36, c->focus == TXF_GAIN,
-                  "Gain dB ", buf);
-
-    snprintf(buf, sizeof buf, "%-6s", c->repeat);
-    tx_draw_field(w, 8, 2, c->focus == TXF_REPEAT,
-                  "Repeat   ", buf);
-    snprintf(buf, sizeof buf, "%-6s", c->gap);
-    tx_draw_field(w, 8, 36, c->focus == TXF_GAP,
-                  "Gap ms  ", buf);
+    snprintf(buf, sizeof buf, "%-8s", c->power);
+    tx_draw_field(w, 5, 2, c->focus == TXF_POWER,
+                  "TX power ", buf);
+    mvwprintw(w, 5, 24, "dB  (B210 TX gain; 0..89.75)");
+    wclrtoeol(w);
 
     snprintf(buf, sizeof buf, "[%c]", c->allow_tx ? 'x' : ' ');
-    tx_draw_field(w, 10, 2, c->focus == TXF_ALLOW_TX,
+    tx_draw_field(w, 7, 2, c->focus == TXF_ALLOW_TX,
                   "", buf);
-    mvwprintw(w, 10, 7, "allow-tx");
-    snprintf(buf, sizeof buf, "[%c]", c->allow_high_power ? 'x' : ' ');
-    tx_draw_field(w, 10, 22, c->focus == TXF_ALLOW_HP,
-                  "", buf);
-    mvwprintw(w, 10, 27, "allow-high-power");
-    snprintf(buf, sizeof buf, "[%c]", c->allow_hf_tx ? 'x' : ' ');
-    tx_draw_field(w, 10, 48, c->focus == TXF_ALLOW_HF,
-                  "", buf);
-    mvwprintw(w, 10, 53, "allow-hf-tx");
+    mvwprintw(w, 7, 7, "allow-tx  (required to key the PA)");
+    wclrtoeol(w);
 
     char summary[160];
     tx_compose_summary(c, summary, sizeof summary);
-    mvwprintw(w, 12, 2, "Summary: %.62s", summary);
+    mvwprintw(w, 9, 2,  "Preview: %.*s",
+              width - 12, summary);
     wclrtoeol(w);
-    mvwprintw(w, 13, 2, "Status:  %.62s", c->status_msg);
+    mvwprintw(w, 10, 2, "Status:  %.*s",
+              width - 12, c->status_msg);
     wclrtoeol(w);
 
-    mvwprintw(w, 15, 2,
-              "Tab/Shift-Tab move   Space toggles   Enter commits   Esc cancels");
+    mvwprintw(w, 12, 2,
+              "Tab/Shift-Tab move   Space toggles allow-tx   Enter commits   Esc cancels");
     wclrtoeol(w);
     wrefresh(w);
 }
-
-// CLAUDE.md gates: high power = "above 10%", which is undocumented in
-// dB but tx_frame_sdr defaults to gain=30 dB and the B210 ramp typically
-// hits 10% somewhere above gain=60 dB. HF cutoff = 100 MHz.
-#define TX_HIGH_POWER_THRESHOLD_DB 60.0
-#define TX_HF_CUTOFF_HZ           100000000L
 
 static int tx_compose_validate(const tx_compose_t *c, char *err, size_t err_size) {
     if (!c->payload[0]) {
         snprintf(err, err_size, "empty payload");
         return -1;
     }
-    if (c->is_hex) {
-        if (strlen(c->payload) % 2 != 0) {
-            snprintf(err, err_size, "hex payload needs even nibble count");
-            return -1;
-        }
-    }
     if (!c->allow_tx) {
         snprintf(err, err_size, "--allow-tx is off; tick it before commit");
         return -1;
     }
-    if (atof(c->gain) > TX_HIGH_POWER_THRESHOLD_DB && !c->allow_high_power) {
+    double db = atof(c->power);
+    if (db < 0.0 || db > 89.75) {
         snprintf(err, err_size,
-                 "gain %.1f dB > %.0f dB needs --allow-high-power",
-                 atof(c->gain), TX_HIGH_POWER_THRESHOLD_DB);
-        return -1;
-    }
-    if (atol(c->freq) < TX_HF_CUTOFF_HZ && !c->allow_hf_tx) {
-        snprintf(err, err_size,
-                 "freq %ld Hz < 100 MHz needs --allow-hf-tx",
-                 atol(c->freq));
+                 "TX power %.1f dB out of B210 range 0..89.75", db);
         return -1;
     }
     return 0;
@@ -787,42 +685,24 @@ static int tx_compose_commit(const tx_compose_t *c, char *err, size_t err_size) 
         snprintf(err, err_size, "previous burst still in flight");
         return -1;
     }
-    // Parse the payload into the request slot. Hex / ASCII are parsed
-    // here so the main-loop burst-service path doesn't need to know
-    // about the compose buffer layout.
-    if (c->is_hex) {
-        ssize_t n = tx_burst_parse_hex(c->payload, g_tx_request.payload,
-                                        sizeof g_tx_request.payload);
-        if (n < 0) {
-            snprintf(err, err_size, "bad hex payload");
-            return -1;
-        }
-        g_tx_request.payload_len = (size_t) n;
-    } else {
-        size_t n = strlen(c->payload);
-        if (n == 0) {
-            snprintf(err, err_size, "empty payload");
-            return -1;
-        }
-        if (n > sizeof g_tx_request.payload) n = sizeof g_tx_request.payload;
-        memcpy(g_tx_request.payload, c->payload, n);
-        g_tx_request.payload_len = n;
+    size_t n = strlen(c->payload);
+    if (n == 0) {
+        snprintf(err, err_size, "empty payload");
+        return -1;
     }
-    g_tx_request.is_hex   = c->is_hex;
-    g_tx_request.csp_hdr  = (csp_v1_header_t){
-        .prio  = (uint8_t) atoi(c->prio),
-        .src   = (uint8_t) atoi(c->src),
-        .dst   = (uint8_t) atoi(c->dst),
-        .dport = (uint8_t) atoi(c->dport),
-        .sport = (uint8_t) atoi(c->sport),
-        .flags = 0,
+    if (n > sizeof g_tx_request.payload) n = sizeof g_tx_request.payload;
+    memcpy(g_tx_request.payload, c->payload, n);
+    g_tx_request.payload_len  = n;
+    g_tx_request.is_hex       = 0;  // always ascii in the simplified modal
+    g_tx_request.csp_hdr      = (csp_v1_header_t){
+        .prio  = 2, .src = 10, .dst = 1, .dport = 7, .sport = 16, .flags = 0,
     };
-    g_tx_request.tx_freq_hz       = atol(c->freq);
-    g_tx_request.tx_gain_db       = atof(c->gain);
-    g_tx_request.repeat           = atoi(c->repeat);
-    g_tx_request.gap_ms           = atoi(c->gap);
-    g_tx_request.allow_high_power = c->allow_high_power;
-    g_tx_request.allow_hf_tx      = c->allow_hf_tx;
+    g_tx_request.tx_freq_hz       = (long) FRONTIERSAT_CARRIER_HZ;
+    g_tx_request.tx_gain_db       = atof(c->power);
+    g_tx_request.repeat           = 1;
+    g_tx_request.gap_ms           = 200;
+    g_tx_request.allow_high_power = 0;
+    g_tx_request.allow_hf_tx      = 0;
     tx_compose_summary(c, g_tx_request.summary, sizeof g_tx_request.summary);
     g_tx_request.pending = 1;
     return 0;
@@ -859,29 +739,6 @@ static void emit_tx_event_local(sso_event_type_t type,
     }
 }
 
-// Service the pending TX request from the main loop: run the burst,
-// publish ACK + COMMAND_SENT to the operator's own log + viewers.
-static void service_tx_burst_locally(void)
-{
-    if (!g_tx_request.pending) return;
-    char summary[160];
-    tx_burst_result_t rc = tx_burst_run(g_b210_core, &g_tx_request,
-                                         g_b210_actual_freq,
-                                         /*hmac_key=*/NULL, /*hmac_key_len=*/0,
-                                         summary, sizeof summary);
-    const char *ack_status = "ok";
-    switch (rc) {
-        case TX_BURST_OK:                                       break;
-        case TX_BURST_NO_CORE:            ack_status = "rejected: no B210"; break;
-        case TX_BURST_FRAME_BUILD_FAILED: ack_status = "rejected: frame build"; break;
-        case TX_BURST_UHD_ERROR:          ack_status = "uhd-err"; break;
-    }
-    emit_tx_event_local(SSO_EVT_TX_ACK, summary, ack_status);
-    if (rc == TX_BURST_OK) {
-        emit_tx_event_local(SSO_EVT_TX_COMMAND_SENT, summary, NULL);
-    }
-    g_tx_request.pending = 0;
-}
 #endif
 
 static long ts_now_ns(void) {
@@ -895,9 +752,11 @@ static void run_tx_compose(void) {
     tx_compose_t c;
     tx_compose_init(&c);
 
-    int h = 18, ww = 78;
+    // Wide modal so a long telecommand fits without scrolling.
+    int h = 14, ww = 120;
     if (h > LINES) h = LINES;
     if (ww > COLS) ww = COLS;
+    if (ww < 60)  ww = (COLS < 60) ? COLS : 60;
     WINDOW *w = newwin(h, ww, (LINES - h) / 2, (COLS - ww) / 2);
     if (!w) return;
     keypad(w, TRUE);
@@ -911,7 +770,8 @@ static void run_tx_compose(void) {
         int ch = wgetch(w);
         if (ch != ERR) {
             int changed = 1;
-            if (ch == 27) {  // Esc
+            if (ch == 27) {  // Esc — remember the typed string but don't send.
+                tx_compose_remember(&c);
                 active = 0; break;
             } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
                 char err[120];
@@ -924,6 +784,7 @@ static void run_tx_compose(void) {
                              "commit failed: %.*s",
                              (int)(sizeof c.status_msg - 20), err);
                 } else {
+                    tx_compose_remember(&c);
                     active = 0; break;
                 }
             } else if (ch == '\t') {
@@ -1590,25 +1451,20 @@ static void render_rx_panel(int *print_row, int print_col)
     int col = print_col;
     int rec_active = rx_session_wav_active(g_rx_session);
     mvprintw(row++, col, "%15s   %s%s", "B210",
-             g_b210_core ? "active" : "(offline)",
+             g_rx_session ? "active" : "(offline)",
              rec_active ? "  [REC]" : "");
     clrtoeol();
-    if (g_b210_core) {
-        mvprintw(row++, col, "%15s   %.6f MHz", "RX freq",
-                 g_b210_actual_freq / 1e6);
+    if (g_rx_session) {
+        uint64_t frames = 0;
+        double   peak_dbfs = -90.0, rms_dbfs = -90.0, freq_hz = 0.0;
+        char     last[80] = "";
+        rx_session_snapshot(g_rx_session, &frames, &peak_dbfs, &rms_dbfs,
+                            &freq_hz, last, sizeof last);
+        mvprintw(row++, col, "%15s   %.6f MHz", "RX freq", freq_hz / 1e6);
         clrtoeol();
-        double peak = 0.0, rms_sq = 0.0;
-        b210_rx_tx_core_iq_levels(g_b210_core, &peak, &rms_sq);
-        double rms = sqrt(rms_sq);
-        double peak_dbfs = (peak < 1.0) ? -90.0 : 20.0 * log10(peak / 32768.0);
-        double rms_dbfs  = (rms  < 1.0) ? -90.0 : 20.0 * log10(rms  / 32768.0);
         mvprintw(row++, col, "%15s   peak %+5.1f  rms %+5.1f dBFS",
                  "level", peak_dbfs, rms_dbfs);
         clrtoeol();
-        uint64_t frames = 0;
-        char     last[80] = "";
-        rx_session_snapshot(g_rx_session, &frames, NULL, NULL,
-                            last, sizeof last);
         mvprintw(row++, col, "%15s   %llu",
                  "frames", (unsigned long long) frames);
         clrtoeol();
@@ -2129,6 +1985,8 @@ int main(int argc, char **argv)
 #ifdef WITH_USRP_B210
     // Open the B210 once, here, before ncurses init — soft-fail on any
     // UHD error so a dev host without a device can still run the UI.
+    // rx_session takes ownership of the core; we drop our local handle
+    // afterwards so main never touches UHD off-thread.
     if (g_control_mode && !g_without_b210) {
         b210_rx_tx_core_params_t cp = {
             .freq_hz         = state.nominal_downlink_frequency_hz,
@@ -2142,17 +2000,16 @@ int main(int argc, char **argv)
             .decim_cutoff_hz = 18000.0,
             .decim_taps      = 96u,
         };
-        if (b210_rx_tx_core_open(&cp, &g_b210_core) != 0) {
+        b210_rx_tx_core_t *core = NULL;
+        if (b210_rx_tx_core_open(&cp, &core) != 0) {
             fprintf(stderr,
                 "simple_sat_ops: B210 open failed — continuing without RF "
                 "(rotator + UI only). Pass --without-b210 to silence.\n");
-            g_b210_core = NULL;
         } else {
-            g_b210_actual_freq = b210_rx_tx_core_actual_freq(g_b210_core);
             fprintf(stderr,
                 "simple_sat_ops: B210 open at %.6f MHz (post-decim rate %.0f)\n",
-                g_b210_actual_freq / 1e6,
-                b210_rx_tx_core_actual_rate(g_b210_core));
+                b210_rx_tx_core_actual_freq(core) / 1e6,
+                b210_rx_tx_core_actual_rate(core));
             rx_session_params_t rxp = {
                 .bit_rate          = 9600,
                 .window_s          = 1.5,
@@ -2171,11 +2028,13 @@ int main(int argc, char **argv)
                                      : NULL,
                 .session_dir       = g_pass_folder[0] ? g_pass_folder : NULL,
             };
-            if (rx_session_open(&g_rx_session, &rxp, g_b210_core) != 0) {
+            if (rx_session_open(&g_rx_session, &rxp, core) != 0) {
                 fprintf(stderr,
-                    "simple_sat_ops: rx_session_open failed — "
-                    "B210 will idle, no decode\n");
+                    "simple_sat_ops: rx_session_open failed — closing B210\n");
+                b210_rx_tx_core_close(core);
             }
+            // rx_session_open succeeded → it owns `core` now.
+            core = NULL;
         }
     }
 #endif
@@ -2277,7 +2136,7 @@ int main(int argc, char **argv)
                 || (sec_to_aos > 0.0 && sec_to_aos <= RECORDING_PREROLL_S);
             int active = rx_session_wav_active(g_rx_session);
             if (!active && in_window) {
-                rx_session_wav_start(g_rx_session);
+                rx_session_request_wav_start(g_rx_session);
                 t_recording_close_at = 0.0;
             } else if (active) {
                 if (state.in_pass) {
@@ -2285,7 +2144,7 @@ int main(int argc, char **argv)
                 } else if (t_recording_close_at == 0.0) {
                     t_recording_close_at = t_now + RECORDING_POSTROLL_S;
                 } else if (t_now >= t_recording_close_at) {
-                    rx_session_wav_stop(g_rx_session);
+                    rx_session_request_wav_stop(g_rx_session);
                     t_recording_close_at = 0.0;
                 }
             }
@@ -2503,19 +2362,20 @@ int main(int argc, char **argv)
         }
 
 #ifdef WITH_USRP_B210
-        // Doppler retune — the operator UI's prediction already moved
-        // doppler_downlink_frequency_hz this tick; if the delta is past
-        // the threshold, hand it to the B210 so the post-FIR passband
-        // tracks the carrier. decode_loop_set_observer carries az/el +
-        // range_rate into the packet DB rows.
-        if (g_b210_core
+        // Doppler retune — queued for the B210 worker. We read the
+        // current actual_freq from the snapshot instead of caching it
+        // here, since the worker thread owns the core's tune state.
+        double snap_freq_hz = 0.0;
+        if (g_rx_session) {
+            rx_session_snapshot(g_rx_session, NULL, NULL, NULL,
+                                &snap_freq_hz, NULL, 0);
+        }
+        if (g_rx_session
             && state.doppler_correction_enabled
-            && fabs(state.doppler_downlink_frequency_hz - g_b210_actual_freq)
+            && fabs(state.doppler_downlink_frequency_hz - snap_freq_hz)
                    >= DOPPLER_SHIFT_RESOLUTION_KHZ * 1000.0) {
-            if (b210_rx_tx_core_set_freq(g_b210_core,
-                    state.doppler_downlink_frequency_hz) == 0) {
-                g_b210_actual_freq = b210_rx_tx_core_actual_freq(g_b210_core);
-            }
+            rx_session_request_freq(g_rx_session,
+                                     state.doppler_downlink_frequency_hz);
         }
         if (g_rx_session) {
             double doppler_offset =
@@ -2529,19 +2389,28 @@ int main(int argc, char **argv)
                 doppler_offset);
         }
 
-        // Pump the B210 — bounded so a steady stream can't starve
-        // rotator commands or the keyboard. ~200 ms budget is well
-        // above UHD's typical chunk delivery of ~8.5 ms at 240 kHz.
-        if (g_rx_session && g_b210_core) {
-            rx_session_pump(g_rx_session, g_b210_core, 0.2);
-        }
-#endif
-
-#ifdef WITH_USRP_B210
-        // Service a pending TX request inline. Pauses RX inside the
-        // core burst, then resumes — no IPC round-trip.
-        if (g_tx_request.pending) {
-            service_tx_burst_locally();
+        // Synchronously service any pending TX request. The B210
+        // worker pauses RX, transmits, resumes RX, then unblocks us.
+        // We block here for the burst duration (~1 s) — that's
+        // intentional; the operator just hit Enter and is staring at
+        // the screen waiting for confirmation.
+        if (g_tx_request.pending && g_rx_session) {
+            char summary[160];
+            rx_burst_result_t br = rx_session_request_burst_sync(
+                g_rx_session, &g_tx_request, NULL, 0,
+                summary, sizeof summary);
+            const char *ack = "ok";
+            switch (br) {
+                case RX_BURST_OK: break;
+                case RX_BURST_NO_CORE:            ack = "rejected: no B210"; break;
+                case RX_BURST_FRAME_BUILD_FAILED: ack = "rejected: frame build"; break;
+                case RX_BURST_UHD_ERROR:          ack = "uhd-err"; break;
+            }
+            emit_tx_event_local(SSO_EVT_TX_ACK, summary, ack);
+            if (br == RX_BURST_OK) {
+                emit_tx_event_local(SSO_EVT_TX_COMMAND_SENT, summary, NULL);
+            }
+            g_tx_request.pending = 0;
         }
 #endif
 
@@ -2566,19 +2435,11 @@ int main(int argc, char **argv)
         }
 
         if (state.running) {
-#ifdef WITH_USRP_B210
-            // With the B210 feeding us, rx_session_pump's blocking
-            // UHD recv already paces the loop at chunk cadence (~8 ms
-            // at 240 kHz). A 500 ms sleep here would starve the stream
-            // and trigger ERROR_CODE_OVERFLOW. Without a core, fall
-            // back to the historical 2 Hz cadence so the rotator + UI
-            // don't burn CPU.
-            if (g_b210_core == NULL) {
-                usleep(UPDATE_INTERVAL_MICROSEC);
-            }
-#else
+            // The B210 worker thread pumps UHD on its own pthread now,
+            // so the main loop doesn't pace itself off the radio. Sleep
+            // at the historical 2 Hz; redraw/IPC gates do their own
+            // throttling.
             usleep(UPDATE_INTERVAL_MICROSEC);
-#endif
         }
     }
 
@@ -2589,13 +2450,12 @@ int main(int argc, char **argv)
     }
 #ifdef WITH_USRP_B210
     if (g_rx_session) {
-        rx_session_wav_stop(g_rx_session);  // explicit on quit
+        // The worker owns the WAV writer and the B210 core. Closing
+        // the session signals the worker to stop, joins it, then
+        // tears down both. Any open WAV gets its header patched.
+        rx_session_request_wav_stop(g_rx_session);
         rx_session_close(g_rx_session);
         g_rx_session = NULL;
-    }
-    if (g_b210_core) {
-        b210_rx_tx_core_close(g_b210_core);
-        g_b210_core = NULL;
     }
 #endif
 
