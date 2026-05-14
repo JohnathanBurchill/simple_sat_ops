@@ -43,7 +43,7 @@
 #include <unistd.h>
 
 // Carrier defaults (used only for display + IPC publication; the
-// actual radio is now driven externally by tx_frame_sdr / b210_rx_live
+// actual radio is now driven externally by tx_frame_sdr / b210_rx_tx
 // over the sso_ipc socket).
 #define UPLINK_FREQ_MHZ   145.150000
 #define DOWNLINK_FREQ_MHZ 436.150000
@@ -69,7 +69,7 @@
 // Set by apply_args when --control is passed. When set, main() opens
 // the sso_ipc server on /run/sso/simple_sat_ops.sock and fans out a
 // state event on every UI tick. Other operator-aware tools
-// (b210_rx_live --control, tx_frame_sdr) verify the operator's Unix
+// (b210_rx_tx --control, tx_frame_sdr) verify the operator's Unix
 // user matches their own via this socket.
 static int g_control_mode = 0;
 static int g_viewer_mode = 0;  // bare invocation found a running operator
@@ -77,7 +77,7 @@ static sso_ipc_server_t *g_ipc = NULL;
 static const char *g_operator_user = NULL;
 // /FrontierSat/Operations/<yyyymmdd>/<hhmmLT>/ for the upcoming
 // pass — created in main() once the AOS prediction is in, then
-// broadcast on every STATE event so b210_rx_live and tx_frame_sdr
+// broadcast on every STATE event so b210_rx_tx and tx_frame_sdr
 // can drop their captures/logs in the same spot. Empty until set.
 static char g_pass_folder[256] = "";
 // SIGUSR1 sets this — used by the force-claim takeover path to nudge
@@ -87,6 +87,121 @@ static volatile sig_atomic_t g_yield_requested = 0;
 static void on_sigusr1(int sig) {
     (void) sig;
     g_yield_requested = 1;
+}
+
+// IPC slot id for the b210_rx_tx daemon (set by the HELLO peer-uid
+// check in commit-3; -1 = no daemon connected). The compose modal
+// commit path targets this slot with sso_ipc_server_send so the daemon
+// is the only recipient of TX_REQUEST events.
+static sso_client_id_t g_tx_daemon_slot = -1;
+
+// TX log ring buffer — last few PREVIEW/SENT/ACK events for display.
+// Shared by operator and viewer renderers.
+typedef struct {
+    sso_event_type_t kind;     // PREVIEW | TX_COMMAND_SENT | TX_ACK
+    char             ts[16];   // HH:MM:SS
+    char             ascii[160];
+    char             tx_ack_status[24];
+} tx_log_entry_t;
+#define TX_LOG_SIZE 8
+static tx_log_entry_t g_tx_log[TX_LOG_SIZE];
+static size_t         g_tx_log_count = 0;
+
+// Pull "HH:MM:SS" out of an event's ISO ts ("2026-05-14T13:22:01.450Z").
+// Falls back to local clock if the event ts is empty/garbled.
+static void tx_log_ts_from_event(const sso_event_t *evt,
+                                 char *out, size_t out_size)
+{
+    if (out_size == 0) return;
+    out[0] = '\0';
+    if (evt && evt->ts[0]) {
+        const char *t = strchr(evt->ts, 'T');
+        if (t && strlen(t) >= 9) {
+            size_t n = 8;
+            if (n >= out_size) n = out_size - 1;
+            memcpy(out, t + 1, n);
+            out[n] = '\0';
+            return;
+        }
+    }
+    time_t now = time(NULL);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    snprintf(out, out_size, "%02d:%02d:%02d",
+             lt.tm_hour, lt.tm_min, lt.tm_sec);
+}
+
+// Push an event into the ring. PREVIEW events overwrite a trailing
+// PREVIEW entry (live cursor-style update). SENT promotes a trailing
+// PREVIEW to SENT, or appends a fresh entry. ACK appends with the
+// status string filled in for rendering.
+static void tx_log_push(const sso_event_t *evt)
+{
+    if (!evt) return;
+    if (evt->type != SSO_EVT_TX_COMMAND_PREVIEW
+     && evt->type != SSO_EVT_TX_COMMAND_SENT
+     && evt->type != SSO_EVT_TX_ACK) return;
+
+    tx_log_entry_t entry;
+    memset(&entry, 0, sizeof entry);
+    entry.kind = evt->type;
+    tx_log_ts_from_event(evt, entry.ts, sizeof entry.ts);
+    snprintf(entry.ascii, sizeof entry.ascii, "%s", evt->ascii);
+    snprintf(entry.tx_ack_status, sizeof entry.tx_ack_status, "%s",
+             evt->tx_ack_status);
+
+    if (evt->type == SSO_EVT_TX_COMMAND_PREVIEW
+        && g_tx_log_count > 0
+        && g_tx_log[g_tx_log_count - 1].kind == SSO_EVT_TX_COMMAND_PREVIEW) {
+        g_tx_log[g_tx_log_count - 1] = entry;
+        return;
+    }
+    if (evt->type == SSO_EVT_TX_COMMAND_SENT
+        && g_tx_log_count > 0
+        && g_tx_log[g_tx_log_count - 1].kind == SSO_EVT_TX_COMMAND_PREVIEW) {
+        // Promote the trailing draft in-place.
+        g_tx_log[g_tx_log_count - 1] = entry;
+        return;
+    }
+    if (g_tx_log_count < TX_LOG_SIZE) {
+        g_tx_log[g_tx_log_count++] = entry;
+    } else {
+        memmove(&g_tx_log[0], &g_tx_log[1],
+                sizeof(g_tx_log[0]) * (TX_LOG_SIZE - 1));
+        g_tx_log[TX_LOG_SIZE - 1] = entry;
+    }
+}
+
+// Render the TX log at rows [start_row .. start_row + (TX_LOG_SIZE+1)).
+// Caller picks the column. Title line + one row per entry. Newest at
+// the bottom; PREVIEW lines render with A_BOLD, SENT/ACK with A_DIM.
+static void render_tx_log_panel(int start_row, int col)
+{
+    int row = start_row;
+    mvprintw(row++, col, "TX log");
+    clrtoeol();
+    for (size_t i = 0; i < g_tx_log_count; ++i) {
+        const tx_log_entry_t *e = &g_tx_log[i];
+        const char *tag = "sent>  ";
+        int attr = A_DIM;
+        if (e->kind == SSO_EVT_TX_COMMAND_PREVIEW) {
+            tag = "draft> ";
+            attr = A_BOLD;
+        } else if (e->kind == SSO_EVT_TX_ACK) {
+            tag = "ack>   ";
+            attr = A_DIM;
+        }
+        attron(attr);
+        if (e->kind == SSO_EVT_TX_ACK && e->tx_ack_status[0]) {
+            mvprintw(row++, col, "%s  %s %.40s  [%s]",
+                     e->ts, tag, e->ascii, e->tx_ack_status);
+        } else {
+            mvprintw(row++, col, "%s  %s %.60s",
+                     e->ts, tag, e->ascii);
+        }
+        clrtoeol();
+        attroff(attr);
+    }
 }
 
 // Latest broadcast snapshot, kept so a newly-connecting viewer gets
@@ -239,7 +354,43 @@ static void ipc_broadcast_state(state_t *s,
 static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
                          const sso_event_t *evt, void *user) {
     (void) user;
+    if (evt->type == SSO_EVT_TX_COMMAND_SENT
+     || evt->type == SSO_EVT_TX_ACK) {
+        // Daemon-side confirmation — log locally and fan out to viewers
+        // so the viewer's TX log reflects what the operator sees too.
+        tx_log_push(evt);
+        char buf[1024];
+        if (sso_event_encode(evt, buf, sizeof buf) == 0) {
+            sso_ipc_server_broadcast(srv, buf);
+        }
+        return;
+    }
     if (evt->type != SSO_EVT_HELLO) return;
+
+    // b210_rx_tx daemon attach: peer uid must match the operator's
+    // effective uid. SO_PEERCRED / getpeereid is captured at accept;
+    // a HELLO claiming role="b210_rx_tx" from a different uid is
+    // recorded and ignored.
+    if (evt->role[0] && strcmp(evt->role, "b210_rx_tx") == 0) {
+        uid_t peer_uid = 0;
+        int ok = (sso_ipc_server_peer_uid(srv, id, &peer_uid) == 0
+                  && peer_uid == geteuid());
+        if (ok) {
+            g_tx_daemon_slot = id;
+            sso_audit_event("tx-daemon-attached",
+                            evt->user[0] ? evt->user : "?");
+            fprintf(stderr,
+                "simple_sat_ops: b210_rx_tx attached (slot=%d, user=%s)\n",
+                (int) id, evt->user[0] ? evt->user : "?");
+        } else {
+            sso_audit_event("tx-daemon-uid-mismatch",
+                            evt->user[0] ? evt->user : "?");
+            fprintf(stderr,
+                "simple_sat_ops: rejecting b210_rx_tx claim (uid mismatch); "
+                "claimant=%s\n",
+                evt->user[0] ? evt->user : "?");
+        }
+    }
     sso_event_t welcome;
     sso_event_init(&welcome, SSO_EVT_WELCOME);
     snprintf(welcome.from, sizeof(welcome.from), "%s",
@@ -314,6 +465,454 @@ static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
     if (sso_event_encode(&welcome, buf, sizeof(buf)) == 0) {
         sso_ipc_server_send(srv, id, buf);
     }
+}
+
+// --- TX compose modal (operator side) -----------------------------
+//
+// Opened with `t` from the operator's main UI when the keyboard is
+// unlocked. As the operator edits a field the modal broadcasts a
+// debounced SSO_EVT_TX_COMMAND_PREVIEW so viewers see the draft and
+// can call out typos. On Enter the modal builds a TX_REQUEST and
+// sends it via sso_ipc_server_send to g_tx_daemon_slot (the b210_rx_tx
+// daemon). If the daemon isn't connected the commit short-circuits
+// with an error and the modal stays open.
+
+typedef enum {
+    TXF_KIND = 0,
+    TXF_PAYLOAD,
+    TXF_SRC,
+    TXF_DST,
+    TXF_DPORT,
+    TXF_SPORT,
+    TXF_PRIO,
+    TXF_FREQ,
+    TXF_GAIN,
+    TXF_REPEAT,
+    TXF_GAP,
+    TXF_ALLOW_TX,
+    TXF_ALLOW_HP,
+    TXF_ALLOW_HF,
+    TXF_COUNT,
+} tx_field_t;
+
+typedef struct {
+    int  is_hex;
+    char payload[160];
+    char src[8], dst[8], dport[8], sport[8], prio[8];
+    char freq[16];
+    char gain[12];
+    char repeat[8];
+    char gap[8];
+    int  allow_tx;
+    int  allow_high_power;
+    int  allow_hf_tx;
+    tx_field_t focus;
+    int  preview_dirty;
+    struct timespec last_edit;
+    char status_msg[160];
+} tx_compose_t;
+
+static void tx_compose_init(tx_compose_t *c) {
+    memset(c, 0, sizeof *c);
+    snprintf(c->src,    sizeof c->src,    "10");
+    snprintf(c->dst,    sizeof c->dst,    "1");
+    snprintf(c->dport,  sizeof c->dport,  "7");
+    snprintf(c->sport,  sizeof c->sport,  "16");
+    snprintf(c->prio,   sizeof c->prio,   "2");
+    snprintf(c->freq,   sizeof c->freq,   "145150000");
+    snprintf(c->gain,   sizeof c->gain,   "30.0");
+    snprintf(c->repeat, sizeof c->repeat, "1");
+    snprintf(c->gap,    sizeof c->gap,    "200");
+    snprintf(c->status_msg, sizeof c->status_msg,
+             "edit; viewers see drafts ~200 ms after you stop typing");
+}
+
+static void tx_compose_summary(const tx_compose_t *c, char *out, size_t out_size) {
+    if (out_size == 0) return;
+    snprintf(out, out_size, "%s:%s @%ld src=%s dst=%s dp=%s",
+             c->is_hex ? "hex" : "ascii",
+             c->payload[0] ? c->payload : "(empty)",
+             atol(c->freq), c->src, c->dst, c->dport);
+}
+
+static void tx_compose_fill_event(const tx_compose_t *c, sso_event_t *evt) {
+    snprintf(evt->tx_payload_kind, sizeof evt->tx_payload_kind, "%s",
+             c->is_hex ? "hex" : "ascii");
+    snprintf(evt->tx_payload, sizeof evt->tx_payload, "%s", c->payload);
+    evt->tx_csp_src   = (uint8_t) atoi(c->src);
+    evt->tx_csp_dst   = (uint8_t) atoi(c->dst);
+    evt->tx_csp_dport = (uint8_t) atoi(c->dport);
+    evt->tx_csp_sport = (uint8_t) atoi(c->sport);
+    evt->tx_csp_prio  = (uint8_t) atoi(c->prio);
+    evt->tx_freq_hz   = atol(c->freq);
+    evt->tx_gain_db   = atof(c->gain);
+    evt->tx_repeat    = atoi(c->repeat);
+    evt->tx_gap_ms    = atoi(c->gap);
+    evt->tx_allow_tx         = c->allow_tx;
+    evt->tx_allow_high_power = c->allow_high_power;
+    evt->tx_allow_hf_tx      = c->allow_hf_tx;
+    char summary[160];
+    tx_compose_summary(c, summary, sizeof summary);
+    snprintf(evt->ascii, sizeof evt->ascii, "%s", summary);
+    snprintf(evt->from, sizeof evt->from, "%s",
+             g_operator_user ? g_operator_user : "?");
+}
+
+// Mark the focused field and append a char (for text/numeric inputs).
+// Numeric fields silently drop non-digit chars (period only allowed
+// for the gain field). Hex payload mode accepts [0-9a-fA-F].
+static int tx_field_is_text(tx_field_t f) {
+    return f == TXF_PAYLOAD;
+}
+static int tx_field_is_numeric(tx_field_t f) {
+    return f == TXF_SRC || f == TXF_DST || f == TXF_DPORT
+        || f == TXF_SPORT || f == TXF_PRIO || f == TXF_FREQ
+        || f == TXF_REPEAT || f == TXF_GAP;
+}
+static int tx_field_is_decimal(tx_field_t f) { return f == TXF_GAIN; }
+static int tx_field_is_toggle(tx_field_t f) {
+    return f == TXF_KIND || f == TXF_ALLOW_TX
+        || f == TXF_ALLOW_HP || f == TXF_ALLOW_HF;
+}
+
+static char *tx_field_buf(tx_compose_t *c, tx_field_t f, size_t *cap) {
+    switch (f) {
+        case TXF_PAYLOAD: *cap = sizeof c->payload; return c->payload;
+        case TXF_SRC:     *cap = sizeof c->src;     return c->src;
+        case TXF_DST:     *cap = sizeof c->dst;     return c->dst;
+        case TXF_DPORT:   *cap = sizeof c->dport;   return c->dport;
+        case TXF_SPORT:   *cap = sizeof c->sport;   return c->sport;
+        case TXF_PRIO:    *cap = sizeof c->prio;    return c->prio;
+        case TXF_FREQ:    *cap = sizeof c->freq;    return c->freq;
+        case TXF_GAIN:    *cap = sizeof c->gain;    return c->gain;
+        case TXF_REPEAT:  *cap = sizeof c->repeat;  return c->repeat;
+        case TXF_GAP:     *cap = sizeof c->gap;     return c->gap;
+        default:          *cap = 0; return NULL;
+    }
+}
+
+static void tx_field_append(tx_compose_t *c, int ch) {
+    size_t cap = 0;
+    char *buf = tx_field_buf(c, c->focus, &cap);
+    if (!buf) return;
+    size_t n = strlen(buf);
+    if (n + 1 >= cap) return;
+    int accept = 0;
+    if (tx_field_is_text(c->focus)) {
+        if (c->is_hex) {
+            accept = (ch >= '0' && ch <= '9')
+                  || (ch >= 'a' && ch <= 'f')
+                  || (ch >= 'A' && ch <= 'F');
+        } else {
+            accept = (ch >= 32 && ch < 127);
+        }
+    } else if (tx_field_is_numeric(c->focus)) {
+        accept = (ch >= '0' && ch <= '9');
+    } else if (tx_field_is_decimal(c->focus)) {
+        accept = (ch >= '0' && ch <= '9') || ch == '.' || ch == '-';
+    }
+    if (!accept) return;
+    buf[n++] = (char) ch;
+    buf[n]   = '\0';
+    c->preview_dirty = 1;
+}
+
+static void tx_field_backspace(tx_compose_t *c) {
+    size_t cap = 0;
+    char *buf = tx_field_buf(c, c->focus, &cap);
+    if (!buf) return;
+    size_t n = strlen(buf);
+    if (n == 0) return;
+    buf[n - 1] = '\0';
+    c->preview_dirty = 1;
+}
+
+static void tx_field_toggle(tx_compose_t *c) {
+    switch (c->focus) {
+        case TXF_KIND:
+            c->is_hex = !c->is_hex;
+            // Hex/ascii change can invalidate prior payload characters;
+            // truncate to the longest leading run that remains valid.
+            for (size_t i = 0; c->payload[i]; ++i) {
+                int ch = (unsigned char) c->payload[i];
+                int ok = c->is_hex
+                    ? ((ch >= '0' && ch <= '9')
+                       || (ch >= 'a' && ch <= 'f')
+                       || (ch >= 'A' && ch <= 'F'))
+                    : (ch >= 32 && ch < 127);
+                if (!ok) { c->payload[i] = '\0'; break; }
+            }
+            break;
+        case TXF_ALLOW_TX: c->allow_tx         = !c->allow_tx;         break;
+        case TXF_ALLOW_HP: c->allow_high_power = !c->allow_high_power; break;
+        case TXF_ALLOW_HF: c->allow_hf_tx      = !c->allow_hf_tx;      break;
+        default: return;
+    }
+    c->preview_dirty = 1;
+}
+
+// Single-line redraw helper: prints a label + value, applies A_REVERSE
+// on the value when this field is focused.
+static void tx_draw_field(WINDOW *w, int row, int col, int focused,
+                          const char *label, const char *value) {
+    mvwprintw(w, row, col, "%s", label);
+    if (focused) wattron(w, A_REVERSE);
+    wprintw(w, "%s", value);
+    if (focused) wattroff(w, A_REVERSE);
+    wclrtoeol(w);
+}
+
+static void tx_compose_draw(WINDOW *w, const tx_compose_t *c) {
+    werase(w);
+    box(w, 0, 0);
+    mvwprintw(w, 0, 2, " TX compose (operator: %s) ",
+              g_operator_user ? g_operator_user : "?");
+    mvwprintw(w, 1, 2,
+              "daemon: %s",
+              g_tx_daemon_slot >= 0 ? "connected" : "(not connected)");
+    wclrtoeol(w);
+
+    char buf[64];
+    snprintf(buf, sizeof buf, "%-6s", c->is_hex ? "hex" : "ascii");
+    tx_draw_field(w, 3, 2, c->focus == TXF_KIND,
+                  "Kind     ", buf);
+    mvwprintw(w, 3, 38, "(Space toggles hex/ascii)");
+    wclrtoeol(w);
+
+    snprintf(buf, sizeof buf, "%-44s",
+             c->payload[0] ? c->payload : " ");
+    tx_draw_field(w, 4, 2, c->focus == TXF_PAYLOAD,
+                  "Payload  ", buf);
+
+    snprintf(buf, sizeof buf, "%-4s", c->src);
+    tx_draw_field(w, 6, 2, c->focus == TXF_SRC,
+                  "CSP src  ", buf);
+    snprintf(buf, sizeof buf, "%-4s", c->dst);
+    tx_draw_field(w, 6, 22, c->focus == TXF_DST,
+                  "dst  ", buf);
+    snprintf(buf, sizeof buf, "%-4s", c->dport);
+    tx_draw_field(w, 6, 36, c->focus == TXF_DPORT,
+                  "dport ", buf);
+    snprintf(buf, sizeof buf, "%-4s", c->sport);
+    tx_draw_field(w, 6, 52, c->focus == TXF_SPORT,
+                  "sport ", buf);
+    snprintf(buf, sizeof buf, "%-3s", c->prio);
+    tx_draw_field(w, 6, 68, c->focus == TXF_PRIO,
+                  "prio ", buf);
+
+    snprintf(buf, sizeof buf, "%-12s", c->freq);
+    tx_draw_field(w, 7, 2, c->focus == TXF_FREQ,
+                  "Freq Hz  ", buf);
+    snprintf(buf, sizeof buf, "%-8s", c->gain);
+    tx_draw_field(w, 7, 36, c->focus == TXF_GAIN,
+                  "Gain dB ", buf);
+
+    snprintf(buf, sizeof buf, "%-6s", c->repeat);
+    tx_draw_field(w, 8, 2, c->focus == TXF_REPEAT,
+                  "Repeat   ", buf);
+    snprintf(buf, sizeof buf, "%-6s", c->gap);
+    tx_draw_field(w, 8, 36, c->focus == TXF_GAP,
+                  "Gap ms  ", buf);
+
+    snprintf(buf, sizeof buf, "[%c]", c->allow_tx ? 'x' : ' ');
+    tx_draw_field(w, 10, 2, c->focus == TXF_ALLOW_TX,
+                  "", buf);
+    mvwprintw(w, 10, 7, "allow-tx");
+    snprintf(buf, sizeof buf, "[%c]", c->allow_high_power ? 'x' : ' ');
+    tx_draw_field(w, 10, 22, c->focus == TXF_ALLOW_HP,
+                  "", buf);
+    mvwprintw(w, 10, 27, "allow-high-power");
+    snprintf(buf, sizeof buf, "[%c]", c->allow_hf_tx ? 'x' : ' ');
+    tx_draw_field(w, 10, 48, c->focus == TXF_ALLOW_HF,
+                  "", buf);
+    mvwprintw(w, 10, 53, "allow-hf-tx");
+
+    char summary[160];
+    tx_compose_summary(c, summary, sizeof summary);
+    mvwprintw(w, 12, 2, "Summary: %.62s", summary);
+    wclrtoeol(w);
+    mvwprintw(w, 13, 2, "Status:  %.62s", c->status_msg);
+    wclrtoeol(w);
+
+    mvwprintw(w, 15, 2,
+              "Tab/Shift-Tab move   Space toggles   Enter commits   Esc cancels");
+    wclrtoeol(w);
+    wrefresh(w);
+}
+
+// CLAUDE.md gates: high power = "above 10%", which is undocumented in
+// dB but tx_frame_sdr defaults to gain=30 dB and the B210 ramp typically
+// hits 10% somewhere above gain=60 dB. HF cutoff = 100 MHz.
+#define TX_HIGH_POWER_THRESHOLD_DB 60.0
+#define TX_HF_CUTOFF_HZ           100000000L
+
+static int tx_compose_validate(const tx_compose_t *c, char *err, size_t err_size) {
+    if (!c->payload[0]) {
+        snprintf(err, err_size, "empty payload");
+        return -1;
+    }
+    if (c->is_hex) {
+        if (strlen(c->payload) % 2 != 0) {
+            snprintf(err, err_size, "hex payload needs even nibble count");
+            return -1;
+        }
+    }
+    if (!c->allow_tx) {
+        snprintf(err, err_size, "--allow-tx is off; tick it before commit");
+        return -1;
+    }
+    if (atof(c->gain) > TX_HIGH_POWER_THRESHOLD_DB && !c->allow_high_power) {
+        snprintf(err, err_size,
+                 "gain %.1f dB > %.0f dB needs --allow-high-power",
+                 atof(c->gain), TX_HIGH_POWER_THRESHOLD_DB);
+        return -1;
+    }
+    if (atol(c->freq) < TX_HF_CUTOFF_HZ && !c->allow_hf_tx) {
+        snprintf(err, err_size,
+                 "freq %ld Hz < 100 MHz needs --allow-hf-tx",
+                 atol(c->freq));
+        return -1;
+    }
+    return 0;
+}
+
+static void tx_compose_broadcast_preview(const tx_compose_t *c) {
+    if (!g_ipc) return;
+    sso_event_t evt;
+    sso_event_init(&evt, SSO_EVT_TX_COMMAND_PREVIEW);
+    tx_compose_fill_event(c, &evt);
+    char buf[2048];
+    if (sso_event_encode(&evt, buf, sizeof buf) == 0) {
+        sso_ipc_server_broadcast(g_ipc, buf);
+    }
+    // Mirror into our own ring buffer so the operator's TX log shows
+    // the same draft line viewers are seeing.
+    tx_log_push(&evt);
+}
+
+static int tx_compose_commit(const tx_compose_t *c, char *err, size_t err_size) {
+    if (!g_ipc) {
+        snprintf(err, err_size, "no IPC server (--control not active)");
+        return -1;
+    }
+    if (g_tx_daemon_slot < 0) {
+        snprintf(err, err_size, "b210_rx_tx daemon not connected");
+        return -1;
+    }
+    // Re-check peer uid right before send (paranoia against a slot id
+    // being reused for a different process between accept and now).
+    uid_t puid = 0;
+    if (sso_ipc_server_peer_uid(g_ipc, g_tx_daemon_slot, &puid) != 0
+        || puid != geteuid()) {
+        g_tx_daemon_slot = -1;
+        snprintf(err, err_size, "daemon peer-uid changed; rejected");
+        return -1;
+    }
+    sso_event_t evt;
+    sso_event_init(&evt, SSO_EVT_TX_REQUEST);
+    tx_compose_fill_event(c, &evt);
+    char buf[2048];
+    if (sso_event_encode(&evt, buf, sizeof buf) != 0) {
+        snprintf(err, err_size, "event encode failed");
+        return -1;
+    }
+    if (sso_ipc_server_send(g_ipc, g_tx_daemon_slot, buf) != 0) {
+        snprintf(err, err_size, "send to daemon slot failed");
+        return -1;
+    }
+    return 0;
+}
+
+// Walk the live slot list; if g_tx_daemon_slot no longer resolves to
+// an open slot, the daemon dropped — forget it so the compose modal
+// reports "not connected" again.
+static void prune_tx_daemon_slot(void) {
+    if (!g_ipc || g_tx_daemon_slot < 0) return;
+    sso_ipc_iter_t it = {0};
+    sso_client_id_t cid;
+    char user[64], role[16], since[40];
+    while (sso_ipc_server_next_client(g_ipc, &it, &cid,
+                                       user, sizeof user,
+                                       role, sizeof role,
+                                       since, sizeof since) == 0) {
+        if (cid == g_tx_daemon_slot) return;
+    }
+    g_tx_daemon_slot = -1;
+}
+
+static long ts_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long) ts.tv_sec * 1000000000L + (long) ts.tv_nsec;
+}
+
+static void run_tx_compose(void) {
+    if (!g_ipc) return;  // no compose without operator IPC
+    tx_compose_t c;
+    tx_compose_init(&c);
+
+    int h = 18, ww = 78;
+    if (h > LINES) h = LINES;
+    if (ww > COLS) ww = COLS;
+    WINDOW *w = newwin(h, ww, (LINES - h) / 2, (COLS - ww) / 2);
+    if (!w) return;
+    keypad(w, TRUE);
+    nodelay(w, TRUE);
+
+    tx_compose_draw(w, &c);
+    long debounce_ns = 200000000L;
+    long last_edit_ns = ts_now_ns();
+    int active = 1;
+    while (active) {
+        int ch = wgetch(w);
+        if (ch != ERR) {
+            int changed = 1;
+            if (ch == 27) {  // Esc
+                active = 0; break;
+            } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+                char err[160];
+                if (tx_compose_validate(&c, err, sizeof err) != 0) {
+                    snprintf(c.status_msg, sizeof c.status_msg, "rejected: %s", err);
+                } else if (tx_compose_commit(&c, err, sizeof err) != 0) {
+                    snprintf(c.status_msg, sizeof c.status_msg, "commit failed: %s", err);
+                } else {
+                    active = 0; break;
+                }
+            } else if (ch == '\t') {
+                c.focus = (tx_field_t) ((c.focus + 1) % TXF_COUNT);
+            } else if (ch == KEY_BTAB) {
+                c.focus = (tx_field_t) ((c.focus + TXF_COUNT - 1) % TXF_COUNT);
+            } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+                tx_field_backspace(&c);
+            } else if (ch == ' ' && tx_field_is_toggle(c.focus)) {
+                tx_field_toggle(&c);
+            } else if (ch >= 32 && ch < 127) {
+                tx_field_append(&c, ch);
+            } else {
+                changed = 0;
+            }
+            if (changed) {
+                last_edit_ns = ts_now_ns();
+                tx_compose_draw(w, &c);
+            }
+        }
+        // Pump operator IPC so HELLO from a late-joining daemon updates
+        // g_tx_daemon_slot, and any ACK from a prior TX request comes
+        // through. Quick poll (no blocking).
+        if (g_ipc) sso_ipc_server_step(g_ipc, 0);
+        // Debounced preview broadcast.
+        if (c.preview_dirty
+            && (ts_now_ns() - last_edit_ns) >= debounce_ns) {
+            tx_compose_broadcast_preview(&c);
+            c.preview_dirty = 0;
+            tx_compose_draw(w, &c);  // re-render so the mirror is visible
+        }
+        usleep(20000);  // 20 ms
+    }
+
+    delwin(w);
+    touchwin(stdscr);
+    refresh();
 }
 
 // --- Forward decls -------------------------------------------------
@@ -566,7 +1165,7 @@ void usage(FILE *dest, const char *name, int full)
         "Live satellite tracker for the FrontierSat ground station. Predicts\n"
         "passes, drives the SPID rotator, computes Doppler-shifted simplex\n"
         "frequencies for display, and (with --control) acts as the operator\n"
-        "coordinator over the sso_ipc socket so b210_rx_live and tx_frame_sdr\n"
+        "coordinator over the sso_ipc socket so b210_rx_tx and tx_frame_sdr\n"
         "verify they're owned by the right Unix user.\n"
         "\n"
         "Modes:\n"
@@ -659,7 +1258,7 @@ void usage(FILE *dest, const char *name, int full)
         "  # Dry-run prediction on a dev host (no rotator hardware)\n"
         "  %s 'ISS (ZARYA)' --without-rotator\n"
         "\n"
-        "  # Operator coordination (broadcasts state to b210_rx_live + tx_frame_sdr)\n"
+        "  # Operator coordination (broadcasts state to b210_rx_tx + tx_frame_sdr)\n"
         "  %s next --control\n",
         name, name, name);
 }
@@ -997,6 +1596,14 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
 {
     (void) cli;
     (void) user;
+    if (evt->type == SSO_EVT_TX_COMMAND_PREVIEW
+     || evt->type == SSO_EVT_TX_COMMAND_SENT
+     || evt->type == SSO_EVT_TX_ACK) {
+        tx_log_push(evt);
+        g_viewer_last_event = time(NULL);
+        g_viewer_event_pending = 1;
+        return;
+    }
     if (evt->type != SSO_EVT_STATE && evt->type != SSO_EVT_WELCOME) {
         return;
     }
@@ -1226,6 +1833,11 @@ static void viewer_render(int connected)
 
         int prow = 5;
         report_position(&g_viewer_state, &prow, 50);
+
+        int tx_log_row = LINES - TX_LOG_SIZE - 2;
+        if (tx_log_row >= 17) {
+            render_tx_log_panel(tx_log_row, 1);
+        }
     }
 
     attron(A_REVERSE);
@@ -1460,6 +2072,8 @@ int main(int argc, char **argv)
     clrtoeol();
     mvprintw(keyboard_info_row++, 3, "%s", "]  - Jog azimuth +5 deg");
     clrtoeol();
+    mvprintw(keyboard_info_row++, 3, "%s", "t  - Compose TX command");
+    clrtoeol();
     mvprintw(keyboard_info_row++, 3, "%s", "K  - Lock/unlock keyboard");
     clrtoeol();
     mvprintw(keyboard_info_row++, 3, "%s", "q  - Quit");
@@ -1624,6 +2238,13 @@ int main(int argc, char **argv)
 
         clrtoeol();
 
+        // TX log lives below the keyboard info / antenna status if the
+        // terminal is tall enough to host it without colliding.
+        int tx_log_row = LINES - TX_LOG_SIZE - 2;
+        if (tx_log_row >= keyboard_info_row + 4) {
+            render_tx_log_panel(tx_log_row, 1);
+        }
+
         key = getch();
         if (key == 'K') {
             keyboard_unlocked = !keyboard_unlocked;
@@ -1662,6 +2283,9 @@ int main(int argc, char **argv)
                     }
                     flushinp();
                     break;
+                case 't':
+                    run_tx_compose();
+                    break;
                 default:
                     break;
             }
@@ -1683,6 +2307,7 @@ int main(int argc, char **argv)
         // --- IPC: serve clients, fan out state, honour SIGUSR1 yield ---
         if (g_ipc) {
             sso_ipc_server_step(g_ipc, 0);
+            prune_tx_daemon_slot();
             ipc_broadcast_state(&state, current_az, current_el,
                                  current_downlink_frequency,
                                  doppler_delta_downlink,
