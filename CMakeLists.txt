@@ -98,6 +98,15 @@ target_include_directories(antenna_rotator_selftest PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(antenna_rotator_selftest PRIVATE m)
 list(APPEND SSO_TARGETS antenna_rotator_selftest)
 
+# TLE CSV self-test: round-trips Celestrak OMM CSV through
+# tle_path_resolve and audits the resulting 3-line TLE. Pure POSIX,
+# no external library deps.
+add_executable(tle_csv_selftest
+               utils/tle_csv_selftest.c tle_csv.c)
+target_include_directories(tle_csv_selftest PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(tle_csv_selftest PRIVATE m)
+list(APPEND SSO_TARGETS tle_csv_selftest)
+
 # FM-audio preview tool: baseband WAV -> audible FM-modulated WAV
 add_executable(fm_preview utils/fm_preview.c utils/wav_read.c modem.c)
 target_include_directories(fm_preview PRIVATE ${CMAKE_SOURCE_DIR})
@@ -236,6 +245,25 @@ if (SGP4SDP4_LIB)
     add_executable(lifetime lifetime.c prediction.c oem.c tle_csv.c)
     target_link_libraries(lifetime PRIVATE ${SGP4SDP4_LIB} m)
     list(APPEND SSO_TARGETS lifetime)
+
+    # Prediction self-test: load a frozen fixture TLE, exercise
+    # tle_default_path / load_tle / update_satellite_position /
+    # update_pass_predictions, and assert physically-plausible ranges.
+    # Pulls oem.c + ncurses through prediction.c's transitive deps.
+    add_executable(prediction_selftest
+                   utils/prediction_selftest.c prediction.c oem.c)
+    target_include_directories(prediction_selftest PRIVATE
+        ${CMAKE_SOURCE_DIR})
+    target_link_libraries(prediction_selftest PRIVATE ${SGP4SDP4_LIB} m)
+    if (NCURSES_FOUND)
+        target_include_directories(prediction_selftest PRIVATE
+            ${NCURSES_INCLUDE_DIRS})
+        target_link_directories(prediction_selftest PRIVATE
+            ${NCURSES_LIBRARY_DIRS})
+        target_link_libraries(prediction_selftest PRIVATE
+            ${NCURSES_LIBRARIES})
+    endif()
+    list(APPEND SSO_TARGETS prediction_selftest)
 else()
     message(STATUS "libsgp4sdp4 not found; next_in_queue, lifetime, simple_sat_ops will not be built.")
 endif()
