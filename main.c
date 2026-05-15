@@ -3222,9 +3222,12 @@ int main(int argc, char **argv)
         if (state.running) {
             // The B210 worker thread pumps UHD on its own pthread now,
             // so the main loop doesn't pace itself off the radio. Sleep
-            // at the historical 2 Hz; redraw/IPC gates do their own
-            // throttling.
-            usleep(UPDATE_INTERVAL_MICROSEC);
+            // at the historical 2 Hz so rotator-STATUS polls don't ramp
+            // up unexpectedly; redraw/IPC gates do their own throttling.
+            // Exception: while the operator is typing in the ":" prompt,
+            // drop to 20 ms so getch() echoes each keystroke promptly
+            // (the 500 ms tick was capping input at ~2 chars/sec).
+            usleep(g_cmd_active ? 20000 : UPDATE_INTERVAL_MICROSEC);
         }
     }
 
