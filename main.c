@@ -499,7 +499,7 @@ static void cmd_set_status(const char *fmt, ...)
 
 // Forward decls so cmd_dispatch can call the existing action helpers,
 // which live further down in the file.
-static void run_tx_compose(void);
+static void tx_compose_open(void);
 void start_tracking(state_t *state);
 void stop_tracking(state_t *state);
 int  point_to_stationary_target(state_t *state, double azimuth, double elevation);
@@ -543,7 +543,7 @@ static void cmd_dispatch(state_t *state)
         // bottom prompt doesn't bleed under the modal box.
         cmd_set_status("opening TX compose...");
         g_cmd_active = 0;
-        run_tx_compose();
+        tx_compose_open();
     } else if (strcmp(cmd, "track") == 0) {
         start_tracking(state);
         cmd_set_status("tracking on");
@@ -958,6 +958,15 @@ typedef struct {
 static tx_log_entry_t g_tx_log[TX_LOG_SIZE];
 static size_t         g_tx_log_count = 0;
 
+// Persistent on-disk TX log. JSONL — one encoded sso_event_t per line.
+// Opened lazily on the first event after g_pass_folder is set, kept
+// open for the rest of the process, fflushed after every line so a
+// crash mid-pass doesn't lose the last command sent. Captures every
+// preview / commit / ack — the same events that drive the in-memory
+// ring above and the viewer-side mirror.
+static FILE *g_tx_log_fp = NULL;
+static char  g_tx_log_path[512] = "";
+
 // Pull "HH:MM:SS" out of an event's ISO ts ("2026-05-14T13:22:01.450Z").
 // Falls back to local clock if the event ts is empty/garbled.
 static void tx_log_ts_from_event(const sso_event_t *evt,
@@ -982,6 +991,31 @@ static void tx_log_ts_from_event(const sso_event_t *evt,
              lt.tm_hour, lt.tm_min, lt.tm_sec);
 }
 
+// Append one event to <pass_folder>/tx.log as a JSON line. Opens the
+// file lazily; no-op when g_pass_folder isn't set yet (so events that
+// arrive before pass-folder bring-up land in the in-memory ring but
+// aren't dropped silently — they just don't reach disk until the
+// folder exists). fflush after every write so a SIGKILL mid-pass
+// preserves the last command sent.
+static void tx_log_file_append(const sso_event_t *evt)
+{
+    if (!evt) return;
+    if (g_tx_log_fp == NULL) {
+        if (g_pass_folder[0] == '\0') return;
+        char path[512];
+        snprintf(path, sizeof path, "%.500s/tx.log", g_pass_folder);
+        FILE *fp = fopen(path, "a");
+        if (!fp) return;
+        snprintf(g_tx_log_path, sizeof g_tx_log_path, "%s", path);
+        g_tx_log_fp = fp;
+    }
+    char buf[2048];
+    if (sso_event_encode(evt, buf, sizeof buf) != 0) return;
+    // sso_event_encode already terminates with "}\n" — don't add another.
+    fputs(buf, g_tx_log_fp);
+    fflush(g_tx_log_fp);
+}
+
 // Push an event into the ring. PREVIEW events overwrite a trailing
 // PREVIEW entry (live cursor-style update). SENT promotes a trailing
 // PREVIEW to SENT, or appends a fresh entry. ACK appends with the
@@ -992,6 +1026,8 @@ static void tx_log_push(const sso_event_t *evt)
     if (evt->type != SSO_EVT_TX_COMMAND_PREVIEW
      && evt->type != SSO_EVT_TX_COMMAND_SENT
      && evt->type != SSO_EVT_TX_ACK) return;
+
+    tx_log_file_append(evt);
 
     tx_log_entry_t entry;
     memset(&entry, 0, sizeof entry);
@@ -1622,6 +1658,20 @@ static int  g_tx_last_allow_tx     = 0;
 static char g_tx_history[TX_HISTORY_MAX][160];
 static int  g_tx_history_count = 0;
 
+// Non-blocking modal state. The TX compose modal used to run a
+// dedicated event loop inside run_tx_compose(), which froze the
+// main loop's antenna control, screen redraws, and viewer broadcast
+// for as long as the operator had the modal open. State now lives at
+// file scope; the main loop ticks the modal alongside everything
+// else, so tracking + rotator commands + IPC fanout keep flowing
+// during composition. The modal window is drawn on top via a layered
+// refresh helper.
+static int           g_tx_compose_active        = 0;
+static WINDOW       *g_tx_compose_win           = NULL;
+static tx_compose_t  g_tx_compose_state;
+static long          g_tx_compose_last_edit_ns  = 0;
+static const long    g_tx_compose_debounce_ns   = 200000000L;
+
 static void tx_history_push(const char *payload) {
     if (payload == NULL || payload[0] == '\0') return;
     if (g_tx_history_count > 0
@@ -2067,108 +2117,124 @@ static long ts_now_ns(void) {
     return (long) ts.tv_sec * 1000000000L + (long) ts.tv_nsec;
 }
 
-static void run_tx_compose(void) {
-    if (!g_ipc) return;  // no compose without operator IPC
-    tx_compose_t c;
-    tx_compose_init(&c);
-
-    // Wide modal so a long telecommand fits without scrolling.
+// Open the modal — allocate the window, seed the compose state, draw
+// once, and flip g_tx_compose_active so the main loop starts ticking
+// it. Idempotent: re-opening while already active is a no-op.
+static void tx_compose_open(void) {
+    if (!g_ipc) return;
+    if (g_tx_compose_active) return;
     int h = 14, ww = 120;
     if (h > LINES) h = LINES;
     if (ww > COLS) ww = COLS;
     if (ww < 60)  ww = (COLS < 60) ? COLS : 60;
-    WINDOW *w = newwin(h, ww, (LINES - h) / 2, (COLS - ww) / 2);
-    if (!w) return;
-    keypad(w, TRUE);
-    nodelay(w, TRUE);
+    g_tx_compose_win = newwin(h, ww, (LINES - h) / 2, (COLS - ww) / 2);
+    if (!g_tx_compose_win) return;
+    keypad(g_tx_compose_win, TRUE);
+    nodelay(g_tx_compose_win, TRUE);
+    tx_compose_init(&g_tx_compose_state);
+    tx_compose_draw(g_tx_compose_win, &g_tx_compose_state);
+    g_tx_compose_last_edit_ns = ts_now_ns();
+    g_tx_compose_active = 1;
+}
 
-    tx_compose_draw(w, &c);
-    long debounce_ns = 200000000L;
-    long last_edit_ns = ts_now_ns();
-    int active = 1;
-    while (active) {
-        int ch = wgetch(w);
-        if (ch != ERR) {
-            int changed = 1;
-            // Esc may be a bare cancel OR the start of a CSI sequence
-            // (arrow keys, Home/End, Delete) when keypad mode can't
-            // translate them — common on tmux without proper terminfo.
-            if (ch == 27) {
-                int translated = tx_drain_csi(w);
-                if (translated >= 0) {
-                    ch = translated;  // fall through to normal key handling
-                } else {
-                    tx_compose_remember(&c);
-                    active = 0; break;
-                }
-            }
-            if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
-                char err[120];
-                if (tx_compose_validate(&c, err, sizeof err) != 0) {
-                    snprintf(c.status_msg, sizeof c.status_msg,
-                             "rejected: %.*s",
-                             (int)(sizeof c.status_msg - 16), err);
-                } else if (tx_compose_commit(&c, err, sizeof err) != 0) {
-                    snprintf(c.status_msg, sizeof c.status_msg,
-                             "commit failed: %.*s",
-                             (int)(sizeof c.status_msg - 20), err);
-                } else {
-                    tx_history_push(c.payload);
-                    tx_compose_remember(&c);
-                    active = 0; break;
-                }
-            } else if (ch == '\t') {
-                c.focus = (tx_field_t) ((c.focus + 1) % TXF_COUNT);
-                tx_field_clamp_cursor(&c, c.focus);
-            } else if (ch == KEY_BTAB) {
-                c.focus = (tx_field_t) ((c.focus + TXF_COUNT - 1) % TXF_COUNT);
-                tx_field_clamp_cursor(&c, c.focus);
-            } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
-                tx_field_backspace(&c);
-            } else if (ch == KEY_DC || ch == 4 /* Ctrl-D */) {
-                tx_field_delete(&c);
-            } else if (ch == 11 /* Ctrl-K */) {
-                tx_field_kill_to_end(&c);
-            } else if (ch == KEY_LEFT) {
-                tx_field_left(&c);
-            } else if (ch == KEY_RIGHT) {
-                tx_field_right(&c);
-            } else if (ch == KEY_HOME || ch == 1 /* Ctrl-A */) {
-                tx_field_home(&c);
-            } else if (ch == KEY_END  || ch == 5 /* Ctrl-E */) {
-                tx_field_end(&c);
-            } else if (ch == KEY_UP) {
-                tx_history_recall(&c, -1);
-            } else if (ch == KEY_DOWN) {
-                tx_history_recall(&c, +1);
-            } else if (ch == ' ' && tx_field_is_toggle(c.focus)) {
-                tx_field_toggle(&c);
-            } else if (ch >= 32 && ch < 127) {
-                tx_field_insert(&c, ch);
-            } else {
-                changed = 0;
-            }
-            if (changed) {
-                last_edit_ns = ts_now_ns();
-                tx_compose_draw(w, &c);
-            }
-        }
-        // Pump operator IPC so viewers stay connected while the
-        // operator is sitting in the modal. Non-blocking.
-        if (g_ipc) sso_ipc_server_step(g_ipc, 0);
-        // Debounced preview broadcast.
-        if (c.preview_dirty
-            && (ts_now_ns() - last_edit_ns) >= debounce_ns) {
-            tx_compose_broadcast_preview(&c);
-            c.preview_dirty = 0;
-            tx_compose_draw(w, &c);  // re-render so the mirror is visible
-        }
-        usleep(20000);  // 20 ms
+// Tear the modal down. Touchwin + refresh paints stdscr's cells back
+// into the area the modal occupied so the operator's normal panels
+// become visible again.
+static void tx_compose_close(void) {
+    if (g_tx_compose_win) {
+        delwin(g_tx_compose_win);
+        g_tx_compose_win = NULL;
     }
-
-    delwin(w);
+    g_tx_compose_active = 0;
     touchwin(stdscr);
     refresh();
+}
+
+// Consume one key (from stdscr's getch, which the main loop is doing).
+// Returns 1 to keep the modal open, 0 when the operator's Enter or
+// Esc closed it — the caller invokes tx_compose_close() in that case.
+static int tx_compose_handle_key(int key) {
+    if (!g_tx_compose_active) return 0;
+    if (key == ERR) return 1;
+    tx_compose_t *c = &g_tx_compose_state;
+    WINDOW *w = g_tx_compose_win;
+    int changed = 1;
+    // Esc may be a bare cancel OR the start of a CSI sequence (arrow
+    // keys, Home/End, Delete) when keypad mode can't translate them.
+    if (key == 27) {
+        int translated = tx_drain_csi(w);
+        if (translated >= 0) {
+            key = translated;
+        } else {
+            tx_compose_remember(c);
+            return 0;
+        }
+    }
+    if (key == '\n' || key == '\r' || key == KEY_ENTER) {
+        char err[120];
+        if (tx_compose_validate(c, err, sizeof err) != 0) {
+            snprintf(c->status_msg, sizeof c->status_msg,
+                     "rejected: %.*s",
+                     (int)(sizeof c->status_msg - 16), err);
+        } else if (tx_compose_commit(c, err, sizeof err) != 0) {
+            snprintf(c->status_msg, sizeof c->status_msg,
+                     "commit failed: %.*s",
+                     (int)(sizeof c->status_msg - 20), err);
+        } else {
+            tx_history_push(c->payload);
+            tx_compose_remember(c);
+            return 0;
+        }
+    } else if (key == '\t') {
+        c->focus = (tx_field_t) ((c->focus + 1) % TXF_COUNT);
+        tx_field_clamp_cursor(c, c->focus);
+    } else if (key == KEY_BTAB) {
+        c->focus = (tx_field_t) ((c->focus + TXF_COUNT - 1) % TXF_COUNT);
+        tx_field_clamp_cursor(c, c->focus);
+    } else if (key == KEY_BACKSPACE || key == 127 || key == 8) {
+        tx_field_backspace(c);
+    } else if (key == KEY_DC || key == 4 /* Ctrl-D */) {
+        tx_field_delete(c);
+    } else if (key == 11 /* Ctrl-K */) {
+        tx_field_kill_to_end(c);
+    } else if (key == KEY_LEFT) {
+        tx_field_left(c);
+    } else if (key == KEY_RIGHT) {
+        tx_field_right(c);
+    } else if (key == KEY_HOME || key == 1 /* Ctrl-A */) {
+        tx_field_home(c);
+    } else if (key == KEY_END  || key == 5 /* Ctrl-E */) {
+        tx_field_end(c);
+    } else if (key == KEY_UP) {
+        tx_history_recall(c, -1);
+    } else if (key == KEY_DOWN) {
+        tx_history_recall(c, +1);
+    } else if (key == ' ' && tx_field_is_toggle(c->focus)) {
+        tx_field_toggle(c);
+    } else if (key >= 32 && key < 127) {
+        tx_field_insert(c, key);
+    } else {
+        changed = 0;
+    }
+    if (changed) {
+        g_tx_compose_last_edit_ns = ts_now_ns();
+        tx_compose_draw(w, c);
+    }
+    return 1;
+}
+
+// Per-tick housekeeping. Pumps the debounced preview broadcast and
+// re-renders if the broadcast fired (so the mirror line refreshes).
+// Called every main-loop iteration when active.
+static void tx_compose_pump(void) {
+    if (!g_tx_compose_active) return;
+    tx_compose_t *c = &g_tx_compose_state;
+    if (c->preview_dirty
+        && (ts_now_ns() - g_tx_compose_last_edit_ns) >= g_tx_compose_debounce_ns) {
+        tx_compose_broadcast_preview(c);
+        c->preview_dirty = 0;
+        tx_compose_draw(g_tx_compose_win, c);
+    }
 }
 
 // --- Forward decls -------------------------------------------------
@@ -2981,10 +3047,12 @@ void report_status(state_t *state, int *print_row, int print_col)
         // The rotator STATUS command does a blocking read() on the
         // serial port (antenna_rotator.c:142) that can take hundreds of
         // milliseconds. Skip the live poll while the operator is typing
-        // in the ":" prompt — the cached az/el from the last poll is
-        // good enough for display, and the loop needs to keep ticking
-        // at 50 Hz so each keystroke echoes promptly.
-        if (!g_cmd_active) {
+        // in the ":" prompt or the TX compose modal — the cached az/el
+        // from the last poll is good enough for display, and the loop
+        // needs to keep ticking at 50 Hz so each keystroke echoes
+        // promptly. Rotator SET commands (the tracking output) are
+        // unaffected; only the read-back blocks.
+        if (!g_cmd_active && !g_tx_compose_active) {
             if (antenna_rotator_command(&state->antenna_rotator,
                                         ANTENNA_ROTATOR_STATUS,
                                         &azimuth, &elevation) == ANTENNA_ROTATOR_OK) {
@@ -3993,7 +4061,11 @@ int main(int argc, char **argv)
         }
 
         key = getch();
-        if (g_cmd_active) {
+        if (g_tx_compose_active) {
+            if (!tx_compose_handle_key(key)) {
+                tx_compose_close();
+            }
+        } else if (g_cmd_active) {
             cmd_handle_key(key, &state);
         } else if (key == 'K') {
             keyboard_unlocked = !keyboard_unlocked;
@@ -4036,7 +4108,7 @@ int main(int argc, char **argv)
                     flushinp();
                     break;
                 case 't':
-                    run_tx_compose();
+                    tx_compose_open();
                     break;
                 default:
                     break;
@@ -4057,13 +4129,26 @@ int main(int argc, char **argv)
             t_last_redraw = t_now;
         }
 
+        // Pump the modal's debounced preview broadcast before the
+        // screen flush so the mirror line is current when we paint.
+        tx_compose_pump();
+
         // Bottom-row prompt + screen flush. When the operator is typing
         // in the ":" prompt we want this every tick (~50 Hz) so each
         // keystroke echoes immediately. Otherwise piggyback on the slow
         // redraw so the row picks up any post-command status string.
-        if (redraw_due || g_cmd_active) {
+        // When the TX modal is open we layer it on top of stdscr via
+        // wnoutrefresh + doupdate so the operator's panels can keep
+        // refreshing underneath without flickering the modal off.
+        if (redraw_due || g_cmd_active || g_tx_compose_active) {
             cmd_render();
-            refresh();
+            if (g_tx_compose_active && g_tx_compose_win) {
+                wnoutrefresh(stdscr);
+                wnoutrefresh(g_tx_compose_win);
+                doupdate();
+            } else {
+                refresh();
+            }
         }
 
 #ifdef WITH_USRP_B210
@@ -4175,7 +4260,8 @@ int main(int argc, char **argv)
             // Exception: while the operator is typing in the ":" prompt,
             // drop to 20 ms so getch() echoes each keystroke promptly
             // (the 500 ms tick was capping input at ~2 chars/sec).
-            usleep(g_cmd_active ? 20000 : UPDATE_INTERVAL_MICROSEC);
+            usleep((g_cmd_active || g_tx_compose_active)
+                   ? 20000 : UPDATE_INTERVAL_MICROSEC);
         }
     }
 
