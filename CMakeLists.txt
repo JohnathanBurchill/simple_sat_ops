@@ -24,6 +24,12 @@ project(simple_sat_ops)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
 #set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g -fsanitize=address")
 
+# Catch buffer-truncation bugs on the dev host so they don't slip to
+# the RAO Linux build. clang and gcc both accept -Wformat-truncation;
+# unknown -W flags become a single warning and the build still proceeds,
+# so unconditional add is safe across host compilers.
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wformat-truncation -Wformat-overflow")
+
 # SDR-only build. The CAT-radio dispatcher (radio.c + radio_*.c) and the
 # ALSA-bound tools (tx_tone, tx_white_noise, tx_frame, rx_capture,
 # rx_live) have been retired. Hardware control of the RF chain now goes

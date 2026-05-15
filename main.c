@@ -2317,9 +2317,10 @@ static int    g_viewer_running            = 1;
 // Mirror of the operator's ":" prompt state. cmd_active = 1 between
 // the first cmd-preview after :  and the cmd-executed that closes it.
 // cmd_buf and cmd_status track g_cmd_buf / g_cmd_status verbatim so
-// the viewer's bottom row matches the operator's exactly.
+// the viewer's bottom row matches the operator's exactly. Sized to the
+// wire field (sso_event_t.cmd_text) so snprintf can't truncate.
 static int    g_viewer_cmd_active         = 0;
-static char   g_viewer_cmd_buf[CMD_BUF_SIZE] = "";
+static char   g_viewer_cmd_buf[160]       = "";
 static char   g_viewer_cmd_status[160]    = "";
 // state_t whose fields the viewer mirrors from the broadcast each tick.
 static state_t g_viewer_state;
