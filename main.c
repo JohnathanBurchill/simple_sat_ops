@@ -1592,6 +1592,17 @@ typedef struct {
     int  preview_dirty;
     struct timespec last_edit;
     char status_msg[160];
+    // Per-field text cursor (only meaningful for the text fields —
+    // payload, power). 0..strlen(buf). Bumped/clamped by every edit
+    // helper below.
+    int  cursors[TXF_COUNT];
+    // Payload-history navigation state. history_idx == -1 means
+    // "editing the current draft" (the live payload buffer); 0..N-1
+    // points at g_tx_history[i] (newest at 0). When stepping into
+    // history we stash the live draft into history_saved_edit so
+    // DOWN can restore it.
+    int  history_idx;
+    char history_saved_edit[160];
 } tx_compose_t;
 
 // Survives Esc / commit so the operator can reopen and pick up the
@@ -1599,11 +1610,41 @@ typedef struct {
 // CTS1 telecommand prefix.
 static char g_tx_last_payload[160] = "CTS1+";
 static char g_tx_last_power[12]    = "30.0";
+// Same idea for the --allow-tx checkbox: operators commonly send a
+// series of commands during a pass and would rather not re-arm the
+// safety gate between every one. Survives Esc + commit; cleared by
+// process exit. Per-session, intentionally not persisted on disk.
+static int  g_tx_last_allow_tx     = 0;
+
+// Payload-only history ring (newest at index 0). Push happens on a
+// successful commit; Esc-cancelled drafts don't enter history.
+#define TX_HISTORY_MAX 32
+static char g_tx_history[TX_HISTORY_MAX][160];
+static int  g_tx_history_count = 0;
+
+static void tx_history_push(const char *payload) {
+    if (payload == NULL || payload[0] == '\0') return;
+    if (g_tx_history_count > 0
+        && strcmp(g_tx_history[0], payload) == 0) {
+        return;  // suppress trivial duplicates of the most-recent entry
+    }
+    int keep = g_tx_history_count < TX_HISTORY_MAX - 1
+             ? g_tx_history_count : TX_HISTORY_MAX - 1;
+    for (int i = keep; i > 0; --i) {
+        memcpy(g_tx_history[i], g_tx_history[i - 1], sizeof g_tx_history[0]);
+    }
+    snprintf(g_tx_history[0], sizeof g_tx_history[0], "%s", payload);
+    if (g_tx_history_count < TX_HISTORY_MAX) g_tx_history_count++;
+}
 
 static void tx_compose_init(tx_compose_t *c) {
     memset(c, 0, sizeof *c);
     snprintf(c->payload, sizeof c->payload, "%s", g_tx_last_payload);
     snprintf(c->power,   sizeof c->power,   "%s", g_tx_last_power);
+    c->allow_tx                = g_tx_last_allow_tx;
+    c->cursors[TXF_PAYLOAD]    = (int) strlen(c->payload);
+    c->cursors[TXF_POWER]      = (int) strlen(c->power);
+    c->history_idx             = -1;
     snprintf(c->status_msg, sizeof c->status_msg,
              "edit; viewers see drafts ~200 ms after you stop typing");
 }
@@ -1611,6 +1652,7 @@ static void tx_compose_init(tx_compose_t *c) {
 static void tx_compose_remember(const tx_compose_t *c) {
     snprintf(g_tx_last_payload, sizeof g_tx_last_payload, "%s", c->payload);
     snprintf(g_tx_last_power,   sizeof g_tx_last_power,   "%s", c->power);
+    g_tx_last_allow_tx = c->allow_tx;
 }
 
 static void tx_compose_summary(const tx_compose_t *c, char *out, size_t out_size) {
@@ -1653,12 +1695,24 @@ static char *tx_field_buf(tx_compose_t *c, tx_field_t f, size_t *cap) {
     }
 }
 
-static void tx_field_append(tx_compose_t *c, int ch) {
+// Clamp the per-field cursor into [0, strlen(buf)]. Called after any
+// op that might leave the cursor past the end (focus change, history
+// recall) so subsequent insert/delete don't run off the buffer.
+static void tx_field_clamp_cursor(tx_compose_t *c, tx_field_t f) {
+    size_t cap = 0;
+    char *buf = tx_field_buf(c, f, &cap);
+    if (!buf) return;
+    int n = (int) strlen(buf);
+    if (c->cursors[f] < 0) c->cursors[f] = 0;
+    if (c->cursors[f] > n) c->cursors[f] = n;
+}
+
+static void tx_field_insert(tx_compose_t *c, int ch) {
     size_t cap = 0;
     char *buf = tx_field_buf(c, c->focus, &cap);
     if (!buf) return;
-    size_t n = strlen(buf);
-    if (n + 1 >= cap) return;
+    int n = (int) strlen(buf);
+    if (n + 1 >= (int) cap) return;
     int accept = 0;
     if (tx_field_is_text(c->focus)) {
         accept = (ch >= 32 && ch < 127);
@@ -1666,19 +1720,141 @@ static void tx_field_append(tx_compose_t *c, int ch) {
         accept = (ch >= '0' && ch <= '9') || ch == '.' || ch == '-';
     }
     if (!accept) return;
-    buf[n++] = (char) ch;
-    buf[n]   = '\0';
+    int cur = c->cursors[c->focus];
+    if (cur < 0) cur = 0;
+    if (cur > n) cur = n;
+    // Shift the tail (including the existing nul) right by one.
+    memmove(buf + cur + 1, buf + cur, (size_t)(n - cur + 1));
+    buf[cur] = (char) ch;
+    c->cursors[c->focus] = cur + 1;
     c->preview_dirty = 1;
+    // Any edit cancels history navigation — the operator is now off
+    // the recalled string, the next UP should walk history fresh.
+    if (c->focus == TXF_PAYLOAD) c->history_idx = -1;
 }
 
 static void tx_field_backspace(tx_compose_t *c) {
     size_t cap = 0;
     char *buf = tx_field_buf(c, c->focus, &cap);
     if (!buf) return;
-    size_t n = strlen(buf);
-    if (n == 0) return;
-    buf[n - 1] = '\0';
+    int n = (int) strlen(buf);
+    int cur = c->cursors[c->focus];
+    if (cur <= 0 || n == 0) return;
+    memmove(buf + cur - 1, buf + cur, (size_t)(n - cur + 1));
+    c->cursors[c->focus] = cur - 1;
     c->preview_dirty = 1;
+    if (c->focus == TXF_PAYLOAD) c->history_idx = -1;
+}
+
+static void tx_field_delete(tx_compose_t *c) {
+    size_t cap = 0;
+    char *buf = tx_field_buf(c, c->focus, &cap);
+    if (!buf) return;
+    int n = (int) strlen(buf);
+    int cur = c->cursors[c->focus];
+    if (cur >= n) return;
+    memmove(buf + cur, buf + cur + 1, (size_t)(n - cur));
+    c->preview_dirty = 1;
+    if (c->focus == TXF_PAYLOAD) c->history_idx = -1;
+}
+
+static void tx_field_kill_to_end(tx_compose_t *c) {
+    size_t cap = 0;
+    char *buf = tx_field_buf(c, c->focus, &cap);
+    if (!buf) return;
+    int n = (int) strlen(buf);
+    int cur = c->cursors[c->focus];
+    if (cur >= n) return;
+    buf[cur] = '\0';
+    c->preview_dirty = 1;
+    if (c->focus == TXF_PAYLOAD) c->history_idx = -1;
+}
+
+static void tx_field_left(tx_compose_t *c) {
+    size_t cap = 0;
+    if (!tx_field_buf(c, c->focus, &cap)) return;
+    if (c->cursors[c->focus] > 0) c->cursors[c->focus]--;
+}
+
+static void tx_field_right(tx_compose_t *c) {
+    size_t cap = 0;
+    char *buf = tx_field_buf(c, c->focus, &cap);
+    if (!buf) return;
+    int n = (int) strlen(buf);
+    if (c->cursors[c->focus] < n) c->cursors[c->focus]++;
+}
+
+static void tx_field_home(tx_compose_t *c) {
+    size_t cap = 0;
+    if (!tx_field_buf(c, c->focus, &cap)) return;
+    c->cursors[c->focus] = 0;
+}
+
+static void tx_field_end(tx_compose_t *c) {
+    size_t cap = 0;
+    char *buf = tx_field_buf(c, c->focus, &cap);
+    if (!buf) return;
+    c->cursors[c->focus] = (int) strlen(buf);
+}
+
+// direction = -1 (UP, older) or +1 (DOWN, newer). No-op when focus
+// is not on the payload field, when history is empty, or at the edge.
+static void tx_history_recall(tx_compose_t *c, int direction) {
+    if (c->focus != TXF_PAYLOAD) return;
+    if (g_tx_history_count == 0) return;
+    int step = (direction < 0) ? +1 : -1;
+    int new_idx = c->history_idx + step;
+    if (new_idx < -1) return;
+    if (new_idx >= g_tx_history_count) return;
+    if (c->history_idx == -1 && new_idx >= 0) {
+        snprintf(c->history_saved_edit, sizeof c->history_saved_edit,
+                 "%s", c->payload);
+    }
+    if (new_idx == -1) {
+        snprintf(c->payload, sizeof c->payload, "%s",
+                 c->history_saved_edit);
+    } else {
+        snprintf(c->payload, sizeof c->payload, "%s",
+                 g_tx_history[new_idx]);
+    }
+    c->cursors[TXF_PAYLOAD] = (int) strlen(c->payload);
+    c->history_idx          = new_idx;
+    c->preview_dirty        = 1;
+}
+
+// Tiny CSI fallback parser for terminals where ncurses' keypad mode
+// doesn't translate arrow / nav keys into KEY_* (notably some tmux
+// configurations). Same idea as cmd_drain_csi in the `:` prompt.
+// Returns a KEY_* code on success, or -1 if the lookahead isn't a
+// CSI we recognise.
+static int tx_drain_csi(WINDOW *w) {
+    int b1 = wgetch(w);
+    if (b1 == ERR || b1 != '[') return -1;
+    int b2 = wgetch(w);
+    if (b2 == ERR) return -1;
+    switch (b2) {
+        case 'A': return KEY_UP;
+        case 'B': return KEY_DOWN;
+        case 'C': return KEY_RIGHT;
+        case 'D': return KEY_LEFT;
+        case 'H': return KEY_HOME;
+        case 'F': return KEY_END;
+        default: break;
+    }
+    if (b2 >= '0' && b2 <= '9') {
+        int b3 = wgetch(w);
+        if (b3 == '~') {
+            switch (b2) {
+                case '1': return KEY_HOME;
+                case '3': return KEY_DC;
+                case '4': return KEY_END;
+                case '7': return KEY_HOME;
+                case '8': return KEY_END;
+                default: break;
+            }
+        }
+    }
+    return -1;
 }
 
 static void tx_field_toggle(tx_compose_t *c) {
@@ -1689,13 +1865,43 @@ static void tx_field_toggle(tx_compose_t *c) {
 }
 
 // Single-line redraw helper: prints a label + value, applies A_REVERSE
-// on the value when this field is focused.
+// on the value when this field is focused. Used for the allow-tx
+// checkbox where there's no cursor.
 static void tx_draw_field(WINDOW *w, int row, int col, int focused,
                           const char *label, const char *value) {
     mvwprintw(w, row, col, "%s", label);
     if (focused) wattron(w, A_REVERSE);
     wprintw(w, "%s", value);
     if (focused) wattroff(w, A_REVERSE);
+    wclrtoeol(w);
+}
+
+// Cursor-aware text-field renderer for payload + power. The value is
+// drawn cell-by-cell across value_w columns; the cursor cell (if
+// focused) is inverted, the remainder normal, and any space past the
+// value is filled with plain spaces. When the cursor sits past the
+// visible window the viewport scrolls so it stays at the right edge.
+static void tx_draw_text_field(WINDOW *w, int row, int col,
+                               const char *label, const char *value,
+                               int value_w, int focused, int cursor)
+{
+    mvwprintw(w, row, col, "%s", label);
+    int x = col + (int) strlen(label);
+    int n = (int) strlen(value);
+    int start = 0;
+    if (focused && cursor > value_w - 1) start = cursor - value_w + 1;
+    for (int i = 0; i < value_w; ++i) {
+        int idx = start + i;
+        char ch = (idx < n) ? value[idx] : ' ';
+        chtype out = (chtype)(unsigned char) ch;
+        if (focused && idx == cursor) {
+            wattron(w, A_REVERSE);
+            mvwaddch(w, row, x + i, out);
+            wattroff(w, A_REVERSE);
+        } else {
+            mvwaddch(w, row, x + i, out);
+        }
+    }
     wclrtoeol(w);
 }
 
@@ -1723,14 +1929,15 @@ static void tx_compose_draw(WINDOW *w, const tx_compose_t *c) {
     char buf[256];
     // Payload spans most of the modal width so a long telecommand
     // doesn't scroll off the right edge.
-    snprintf(buf, sizeof buf, "%-*.*s", payload_w, payload_w,
-             c->payload[0] ? c->payload : " ");
-    tx_draw_field(w, 3, 2, c->focus == TXF_PAYLOAD,
-                  "Payload  ", buf);
+    tx_draw_text_field(w, 3, 2, "Payload  ",
+                       c->payload, payload_w,
+                       c->focus == TXF_PAYLOAD,
+                       c->cursors[TXF_PAYLOAD]);
 
-    snprintf(buf, sizeof buf, "%-8s", c->power);
-    tx_draw_field(w, 5, 2, c->focus == TXF_POWER,
-                  "TX power ", buf);
+    tx_draw_text_field(w, 5, 2, "TX power ",
+                       c->power, 8,
+                       c->focus == TXF_POWER,
+                       c->cursors[TXF_POWER]);
     mvwprintw(w, 5, 24, "dB  (B210 TX gain; 0..89.75)");
     wclrtoeol(w);
 
@@ -1750,7 +1957,7 @@ static void tx_compose_draw(WINDOW *w, const tx_compose_t *c) {
     wclrtoeol(w);
 
     mvwprintw(w, 12, 2,
-              "Tab/Shift-Tab move   Space toggles allow-tx   Enter commits   Esc cancels");
+              "Tab focus  Space toggle  Up/Down history  ^A/^E home/end  ^K kill  Enter send  Esc cancel");
     wclrtoeol(w);
     wrefresh(w);
 }
@@ -1883,10 +2090,19 @@ static void run_tx_compose(void) {
         int ch = wgetch(w);
         if (ch != ERR) {
             int changed = 1;
-            if (ch == 27) {  // Esc — remember the typed string but don't send.
-                tx_compose_remember(&c);
-                active = 0; break;
-            } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+            // Esc may be a bare cancel OR the start of a CSI sequence
+            // (arrow keys, Home/End, Delete) when keypad mode can't
+            // translate them — common on tmux without proper terminfo.
+            if (ch == 27) {
+                int translated = tx_drain_csi(w);
+                if (translated >= 0) {
+                    ch = translated;  // fall through to normal key handling
+                } else {
+                    tx_compose_remember(&c);
+                    active = 0; break;
+                }
+            }
+            if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
                 char err[120];
                 if (tx_compose_validate(&c, err, sizeof err) != 0) {
                     snprintf(c.status_msg, sizeof c.status_msg,
@@ -1897,19 +2113,38 @@ static void run_tx_compose(void) {
                              "commit failed: %.*s",
                              (int)(sizeof c.status_msg - 20), err);
                 } else {
+                    tx_history_push(c.payload);
                     tx_compose_remember(&c);
                     active = 0; break;
                 }
             } else if (ch == '\t') {
                 c.focus = (tx_field_t) ((c.focus + 1) % TXF_COUNT);
+                tx_field_clamp_cursor(&c, c.focus);
             } else if (ch == KEY_BTAB) {
                 c.focus = (tx_field_t) ((c.focus + TXF_COUNT - 1) % TXF_COUNT);
+                tx_field_clamp_cursor(&c, c.focus);
             } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
                 tx_field_backspace(&c);
+            } else if (ch == KEY_DC || ch == 4 /* Ctrl-D */) {
+                tx_field_delete(&c);
+            } else if (ch == 11 /* Ctrl-K */) {
+                tx_field_kill_to_end(&c);
+            } else if (ch == KEY_LEFT) {
+                tx_field_left(&c);
+            } else if (ch == KEY_RIGHT) {
+                tx_field_right(&c);
+            } else if (ch == KEY_HOME || ch == 1 /* Ctrl-A */) {
+                tx_field_home(&c);
+            } else if (ch == KEY_END  || ch == 5 /* Ctrl-E */) {
+                tx_field_end(&c);
+            } else if (ch == KEY_UP) {
+                tx_history_recall(&c, -1);
+            } else if (ch == KEY_DOWN) {
+                tx_history_recall(&c, +1);
             } else if (ch == ' ' && tx_field_is_toggle(c.focus)) {
                 tx_field_toggle(&c);
             } else if (ch >= 32 && ch < 127) {
-                tx_field_append(&c, ch);
+                tx_field_insert(&c, ch);
             } else {
                 changed = 0;
             }
