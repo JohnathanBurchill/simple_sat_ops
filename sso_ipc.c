@@ -492,6 +492,13 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
         if (evt->roster_json[0]) {
             if (json_field_raw(&p, end, &first, "roster", evt->roster_json) < 0) return -1;
         }
+        // Operator-level warning (e.g., low disk). Emitted outside the
+        // rx_have_session block so viewers see it even on builds without
+        // an SDR — disk pressure matters either way.
+        if (evt->rx_warning[0]) {
+            if (json_field_str(&p, end, &first, "rx_warn",
+                               evt->rx_warning) < 0) return -1;
+        }
         // RX panel mirror. Only worth shipping when the operator has an
         // active rx_session; non-B210 broadcasts omit the whole block.
         if (evt->rx_have_session) {
@@ -746,6 +753,7 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
             }
         }
     }
+    json_get_string(line, "rx_warn", evt->rx_warning, sizeof evt->rx_warning);
     if (json_get_string(line, "rx_rb",
                         evt->rx_ribbon, sizeof evt->rx_ribbon) > 0) {
         evt->rx_ribbon_n = (int) strlen(evt->rx_ribbon);

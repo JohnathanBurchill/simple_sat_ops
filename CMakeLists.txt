@@ -126,6 +126,14 @@ target_include_directories(beacon_detect PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(beacon_detect PRIVATE m)
 list(APPEND SSO_TARGETS beacon_detect)
 
+# SatNOGS-style waterfall renderer: raw int16 IQ → viridis PNG.
+# Self-contained — no libpng or libz dependency (stored-DEFLATE PNG +
+# inlined radix-2 FFT). simple_sat_ops invokes it for `:spectrum N` and
+# end-of-pass renders when an IQ sidecar is available.
+add_executable(gen_waterfall utils/gen_waterfall.c)
+target_link_libraries(gen_waterfall PRIVATE m)
+list(APPEND SSO_TARGETS gen_waterfall)
+
 # ----- Optional: OpenSSL-dependent (libcrypto) ------------------------------
 
 if (OPENSSL_FOUND)

@@ -241,8 +241,11 @@ void b210_rx_tx_core_close(b210_rx_tx_core_t *c)
     free(c);
 }
 
-ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *c, int16_t *pcm_out, size_t pcm_cap)
+ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *c, int16_t *pcm_out, size_t pcm_cap,
+                             int16_t *iq_out, size_t iq_cap,
+                             size_t *out_iq_pairs)
 {
+    if (out_iq_pairs) *out_iq_pairs = 0;
     if (c == NULL || pcm_out == NULL || pcm_cap == 0) return -1;
 
     // Decide how much IQ to ask UHD for. With decimation by M, each
@@ -321,6 +324,18 @@ ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *c, int16_t *pcm_out, size_t pcm_
         }
         c->iq_peak_env = env;
         c->iq_rms_sq   = rms;
+    }
+
+    // IQ tap: copy the post-decim IQ stream to the caller's buffer
+    // before we run the discriminator on it. Same sample timing as
+    // the PCM output (one IQ pair per PCM sample) so a downstream
+    // recorder can pair them. Caller decides the cap; the count we
+    // actually delivered lands in *out_iq_pairs.
+    if (iq_out != NULL && iq_cap >= 2) {
+        size_t pairs = n_demod;
+        if (pairs * 2 > iq_cap) pairs = iq_cap / 2;
+        memcpy(iq_out, iq_demod, pairs * 2 * sizeof(int16_t));
+        if (out_iq_pairs) *out_iq_pairs = pairs;
     }
 
     // FM discriminator: pcm[k] = arg(z[k] * conj(z[k-1])) * k_scale,

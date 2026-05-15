@@ -155,6 +155,7 @@ typedef struct {
     int     rx_ribbon_n;
     char    rx_ribbon[SSO_RIBBON_MAX + 1];  // '.' / '-' chars per second + nul
     int8_t  rx_ribbon_peak[SSO_RIBBON_MAX]; // peak dBFS per second (parallel)
+    char    rx_warning[80];                  // optional rx-panel warning row
 } sso_event_t;
 
 void sso_event_init(sso_event_t *evt, sso_event_type_t type);

@@ -78,12 +78,21 @@ void b210_rx_tx_core_close(b210_rx_tx_core_t *core);
 // the prev-IQ phase reference across calls. pcm_cap should be at least
 // b210_rx_tx_core_max_chunk(core) — short caps just truncate the chunk.
 //
+// iq_out is an optional tap on the post-decimation IQ stream — the same
+// samples the FM discriminator runs on. When non-NULL, the call copies
+// up to (iq_cap / 2) IQ pairs (interleaved I,Q int16) into the buffer,
+// returning the IQ count in *out_iq_pairs. Pass NULL for both iq_out
+// and out_iq_pairs to keep the existing PCM-only behaviour. Use this
+// to write a sidecar IQ recording without re-running the FIR.
+//
 // Return:
 //   > 0  number of PCM samples written
 //   = 0  transient UHD error (overflow / timeout) — keep looping
 //   < 0  fatal UHD error — bail
 ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *core,
-                          int16_t *pcm_out, size_t pcm_cap);
+                          int16_t *pcm_out, size_t pcm_cap,
+                          int16_t *iq_out, size_t iq_cap,
+                          size_t *out_iq_pairs);
 
 // Issue a tune request on RX channel 0. The streamer keeps running.
 // Return: 0 on success, -1 on UHD error.

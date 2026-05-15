@@ -91,6 +91,14 @@ void rx_session_wav_snapshot(const rx_session_t *rxs,
                              int      *out_sample_rate,
                              int      *out_active);
 
+// Companion snapshot for the IQ sidecar (raw interleaved int16 I,Q at
+// the post-decim sample rate). Pairs counts complex samples written.
+// Same path-persistence semantics as wav_snapshot.
+void rx_session_iq_snapshot(const rx_session_t *rxs,
+                            char *out_path, size_t path_cap,
+                            long *out_pairs,
+                            int  *out_sample_rate);
+
 // Sync: hand a TX burst request to the worker, block until it pauses
 // RX, transmits, and resumes RX. Returns the burst's outcome plus a
 // short one-line summary suitable for the operator's TX log.

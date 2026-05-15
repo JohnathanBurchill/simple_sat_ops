@@ -176,6 +176,7 @@ struct rx_session {
     // Allocated scratch.
     int16_t *pcm_chunk;
     size_t   max_chunk;
+    int16_t *iq_chunk;   // 2 * max_chunk int16: interleaved I,Q pairs
     int16_t *window;
     size_t   window_filled;
     uint8_t *bits_scratch;
@@ -196,6 +197,14 @@ struct rx_session {
     char     log_path[512];
     char     pass_folder[256];
     int      want_wav;
+
+    // Raw IQ sidecar (interleaved int16 I,Q at samp_rate). Opens/closes
+    // in lockstep with the WAV so each pass produces both a .wav and a
+    // .iq with the same UTC stamp. The .iq feeds gen_waterfall to make
+    // SatNOGS-style waterfalls; the WAV stays as the FM-demoded audio.
+    FILE     *iq_fp;
+    char      iq_path[512];
+    uint64_t  iq_pairs_written;
 
     // Frame counters + last-decoded summary.
     uint64_t frames_total;
@@ -255,6 +264,8 @@ struct rx_session {
     uint8_t  snap_per_type_last_payload[RX_PT_COUNT][RX_LAST_PAYLOAD_MAX];
     char     snap_wav_path[512];
     long     snap_wav_n_samples;
+    char     snap_iq_path[512];
+    long     snap_iq_pairs;
 };
 
 static void *rx_session_thread_fn(void *arg);
@@ -304,13 +315,14 @@ int rx_session_open(rx_session_t **out, const rx_session_params_t *p,
 
     rxs->max_chunk = b210_rx_tx_core_max_chunk(core);
     if (rxs->max_chunk == 0) rxs->max_chunk = 2040;
-    rxs->pcm_chunk   = malloc(rxs->max_chunk * sizeof(int16_t));
-    rxs->window      = malloc(rxs->window_samples * sizeof(int16_t));
-    rxs->bits_cap    = rxs->window_samples + 8;
+    rxs->pcm_chunk     = malloc(rxs->max_chunk * sizeof(int16_t));
+    rxs->iq_chunk      = malloc(rxs->max_chunk * 2 * sizeof(int16_t));
+    rxs->window        = malloc(rxs->window_samples * sizeof(int16_t));
+    rxs->bits_cap      = rxs->window_samples + 8;
     rxs->bits_scratch  = malloc(rxs->bits_cap);
-    rxs->bytes_cap   = rxs->bits_cap / 8 + 1;
+    rxs->bytes_cap     = rxs->bits_cap / 8 + 1;
     rxs->bytes_scratch = malloc(rxs->bytes_cap);
-    if (!rxs->pcm_chunk || !rxs->window
+    if (!rxs->pcm_chunk || !rxs->iq_chunk || !rxs->window
         || !rxs->bits_scratch || !rxs->bytes_scratch) {
         rx_session_close(rxs);
         return -1;
@@ -382,6 +394,21 @@ static void worker_wav_start(rx_session_t *rxs)
         rxs->wav_path[0] = '\0';
         return;
     }
+    // Open the IQ sidecar — same base name, .iq extension. Raw int16
+    // I,Q pairs at samp_rate; gen_waterfall reads them straight. If the
+    // open fails we keep the WAV open (so the audio path still works)
+    // and just leave iq_fp NULL so subsequent pumps skip the write.
+    size_t wlen = strlen(rxs->wav_path);
+    if (wlen >= 4 && strcmp(rxs->wav_path + wlen - 4, ".wav") == 0) {
+        snprintf(rxs->iq_path, sizeof rxs->iq_path,
+                 "%.*s.iq", (int)(wlen - 4), rxs->wav_path);
+    } else {
+        snprintf(rxs->iq_path, sizeof rxs->iq_path,
+                 "%s.iq", rxs->wav_path);
+    }
+    rxs->iq_fp = fopen(rxs->iq_path, "wb");
+    rxs->iq_pairs_written = 0;
+    if (rxs->iq_fp == NULL) rxs->iq_path[0] = '\0';
     // No stderr print on success either — operator sees [REC] in the
     // UI, and the WAV path is auto-named from the same UTC stamp as
     // every other artifact in the pass folder.
@@ -389,8 +416,11 @@ static void worker_wav_start(rx_session_t *rxs)
 
 static void worker_wav_stop(rx_session_t *rxs)
 {
-    if (rxs->wav.fp == NULL) return;
-    wav_w_close(&rxs->wav);
+    if (rxs->wav.fp != NULL) wav_w_close(&rxs->wav);
+    if (rxs->iq_fp != NULL) {
+        fclose(rxs->iq_fp);
+        rxs->iq_fp = NULL;
+    }
 }
 
 void rx_session_request_wav_start(rx_session_t *rxs)
@@ -440,6 +470,24 @@ void rx_session_wav_snapshot(const rx_session_t *rxs,
     if (out_n_samples)    *out_n_samples   = rxs->snap_wav_n_samples;
     if (out_sample_rate)  *out_sample_rate = rxs->samp_rate;
     if (out_active)       *out_active      = rxs->snap_wav_active;
+    pthread_mutex_unlock((pthread_mutex_t *) &rxs->mu);
+}
+
+void rx_session_iq_snapshot(const rx_session_t *rxs,
+                            char *out_path, size_t path_cap,
+                            long *out_pairs,
+                            int  *out_sample_rate)
+{
+    if (out_path && path_cap)  out_path[0]       = '\0';
+    if (out_pairs)             *out_pairs        = 0;
+    if (out_sample_rate)       *out_sample_rate  = 0;
+    if (rxs == NULL) return;
+    pthread_mutex_lock((pthread_mutex_t *) &rxs->mu);
+    if (out_path && path_cap) {
+        snprintf(out_path, path_cap, "%s", rxs->snap_iq_path);
+    }
+    if (out_pairs)        *out_pairs       = rxs->snap_iq_pairs;
+    if (out_sample_rate)  *out_sample_rate = rxs->samp_rate;
     pthread_mutex_unlock((pthread_mutex_t *) &rxs->mu);
 }
 
@@ -497,11 +545,13 @@ void rx_session_close(rx_session_t *rxs)
         pthread_cond_destroy (&rxs->cv);
         pthread_mutex_destroy(&rxs->mu);
     }
-    // Worker exited, so we own the wav/core/db scratch outright.
+    // Worker exited, so we own the wav/iq/core/db scratch outright.
     if (rxs->wav.fp) wav_w_close(&rxs->wav);
+    if (rxs->iq_fp)  { fclose(rxs->iq_fp); rxs->iq_fp = NULL; }
     if (rxs->core)   b210_rx_tx_core_close(rxs->core);
     if (rxs->db)     packet_db_close(rxs->db);
     free(rxs->pcm_chunk);
+    free(rxs->iq_chunk);
     free(rxs->window);
     free(rxs->bits_scratch);
     free(rxs->bytes_scratch);
@@ -620,11 +670,25 @@ static void try_decode_at_window(rx_session_t *rxs)
 // PCM into the WAV and the decode window.
 static int worker_pump_once(rx_session_t *rxs)
 {
+    // Pass the IQ tap buffer through so the core copies post-decim IQ
+    // alongside the FM-demoded PCM. iq_pairs may be less than n on the
+    // very first pump (the discriminator emits a leading zero for the
+    // missing prev-sample) — that's fine; we write only what the core
+    // actually delivered.
+    size_t iq_pairs = 0;
     ssize_t n = b210_rx_tx_core_pump(rxs->core, rxs->pcm_chunk,
-                                     rxs->max_chunk);
+                                     rxs->max_chunk,
+                                     rxs->iq_chunk, rxs->max_chunk * 2,
+                                     &iq_pairs);
     if (n < 0) return -1;
     if (n == 0) return 0;
     if (rxs->wav.fp) wav_w_append(&rxs->wav, rxs->pcm_chunk, (size_t) n);
+    if (rxs->iq_fp && iq_pairs > 0) {
+        size_t want = iq_pairs * 2;  // int16 count
+        if (fwrite(rxs->iq_chunk, sizeof(int16_t), want, rxs->iq_fp) == want) {
+            rxs->iq_pairs_written += iq_pairs;
+        }
+    }
 
     for (ssize_t i = 0; i < n; i++) {
         rxs->window[rxs->window_filled++] = rxs->pcm_chunk[i];
@@ -651,11 +715,16 @@ static void worker_update_snapshot(rx_session_t *rxs)
     rxs->snap_actual_freq_hz = freq;
     rxs->snap_wav_active     = wav_active;
     rxs->snap_wav_n_samples  = (long) rxs->wav.n_samples;
-    // Persist the last-known wav path even after a close so that the
-    // end-of-pass renderer (which runs post-close) can still find it.
+    rxs->snap_iq_pairs       = (long) rxs->iq_pairs_written;
+    // Persist the last-known paths even after a close so that the
+    // end-of-pass renderer (which runs post-close) can still find them.
     if (rxs->wav_path[0]) {
         snprintf(rxs->snap_wav_path, sizeof rxs->snap_wav_path,
                  "%s", rxs->wav_path);
+    }
+    if (rxs->iq_path[0]) {
+        snprintf(rxs->snap_iq_path, sizeof rxs->snap_iq_path,
+                 "%s", rxs->iq_path);
     }
     snprintf(rxs->snap_last_frame_ts, sizeof rxs->snap_last_frame_ts,
              "%.*s", (int)(sizeof rxs->snap_last_frame_ts - 1),

@@ -49,6 +49,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -119,6 +120,50 @@ static void ribbon_push(double peak_dbfs)
     g_ribbon_push_count++;
 }
 
+// Low-disk warning. statvfs on the pass folder filesystem; rendered in
+// the RX panel when free space dips below LOW_DISK_BYTES. Re-checked
+// every LOW_DISK_PERIOD_S seconds so we don't statvfs on every redraw.
+#define LOW_DISK_BYTES   ((uint64_t)10 * 1000 * 1000 * 1000)
+#define LOW_DISK_PERIOD_S 30.0
+static char   g_low_disk_msg[80] = "";
+static double g_low_disk_last_t  = 0.0;
+// Tentative declaration so low_disk_refresh can reference g_pass_folder
+// without reordering the whole file; the definition with an initialiser
+// lives further down.
+static char   g_pass_folder[256];
+
+// Returns bytes available to a non-privileged user on the filesystem
+// hosting `path`. Returns (uint64_t) -1 on error or when path is empty.
+static uint64_t free_disk_bytes(const char *path)
+{
+    if (path == NULL || path[0] == '\0') return (uint64_t) -1;
+    struct statvfs s;
+    if (statvfs(path, &s) != 0) return (uint64_t) -1;
+    return (uint64_t) s.f_bavail * (uint64_t) s.f_frsize;
+}
+
+// Refresh g_low_disk_msg if the period has elapsed. Empty message
+// means "above threshold" — render_rx_panel skips the row in that case.
+static void low_disk_refresh(double t_now)
+{
+    if ((t_now - g_low_disk_last_t) < LOW_DISK_PERIOD_S
+        && g_low_disk_last_t != 0.0) return;
+    g_low_disk_last_t = t_now;
+    const char *probe = g_pass_folder[0] ? g_pass_folder : ".";
+    uint64_t avail = free_disk_bytes(probe);
+    if (avail == (uint64_t) -1) {
+        g_low_disk_msg[0] = '\0';
+        return;
+    }
+    if (avail >= LOW_DISK_BYTES) {
+        g_low_disk_msg[0] = '\0';
+        return;
+    }
+    double gb = (double) avail / 1.0e9;
+    snprintf(g_low_disk_msg, sizeof g_low_disk_msg,
+             "LOW DISK: %.2f GB free at %s", gb, probe);
+}
+
 // Spectrogram render job. The `:spectrum N` REPL command snapshots the
 // last N seconds of the live WAV (which the rx_session worker is still
 // appending to), copies them into a temporary WAV, and shells out to
@@ -135,15 +180,63 @@ typedef struct spectrum_job {
     pthread_t       thr;
     int             active;          // 1 once the thread has been launched
     volatile int    done;            // worker sets to 1 just before return
+    // Source — pick one. When iq_in[0] is non-empty the worker renders
+    // a SatNOGS-style waterfall via gen_waterfall(1) on the IQ slice;
+    // otherwise it falls back to the FM-demod WAV slice through ffmpeg.
     char            wav_in[512];
     int             sample_rate;
     long            start_sample;
     long            n_samples;
+    char            iq_in[512];
+    int             iq_sample_rate;
+    long             iq_start_pair;
+    long             iq_pairs;
     char            png_out[640];
     char            status_msg[1024];
 } spectrum_job_t;
 
 static spectrum_job_t g_spec_job;
+
+// Render a full IQ recording with gen_waterfall — SatNOGS-style
+// viridis waterfall, no ffmpeg dependency, signals pop against a
+// flat median-subtracted noise floor. Returns 0 on success, -1 on
+// fork/exec failure or non-zero gen_waterfall exit.
+static int generate_full_iq_waterfall(const char *iq_path, int rate_hz,
+                                      char *png_out, size_t png_cap)
+{
+    if (iq_path == NULL || rate_hz <= 0) return -1;
+    size_t len = strlen(iq_path);
+    char png[640];
+    int n;
+    if (len >= 3 && strcmp(iq_path + len - 3, ".iq") == 0) {
+        n = snprintf(png, sizeof png, "%.*s_waterfall.png",
+                     (int)(len - 3), iq_path);
+    } else {
+        n = snprintf(png, sizeof png, "%s_waterfall.png", iq_path);
+    }
+    if (n <= 0 || (size_t) n >= sizeof png) return -1;
+    char rate_buf[16];
+    snprintf(rate_buf, sizeof rate_buf, "%d", rate_hz);
+
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        char *args[] = {
+            "gen_waterfall",
+            (char *) iq_path, rate_buf, png,
+            NULL,
+        };
+        execvp("gen_waterfall", args);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        if (png_out && png_cap) snprintf(png_out, png_cap, "%s", png);
+        return 0;
+    }
+    return -1;
+}
 
 // Render a finished WAV directly (no slicing) via ffmpeg. Blocks until
 // ffmpeg exits. Returns 0 on success, -1 on fork/exec/exit failure.
@@ -183,9 +276,86 @@ static int generate_full_spectrogram(const char *wav_path, char *png_out, size_t
     return -1;
 }
 
+// IQ-slice branch of spectrum_worker. Snapshots `j->iq_pairs` pairs
+// starting at `j->iq_start_pair` from the live .iq file, then shells
+// out gen_waterfall on the slice. Returns 0 on success, -1 on failure
+// (the worker fills j->status_msg in either case).
+static int spectrum_worker_iq(spectrum_job_t *j)
+{
+    char tmp_iq[700];
+    snprintf(tmp_iq, sizeof tmp_iq, "%s.tmp.iq", j->png_out);
+
+    FILE *fin = fopen(j->iq_in, "rb");
+    if (fin == NULL) {
+        snprintf(j->status_msg, sizeof j->status_msg,
+                 "spectrum: open %s failed: %s", j->iq_in, strerror(errno));
+        return -1;
+    }
+    if (fseek(fin, j->iq_start_pair * 4, SEEK_SET) != 0) {
+        snprintf(j->status_msg, sizeof j->status_msg,
+                 "spectrum: iq seek failed: %s", strerror(errno));
+        fclose(fin); return -1;
+    }
+    FILE *fout = fopen(tmp_iq, "wb");
+    if (fout == NULL) {
+        snprintf(j->status_msg, sizeof j->status_msg,
+                 "spectrum: open %s failed: %s", tmp_iq, strerror(errno));
+        fclose(fin); return -1;
+    }
+    int16_t buf[4096];     // 1024 pairs per read
+    long remaining = j->iq_pairs;
+    while (remaining > 0) {
+        long want_pairs = remaining > (long)(sizeof buf / 4)
+                        ? (long)(sizeof buf / 4) : remaining;
+        size_t int16_count = (size_t)(want_pairs * 2);
+        size_t got = fread(buf, sizeof(int16_t), int16_count, fin);
+        if (got == 0) break;
+        fwrite(buf, sizeof(int16_t), got, fout);
+        remaining -= (long)(got / 2);
+    }
+    fclose(fin); fclose(fout);
+
+    char rate_buf[16];
+    snprintf(rate_buf, sizeof rate_buf, "%d", j->iq_sample_rate);
+    pid_t pid = fork();
+    int rc = -1;
+    if (pid == 0) {
+        char *args[] = {
+            "gen_waterfall",
+            tmp_iq, rate_buf, j->png_out,
+            NULL,
+        };
+        execvp("gen_waterfall", args);
+        _exit(127);
+    } else if (pid > 0) {
+        int status;
+        if (waitpid(pid, &status, 0) >= 0 && WIFEXITED(status))
+            rc = WEXITSTATUS(status);
+    }
+    unlink(tmp_iq);
+    if (rc == 0) {
+        snprintf(j->status_msg, sizeof j->status_msg,
+                 "spectrum: wrote %s (%.1fs IQ)",
+                 j->png_out,
+                 (double) j->iq_pairs / (double) j->iq_sample_rate);
+        return 0;
+    }
+    snprintf(j->status_msg, sizeof j->status_msg,
+             "spectrum: gen_waterfall failed (rc=%d) for %s", rc, j->png_out);
+    return -1;
+}
+
 static void *spectrum_worker(void *arg)
 {
     spectrum_job_t *j = (spectrum_job_t *) arg;
+    // Prefer the IQ path — gives a real SatNOGS-style waterfall. The
+    // WAV fallback below stays in place for runs where the IQ sidecar
+    // didn't open (e.g., disk full mid-pass).
+    if (j->iq_in[0] && j->iq_pairs > 0 && j->iq_sample_rate > 0) {
+        (void) spectrum_worker_iq(j);
+        j->done = 1;
+        return NULL;
+    }
     char tmp_wav[700];
     snprintf(tmp_wav, sizeof tmp_wav, "%s.tmp.wav", j->png_out);
 
@@ -471,14 +641,38 @@ static void cmd_dispatch(state_t *state)
                             g_spec_job.start_sample = start;
                             g_spec_job.n_samples    = want;
 
+                            // Pair the WAV slice with an IQ slice if the
+                            // sidecar exists — worker prefers IQ and only
+                            // falls back to the WAV+ffmpeg path when iq_in
+                            // is empty.
+                            char iq_path[512] = "";
+                            long iq_pairs = 0;
+                            int  iq_rate  = 0;
+                            rx_session_iq_snapshot(g_rx_session,
+                                                   iq_path, sizeof iq_path,
+                                                   &iq_pairs, &iq_rate);
+                            if (iq_path[0] && iq_pairs > 0 && iq_rate > 0) {
+                                long want_p  = (long)(duration_s * (double) iq_rate);
+                                long start_p = iq_pairs - want_p;
+                                if (start_p < 0) { start_p = 0; want_p = iq_pairs; }
+                                if (want_p > 0) {
+                                    snprintf(g_spec_job.iq_in,
+                                             sizeof g_spec_job.iq_in, "%s", iq_path);
+                                    g_spec_job.iq_sample_rate = iq_rate;
+                                    g_spec_job.iq_start_pair  = start_p;
+                                    g_spec_job.iq_pairs       = want_p;
+                                }
+                            }
+
                             if (pthread_create(&g_spec_job.thr, NULL,
                                                spectrum_worker, &g_spec_job) != 0) {
                                 cmd_set_status("spectrum: pthread_create failed: %s",
                                                strerror(errno));
                             } else {
                                 g_spec_job.active = 1;
-                                cmd_set_status("spectrum: rendering %.1fs -> %s",
+                                cmd_set_status("spectrum: rendering %.1fs (%s) -> %s",
                                                (double) want / (double) sample_rate,
+                                               g_spec_job.iq_in[0] ? "iq" : "wav",
                                                g_spec_job.png_out);
                             }
                         }
@@ -938,6 +1132,8 @@ typedef struct {
     // Parallel array: peak dBFS for the i-th second back. Clamped into
     // int8 (dBFS is naturally -90..0, well inside int8's range).
     int8_t     ribbon_peak[RIBBON_LEN];
+    // Optional warning row (e.g., low-disk). Empty when no warning.
+    char       warning[80];
 } rx_panel_data_t;
 
 // Operator-side collector. Reads the live rx_session + g_ribbon globals
@@ -993,6 +1189,9 @@ static void rx_panel_collect_local(rx_panel_data_t *d)
     d->ribbon[n] = '\0';
     d->ribbon_n  = n;
 #endif
+    // Warning row is filled regardless of the B210 build — even without
+    // an SDR the operator could be running short on disk for logs.
+    snprintf(d->warning, sizeof d->warning, "%s", g_low_disk_msg);
 }
 
 // Render the RX panel from a snapshot. Compiles even without UHD —
@@ -1008,6 +1207,14 @@ static void render_rx_panel(const rx_panel_data_t *d,
              d->have_session ? "active" : "(offline)",
              d->rec_active ? "  [REC]" : "");
     clrtoeol();
+    if (d->warning[0]) {
+        // Red attribute pair 1 was initialised in init_window; fall
+        // back gracefully if colors aren't available.
+        attron(COLOR_PAIR(1) | A_BOLD);
+        mvprintw(row++, col, "%15s   %s", "WARNING", d->warning);
+        attroff(COLOR_PAIR(1) | A_BOLD);
+        clrtoeol();
+    }
     if (!d->have_session) {
         *print_row = row;
         return;
@@ -1110,6 +1317,9 @@ static void ipc_fill_rx_panel(sso_event_t *evt)
     rx_panel_data_t d;
     rx_panel_collect_local(&d);
     evt->rx_have_session = d.have_session;
+    // Warning row is operator-wide (e.g. low disk), not gated on the
+    // SDR — fill it before the have_session early-return.
+    snprintf(evt->rx_warning, sizeof evt->rx_warning, "%s", d.warning);
     if (!d.have_session) return;
     evt->rx_rec_active   = d.rec_active;
     evt->rx_freq_hz      = d.rx_freq_hz;
@@ -2707,6 +2917,8 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
     // doesn't carry stale state from a previous event.
     memset(&g_viewer_rx_panel, 0, sizeof g_viewer_rx_panel);
     g_viewer_rx_panel.have_session  = evt->rx_have_session;
+    snprintf(g_viewer_rx_panel.warning, sizeof g_viewer_rx_panel.warning,
+             "%s", evt->rx_warning);
     if (evt->rx_have_session) {
         g_viewer_rx_panel.rec_active     = evt->rx_rec_active;
         g_viewer_rx_panel.rx_freq_hz     = evt->rx_freq_hz;
@@ -3500,6 +3712,9 @@ int main(int argc, char **argv)
             col = 50;
             report_position(&state, &row, col);
             row++;
+            // Refresh the low-disk warning lazily — statvfs every 30 s
+            // is plenty given how slowly disk fills.
+            low_disk_refresh(t_now);
             rx_panel_data_t rxd;
             rx_panel_collect_local(&rxd);
             render_rx_panel(&rxd, &row, 50);
@@ -3718,23 +3933,29 @@ int main(int argc, char **argv)
     }
 #ifdef WITH_USRP_B210
     char final_wav_path[512] = "";
+    char final_iq_path[512]  = "";
+    int  final_iq_rate       = 0;
     if (g_rx_session) {
-        // Snapshot the WAV path before close so the full-pass spectrogram
-        // can find the closed file on disk. snap_wav_path persists across
-        // wav_stop, so this works even if recording was already stopped.
+        // Snapshot both sidecar paths before close so the full-pass
+        // renderers can find the closed files on disk. Both paths
+        // persist across wav_stop in rx_session.
         rx_session_wav_snapshot(g_rx_session,
                                 final_wav_path, sizeof final_wav_path,
                                 NULL, NULL, NULL);
+        rx_session_iq_snapshot(g_rx_session,
+                               final_iq_path, sizeof final_iq_path,
+                               NULL, &final_iq_rate);
         // The worker owns the WAV writer and the B210 core. Closing
         // the session signals the worker to stop, joins it, then
-        // tears down both. Any open WAV gets its header patched.
+        // tears down both. Any open WAV / .iq gets its header patched
+        // (WAV) or its trailer flushed (IQ).
         rx_session_request_wav_stop(g_rx_session);
         rx_session_close(g_rx_session);
         g_rx_session = NULL;
     }
 
-    // Any in-flight `:spectrum N` worker is touching the same WAV — let
-    // it finish before we hand the file to the full-pass render.
+    // Any in-flight `:spectrum N` worker is touching the same WAV / IQ
+    // — let it finish before we hand the file to the full-pass render.
     if (g_spec_job.active) {
         pthread_join(g_spec_job.thr, NULL);
         g_spec_job.active = 0;
@@ -3743,11 +3964,27 @@ int main(int argc, char **argv)
         }
     }
 
-    // Full-pass spectrogram. Best-effort: prints status to stderr (the
-    // ncurses screen is already torn down). Skipped silently if no WAV
-    // was ever opened or ffmpeg isn't on PATH (exec returns 127, which
-    // generate_full_spectrogram reports as a -1 return).
-    if (final_wav_path[0]) {
+    // Full-pass renderer. Prefer the IQ → gen_waterfall path because it
+    // gives SatNOGS-style waterfalls (real complex FFT, median-subtracted
+    // floor, viridis). Fall back to the FM-demod WAV via ffmpeg when the
+    // IQ sidecar isn't on disk (e.g., disk full, mid-pass shutdown).
+    int did_iq = 0;
+    if (final_iq_path[0] && final_iq_rate > 0) {
+        struct stat st;
+        if (stat(final_iq_path, &st) == 0 && st.st_size > 0) {
+            char png[640];
+            if (generate_full_iq_waterfall(final_iq_path, final_iq_rate,
+                                            png, sizeof png) == 0) {
+                fprintf(stderr, "simple_sat_ops: waterfall -> %s\n", png);
+                did_iq = 1;
+            } else {
+                fprintf(stderr,
+                    "simple_sat_ops: gen_waterfall failed for %s "
+                    "(gen_waterfall on PATH?)\n", final_iq_path);
+            }
+        }
+    }
+    if (!did_iq && final_wav_path[0]) {
         struct stat st;
         if (stat(final_wav_path, &st) == 0 && st.st_size > 44) {
             char png[640];
