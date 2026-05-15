@@ -1204,7 +1204,8 @@ static void generate_pass_plot(state_t *state, const char *pass_folder,
             ? state->prediction.satellite_ephem.name : "satellite";
 
     // Mirror scripts/plot_sky_pass.sh's polar style so both plots read
-    // the same way (N up, E clockwise, zenith at centre).
+    // the same way (N up, E clockwise, zenith at centre). Solid darker
+    // grid + elevation-valued rtics so the reticules are readable.
     fprintf(gp,
         "set terminal pngcairo size 900,900 enhanced font 'Helvetica,11'\n"
         "set output '%s/az_el_plot.png'\n"
@@ -1212,16 +1213,27 @@ static void generate_pass_plot(state_t *state, const char *pass_folder,
         "set angles degrees\n"
         "set theta top clockwise\n"
         "set size square\n"
-        "set grid polar 30\n"
+        // Explicit margins so the W cardinal label isn't clipped on the
+        // left and the legend has room on the right.
+        "set lmargin 8\n"
+        "set rmargin 14\n"
+        "set tmargin 4\n"
+        "set bmargin 4\n"
+        "set grid polar 30 lt 1 lw 0.6 lc rgb '#666666'\n"
         "unset border\n"
         "unset xtics\n"
         "unset ytics\n"
         "set rrange [0:90]\n"
-        "set rtics (30, 60)\n"
-        "set ttics ('N' 0, 'E' 90, 'S' 180, 'W' 270)\n"
+        // Label the rings with the elevation they correspond to (r = 90
+        // - el): inner ring = 60 deg el, outer ring = 0 deg el (horizon);
+        // centre is zenith (90 deg el) and the title says so.
+        "set rtics ('60' 30, '30' 60, '0' 90) "
+              "font 'Helvetica,9' textcolor rgb '#333333'\n"
+        "set ttics ('N' 0, 'E' 90, 'S' 180, 'W' 270) "
+              "font 'Helvetica,11,Bold'\n"
         "set key outside right top\n"
         "set title \"%s  max_el=%.1f deg  flip=%s\\n"
-                  "(zenith=centre, horizon=outer ring)\" noenhanced\n"
+                  "(zenith = centre; ring labels = elevation deg)\" noenhanced\n"
         "plot \\\n"
         "  '%s/pass_plot.dat' using 2:(90-$3) "
             "with lines lw 2 lc rgb '#1f77b4' title 'satellite', \\\n"
