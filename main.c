@@ -2840,7 +2840,9 @@ static void auto_tcmd_tick(state_t *state) {
     g_tx_request.tx_gain_db       = atof(a->power);
     g_tx_request.repeat           = 1;
     g_tx_request.gap_ms           = 200;
-    g_tx_request.allow_tx         = a->allow_tx;
+    // No g_tx_request.allow_tx field — the TX-inhibit gate is enforced
+    // at auto_tcmd_start time (refuses to enter RUNNING unless allow_tx
+    // is ticked), same way tx_compose_validate handles it before commit.
     g_tx_request.allow_high_power = 0;
     g_tx_request.allow_hf_tx      = 0;
     snprintf(g_tx_request.summary, sizeof g_tx_request.summary,
