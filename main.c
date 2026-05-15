@@ -299,6 +299,7 @@ static void spectrum_job_reap(void)
 static int  g_cmd_active = 0;
 static char g_cmd_buf[CMD_BUF_SIZE];
 static int  g_cmd_len = 0;
+static int  g_cmd_cursor = 0;            // 0..g_cmd_len; insert position
 static char g_cmd_status[160] = "";
 // cmd-preview debounce state. cmd_dirty is set every time the buffer is
 // edited (or :  is entered fresh); the main loop broadcasts a preview
@@ -320,6 +321,7 @@ static void cmd_enter(void)
     g_cmd_active = 1;
     g_cmd_buf[0] = '\0';
     g_cmd_len = 0;
+    g_cmd_cursor = 0;
     // Force an immediate preview broadcast so viewers see the ":" prompt
     // appear the moment the operator opens it.
     g_cmd_dirty = 1;
@@ -540,6 +542,9 @@ static void cmd_broadcast_executed(const char *executed_cmd)
 }
 
 // Returns 1 if key was consumed by the command line, 0 to fall through.
+// Supports left/right cursor movement, mid-line insert + delete, Home/
+// End jumps, and Enter from any cursor position. The viewer's cmd_text
+// wire field carries the buffer verbatim; cursor position stays local.
 static int cmd_handle_key(int key, state_t *state)
 {
     if (!g_cmd_active) return 0;
@@ -550,6 +555,7 @@ static int cmd_handle_key(int key, state_t *state)
         // Tell viewers the draft is gone — empty preview, no result.
         g_cmd_buf[0] = '\0';
         g_cmd_len = 0;
+        g_cmd_cursor = 0;
         cmd_broadcast_executed("");
         g_cmd_dirty = 0;
         return 1;
@@ -565,17 +571,54 @@ static int cmd_handle_key(int key, state_t *state)
         g_cmd_dirty = 0;
         return 1;
     }
+    if (key == KEY_LEFT) {
+        if (g_cmd_cursor > 0) g_cmd_cursor--;
+        return 1;
+    }
+    if (key == KEY_RIGHT) {
+        if (g_cmd_cursor < g_cmd_len) g_cmd_cursor++;
+        return 1;
+    }
+    if (key == KEY_HOME || key == 1 /* Ctrl-A */) {
+        g_cmd_cursor = 0;
+        return 1;
+    }
+    if (key == KEY_END || key == 5 /* Ctrl-E */) {
+        g_cmd_cursor = g_cmd_len;
+        return 1;
+    }
     if (key == KEY_BACKSPACE || key == 127 || key == 8) {
-        if (g_cmd_len > 0) {
-            g_cmd_buf[--g_cmd_len] = '\0';
+        if (g_cmd_cursor > 0) {
+            // Shift the tail one char left over the deleted slot.
+            memmove(&g_cmd_buf[g_cmd_cursor - 1],
+                    &g_cmd_buf[g_cmd_cursor],
+                    (size_t)(g_cmd_len - g_cmd_cursor + 1));  // include nul
+            g_cmd_len--;
+            g_cmd_cursor--;
             g_cmd_dirty = 1;
             g_cmd_last_edit_ns = cmd_now_ns();
         }
         return 1;
     }
-    if (key >= 32 && key < 127 && g_cmd_len < (int)sizeof g_cmd_buf - 1) {
-        g_cmd_buf[g_cmd_len++] = (char)key;
-        g_cmd_buf[g_cmd_len] = '\0';
+    if (key == KEY_DC /* forward delete */ || key == 4 /* Ctrl-D */) {
+        if (g_cmd_cursor < g_cmd_len) {
+            memmove(&g_cmd_buf[g_cmd_cursor],
+                    &g_cmd_buf[g_cmd_cursor + 1],
+                    (size_t)(g_cmd_len - g_cmd_cursor));  // include nul
+            g_cmd_len--;
+            g_cmd_dirty = 1;
+            g_cmd_last_edit_ns = cmd_now_ns();
+        }
+        return 1;
+    }
+    if (key >= 32 && key < 127 && g_cmd_len < (int) sizeof g_cmd_buf - 1) {
+        // Insert at cursor: shift the tail right by one, drop char in.
+        memmove(&g_cmd_buf[g_cmd_cursor + 1],
+                &g_cmd_buf[g_cmd_cursor],
+                (size_t)(g_cmd_len - g_cmd_cursor + 1));  // include nul
+        g_cmd_buf[g_cmd_cursor] = (char) key;
+        g_cmd_len++;
+        g_cmd_cursor++;
         g_cmd_dirty = 1;
         g_cmd_last_edit_ns = cmd_now_ns();
     }
@@ -583,13 +626,25 @@ static int cmd_handle_key(int key, state_t *state)
 }
 
 // Render the command prompt (or last-result status) on the bottom row.
+// Cursor is drawn as a reverse-video block on the char at g_cmd_cursor
+// — or on a trailing space when the cursor is at end-of-line. The
+// surrounding text is plain so cursor position is unambiguous.
 static void cmd_render(void)
 {
     int row = LINES - 1;
     if (g_cmd_active) {
-        mvprintw(row, 0, ":%s", g_cmd_buf);
-        // Visible cursor block at the typing position.
-        addch(' ' | A_REVERSE);
+        move(row, 0);
+        addch(':');
+        for (int i = 0; i < g_cmd_len; ++i) {
+            if (i == g_cmd_cursor) {
+                addch(((unsigned char) g_cmd_buf[i]) | A_REVERSE);
+            } else {
+                addch((unsigned char) g_cmd_buf[i]);
+            }
+        }
+        if (g_cmd_cursor == g_cmd_len) {
+            addch(' ' | A_REVERSE);
+        }
     } else if (g_cmd_status[0]) {
         mvprintw(row, 0, "%s", g_cmd_status);
     } else {
@@ -2113,6 +2168,12 @@ void init_window(void)
     timeout(0);
     intrflush(stdscr, FALSE);
     keypad(stdscr, TRUE);
+    // ncurses defaults ESCDELAY to 1000 ms — fine for distinguishing
+    // bare Esc from the leading byte of a function-key sequence, but
+    // makes Esc-to-cancel and arrow-key composition feel sluggish.
+    // 25 ms is the conventional snappy value; any real escape sequence
+    // arrives in a few ms so this isn't tight.
+    set_escdelay(25);
     start_color();
     init_pair(1, COLOR_RED, COLOR_BLACK);
     init_pair(2, COLOR_YELLOW, COLOR_BLACK);
