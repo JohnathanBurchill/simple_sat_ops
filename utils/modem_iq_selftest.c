@@ -32,6 +32,7 @@
 
 #include "modem.h"
 #include "modem_iq.h"
+#include "modem_viterbi.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -441,6 +442,199 @@ static int test_low_snr_ab(void)
     return fails;
 }
 
+// ------------------------------------------------------------------
+// Viterbi-MLSE checks. Same modulator output as the slicer tests so
+// the comparison is apples-to-apples on the same RF.
+// ------------------------------------------------------------------
+
+static int test_viterbi_clean(void)
+{
+    const int samp_rate = 48000;
+    const int bit_rate  = 9600;
+    const size_t preamble_bits = 64;
+    const size_t payload_bits  = 8 * 64;
+    const size_t total_bits = preamble_bits + 32 + payload_bits;
+    int sps = samp_rate / bit_rate;
+    size_t n_pairs = total_bits * (size_t) sps;
+
+    uint8_t *bits     = malloc(total_bits);
+    int16_t *iq       = malloc(n_pairs * 2 * sizeof(int16_t));
+    uint8_t *out_bits = malloc(total_bits + 1024);
+    if (!bits || !iq || !out_bits) { free(bits); free(iq); free(out_bits); return 1; }
+
+    size_t nb = build_test_frame(bits, total_bits, preamble_bits, payload_bits);
+    mod_params_t mp = { samp_rate, bit_rate, 0.5, 0.5 };
+    cpfsk_modulate(bits, nb, &mp, iq);
+
+    modem_params_t p;
+    modem_params_defaults(&p);
+    p.samp_rate = samp_rate;
+    p.bit_rate  = bit_rate;
+    p.rx_disable_dc_block = 1;
+
+    size_t n_out = 0, sync_off = 0;
+    int polarity = -1;
+    int rc = modem_iq_viterbi_to_bits(iq, n_pairs, &p,
+                                      0, 0, 0,
+                                      out_bits, &n_out, &sync_off, &polarity);
+
+    int fails = 0;
+    fails += check(rc == 0, "viterbi clean: ASM found");
+    if (rc == 0) {
+        size_t expected = preamble_bits;
+        long delta = (long) sync_off - (long) expected;
+        if (delta < 0) delta = -delta;
+        fails += check(delta <= 6, "viterbi clean: ASM offset near expected");
+
+        size_t mismatches = 0;
+        size_t check_bits = payload_bits;
+        if (n_out < 32 + check_bits) check_bits = n_out >= 32 ? n_out - 32 : 0;
+        for (size_t i = 0; i < check_bits; ++i) {
+            uint8_t got = out_bits[32 + i] & 1u;
+            uint8_t want = bits[preamble_bits + 32 + i] & 1u;
+            if (got != want) ++mismatches;
+        }
+        char msg[128];
+        snprintf(msg, sizeof msg, "viterbi clean: payload BER = %zu/%zu",
+                 mismatches, check_bits);
+        fails += check(mismatches == 0, msg);
+    }
+
+    free(bits); free(iq); free(out_bits);
+    return fails;
+}
+
+static int test_viterbi_silence(void)
+{
+    const int samp_rate = 48000;
+    const int bit_rate  = 9600;
+    const size_t n_pairs = (size_t) samp_rate;
+    int16_t *iq = calloc(n_pairs * 2, sizeof(int16_t));
+    uint8_t *out_bits = malloc(n_pairs);
+    if (!iq || !out_bits) { free(iq); free(out_bits); return 1; }
+
+    modem_params_t p;
+    modem_params_defaults(&p);
+    p.samp_rate = samp_rate;
+    p.bit_rate  = bit_rate;
+    p.rx_disable_dc_block = 1;
+
+    size_t n_out = 0, sync_off = 0;
+    int polarity = -1;
+    int rc = modem_iq_viterbi_to_bits(iq, n_pairs, &p,
+                                      0, 0, 0,
+                                      out_bits, &n_out, &sync_off, &polarity);
+
+    int fails = 0;
+    fails += check(rc != 0, "viterbi silence: no false ASM on zero IQ");
+
+    free(iq); free(out_bits);
+    return fails;
+}
+
+// Aggregate-Monte-Carlo BER comparison between the slicer (modem_iq)
+// and Viterbi MLSE at low SNR. Single-trial AWGN BER is noisy; running
+// a few trials and summing keeps the verdict stable.
+//
+// Theory: for MSK at very low Eb/N0 the differential receiver pays
+// roughly 0.6–1.0 dB versus coherent. The Viterbi recovers most of
+// that. We do NOT require the Viterbi to win every trial — only that
+// the *aggregate* error count is no worse than the slicer plus a
+// modest cushion.
+static int test_viterbi_vs_slicer_low_snr(void)
+{
+    const int samp_rate = 48000;
+    const int bit_rate  = 9600;
+    const size_t preamble_bits = 128;
+    const size_t payload_bits  = 8 * 400;       // 400 B per trial
+    const size_t total_bits = preamble_bits + 32 + payload_bits;
+    int sps = samp_rate / bit_rate;
+    size_t n_pairs = total_bits * (size_t) sps;
+    const double snr_db = 3.0;                  // slicer starts cracking here
+    const int trials = 4;
+
+    uint8_t *bits      = malloc(total_bits);
+    int16_t *iq_clean  = malloc(n_pairs * 2 * sizeof(int16_t));
+    int16_t *iq        = malloc(n_pairs * 2 * sizeof(int16_t));
+    uint8_t *out_slc   = malloc(total_bits + 1024);
+    uint8_t *out_vit   = malloc(total_bits + 1024);
+    if (!bits || !iq_clean || !iq || !out_slc || !out_vit) {
+        free(bits); free(iq_clean); free(iq); free(out_slc); free(out_vit);
+        return 1;
+    }
+
+    size_t nb = build_test_frame(bits, total_bits, preamble_bits, payload_bits);
+    mod_params_t mp = { samp_rate, bit_rate, 0.5, 0.5 };
+    cpfsk_modulate(bits, nb, &mp, iq_clean);
+
+    modem_params_t p;
+    modem_params_defaults(&p);
+    p.samp_rate = samp_rate;
+    p.bit_rate  = bit_rate;
+    p.rx_disable_dc_block = 1;
+
+    size_t total_check = 0;
+    size_t total_mis_slc = 0, total_mis_vit = 0;
+    int slc_sync = 0, vit_sync = 0;
+
+    for (int t = 0; t < trials; ++t) {
+        memcpy(iq, iq_clean, n_pairs * 2 * sizeof(int16_t));
+        add_awgn(iq, n_pairs, mp.amplitude, snr_db);
+
+        size_t n_slc = 0, off_slc = 0;
+        int pol_slc = -1;
+        int rc_slc = modem_iq_to_bits(iq, n_pairs, &p, 0, 4, 0,
+                                      out_slc, &n_slc, &off_slc, &pol_slc);
+
+        size_t n_vit = 0, off_vit = 0;
+        int pol_vit = -1;
+        int rc_vit = modem_iq_viterbi_to_bits(iq, n_pairs, &p, 0, 4, 0,
+                                              out_vit, &n_vit, &off_vit, &pol_vit);
+
+        slc_sync += (rc_slc == 0);
+        vit_sync += (rc_vit == 0);
+
+        if (rc_slc == 0 && rc_vit == 0) {
+            size_t check_bits = payload_bits;
+            if (n_slc < 32 + check_bits) check_bits = n_slc >= 32 ? n_slc - 32 : 0;
+            if (n_vit < 32 + check_bits) check_bits = n_vit >= 32 ? n_vit - 32 : 0;
+            size_t mis_slc = 0, mis_vit = 0;
+            for (size_t i = 0; i < check_bits; ++i) {
+                uint8_t want = bits[preamble_bits + 32 + i] & 1u;
+                if ((out_slc[32 + i] & 1u) != want) ++mis_slc;
+                if ((out_vit[32 + i] & 1u) != want) ++mis_vit;
+            }
+            total_check    += check_bits;
+            total_mis_slc  += mis_slc;
+            total_mis_vit  += mis_vit;
+        }
+    }
+
+    int fails = 0;
+    char msg[160];
+    snprintf(msg, sizeof msg,
+             "viterbi vs slicer @3dB: sync %d/%d (slc) vs %d/%d (vit)",
+             slc_sync, trials, vit_sync, trials);
+    fails += check(vit_sync >= slc_sync, msg);
+
+    if (total_check > 0) {
+        snprintf(msg, sizeof msg,
+                 "viterbi vs slicer @3dB: BER slc=%zu/%zu vs vit=%zu/%zu",
+                 total_mis_slc, total_check, total_mis_vit, total_check);
+        // Cushion: viterbi shouldn't be more than +5 errors over the
+        // slicer across all trials. With ~0.5–1 dB gap and several
+        // thousand bits this is comfortable; lets a single unlucky
+        // trial slide.
+        fails += check(total_mis_vit <= total_mis_slc + 5, msg);
+    } else {
+        printf("INFO  viterbi vs slicer @3dB: no joint syncs to compare\n");
+    }
+
+    free(bits); free(iq_clean); free(iq);
+    free(out_slc); free(out_vit);
+    return fails;
+}
+
 int main(void)
 {
     g_rng = (uint32_t) time(NULL);
@@ -450,6 +644,9 @@ int main(void)
     fails += test_silence();
     fails += test_iq_not_worse_than_pcm();
     fails += test_low_snr_ab();
+    fails += test_viterbi_clean();
+    fails += test_viterbi_silence();
+    fails += test_viterbi_vs_slicer_low_snr();
     printf("modem_iq_selftest: %d failure(s)\n", fails);
     return fails == 0 ? 0 : 1;
 }

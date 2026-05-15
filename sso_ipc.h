@@ -148,6 +148,7 @@ typedef struct {
     double  rx_rms_dbfs;
     long    rx_frames_total;
     long    rx_frames_iq;       // shadow IQ-demod count for A/B
+    long    rx_frames_vit;      // shadow Viterbi-MLSE count for A/B
     char    rx_last_frame_summary[80];
     double  rx_age_s;                   // <0 means "no frame yet"
     long    rx_pt_count[SSO_RX_PT_SLOTS];

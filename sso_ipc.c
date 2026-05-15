@@ -514,6 +514,10 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
                 if (json_field_int(&p, end, &first, "rx_fr_iq",
                                    evt->rx_frames_iq) < 0) return -1;
             }
+            if (evt->rx_frames_vit) {
+                if (json_field_int(&p, end, &first, "rx_fr_vt",
+                                   evt->rx_frames_vit) < 0) return -1;
+            }
             if (evt->rx_last_frame_summary[0]) {
                 if (json_field_str(&p, end, &first, "rx_lf",
                                    evt->rx_last_frame_summary) < 0) return -1;
@@ -724,6 +728,7 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
     long rx_long = 0;
     if (json_get_int(line, "rx_fr", &rx_long) > 0) evt->rx_frames_total = rx_long;
     if (json_get_int(line, "rx_fr_iq", &rx_long) > 0) evt->rx_frames_iq = rx_long;
+    if (json_get_int(line, "rx_fr_vt", &rx_long) > 0) evt->rx_frames_vit = rx_long;
     json_get_string(line, "rx_lf",
                     evt->rx_last_frame_summary,
                     sizeof(evt->rx_last_frame_summary));

@@ -205,6 +205,15 @@ struct rx_session {
     int      iq_recent_count;
     uint64_t iq_frames_total;
 
+    // Third decode chain: MSK-MLSE Viterbi over the same IQ window. Same
+    // measurement role as the IQ slicer above — counts frames only, no
+    // packet_db write, so the live pipeline stays single-source until
+    // the new chain has earned a promotion on real RF.
+    uint64_t vit_recent_pos_quant[DEDUP_RING_SZ];
+    int      vit_recent_idx;
+    int      vit_recent_count;
+    uint64_t vit_frames_total;
+
     // Output paths.
     wav_w_t  wav;
     char     wav_path[512];
@@ -281,6 +290,7 @@ struct rx_session {
     char     snap_iq_path[512];
     long     snap_iq_pairs;
     uint64_t snap_iq_frames_total;
+    uint64_t snap_vit_frames_total;
 };
 
 static void *rx_session_thread_fn(void *arg);
@@ -511,6 +521,15 @@ void rx_session_iq_snapshot(const rx_session_t *rxs,
     if (out_pairs)        *out_pairs       = rxs->snap_iq_pairs;
     if (out_sample_rate)  *out_sample_rate = rxs->samp_rate;
     pthread_mutex_unlock((pthread_mutex_t *) &rxs->mu);
+}
+
+uint64_t rx_session_viterbi_frames(const rx_session_t *rxs)
+{
+    if (!rxs) return 0;
+    pthread_mutex_lock((pthread_mutex_t *) &rxs->mu);
+    uint64_t v = rxs->snap_vit_frames_total;
+    pthread_mutex_unlock((pthread_mutex_t *) &rxs->mu);
+    return v;
 }
 
 uint64_t rx_session_iq_frames(const rx_session_t *rxs)
@@ -754,6 +773,56 @@ static void try_decode_iq_at_window(rx_session_t *rxs)
     }
 }
 
+// Same shape as try_decode_iq_at_window but runs the Viterbi MLSE
+// front-end. Independent dedup ring so a frame all three chains
+// decode counts everywhere (frames_total, iq_frames_total, AND
+// vit_frames_total) — that's the operator's A/B/C signal.
+static void try_decode_viterbi_at_window(rx_session_t *rxs)
+{
+    size_t inner_min_offset = 0;
+    for (;;) {
+        ssize_t plen = -1;
+        int golay_errs = 0, hmac_ok = -1;
+        int rs_errs = -1, used_golay_len = -1;
+        int rs_locs[32];
+        size_t sync_off_local = 0;
+        if (!try_decode_window_viterbi(rxs->iq_window, rxs->window_samples,
+                                       &rxs->mp, &rxs->opts,
+                                       rxs->sync_max_ham, rxs->use_hmac,
+                                       /*allow_partial_rs=*/1,
+                                       inner_min_offset,
+                                       rxs->bits_scratch, rxs->bits_cap,
+                                       rxs->bytes_scratch, rxs->bytes_cap,
+                                       rxs->packet, sizeof rxs->packet,
+                                       &plen, &golay_errs, &hmac_ok,
+                                       &rs_errs, &used_golay_len,
+                                       &sync_off_local, rs_locs)) {
+            break;
+        }
+        inner_min_offset = sync_off_local + 1;
+        if (plen < 4 || (size_t) plen > sizeof rxs->packet) continue;
+
+        uint64_t window_start_abs =
+            rxs->total_window_samples - (uint64_t) rxs->window_samples;
+        uint64_t asm_abs_sample = window_start_abs
+            + (uint64_t) sync_off_local * (uint64_t) rxs->sps
+            + (uint64_t)(rxs->sps / 2);
+        uint64_t pos_quant = asm_abs_sample / rxs->dedup_quant;
+        int seen = 0;
+        int ring_n = rxs->vit_recent_count < DEDUP_RING_SZ
+                   ? rxs->vit_recent_count : DEDUP_RING_SZ;
+        for (int r = 0; r < ring_n; r++) {
+            if (rxs->vit_recent_pos_quant[r] == pos_quant) { seen = 1; break; }
+        }
+        if (seen) continue;
+        rxs->vit_recent_pos_quant[rxs->vit_recent_idx] = pos_quant;
+        rxs->vit_recent_idx = (rxs->vit_recent_idx + 1) % DEDUP_RING_SZ;
+        if (rxs->vit_recent_count < DEDUP_RING_SZ) rxs->vit_recent_count++;
+
+        rxs->vit_frames_total++;
+    }
+}
+
 static int worker_pump_once(rx_session_t *rxs)
 {
     // Pass the IQ tap buffer through so the core copies post-decim IQ
@@ -793,6 +862,7 @@ static int worker_pump_once(rx_session_t *rxs)
         try_decode_at_window(rxs);
         if (rxs->iq_window_filled >= rxs->window_samples) {
             try_decode_iq_at_window(rxs);
+            try_decode_viterbi_at_window(rxs);
         }
         memmove(rxs->window, rxs->window + rxs->slide_samples,
                 (rxs->window_samples - rxs->slide_samples) * sizeof(int16_t));
@@ -823,6 +893,7 @@ static void worker_update_snapshot(rx_session_t *rxs)
     rxs->snap_wav_n_samples  = (long) rxs->wav.n_samples;
     rxs->snap_iq_pairs       = (long) rxs->iq_pairs_written;
     rxs->snap_iq_frames_total = rxs->iq_frames_total;
+    rxs->snap_vit_frames_total = rxs->vit_frames_total;
     // Persist the last-known paths even after a close so that the
     // end-of-pass renderer (which runs post-close) can still find them.
     if (rxs->wav_path[0]) {
