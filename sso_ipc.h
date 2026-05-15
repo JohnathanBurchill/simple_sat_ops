@@ -140,6 +140,7 @@ typedef struct {
     // raw bytes, hex-encoded on the wire.
 #define SSO_RX_PT_SLOTS       6
 #define SSO_RX_PT_PAYLOAD_MAX 64
+#define SSO_RX_PT_SUMMARY_MAX 160
 #define SSO_RIBBON_MAX        60
     int     rx_have_session;
     int     rx_rec_active;
@@ -154,6 +155,7 @@ typedef struct {
     long    rx_pt_count[SSO_RX_PT_SLOTS];
     int     rx_pt_payload_len[SSO_RX_PT_SLOTS];
     uint8_t rx_pt_payload[SSO_RX_PT_SLOTS][SSO_RX_PT_PAYLOAD_MAX];
+    char    rx_pt_summary[SSO_RX_PT_SLOTS][SSO_RX_PT_SUMMARY_MAX];
     int     rx_ribbon_n;
     char    rx_ribbon[SSO_RIBBON_MAX + 1];  // '.' / '-' chars per second + nul
     int8_t  rx_ribbon_peak[SSO_RIBBON_MAX]; // peak dBFS per second (parallel)

@@ -5,6 +5,7 @@
 
 #include "ax100.h"
 #include "b210_rx_tx_core.h"
+#include "beacon_cts1.h"
 #include "csp.h"
 #include "decode_loop.h"
 #include "modem.h"
@@ -239,6 +240,7 @@ struct rx_session {
     uint64_t per_type_count[RX_PT_COUNT];
     int      per_type_last_len[RX_PT_COUNT];
     uint8_t  per_type_last_payload[RX_PT_COUNT][RX_LAST_PAYLOAD_MAX];
+    char     per_type_last_summary[RX_PT_COUNT][RX_LAST_SUMMARY_MAX];
     // Monotonic time of the most-recent decoded frame; 0.0 means
     // "no frame yet".
     double   last_frame_monotonic_s;
@@ -285,6 +287,7 @@ struct rx_session {
     uint64_t snap_per_type_count[RX_PT_COUNT];
     int      snap_per_type_last_len[RX_PT_COUNT];
     uint8_t  snap_per_type_last_payload[RX_PT_COUNT][RX_LAST_PAYLOAD_MAX];
+    char     snap_per_type_last_summary[RX_PT_COUNT][RX_LAST_SUMMARY_MAX];
     char     snap_wav_path[512];
     long     snap_wav_n_samples;
     char     snap_iq_path[512];
@@ -708,6 +711,33 @@ static void try_decode_at_window(rx_session_t *rxs)
         int copy = (plen < RX_LAST_PAYLOAD_MAX) ? (int)plen : RX_LAST_PAYLOAD_MAX;
         rxs->per_type_last_len[slot] = copy;
         memcpy(rxs->per_type_last_payload[slot], rxs->packet, (size_t)copy);
+        // Build the decoded one-line summary while we still have the
+        // full plen bytes (the per-type payload buffer is capped at 64
+        // which isn't enough for a 130-byte beacon). beacon_*_summary
+        // re-runs the sniff so a payload that almost-but-not-quite
+        // matches the slot's type just leaves an empty summary; the
+        // panel renderer falls back to hex in that case.
+        char *sum_out  = rxs->per_type_last_summary[slot];
+        size_t sum_cap = sizeof rxs->per_type_last_summary[slot];
+        sum_out[0] = '\0';
+        switch (slot) {
+            case RX_PT_BEACON_BASIC:
+                beacon_basic_summary(rxs->packet, (size_t) plen,
+                                     sum_out, sum_cap);
+                break;
+            case RX_PT_TCMD_RESPONSE:
+                tcmd_response_summary(rxs->packet, (size_t) plen,
+                                      sum_out, sum_cap);
+                break;
+            case RX_PT_LOG_MESSAGE:
+                log_message_summary(rxs->packet, (size_t) plen,
+                                    sum_out, sum_cap);
+                break;
+            default:
+                // Beacon-peripheral / bulk_file / OTHER fall through —
+                // panel renders the existing hex preview.
+                break;
+        }
 
         struct timespec mono;
         if (clock_gettime(CLOCK_MONOTONIC, &mono) == 0) {
@@ -915,6 +945,8 @@ static void worker_update_snapshot(rx_session_t *rxs)
            sizeof rxs->snap_per_type_last_len);
     memcpy(rxs->snap_per_type_last_payload, rxs->per_type_last_payload,
            sizeof rxs->snap_per_type_last_payload);
+    memcpy(rxs->snap_per_type_last_summary, rxs->per_type_last_summary,
+           sizeof rxs->snap_per_type_last_summary);
     pthread_mutex_unlock(&rxs->mu);
 }
 
@@ -1053,6 +1085,9 @@ void rx_session_stats_snapshot(const rx_session_t *rxs,
             memcpy(out_stats[i].last_payload,
                    rxs->snap_per_type_last_payload[i],
                    RX_LAST_PAYLOAD_MAX);
+            memcpy(out_stats[i].last_summary,
+                   rxs->snap_per_type_last_summary[i],
+                   RX_LAST_SUMMARY_MAX);
         }
     }
     pthread_mutex_unlock((pthread_mutex_t *)&rxs->mu);

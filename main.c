@@ -1157,9 +1157,11 @@ static double g_last_state_rrate_kms   = 0.0;
 #ifdef WITH_USRP_B210
 #define RX_PANEL_PT_COUNT RX_PT_COUNT
 #define RX_PANEL_PAYLOAD_MAX RX_LAST_PAYLOAD_MAX
+#define RX_PANEL_SUMMARY_MAX RX_LAST_SUMMARY_MAX
 #else
 #define RX_PANEL_PT_COUNT 6
 #define RX_PANEL_PAYLOAD_MAX 64
+#define RX_PANEL_SUMMARY_MAX 160
 #endif
 
 // Labels for the six RX packet-type slots, in the same order as the
@@ -1187,6 +1189,10 @@ typedef struct {
     uint64_t   pt_count[RX_PANEL_PT_COUNT];
     int        pt_payload_len[RX_PANEL_PT_COUNT];
     uint8_t    pt_payload[RX_PANEL_PT_COUNT][RX_PANEL_PAYLOAD_MAX];
+    // One-line decoded summary built by rx_session when the payload
+    // sniffs as a known FrontierSat packet type. Empty = no decode
+    // available; render falls back to the hex preview above.
+    char       pt_summary[RX_PANEL_PT_COUNT][RX_PANEL_SUMMARY_MAX];
     int        ribbon_n;
     char       ribbon[RIBBON_LEN + 1];
     // Parallel array: peak dBFS for the i-th second back. Clamped into
@@ -1231,6 +1237,9 @@ static void rx_panel_collect_local(rx_panel_data_t *d)
         if (copy < 0) copy = 0;
         if (copy > RX_PANEL_PAYLOAD_MAX) copy = RX_PANEL_PAYLOAD_MAX;
         memcpy(d->pt_payload[s], pts[s].last_payload, (size_t) copy);
+        snprintf(d->pt_summary[s], sizeof d->pt_summary[s],
+                 "%.*s", (int)(sizeof d->pt_summary[s] - 1),
+                 pts[s].last_summary);
     }
     // Wire format: ribbon[0] is the newest sample, ribbon[ribbon_n-1]
     // is the oldest. Each char is '.' for a normal second or '-' for
@@ -1320,6 +1329,15 @@ static void render_rx_panel(const rx_panel_data_t *d,
     clrtoeol();
     for (int s = 0; s < RX_PANEL_PT_COUNT; ++s) {
         if (d->pt_count[s] == 0 || d->pt_payload_len[s] <= 0) continue;
+        // Prefer the decoded summary when rx_session was able to
+        // produce one (basic beacon / tcmd response / log message);
+        // fall back to a hex preview for unknown / unparsed types.
+        if (d->pt_summary[s][0]) {
+            mvprintw(row++, col, "%15s   %s",
+                     rx_panel_pt_label(s), d->pt_summary[s]);
+            clrtoeol();
+            continue;
+        }
         char hexbuf[3 * 24 + 16];
         size_t hex_len = 0;
         int n_show = d->pt_payload_len[s];
@@ -1411,6 +1429,9 @@ static void ipc_fill_rx_panel(sso_event_t *evt)
         if (wire_pl > SSO_RX_PT_PAYLOAD_MAX) wire_pl = SSO_RX_PT_PAYLOAD_MAX;
         evt->rx_pt_payload_len[s] = pl;
         memcpy(evt->rx_pt_payload[s], d.pt_payload[s], (size_t) wire_pl);
+        snprintf(evt->rx_pt_summary[s], sizeof evt->rx_pt_summary[s],
+                 "%.*s", (int)(sizeof evt->rx_pt_summary[s] - 1),
+                 d.pt_summary[s]);
     }
     int rn = d.ribbon_n;
     if (rn > SSO_RIBBON_MAX) rn = SSO_RIBBON_MAX;
@@ -3976,6 +3997,11 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
             g_viewer_rx_panel.pt_payload_len[s] = pl;
             memcpy(g_viewer_rx_panel.pt_payload[s],
                    evt->rx_pt_payload[s], (size_t) copy);
+            snprintf(g_viewer_rx_panel.pt_summary[s],
+                     sizeof g_viewer_rx_panel.pt_summary[s],
+                     "%.*s",
+                     (int)(sizeof g_viewer_rx_panel.pt_summary[s] - 1),
+                     evt->rx_pt_summary[s]);
         }
         int rn = evt->rx_ribbon_n;
         if (rn > RIBBON_LEN) rn = RIBBON_LEN;

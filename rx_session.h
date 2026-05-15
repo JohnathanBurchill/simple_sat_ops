@@ -148,10 +148,18 @@ typedef enum {
 // the original frame length (so reading past last_payload_len is
 // undefined).
 #define RX_LAST_PAYLOAD_MAX 64
+#define RX_LAST_SUMMARY_MAX 160
 typedef struct {
     uint64_t count;
     int      last_payload_len;
     uint8_t  last_payload[RX_LAST_PAYLOAD_MAX];
+    // One-line decoded summary built by the rx_session worker when the
+    // payload sniffs as a known FrontierSat packet type. Empty string
+    // when no decode was possible — the operator-side renderer can
+    // then fall back to a hex dump of last_payload[]. Saves the panel
+    // from having to know the full beacon layout itself, and makes
+    // the same string available to viewers over IPC.
+    char     last_summary[RX_LAST_SUMMARY_MAX];
 } rx_packet_type_stats_t;
 
 // Per-type stats snapshot + monotonic time of the last frame in any

@@ -234,6 +234,15 @@ int beacon_is_basic(const uint8_t *payload, size_t len);
 void beacon_print(FILE *fp, const char *ts,
                   const uint8_t *payload, size_t len);
 
+// One-line compact summary of the basic beacon for the operator's
+// RX panel. Writes "CTS1 st=ARMED eps=NORMAL batt=8.12V/87%
+// obc=15.2C up=1d2h cnt=12345 \"<msg>\"" or similar. Returns the
+// number of bytes written (excluding the nul terminator), or 0 if
+// the payload doesn't sniff as a basic beacon. Caller must have
+// already accepted the dispatch packet (payload[0] == 0x01).
+int beacon_basic_summary(const uint8_t *payload, size_t len,
+                         char *out, size_t out_size);
+
 // Sniff test for the TCMD-response packet. Strong anchors:
 //   - len in [15, 200] (header + 1..186 data bytes)
 //   - payload[0] == 0x04 (COMMS_PACKET_TYPE_TCMD_RESPONSE)
@@ -248,6 +257,12 @@ int tcmd_response_is(const uint8_t *payload, size_t len);
 void tcmd_response_print(FILE *fp, const char *ts,
                          const uint8_t *payload, size_t len);
 
+// One-line summary of the tcmd response — "[seq/max] code=N
+// 'text...'" — for the RX panel. Returns bytes written or 0 if not
+// a tcmd response.
+int tcmd_response_summary(const uint8_t *payload, size_t len,
+                          char *out, size_t out_size);
+
 // Sniff for the LOG_MESSAGE packet. Anchors:
 //   - 2 <= len <= 200 (1 header + at least 1 data byte)
 //   - payload[0] == 0x03 (COMMS_PACKET_TYPE_LOG_MESSAGE), tolerant of
@@ -261,6 +276,11 @@ int log_message_is(const uint8_t *payload, size_t len);
 // '.' so a single bad byte doesn't break terminal rendering.
 void log_message_print(FILE *fp, const char *ts,
                        const uint8_t *payload, size_t len);
+
+// One-line summary of the log message — "'<text>'" — for the RX
+// panel. Returns bytes written or 0 if not a log message.
+int log_message_summary(const uint8_t *payload, size_t len,
+                        char *out, size_t out_size);
 
 // Sniff for the BULK_FILE_DOWNLINK packet. Anchors:
 //   - len >= 6 (header + at least 1 data byte)

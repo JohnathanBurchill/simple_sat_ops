@@ -551,6 +551,11 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
                     snprintf(key, sizeof key, "rx_pt%d_p", s);
                     if (json_field_str(&p, end, &first, key, hex) < 0) return -1;
                 }
+                if (evt->rx_pt_summary[s][0]) {
+                    snprintf(key, sizeof key, "rx_pt%d_s", s);
+                    if (json_field_str(&p, end, &first, key,
+                                       evt->rx_pt_summary[s]) < 0) return -1;
+                }
             }
             if (evt->rx_ribbon_n > 0) {
                 if (json_field_str(&p, end, &first, "rx_rb", evt->rx_ribbon) < 0)
@@ -762,6 +767,9 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
                 evt->rx_pt_payload[s][b] = (uint8_t) ((hv << 4) | lv);
             }
         }
+        snprintf(key, sizeof key, "rx_pt%d_s", s);
+        json_get_string(line, key, evt->rx_pt_summary[s],
+                        sizeof evt->rx_pt_summary[s]);
     }
     json_get_string(line, "rx_warn", evt->rx_warning, sizeof evt->rx_warning);
     if (json_get_string(line, "rx_rb",

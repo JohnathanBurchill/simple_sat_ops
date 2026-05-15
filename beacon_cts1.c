@@ -341,6 +341,37 @@ void beacon_print(FILE *fp, const char *ts,
     fprintf(fp, "%sbeacon: msg=\"%s\"\n", prefix, msg);
 }
 
+int beacon_basic_summary(const uint8_t *payload, size_t len,
+                         char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return 0;
+    out[0] = '\0';
+    if (!beacon_is_basic(payload, len)) return 0;
+    COMMS_beacon_basic_packet_t b;
+    memcpy(&b, payload, sizeof b);
+    char state_buf[8], eps_buf[8], obc_buf[16], up_buf[24];
+    cts1_state_str(b.cts1_operation_state, state_buf, sizeof state_buf);
+    eps_mode_str  (b.eps_mode_enum,        eps_buf,   sizeof eps_buf);
+    fmt_cC_i32    (obc_buf, sizeof obc_buf, b.obc_temperature_cC);
+    fmt_ms_clock  (b.uptime_ms,             up_buf,    sizeof up_buf);
+    // Sanitised friendly_message — non-printables become '.' so a
+    // single bad byte doesn't break terminal rendering.
+    char msg[COMMS_BEACON_FRIENDLY_MESSAGE_SIZE + 1];
+    cts1_sanitise_text((const uint8_t *) b.friendly_message,
+                       COMMS_BEACON_FRIENDLY_MESSAGE_SIZE,
+                       msg, sizeof msg, NULL);
+    int n = snprintf(out, out_size,
+        "%.4s st=%s eps=%s batt=%.2fV/%u%% obc=%s up=%s cnt=%u \"%s\"",
+        b.satellite_name, state_buf, eps_buf,
+        b.eps_battery_voltage_mV / 1000.0,
+        (unsigned) b.eps_battery_percent,
+        obc_buf, up_buf,
+        (unsigned) b.total_beacon_count_since_boot,
+        msg);
+    if (n < 0) { out[0] = '\0'; return 0; }
+    return (n < (int) out_size) ? n : (int) out_size - 1;
+}
+
 int tcmd_response_is(const uint8_t *payload, size_t len)
 {
     if (payload == NULL) return 0;
@@ -415,6 +446,36 @@ void tcmd_response_print(FILE *fp, const char *ts,
     fprintf(fp, "\"\n");
 }
 
+int tcmd_response_summary(const uint8_t *payload, size_t len,
+                          char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return 0;
+    out[0] = '\0';
+    if (!tcmd_response_is(payload, len)) return 0;
+    COMMS_tcmd_response_packet_t hdr;
+    memcpy(&hdr, payload, COMMS_TCMD_RESPONSE_HEADER_SIZE);
+    size_t data_len  = len - COMMS_TCMD_RESPONSE_HEADER_SIZE;
+    size_t print_len = data_len;
+    if (hdr.response_seq_num == hdr.response_max_seq_num) {
+        while (print_len > 0
+               && payload[COMMS_TCMD_RESPONSE_HEADER_SIZE + print_len - 1] == 0x00) {
+            print_len--;
+        }
+    }
+    char text[96];
+    cts1_sanitise_text(payload + COMMS_TCMD_RESPONSE_HEADER_SIZE,
+                       print_len, text, sizeof text, NULL);
+    int n = snprintf(out, out_size,
+                     "[%u/%u] code=%u%s '%s'",
+                     (unsigned) hdr.response_seq_num,
+                     (unsigned) hdr.response_max_seq_num,
+                     (unsigned) hdr.response_code,
+                     (hdr.response_code == 0) ? "(OK)" : "",
+                     text);
+    if (n < 0) { out[0] = '\0'; return 0; }
+    return (n < (int) out_size) ? n : (int) out_size - 1;
+}
+
 size_t cts1_sanitise_text(const uint8_t *data, size_t data_len,
                           char *out, size_t outn,
                           int *out_truncated)
@@ -471,6 +532,22 @@ void log_message_print(FILE *fp, const char *ts,
 
     fprintf(fp, "%slog: \"%s\"%s (%zu bytes)\n",
             prefix, text, truncated ? "..." : "", shown);
+}
+
+int log_message_summary(const uint8_t *payload, size_t len,
+                        char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return 0;
+    out[0] = '\0';
+    if (!log_message_is(payload, len)) return 0;
+    size_t data_len = (len > 0) ? len - 1 : 0;
+    char text[COMMS_LOG_MESSAGE_PACKET_MAX_DATA_BYTES_PER_PACKET + 1];
+    int truncated = 0;
+    cts1_sanitise_text(payload + 1, data_len,
+                       text, sizeof text, &truncated);
+    int n = snprintf(out, out_size, "'%s'%s", text, truncated ? "..." : "");
+    if (n < 0) { out[0] = '\0'; return 0; }
+    return (n < (int) out_size) ? n : (int) out_size - 1;
 }
 
 int bulk_file_is(const uint8_t *payload, size_t len)
