@@ -1132,6 +1132,9 @@ typedef struct {
     // Parallel array: peak dBFS for the i-th second back. Clamped into
     // int8 (dBFS is naturally -90..0, well inside int8's range).
     int8_t     ribbon_peak[RIBBON_LEN];
+    // Shadow IQ-demod frame count (modem_iq.c). Reported alongside
+    // frames_total so the operator can A/B the IQ vs FM-audio chains.
+    uint64_t   frames_iq;
     // Optional warning row (e.g., low-disk). Empty when no warning.
     char       warning[80];
 } rx_panel_data_t;
@@ -1154,6 +1157,7 @@ static void rx_panel_collect_local(rx_panel_data_t *d)
                         last, sizeof last);
     snprintf(d->last_frame_summary, sizeof d->last_frame_summary,
              "%s", last);
+    d->frames_iq = rx_session_iq_frames(g_rx_session);
     rx_packet_type_stats_t pts[RX_PT_COUNT];
     rx_session_stats_snapshot(g_rx_session, pts, &d->age_s);
     for (int s = 0; s < RX_PT_COUNT; ++s) {
@@ -1224,8 +1228,9 @@ static void render_rx_panel(const rx_panel_data_t *d,
     mvprintw(row++, col, "%15s   peak %+5.1f  rms %+5.1f dBFS",
              "level", d->peak_dbfs, d->rms_dbfs);
     clrtoeol();
-    mvprintw(row++, col, "%15s   %llu",
-             "frames", (unsigned long long) d->frames_total);
+    mvprintw(row++, col, "%15s   %llu  (iq=%llu)", "frames",
+             (unsigned long long) d->frames_total,
+             (unsigned long long) d->frames_iq);
     clrtoeol();
     if (d->last_frame_summary[0]) {
         mvprintw(row++, col, "%15s   %s", "last frame", d->last_frame_summary);
@@ -1326,6 +1331,7 @@ static void ipc_fill_rx_panel(sso_event_t *evt)
     evt->rx_peak_dbfs    = d.peak_dbfs;
     evt->rx_rms_dbfs     = d.rms_dbfs;
     evt->rx_frames_total = (long) d.frames_total;
+    evt->rx_frames_iq    = (long) d.frames_iq;
     snprintf(evt->rx_last_frame_summary,
              sizeof evt->rx_last_frame_summary, "%s", d.last_frame_summary);
     evt->rx_age_s = d.age_s;
@@ -2925,6 +2931,7 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
         g_viewer_rx_panel.peak_dbfs      = evt->rx_peak_dbfs;
         g_viewer_rx_panel.rms_dbfs       = evt->rx_rms_dbfs;
         g_viewer_rx_panel.frames_total   = (uint64_t) evt->rx_frames_total;
+        g_viewer_rx_panel.frames_iq      = (uint64_t) evt->rx_frames_iq;
         snprintf(g_viewer_rx_panel.last_frame_summary,
                  sizeof g_viewer_rx_panel.last_frame_summary,
                  "%s", evt->rx_last_frame_summary);

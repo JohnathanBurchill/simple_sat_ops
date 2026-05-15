@@ -134,6 +134,15 @@ add_executable(gen_waterfall utils/gen_waterfall.c)
 target_link_libraries(gen_waterfall PRIVATE m)
 list(APPEND SSO_TARGETS gen_waterfall)
 
+# Selftest for the IQ-domain demod (modem_iq.c). Synthesizes CPFSK +
+# optional AWGN, round-trips through modem_iq_to_bits, and A/B-checks
+# against modem_pcm16_to_bits on the FM-discriminated equivalent.
+add_executable(modem_iq_selftest utils/modem_iq_selftest.c
+               modem.c modem_iq.c)
+target_include_directories(modem_iq_selftest PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(modem_iq_selftest PRIVATE m)
+list(APPEND SSO_TARGETS modem_iq_selftest)
+
 # ----- Optional: OpenSSL-dependent (libcrypto) ------------------------------
 
 if (OPENSSL_FOUND)
@@ -146,7 +155,7 @@ if (OPENSSL_FOUND)
 
     # Offline AX100 frame decoder: WAV/RAW -> demod -> ax100_unframe -> CSP
     add_executable(rx_decode utils/rx_decode.c utils/wav_read.c
-                   modem.c ax100.c rs.c golay24.c csp.c hmac_keyfile.c
+                   modem.c modem_iq.c ax100.c rs.c golay24.c csp.c hmac_keyfile.c
                    beacon_cts1.c decode_loop.c)
     target_include_directories(rx_decode PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(rx_decode PRIVATE ${OPENSSL_LIBRARY_DIRS})
@@ -184,7 +193,7 @@ if (OPENSSL_FOUND)
 
     # Offline sliding-window decoder for WAV / raw S16_LE files.
     add_executable(rx_replay utils/rx_replay.c utils/wav_read.c decode_loop.c
-                   modem.c ax100.c rs.c golay24.c csp.c hmac_keyfile.c
+                   modem.c modem_iq.c ax100.c rs.c golay24.c csp.c hmac_keyfile.c
                    beacon_cts1.c rx_tui.c tle_csv.c)
     target_include_directories(rx_replay PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(rx_replay PRIVATE ${OPENSSL_LIBRARY_DIRS})
@@ -301,7 +310,7 @@ endif()
 if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
     add_executable(simple_sat_ops main.c prediction.c
                    antenna_rotator.c telemetry.c oem.c
-                   decode_loop.c modem.c ax100.c rs.c golay24.c csp.c
+                   decode_loop.c modem.c modem_iq.c ax100.c rs.c golay24.c csp.c
                    hmac_keyfile.c beacon_cts1.c tle_csv.c
                    biquad.c monitor_squelch.c)
     target_include_directories(simple_sat_ops PRIVATE

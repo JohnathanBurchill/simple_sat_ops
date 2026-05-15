@@ -99,6 +99,11 @@ void rx_session_iq_snapshot(const rx_session_t *rxs,
                             long *out_pairs,
                             int  *out_sample_rate);
 
+// Frame count from the shadow IQ-domain demod (modem_iq.c). Runs in
+// parallel with the primary PCM demod purely as a measurement. Use
+// alongside rx_session_snapshot's frames_total to A/B the two chains.
+uint64_t rx_session_iq_frames(const rx_session_t *rxs);
+
 // Sync: hand a TX burst request to the worker, block until it pauses
 // RX, transmits, and resumes RX. Returns the burst's outcome plus a
 // short one-line summary suitable for the operator's TX log.

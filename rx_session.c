@@ -8,6 +8,7 @@
 #include "csp.h"
 #include "decode_loop.h"
 #include "modem.h"
+#include "modem_iq.h"
 #include "packet_db.h"
 #include "tx_burst.h"
 
@@ -179,6 +180,12 @@ struct rx_session {
     int16_t *iq_chunk;   // 2 * max_chunk int16: interleaved I,Q pairs
     int16_t *window;
     size_t   window_filled;
+    // Shadow IQ window: interleaved I,Q pairs, same length (in pairs)
+    // as `window` is in PCM samples. Filled in lockstep with `window`
+    // so the IQ-domain demod sees the same time slice the PCM demod
+    // does — that's what makes the A/B fair on the same RF.
+    int16_t *iq_window;
+    size_t   iq_window_filled;  // in PAIRS
     uint8_t *bits_scratch;
     size_t   bits_cap;
     uint8_t *bytes_scratch;
@@ -190,6 +197,13 @@ struct rx_session {
     int      recent_idx;
     int      recent_count;
     uint64_t total_window_samples;
+    // Parallel dedup ring for the shadow IQ chain. Independent of the
+    // PCM ring so a frame both chains decode counts in BOTH `frames_total`
+    // and `frames_iq_total` — that's the A/B signal.
+    uint64_t iq_recent_pos_quant[DEDUP_RING_SZ];
+    int      iq_recent_idx;
+    int      iq_recent_count;
+    uint64_t iq_frames_total;
 
     // Output paths.
     wav_w_t  wav;
@@ -266,6 +280,7 @@ struct rx_session {
     long     snap_wav_n_samples;
     char     snap_iq_path[512];
     long     snap_iq_pairs;
+    uint64_t snap_iq_frames_total;
 };
 
 static void *rx_session_thread_fn(void *arg);
@@ -318,11 +333,13 @@ int rx_session_open(rx_session_t **out, const rx_session_params_t *p,
     rxs->pcm_chunk     = malloc(rxs->max_chunk * sizeof(int16_t));
     rxs->iq_chunk      = malloc(rxs->max_chunk * 2 * sizeof(int16_t));
     rxs->window        = malloc(rxs->window_samples * sizeof(int16_t));
+    rxs->iq_window     = malloc(rxs->window_samples * 2 * sizeof(int16_t));
     rxs->bits_cap      = rxs->window_samples + 8;
     rxs->bits_scratch  = malloc(rxs->bits_cap);
     rxs->bytes_cap     = rxs->bits_cap / 8 + 1;
     rxs->bytes_scratch = malloc(rxs->bytes_cap);
     if (!rxs->pcm_chunk || !rxs->iq_chunk || !rxs->window
+        || !rxs->iq_window
         || !rxs->bits_scratch || !rxs->bytes_scratch) {
         rx_session_close(rxs);
         return -1;
@@ -491,6 +508,15 @@ void rx_session_iq_snapshot(const rx_session_t *rxs,
     pthread_mutex_unlock((pthread_mutex_t *) &rxs->mu);
 }
 
+uint64_t rx_session_iq_frames(const rx_session_t *rxs)
+{
+    if (rxs == NULL) return 0;
+    pthread_mutex_lock((pthread_mutex_t *) &rxs->mu);
+    uint64_t v = rxs->snap_iq_frames_total;
+    pthread_mutex_unlock((pthread_mutex_t *) &rxs->mu);
+    return v;
+}
+
 void rx_session_request_freq(rx_session_t *rxs, double freq_hz)
 {
     if (rxs == NULL) return;
@@ -553,6 +579,7 @@ void rx_session_close(rx_session_t *rxs)
     free(rxs->pcm_chunk);
     free(rxs->iq_chunk);
     free(rxs->window);
+    free(rxs->iq_window);
     free(rxs->bits_scratch);
     free(rxs->bytes_scratch);
     free(rxs);
@@ -668,6 +695,60 @@ static void try_decode_at_window(rx_session_t *rxs)
 
 // Worker-internal: pump UHD until it returns 0 (transient), feeding
 // PCM into the WAV and the decode window.
+// Shadow IQ decoder. Counts frames the IQ-domain chain extracts from
+// the same sliding window the PCM chain just chewed on — no packet_db
+// write, no event emit, no packet-type bookkeeping. We only need the
+// frame count to A/B the front ends; the rest of the pipeline keeps
+// reading from the PCM chain so behaviour on live RF is unchanged
+// until we're sure the IQ chain is at least as reliable.
+static void try_decode_iq_at_window(rx_session_t *rxs)
+{
+    size_t inner_min_offset = 0;
+    for (;;) {
+        ssize_t plen = -1;
+        int golay_errs = 0, hmac_ok = -1;
+        int rs_errs = -1, used_golay_len = -1;
+        int rs_locs[32];
+        size_t sync_off_local = 0;
+        if (!try_decode_window_iq(rxs->iq_window, rxs->window_samples,
+                                  &rxs->mp, &rxs->opts,
+                                  rxs->sync_max_ham, rxs->use_hmac,
+                                  /*allow_partial_rs=*/1,
+                                  inner_min_offset,
+                                  rxs->bits_scratch, rxs->bits_cap,
+                                  rxs->bytes_scratch, rxs->bytes_cap,
+                                  rxs->packet, sizeof rxs->packet,
+                                  &plen, &golay_errs, &hmac_ok,
+                                  &rs_errs, &used_golay_len,
+                                  &sync_off_local, rs_locs)) {
+            break;
+        }
+        inner_min_offset = sync_off_local + 1;
+        if (plen < 4 || (size_t) plen > sizeof rxs->packet) continue;
+
+        // Independent dedup against the IQ ring so a frame both chains
+        // decode counts in BOTH frames_total and iq_frames_total.
+        uint64_t window_start_abs =
+            rxs->total_window_samples - (uint64_t) rxs->window_samples;
+        uint64_t asm_abs_sample = window_start_abs
+            + (uint64_t) sync_off_local * (uint64_t) rxs->sps
+            + (uint64_t)(rxs->sps / 2);
+        uint64_t pos_quant = asm_abs_sample / rxs->dedup_quant;
+        int seen = 0;
+        int ring_n = rxs->iq_recent_count < DEDUP_RING_SZ
+                   ? rxs->iq_recent_count : DEDUP_RING_SZ;
+        for (int r = 0; r < ring_n; r++) {
+            if (rxs->iq_recent_pos_quant[r] == pos_quant) { seen = 1; break; }
+        }
+        if (seen) continue;
+        rxs->iq_recent_pos_quant[rxs->iq_recent_idx] = pos_quant;
+        rxs->iq_recent_idx = (rxs->iq_recent_idx + 1) % DEDUP_RING_SZ;
+        if (rxs->iq_recent_count < DEDUP_RING_SZ) rxs->iq_recent_count++;
+
+        rxs->iq_frames_total++;
+    }
+}
+
 static int worker_pump_once(rx_session_t *rxs)
 {
     // Pass the IQ tap buffer through so the core copies post-decim IQ
@@ -690,14 +771,34 @@ static int worker_pump_once(rx_session_t *rxs)
         }
     }
 
+    size_t pairs_to_use = iq_pairs;
+    if (pairs_to_use > (size_t) n) pairs_to_use = (size_t) n;
     for (ssize_t i = 0; i < n; i++) {
         rxs->window[rxs->window_filled++] = rxs->pcm_chunk[i];
+        if ((size_t) i < pairs_to_use
+            && rxs->iq_window_filled < rxs->window_samples) {
+            rxs->iq_window[rxs->iq_window_filled * 2 + 0] =
+                rxs->iq_chunk[i * 2 + 0];
+            rxs->iq_window[rxs->iq_window_filled * 2 + 1] =
+                rxs->iq_chunk[i * 2 + 1];
+            rxs->iq_window_filled++;
+        }
         rxs->total_window_samples++;
         if (rxs->window_filled < rxs->window_samples) continue;
         try_decode_at_window(rxs);
+        if (rxs->iq_window_filled >= rxs->window_samples) {
+            try_decode_iq_at_window(rxs);
+        }
         memmove(rxs->window, rxs->window + rxs->slide_samples,
                 (rxs->window_samples - rxs->slide_samples) * sizeof(int16_t));
         rxs->window_filled = rxs->window_samples - rxs->slide_samples;
+        if (rxs->iq_window_filled >= rxs->window_samples) {
+            memmove(rxs->iq_window,
+                    rxs->iq_window + rxs->slide_samples * 2,
+                    (rxs->window_samples - rxs->slide_samples)
+                        * 2 * sizeof(int16_t));
+            rxs->iq_window_filled = rxs->window_samples - rxs->slide_samples;
+        }
     }
     return (int) n;
 }
@@ -716,6 +817,7 @@ static void worker_update_snapshot(rx_session_t *rxs)
     rxs->snap_wav_active     = wav_active;
     rxs->snap_wav_n_samples  = (long) rxs->wav.n_samples;
     rxs->snap_iq_pairs       = (long) rxs->iq_pairs_written;
+    rxs->snap_iq_frames_total = rxs->iq_frames_total;
     // Persist the last-known paths even after a close so that the
     // end-of-pass renderer (which runs post-close) can still find them.
     if (rxs->wav_path[0]) {
