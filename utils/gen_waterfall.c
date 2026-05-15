@@ -319,9 +319,13 @@ typedef struct {
     int    out_rows;
     float  db_min;
     float  db_max;
-    int    auto_clip;   // 1 = ignore db_min/db_max, derive from percentiles
-    int    sample_rate; // for the time + frequency axis labels
-    double center_hz;   // baseband centre frequency for the freq-axis label
+    int    auto_clip;     // 1 = ignore db_min/db_max, derive from percentiles
+    int    sample_rate;   // for the time + frequency axis labels
+    double center_hz;     // baseband centre frequency for the freq-axis label
+    double zoom_hz;       // visible bandwidth around DC; 0 or negative = full
+    int    dc_notch;      // 1 = interpolate over DC bin (B210 LO spike); 0 = off
+    int    dc_notch_bins; // half-width of the notch in FFT bins (each side)
+    double display_bw_hz; // filled in by build_waterfall — the actual rendered BW
 } wf_opts_t;
 
 static float median_inplace(float *buf, int n)
@@ -448,6 +452,60 @@ static int build_waterfall(const int16_t *iq, size_t n_pairs,
         }
     }
     free(col);
+
+    // B210 direct-conversion LO bleed lands on the DC bin and a couple
+    // of bins either side, even after median subtraction (the leakage
+    // isn't quite constant — slow AGC + LO drift). Replace those bins
+    // with the value of the first clean bin outside the notch so the
+    // spike doesn't dominate the colormap. SatNOGS waterfalls don't
+    // show this artefact because typical SatNOGS stations (RTL-SDR /
+    // Airspy) deliberately tune a few kHz off-channel and shift in
+    // software so DC never sits inside the signal lobe.
+    int dc_k = N / 2;
+    int notch = opt->dc_notch_bins > 0 ? opt->dc_notch_bins : 2;
+    if (opt->dc_notch && dc_k - notch - 1 >= 0 && dc_k + notch + 1 < N) {
+        for (int r = 0; r < out_rows; ++r) {
+            float left  = binned[(size_t) r * (size_t) N + (size_t)(dc_k - notch - 1)];
+            float right = binned[(size_t) r * (size_t) N + (size_t)(dc_k + notch + 1)];
+            float fill  = 0.5f * (left + right);
+            for (int off = -notch; off <= notch; ++off) {
+                binned[(size_t) r * (size_t) N + (size_t)(dc_k + off)] = fill;
+            }
+        }
+    }
+
+    // Zoom: keep only the columns inside ±zoom_hz/2 around DC. Default
+    // for this stack (48 kHz IQ, 9600 baud MSK, ~±10 kHz Doppler) is
+    // ±15 kHz — fits the data lobe + Doppler tracks with a couple of
+    // dB of margin and ditches the corners that are nothing but noise
+    // floor. Pass --full-width to disable.
+    int k_lo = 0;
+    int k_hi = N - 1;
+    double display_bw = (double) opt->sample_rate;
+    if (opt->zoom_hz > 0.0 && opt->zoom_hz < (double) opt->sample_rate) {
+        double half = opt->zoom_hz / 2.0;
+        int half_bins = (int)(half / (double) opt->sample_rate * (double) N);
+        if (half_bins < 1) half_bins = 1;
+        if (half_bins > N / 2 - 1) half_bins = N / 2 - 1;
+        k_lo = dc_k - half_bins;
+        k_hi = dc_k + half_bins;
+        display_bw = 2.0 * half_bins * (double) opt->sample_rate / (double) N;
+    }
+    ((wf_opts_t *) opt)->display_bw_hz = display_bw;
+    int zoom_N = k_hi - k_lo + 1;
+    if (zoom_N != N) {
+        float *cropped = (float *) malloc((size_t) out_rows * (size_t) zoom_N
+                                          * sizeof(float));
+        if (!cropped) { free(binned); return -1; }
+        for (int r = 0; r < out_rows; ++r) {
+            memcpy(cropped + (size_t) r * (size_t) zoom_N,
+                   binned + (size_t) r * (size_t) N + (size_t) k_lo,
+                   (size_t) zoom_N * sizeof(float));
+        }
+        free(binned);
+        binned = cropped;
+        N = zoom_N;
+    }
 
     // Auto-clip the dB range to data percentiles unless the caller
     // pinned both endpoints. Most real captures have a noise floor a
@@ -700,10 +758,13 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
     const uint8_t LBL_R = 220, LBL_G = 220, LBL_B = 220;
     const uint8_t TIC_R = 180, TIC_G = 180, TIC_B = 180;
 
-    // Frequency axis: -Fs/2 .. +Fs/2 across spec_w pixels, with
-    // centre_hz adding to the labels (so a tuned carrier reads as the
-    // absolute RF frequency around the nominal carrier).
-    double fs = opt->sample_rate;
+    // Frequency axis: ±BW/2 across spec_w pixels, where BW is the
+    // displayed bandwidth (either the full sample rate or the zoom
+    // width set by --zoom-khz). centre_hz adds to the labels so a
+    // tuned carrier reads as the absolute RF frequency around the
+    // nominal carrier.
+    double fs = (opt->display_bw_hz > 0.0)
+                ? opt->display_bw_hz : (double) opt->sample_rate;
     double f_lo = -fs / 2.0;
     double f_hi = +fs / 2.0;
     double f_step = pick_tick_step(fs, 8);
@@ -764,12 +825,27 @@ static void usage(void)
         "usage: gen_waterfall <iq_path> <sample_rate_hz> <out_png>\n"
         "                     [--fft=N] [--rows=N] [--db-min=X]\n"
         "                     [--db-max=X] [--center-hz=F]\n"
+        "                     [--zoom-khz=W] [--full-width]\n"
+        "                     [--dc-notch] [--dc-notch-bins=N]\n"
         "\n"
         "  Reads raw interleaved int16 I,Q samples (no header) from\n"
         "  <iq_path> at <sample_rate_hz>, builds a SatNOGS-style\n"
         "  waterfall PNG with viridis colormap, and writes it to\n"
-        "  <out_png>. Defaults: --fft=1024, --rows=1080, --db-min=-3,\n"
-        "  --db-max=20 (post-median-subtraction).\n");
+        "  <out_png>.\n"
+        "\n"
+        "  Display defaults:\n"
+        "    --fft=1024 --rows=1080\n"
+        "    --zoom-khz=30        ±15 kHz around DC. --full-width to disable.\n"
+        "    --dc-notch           Notch out DC and ±dc-notch-bins. Off by\n"
+        "                         default — the B210 in this stack has a\n"
+        "                         working DC blocker so DC sits BELOW the\n"
+        "                         noise floor, and the bright vertical line\n"
+        "                         one sometimes sees at DC is the satellite\n"
+        "                         carrier passing through 0 Hz baseband at\n"
+        "                         TCA. Enable for SDRs that leak DC.\n"
+        "    dB range auto-clipped to the 5th/99th percentile of the\n"
+        "    post-median-subtraction values unless --db-min and --db-max\n"
+        "    are both set.\n");
 }
 
 static int parse_double_opt(const char *arg, const char *prefix, double *out)
@@ -802,14 +878,24 @@ int main(int argc, char **argv)
     const char *out_png  = argv[3];
 
     wf_opts_t opt;
-    opt.fft_size    = 1024;
-    opt.hop         = 0;     // 0 = N/2 default
-    opt.out_rows    = 1080;
-    opt.db_min      = 0.0f;
-    opt.db_max      = 0.0f;
-    opt.auto_clip   = 1;     // default: percentile-based dB clip
-    opt.sample_rate = sample_rate;
-    opt.center_hz   = 0.0;
+    opt.fft_size      = 1024;
+    opt.hop           = 0;            // 0 = N/2 default
+    opt.out_rows      = 1080;
+    opt.db_min        = 0.0f;
+    opt.db_max        = 0.0f;
+    opt.auto_clip     = 1;            // default: percentile-based dB clip
+    opt.sample_rate   = sample_rate;
+    opt.center_hz     = 0.0;
+    opt.zoom_hz       = 30000.0;      // default ±15 kHz; --full-width disables
+    // DC notch is OFF by default. The B210 in this stack ships with
+    // its DC blocker active so the DC bin sits BELOW the noise floor,
+    // and the bright vertical line one sees in the middle of a pass
+    // is the satellite carrier passing through 0 Hz baseband at TCA
+    // (Doppler crossing zero) — real signal, not LO bleed. Pass
+    // --dc-notch when capturing from an SDR that leaks DC.
+    opt.dc_notch      = 0;
+    opt.dc_notch_bins = 4;            // ±4 bins ≈ ±188 Hz at fft=1024 fs=48k
+    opt.display_bw_hz = 0.0;          // build_waterfall fills this in
 
     for (int i = 4; i < argc; ++i) {
         int rc = 0;
@@ -832,6 +918,18 @@ int main(int argc, char **argv)
         } else if ((rc = parse_double_opt(argv[i], "--center-hz=", &d)) != 0) {
             if (rc < 0) { usage(); return 2; }
             opt.center_hz = d;
+        } else if ((rc = parse_double_opt(argv[i], "--zoom-khz=", &d)) != 0) {
+            if (rc < 0) { usage(); return 2; }
+            opt.zoom_hz = d * 1000.0;
+        } else if (strcmp(argv[i], "--full-width") == 0) {
+            opt.zoom_hz = 0.0;
+        } else if (strcmp(argv[i], "--no-dc-notch") == 0) {
+            opt.dc_notch = 0;
+        } else if (strcmp(argv[i], "--dc-notch") == 0) {
+            opt.dc_notch = 1;
+        } else if ((rc = parse_int_opt(argv[i], "--dc-notch-bins=", &v)) != 0) {
+            if (rc < 0) { usage(); return 2; }
+            opt.dc_notch_bins = v;
         } else {
             fprintf(stderr, "gen_waterfall: unknown option '%s'\n", argv[i]);
             usage();
