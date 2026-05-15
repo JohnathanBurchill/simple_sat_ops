@@ -39,6 +39,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <locale.h>
 #include <math.h>
 #include <signal.h>
 #include <stdio.h>
@@ -1384,6 +1385,13 @@ void usage(FILE *dest, const char *name, int full)
 
 void init_window(void)
 {
+    // setlocale BEFORE initscr so ncurses knows the terminal can render
+    // its alternate-character-set line glyphs (and UTF-8 elsewhere).
+    // Without this, box() and friends emit the ACS fallback letters
+    // (q for horizontal, x for vertical, lkjm for corners) instead of
+    // line-drawing characters.
+    setlocale(LC_ALL, "");
+
     initscr(); cbreak(); noecho();
     nonl();
     timeout(0);
