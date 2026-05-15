@@ -500,6 +500,7 @@ static void cmd_set_status(const char *fmt, ...)
 // Forward decls so cmd_dispatch can call the existing action helpers,
 // which live further down in the file.
 static void tx_compose_open(void);
+static void auto_tcmd_open(void);
 void start_tracking(state_t *state);
 void stop_tracking(state_t *state);
 int  point_to_stationary_target(state_t *state, double azimuth, double elevation);
@@ -510,6 +511,10 @@ int  point_to_stationary_target(state_t *state, double azimuth, double elevation
 #ifdef WITH_USRP_B210
 static rx_session_t *g_rx_session;
 #endif
+// Forward-decl the auto-tcmd file path for the same reason — its
+// definition lives next to the rest of the modal state further down,
+// but cmd_dispatch needs to check it.
+static char g_auto_tcmd_file_path[512];
 
 // Dispatch the typed command. state may be touched by tracking-related
 // commands; nothing else needs it. Returns nothing -- result lands in
@@ -544,6 +549,14 @@ static void cmd_dispatch(state_t *state)
         cmd_set_status("opening TX compose...");
         g_cmd_active = 0;
         tx_compose_open();
+    } else if (strcmp(cmd, "auto") == 0) {
+        if (g_auto_tcmd_file_path[0] == '\0') {
+            cmd_set_status("auto: no --tc-file=<path> given on the cmdline");
+        } else {
+            cmd_set_status("opening auto-tcmd...");
+            g_cmd_active = 0;
+            auto_tcmd_open();
+        }
     } else if (strcmp(cmd, "track") == 0) {
         start_tracking(state);
         cmd_set_status("tracking on");
@@ -1672,6 +1685,128 @@ static tx_compose_t  g_tx_compose_state;
 static long          g_tx_compose_last_edit_ns  = 0;
 static const long    g_tx_compose_debounce_ns   = 200000000L;
 
+// --- Auto-TCMD modal ----------------------------------------------
+//
+// Drives a file of ASCII telecommands through the TX path automatically.
+// Loaded via --tc-file=<path>; opened with 'A' (or `:auto`) from the
+// operator UI. Each non-blank, non-comment line in the file is one
+// CTS1+ telecommand. The operator picks TX power, how many times each
+// command should be sent, and the inter-send delay. Once started the
+// modal's tick runs alongside the main loop — non-blocking, like the
+// TX compose modal — and queues one g_tx_request per shot, advancing
+// through the file. Stops automatically when the satellite drops
+// below the horizon (LOS) so an unattended run can't keep TXing after
+// the pass. Every send goes through emit_tx_event_local, so the
+// existing tx.log + viewer fanout capture all of them.
+typedef enum {
+    AUTO_F_POWER = 0,
+    AUTO_F_REPEATS,
+    AUTO_F_DELAY,
+    AUTO_F_ALLOW_TX,
+    AUTO_F_COUNT,
+} auto_tcmd_field_t;
+
+typedef enum {
+    AUTO_STATE_SETUP = 0,
+    AUTO_STATE_RUNNING,
+    AUTO_STATE_STOPPED,    // user stopped, file not exhausted
+    AUTO_STATE_DONE,       // file exhausted
+    AUTO_STATE_PASS_OVER,  // LOS hit while running
+} auto_tcmd_state_t;
+
+typedef struct {
+    // Commands loaded from --tc-file. commands[i] is one CTS1+ line,
+    // trimmed of leading/trailing whitespace; comment lines (#...) and
+    // blank lines are dropped at load.
+    char **commands;
+    int    n_commands;
+    char   file_path[256];
+
+    // Editable fields (text-edit semantics shared with TX compose).
+    char power[12];
+    char repeats[8];
+    char delay_s[12];
+    int  allow_tx;
+    auto_tcmd_field_t focus;
+    int               cursors[AUTO_F_COUNT];
+
+    // Run state.
+    auto_tcmd_state_t state;
+    int    cmd_idx;        // index into commands[]
+    int    repeat_idx;     // how many sends of commands[cmd_idx] so far
+    int    repeats_total;  // parsed from repeats at start
+    double delay_s_val;    // parsed from delay_s at start
+    long   next_send_ns;
+    int    sends_total;    // running tally — every queued burst
+    char   last_sent[160];
+    char   status_msg[160];
+} auto_tcmd_t;
+
+static int          g_auto_tcmd_active           = 0;
+static WINDOW      *g_auto_tcmd_win              = NULL;
+static auto_tcmd_t  g_auto_tcmd;
+// Path captured from --tc-file. The modal reads this lazily so the
+// CLI can be parsed before all the modal infrastructure is up.
+static char         g_auto_tcmd_file_path[512]   = "";
+
+// Trim leading and trailing whitespace in place; returns the (possibly
+// advanced) start pointer. Used by the auto-tcmd file loader so the
+// stored commands are clean for the wire.
+static char *str_trim_inplace(char *s) {
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t'
+                     || s[n - 1] == '\r' || s[n - 1] == '\n')) {
+        s[--n] = '\0';
+    }
+    return s;
+}
+
+// Read commands from path; one per line. Comments (#...) and blank
+// lines after trim are dropped. Returns 0 on success; allocates and
+// stores in *out_commands / *out_n on success. Caller owns the
+// allocation.
+static int auto_tcmd_load_file(const char *path,
+                               char ***out_commands, int *out_n)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    int cap = 16, n = 0;
+    char **arr = (char **) malloc((size_t) cap * sizeof(char *));
+    if (!arr) { fclose(fp); return -1; }
+    char line[512];
+    while (fgets(line, sizeof line, fp)) {
+        char *t = str_trim_inplace(line);
+        if (t[0] == '\0' || t[0] == '#') continue;
+        if (n == cap) {
+            int new_cap = cap * 2;
+            char **new_arr = (char **) realloc(arr,
+                (size_t) new_cap * sizeof(char *));
+            if (!new_arr) {
+                for (int i = 0; i < n; ++i) free(arr[i]);
+                free(arr); fclose(fp); return -1;
+            }
+            arr = new_arr; cap = new_cap;
+        }
+        arr[n] = strdup(t);
+        if (!arr[n]) {
+            for (int i = 0; i < n; ++i) free(arr[i]);
+            free(arr); fclose(fp); return -1;
+        }
+        n++;
+    }
+    fclose(fp);
+    *out_commands = arr;
+    *out_n        = n;
+    return 0;
+}
+
+static void auto_tcmd_free_commands(char **commands, int n) {
+    if (!commands) return;
+    for (int i = 0; i < n; ++i) free(commands[i]);
+    free(commands);
+}
+
 static void tx_history_push(const char *payload) {
     if (payload == NULL || payload[0] == '\0') return;
     if (g_tx_history_count > 0
@@ -2123,6 +2258,7 @@ static long ts_now_ns(void) {
 static void tx_compose_open(void) {
     if (!g_ipc) return;
     if (g_tx_compose_active) return;
+    if (g_auto_tcmd_active) return;  // one modal at a time
     int h = 14, ww = 120;
     if (h > LINES) h = LINES;
     if (ww > COLS) ww = COLS;
@@ -2235,6 +2371,502 @@ static void tx_compose_pump(void) {
         c->preview_dirty = 0;
         tx_compose_draw(g_tx_compose_win, c);
     }
+}
+
+// --- Auto-TCMD modal helpers --------------------------------------
+
+static const char *auto_tcmd_state_label(auto_tcmd_state_t s) {
+    switch (s) {
+        case AUTO_STATE_SETUP:     return "idle";
+        case AUTO_STATE_RUNNING:   return "running";
+        case AUTO_STATE_STOPPED:   return "stopped";
+        case AUTO_STATE_DONE:      return "done";
+        case AUTO_STATE_PASS_OVER: return "pass-over";
+    }
+    return "?";
+}
+
+static int auto_field_is_text(auto_tcmd_field_t f) {
+    return f == AUTO_F_POWER || f == AUTO_F_REPEATS || f == AUTO_F_DELAY;
+}
+static int auto_field_is_toggle(auto_tcmd_field_t f) {
+    return f == AUTO_F_ALLOW_TX;
+}
+
+static char *auto_field_buf(auto_tcmd_t *a, auto_tcmd_field_t f, size_t *cap) {
+    switch (f) {
+        case AUTO_F_POWER:   *cap = sizeof a->power;   return a->power;
+        case AUTO_F_REPEATS: *cap = sizeof a->repeats; return a->repeats;
+        case AUTO_F_DELAY:   *cap = sizeof a->delay_s; return a->delay_s;
+        default:             *cap = 0; return NULL;
+    }
+}
+
+static int auto_field_char_ok(auto_tcmd_field_t f, int ch) {
+    if (f == AUTO_F_POWER || f == AUTO_F_DELAY) {
+        return (ch >= '0' && ch <= '9') || ch == '.' || ch == '-';
+    }
+    if (f == AUTO_F_REPEATS) {
+        return (ch >= '0' && ch <= '9');
+    }
+    return 0;
+}
+
+static void auto_field_clamp_cursor(auto_tcmd_t *a, auto_tcmd_field_t f) {
+    size_t cap = 0;
+    char *buf = auto_field_buf(a, f, &cap);
+    if (!buf) return;
+    int n = (int) strlen(buf);
+    if (a->cursors[f] < 0) a->cursors[f] = 0;
+    if (a->cursors[f] > n) a->cursors[f] = n;
+}
+
+static void auto_field_insert(auto_tcmd_t *a, int ch) {
+    size_t cap = 0;
+    char *buf = auto_field_buf(a, a->focus, &cap);
+    if (!buf) return;
+    int n = (int) strlen(buf);
+    if (n + 1 >= (int) cap) return;
+    if (!auto_field_char_ok(a->focus, ch)) return;
+    int cur = a->cursors[a->focus];
+    if (cur < 0) cur = 0;
+    if (cur > n) cur = n;
+    memmove(buf + cur + 1, buf + cur, (size_t)(n - cur + 1));
+    buf[cur] = (char) ch;
+    a->cursors[a->focus] = cur + 1;
+}
+static void auto_field_backspace(auto_tcmd_t *a) {
+    size_t cap = 0;
+    char *buf = auto_field_buf(a, a->focus, &cap);
+    if (!buf) return;
+    int n = (int) strlen(buf);
+    int cur = a->cursors[a->focus];
+    if (cur <= 0 || n == 0) return;
+    memmove(buf + cur - 1, buf + cur, (size_t)(n - cur + 1));
+    a->cursors[a->focus] = cur - 1;
+}
+static void auto_field_delete(auto_tcmd_t *a) {
+    size_t cap = 0;
+    char *buf = auto_field_buf(a, a->focus, &cap);
+    if (!buf) return;
+    int n = (int) strlen(buf);
+    int cur = a->cursors[a->focus];
+    if (cur >= n) return;
+    memmove(buf + cur, buf + cur + 1, (size_t)(n - cur));
+}
+static void auto_field_kill_to_end(auto_tcmd_t *a) {
+    size_t cap = 0;
+    char *buf = auto_field_buf(a, a->focus, &cap);
+    if (!buf) return;
+    int n = (int) strlen(buf);
+    int cur = a->cursors[a->focus];
+    if (cur >= n) return;
+    buf[cur] = '\0';
+}
+static void auto_field_left(auto_tcmd_t *a) {
+    size_t cap = 0;
+    if (!auto_field_buf(a, a->focus, &cap)) return;
+    if (a->cursors[a->focus] > 0) a->cursors[a->focus]--;
+}
+static void auto_field_right(auto_tcmd_t *a) {
+    size_t cap = 0;
+    char *buf = auto_field_buf(a, a->focus, &cap);
+    if (!buf) return;
+    int n = (int) strlen(buf);
+    if (a->cursors[a->focus] < n) a->cursors[a->focus]++;
+}
+static void auto_field_home(auto_tcmd_t *a) {
+    size_t cap = 0;
+    if (!auto_field_buf(a, a->focus, &cap)) return;
+    a->cursors[a->focus] = 0;
+}
+static void auto_field_end(auto_tcmd_t *a) {
+    size_t cap = 0;
+    char *buf = auto_field_buf(a, a->focus, &cap);
+    if (!buf) return;
+    a->cursors[a->focus] = (int) strlen(buf);
+}
+static void auto_field_toggle(auto_tcmd_t *a) {
+    if (a->focus == AUTO_F_ALLOW_TX) a->allow_tx = !a->allow_tx;
+}
+
+// Render helper — single inverse-cursor text-field cell, same shape as
+// the TX compose renderer.
+static void auto_draw_text_field(WINDOW *w, int row, int col,
+                                 const char *label, const char *value,
+                                 int value_w, int focused, int cursor)
+{
+    mvwprintw(w, row, col, "%s", label);
+    int x = col + (int) strlen(label);
+    int n = (int) strlen(value);
+    int start = 0;
+    if (focused && cursor > value_w - 1) start = cursor - value_w + 1;
+    for (int i = 0; i < value_w; ++i) {
+        int idx = start + i;
+        char ch = (idx < n) ? value[idx] : ' ';
+        chtype out = (chtype)(unsigned char) ch;
+        if (focused && idx == cursor) {
+            wattron(w, A_REVERSE);
+            mvwaddch(w, row, x + i, out);
+            wattroff(w, A_REVERSE);
+        } else {
+            mvwaddch(w, row, x + i, out);
+        }
+    }
+    wclrtoeol(w);
+}
+
+static void auto_tcmd_draw(void) {
+    if (!g_auto_tcmd_active || !g_auto_tcmd_win) return;
+    WINDOW *w = g_auto_tcmd_win;
+    auto_tcmd_t *a = &g_auto_tcmd;
+    werase(w);
+    box(w, 0, 0);
+    int width = getmaxx(w);
+
+    mvwprintw(w, 0, 2, " Auto-TCMD (operator: %s)%s ",
+              g_operator_user ? g_operator_user : "?",
+              g_no_tx ? "  [--no-tx]" : "");
+
+    mvwprintw(w, 1, 2, "File:    %.*s  (%d commands)",
+              width - 28, a->file_path[0] ? a->file_path : "(none)",
+              a->n_commands);
+    wclrtoeol(w);
+
+    int running_ro = (a->state == AUTO_STATE_RUNNING);
+
+    auto_draw_text_field(w, 3, 2, "TX power ",
+                         a->power, 8,
+                         !running_ro && a->focus == AUTO_F_POWER,
+                         a->cursors[AUTO_F_POWER]);
+    mvwprintw(w, 3, 24, "dB  (B210 TX gain; 0..89.75)");
+    wclrtoeol(w);
+
+    auto_draw_text_field(w, 4, 2, "Repeats  ",
+                         a->repeats, 6,
+                         !running_ro && a->focus == AUTO_F_REPEATS,
+                         a->cursors[AUTO_F_REPEATS]);
+    mvwprintw(w, 4, 24, "per command (TCM1 N×, then TCM2 N×, ...)");
+    wclrtoeol(w);
+
+    auto_draw_text_field(w, 5, 2, "Delay    ",
+                         a->delay_s, 8,
+                         !running_ro && a->focus == AUTO_F_DELAY,
+                         a->cursors[AUTO_F_DELAY]);
+    mvwprintw(w, 5, 24, "s between every send");
+    wclrtoeol(w);
+
+    char tg[8];
+    snprintf(tg, sizeof tg, "[%c]", a->allow_tx ? 'x' : ' ');
+    mvwprintw(w, 7, 2, "%s", "");
+    if (!running_ro && a->focus == AUTO_F_ALLOW_TX) wattron(w, A_REVERSE);
+    mvwprintw(w, 7, 2, "%s", tg);
+    if (!running_ro && a->focus == AUTO_F_ALLOW_TX) wattroff(w, A_REVERSE);
+    mvwprintw(w, 7, 7, "allow-tx  (required to key the PA)");
+    wclrtoeol(w);
+
+    mvwprintw(w, 9, 2, "State:    %s", auto_tcmd_state_label(a->state));
+    wclrtoeol(w);
+    if (a->n_commands > 0) {
+        int rt = a->repeats_total > 0 ? a->repeats_total : 0;
+        mvwprintw(w, 10, 2,
+                  "Progress: cmd %d/%d   send %d/%d   total sent: %d",
+                  a->cmd_idx + (a->state == AUTO_STATE_RUNNING ? 1 : 0),
+                  a->n_commands,
+                  a->repeat_idx, rt,
+                  a->sends_total);
+    } else {
+        mvwprintw(w, 10, 2, "Progress: (no commands loaded)");
+    }
+    wclrtoeol(w);
+    mvwprintw(w, 11, 2, "Last sent: %.*s",
+              width - 14, a->last_sent[0] ? a->last_sent : "-");
+    wclrtoeol(w);
+    mvwprintw(w, 12, 2, "Status:    %.*s",
+              width - 14, a->status_msg[0] ? a->status_msg : "-");
+    wclrtoeol(w);
+
+    if (a->state == AUTO_STATE_RUNNING) {
+        mvwprintw(w, 14, 2,
+                  "Running — s stops   Esc closes (and stops)");
+    } else {
+        mvwprintw(w, 14, 2,
+                  "Tab focus  Space toggle  Enter start  Esc cancel");
+    }
+    wclrtoeol(w);
+    wrefresh(w);
+}
+
+// Open the modal. Refuses if the TX compose modal is already up — at
+// most one modal owns the screen at a time. Lazily loads the file if
+// --tc-file was passed and we haven't loaded yet.
+static void auto_tcmd_open(void) {
+    if (!g_ipc) return;
+    if (g_tx_compose_active) return;
+    if (g_auto_tcmd_active) return;
+    if (g_auto_tcmd_file_path[0] == '\0') return;
+
+    // (Re)load on open — file may have been edited since last open.
+    if (g_auto_tcmd.commands) {
+        auto_tcmd_free_commands(g_auto_tcmd.commands, g_auto_tcmd.n_commands);
+        g_auto_tcmd.commands = NULL;
+        g_auto_tcmd.n_commands = 0;
+    }
+    char **cmds = NULL;
+    int    nc   = 0;
+    if (auto_tcmd_load_file(g_auto_tcmd_file_path, &cmds, &nc) != 0) {
+        return;  // silent — operator will notice via the absent modal
+    }
+
+    memset(&g_auto_tcmd, 0, sizeof g_auto_tcmd);
+    g_auto_tcmd.commands   = cmds;
+    g_auto_tcmd.n_commands = nc;
+    snprintf(g_auto_tcmd.file_path, sizeof g_auto_tcmd.file_path,
+             "%s", g_auto_tcmd_file_path);
+    snprintf(g_auto_tcmd.power,   sizeof g_auto_tcmd.power,   "30.0");
+    snprintf(g_auto_tcmd.repeats, sizeof g_auto_tcmd.repeats, "3");
+    snprintf(g_auto_tcmd.delay_s, sizeof g_auto_tcmd.delay_s, "2.0");
+    g_auto_tcmd.allow_tx = 0;
+    g_auto_tcmd.focus    = AUTO_F_POWER;
+    g_auto_tcmd.cursors[AUTO_F_POWER]   = (int) strlen(g_auto_tcmd.power);
+    g_auto_tcmd.cursors[AUTO_F_REPEATS] = (int) strlen(g_auto_tcmd.repeats);
+    g_auto_tcmd.cursors[AUTO_F_DELAY]   = (int) strlen(g_auto_tcmd.delay_s);
+    g_auto_tcmd.state    = AUTO_STATE_SETUP;
+    snprintf(g_auto_tcmd.status_msg, sizeof g_auto_tcmd.status_msg,
+             "loaded %d command(s). Set fields, then Enter to start.",
+             nc);
+
+    int h = 17, ww = 110;
+    if (h > LINES) h = LINES;
+    if (ww > COLS) ww = COLS;
+    if (ww < 60)  ww = (COLS < 60) ? COLS : 60;
+    g_auto_tcmd_win = newwin(h, ww, (LINES - h) / 2, (COLS - ww) / 2);
+    if (!g_auto_tcmd_win) {
+        auto_tcmd_free_commands(g_auto_tcmd.commands, g_auto_tcmd.n_commands);
+        g_auto_tcmd.commands = NULL;
+        g_auto_tcmd.n_commands = 0;
+        return;
+    }
+    keypad(g_auto_tcmd_win, TRUE);
+    nodelay(g_auto_tcmd_win, TRUE);
+    g_auto_tcmd_active = 1;
+    auto_tcmd_draw();
+}
+
+static void auto_tcmd_close(void) {
+    if (g_auto_tcmd_win) {
+        delwin(g_auto_tcmd_win);
+        g_auto_tcmd_win = NULL;
+    }
+    g_auto_tcmd_active = 0;
+    if (g_auto_tcmd.commands) {
+        auto_tcmd_free_commands(g_auto_tcmd.commands, g_auto_tcmd.n_commands);
+        g_auto_tcmd.commands = NULL;
+        g_auto_tcmd.n_commands = 0;
+    }
+    touchwin(stdscr);
+    refresh();
+}
+
+// Validate the setup fields and move to RUNNING. Returns 0 on success,
+// fills status_msg + returns -1 on failure.
+static int auto_tcmd_start(void) {
+    auto_tcmd_t *a = &g_auto_tcmd;
+    if (a->n_commands == 0) {
+        snprintf(a->status_msg, sizeof a->status_msg,
+                 "rejected: file has no commands");
+        return -1;
+    }
+    if (!a->allow_tx) {
+        snprintf(a->status_msg, sizeof a->status_msg,
+                 "rejected: allow-tx is off");
+        return -1;
+    }
+    double power = atof(a->power);
+    if (power < 0.0 || power > 89.75) {
+        snprintf(a->status_msg, sizeof a->status_msg,
+                 "rejected: TX power %.1f dB out of B210 range 0..89.75",
+                 power);
+        return -1;
+    }
+    int repeats = atoi(a->repeats);
+    if (repeats < 1) {
+        snprintf(a->status_msg, sizeof a->status_msg,
+                 "rejected: repeats must be >= 1");
+        return -1;
+    }
+    double delay = atof(a->delay_s);
+    if (delay < 0.0) {
+        snprintf(a->status_msg, sizeof a->status_msg,
+                 "rejected: delay must be >= 0");
+        return -1;
+    }
+    a->repeats_total = repeats;
+    a->delay_s_val   = delay;
+    a->cmd_idx       = 0;
+    a->repeat_idx    = 0;
+    a->sends_total   = 0;
+    a->next_send_ns  = ts_now_ns();  // first send fires immediately
+    a->state         = AUTO_STATE_RUNNING;
+    snprintf(a->status_msg, sizeof a->status_msg,
+             "running: %d cmds × %d repeats, %.2f s delay",
+             a->n_commands, repeats, delay);
+    return 0;
+}
+
+// Pause / cancel without closing the modal so the operator can see the
+// final progress numbers.
+static void auto_tcmd_stop(const char *reason) {
+    auto_tcmd_t *a = &g_auto_tcmd;
+    if (a->state != AUTO_STATE_RUNNING) return;
+    a->state = AUTO_STATE_STOPPED;
+    snprintf(a->status_msg, sizeof a->status_msg, "stopped: %s",
+             reason ? reason : "user");
+}
+
+static int auto_tcmd_handle_key(int key) {
+    if (!g_auto_tcmd_active) return 0;
+    if (key == ERR) return 1;
+    auto_tcmd_t *a = &g_auto_tcmd;
+    int changed = 1;
+    // Esc-as-CSI same fallback the TX modal uses.
+    if (key == 27) {
+        int translated = tx_drain_csi(g_auto_tcmd_win);
+        if (translated >= 0) {
+            key = translated;
+        } else {
+            return 0;  // Esc closes (and stops via close path below)
+        }
+    }
+    if (a->state == AUTO_STATE_RUNNING) {
+        // Run mode: only stop / close commands are honoured. Field
+        // edits are blocked so an operator can't change power mid-run.
+        if (key == 's' || key == 'S') {
+            auto_tcmd_stop("user");
+            auto_tcmd_draw();
+            return 1;
+        }
+        return 1;
+    }
+    if (key == '\n' || key == '\r' || key == KEY_ENTER) {
+        if (auto_tcmd_start() == 0) {
+            auto_tcmd_draw();
+        } else {
+            auto_tcmd_draw();
+        }
+        return 1;
+    } else if (key == '\t') {
+        a->focus = (auto_tcmd_field_t) ((a->focus + 1) % AUTO_F_COUNT);
+        auto_field_clamp_cursor(a, a->focus);
+    } else if (key == KEY_BTAB) {
+        a->focus = (auto_tcmd_field_t) ((a->focus + AUTO_F_COUNT - 1)
+                                         % AUTO_F_COUNT);
+        auto_field_clamp_cursor(a, a->focus);
+    } else if (key == KEY_BACKSPACE || key == 127 || key == 8) {
+        auto_field_backspace(a);
+    } else if (key == KEY_DC || key == 4) {
+        auto_field_delete(a);
+    } else if (key == 11) {
+        auto_field_kill_to_end(a);
+    } else if (key == KEY_LEFT) {
+        auto_field_left(a);
+    } else if (key == KEY_RIGHT) {
+        auto_field_right(a);
+    } else if (key == KEY_HOME || key == 1) {
+        auto_field_home(a);
+    } else if (key == KEY_END || key == 5) {
+        auto_field_end(a);
+    } else if (key == ' ' && auto_field_is_toggle(a->focus)) {
+        auto_field_toggle(a);
+    } else if (key >= 32 && key < 127) {
+        auto_field_insert(a, key);
+    } else {
+        changed = 0;
+    }
+    if (changed) auto_tcmd_draw();
+    return 1;
+}
+
+// Per-tick burst driver. When running, queues one g_tx_request when
+// (a) the previous burst has cleared, and (b) the inter-send delay
+// has elapsed. Stops automatically on LOS so an unattended run won't
+// keep TXing after the pass. emit_tx_event_local fires from the main
+// loop's burst-handler the same way it does for the manual TX
+// compose path, so tx.log + viewer fanout capture every shot.
+static void auto_tcmd_tick(state_t *state) {
+    if (!g_auto_tcmd_active) return;
+    auto_tcmd_t *a = &g_auto_tcmd;
+    if (a->state != AUTO_STATE_RUNNING) return;
+
+    // LOS guard. We consider the pass over once the elevation has
+    // gone negative AND the predictor has rolled the next pass into
+    // the future. Sitting on a freshly-loaded prediction during AOS
+    // ambiguity (elevation < 0 but next pass not yet predicted) is
+    // not enough to abort; the running flag stays so a momentary
+    // numerical wobble can't kill an active session.
+    double el = state->prediction.satellite_ephem.elevation;
+    if (el < 0.0
+        && state->prediction.predicted_minutes_until_visible > 0.5) {
+        a->state = AUTO_STATE_PASS_OVER;
+        snprintf(a->status_msg, sizeof a->status_msg,
+                 "stopped: pass over (elevation %.1f deg)", el);
+        auto_tcmd_draw();
+        return;
+    }
+
+    if (a->cmd_idx >= a->n_commands) {
+        a->state = AUTO_STATE_DONE;
+        snprintf(a->status_msg, sizeof a->status_msg,
+                 "done: sent all %d command(s)", a->n_commands);
+        auto_tcmd_draw();
+        return;
+    }
+
+#ifdef WITH_USRP_B210
+    long now = ts_now_ns();
+    if (now < a->next_send_ns) return;
+    if (g_tx_request.pending)  return;  // prior burst still inflight
+
+    const char *cmd = a->commands[a->cmd_idx];
+    size_t n = strlen(cmd);
+    if (n > sizeof g_tx_request.payload) n = sizeof g_tx_request.payload;
+    memcpy(g_tx_request.payload, cmd, n);
+    g_tx_request.payload_len  = n;
+    g_tx_request.is_hex       = 0;
+    g_tx_request.csp_hdr      = (csp_v1_header_t){
+        .prio  = 2, .src = 10, .dst = 1, .dport = 7, .sport = 16, .flags = 0,
+    };
+    g_tx_request.tx_freq_hz       = (long) FRONTIERSAT_CARRIER_HZ;
+    g_tx_request.tx_gain_db       = atof(a->power);
+    g_tx_request.repeat           = 1;
+    g_tx_request.gap_ms           = 200;
+    g_tx_request.allow_tx         = a->allow_tx;
+    g_tx_request.allow_high_power = 0;
+    g_tx_request.allow_hf_tx      = 0;
+    snprintf(g_tx_request.summary, sizeof g_tx_request.summary,
+             "auto[%d/%d %d/%d]: %s",
+             a->cmd_idx + 1, a->n_commands,
+             a->repeat_idx + 1, a->repeats_total,
+             cmd);
+    g_tx_request.pending = 1;
+    snprintf(a->last_sent, sizeof a->last_sent, "%s", cmd);
+    a->sends_total++;
+
+    a->repeat_idx++;
+    if (a->repeat_idx >= a->repeats_total) {
+        a->cmd_idx++;
+        a->repeat_idx = 0;
+    }
+
+    a->next_send_ns = now + (long)(a->delay_s_val * 1e9);
+    auto_tcmd_draw();
+#else
+    (void) state;
+    a->state = AUTO_STATE_STOPPED;
+    snprintf(a->status_msg, sizeof a->status_msg,
+             "stopped: this build has no B210 (WITH_USRP_B210=OFF)");
+    auto_tcmd_draw();
+#endif
 }
 
 // --- Forward decls -------------------------------------------------
@@ -2716,6 +3348,20 @@ void usage(FILE *dest, const char *name, int full)
         "                               viewers still work, so the operator\n"
         "                               can rehearse a telecommand and get\n"
         "                               eyes on it without going on air.\n"
+        "  --tc-file=<path>             Load a file of ASCII telecommands\n"
+        "                               (CTS1+...; one per line; '#' lines\n"
+        "                               and blank lines ignored). Press 'A'\n"
+        "                               (or `:auto`) in the operator UI to\n"
+        "                               open the auto-tcmd modal, set TX\n"
+        "                               power / repeats-per-command / inter-\n"
+        "                               send delay / allow-tx, and Enter to\n"
+        "                               start. Sends each command N times\n"
+        "                               with the chosen delay between every\n"
+        "                               shot, then advances to the next line.\n"
+        "                               Stops automatically at LOS so an\n"
+        "                               unattended run can't keep TXing\n"
+        "                               after the pass. All TX events land\n"
+        "                               in <pass_folder>/tx.log.\n"
         "\n"
         "Operator coordination:\n"
         "  --control                    Open the sso_ipc server (operator mode).\n"
@@ -3052,7 +3698,7 @@ void report_status(state_t *state, int *print_row, int print_col)
         // needs to keep ticking at 50 Hz so each keystroke echoes
         // promptly. Rotator SET commands (the tracking output) are
         // unaffected; only the read-back blocks.
-        if (!g_cmd_active && !g_tx_compose_active) {
+        if (!g_cmd_active && !g_tx_compose_active && !g_auto_tcmd_active) {
             if (antenna_rotator_command(&state->antenna_rotator,
                                         ANTENNA_ROTATOR_STATUS,
                                         &azimuth, &elevation) == ANTENNA_ROTATOR_OK) {
@@ -4065,6 +4711,10 @@ int main(int argc, char **argv)
             if (!tx_compose_handle_key(key)) {
                 tx_compose_close();
             }
+        } else if (g_auto_tcmd_active) {
+            if (!auto_tcmd_handle_key(key)) {
+                auto_tcmd_close();
+            }
         } else if (g_cmd_active) {
             cmd_handle_key(key, &state);
         } else if (key == 'K') {
@@ -4110,6 +4760,9 @@ int main(int argc, char **argv)
                 case 't':
                     tx_compose_open();
                     break;
+                case 'A':
+                    auto_tcmd_open();
+                    break;
                 default:
                     break;
             }
@@ -4132,19 +4785,28 @@ int main(int argc, char **argv)
         // Pump the modal's debounced preview broadcast before the
         // screen flush so the mirror line is current when we paint.
         tx_compose_pump();
+        // Drive the auto-tcmd burst loop. Queues g_tx_request when
+        // it's time for the next send; the existing main-loop burst
+        // handler below transmits and emits the SENT/ACK events.
+        auto_tcmd_tick(&state);
 
         // Bottom-row prompt + screen flush. When the operator is typing
         // in the ":" prompt we want this every tick (~50 Hz) so each
         // keystroke echoes immediately. Otherwise piggyback on the slow
         // redraw so the row picks up any post-command status string.
-        // When the TX modal is open we layer it on top of stdscr via
+        // When a modal is open we layer it on top of stdscr via
         // wnoutrefresh + doupdate so the operator's panels can keep
         // refreshing underneath without flickering the modal off.
-        if (redraw_due || g_cmd_active || g_tx_compose_active) {
+        if (redraw_due || g_cmd_active || g_tx_compose_active
+            || g_auto_tcmd_active) {
             cmd_render();
             if (g_tx_compose_active && g_tx_compose_win) {
                 wnoutrefresh(stdscr);
                 wnoutrefresh(g_tx_compose_win);
+                doupdate();
+            } else if (g_auto_tcmd_active && g_auto_tcmd_win) {
+                wnoutrefresh(stdscr);
+                wnoutrefresh(g_auto_tcmd_win);
                 doupdate();
             } else {
                 refresh();
@@ -4260,7 +4922,7 @@ int main(int argc, char **argv)
             // Exception: while the operator is typing in the ":" prompt,
             // drop to 20 ms so getch() echoes each keystroke promptly
             // (the 500 ms tick was capping input at ~2 chars/sec).
-            usleep((g_cmd_active || g_tx_compose_active)
+            usleep((g_cmd_active || g_tx_compose_active || g_auto_tcmd_active)
                    ? 20000 : UPDATE_INTERVAL_MICROSEC);
         }
     }
@@ -4398,6 +5060,14 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strcmp("--no-tx", argv[i]) == 0) {
             state->n_options++;
             g_no_tx = 1;
+        } else if (strncmp("--tc-file=", argv[i], 10) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 11) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            snprintf(g_auto_tcmd_file_path, sizeof g_auto_tcmd_file_path,
+                     "%s", argv[i] + 10);
         } else if (strncmp("--tle=", argv[i], 6) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 7) {
