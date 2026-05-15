@@ -39,6 +39,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <langinfo.h>
 #include <locale.h>
 #include <math.h>
 #include <pthread.h>
@@ -2097,9 +2098,62 @@ static void tx_draw_text_field(WINDOW *w, int row, int col,
     wclrtoeol(w);
 }
 
+// Locale-aware box drawer. ncurses' built-in box() uses ACS line-
+// drawing glyphs, which fall back to the raw vt100 alphabet ('q' for
+// HLINE, 'x' for VLINE, 'l/m/k/j' for corners) on terminals where
+// ncurses can't get a working ACS map — typically over SSH when the
+// remote has a non-UTF-8 LANG. Draw the box ourselves using direct
+// UTF-8 line-drawing characters when the runtime locale is UTF-8,
+// and fall back to plain ASCII '+'/'-'/'|' when it isn't, so the
+// borders never devolve into letter soup.
+static int  g_utf8_locale_checked = 0;
+static int  g_utf8_locale         = 0;
+static int  utf8_locale_available(void) {
+    if (g_utf8_locale_checked) return g_utf8_locale;
+    g_utf8_locale_checked = 1;
+    const char *l = nl_langinfo(CODESET);
+    if (l && (strcasecmp(l, "UTF-8") == 0 || strcasecmp(l, "UTF8") == 0)) {
+        g_utf8_locale = 1;
+    }
+    return g_utf8_locale;
+}
+static void draw_box(WINDOW *w) {
+    int h = getmaxy(w), wd = getmaxx(w);
+    if (h < 2 || wd < 2) return;
+    if (utf8_locale_available()) {
+        const char *hl = "\xE2\x94\x80";  // ─
+        const char *vl = "\xE2\x94\x82";  // │
+        const char *tl = "\xE2\x94\x8C";  // ┌
+        const char *tr = "\xE2\x94\x90";  // ┐
+        const char *bl = "\xE2\x94\x94";  // └
+        const char *br = "\xE2\x94\x98";  // ┘
+        mvwprintw(w, 0, 0, "%s", tl);
+        for (int x = 1; x < wd - 1; ++x) mvwprintw(w, 0, x, "%s", hl);
+        mvwprintw(w, 0, wd - 1, "%s", tr);
+        for (int y = 1; y < h - 1; ++y) {
+            mvwprintw(w, y, 0, "%s", vl);
+            mvwprintw(w, y, wd - 1, "%s", vl);
+        }
+        mvwprintw(w, h - 1, 0, "%s", bl);
+        for (int x = 1; x < wd - 1; ++x) mvwprintw(w, h - 1, x, "%s", hl);
+        mvwprintw(w, h - 1, wd - 1, "%s", br);
+    } else {
+        mvwaddch(w, 0, 0, '+');
+        for (int x = 1; x < wd - 1; ++x) mvwaddch(w, 0, x, '-');
+        mvwaddch(w, 0, wd - 1, '+');
+        for (int y = 1; y < h - 1; ++y) {
+            mvwaddch(w, y, 0, '|');
+            mvwaddch(w, y, wd - 1, '|');
+        }
+        mvwaddch(w, h - 1, 0, '+');
+        for (int x = 1; x < wd - 1; ++x) mvwaddch(w, h - 1, x, '-');
+        mvwaddch(w, h - 1, wd - 1, '+');
+    }
+}
+
 static void tx_compose_draw(WINDOW *w, const tx_compose_t *c) {
     werase(w);
-    box(w, 0, 0);
+    draw_box(w);
     int width = getmaxx(w);
     int payload_w = width - 14;
     if (payload_w < 32) payload_w = 32;
@@ -2541,7 +2595,7 @@ static void auto_tcmd_draw(void) {
     WINDOW *w = g_auto_tcmd_win;
     auto_tcmd_t *a = &g_auto_tcmd;
     werase(w);
-    box(w, 0, 0);
+    draw_box(w);
     int width = getmaxx(w);
 
     mvwprintw(w, 0, 2, " Auto-TCMD (operator: %s)%s ",
@@ -4434,7 +4488,12 @@ int main(int argc, char **argv)
 
     init_window();
 
-    char key = '\0';
+    // int (not char) — getch returns KEY_* codes well above 127 for
+    // arrow keys / function keys / KEY_BACKSPACE etc. A signed char
+    // would silently truncate those into bogus low-byte values, which
+    // is what made KEY_LEFT (260) look like Ctrl-D (4) in the modal
+    // handlers and broke field editing inside the auto-tcmd modal.
+    int key = ERR;
     int row = 0;
     int col = 2;
     state.running = 1;
