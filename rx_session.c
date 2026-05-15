@@ -415,13 +415,18 @@ static void worker_wav_start(rx_session_t *rxs)
     // I,Q pairs at samp_rate; gen_waterfall reads them straight. If the
     // open fails we keep the WAV open (so the audio path still works)
     // and just leave iq_fp NULL so subsequent pumps skip the write.
+    // Both buffers are 512; ".iq" needs 3 bytes + nul, so cap the
+    // path-portion at 508 so the suffix always fits and GCC can prove
+    // the snprintf won't truncate.
     size_t wlen = strlen(rxs->wav_path);
     if (wlen >= 4 && strcmp(rxs->wav_path + wlen - 4, ".wav") == 0) {
+        int base_len = (int)(wlen - 4);
+        if (base_len > 508) base_len = 508;
         snprintf(rxs->iq_path, sizeof rxs->iq_path,
-                 "%.*s.iq", (int)(wlen - 4), rxs->wav_path);
+                 "%.*s.iq", base_len, rxs->wav_path);
     } else {
         snprintf(rxs->iq_path, sizeof rxs->iq_path,
-                 "%s.iq", rxs->wav_path);
+                 "%.508s.iq", rxs->wav_path);
     }
     rxs->iq_fp = fopen(rxs->iq_path, "wb");
     rxs->iq_pairs_written = 0;
