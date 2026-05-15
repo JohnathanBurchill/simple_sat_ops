@@ -253,6 +253,8 @@ struct rx_session {
     uint64_t snap_per_type_count[RX_PT_COUNT];
     int      snap_per_type_last_len[RX_PT_COUNT];
     uint8_t  snap_per_type_last_payload[RX_PT_COUNT][RX_LAST_PAYLOAD_MAX];
+    char     snap_wav_path[512];
+    long     snap_wav_n_samples;
 };
 
 static void *rx_session_thread_fn(void *arg);
@@ -418,6 +420,27 @@ int rx_session_wav_active(const rx_session_t *rxs)
     int v = rxs->snap_wav_active;
     pthread_mutex_unlock((pthread_mutex_t *) &rxs->mu);
     return v;
+}
+
+void rx_session_wav_snapshot(const rx_session_t *rxs,
+                             char     *out_path, size_t path_cap,
+                             long     *out_n_samples,
+                             int      *out_sample_rate,
+                             int      *out_active)
+{
+    if (out_path && path_cap)  out_path[0]       = '\0';
+    if (out_n_samples)         *out_n_samples    = 0;
+    if (out_sample_rate)       *out_sample_rate  = 0;
+    if (out_active)            *out_active       = 0;
+    if (rxs == NULL) return;
+    pthread_mutex_lock((pthread_mutex_t *) &rxs->mu);
+    if (out_path && path_cap) {
+        snprintf(out_path, path_cap, "%s", rxs->snap_wav_path);
+    }
+    if (out_n_samples)    *out_n_samples   = rxs->snap_wav_n_samples;
+    if (out_sample_rate)  *out_sample_rate = rxs->samp_rate;
+    if (out_active)       *out_active      = rxs->snap_wav_active;
+    pthread_mutex_unlock((pthread_mutex_t *) &rxs->mu);
 }
 
 void rx_session_request_freq(rx_session_t *rxs, double freq_hz)
@@ -627,6 +650,13 @@ static void worker_update_snapshot(rx_session_t *rxs)
     rxs->snap_rms_sq         = rms_sq;
     rxs->snap_actual_freq_hz = freq;
     rxs->snap_wav_active     = wav_active;
+    rxs->snap_wav_n_samples  = (long) rxs->wav.n_samples;
+    // Persist the last-known wav path even after a close so that the
+    // end-of-pass renderer (which runs post-close) can still find it.
+    if (rxs->wav_path[0]) {
+        snprintf(rxs->snap_wav_path, sizeof rxs->snap_wav_path,
+                 "%s", rxs->wav_path);
+    }
     snprintf(rxs->snap_last_frame_ts, sizeof rxs->snap_last_frame_ts,
              "%.*s", (int)(sizeof rxs->snap_last_frame_ts - 1),
              rxs->last_frame_ts);

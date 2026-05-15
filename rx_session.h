@@ -78,6 +78,19 @@ void rx_session_request_wav_stop(rx_session_t *rxs);
 // 1 when a WAV is currently being written, 0 otherwise. (Snapshot.)
 int  rx_session_wav_active(const rx_session_t *rxs);
 
+// Snapshot the live WAV's path, written-sample count, and sample rate
+// so an external worker can render a spectrogram off the bytes already
+// on disk. out_active reflects whether the writer is currently open.
+// The path remains valid (last-opened) after a wav_stop, which lets
+// the end-of-pass renderer use it after rx_session_close.
+//
+// Any out-pointer may be NULL.
+void rx_session_wav_snapshot(const rx_session_t *rxs,
+                             char     *out_path, size_t path_cap,
+                             long     *out_n_samples,
+                             int      *out_sample_rate,
+                             int      *out_active);
+
 // Sync: hand a TX burst request to the worker, block until it pauses
 // RX, transmits, and resumes RX. Returns the burst's outcome plus a
 // short one-line summary suitable for the operator's TX log.

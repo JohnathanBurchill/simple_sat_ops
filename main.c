@@ -41,13 +41,16 @@
 #include <errno.h>
 #include <locale.h>
 #include <math.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <ncurses.h>
 #include <unistd.h>
@@ -120,6 +123,166 @@ static const char *ribbon_glyph(double dbfs)
     return blocks[idx];
 }
 
+// Spectrogram render job. The `:spectrum N` REPL command snapshots the
+// last N seconds of the live WAV (which the rx_session worker is still
+// appending to), copies them into a temporary WAV, and shells out to
+// ffmpeg's showspectrumpic. Runs on its own pthread so the main loop
+// keeps ticking. Single slot — only one render at a time.
+//
+// Caveat: the WAV is FM-demoded mono PCM, not IQ. That puts a hard
+// ceiling on how SatNOGS-like these spectrograms can look — see the
+// commentary in b210_rx_tx_core.c (line ~303) about the FM-discriminator
+// noise floor dropping on carrier capture. For a SatNOGS-style waterfall
+// against a flat thermal floor we'd need to tap the IQ stream before
+// the discriminator; that's a separate feature.
+typedef struct spectrum_job {
+    pthread_t       thr;
+    int             active;          // 1 once the thread has been launched
+    volatile int    done;            // worker sets to 1 just before return
+    char            wav_in[512];
+    int             sample_rate;
+    long            start_sample;
+    long            n_samples;
+    char            png_out[640];
+    char            status_msg[256];
+} spectrum_job_t;
+
+static spectrum_job_t g_spec_job;
+
+// Render a finished WAV directly (no slicing) via ffmpeg. Blocks until
+// ffmpeg exits. Returns 0 on success, -1 on fork/exec/exit failure.
+// Used at end-of-pass on the final closed WAV.
+static int generate_full_spectrogram(const char *wav_path, char *png_out, size_t png_cap)
+{
+    if (wav_path == NULL) return -1;
+    size_t len = strlen(wav_path);
+    char png[640];
+    int n;
+    if (len >= 4 && strcmp(wav_path + len - 4, ".wav") == 0) {
+        n = snprintf(png, sizeof png, "%.*s.png", (int)(len - 4), wav_path);
+    } else {
+        n = snprintf(png, sizeof png, "%s.png", wav_path);
+    }
+    if (n <= 0 || (size_t) n >= sizeof png) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        char *args[] = {
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", (char *) wav_path,
+            "-lavfi",
+            "showspectrumpic=s=1920x1080:mode=combined:color=intensity:legend=1",
+            png, NULL,
+        };
+        execvp("ffmpeg", args);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        if (png_out && png_cap) snprintf(png_out, png_cap, "%s", png);
+        return 0;
+    }
+    return -1;
+}
+
+static void *spectrum_worker(void *arg)
+{
+    spectrum_job_t *j = (spectrum_job_t *) arg;
+    char tmp_wav[700];
+    snprintf(tmp_wav, sizeof tmp_wav, "%s.tmp.wav", j->png_out);
+
+    FILE *fin = fopen(j->wav_in, "rb");
+    if (fin == NULL) {
+        snprintf(j->status_msg, sizeof j->status_msg,
+                 "spectrum: open %s failed: %s", j->wav_in, strerror(errno));
+        j->done = 1;
+        return NULL;
+    }
+    if (fseek(fin, 44 + j->start_sample * 2, SEEK_SET) != 0) {
+        snprintf(j->status_msg, sizeof j->status_msg,
+                 "spectrum: seek failed: %s", strerror(errno));
+        fclose(fin); j->done = 1; return NULL;
+    }
+    FILE *fout = fopen(tmp_wav, "wb");
+    if (fout == NULL) {
+        snprintf(j->status_msg, sizeof j->status_msg,
+                 "spectrum: open %s failed: %s", tmp_wav, strerror(errno));
+        fclose(fin); j->done = 1; return NULL;
+    }
+    uint32_t sr   = (uint32_t) j->sample_rate;
+    uint32_t bps  = sr * 2;
+    uint32_t bcnt = (uint32_t)(j->n_samples * 2);
+    uint32_t fsz  = bcnt + 36;
+    uint8_t hdr[44] = {
+        'R','I','F','F',
+        (uint8_t) fsz,(uint8_t)(fsz>>8),(uint8_t)(fsz>>16),(uint8_t)(fsz>>24),
+        'W','A','V','E', 'f','m','t',' ', 16,0,0,0, 1,0, 1,0,
+        (uint8_t) sr, (uint8_t)(sr>>8), (uint8_t)(sr>>16), (uint8_t)(sr>>24),
+        (uint8_t) bps,(uint8_t)(bps>>8),(uint8_t)(bps>>16),(uint8_t)(bps>>24),
+        2,0, 16,0,
+        'd','a','t','a',
+        (uint8_t) bcnt,(uint8_t)(bcnt>>8),(uint8_t)(bcnt>>16),(uint8_t)(bcnt>>24),
+    };
+    if (fwrite(hdr, 1, 44, fout) != 44) {
+        snprintf(j->status_msg, sizeof j->status_msg, "spectrum: header write failed");
+        fclose(fin); fclose(fout); unlink(tmp_wav); j->done = 1; return NULL;
+    }
+    int16_t buf[4096];
+    long remaining = j->n_samples;
+    while (remaining > 0) {
+        size_t want = remaining > (long)(sizeof buf / sizeof buf[0])
+                    ? sizeof buf / sizeof buf[0] : (size_t) remaining;
+        size_t got = fread(buf, sizeof buf[0], want, fin);
+        if (got == 0) break;
+        fwrite(buf, sizeof buf[0], got, fout);
+        remaining -= (long) got;
+    }
+    fclose(fin); fclose(fout);
+
+    pid_t pid = fork();
+    int rc = -1;
+    if (pid == 0) {
+        char *args[] = {
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", tmp_wav,
+            "-lavfi",
+            "showspectrumpic=s=1920x1080:mode=combined:color=intensity:legend=1",
+            j->png_out, NULL,
+        };
+        execvp("ffmpeg", args);
+        _exit(127);
+    } else if (pid > 0) {
+        int status;
+        if (waitpid(pid, &status, 0) >= 0 && WIFEXITED(status))
+            rc = WEXITSTATUS(status);
+    }
+    unlink(tmp_wav);
+
+    if (rc == 0) {
+        snprintf(j->status_msg, sizeof j->status_msg,
+                 "spectrum: wrote %s (%.1fs)",
+                 j->png_out, (double) j->n_samples / (double) j->sample_rate);
+    } else {
+        snprintf(j->status_msg, sizeof j->status_msg,
+                 "spectrum: ffmpeg failed (rc=%d) for %s", rc, j->png_out);
+    }
+    j->done = 1;
+    return NULL;
+}
+
+// Reap a finished spectrum job so the slot is free for the next request.
+// Called both from cmd_dispatch (so the operator can retry) and from the
+// shutdown path (so we don't leak the worker thread).
+static void spectrum_job_reap(void)
+{
+    if (g_spec_job.active && g_spec_job.done) {
+        pthread_join(g_spec_job.thr, NULL);
+        g_spec_job.active = 0;
+    }
+}
+
 // Command line: vi-style ":" prompt at the bottom of the screen for
 // runtime actions. While g_cmd_active, every key is routed through the
 // command handler instead of the main key switch.
@@ -150,6 +313,13 @@ static void run_tx_compose(void);
 void start_tracking(state_t *state);
 void stop_tracking(state_t *state);
 int  point_to_stationary_target(state_t *state, double azimuth, double elevation);
+// g_rx_session is referenced here in cmd_dispatch but its definition
+// sits with the rest of the B210 globals further down. Forward-declare
+// it so the compiler doesn't reject the references; the symbol resolves
+// at link time to the static definition below.
+#ifdef WITH_USRP_B210
+static rx_session_t *g_rx_session;
+#endif
 
 // Dispatch the typed command. state may be touched by tracking-related
 // commands; nothing else needs it. Returns nothing -- result lands in
@@ -173,7 +343,7 @@ static void cmd_dispatch(state_t *state)
     }
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "h") == 0 || strcmp(cmd, "?") == 0) {
         cmd_set_status("commands: help tx track stop home quit "
-                       "freq <MHz> rs on|off spectrum [N]");
+                       "freq <MHz> rs on|off spectrum <sec>");
     } else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0
                || strcmp(cmd, "exit") == 0) {
         state->running = 0;
@@ -223,8 +393,86 @@ static void cmd_dispatch(state_t *state)
             cmd_set_status("rs %s: NOT YET WIRED -- rx_session_open params only",
                            arg1);
         }
-    } else if (strcmp(cmd, "spectrum") == 0) {
-        cmd_set_status("spectrum: not yet implemented");
+    } else if (strcmp(cmd, "spectrum") == 0 || strcmp(cmd, "spec") == 0) {
+#ifdef WITH_USRP_B210
+        if (arg1 == NULL) {
+            cmd_set_status("spectrum: usage `spectrum <seconds>` (1..600)");
+        } else if (g_rx_session == NULL) {
+            cmd_set_status("spectrum: no RX session");
+        } else {
+            double duration_s = atof(arg1);
+            if (duration_s <= 0.0) {
+                cmd_set_status("spectrum: invalid duration '%s'", arg1);
+            } else {
+                if (duration_s > 600.0) duration_s = 600.0;
+                if (duration_s < 1.0)   duration_s = 1.0;
+
+                spectrum_job_reap();
+                if (g_spec_job.active) {
+                    cmd_set_status("spectrum: a render is already in progress");
+                } else {
+                    char wav_path[512];
+                    long n_samples = 0;
+                    int  sample_rate = 0;
+                    int  wav_active = 0;
+                    rx_session_wav_snapshot(g_rx_session,
+                                            wav_path, sizeof wav_path,
+                                            &n_samples, &sample_rate, &wav_active);
+                    if (wav_path[0] == '\0' || sample_rate <= 0) {
+                        cmd_set_status("spectrum: no WAV (recording not started yet)");
+                    } else {
+                        long want  = (long)(duration_s * (double) sample_rate);
+                        long start = n_samples - want;
+                        if (start < 0) { start = 0; want = n_samples; }
+                        if (want <= 0) {
+                            cmd_set_status("spectrum: no samples captured yet");
+                        } else {
+                            // Filename: strip .wav and append a local-time stamp range.
+                            char base[512];
+                            size_t plen = strlen(wav_path);
+                            if (plen >= 4 && strcmp(wav_path + plen - 4, ".wav") == 0) {
+                                snprintf(base, sizeof base, "%.*s",
+                                         (int)(plen - 4), wav_path);
+                            } else {
+                                snprintf(base, sizeof base, "%s", wav_path);
+                            }
+                            time_t t_end = time(NULL);
+                            time_t t_start = t_end - (time_t) llround(duration_s);
+                            struct tm lt_start, lt_end;
+                            localtime_r(&t_start, &lt_start);
+                            localtime_r(&t_end,   &lt_end);
+                            char ts_start[32], ts_end[32];
+                            strftime(ts_start, sizeof ts_start, "%Y-%m-%d_%H-%M-%S", &lt_start);
+                            strftime(ts_end,   sizeof ts_end,   "%H-%M-%S",          &lt_end);
+
+                            memset(&g_spec_job, 0, sizeof g_spec_job);
+                            snprintf(g_spec_job.wav_in, sizeof g_spec_job.wav_in,
+                                     "%s", wav_path);
+                            snprintf(g_spec_job.png_out, sizeof g_spec_job.png_out,
+                                     "%.480s_LOCAL_%s_to_%s.png",
+                                     base, ts_start, ts_end);
+                            g_spec_job.sample_rate  = sample_rate;
+                            g_spec_job.start_sample = start;
+                            g_spec_job.n_samples    = want;
+
+                            if (pthread_create(&g_spec_job.thr, NULL,
+                                               spectrum_worker, &g_spec_job) != 0) {
+                                cmd_set_status("spectrum: pthread_create failed: %s",
+                                               strerror(errno));
+                            } else {
+                                g_spec_job.active = 1;
+                                cmd_set_status("spectrum: rendering %.1fs -> %s",
+                                               (double) want / (double) sample_rate,
+                                               g_spec_job.png_out);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+#else
+        cmd_set_status("spectrum: this build has no USRP support");
+#endif
     } else {
         cmd_set_status("unknown command '%s' (try :help)", cmd);
     }
@@ -2960,6 +3208,15 @@ int main(int argc, char **argv)
             state.running = 0;
         }
 
+        // Surface a finished spectrum render so the operator sees the
+        // outcome (PNG path or ffmpeg error) in the command-line status.
+        if (g_spec_job.active && g_spec_job.done) {
+            char msg[256];
+            snprintf(msg, sizeof msg, "%s", g_spec_job.status_msg);
+            spectrum_job_reap();
+            if (msg[0]) cmd_set_status("%s", msg);
+        }
+
         if (state.running) {
             // The B210 worker thread pumps UHD on its own pthread now,
             // so the main loop doesn't pace itself off the radio. Sleep
@@ -2975,13 +3232,48 @@ int main(int argc, char **argv)
         g_ipc = NULL;
     }
 #ifdef WITH_USRP_B210
+    char final_wav_path[512] = "";
     if (g_rx_session) {
+        // Snapshot the WAV path before close so the full-pass spectrogram
+        // can find the closed file on disk. snap_wav_path persists across
+        // wav_stop, so this works even if recording was already stopped.
+        rx_session_wav_snapshot(g_rx_session,
+                                final_wav_path, sizeof final_wav_path,
+                                NULL, NULL, NULL);
         // The worker owns the WAV writer and the B210 core. Closing
         // the session signals the worker to stop, joins it, then
         // tears down both. Any open WAV gets its header patched.
         rx_session_request_wav_stop(g_rx_session);
         rx_session_close(g_rx_session);
         g_rx_session = NULL;
+    }
+
+    // Any in-flight `:spectrum N` worker is touching the same WAV — let
+    // it finish before we hand the file to the full-pass render.
+    if (g_spec_job.active) {
+        pthread_join(g_spec_job.thr, NULL);
+        g_spec_job.active = 0;
+        if (g_spec_job.status_msg[0]) {
+            fprintf(stderr, "simple_sat_ops: %s\n", g_spec_job.status_msg);
+        }
+    }
+
+    // Full-pass spectrogram. Best-effort: prints status to stderr (the
+    // ncurses screen is already torn down). Skipped silently if no WAV
+    // was ever opened or ffmpeg isn't on PATH (exec returns 127, which
+    // generate_full_spectrogram reports as a -1 return).
+    if (final_wav_path[0]) {
+        struct stat st;
+        if (stat(final_wav_path, &st) == 0 && st.st_size > 44) {
+            char png[640];
+            if (generate_full_spectrogram(final_wav_path, png, sizeof png) == 0) {
+                fprintf(stderr, "simple_sat_ops: pass spectrogram -> %s\n", png);
+            } else {
+                fprintf(stderr,
+                    "simple_sat_ops: ffmpeg spectrogram failed for %s "
+                    "(ffmpeg on PATH?)\n", final_wav_path);
+            }
+        }
     }
 #endif
 
