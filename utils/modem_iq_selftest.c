@@ -364,6 +364,83 @@ static int test_iq_not_worse_than_pcm(void)
     return fails;
 }
 
+// Low-SNR A/B at 5 dB — the regime where symbol-rate differential
+// matters. The IQ chain should keep BER under ~10 % of payload; the
+// PCM chain is allowed to drop sync at this floor (sync robustness
+// is a separate axis from BER-after-sync).
+static int test_low_snr_ab(void)
+{
+    const int samp_rate = 48000;
+    const int bit_rate  = 9600;
+    const size_t preamble_bits = 128;
+    const size_t payload_bits  = 8 * 200;
+    const size_t total_bits = preamble_bits + 32 + payload_bits;
+    int sps = samp_rate / bit_rate;
+    size_t n_pairs = total_bits * (size_t) sps;
+    const double snr_db = 5.0;
+
+    uint8_t *bits     = malloc(total_bits);
+    int16_t *iq       = malloc(n_pairs * 2 * sizeof(int16_t));
+    int16_t *pcm      = malloc(n_pairs * sizeof(int16_t));
+    uint8_t *out_iq   = malloc(total_bits + 1024);
+    uint8_t *out_pcm  = malloc(total_bits + 1024);
+    if (!bits || !iq || !pcm || !out_iq || !out_pcm) {
+        free(bits); free(iq); free(pcm); free(out_iq); free(out_pcm);
+        return 1;
+    }
+
+    size_t nb = build_test_frame(bits, total_bits, preamble_bits, payload_bits);
+    mod_params_t mp = { samp_rate, bit_rate, 0.5, 0.5 };
+    cpfsk_modulate(bits, nb, &mp, iq);
+    add_awgn(iq, n_pairs, mp.amplitude, snr_db);
+    fm_discriminate(iq, n_pairs, pcm, 25000.0, samp_rate);
+
+    modem_params_t p;
+    modem_params_defaults(&p);
+    p.samp_rate = samp_rate;
+    p.bit_rate  = bit_rate;
+    p.rx_disable_dc_block = 1;
+
+    size_t n_iq = 0,  iq_off = 0;  int iq_pol = -1;
+    size_t n_pcm = 0, pcm_off = 0; int pcm_pol = -1;
+    int rc_iq  = modem_iq_to_bits(iq, n_pairs, &p, 0, 4, 0,
+                                  out_iq, &n_iq, &iq_off, &iq_pol);
+    int rc_pcm = modem_pcm16_to_bits(pcm, n_pairs, &p, 0, 4, 0,
+                                     out_pcm, &n_pcm, &pcm_off, &pcm_pol);
+
+    int fails = 0;
+    fails += check(rc_iq == 0, "lowsnr: IQ chain found ASM at SNR=5 dB");
+    if (rc_pcm != 0) {
+        printf("INFO  lowsnr: PCM chain did not sync at SNR=5 dB\n");
+    }
+
+    if (rc_iq == 0) {
+        size_t check_bits = payload_bits;
+        if (n_iq < 32 + check_bits) check_bits = n_iq >= 32 ? n_iq - 32 : 0;
+        size_t mis_iq = 0, mis_pcm = 0;
+        for (size_t i = 0; i < check_bits; ++i) {
+            uint8_t want = bits[preamble_bits + 32 + i] & 1u;
+            if ((out_iq[32 + i] & 1u) != want) ++mis_iq;
+            if (rc_pcm == 0 && (out_pcm[32 + i] & 1u) != want) ++mis_pcm;
+        }
+        char msg[160];
+        if (rc_pcm == 0) {
+            snprintf(msg, sizeof msg,
+                     "lowsnr: IQ BER %zu/%zu vs PCM BER %zu/%zu",
+                     mis_iq, check_bits, mis_pcm, check_bits);
+        } else {
+            snprintf(msg, sizeof msg,
+                     "lowsnr: IQ BER %zu/%zu (PCM no-sync)",
+                     mis_iq, check_bits);
+        }
+        size_t ceiling = check_bits / 10;
+        fails += check(mis_iq <= ceiling, msg);
+    }
+
+    free(bits); free(iq); free(pcm); free(out_iq); free(out_pcm);
+    return fails;
+}
+
 int main(void)
 {
     g_rng = (uint32_t) time(NULL);
@@ -372,6 +449,7 @@ int main(void)
     fails += test_clean_decode();
     fails += test_silence();
     fails += test_iq_not_worse_than_pcm();
+    fails += test_low_snr_ab();
     printf("modem_iq_selftest: %d failure(s)\n", fails);
     return fails == 0 ? 0 : 1;
 }

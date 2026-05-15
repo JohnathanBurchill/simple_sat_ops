@@ -127,24 +127,34 @@ int modem_iq_to_bits(const int16_t *iq_pairs, size_t n_pairs,
     //    per-sample phase advance is ±πh/sps and integrates to ±πh per
     //    symbol. At h=0.5 (MSK) a perfectly-strobed symbol differential
     //    is ±π/2 — well separated from 0.
-    size_t df_len = mf_len > 0 ? mf_len - 1 : 0;
-    float *dphi = (float *) malloc((df_len > 0 ? df_len : 1) * sizeof(float));
+    // 3. Symbol-rate differential phase at every sample position:
+    //    dphi[i] = arg(z_mf[i+sps] · conj(z_mf[i]))
+    //
+    //    For MSK h=0.5 this is ±π/2 inside a symbol, with a smooth
+    //    transition at symbol boundaries — exactly what M&M needs to
+    //    track timing (zero-crossings at symbol edges, large saturated
+    //    values inside a symbol). The slicer then strobes this same
+    //    signal at the symbol rate, so the bit decision sees the full
+    //    ±π/2 per-symbol phase advance rather than the per-sample
+    //    ±π/(2·sps) the original implementation accidentally strobed.
+    if (mf_len <= (size_t) sps) { free(Imf); free(Qmf); return -1; }
+    size_t df_len = mf_len - (size_t) sps;
+    float *dphi = (float *) malloc(df_len * sizeof(float));
     if (dphi == NULL) { free(Imf); free(Qmf); return -1; }
     for (size_t i = 0; i < df_len; ++i) {
-        double I0 = (double) Imf[i],     Q0 = (double) Qmf[i];
-        double I1 = (double) Imf[i + 1], Q1 = (double) Qmf[i + 1];
-        // z1 * conj(z0) = (I1 + jQ1)(I0 - jQ0)
-        //               = (I1 I0 + Q1 Q0) + j(Q1 I0 - I1 Q0)
+        double I0 = (double) Imf[i],             Q0 = (double) Qmf[i];
+        double I1 = (double) Imf[i + (size_t) sps],
+               Q1 = (double) Qmf[i + (size_t) sps];
         double real_p = I1 * I0 + Q1 * Q0;
         double imag_p = Q1 * I0 - I1 * Q0;
         dphi[i] = (float) atan2(imag_p, real_p);
     }
     free(Imf); free(Qmf);
 
-    // 4. Mueller-Müller decision-directed timing recovery on dphi.
-    //    Identical loop to modem_pcm16_to_bits — keeps the bit-detection
-    //    half of both chains apples-to-apples so any A/B difference is
-    //    attributable to the front end.
+    // 4. Mueller-Müller decision-directed timing recovery on the
+    //    symbol-rate dphi above. Slicer strobes the same signal —
+    //    one per-symbol sample produces one bit. Same loop shape as
+    //    modem_pcm16_to_bits.
     size_t max_strobes = df_len / (size_t) sps + 1;
     float *strobe = (float *) malloc(max_strobes * sizeof(float));
     if (strobe == NULL) { free(dphi); return -1; }
