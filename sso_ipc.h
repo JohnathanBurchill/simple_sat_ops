@@ -40,6 +40,8 @@ typedef enum {
     SSO_EVT_TX_COMMAND_PREVIEW, // operator -> all viewers (debounced draft)
     SSO_EVT_TX_REQUEST,         // operator -> b210_rx_tx (commit)
     SSO_EVT_TX_ACK,             // b210_rx_tx -> operator (queued/ok/rejected)
+    SSO_EVT_CMD_PREVIEW,        // operator -> viewers: live ":" prompt buffer
+    SSO_EVT_CMD_EXECUTED,       // operator -> viewers: dispatched cmd + result
 } sso_event_type_t;
 
 typedef struct {
@@ -123,6 +125,13 @@ typedef struct {
     int     tx_repeat;
     int     tx_gap_ms;
     char    tx_ack_status[24];    // tx-ack only: "ok" | "rejected: <reason>"
+
+    // cmd-preview / cmd-executed: mirror the operator's ":" prompt to
+    // viewers. cmd_text is the live buffer being typed (preview) or the
+    // dispatched command line (executed). cmd_status is the post-dispatch
+    // status string the operator sees in g_cmd_status; empty on preview.
+    char    cmd_text[160];
+    char    cmd_status[160];
 } sso_event_t;
 
 void sso_event_init(sso_event_t *evt, sso_event_type_t type);

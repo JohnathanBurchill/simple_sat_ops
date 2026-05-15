@@ -291,12 +291,30 @@ static int  g_cmd_active = 0;
 static char g_cmd_buf[CMD_BUF_SIZE];
 static int  g_cmd_len = 0;
 static char g_cmd_status[160] = "";
+// cmd-preview debounce state. cmd_dirty is set every time the buffer is
+// edited (or :  is entered fresh); the main loop broadcasts a preview
+// event once the buffer has been idle for cmd_debounce_ns. Mirrors how
+// the TX compose modal debounces its tx-preview events.
+static int    g_cmd_dirty        = 0;
+static long   g_cmd_last_edit_ns = 0;
+static long   g_cmd_debounce_ns  = 150000000L;  // 150 ms
+
+static long cmd_now_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (long) ts.tv_sec * 1000000000L + (long) ts.tv_nsec;
+}
 
 static void cmd_enter(void)
 {
     g_cmd_active = 1;
     g_cmd_buf[0] = '\0';
     g_cmd_len = 0;
+    // Force an immediate preview broadcast so viewers see the ":" prompt
+    // appear the moment the operator opens it.
+    g_cmd_dirty = 1;
+    g_cmd_last_edit_ns = 0;
 }
 
 static void cmd_set_status(const char *fmt, ...)
@@ -478,6 +496,40 @@ static void cmd_dispatch(state_t *state)
     }
 }
 
+// Mirror the operator's ":" prompt to viewers. cmd-preview carries the
+// live buffer (debounced in the main loop); cmd-executed carries the
+// dispatched command + the resulting status string. Both helpers no-op
+// when g_ipc isn't open (e.g., --no-control).
+static void cmd_broadcast_preview(void)
+{
+    if (!g_ipc) return;
+    sso_event_t evt;
+    sso_event_init(&evt, SSO_EVT_CMD_PREVIEW);
+    snprintf(evt.from, sizeof evt.from, "%s",
+             g_operator_user ? g_operator_user : "?");
+    snprintf(evt.cmd_text, sizeof evt.cmd_text, "%s", g_cmd_buf);
+    char buf[2048];
+    if (sso_event_encode(&evt, buf, sizeof buf) == 0) {
+        sso_ipc_server_broadcast(g_ipc, buf);
+    }
+}
+
+static void cmd_broadcast_executed(const char *executed_cmd)
+{
+    if (!g_ipc) return;
+    sso_event_t evt;
+    sso_event_init(&evt, SSO_EVT_CMD_EXECUTED);
+    snprintf(evt.from, sizeof evt.from, "%s",
+             g_operator_user ? g_operator_user : "?");
+    snprintf(evt.cmd_text,   sizeof evt.cmd_text,   "%s",
+             executed_cmd ? executed_cmd : "");
+    snprintf(evt.cmd_status, sizeof evt.cmd_status, "%s", g_cmd_status);
+    char buf[2048];
+    if (sso_event_encode(&evt, buf, sizeof buf) == 0) {
+        sso_ipc_server_broadcast(g_ipc, buf);
+    }
+}
+
 // Returns 1 if key was consumed by the command line, 0 to fall through.
 static int cmd_handle_key(int key, state_t *state)
 {
@@ -486,22 +538,37 @@ static int cmd_handle_key(int key, state_t *state)
     if (key == 27 /* Esc */) {
         g_cmd_active = 0;
         g_cmd_status[0] = '\0';  // clear, don't leave a stale message
+        // Tell viewers the draft is gone — empty preview, no result.
+        g_cmd_buf[0] = '\0';
+        g_cmd_len = 0;
+        cmd_broadcast_executed("");
+        g_cmd_dirty = 0;
         return 1;
     }
     if (key == '\n' || key == '\r' || key == KEY_ENTER) {
+        char executed[CMD_BUF_SIZE];
+        snprintf(executed, sizeof executed, "%s", g_cmd_buf);
         g_cmd_active = 0;
         cmd_dispatch(state);
+        // After dispatch, g_cmd_status holds the result string. Mirror
+        // both to viewers so they see exactly what the operator sees.
+        cmd_broadcast_executed(executed);
+        g_cmd_dirty = 0;
         return 1;
     }
     if (key == KEY_BACKSPACE || key == 127 || key == 8) {
         if (g_cmd_len > 0) {
             g_cmd_buf[--g_cmd_len] = '\0';
+            g_cmd_dirty = 1;
+            g_cmd_last_edit_ns = cmd_now_ns();
         }
         return 1;
     }
     if (key >= 32 && key < 127 && g_cmd_len < (int)sizeof g_cmd_buf - 1) {
         g_cmd_buf[g_cmd_len++] = (char)key;
         g_cmd_buf[g_cmd_len] = '\0';
+        g_cmd_dirty = 1;
+        g_cmd_last_edit_ns = cmd_now_ns();
     }
     return 1;
 }
@@ -2247,6 +2314,13 @@ static char   g_viewer_operator[64]       = "";
 static char   g_viewer_roster_json[1024]  = "";
 static time_t g_viewer_last_event         = 0;
 static int    g_viewer_running            = 1;
+// Mirror of the operator's ":" prompt state. cmd_active = 1 between
+// the first cmd-preview after :  and the cmd-executed that closes it.
+// cmd_buf and cmd_status track g_cmd_buf / g_cmd_status verbatim so
+// the viewer's bottom row matches the operator's exactly.
+static int    g_viewer_cmd_active         = 0;
+static char   g_viewer_cmd_buf[CMD_BUF_SIZE] = "";
+static char   g_viewer_cmd_status[160]    = "";
 // state_t whose fields the viewer mirrors from the broadcast each tick.
 static state_t g_viewer_state;
 static double  g_viewer_carrier_hz        = 0.0;
@@ -2268,6 +2342,26 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
      || evt->type == SSO_EVT_TX_COMMAND_SENT
      || evt->type == SSO_EVT_TX_ACK) {
         tx_log_push(evt);
+        g_viewer_last_event = time(NULL);
+        g_viewer_event_pending = 1;
+        return;
+    }
+    if (evt->type == SSO_EVT_CMD_PREVIEW) {
+        g_viewer_cmd_active = 1;
+        snprintf(g_viewer_cmd_buf, sizeof g_viewer_cmd_buf,
+                 "%s", evt->cmd_text);
+        g_viewer_last_event = time(NULL);
+        g_viewer_event_pending = 1;
+        return;
+    }
+    if (evt->type == SSO_EVT_CMD_EXECUTED) {
+        // Empty cmd_text + empty cmd_status = Esc/cancel; clear the row.
+        // Otherwise show the executed-command result string just like the
+        // operator does after cmd_dispatch returns.
+        g_viewer_cmd_active = 0;
+        g_viewer_cmd_buf[0] = '\0';
+        snprintf(g_viewer_cmd_status, sizeof g_viewer_cmd_status,
+                 "%s", evt->cmd_status);
         g_viewer_last_event = time(NULL);
         g_viewer_event_pending = 1;
         return;
@@ -2508,8 +2602,6 @@ static void viewer_render(int connected)
         }
     }
 
-    attron(A_REVERSE);
-    char foot[200];
     time_t now = time(NULL);
     long stale_s = g_viewer_last_event > 0
         ? (long)(now - g_viewer_last_event)
@@ -2518,20 +2610,44 @@ static void viewer_render(int connected)
                                     : (stale_s < 0 ? "WAITING"
                                                    : (stale_s > 5 ? "STALE"
                                                                   : "LIVE"));
-    if (g_viewer_confirm_until > 0 && now < g_viewer_confirm_until) {
-        snprintf(foot, sizeof foot,
-            " %s     Take control from %s? y/N ",
-            status,
-            g_viewer_operator[0] ? g_viewer_operator : "?");
+
+    // Bottom row priority: take-control confirm > cmd mirror > footer.
+    // The cmd mirror reproduces exactly what the operator sees on its
+    // own LINES-1; the footer (connection status + viewer-only shortcuts)
+    // is the fallback when neither is active. The mirror does not invert
+    // the row — matches the operator's plain ":" prompt rendering.
+    int show_confirm = (g_viewer_confirm_until > 0
+                        && now < g_viewer_confirm_until);
+    int show_mirror  = !show_confirm
+        && (g_viewer_cmd_active || g_viewer_cmd_status[0]);
+
+    move(LINES - 1, 0);
+    clrtoeol();
+    if (show_mirror) {
+        if (g_viewer_cmd_active) {
+            mvprintw(LINES - 1, 0, ":%s", g_viewer_cmd_buf);
+            addch(' ' | A_REVERSE);
+        } else {
+            mvprintw(LINES - 1, 0, "%s", g_viewer_cmd_status);
+        }
     } else {
-        snprintf(foot, sizeof foot,
-            " %s     c : take control   q : quit ", status);
+        attron(A_REVERSE);
+        char foot[200];
+        if (show_confirm) {
+            snprintf(foot, sizeof foot,
+                " %s     Take control from %s? y/N ",
+                status,
+                g_viewer_operator[0] ? g_viewer_operator : "?");
+        } else {
+            snprintf(foot, sizeof foot,
+                " %s     c : take control   q : quit ", status);
+        }
+        int flen = (int)strlen(foot);
+        if (flen > cols) flen = cols;
+        mvaddnstr(LINES - 1, 0, foot, flen);
+        for (int i = flen; i < cols; i++) mvaddch(LINES - 1, i, ' ');
+        attroff(A_REVERSE);
     }
-    int flen = (int)strlen(foot);
-    if (flen > cols) flen = cols;
-    mvaddnstr(LINES - 1, 0, foot, flen);
-    for (int i = flen; i < cols; i++) mvaddch(LINES - 1, i, ' ');
-    attroff(A_REVERSE);
 
     refresh();
 }
@@ -3200,6 +3316,14 @@ int main(int argc, char **argv)
                                      doppler_delta_downlink,
                                      jul_utc);
                 t_last_ipc_broadcast = t_now;
+            }
+            // Debounced cmd-preview broadcast: viewers see the operator's
+            // ":" prompt as it's typed, lagging by g_cmd_debounce_ns so we
+            // don't fire a packet per keystroke.
+            if (g_cmd_active && g_cmd_dirty
+                && (cmd_now_ns() - g_cmd_last_edit_ns) >= g_cmd_debounce_ns) {
+                cmd_broadcast_preview();
+                g_cmd_dirty = 0;
             }
         }
         if (g_yield_requested) {

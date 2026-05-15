@@ -398,6 +398,8 @@ static const struct {
     { SSO_EVT_TX_COMMAND_PREVIEW,"tx-preview" },
     { SSO_EVT_TX_REQUEST,        "tx-request" },
     { SSO_EVT_TX_ACK,            "tx-ack" },
+    { SSO_EVT_CMD_PREVIEW,       "cmd-preview" },
+    { SSO_EVT_CMD_EXECUTED,      "cmd-executed" },
     { SSO_EVT_UNKNOWN,           NULL },
 };
 
@@ -543,6 +545,10 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
         }
         if (json_field_str(&p, end, &first, "tx_st", evt->tx_ack_status) < 0) return -1;
     }
+    if (evt->type == SSO_EVT_CMD_PREVIEW || evt->type == SSO_EVT_CMD_EXECUTED) {
+        if (json_field_str(&p, end, &first, "cmd_text",   evt->cmd_text)   < 0) return -1;
+        if (json_field_str(&p, end, &first, "cmd_status", evt->cmd_status) < 0) return -1;
+    }
     if (json_append(&p, end + 2, "}\n") < 0) return -1;
     *p = '\0';
     return 0;
@@ -631,6 +637,8 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
     if (json_get_int(line, "tx_rep", &tx_int) > 0) evt->tx_repeat = (int) tx_int;
     if (json_get_int(line, "tx_gap", &tx_int) > 0) evt->tx_gap_ms = (int) tx_int;
     json_get_string(line, "tx_st", evt->tx_ack_status, sizeof(evt->tx_ack_status));
+    json_get_string(line, "cmd_text",   evt->cmd_text,   sizeof(evt->cmd_text));
+    json_get_string(line, "cmd_status", evt->cmd_status, sizeof(evt->cmd_status));
     return 0;
 }
 
