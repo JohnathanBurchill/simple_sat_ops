@@ -181,7 +181,7 @@ static int generate_full_spectrogram(const char *wav_path, char *png_out, size_t
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-i", (char *) wav_path,
             "-lavfi",
-            "showspectrumpic=s=1920x1080:mode=combined:color=intensity:legend=1",
+            "showspectrumpic=s=1920x1080:mode=combined:color=viridis:scale=log:legend=1:saturation=1.5",
             png, NULL,
         };
         execvp("ffmpeg", args);
@@ -257,7 +257,7 @@ static void *spectrum_worker(void *arg)
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-i", tmp_wav,
             "-lavfi",
-            "showspectrumpic=s=1920x1080:mode=combined:color=intensity:legend=1",
+            "showspectrumpic=s=1920x1080:mode=combined:color=viridis:scale=log:legend=1:saturation=1.5",
             j->png_out, NULL,
         };
         execvp("ffmpeg", args);
@@ -541,6 +541,98 @@ static void cmd_broadcast_executed(const char *executed_cmd)
     }
 }
 
+// Apply a single editing action to the cmd buffer. Factored so both
+// the keypad-translated codepath (KEY_LEFT, KEY_RIGHT, KEY_DC, etc.)
+// and the manual escape-sequence fallback (`\x1b[D` and friends) feed
+// the same logic.
+typedef enum {
+    CMD_ACTION_NONE = 0,
+    CMD_ACTION_LEFT,
+    CMD_ACTION_RIGHT,
+    CMD_ACTION_HOME,
+    CMD_ACTION_END,
+    CMD_ACTION_BACKSPACE,
+    CMD_ACTION_DEL,
+} cmd_action_t;
+
+static int cmd_apply_action(cmd_action_t a)
+{
+    switch (a) {
+        case CMD_ACTION_LEFT:
+            if (g_cmd_cursor > 0) g_cmd_cursor--;
+            return 1;
+        case CMD_ACTION_RIGHT:
+            if (g_cmd_cursor < g_cmd_len) g_cmd_cursor++;
+            return 1;
+        case CMD_ACTION_HOME:
+            g_cmd_cursor = 0;
+            return 1;
+        case CMD_ACTION_END:
+            g_cmd_cursor = g_cmd_len;
+            return 1;
+        case CMD_ACTION_BACKSPACE:
+            if (g_cmd_cursor > 0) {
+                memmove(&g_cmd_buf[g_cmd_cursor - 1],
+                        &g_cmd_buf[g_cmd_cursor],
+                        (size_t)(g_cmd_len - g_cmd_cursor + 1));
+                g_cmd_len--;
+                g_cmd_cursor--;
+                g_cmd_dirty = 1;
+                g_cmd_last_edit_ns = cmd_now_ns();
+            }
+            return 1;
+        case CMD_ACTION_DEL:
+            if (g_cmd_cursor < g_cmd_len) {
+                memmove(&g_cmd_buf[g_cmd_cursor],
+                        &g_cmd_buf[g_cmd_cursor + 1],
+                        (size_t)(g_cmd_len - g_cmd_cursor));
+                g_cmd_len--;
+                g_cmd_dirty = 1;
+                g_cmd_last_edit_ns = cmd_now_ns();
+            }
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+// When keypad/terminfo doesn't translate arrow keys (some minimal
+// $TERM values, or a tmux/screen pane that strips function-key info)
+// the raw escape sequence arrives byte-by-byte instead of as a single
+// KEY_*. The first byte is Esc (27); if we treat that as cancel the
+// rest of the sequence falls into the main keyboard switch and gets
+// silently dropped. Peek for follow-on bytes; only fall through to
+// the Esc-as-cancel path when nothing else is queued.
+static cmd_action_t cmd_drain_csi(void)
+{
+    // After Esc we expect '['; otherwise it's some other sequence we
+    // don't recognise and we just swallow the lookahead.
+    int b1 = getch();
+    if (b1 == ERR) return CMD_ACTION_NONE;
+    if (b1 != '[') return CMD_ACTION_NONE;
+    int b2 = getch();
+    if (b2 == ERR) return CMD_ACTION_NONE;
+    if (b2 == 'D') return CMD_ACTION_LEFT;
+    if (b2 == 'C') return CMD_ACTION_RIGHT;
+    if (b2 == 'H') return CMD_ACTION_HOME;
+    if (b2 == 'F') return CMD_ACTION_END;
+    // VT-style sequences: ESC [ <digits> ~ . We only care about a few.
+    if (b2 >= '0' && b2 <= '9') {
+        int b3 = getch();
+        if (b3 == '~') {
+            switch (b2) {
+                case '1': return CMD_ACTION_HOME;   // some terminals
+                case '3': return CMD_ACTION_DEL;
+                case '4': return CMD_ACTION_END;    // some terminals
+                case '7': return CMD_ACTION_HOME;
+                case '8': return CMD_ACTION_END;
+                default:  return CMD_ACTION_NONE;
+            }
+        }
+    }
+    return CMD_ACTION_NONE;
+}
+
 // Returns 1 if key was consumed by the command line, 0 to fall through.
 // Supports left/right cursor movement, mid-line insert + delete, Home/
 // End jumps, and Enter from any cursor position. The viewer's cmd_text
@@ -549,10 +641,15 @@ static int cmd_handle_key(int key, state_t *state)
 {
     if (!g_cmd_active) return 0;
     if (key == ERR) return 1;
-    if (key == 27 /* Esc */) {
+    if (key == 27 /* Esc OR start of a CSI sequence */) {
+        cmd_action_t a = cmd_drain_csi();
+        if (a != CMD_ACTION_NONE) {
+            cmd_apply_action(a);
+            return 1;
+        }
+        // Truly bare Esc — cancel.
         g_cmd_active = 0;
-        g_cmd_status[0] = '\0';  // clear, don't leave a stale message
-        // Tell viewers the draft is gone — empty preview, no result.
+        g_cmd_status[0] = '\0';
         g_cmd_buf[0] = '\0';
         g_cmd_len = 0;
         g_cmd_cursor = 0;
@@ -571,46 +668,16 @@ static int cmd_handle_key(int key, state_t *state)
         g_cmd_dirty = 0;
         return 1;
     }
-    if (key == KEY_LEFT) {
-        if (g_cmd_cursor > 0) g_cmd_cursor--;
-        return 1;
-    }
-    if (key == KEY_RIGHT) {
-        if (g_cmd_cursor < g_cmd_len) g_cmd_cursor++;
-        return 1;
-    }
-    if (key == KEY_HOME || key == 1 /* Ctrl-A */) {
-        g_cmd_cursor = 0;
-        return 1;
-    }
-    if (key == KEY_END || key == 5 /* Ctrl-E */) {
-        g_cmd_cursor = g_cmd_len;
-        return 1;
-    }
-    if (key == KEY_BACKSPACE || key == 127 || key == 8) {
-        if (g_cmd_cursor > 0) {
-            // Shift the tail one char left over the deleted slot.
-            memmove(&g_cmd_buf[g_cmd_cursor - 1],
-                    &g_cmd_buf[g_cmd_cursor],
-                    (size_t)(g_cmd_len - g_cmd_cursor + 1));  // include nul
-            g_cmd_len--;
-            g_cmd_cursor--;
-            g_cmd_dirty = 1;
-            g_cmd_last_edit_ns = cmd_now_ns();
-        }
-        return 1;
-    }
-    if (key == KEY_DC /* forward delete */ || key == 4 /* Ctrl-D */) {
-        if (g_cmd_cursor < g_cmd_len) {
-            memmove(&g_cmd_buf[g_cmd_cursor],
-                    &g_cmd_buf[g_cmd_cursor + 1],
-                    (size_t)(g_cmd_len - g_cmd_cursor));  // include nul
-            g_cmd_len--;
-            g_cmd_dirty = 1;
-            g_cmd_last_edit_ns = cmd_now_ns();
-        }
-        return 1;
-    }
+    if (key == KEY_LEFT)  return cmd_apply_action(CMD_ACTION_LEFT);
+    if (key == KEY_RIGHT) return cmd_apply_action(CMD_ACTION_RIGHT);
+    if (key == KEY_HOME || key == 1 /* Ctrl-A */)
+        return cmd_apply_action(CMD_ACTION_HOME);
+    if (key == KEY_END  || key == 5 /* Ctrl-E */)
+        return cmd_apply_action(CMD_ACTION_END);
+    if (key == KEY_BACKSPACE || key == 127 || key == 8)
+        return cmd_apply_action(CMD_ACTION_BACKSPACE);
+    if (key == KEY_DC || key == 4 /* Ctrl-D */)
+        return cmd_apply_action(CMD_ACTION_DEL);
     if (key >= 32 && key < 127 && g_cmd_len < (int) sizeof g_cmd_buf - 1) {
         // Insert at cursor: shift the tail right by one, drop char in.
         memmove(&g_cmd_buf[g_cmd_cursor + 1],
