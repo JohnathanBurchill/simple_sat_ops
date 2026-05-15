@@ -361,6 +361,18 @@ packet_db_t *packet_db_open(const char *path)
         errno = EIO;
         return NULL;
     }
+    // busy_timeout: when a writer contends (another process running
+    // packet_browser / packet_query / rx_decode while a pass is being
+    // recorded), wait up to 5 s for the lock instead of immediately
+    // returning SQLITE_BUSY ("database is locked"). 5 s is generous
+    // for our single-row inserts but bounded enough to surface a real
+    // deadlock.
+    sqlite3_busy_timeout(raw, 5000);
+    // synchronous=NORMAL is the standard WAL companion: durable across
+    // process crashes (fsync at checkpoint), not across OS crashes.
+    // Cuts per-insert latency without affecting our use case (post-
+    // pass review is fine with checkpoint-level durability).
+    (void) sqlite3_exec(raw, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
     if (sqlite3_exec(raw, SCHEMA_SQL, NULL, NULL, &errmsg) != SQLITE_OK) {
         fprintf(stderr, "packet_db: schema apply failed: %s\n",
                 errmsg ? errmsg : "(unknown)");
