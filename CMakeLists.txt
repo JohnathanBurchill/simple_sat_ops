@@ -139,7 +139,7 @@ list(APPEND SSO_TARGETS gen_waterfall)
 # and A/B-checks against modem_pcm16_to_bits on the FM-discriminated
 # equivalent.
 add_executable(modem_iq_selftest utils/modem_iq_selftest.c
-               modem.c modem_iq.c modem_viterbi.c)
+               modem.c modem_fsk.c modem_iq.c modem_viterbi.c)
 target_include_directories(modem_iq_selftest PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(modem_iq_selftest PRIVATE m)
 list(APPEND SSO_TARGETS modem_iq_selftest)
@@ -156,7 +156,7 @@ if (OPENSSL_FOUND)
 
     # Offline AX100 frame decoder: WAV/RAW -> demod -> ax100_unframe -> CSP
     add_executable(rx_decode utils/rx_decode.c utils/wav_read.c
-                   modem.c modem_iq.c modem_viterbi.c
+                   modem.c modem_fsk.c modem_iq.c modem_viterbi.c
                    ax100.c rs.c golay24.c csp.c hmac_keyfile.c
                    beacon_cts1.c decode_loop.c)
     target_include_directories(rx_decode PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
@@ -195,7 +195,7 @@ if (OPENSSL_FOUND)
 
     # Offline sliding-window decoder for WAV / raw S16_LE files.
     add_executable(rx_replay utils/rx_replay.c utils/wav_read.c decode_loop.c
-                   modem.c modem_iq.c modem_viterbi.c
+                   modem.c modem_fsk.c modem_iq.c modem_viterbi.c
                    ax100.c rs.c golay24.c csp.c hmac_keyfile.c
                    beacon_cts1.c rx_tui.c tle_csv.c)
     target_include_directories(rx_replay PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
@@ -313,7 +313,7 @@ endif()
 if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
     add_executable(simple_sat_ops main.c prediction.c
                    antenna_rotator.c telemetry.c oem.c
-                   decode_loop.c modem.c modem_iq.c modem_viterbi.c
+                   decode_loop.c modem.c modem_fsk.c modem_iq.c modem_viterbi.c
                    ax100.c rs.c golay24.c csp.c
                    hmac_keyfile.c beacon_cts1.c tle_csv.c
                    biquad.c monitor_squelch.c)

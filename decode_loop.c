@@ -22,6 +22,7 @@
 
 #include "beacon_cts1.h"
 #include "csp.h"
+#include "modem_fsk.h"
 #include "modem_iq.h"
 #include "modem_viterbi.h"
 #include "packet_db.h"
@@ -301,6 +302,88 @@ int try_decode_window_iq(const int16_t *iq_pairs, size_t n_pairs,
                                   0, sync_max_ham, min_offset,
                                   bits_scratch, &n_bits,
                                   &sync_off, &polarity_used);
+        if (rc != 0) break;
+        ++attempts;
+        if (n_bits == 0) {
+            min_offset = sync_off + 1;
+            continue;
+        }
+        size_t need_bytes = (n_bits + 7) / 8;
+        if (need_bytes > bytes_cap) {
+            min_offset = sync_off + 1;
+            continue;
+        }
+        size_t n_bytes = modem_bits_to_bytes(bits_scratch, n_bits,
+                                             bytes_scratch);
+        ssize_t plen = ax100_unframe(bytes_scratch, n_bytes, opts,
+                                     packet, packet_cap,
+                                     out_golay_errs, out_hmac_ok,
+                                     out_rs_errs, out_used_golay_len,
+                                     out_rs_locs);
+        (void) polarity_used;
+        if (plen < 0) {
+            if (allow_partial_rs && !use_hmac && opts->reed_solomon
+                && *out_golay_errs == 0) {
+                ax100_opts_t partial_opts = *opts;
+                partial_opts.reed_solomon = 0;
+                int p_golay = 0, p_hmac = -1, p_rs = -1, p_lensrc = -1;
+                ssize_t pp = ax100_unframe(bytes_scratch, n_bytes,
+                                           &partial_opts,
+                                           packet, packet_cap,
+                                           &p_golay, &p_hmac,
+                                           &p_rs, &p_lensrc,
+                                           NULL);
+                if (pp > 32) {
+                    *out_packet_len = pp - 32;
+                    *out_golay_errs = p_golay;
+                    *out_hmac_ok = -1;
+                    *out_rs_errs = -2;
+                    *out_used_golay_len = p_lensrc;
+                    if (out_sync_off) *out_sync_off = sync_off;
+                    return 1;
+                }
+            }
+            min_offset = sync_off + 1;
+            continue;
+        }
+        if (use_hmac && *out_hmac_ok == 0) {
+            min_offset = sync_off + 1;
+            continue;
+        }
+        *out_packet_len = plen;
+        if (out_sync_off) *out_sync_off = sync_off;
+        return 1;
+    }
+    return 0;
+}
+
+int try_decode_window_fsk(const int16_t *iq_pairs, size_t n_pairs,
+                          const modem_params_t *mp,
+                          const ax100_opts_t *opts,
+                          int sync_max_ham, int use_hmac,
+                          int allow_partial_rs,
+                          size_t min_offset_in,
+                          uint8_t *bits_scratch, size_t bits_cap,
+                          uint8_t *bytes_scratch, size_t bytes_cap,
+                          uint8_t *packet, size_t packet_cap,
+                          ssize_t *out_packet_len,
+                          int *out_golay_errs, int *out_hmac_ok,
+                          int *out_rs_errs, int *out_used_golay_len,
+                          size_t *out_sync_off,
+                          int *out_rs_locs)
+{
+    (void) bits_cap;
+    const int MAX_ATTEMPTS = 256;
+    size_t min_offset = min_offset_in;
+    int attempts = 0;
+
+    while (attempts < MAX_ATTEMPTS) {
+        size_t n_bits = 0, sync_off = 0;
+        int polarity_used = -1;
+        int rc = modem_fsk_iq_to_bits(iq_pairs, n_pairs, mp,
+                                      0, sync_max_ham, min_offset,
+                                      bits_scratch, &n_bits,
+                                      &sync_off, &polarity_used);
         if (rc != 0) break;
         ++attempts;
         if (n_bits == 0) {

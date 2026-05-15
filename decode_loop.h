@@ -95,6 +95,26 @@ int try_decode_window_iq(const int16_t *iq_pairs, size_t n_pairs,
                          size_t *out_sync_off,
                          int *out_rs_locs);
 
+// Same contract again, but FM-discriminates the IQ first and then
+// runs the same DC-block + AGC + MF + M&M + slicer pipeline that
+// modem_pcm16 uses on FM-demod audio. Modulation-index-agnostic
+// (works on h=0.5 MSK and the h~2/3 FSK FrontierSat actually
+// transmits); usually the best primary chain on real captures.
+int try_decode_window_fsk(const int16_t *iq_pairs, size_t n_pairs,
+                          const modem_params_t *mp,
+                          const ax100_opts_t *opts,
+                          int sync_max_ham, int use_hmac,
+                          int allow_partial_rs,
+                          size_t min_offset_in,
+                          uint8_t *bits_scratch, size_t bits_cap,
+                          uint8_t *bytes_scratch, size_t bytes_cap,
+                          uint8_t *packet, size_t packet_cap,
+                          ssize_t *out_packet_len,
+                          int *out_golay_errs, int *out_hmac_ok,
+                          int *out_rs_errs, int *out_used_golay_len,
+                          size_t *out_sync_off,
+                          int *out_rs_locs);
+
 // Same contract again, but runs the MSK-MLSE Viterbi
 // (modem_iq_viterbi_to_bits) on the IQ window. Used by rx_session as a
 // second shadow chain so we can A/B Viterbi vs differential slicer vs

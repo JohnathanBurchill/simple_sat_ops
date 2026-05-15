@@ -40,6 +40,7 @@
 #include "decode_loop.h"
 #include "hmac_keyfile.h"
 #include "modem.h"
+#include "modem_fsk.h"
 #include "modem_iq.h"
 #include "packet_db.h"
 #include "rx_tui.h"
@@ -1063,11 +1064,17 @@ int main(int argc, char **argv)
         .n_emitted_p = &n_emitted,
     };
 
-    // Pass 1: the original sliding-window decode. When two_pass is on
-    // and we're in iq_mode, force the slicer chain — Viterbi is run
-    // from pass 2 on anchored tight windows. When two_pass is off the
-    // user's --viterbi / --no-viterbi choice still wins.
+    // Pass 1: the original sliding-window decode. In iq_mode the
+    // default chain is now modem_fsk (FM-discriminator + DC-block +
+    // AGC + boxcar MF + M&M + slicer — same chain gr_satellites uses,
+    // and modulation-index-agnostic so it handles FrontierSat's h≈2/3
+    // FSK rather than only h=0.5 MSK). Set RX_REPLAY_USE_DIFF_SLICER=1
+    // to fall back to modem_iq's complex-differential slicer for A/B
+    // testing. When two_pass is on, pass-1 always uses the slicer
+    // family — the Viterbi (still h=0.5-only) runs in pass 2.
     int pass1_use_viterbi = (iq_mode && two_pass) ? 0 : use_viterbi;
+    int pass1_use_fsk = iq_mode && !getenv("RX_REPLAY_USE_DIFF_SLICER")
+                        && !pass1_use_viterbi;
     for (size_t window_start = 0;
          window_start + window_samples <= n_frames && !g_stop;
          window_start += slide_samples)
@@ -1087,6 +1094,17 @@ int main(int argc, char **argv)
             int decoded;
             if (iq_mode && pass1_use_viterbi) {
                 decoded = try_decode_window_viterbi(
+                    win, window_samples, &mp, &opts,
+                    sync_max_ham, use_hmac, allow_partial_rs,
+                    inner_min_offset,
+                    bits_scratch, bits_cap,
+                    bytes_scratch, bytes_cap,
+                    packet, sizeof packet,
+                    &plen, &golay_errs, &hmac_ok,
+                    &rs_errs, &used_golay_len,
+                    &sync_off_local, rs_locs);
+            } else if (iq_mode && pass1_use_fsk) {
+                decoded = try_decode_window_fsk(
                     win, window_samples, &mp, &opts,
                     sync_max_ham, use_hmac, allow_partial_rs,
                     inner_min_offset,
@@ -1161,7 +1179,7 @@ int main(int argc, char **argv)
             for (int tries = 0; tries < 64; ++tries) {
                 size_t n_bits_sym = 0, sync_off_bits = 0;
                 int polarity_used = -1;
-                int rc = modem_iq_to_bits(win, window_samples, &mp,
+                int rc = modem_fsk_iq_to_bits(win, window_samples, &mp,
                                           0, sync_max_ham, inner_min,
                                           bits_scratch, &n_bits_sym,
                                           &sync_off_bits, &polarity_used);
@@ -1196,7 +1214,16 @@ int main(int argc, char **argv)
                 int golay2 = 0, hmac2 = -1, rs2 = -1, glen2 = -1;
                 int rs_locs2[32];
                 size_t sync_off2 = 0;
-                int dec2 = try_decode_window_viterbi(
+                // Pass-2 retry uses the FSK chain on a tight window
+                // centered on the sync candidate. The tight window
+                // lets AGC + HPF settle on signal-dominated samples
+                // rather than mostly-noise — sometimes recovers a
+                // frame that pass-1's wide-window FSK partial-RS'd
+                // or that pass-1 missed entirely. The Viterbi MLSE
+                // is reserved for h=0.5 AWGN tests where its 2 dB
+                // coherent gain matters; on FrontierSat's h≈2/3 FSK
+                // its 4-state trellis is wrong and finds zero syncs.
+                int dec2 = try_decode_window_fsk(
                     tw, tw_pairs, &mp, &opts,
                     sync_max_ham, use_hmac, allow_partial_rs,
                     0,
@@ -1236,17 +1263,21 @@ done:
     if (!iq_mode) {
         chain = "fm-audio";
     } else if (two_pass) {
-        chain = "iq+slicer+anchored-viterbi";
+        chain = pass1_use_fsk ? "iq+fsk+anchored-fsk"
+                              : "iq+slicer+anchored-fsk";
+    } else if (pass1_use_viterbi) {
+        chain = "iq+viterbi";
+    } else if (pass1_use_fsk) {
+        chain = "iq+fsk";
     } else {
-        chain = use_viterbi ? "iq+viterbi" : "iq+slicer";
+        chain = "iq+slicer";
     }
     fprintf(stderr, "rx_replay: %d frame(s) emitted (chain=%s).\n",
             n_emitted, chain);
     if (iq_mode && two_pass) {
         fprintf(stderr,
-                "rx_replay: pass-1 (slicer) emitted %d, "
-                "pass-2 (anchored Viterbi) tried %d candidate(s) "
-                "and rescued %d.\n",
+                "rx_replay: pass-1 emitted %d, pass-2 (anchored FSK) "
+                "tried %d candidate(s) and rescued %d.\n",
                 pass1_n_emitted, p2_attempts, p2_emitted);
     }
     free(bits_scratch);
