@@ -28,10 +28,10 @@
 #include "sso_ipc_paths.h"
 #include "sso_paths.h"
 #include "tle_csv.h"
+#include "frontiersat.h"
 
 #ifdef WITH_USRP_B210
 #include "b210_rx_tx_core.h"
-#include "frontiersat.h"
 #include "rx_session.h"
 #include "tx_burst.h"
 #endif
@@ -1075,6 +1075,173 @@ static void setup_pass_folder(state_t *state, double jul_utc_now)
     fprintf(stderr, "simple_sat_ops: pass folder %s\n", folder);
 }
 
+// Sample the upcoming pass on a local prediction_t copy and render a
+// polar az/el plot to pass_folder/az_el_plot.png via gnuplot. Two
+// traces: the satellite's sky position and the rotator boom's beam
+// direction (which match for non-flip passes and diverge near apex on
+// flip passes -- a visual sanity check of the flip mapping). The
+// raw TSV and the gnuplot script are left in the pass folder so the
+// operator can rerun or tweak the plot offline.
+static void generate_pass_plot(state_t *state, const char *pass_folder,
+                               double jul_utc_now)
+{
+    if (!pass_folder || !pass_folder[0]) {
+        return;
+    }
+
+    // Work on a local copy: update_pass_predictions / update_satellite_position
+    // both mutate the prediction's satellite_ephem and aggregate fields.
+    prediction_t pred = state->prediction;
+
+    // Defensive: handoff case (setup_pass_folder used inherited
+    // g_pass_folder) leaves predicted_minutes_until_visible stale.
+    // Re-run the search so aos_jul below is well defined.
+    minutes_until_visible(&pred, jul_utc_now,
+                          jul_utc_now + 180.0 / 1440.0, 1.0);
+    if (pred.predicted_minutes_until_visible <= -9000.0) {
+        fprintf(stderr,
+                "simple_sat_ops: no AOS in the next 3 h — skipping plot\n");
+        return;
+    }
+    double aos_jul = jul_utc_now + pred.predicted_minutes_until_visible / 1440.0;
+
+    // Populate predicted_max_elevation / predicted_ascension_azimuth /
+    // predicted_pass_duration_minutes on the local copy.
+    update_pass_predictions(&pred, aos_jul, 0.1);
+
+    int flip_mode = 0;
+    double aos_az = pred.predicted_ascension_azimuth;
+    if (ANTENNA_ROTATOR_MAXIMUM_ELEVATION > 90
+        && pred.predicted_max_elevation
+               >= ANTENNA_ROTATOR_FLIP_ELEVATION_THRESHOLD) {
+        flip_mode = 1;
+    }
+
+    char dat_path[512];
+    int n = snprintf(dat_path, sizeof dat_path, "%s/pass_plot.dat",
+                     pass_folder);
+    if (n <= 0 || (size_t)n >= sizeof dat_path) return;
+    FILE *f = fopen(dat_path, "w");
+    if (!f) {
+        fprintf(stderr, "simple_sat_ops: fopen %s: %s\n",
+                dat_path, strerror(errno));
+        return;
+    }
+    fprintf(f, "# t_min\tsat_az\tsat_el\tbeam_az\tbeam_el\n");
+
+    // 10 s cadence over the visible portion. predicted_pass_duration_minutes
+    // includes the -5..0 deg pre-AOS / post-LOS buffer, so step a little
+    // wider and let the el-filter below drop the wings.
+    const double step_min = 10.0 / 60.0;
+    const double duration_min = pred.predicted_pass_duration_minutes > 0
+        ? pred.predicted_pass_duration_minutes
+        : 15.0;
+    const int n_steps = (int)(duration_min / step_min) + 1;
+
+    int wrote = 0;
+    for (int i = 0; i <= n_steps; ++i) {
+        double t_min = i * step_min;
+        update_satellite_position(&pred, aos_jul + t_min / 1440.0);
+        double sat_az = pred.satellite_ephem.azimuth;
+        double sat_el = pred.satellite_ephem.elevation;
+        if (sat_el < 0.0) continue;
+
+        double mech_az = sat_az;
+        double mech_el = sat_el;
+        int half;
+        antenna_rotator_to_mech_coords(flip_mode, aos_az,
+                                       sat_az, sat_el,
+                                       &mech_az, &mech_el, &half);
+
+        // Convert mech back to where the boom's beam actually points
+        // on the sky. mech_el > 90 deg means back-pointing through the
+        // rotator: equivalent sky direction is (mech_az + 180, 180 -
+        // mech_el).
+        double beam_az = mech_az;
+        double beam_el = mech_el;
+        if (beam_el > 90.0) {
+            beam_az = fmod(beam_az + 180.0, 360.0);
+            if (beam_az < 0.0) beam_az += 360.0;
+            beam_el = 180.0 - beam_el;
+        }
+
+        fprintf(f, "%.3f\t%.3f\t%.3f\t%.3f\t%.3f\n",
+                t_min, sat_az, sat_el, beam_az, beam_el);
+        ++wrote;
+    }
+    fclose(f);
+
+    if (wrote == 0) {
+        fprintf(stderr,
+                "simple_sat_ops: no visible samples in predicted pass — "
+                "skipping plot\n");
+        return;
+    }
+
+    char gp_path[512];
+    n = snprintf(gp_path, sizeof gp_path, "%s/pass_plot.gp", pass_folder);
+    if (n <= 0 || (size_t)n >= sizeof gp_path) return;
+    FILE *gp = fopen(gp_path, "w");
+    if (!gp) {
+        fprintf(stderr, "simple_sat_ops: fopen %s: %s\n",
+                gp_path, strerror(errno));
+        return;
+    }
+
+    const char *sat_name =
+        (state->prediction.satellite_ephem.name
+         && state->prediction.satellite_ephem.name[0])
+            ? state->prediction.satellite_ephem.name : "satellite";
+
+    // Mirror scripts/plot_sky_pass.sh's polar style so both plots read
+    // the same way (N up, E clockwise, zenith at centre).
+    fprintf(gp,
+        "set terminal pngcairo size 900,900 enhanced font 'Helvetica,11'\n"
+        "set output '%s/az_el_plot.png'\n"
+        "set polar\n"
+        "set angles degrees\n"
+        "set theta top clockwise\n"
+        "set size square\n"
+        "set grid polar 30\n"
+        "unset border\n"
+        "unset xtics\n"
+        "unset ytics\n"
+        "set rrange [0:90]\n"
+        "set rtics (30, 60)\n"
+        "set ttics ('N' 0, 'E' 90, 'S' 180, 'W' 270)\n"
+        "set key outside right top\n"
+        "set title \"%s  max_el=%.1f deg  flip=%s\\n"
+                  "(zenith=centre, horizon=outer ring)\" noenhanced\n"
+        "plot \\\n"
+        "  '%s/pass_plot.dat' using 2:(90-$3) "
+            "with lines lw 2 lc rgb '#1f77b4' title 'satellite', \\\n"
+        "  '' using 4:(90-$5) "
+            "with lines lw 2 lc rgb '#d62728' title 'antenna beam'\n",
+        pass_folder,
+        sat_name,
+        pred.predicted_max_elevation,
+        flip_mode ? "yes" : "no",
+        pass_folder);
+    fclose(gp);
+
+    char cmd[1100];
+    n = snprintf(cmd, sizeof cmd, "gnuplot '%s' 2>&1", gp_path);
+    if (n <= 0 || (size_t)n >= sizeof cmd) return;
+    int rc = system(cmd);
+    if (rc != 0) {
+        fprintf(stderr,
+                "simple_sat_ops: gnuplot failed (rc=%d). Install gnuplot "
+                "or run manually:  gnuplot '%s'\n",
+                rc, gp_path);
+    } else {
+        fprintf(stderr,
+                "simple_sat_ops: pass plot %s/az_el_plot.png "
+                "(%d samples, %s)\n",
+                pass_folder, wrote,
+                flip_mode ? "flip" : "no flip");
+    }
+}
+
 // --- Usage ---------------------------------------------------------
 
 void usage(FILE *dest, const char *name, int full)
@@ -1981,6 +2148,9 @@ int main(int argc, char **argv)
         double jul_now = Julian_Date(&utc, &tv);
         update_satellite_position(&state.prediction, jul_now);
         setup_pass_folder(&state, jul_now);
+        if (g_pass_folder[0]) {
+            generate_pass_plot(&state, g_pass_folder, jul_now);
+        }
     }
 
     int antenna_rotator_result = 0;
