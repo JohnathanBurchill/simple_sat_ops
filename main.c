@@ -2351,15 +2351,21 @@ void report_status(state_t *state, int *print_row, int print_col)
 
     p.have_rotator = state->have_antenna_rotator;
     if (state->have_antenna_rotator) {
-        double azimuth = 0.0, elevation = 0.0;
-        if (antenna_rotator_command(&state->antenna_rotator,
-                                    ANTENNA_ROTATOR_STATUS,
-                                    &azimuth, &elevation) == ANTENNA_ROTATOR_OK) {
-            state->antenna_rotator.azimuth   = azimuth;
-            state->antenna_rotator.elevation = elevation;
-        } else {
-            azimuth   = state->antenna_rotator.azimuth;
-            elevation = state->antenna_rotator.elevation;
+        double azimuth = state->antenna_rotator.azimuth;
+        double elevation = state->antenna_rotator.elevation;
+        // The rotator STATUS command does a blocking read() on the
+        // serial port (antenna_rotator.c:142) that can take hundreds of
+        // milliseconds. Skip the live poll while the operator is typing
+        // in the ":" prompt — the cached az/el from the last poll is
+        // good enough for display, and the loop needs to keep ticking
+        // at 50 Hz so each keystroke echoes promptly.
+        if (!g_cmd_active) {
+            if (antenna_rotator_command(&state->antenna_rotator,
+                                        ANTENNA_ROTATOR_STATUS,
+                                        &azimuth, &elevation) == ANTENNA_ROTATOR_OK) {
+                state->antenna_rotator.azimuth   = azimuth;
+                state->antenna_rotator.elevation = elevation;
+            }
         }
         p.current_az = azimuth;
         p.current_el = elevation;
