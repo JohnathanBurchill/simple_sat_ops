@@ -1877,6 +1877,55 @@ static void render_rx_panel(int *print_row, int print_col)
             clrtoeol();
         }
 
+        // Per-type counters + time since the most recent decoded
+        // frame. Goes after the live numbers so it doesn't bury them.
+        rx_packet_type_stats_t per_type[RX_PT_COUNT];
+        double age_s = -1.0;
+        rx_session_stats_snapshot(g_rx_session, per_type, &age_s);
+        if (age_s >= 0.0) {
+            mvprintw(row++, col, "%15s   %.1f s ago",
+                     "last frame T+", age_s);
+            clrtoeol();
+        }
+        // One row of "name=N" pairs across all six slots.
+        char by_type[160] = {0};
+        size_t bt_len = 0;
+        for (int s = 0; s < RX_PT_COUNT; ++s) {
+            int n = snprintf(by_type + bt_len, sizeof by_type - bt_len,
+                             "%s%s=%llu",
+                             (bt_len ? "  " : ""),
+                             rx_packet_type_label((rx_packet_type_slot_t)s),
+                             (unsigned long long) per_type[s].count);
+            if (n < 0 || (size_t)n >= sizeof by_type - bt_len) break;
+            bt_len += (size_t) n;
+        }
+        mvprintw(row++, col, "%15s   %s", "by type", by_type);
+        clrtoeol();
+        // For each slot that's seen at least one frame, hex-preview
+        // the latest payload (up to 24 bytes -- enough to read the
+        // CSP header + first few payload bytes at a glance).
+        for (int s = 0; s < RX_PT_COUNT; ++s) {
+            if (per_type[s].count == 0 || per_type[s].last_payload_len <= 0) {
+                continue;
+            }
+            char hexbuf[3 * 24 + 16];
+            size_t hex_len = 0;
+            int n_show = per_type[s].last_payload_len;
+            if (n_show > 24) n_show = 24;
+            for (int b = 0; b < n_show; ++b) {
+                int w = snprintf(hexbuf + hex_len, sizeof hexbuf - hex_len,
+                                 "%s%02X",
+                                 (b ? " " : ""),
+                                 per_type[s].last_payload[b]);
+                if (w < 0 || (size_t)w >= sizeof hexbuf - hex_len) break;
+                hex_len += (size_t) w;
+            }
+            const char *label = rx_packet_type_label((rx_packet_type_slot_t)s);
+            mvprintw(row++, col, "%15s   %s%s", label, hexbuf,
+                     per_type[s].last_payload_len > n_show ? " ..." : "");
+            clrtoeol();
+        }
+
         // Signal ribbon: oldest sample on the left, newest on the
         // right. Each glyph = 1 s of peak dBFS. Empty until the
         // sampler has accumulated history.

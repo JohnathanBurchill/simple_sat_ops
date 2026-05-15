@@ -96,6 +96,43 @@ void rx_session_snapshot(const rx_session_t *rxs,
                          double   *out_actual_freq_hz,
                          char     *out_last_summary, size_t summary_n);
 
+// Packet-type buckets that rx_session keeps live counters for. Matches
+// the COMMS_PACKET_TYPE_* constants in beacon_cts1.h (low byte of the
+// CSP payload). Anything we don't recognise lands in RX_PT_OTHER.
+typedef enum {
+    RX_PT_BEACON_BASIC = 0,
+    RX_PT_BEACON_PERIPHERAL,
+    RX_PT_LOG_MESSAGE,
+    RX_PT_TCMD_RESPONSE,
+    RX_PT_BULK_FILE,
+    RX_PT_OTHER,
+    RX_PT_COUNT,
+} rx_packet_type_slot_t;
+
+// One slot's worth of stats, returned by rx_session_stats_snapshot.
+// last_payload holds the first last_payload_len bytes of the most
+// recent packet that landed in this slot; the byte limit (64) is
+// enough for a hex preview and short enough to keep the snapshot
+// copy cheap. last_payload_len is the on-wire length stored, NOT
+// the original frame length (so reading past last_payload_len is
+// undefined).
+#define RX_LAST_PAYLOAD_MAX 64
+typedef struct {
+    uint64_t count;
+    int      last_payload_len;
+    uint8_t  last_payload[RX_LAST_PAYLOAD_MAX];
+} rx_packet_type_stats_t;
+
+// Per-type stats snapshot + monotonic time of the last frame in any
+// slot. out_seconds_since_last_frame is negative when no frame has
+// arrived yet (or rxs is NULL). out_stats[] must point at an array
+// of RX_PT_COUNT entries.
+void rx_session_stats_snapshot(const rx_session_t *rxs,
+                               rx_packet_type_stats_t out_stats[],
+                               double *out_seconds_since_last_frame);
+// Human-readable label for a packet-type slot ("beacon", "log", ...).
+const char *rx_packet_type_label(rx_packet_type_slot_t slot);
+
 // Tell the decoder where the satellite was at the last Doppler tick so
 // per-frame DB rows carry geometry. Safe to call at any cadence.
 void rx_session_update_observer(rx_session_t *rxs,

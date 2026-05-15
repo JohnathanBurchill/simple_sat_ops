@@ -202,6 +202,14 @@ struct rx_session {
     unsigned frames_in_window;
     char     last_frame_ts[24];
     int      last_frame_len;
+    // Per-type stats. Worker writes under mu so the main-thread
+    // snapshot can read a coherent copy.
+    uint64_t per_type_count[RX_PT_COUNT];
+    int      per_type_last_len[RX_PT_COUNT];
+    uint8_t  per_type_last_payload[RX_PT_COUNT][RX_LAST_PAYLOAD_MAX];
+    // Monotonic time of the most-recent decoded frame; 0.0 means
+    // "no frame yet".
+    double   last_frame_monotonic_s;
 
     // packet_db handle (owned).
     packet_db_t *db;
@@ -241,6 +249,10 @@ struct rx_session {
     char     snap_last_frame_ts[24];
     int      snap_last_frame_len;
     int      snap_wav_active;
+    double   snap_last_frame_monotonic_s;
+    uint64_t snap_per_type_count[RX_PT_COUNT];
+    int      snap_per_type_last_len[RX_PT_COUNT];
+    uint8_t  snap_per_type_last_payload[RX_PT_COUNT][RX_LAST_PAYLOAD_MAX];
 };
 
 static void *rx_session_thread_fn(void *arg);
@@ -552,6 +564,32 @@ static void try_decode_at_window(rx_session_t *rxs)
         snprintf(rxs->last_frame_ts, sizeof rxs->last_frame_ts,
                  "%.*s", (int)(sizeof rxs->last_frame_ts - 1), ts);
         rxs->last_frame_len = (int) plen;
+
+        // Per-type bookkeeping. FrontierSat tags packet_type in the
+        // first byte of the CSP payload (after the 4-byte CSP header).
+        // CSP_HDR_LEN = 4. Map to the public RX_PT_* slot.
+        rx_packet_type_slot_t slot = RX_PT_OTHER;
+        if (plen >= 5) {
+            uint8_t ptype = rxs->packet[4];
+            switch (ptype) {
+                case 0x01: slot = RX_PT_BEACON_BASIC; break;
+                case 0x02: slot = RX_PT_BEACON_PERIPHERAL; break;
+                case 0x03: slot = RX_PT_LOG_MESSAGE; break;
+                case 0x04: slot = RX_PT_TCMD_RESPONSE; break;
+                case 0x10: slot = RX_PT_BULK_FILE; break;
+                default:   slot = RX_PT_OTHER; break;
+            }
+        }
+        rxs->per_type_count[slot]++;
+        int copy = (plen < RX_LAST_PAYLOAD_MAX) ? (int)plen : RX_LAST_PAYLOAD_MAX;
+        rxs->per_type_last_len[slot] = copy;
+        memcpy(rxs->per_type_last_payload[slot], rxs->packet, (size_t)copy);
+
+        struct timespec mono;
+        if (clock_gettime(CLOCK_MONOTONIC, &mono) == 0) {
+            rxs->last_frame_monotonic_s =
+                (double) mono.tv_sec + (double) mono.tv_nsec * 1e-9;
+        }
     }
 }
 
@@ -593,6 +631,13 @@ static void worker_update_snapshot(rx_session_t *rxs)
              "%.*s", (int)(sizeof rxs->snap_last_frame_ts - 1),
              rxs->last_frame_ts);
     rxs->snap_last_frame_len = rxs->last_frame_len;
+    rxs->snap_last_frame_monotonic_s = rxs->last_frame_monotonic_s;
+    memcpy(rxs->snap_per_type_count, rxs->per_type_count,
+           sizeof rxs->snap_per_type_count);
+    memcpy(rxs->snap_per_type_last_len, rxs->per_type_last_len,
+           sizeof rxs->snap_per_type_last_len);
+    memcpy(rxs->snap_per_type_last_payload, rxs->per_type_last_payload,
+           sizeof rxs->snap_per_type_last_payload);
     pthread_mutex_unlock(&rxs->mu);
 }
 
@@ -706,4 +751,59 @@ void rx_session_update_observer(rx_session_t *rxs,
     (void) rxs;
     decode_loop_set_observer(az_deg, el_deg, range_km, range_rate_km_s,
                               doppler_offset_hz);
+}
+
+void rx_session_stats_snapshot(const rx_session_t *rxs,
+                               rx_packet_type_stats_t out_stats[],
+                               double *out_seconds_since_last_frame)
+{
+    if (rxs == NULL) {
+        if (out_stats) {
+            memset(out_stats, 0,
+                   sizeof(rx_packet_type_stats_t) * RX_PT_COUNT);
+        }
+        if (out_seconds_since_last_frame) {
+            *out_seconds_since_last_frame = -1.0;
+        }
+        return;
+    }
+    pthread_mutex_lock((pthread_mutex_t *)&rxs->mu);
+    double last_mono = rxs->snap_last_frame_monotonic_s;
+    if (out_stats) {
+        for (int i = 0; i < RX_PT_COUNT; ++i) {
+            out_stats[i].count = rxs->snap_per_type_count[i];
+            out_stats[i].last_payload_len = rxs->snap_per_type_last_len[i];
+            memcpy(out_stats[i].last_payload,
+                   rxs->snap_per_type_last_payload[i],
+                   RX_LAST_PAYLOAD_MAX);
+        }
+    }
+    pthread_mutex_unlock((pthread_mutex_t *)&rxs->mu);
+    if (out_seconds_since_last_frame) {
+        if (last_mono == 0.0) {
+            *out_seconds_since_last_frame = -1.0;
+        } else {
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+                double now_s = (double) now.tv_sec
+                             + (double) now.tv_nsec * 1e-9;
+                *out_seconds_since_last_frame = now_s - last_mono;
+            } else {
+                *out_seconds_since_last_frame = -1.0;
+            }
+        }
+    }
+}
+
+const char *rx_packet_type_label(rx_packet_type_slot_t slot)
+{
+    switch (slot) {
+        case RX_PT_BEACON_BASIC:      return "beacon";
+        case RX_PT_BEACON_PERIPHERAL: return "periph";
+        case RX_PT_LOG_MESSAGE:       return "log";
+        case RX_PT_TCMD_RESPONSE:     return "tcmd";
+        case RX_PT_BULK_FILE:         return "bulk";
+        case RX_PT_OTHER:             return "other";
+        default:                      return "?";
+    }
 }
