@@ -160,8 +160,12 @@ static void low_disk_refresh(double t_now)
         return;
     }
     double gb = (double) avail / 1.0e9;
+    // Cap path width so the message fits in the 80-byte buffer: prefix
+    // is ~26 chars ("LOW DISK: 12.34 GB free at "), leaving 50 for the
+    // path. GCC -Wformat-truncation would otherwise flag the unbounded
+    // %s against a 255-byte g_pass_folder.
     snprintf(g_low_disk_msg, sizeof g_low_disk_msg,
-             "LOW DISK: %.2f GB free at %s", gb, probe);
+             "LOW DISK: %.2f GB free at %.50s", gb, probe);
 }
 
 // Spectrogram render job. The `:spectrum N` REPL command snapshots the
