@@ -144,7 +144,7 @@ typedef struct spectrum_job {
     long            start_sample;
     long            n_samples;
     char            png_out[640];
-    char            status_msg[256];
+    char            status_msg[1024];
 } spectrum_job_t;
 
 static spectrum_job_t g_spec_job;
