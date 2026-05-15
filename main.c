@@ -2622,7 +2622,8 @@ static void auto_tcmd_open(void) {
     g_auto_tcmd.commands   = cmds;
     g_auto_tcmd.n_commands = nc;
     snprintf(g_auto_tcmd.file_path, sizeof g_auto_tcmd.file_path,
-             "%s", g_auto_tcmd_file_path);
+             "%.*s", (int)(sizeof g_auto_tcmd.file_path - 1),
+             g_auto_tcmd_file_path);
     snprintf(g_auto_tcmd.power,   sizeof g_auto_tcmd.power,   "30.0");
     snprintf(g_auto_tcmd.repeats, sizeof g_auto_tcmd.repeats, "3");
     snprintf(g_auto_tcmd.delay_s, sizeof g_auto_tcmd.delay_s, "2.0");
