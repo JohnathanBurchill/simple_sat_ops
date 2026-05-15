@@ -319,7 +319,9 @@ typedef struct {
     int    out_rows;
     float  db_min;
     float  db_max;
-    double center_hz;   // for informational labels; not baked into pixels
+    int    auto_clip;   // 1 = ignore db_min/db_max, derive from percentiles
+    int    sample_rate; // for the time + frequency axis labels
+    double center_hz;   // baseband centre frequency for the freq-axis label
 } wf_opts_t;
 
 static float median_inplace(float *buf, int n)
@@ -373,7 +375,13 @@ static int build_waterfall(const int16_t *iq, size_t n_pairs,
     size_t n_frames = (n_pairs - (size_t) N) / (size_t) H + 1;
     if (n_frames < 1) { free(win); return -1; }
 
-    // Allocate the high-resolution spectrogram: n_frames × N dB values.
+    // Allocate the high-resolution spectrogram: n_frames × N linear
+    // magnitude² values. Keeping the per-frame data in the LINEAR
+    // domain matters for the time-binning step below — averaging in
+    // dB-space pulls the average toward the geometric mean rather
+    // than the arithmetic mean, which on a sparse-burst capture (a
+    // single bright cell mixed with mostly noise) buries the burst.
+    // SatNOGS-style waterfalls keep linear sums until the final log.
     float *spec = (float *) malloc(n_frames * (size_t) N * sizeof(float));
     if (!spec) { free(win); return -1; }
 
@@ -391,19 +399,19 @@ static int build_waterfall(const int16_t *iq, size_t n_pairs,
             im[i] = Q * w;
         }
         fft_forward(re, im, (unsigned) N);
-        // dB magnitude², with fftshift: bin 0 of the OUTPUT is the most
+        // |Z(f)|², with fftshift: bin 0 of the OUTPUT is the most
         // negative frequency (-Fs/2), bin N/2 is DC, bin N-1 is +Fs/2 - bin.
         for (int k = 0; k < N; ++k) {
             int src = (k + N / 2) % N;
             float mag2 = re[src] * re[src] + im[src] * im[src];
-            spec[fi * (size_t) N + (size_t) k] =
-                10.0f * log10f(mag2 + 1e-20f);
+            spec[fi * (size_t) N + (size_t) k] = mag2;
         }
     }
     free(win); free(re); free(im);
 
-    // Bin input frames into output rows (averaging in dB-space — close
-    // enough for visualisation, much cheaper than averaging linearly).
+    // Time-bin frames into output rows by summing the linear power and
+    // converting to dB at the very end (single log per output cell,
+    // not per input frame).
     int out_rows = opt->out_rows;
     if (out_rows <= 0) out_rows = 1080;
     if ((size_t) out_rows > n_frames) out_rows = (int) n_frames;
@@ -415,12 +423,14 @@ static int build_waterfall(const int16_t *iq, size_t n_pairs,
         if (b <= a) b = a + 1;
         if (b > n_frames) b = n_frames;
         size_t span = b - a;
+        double inv = 1.0 / (double) span;
         for (int k = 0; k < N; ++k) {
             double sum = 0.0;
             for (size_t fi = a; fi < b; ++fi) {
                 sum += spec[fi * (size_t) N + (size_t) k];
             }
-            binned[(size_t) r * (size_t) N + (size_t) k] = (float)(sum / (double) span);
+            binned[(size_t) r * (size_t) N + (size_t) k] =
+                (float)(10.0 * log10(sum * inv + 1e-20));
         }
     }
     free(spec);
@@ -439,13 +449,83 @@ static int build_waterfall(const int16_t *iq, size_t n_pairs,
     }
     free(col);
 
+    // Auto-clip the dB range to data percentiles unless the caller
+    // pinned both endpoints. Most real captures have a noise floor a
+    // few dB wide and bright peaks 20-40 dB above it; the old fixed
+    // -3..+20 dB range left the image purple-dim whenever the burst
+    // SNR wasn't already in that band. Walk the post-median-subtraction
+    // values, sample a 5th- and 99th-percentile pair, and use those as
+    // the visible range. The user's --db-min / --db-max still override.
+    float lo = opt->db_min, hi = opt->db_max;
+    if (opt->auto_clip) {
+        size_t n_cells = (size_t) out_rows * (size_t) N;
+        // Sample-and-sort a subset to keep the percentile estimate fast.
+        size_t sample_n = n_cells / 64;
+        if (sample_n < 4096)   sample_n = 4096;
+        if (sample_n > 200000) sample_n = 200000;
+        if (sample_n > n_cells) sample_n = n_cells;
+        float *sample = (float *) malloc(sample_n * sizeof(float));
+        if (sample) {
+            uint32_t state = 0xC0FFEEu;
+            for (size_t i = 0; i < sample_n; ++i) {
+                // xorshift32 — deterministic per-run, no need for proper RNG.
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                sample[i] = binned[(size_t) state % n_cells];
+            }
+            // Partial sort via stdlib qsort would be fine for sample_n
+            // up to 200k; reuse the inplace selector for the two
+            // percentiles instead — half the work.
+            float p05 = median_inplace(sample, (int) sample_n);
+            // median_inplace mutates and returns the median; redo with
+            // a fresh copy for each percentile.
+            for (size_t i = 0; i < sample_n; ++i) {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                sample[i] = binned[(size_t) state % n_cells];
+            }
+            // 99th percentile via quickselect: shuffle then take element
+            // at index 0.99 * n.
+            size_t k99 = (size_t)((double) sample_n * 0.99);
+            if (k99 >= sample_n) k99 = sample_n - 1;
+            {
+                int lo_i = 0, hi_i = (int) sample_n - 1;
+                while (lo_i < hi_i) {
+                    float pivot = sample[(lo_i + hi_i) / 2];
+                    int i = lo_i, j = hi_i;
+                    while (i <= j) {
+                        while (sample[i] < pivot) ++i;
+                        while (sample[j] > pivot) --j;
+                        if (i <= j) {
+                            float t = sample[i]; sample[i] = sample[j]; sample[j] = t;
+                            ++i; --j;
+                        }
+                    }
+                    if ((int) k99 <= j) hi_i = j;
+                    else if ((int) k99 >= i) lo_i = i;
+                    else break;
+                }
+            }
+            float p99 = sample[k99];
+            free(sample);
+            // Floor at p05 minus 1 dB so the noise floor maps to the
+            // darkest cell, ceiling at max(p99, lo + 12) so we always
+            // get at least 12 dB of visible range even on a quiet
+            // capture (otherwise viridis compresses too hard).
+            lo = p05 - 1.0f;
+            hi = p99;
+            if (hi < lo + 12.0f) hi = lo + 12.0f;
+        }
+    }
+
     // Map to viridis. Width = N (already fftshift'd). Height = out_rows.
     // The PNG's row 0 is the TOP of the image, so iterate as-is — the
     // first output row corresponds to the earliest IQ samples, which
     // matches the SatNOGS convention of "earliest at top".
     uint8_t *rgb = (uint8_t *) malloc((size_t) N * (size_t) out_rows * 3);
     if (!rgb) { free(binned); return -1; }
-    float lo = opt->db_min, hi = opt->db_max;
     float scale = (hi > lo) ? (255.0f / (hi - lo)) : 1.0f;
     for (int r = 0; r < out_rows; ++r) {
         for (int k = 0; k < N; ++k) {
@@ -465,6 +545,212 @@ static int build_waterfall(const int16_t *iq, size_t n_pairs,
     *out_rgb = rgb;
     *out_w = N;
     *out_h = out_rows;
+    return 0;
+}
+
+// --------------------------------------------------------------------
+// Bitmap font + axis renderer
+// --------------------------------------------------------------------
+//
+// Hand-rolled 5x7 bitmap glyphs for just the characters we need on the
+// axes ("0-9 . + - : k M H z s t f T space"). Each row of a glyph is
+// the low 5 bits of one byte, MSB-of-the-5-bits is the leftmost pixel.
+// Drawn at 2× scale so labels stay legible on 1080-row spectrograms.
+
+static const uint8_t G_0[7]   = {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E};
+static const uint8_t G_1[7]   = {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E};
+static const uint8_t G_2[7]   = {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F};
+static const uint8_t G_3[7]   = {0x0E,0x11,0x01,0x06,0x01,0x11,0x0E};
+static const uint8_t G_4[7]   = {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02};
+static const uint8_t G_5[7]   = {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E};
+static const uint8_t G_6[7]   = {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E};
+static const uint8_t G_7[7]   = {0x1F,0x01,0x02,0x04,0x08,0x08,0x08};
+static const uint8_t G_8[7]   = {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E};
+static const uint8_t G_9[7]   = {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C};
+static const uint8_t G_dot[7] = {0x00,0x00,0x00,0x00,0x00,0x06,0x06};
+static const uint8_t G_plu[7] = {0x00,0x04,0x04,0x1F,0x04,0x04,0x00};
+static const uint8_t G_min[7] = {0x00,0x00,0x00,0x1F,0x00,0x00,0x00};
+static const uint8_t G_col[7] = {0x00,0x06,0x06,0x00,0x06,0x06,0x00};
+static const uint8_t G_k[7]   = {0x10,0x10,0x12,0x14,0x18,0x14,0x12};
+static const uint8_t G_M[7]   = {0x11,0x1B,0x15,0x11,0x11,0x11,0x11};
+static const uint8_t G_H[7]   = {0x11,0x11,0x11,0x1F,0x11,0x11,0x11};
+static const uint8_t G_z[7]   = {0x00,0x00,0x1F,0x02,0x04,0x08,0x1F};
+static const uint8_t G_s[7]   = {0x00,0x00,0x0F,0x10,0x0E,0x01,0x1E};
+static const uint8_t G_t[7]   = {0x08,0x08,0x1E,0x08,0x08,0x09,0x06};
+static const uint8_t G_f[7]   = {0x06,0x09,0x08,0x1E,0x08,0x08,0x08};
+static const uint8_t G_T[7]   = {0x1F,0x04,0x04,0x04,0x04,0x04,0x04};
+static const uint8_t G_sp[7]  = {0,0,0,0,0,0,0};
+
+static const uint8_t *glyph_for(char c)
+{
+    switch (c) {
+        case '0': return G_0;  case '1': return G_1;
+        case '2': return G_2;  case '3': return G_3;
+        case '4': return G_4;  case '5': return G_5;
+        case '6': return G_6;  case '7': return G_7;
+        case '8': return G_8;  case '9': return G_9;
+        case '.': return G_dot; case '+': return G_plu;
+        case '-': return G_min; case ':': return G_col;
+        case 'k': return G_k;   case 'M': return G_M;
+        case 'H': return G_H;   case 'z': return G_z;
+        case 's': return G_s;   case 't': return G_t;
+        case 'f': return G_f;   case 'T': return G_T;
+        default:  return G_sp;
+    }
+}
+
+static void px_set(uint8_t *rgb, int W, int H, int x, int y,
+                   uint8_t r, uint8_t g, uint8_t b)
+{
+    if (x < 0 || x >= W || y < 0 || y >= H) return;
+    uint8_t *p = rgb + ((size_t) y * (size_t) W + (size_t) x) * 3;
+    p[0] = r; p[1] = g; p[2] = b;
+}
+
+static void draw_text(uint8_t *rgb, int W, int H, int x, int y,
+                      const char *s, int scale,
+                      uint8_t r, uint8_t g, uint8_t b)
+{
+    int cx = x;
+    for (; *s; ++s) {
+        const uint8_t *gl = glyph_for(*s);
+        for (int gy = 0; gy < 7; ++gy) {
+            uint8_t row = gl[gy];
+            for (int gx = 0; gx < 5; ++gx) {
+                if (row & (1 << (4 - gx))) {
+                    for (int sy = 0; sy < scale; ++sy)
+                        for (int sx = 0; sx < scale; ++sx)
+                            px_set(rgb, W, H,
+                                   cx + gx * scale + sx,
+                                   y  + gy * scale + sy,
+                                   r, g, b);
+                }
+            }
+        }
+        cx += (5 + 1) * scale;
+    }
+}
+
+static int text_width(const char *s, int scale) {
+    int n = 0;
+    for (const char *p = s; *p; ++p) ++n;
+    return n * 6 * scale;
+}
+
+// Pick a "nice" tick step (1·10ⁿ, 2·10ⁿ, or 5·10ⁿ) close to range/target.
+static double pick_tick_step(double range, int target_ticks)
+{
+    if (range <= 0.0 || target_ticks < 1) return 1.0;
+    double raw = range / (double) target_ticks;
+    double p = pow(10.0, floor(log10(raw)));
+    double frac = raw / p;
+    double mul;
+    if      (frac < 1.5) mul = 1.0;
+    else if (frac < 3.5) mul = 2.0;
+    else if (frac < 7.0) mul = 5.0;
+    else                 mul = 10.0;
+    return p * mul;
+}
+
+// Format a frequency value as "<n>kHz" or "<n.n>MHz" (no centre-Hz
+// baseline added — pass the absolute or relative Hz the caller wants).
+// Returns bytes written.
+static int fmt_freq(double hz, char *out, size_t out_cap)
+{
+    double abs_hz = (hz < 0.0) ? -hz : hz;
+    const char *sgn = (hz < 0.0) ? "-" : "+";
+    if (abs_hz >= 1.0e6 - 1.0) {
+        return snprintf(out, out_cap, "%s%.2fMHz", sgn, abs_hz / 1.0e6);
+    } else {
+        return snprintf(out, out_cap, "%s%.1fkHz", sgn, abs_hz / 1.0e3);
+    }
+}
+
+static int fmt_time(double sec, char *out, size_t out_cap)
+{
+    if (sec >= 100.0)      return snprintf(out, out_cap, "%.0fs", sec);
+    else                   return snprintf(out, out_cap, "%.1fs", sec);
+}
+
+// Compose the final PNG: spectrogram pixels in the centre, axis ticks
+// + labels in the surrounding margins. Caller owns spec_rgb; the
+// returned buffer is freshly malloc'd (caller frees).
+static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
+                            const wf_opts_t *opt, double duration_s,
+                            uint8_t **out_rgb, int *out_w, int *out_h)
+{
+    const int LM = 56;
+    const int RM = 12;
+    const int TM = 12;
+    const int BM = 28;
+    int W = spec_w + LM + RM;
+    int H = spec_h + TM + BM;
+    uint8_t *rgb = (uint8_t *) malloc((size_t) W * (size_t) H * 3);
+    if (!rgb) return -1;
+    // Fill margins with near-black; the spectrogram fills the centre.
+    for (size_t i = 0; i < (size_t) W * (size_t) H; ++i) {
+        rgb[i*3+0] = 0; rgb[i*3+1] = 0; rgb[i*3+2] = 0;
+    }
+    for (int r = 0; r < spec_h; ++r) {
+        memcpy(rgb + ((size_t)(r + TM) * (size_t) W + (size_t) LM) * 3,
+               spec_rgb + (size_t) r * (size_t) spec_w * 3,
+               (size_t) spec_w * 3);
+    }
+
+    const uint8_t LBL_R = 220, LBL_G = 220, LBL_B = 220;
+    const uint8_t TIC_R = 180, TIC_G = 180, TIC_B = 180;
+
+    // Frequency axis: -Fs/2 .. +Fs/2 across spec_w pixels, with
+    // centre_hz adding to the labels (so a tuned carrier reads as the
+    // absolute RF frequency around the nominal carrier).
+    double fs = opt->sample_rate;
+    double f_lo = -fs / 2.0;
+    double f_hi = +fs / 2.0;
+    double f_step = pick_tick_step(fs, 8);
+    // Start at the smallest multiple of f_step that's >= f_lo.
+    double f0 = ceil(f_lo / f_step) * f_step;
+    for (double f = f0; f <= f_hi + 0.5 * f_step; f += f_step) {
+        double frac = (f - f_lo) / fs;
+        int x = LM + (int)(frac * (double) spec_w);
+        if (x < LM || x >= LM + spec_w) continue;
+        for (int t = 0; t < 6; ++t) {
+            px_set(rgb, W, H, x, TM + spec_h + t, TIC_R, TIC_G, TIC_B);
+        }
+        char buf[24];
+        double f_abs = (opt->center_hz != 0.0) ? (opt->center_hz + f) : f;
+        if (opt->center_hz != 0.0) fmt_freq(f_abs, buf, sizeof buf);
+        else                       fmt_freq(f,     buf, sizeof buf);
+        int lw = text_width(buf, 1);
+        draw_text(rgb, W, H, x - lw / 2, TM + spec_h + 8, buf, 1,
+                  LBL_R, LBL_G, LBL_B);
+    }
+
+    // Time axis: 0..duration_s top-to-bottom across spec_h pixels.
+    double t_step = pick_tick_step(duration_s, 10);
+    double t0 = 0.0;
+    for (double t = t0; t <= duration_s + 0.5 * t_step; t += t_step) {
+        double frac = t / duration_s;
+        int y = TM + (int)(frac * (double) spec_h);
+        if (y < TM || y >= TM + spec_h) continue;
+        for (int dx = 0; dx < 6; ++dx) {
+            px_set(rgb, W, H, LM - 1 - dx, y, TIC_R, TIC_G, TIC_B);
+        }
+        char buf[24];
+        fmt_time(t, buf, sizeof buf);
+        int lw = text_width(buf, 1);
+        draw_text(rgb, W, H, LM - 8 - lw, y - 3, buf, 1,
+                  LBL_R, LBL_G, LBL_B);
+    }
+
+    // Axis names along the outer edge.
+    draw_text(rgb, W, H, LM, TM + spec_h + 18, "frequency", 1,
+              LBL_R, LBL_G, LBL_B);
+    draw_text(rgb, W, H, 4, TM + 4, "time", 1,
+              LBL_R, LBL_G, LBL_B);
+
+    *out_rgb = rgb;
+    *out_w   = W;
+    *out_h   = H;
     return 0;
 }
 
@@ -516,12 +802,14 @@ int main(int argc, char **argv)
     const char *out_png  = argv[3];
 
     wf_opts_t opt;
-    opt.fft_size  = 1024;
-    opt.hop       = 0;     // 0 = N/2 default
-    opt.out_rows  = 1080;
-    opt.db_min    = -3.0f;
-    opt.db_max    = 20.0f;
-    opt.center_hz = 0.0;
+    opt.fft_size    = 1024;
+    opt.hop         = 0;     // 0 = N/2 default
+    opt.out_rows    = 1080;
+    opt.db_min      = 0.0f;
+    opt.db_max      = 0.0f;
+    opt.auto_clip   = 1;     // default: percentile-based dB clip
+    opt.sample_rate = sample_rate;
+    opt.center_hz   = 0.0;
 
     for (int i = 4; i < argc; ++i) {
         int rc = 0;
@@ -536,9 +824,11 @@ int main(int argc, char **argv)
         } else if ((rc = parse_double_opt(argv[i], "--db-min=", &d)) != 0) {
             if (rc < 0) { usage(); return 2; }
             opt.db_min = (float) d;
+            opt.auto_clip = 0;
         } else if ((rc = parse_double_opt(argv[i], "--db-max=", &d)) != 0) {
             if (rc < 0) { usage(); return 2; }
             opt.db_max = (float) d;
+            opt.auto_clip = 0;
         } else if ((rc = parse_double_opt(argv[i], "--center-hz=", &d)) != 0) {
             if (rc < 0) { usage(); return 2; }
             opt.center_hz = d;
@@ -584,11 +874,22 @@ int main(int argc, char **argv)
     }
     fclose(f);
 
-    uint8_t *rgb = NULL;
-    int W = 0, H = 0;
-    int rc = build_waterfall(iq, n_pairs, &opt, &rgb, &W, &H);
+    uint8_t *spec_rgb = NULL;
+    int spec_w = 0, spec_h = 0;
+    int rc = build_waterfall(iq, n_pairs, &opt, &spec_rgb, &spec_w, &spec_h);
     free(iq);
     if (rc != 0) return 1;
+
+    double duration_s = (double) n_pairs / (double) sample_rate;
+    uint8_t *rgb = NULL;
+    int W = 0, H = 0;
+    rc = render_with_axes(spec_rgb, spec_w, spec_h, &opt, duration_s,
+                          &rgb, &W, &H);
+    free(spec_rgb);
+    if (rc != 0) {
+        fprintf(stderr, "gen_waterfall: render_with_axes failed\n");
+        return 1;
+    }
 
     rc = write_png_rgb(out_png, rgb, W, H);
     free(rgb);
@@ -597,10 +898,8 @@ int main(int argc, char **argv)
                 out_png, strerror(errno));
         return 1;
     }
-    double duration_s = (double) n_pairs / (double) sample_rate;
     fprintf(stderr,
         "gen_waterfall: %s -> %s (%dx%d, %.1fs, fft=%d)\n",
         iq_path, out_png, W, H, duration_s, opt.fft_size);
-    (void) opt.center_hz;  // reserved for future axis labels
     return 0;
 }
