@@ -910,6 +910,13 @@ static void cmd_render(void)
         if (g_cmd_cursor == g_cmd_len) {
             addch(' ' | A_REVERSE);
         }
+        clrtoeol();
+        // Park the hardware cursor on the same cell the A_REVERSE
+        // block highlights. The layered refresh below will curs_set(1)
+        // when an editable context is active so the operator sees a
+        // visible blinking cursor on top of the inverse block.
+        move(row, 1 + g_cmd_cursor);
+        return;
     } else if (g_cmd_status[0]) {
         mvprintw(row, 0, "%s", g_cmd_status);
     } else {
@@ -2144,6 +2151,19 @@ static void tx_compose_draw(WINDOW *w, const tx_compose_t *c) {
     mvwprintw(w, 12, 2,
               "Tab focus  Space toggle  Up/Down history  ^A/^E home/end  ^K kill  Enter send  Esc cancel");
     wclrtoeol(w);
+
+    // Park the hardware cursor over the focused field's text cell so
+    // the main loop's curs_set(1) lands a visible blinking cursor on
+    // top of the A_REVERSE block. Toggle field has no cursor.
+    if (c->focus == TXF_PAYLOAD) {
+        int cur = c->cursors[TXF_PAYLOAD];
+        int vis = (cur > payload_w - 1) ? (payload_w - 1) : cur;
+        wmove(w, 3, 2 + 9 + vis);  // "Payload  " is 9 chars
+    } else if (c->focus == TXF_POWER) {
+        int cur = c->cursors[TXF_POWER];
+        int vis = (cur > 7) ? 7 : cur;
+        wmove(w, 5, 2 + 9 + vis);  // "TX power " is 9 chars
+    }
     wrefresh(w);
 }
 
@@ -2594,6 +2614,25 @@ static void auto_tcmd_draw(void) {
                   "Tab focus  Space toggle  Enter start  Esc cancel");
     }
     wclrtoeol(w);
+
+    // Park the hardware cursor on the focused text field's cell. The
+    // toggle field has no cursor; running mode is read-only so we
+    // also skip cursor placement there.
+    if (a->state != AUTO_STATE_RUNNING) {
+        if (a->focus == AUTO_F_POWER) {
+            int cur = a->cursors[AUTO_F_POWER];
+            int vis = (cur > 7) ? 7 : cur;
+            wmove(w, 3, 2 + 9 + vis);   // "TX power " is 9 chars
+        } else if (a->focus == AUTO_F_REPEATS) {
+            int cur = a->cursors[AUTO_F_REPEATS];
+            int vis = (cur > 5) ? 5 : cur;
+            wmove(w, 4, 2 + 9 + vis);   // "Repeats  " is 9 chars
+        } else if (a->focus == AUTO_F_DELAY) {
+            int cur = a->cursors[AUTO_F_DELAY];
+            int vis = (cur > 7) ? 7 : cur;
+            wmove(w, 5, 2 + 9 + vis);   // "Delay    " is 9 chars
+        }
+    }
     wrefresh(w);
 }
 
@@ -4807,13 +4846,21 @@ int main(int argc, char **argv)
             || g_auto_tcmd_active) {
             cmd_render();
             refresh();
+            int show_hw_cursor = 0;
             if (g_tx_compose_active && g_tx_compose_win) {
                 touchwin(g_tx_compose_win);
                 wrefresh(g_tx_compose_win);
+                tx_field_t f = g_tx_compose_state.focus;
+                show_hw_cursor = (f == TXF_PAYLOAD || f == TXF_POWER);
             } else if (g_auto_tcmd_active && g_auto_tcmd_win) {
                 touchwin(g_auto_tcmd_win);
                 wrefresh(g_auto_tcmd_win);
+                show_hw_cursor = (g_auto_tcmd.state != AUTO_STATE_RUNNING)
+                              && auto_field_is_text(g_auto_tcmd.focus);
+            } else if (g_cmd_active) {
+                show_hw_cursor = 1;
             }
+            curs_set(show_hw_cursor ? 1 : 0);
         }
 
 #ifdef WITH_USRP_B210
