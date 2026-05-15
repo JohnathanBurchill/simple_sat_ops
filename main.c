@@ -106,21 +106,30 @@ static void ribbon_push(double peak_dbfs)
     if (g_ribbon_count < RIBBON_LEN) g_ribbon_count++;
 }
 
-// Map a dBFS sample to one of 8 UTF-8 block glyphs (U+2581..U+2588).
-// -90 dBFS or lower renders as a space so silent gaps are visually
-// distinct from "low" signal. 0 dBFS rails to the tallest block.
-static const char *ribbon_glyph(double dbfs)
+// Quantize a peak dBFS sample to a single byte. Wire-friendly: ' ' means
+// silence or non-finite, '0'..'7' tag one of 8 dBFS bins covering -90..0
+// dBFS in ~11.25 dB steps. The 8 bins map straight onto the UTF-8 block
+// glyphs U+2581..U+2588 in ribbon_glyph_from_index. Carried verbatim in
+// SSO_EVT_STATE so viewers can render the same ribbon without seeing
+// the underlying dBFS stream.
+static char ribbon_glyph_index_from_dbfs(double dbfs)
 {
-    if (!isfinite(dbfs) || dbfs <= -90.0) return " ";
-    double level = (dbfs - (-90.0)) / 11.25;  // 8 bins of ~11.25 dB each
-    int idx = (int)level;
+    if (!isfinite(dbfs) || dbfs <= -90.0) return ' ';
+    double level = (dbfs - (-90.0)) / 11.25;
+    int idx = (int) level;
     if (idx < 0) idx = 0;
     if (idx > 7) idx = 7;
+    return (char) ('0' + idx);
+}
+
+static const char *ribbon_glyph_from_index(char c)
+{
+    if (c < '0' || c > '7') return " ";
     static const char *blocks[8] = {
         "\xE2\x96\x81", "\xE2\x96\x82", "\xE2\x96\x83", "\xE2\x96\x84",
         "\xE2\x96\x85", "\xE2\x96\x86", "\xE2\x96\x87", "\xE2\x96\x88",
     };
-    return blocks[idx];
+    return blocks[c - '0'];
 }
 
 // Spectrogram render job. The `:spectrum N` REPL command snapshots the
@@ -771,6 +780,207 @@ static double g_last_state_speed_kms   = 0.0;
 static double g_last_state_range_km    = 0.0;
 static double g_last_state_rrate_kms   = 0.0;
 
+// Snapshot the operator's live RX panel data into a self-contained
+// struct so the same renderer can be driven by either the operator
+// (reading rx_session + g_ribbon_*) or the viewer (filling it from a
+// STATE event). RX_PT_COUNT comes from rx_session.h. ribbon is a
+// nul-terminated string of glyph-index chars (' ' or '0'..'7'); empty
+// when no samples have arrived yet.
+//
+// RX_PT_COUNT is gated by WITH_USRP_B210 (it lives in rx_session.h).
+// On builds without B210 we still want the viewer to draw the panel
+// from broadcast data, so define a fallback so the struct compiles
+// everywhere.
+#ifdef WITH_USRP_B210
+#define RX_PANEL_PT_COUNT RX_PT_COUNT
+#define RX_PANEL_PAYLOAD_MAX RX_LAST_PAYLOAD_MAX
+#else
+#define RX_PANEL_PT_COUNT 6
+#define RX_PANEL_PAYLOAD_MAX 64
+#endif
+
+// Labels for the six RX packet-type slots, in the same order as the
+// RX_PT_* enum (rx_session.h). Defined here so the viewer build —
+// which doesn't link rx_session.c — can render the panel without
+// pulling in the WITH_USRP_B210 codepath.
+static const char *rx_panel_pt_label(int slot)
+{
+    static const char *labels[RX_PANEL_PT_COUNT] = {
+        "beacon", "periph", "log", "tcmd", "bulk", "other",
+    };
+    if (slot < 0 || slot >= RX_PANEL_PT_COUNT) return "?";
+    return labels[slot];
+}
+
+typedef struct {
+    int        have_session;
+    int        rec_active;
+    double     rx_freq_hz;
+    double     peak_dbfs;
+    double     rms_dbfs;
+    uint64_t   frames_total;
+    char       last_frame_summary[80]; // "<ts>  N bytes" or empty
+    double     age_s;                  // <0 = no frame yet
+    uint64_t   pt_count[RX_PANEL_PT_COUNT];
+    int        pt_payload_len[RX_PANEL_PT_COUNT];
+    uint8_t    pt_payload[RX_PANEL_PT_COUNT][RX_PANEL_PAYLOAD_MAX];
+    int        ribbon_n;
+    char       ribbon[RIBBON_LEN + 1];
+} rx_panel_data_t;
+
+// Operator-side collector. Reads the live rx_session + g_ribbon globals
+// into the struct. On non-B210 builds, only have_session=0 is filled.
+static void rx_panel_collect_local(rx_panel_data_t *d)
+{
+    memset(d, 0, sizeof *d);
+#ifdef WITH_USRP_B210
+    d->have_session = (g_rx_session != NULL);
+    if (!d->have_session) return;
+    d->rec_active = rx_session_wav_active(g_rx_session);
+    char last[sizeof d->last_frame_summary] = "";
+    rx_session_snapshot(g_rx_session,
+                        &d->frames_total,
+                        &d->peak_dbfs,
+                        &d->rms_dbfs,
+                        &d->rx_freq_hz,
+                        last, sizeof last);
+    snprintf(d->last_frame_summary, sizeof d->last_frame_summary,
+             "%s", last);
+    rx_packet_type_stats_t pts[RX_PT_COUNT];
+    rx_session_stats_snapshot(g_rx_session, pts, &d->age_s);
+    for (int s = 0; s < RX_PT_COUNT; ++s) {
+        d->pt_count[s]       = pts[s].count;
+        d->pt_payload_len[s] = pts[s].last_payload_len;
+        int copy = pts[s].last_payload_len;
+        if (copy < 0) copy = 0;
+        if (copy > RX_PANEL_PAYLOAD_MAX) copy = RX_PANEL_PAYLOAD_MAX;
+        memcpy(d->pt_payload[s], pts[s].last_payload, (size_t) copy);
+    }
+    if (g_ribbon_count > 0) {
+        int start = (g_ribbon_head - g_ribbon_count + RIBBON_LEN) % RIBBON_LEN;
+        for (int i = 0; i < g_ribbon_count; ++i) {
+            int idx = (start + i) % RIBBON_LEN;
+            d->ribbon[i] = ribbon_glyph_index_from_dbfs(g_ribbon_peak[idx]);
+        }
+        d->ribbon_n = g_ribbon_count;
+        d->ribbon[g_ribbon_count] = '\0';
+    }
+#endif
+}
+
+// Render the RX panel from a snapshot. Compiles even without UHD —
+// the viewer feeds this from broadcast STATE so it can draw what the
+// operator sees.
+static void render_rx_panel(const rx_panel_data_t *d,
+                            int *print_row, int print_col)
+{
+    if (print_row == NULL || d == NULL) return;
+    int row = *print_row;
+    int col = print_col;
+    mvprintw(row++, col, "%15s   %s%s", "B210",
+             d->have_session ? "active" : "(offline)",
+             d->rec_active ? "  [REC]" : "");
+    clrtoeol();
+    if (!d->have_session) {
+        *print_row = row;
+        return;
+    }
+    mvprintw(row++, col, "%15s   %.6f MHz", "RX freq", d->rx_freq_hz / 1e6);
+    clrtoeol();
+    mvprintw(row++, col, "%15s   peak %+5.1f  rms %+5.1f dBFS",
+             "level", d->peak_dbfs, d->rms_dbfs);
+    clrtoeol();
+    mvprintw(row++, col, "%15s   %llu",
+             "frames", (unsigned long long) d->frames_total);
+    clrtoeol();
+    if (d->last_frame_summary[0]) {
+        mvprintw(row++, col, "%15s   %s", "last frame", d->last_frame_summary);
+        clrtoeol();
+    }
+    if (d->age_s >= 0.0) {
+        mvprintw(row++, col, "%15s   %.1f s ago", "last frame T+", d->age_s);
+        clrtoeol();
+    }
+    char by_type[160] = {0};
+    size_t bt_len = 0;
+    for (int s = 0; s < RX_PANEL_PT_COUNT; ++s) {
+        int n = snprintf(by_type + bt_len, sizeof by_type - bt_len,
+                         "%s%s=%llu",
+                         (bt_len ? "  " : ""),
+                         rx_panel_pt_label(s),
+                         (unsigned long long) d->pt_count[s]);
+        if (n < 0 || (size_t) n >= sizeof by_type - bt_len) break;
+        bt_len += (size_t) n;
+    }
+    mvprintw(row++, col, "%15s   %s", "by type", by_type);
+    clrtoeol();
+    for (int s = 0; s < RX_PANEL_PT_COUNT; ++s) {
+        if (d->pt_count[s] == 0 || d->pt_payload_len[s] <= 0) continue;
+        char hexbuf[3 * 24 + 16];
+        size_t hex_len = 0;
+        int n_show = d->pt_payload_len[s];
+        if (n_show > 24) n_show = 24;
+        for (int b = 0; b < n_show; ++b) {
+            int w = snprintf(hexbuf + hex_len, sizeof hexbuf - hex_len,
+                             "%s%02X",
+                             (b ? " " : ""),
+                             d->pt_payload[s][b]);
+            if (w < 0 || (size_t) w >= sizeof hexbuf - hex_len) break;
+            hex_len += (size_t) w;
+        }
+        mvprintw(row++, col, "%15s   %s%s", rx_panel_pt_label(s), hexbuf,
+                 d->pt_payload_len[s] > n_show ? " ..." : "");
+        clrtoeol();
+    }
+    if (d->ribbon_n > 0) {
+        mvprintw(row, col, "%15s   ", "ribbon");
+        for (int i = 0; i < d->ribbon_n; ++i) {
+            addstr(ribbon_glyph_from_index(d->ribbon[i]));
+        }
+        clrtoeol();
+        ++row;
+        mvprintw(row++, col, "%15s   -90 dBFS .. 0 dBFS  (60 s)",
+                 "scale");
+        clrtoeol();
+    }
+    *print_row = row;
+}
+
+// Snapshot the operator's RX panel into the wire-side fields of an
+// event. Called for both STATE broadcasts and WELCOME replies so a
+// newly-connecting viewer sees the same panel state everyone else does.
+static void ipc_fill_rx_panel(sso_event_t *evt)
+{
+    rx_panel_data_t d;
+    rx_panel_collect_local(&d);
+    evt->rx_have_session = d.have_session;
+    if (!d.have_session) return;
+    evt->rx_rec_active   = d.rec_active;
+    evt->rx_freq_hz      = d.rx_freq_hz;
+    evt->rx_peak_dbfs    = d.peak_dbfs;
+    evt->rx_rms_dbfs     = d.rms_dbfs;
+    evt->rx_frames_total = (long) d.frames_total;
+    snprintf(evt->rx_last_frame_summary,
+             sizeof evt->rx_last_frame_summary, "%s", d.last_frame_summary);
+    evt->rx_age_s = d.age_s;
+    int slots = RX_PANEL_PT_COUNT < SSO_RX_PT_SLOTS
+              ? RX_PANEL_PT_COUNT : SSO_RX_PT_SLOTS;
+    for (int s = 0; s < slots; ++s) {
+        evt->rx_pt_count[s]       = (long) d.pt_count[s];
+        int pl = d.pt_payload_len[s];
+        if (pl < 0) pl = 0;
+        int wire_pl = pl;
+        if (wire_pl > SSO_RX_PT_PAYLOAD_MAX) wire_pl = SSO_RX_PT_PAYLOAD_MAX;
+        evt->rx_pt_payload_len[s] = pl;
+        memcpy(evt->rx_pt_payload[s], d.pt_payload[s], (size_t) wire_pl);
+    }
+    int rn = d.ribbon_n;
+    if (rn > SSO_RIBBON_MAX) rn = SSO_RIBBON_MAX;
+    evt->rx_ribbon_n = rn;
+    memcpy(evt->rx_ribbon, d.ribbon, (size_t) rn);
+    evt->rx_ribbon[rn] = '\0';
+}
+
 static void ipc_broadcast_state(state_t *s,
                                   double az, double el,
                                   double downlink_freq,
@@ -849,6 +1059,7 @@ static void ipc_broadcast_state(state_t *s,
         n++;
     }
     sso_event_set_roster(&evt, entries, n);
+    ipc_fill_rx_panel(&evt);
     char buf[4096];
     if (sso_event_encode(&evt, buf, sizeof(buf)) == 0) {
         sso_ipc_server_broadcast(g_ipc, buf);
@@ -959,6 +1170,7 @@ static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
             n++;
         }
         sso_event_set_roster(&welcome, entries, n);
+        ipc_fill_rx_panel(&welcome);
     }
     char buf[4096];
     if (sso_event_encode(&welcome, buf, sizeof(buf)) == 0) {
@@ -2159,112 +2371,6 @@ void report_status(state_t *state, int *print_row, int print_col)
     render_status_panel(&p, print_row, print_col);
 }
 
-// Render the B210 RX panel: live freq, IQ level meter, decoded-frame
-// count, last decoded frame summary. No-op when there's no B210 in
-// this build / run.
-static void render_rx_panel(int *print_row, int print_col)
-{
-    if (print_row == NULL) return;
-#ifdef WITH_USRP_B210
-    int row = *print_row;
-    int col = print_col;
-    int rec_active = rx_session_wav_active(g_rx_session);
-    mvprintw(row++, col, "%15s   %s%s", "B210",
-             g_rx_session ? "active" : "(offline)",
-             rec_active ? "  [REC]" : "");
-    clrtoeol();
-    if (g_rx_session) {
-        uint64_t frames = 0;
-        double   peak_dbfs = -90.0, rms_dbfs = -90.0, freq_hz = 0.0;
-        char     last[80] = "";
-        rx_session_snapshot(g_rx_session, &frames, &peak_dbfs, &rms_dbfs,
-                            &freq_hz, last, sizeof last);
-        mvprintw(row++, col, "%15s   %.6f MHz", "RX freq", freq_hz / 1e6);
-        clrtoeol();
-        mvprintw(row++, col, "%15s   peak %+5.1f  rms %+5.1f dBFS",
-                 "level", peak_dbfs, rms_dbfs);
-        clrtoeol();
-        mvprintw(row++, col, "%15s   %llu",
-                 "frames", (unsigned long long) frames);
-        clrtoeol();
-        if (last[0]) {
-            mvprintw(row++, col, "%15s   %s", "last frame", last);
-            clrtoeol();
-        }
-
-        // Per-type counters + time since the most recent decoded
-        // frame. Goes after the live numbers so it doesn't bury them.
-        rx_packet_type_stats_t per_type[RX_PT_COUNT];
-        double age_s = -1.0;
-        rx_session_stats_snapshot(g_rx_session, per_type, &age_s);
-        if (age_s >= 0.0) {
-            mvprintw(row++, col, "%15s   %.1f s ago",
-                     "last frame T+", age_s);
-            clrtoeol();
-        }
-        // One row of "name=N" pairs across all six slots.
-        char by_type[160] = {0};
-        size_t bt_len = 0;
-        for (int s = 0; s < RX_PT_COUNT; ++s) {
-            int n = snprintf(by_type + bt_len, sizeof by_type - bt_len,
-                             "%s%s=%llu",
-                             (bt_len ? "  " : ""),
-                             rx_packet_type_label((rx_packet_type_slot_t)s),
-                             (unsigned long long) per_type[s].count);
-            if (n < 0 || (size_t)n >= sizeof by_type - bt_len) break;
-            bt_len += (size_t) n;
-        }
-        mvprintw(row++, col, "%15s   %s", "by type", by_type);
-        clrtoeol();
-        // For each slot that's seen at least one frame, hex-preview
-        // the latest payload (up to 24 bytes -- enough to read the
-        // CSP header + first few payload bytes at a glance).
-        for (int s = 0; s < RX_PT_COUNT; ++s) {
-            if (per_type[s].count == 0 || per_type[s].last_payload_len <= 0) {
-                continue;
-            }
-            char hexbuf[3 * 24 + 16];
-            size_t hex_len = 0;
-            int n_show = per_type[s].last_payload_len;
-            if (n_show > 24) n_show = 24;
-            for (int b = 0; b < n_show; ++b) {
-                int w = snprintf(hexbuf + hex_len, sizeof hexbuf - hex_len,
-                                 "%s%02X",
-                                 (b ? " " : ""),
-                                 per_type[s].last_payload[b]);
-                if (w < 0 || (size_t)w >= sizeof hexbuf - hex_len) break;
-                hex_len += (size_t) w;
-            }
-            const char *label = rx_packet_type_label((rx_packet_type_slot_t)s);
-            mvprintw(row++, col, "%15s   %s%s", label, hexbuf,
-                     per_type[s].last_payload_len > n_show ? " ..." : "");
-            clrtoeol();
-        }
-
-        // Signal ribbon: oldest sample on the left, newest on the
-        // right. Each glyph = 1 s of peak dBFS. Empty until the
-        // sampler has accumulated history.
-        if (g_ribbon_count > 0) {
-            mvprintw(row, col, "%15s   ", "ribbon");
-            int start = (g_ribbon_head - g_ribbon_count + RIBBON_LEN)
-                        % RIBBON_LEN;
-            for (int i = 0; i < g_ribbon_count; ++i) {
-                int idx = (start + i) % RIBBON_LEN;
-                addstr(ribbon_glyph(g_ribbon_peak[idx]));
-            }
-            clrtoeol();
-            ++row;
-            mvprintw(row++, col, "%15s   -90 dBFS .. 0 dBFS  (60 s)",
-                     "scale");
-            clrtoeol();
-        }
-    }
-    *print_row = row;
-#else
-    (void) print_row; (void) print_col;
-#endif
-}
-
 void report_position(state_t *state, int *print_row, int print_col)
 {
     if (print_row == NULL) {
@@ -2322,6 +2428,9 @@ static int    g_viewer_running            = 1;
 static int    g_viewer_cmd_active         = 0;
 static char   g_viewer_cmd_buf[160]       = "";
 static char   g_viewer_cmd_status[160]    = "";
+// Mirror of the operator's RX panel. Filled from STATE / WELCOME events;
+// render_rx_panel reads it directly during viewer_render.
+static rx_panel_data_t g_viewer_rx_panel;
 // state_t whose fields the viewer mirrors from the broadcast each tick.
 static state_t g_viewer_state;
 static double  g_viewer_carrier_hz        = 0.0;
@@ -2422,6 +2531,41 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
         snprintf(g_viewer_pass_folder, sizeof g_viewer_pass_folder,
                  "%s", evt->pass_folder);
     }
+
+    // Mirror the operator's RX panel from the broadcast. Wipe to zero
+    // first so a slot that the operator hasn't decoded in this run
+    // doesn't carry stale state from a previous event.
+    memset(&g_viewer_rx_panel, 0, sizeof g_viewer_rx_panel);
+    g_viewer_rx_panel.have_session  = evt->rx_have_session;
+    if (evt->rx_have_session) {
+        g_viewer_rx_panel.rec_active     = evt->rx_rec_active;
+        g_viewer_rx_panel.rx_freq_hz     = evt->rx_freq_hz;
+        g_viewer_rx_panel.peak_dbfs      = evt->rx_peak_dbfs;
+        g_viewer_rx_panel.rms_dbfs       = evt->rx_rms_dbfs;
+        g_viewer_rx_panel.frames_total   = (uint64_t) evt->rx_frames_total;
+        snprintf(g_viewer_rx_panel.last_frame_summary,
+                 sizeof g_viewer_rx_panel.last_frame_summary,
+                 "%s", evt->rx_last_frame_summary);
+        g_viewer_rx_panel.age_s = evt->rx_age_s;
+        int slots = RX_PANEL_PT_COUNT < SSO_RX_PT_SLOTS
+                  ? RX_PANEL_PT_COUNT : SSO_RX_PT_SLOTS;
+        for (int s = 0; s < slots; ++s) {
+            g_viewer_rx_panel.pt_count[s] = (uint64_t) evt->rx_pt_count[s];
+            int pl = evt->rx_pt_payload_len[s];
+            if (pl < 0) pl = 0;
+            int copy = pl;
+            if (copy > RX_PANEL_PAYLOAD_MAX) copy = RX_PANEL_PAYLOAD_MAX;
+            g_viewer_rx_panel.pt_payload_len[s] = pl;
+            memcpy(g_viewer_rx_panel.pt_payload[s],
+                   evt->rx_pt_payload[s], (size_t) copy);
+        }
+        int rn = evt->rx_ribbon_n;
+        if (rn > RIBBON_LEN) rn = RIBBON_LEN;
+        g_viewer_rx_panel.ribbon_n = rn;
+        memcpy(g_viewer_rx_panel.ribbon, evt->rx_ribbon, (size_t) rn);
+        g_viewer_rx_panel.ribbon[rn] = '\0';
+    }
+
     g_viewer_has_state   = 1;
     g_viewer_event_pending = 1;
 }
@@ -2596,6 +2740,10 @@ static void viewer_render(int connected)
 
         int prow = 5;
         report_position(&g_viewer_state, &prow, 50);
+        // RX panel directly below position (matches the operator's layout
+        // — main.c:3227 does the same +1 then render_rx_panel(&row, 50)).
+        prow++;
+        render_rx_panel(&g_viewer_rx_panel, &prow, 50);
 
         int tx_log_row = LINES - TX_LOG_SIZE - 2;
         if (tx_log_row >= 17) {
@@ -3162,7 +3310,9 @@ int main(int argc, char **argv)
             col = 50;
             report_position(&state, &row, col);
             row++;
-            render_rx_panel(&row, 50);
+            rx_panel_data_t rxd;
+            rx_panel_collect_local(&rxd);
+            render_rx_panel(&rxd, &row, 50);
 
             clrtoeol();
 

@@ -492,6 +492,56 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
         if (evt->roster_json[0]) {
             if (json_field_raw(&p, end, &first, "roster", evt->roster_json) < 0) return -1;
         }
+        // RX panel mirror. Only worth shipping when the operator has an
+        // active rx_session; non-B210 broadcasts omit the whole block.
+        if (evt->rx_have_session) {
+            if (json_field_bool  (&p, end, &first, "rx_has", 1) < 0) return -1;
+            if (evt->rx_rec_active) {
+                if (json_field_bool(&p, end, &first, "rx_rec", 1) < 0) return -1;
+            }
+            if (json_field_double(&p, end, &first, "rx_fhz", evt->rx_freq_hz) < 0) return -1;
+            if (json_field_double(&p, end, &first, "rx_pk",  evt->rx_peak_dbfs) < 0) return -1;
+            if (json_field_double(&p, end, &first, "rx_rm",  evt->rx_rms_dbfs) < 0) return -1;
+            if (json_field_int   (&p, end, &first, "rx_fr",  evt->rx_frames_total) < 0) return -1;
+            if (evt->rx_last_frame_summary[0]) {
+                if (json_field_str(&p, end, &first, "rx_lf",
+                                   evt->rx_last_frame_summary) < 0) return -1;
+            }
+            if (evt->rx_age_s >= 0.0) {
+                if (json_field_double(&p, end, &first, "rx_age",
+                                      evt->rx_age_s) < 0) return -1;
+            }
+            for (int s = 0; s < SSO_RX_PT_SLOTS; ++s) {
+                if (evt->rx_pt_count[s] == 0) continue;
+                char key[16];
+                snprintf(key, sizeof key, "rx_pt%d_c", s);
+                if (json_field_int(&p, end, &first, key,
+                                   evt->rx_pt_count[s]) < 0) return -1;
+                int n = evt->rx_pt_payload_len[s];
+                if (n > 0) {
+                    snprintf(key, sizeof key, "rx_pt%d_l", s);
+                    if (json_field_int(&p, end, &first, key, n) < 0) return -1;
+                    // Hex-encode the payload preview. Cap at the wire-
+                    // declared max so a misbehaving sender can't blow
+                    // through the receive buffer.
+                    int max_b = (n < SSO_RX_PT_PAYLOAD_MAX)
+                                ? n : SSO_RX_PT_PAYLOAD_MAX;
+                    char hex[SSO_RX_PT_PAYLOAD_MAX * 2 + 1] = {0};
+                    static const char hd[] = "0123456789ABCDEF";
+                    for (int b = 0; b < max_b; ++b) {
+                        hex[b * 2 + 0] = hd[(evt->rx_pt_payload[s][b] >> 4) & 0xF];
+                        hex[b * 2 + 1] = hd[ evt->rx_pt_payload[s][b]       & 0xF];
+                    }
+                    hex[max_b * 2] = '\0';
+                    snprintf(key, sizeof key, "rx_pt%d_p", s);
+                    if (json_field_str(&p, end, &first, key, hex) < 0) return -1;
+                }
+            }
+            if (evt->rx_ribbon_n > 0) {
+                if (json_field_str(&p, end, &first, "rx_rb", evt->rx_ribbon) < 0)
+                    return -1;
+            }
+        }
     }
     // rx-stats fields
     if (evt->type == SSO_EVT_RX_STATS) {
@@ -639,6 +689,55 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
     json_get_string(line, "tx_st", evt->tx_ack_status, sizeof(evt->tx_ack_status));
     json_get_string(line, "cmd_text",   evt->cmd_text,   sizeof(evt->cmd_text));
     json_get_string(line, "cmd_status", evt->cmd_status, sizeof(evt->cmd_status));
+
+    // RX panel mirror. Absent fields stay zeroed (memset at top of decode).
+    int rx_flag = 0;
+    if (json_get_bool(line, "rx_has", &rx_flag) > 0) evt->rx_have_session = rx_flag;
+    if (json_get_bool(line, "rx_rec", &rx_flag) > 0) evt->rx_rec_active   = rx_flag;
+    json_get_double(line, "rx_fhz", &evt->rx_freq_hz);
+    json_get_double(line, "rx_pk",  &evt->rx_peak_dbfs);
+    json_get_double(line, "rx_rm",  &evt->rx_rms_dbfs);
+    long rx_long = 0;
+    if (json_get_int(line, "rx_fr", &rx_long) > 0) evt->rx_frames_total = rx_long;
+    json_get_string(line, "rx_lf",
+                    evt->rx_last_frame_summary,
+                    sizeof(evt->rx_last_frame_summary));
+    // rx_age may be absent (no frame yet) — leave -1 sentinel via the
+    // memset, unless the field is present.
+    if (json_get_double(line, "rx_age", &evt->rx_age_s) <= 0) {
+        evt->rx_age_s = -1.0;
+    }
+    for (int s = 0; s < SSO_RX_PT_SLOTS; ++s) {
+        char key[16];
+        snprintf(key, sizeof key, "rx_pt%d_c", s);
+        long c = 0;
+        if (json_get_int(line, key, &c) > 0) evt->rx_pt_count[s] = c;
+        snprintf(key, sizeof key, "rx_pt%d_l", s);
+        long n = 0;
+        if (json_get_int(line, key, &n) > 0) evt->rx_pt_payload_len[s] = (int) n;
+        snprintf(key, sizeof key, "rx_pt%d_p", s);
+        char hex[SSO_RX_PT_PAYLOAD_MAX * 2 + 1] = {0};
+        if (json_get_string(line, key, hex, sizeof hex) > 0) {
+            int hl = (int) strlen(hex);
+            int bytes = hl / 2;
+            if (bytes > SSO_RX_PT_PAYLOAD_MAX) bytes = SSO_RX_PT_PAYLOAD_MAX;
+            for (int b = 0; b < bytes; ++b) {
+                char hi = hex[b * 2], lo = hex[b * 2 + 1];
+                int hv = (hi >= '0' && hi <= '9') ? (hi - '0')
+                       : (hi >= 'A' && hi <= 'F') ? (hi - 'A' + 10)
+                       : (hi >= 'a' && hi <= 'f') ? (hi - 'a' + 10) : 0;
+                int lv = (lo >= '0' && lo <= '9') ? (lo - '0')
+                       : (lo >= 'A' && lo <= 'F') ? (lo - 'A' + 10)
+                       : (lo >= 'a' && lo <= 'f') ? (lo - 'a' + 10) : 0;
+                evt->rx_pt_payload[s][b] = (uint8_t) ((hv << 4) | lv);
+            }
+        }
+    }
+    if (json_get_string(line, "rx_rb",
+                        evt->rx_ribbon, sizeof evt->rx_ribbon) > 0) {
+        evt->rx_ribbon_n = (int) strlen(evt->rx_ribbon);
+        if (evt->rx_ribbon_n > SSO_RIBBON_MAX) evt->rx_ribbon_n = SSO_RIBBON_MAX;
+    }
     return 0;
 }
 
