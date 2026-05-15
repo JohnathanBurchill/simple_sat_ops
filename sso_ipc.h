@@ -153,7 +153,8 @@ typedef struct {
     int     rx_pt_payload_len[SSO_RX_PT_SLOTS];
     uint8_t rx_pt_payload[SSO_RX_PT_SLOTS][SSO_RX_PT_PAYLOAD_MAX];
     int     rx_ribbon_n;
-    char    rx_ribbon[SSO_RIBBON_MAX + 1];  // glyph-index chars + nul
+    char    rx_ribbon[SSO_RIBBON_MAX + 1];  // '.' / '-' chars per second + nul
+    int8_t  rx_ribbon_peak[SSO_RIBBON_MAX]; // peak dBFS per second (parallel)
 } sso_event_t;
 
 void sso_event_init(sso_event_t *evt, sso_event_type_t type);

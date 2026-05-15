@@ -935,6 +935,9 @@ typedef struct {
     uint8_t    pt_payload[RX_PANEL_PT_COUNT][RX_PANEL_PAYLOAD_MAX];
     int        ribbon_n;
     char       ribbon[RIBBON_LEN + 1];
+    // Parallel array: peak dBFS for the i-th second back. Clamped into
+    // int8 (dBFS is naturally -90..0, well inside int8's range).
+    int8_t     ribbon_peak[RIBBON_LEN];
 } rx_panel_data_t;
 
 // Operator-side collector. Reads the live rx_session + g_ribbon globals
@@ -970,6 +973,9 @@ static void rx_panel_collect_local(rx_panel_data_t *d)
     // a 20 s tick. Tick test uses absolute push count (P) rather than
     // a fixed visual position so the tick row visibly walks upward at
     // 1 row/s; without that the strip looked frozen once it filled.
+    // ribbon_peak[i] is the peak dBFS that was pushed at that same
+    // second, clamped into int8 — rendered alongside the marker so
+    // the operator sees the signal level on every row.
     int n = g_ribbon_count;
     if (n > (int) sizeof d->ribbon - 1) n = (int) sizeof d->ribbon - 1;
     long P = g_ribbon_push_count;
@@ -977,6 +983,12 @@ static void rx_panel_collect_local(rx_panel_data_t *d)
         long abs_t = P - (long) i;
         if (abs_t > 0 && (abs_t % 20) == 0) d->ribbon[i] = '-';
         else                                 d->ribbon[i] = '.';
+        int idx = (g_ribbon_head - 1 - i + RIBBON_LEN) % RIBBON_LEN;
+        double dbfs = g_ribbon_peak[idx];
+        long lr = lround(dbfs);
+        if (lr > 127)  lr = 127;
+        if (lr < -127) lr = -127;
+        d->ribbon_peak[i] = (int8_t) lr;
     }
     d->ribbon[n] = '\0';
     d->ribbon_n  = n;
@@ -1054,24 +1066,38 @@ static void render_rx_panel(const rx_panel_data_t *d,
 }
 
 // Vertical ribbon strip. Bottom row (`bot_row`) holds the newest
-// sample; older samples climb upward toward `top_row`. '-' ticks are
-// rendered bold; rows past the available data are cleared so the strip
-// is always a clean column.
+// sample; older samples climb upward toward `top_row`. Each row is
+// rendered as "%3d <marker>" — right-aligned peak dBFS followed by
+// space + '.' or '-'. '-' ticks render bold. Rows past the available
+// data are blanked so the strip stays a clean column.
+//
+// `col` is the column of the marker char. The integer occupies the 4
+// columns immediately to its left (col-4 .. col-1).
 static void render_ribbon_vertical(const rx_panel_data_t *d,
                                    int top_row, int bot_row, int col)
 {
     if (d == NULL || bot_row <= top_row) return;
+    if (col < 4) return;
+    int int_col = col - 4;
     int max_rows = bot_row - top_row + 1;
     for (int i = 0; i < max_rows; ++i) {
         int row = bot_row - i;
-        char c = (i < d->ribbon_n) ? d->ribbon[i] : ' ';
-        if (c == '\0') c = ' ';
-        if (c == '-') {
-            attron(A_BOLD);
-            mvaddch(row, col, c);
-            attroff(A_BOLD);
+        if (i < d->ribbon_n) {
+            int peak = (int) d->ribbon_peak[i];
+            mvprintw(row, int_col, "%3d ", peak);
+            char c = d->ribbon[i];
+            if (c == '\0') c = ' ';
+            if (c == '-') {
+                attron(A_BOLD);
+                mvaddch(row, col, c);
+                attroff(A_BOLD);
+            } else {
+                mvaddch(row, col, c);
+            }
         } else {
-            mvaddch(row, col, c);
+            // No data yet for this row — leave it blank.
+            mvprintw(row, int_col, "    ");
+            mvaddch(row, col, ' ');
         }
     }
 }
@@ -1109,6 +1135,8 @@ static void ipc_fill_rx_panel(sso_event_t *evt)
     evt->rx_ribbon_n = rn;
     memcpy(evt->rx_ribbon, d.ribbon, (size_t) rn);
     evt->rx_ribbon[rn] = '\0';
+    memcpy(evt->rx_ribbon_peak, d.ribbon_peak,
+           (size_t) rn * sizeof evt->rx_ribbon_peak[0]);
 }
 
 static void ipc_broadcast_state(state_t *s,
@@ -2706,6 +2734,8 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
         g_viewer_rx_panel.ribbon_n = rn;
         memcpy(g_viewer_rx_panel.ribbon, evt->rx_ribbon, (size_t) rn);
         g_viewer_rx_panel.ribbon[rn] = '\0';
+        memcpy(g_viewer_rx_panel.ribbon_peak, evt->rx_ribbon_peak,
+               (size_t) rn * sizeof g_viewer_rx_panel.ribbon_peak[0]);
     }
 
     g_viewer_has_state   = 1;
@@ -2892,7 +2922,7 @@ static void viewer_render(int connected)
         int ribbon_col = COLS - 2;
         int ribbon_top = 1;
         int ribbon_bot = LINES - 2;
-        if (ribbon_col >= 60 && ribbon_bot > ribbon_top) {
+        if (ribbon_col >= 64 && ribbon_bot > ribbon_top) {
             render_ribbon_vertical(&g_viewer_rx_panel,
                                    ribbon_top, ribbon_bot, ribbon_col);
         }
@@ -3482,7 +3512,7 @@ int main(int argc, char **argv)
             int ribbon_col = COLS - 2;
             int ribbon_top = 1;
             int ribbon_bot = LINES - 2;
-            if (ribbon_col >= 60 && ribbon_bot > ribbon_top) {
+            if (ribbon_col >= 64 && ribbon_bot > ribbon_top) {
                 render_ribbon_vertical(&rxd, ribbon_top, ribbon_bot, ribbon_col);
             }
 

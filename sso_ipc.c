@@ -540,6 +540,19 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
             if (evt->rx_ribbon_n > 0) {
                 if (json_field_str(&p, end, &first, "rx_rb", evt->rx_ribbon) < 0)
                     return -1;
+                // Parallel peak-dBFS array hex-encoded: each int8 → 2 hex
+                // chars (two's complement so negative numbers round-trip).
+                char hex[SSO_RIBBON_MAX * 2 + 1] = {0};
+                static const char hd[] = "0123456789ABCDEF";
+                int hn = evt->rx_ribbon_n;
+                for (int i = 0; i < hn; ++i) {
+                    uint8_t b = (uint8_t) evt->rx_ribbon_peak[i];
+                    hex[i * 2 + 0] = hd[(b >> 4) & 0xF];
+                    hex[i * 2 + 1] = hd[ b       & 0xF];
+                }
+                hex[hn * 2] = '\0';
+                if (json_field_str(&p, end, &first, "rx_rb_p", hex) < 0)
+                    return -1;
             }
         }
     }
@@ -737,6 +750,21 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
                         evt->rx_ribbon, sizeof evt->rx_ribbon) > 0) {
         evt->rx_ribbon_n = (int) strlen(evt->rx_ribbon);
         if (evt->rx_ribbon_n > SSO_RIBBON_MAX) evt->rx_ribbon_n = SSO_RIBBON_MAX;
+    }
+    char rb_hex[SSO_RIBBON_MAX * 2 + 1] = {0};
+    if (json_get_string(line, "rx_rb_p", rb_hex, sizeof rb_hex) > 0) {
+        int hn = (int) strlen(rb_hex) / 2;
+        if (hn > SSO_RIBBON_MAX) hn = SSO_RIBBON_MAX;
+        for (int i = 0; i < hn; ++i) {
+            char hi = rb_hex[i * 2], lo = rb_hex[i * 2 + 1];
+            int hv = (hi >= '0' && hi <= '9') ? (hi - '0')
+                   : (hi >= 'A' && hi <= 'F') ? (hi - 'A' + 10)
+                   : (hi >= 'a' && hi <= 'f') ? (hi - 'a' + 10) : 0;
+            int lv = (lo >= '0' && lo <= '9') ? (lo - '0')
+                   : (lo >= 'A' && lo <= 'F') ? (lo - 'A' + 10)
+                   : (lo >= 'a' && lo <= 'f') ? (lo - 'a' + 10) : 0;
+            evt->rx_ribbon_peak[i] = (int8_t) ((hv << 4) | lv);
+        }
     }
     return 0;
 }
