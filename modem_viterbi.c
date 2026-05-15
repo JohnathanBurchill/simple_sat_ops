@@ -110,17 +110,59 @@ int modem_iq_viterbi_to_bits(const int16_t *iq_pairs, size_t n_pairs,
         }
     }
 
-    // 3. Symbol-rate differential phase: dphi[i] = arg(z_mf[i+sps] · conj(z_mf[i])).
+    // 3. Symbol-rate complex differential and carrier-frequency-offset
+    //    (per-symbol bias) estimate. The complex differential
+    //        d[i] = z_mf[i+sps] · conj(z_mf[i])
+    //    has phase bias ± π/2 for MSK at h=1/2. Squaring d[i] strips
+    //    the ±π/2 data modulation (lands at 2·bias ± π = 2·bias + π,
+    //    a single phase regardless of bit), so atan2(-Σ d², -Σ d²)
+    //    recovers 2·bias and half gives the bias mod π. The residual
+    //    π-ambiguity propagates to a polarity flip in the decoded bits
+    //    and is resolved by the ASM-search polarity loop in step 8.
     if (mf_len <= (size_t) sps) { free(Imf); free(Qmf); return -1; }
     size_t df_len = mf_len - (size_t) sps;
     float *dphi = (float *) malloc(df_len * sizeof(float));
     if (dphi == NULL) { free(Imf); free(Qmf); return -1; }
+
+    double s2r = 0.0, s2i = 0.0;
     for (size_t i = 0; i < df_len; ++i) {
         double I0 = (double) Imf[i],             Q0 = (double) Qmf[i];
         double I1 = (double) Imf[i + (size_t) sps],
                Q1 = (double) Qmf[i + (size_t) sps];
-        dphi[i] = (float) atan2(Q1 * I0 - I1 * Q0,
-                                I1 * I0 + Q1 * Q0);
+        double a  = I1 * I0 + Q1 * Q0;
+        double b  = Q1 * I0 - I1 * Q0;
+        s2r += a * a - b * b;
+        s2i += 2.0 * a * b;
+    }
+    double bias_mf = atan2(-s2i, -s2r) / 2.0;
+
+    // The MF-domain estimator has a small structural noise floor
+    // (~0.005 rad on clean MSK) from the matched filter's transient
+    // response at symbol boundaries. That is tiny per symbol but
+    // accumulates across the window and corrupts the slicer that
+    // M&M's TED relies on. Apply the correction only when it is
+    // unambiguously larger than the noise floor; below the threshold
+    // the carrier offset is small enough that raw dphi is already on
+    // the right side of zero for M&M to work.
+    const double BIAS_APPLY_RAD = 0.05;     // ~3°/sym, ~75 Hz @ sps=5/48k
+    int apply_dphi_bias = (bias_mf >  BIAS_APPLY_RAD)
+                        || (bias_mf < -BIAS_APPLY_RAD);
+    double cb = cos(-bias_mf), sb = sin(-bias_mf);
+
+    // dphi with bias rotated out (gated by threshold), ready for M&M.
+    for (size_t i = 0; i < df_len; ++i) {
+        double I0 = (double) Imf[i],             Q0 = (double) Qmf[i];
+        double I1 = (double) Imf[i + (size_t) sps],
+               Q1 = (double) Qmf[i + (size_t) sps];
+        double a = I1 * I0 + Q1 * Q0;
+        double b = Q1 * I0 - I1 * Q0;
+        if (apply_dphi_bias) {
+            double a_rot = a * cb - b * sb;
+            double b_rot = a * sb + b * cb;
+            dphi[i] = (float) atan2(b_rot, a_rot);
+        } else {
+            dphi[i] = (float) atan2(b, a);
+        }
     }
 
     // 4. Mueller-Müller timing on dphi (same loop as modem_iq.c). The
@@ -177,7 +219,40 @@ int modem_iq_viterbi_to_bits(const int16_t *iq_pairs, size_t n_pairs,
     free(dphi); free(Imf); free(Qmf);
     if (n_sym < 64) { free(yI); free(yQ); return -1; }
 
-    // 5. Carrier-phase estimate via fourth-power. For MSK at h=1/2 the
+    // 5. Per-symbol derotation by n·bias. The carrier-frequency
+    //    offset leaves an accumulated n·bias of phase rotation on
+    //    the symbol-rate complex samples y[n] that feed the Viterbi.
+    //    Re-estimate bias from y[n+1]·conj(y[n]) instead of reusing
+    //    the MF-domain estimate from step 3 — once M&M has placed the
+    //    strobes near symbol centres the differential is cleaner
+    //    (no boxcar-MF transient ISI), so the 2nd-power phase here is
+    //    a tighter estimate. Same threshold logic as step 3: on clean
+    //    AWGN the estimate is essentially zero but a tiny residual
+    //    would still accumulate to many radians across the Viterbi
+    //    window, so don't apply unless we have confidence.
+    if (n_sym >= 2) {
+        double s2r_y = 0.0, s2i_y = 0.0;
+        for (size_t n = 0; n + 1 < n_sym; ++n) {
+            double I0 = (double) yI[n],     Q0 = (double) yQ[n];
+            double I1 = (double) yI[n + 1], Q1 = (double) yQ[n + 1];
+            double a  = I1 * I0 + Q1 * Q0;
+            double b  = Q1 * I0 - I1 * Q0;
+            s2r_y += a * a - b * b;
+            s2i_y += 2.0 * a * b;
+        }
+        double bias_y = atan2(-s2i_y, -s2r_y) / 2.0;
+        if (bias_y > BIAS_APPLY_RAD || bias_y < -BIAS_APPLY_RAD) {
+            for (size_t n = 0; n < n_sym; ++n) {
+                double ang = -(double) n * bias_y;
+                double c   = cos(ang), s = sin(ang);
+                double I   = (double) yI[n], Q = (double) yQ[n];
+                yI[n] = (float)(I * c - Q * s);
+                yQ[n] = (float)(I * s + Q * c);
+            }
+        }
+    }
+
+    // 6. Carrier-phase estimate via fourth-power. For MSK at h=1/2 the
     //    quartic operation removes the bit-by-bit ±π/2 modulation
     //    (since 4·(±π/2) ≡ 0 mod 2π) and the remainder is 4·φ₀ + n,
     //    so a sum-then-arg recovers φ₀ up to a π/2 ambiguity. That
@@ -204,7 +279,7 @@ int modem_iq_viterbi_to_bits(const int16_t *iq_pairs, size_t n_pairs,
         yQ[n] = (float) Qr;
     }
 
-    // 6. 4-state Viterbi MLSE. State s ∈ {0,1,2,3} represents phase
+    // 7. 4-state Viterbi MLSE. State s ∈ {0,1,2,3} represents phase
     //    s·π/2. Predecessor under bit=1 (+π/2 transition) is (s+3)%4;
     //    under bit=0 (-π/2) is (s+1)%4. Branch metric Re{y·exp(-j·s·π/2)}
     //    simplifies to bm[0]=Re{y}, bm[1]=Im{y}, bm[2]=-Re{y}, bm[3]=-Im{y}.
@@ -256,7 +331,7 @@ int modem_iq_viterbi_to_bits(const int16_t *iq_pairs, size_t n_pairs,
     }
     free(bt_pred); free(bt_bit); free(yI); free(yQ);
 
-    // 7. ASM search under both polarities — same convention as
+    // 8. ASM search under both polarities — same convention as
     //    modem_iq_to_bits so callers can swap chains without
     //    re-thinking how the polarity flag flows.
     uint8_t *tmp_bits = (uint8_t *) malloc(n_sym ? n_sym : 1);

@@ -11,13 +11,18 @@
     Pipeline:
       1. AGC on the complex baseband (RMS-normalise).
       2. Boxcar matched filter of length sps on I and Q separately.
-      3. Symbol-rate differential phase: arg(z_mf[i+sps]·conj(z_mf[i]))
-         — identical to modem_iq.c so the timing-recovery loop sees the
-         same signal that already works there.
-      4. Mueller-Müller decision-directed timing. As a side product the
-         loop also strobes z_mf[strobe + sps] (with the same fractional
-         interpolation) so we get a clean symbol-rate complex sequence
-         y[n] to feed the Viterbi.
+      3. Carrier-frequency-offset (per-symbol bias) estimate from the
+         2nd-power of the symbol-spaced complex differential. For MSK
+         at h=1/2 the differential phase is bias ± π/2; squaring lands
+         at 2·bias + π so atan2(-Σd²) / 2 recovers bias mod π. The
+         bias is rotated out of dphi for timing recovery and out of
+         the symbol-rate samples y[n] before the Viterbi sees them.
+         (The remaining π-ambiguity becomes a polarity flip and is
+         resolved by the ASM-search polarity loop in step 7.)
+      4. Mueller-Müller decision-directed timing on bias-corrected
+         dphi. As a side product the loop strobes z_mf[strobe + sps]
+         (with fractional interpolation) so we also get a clean
+         symbol-rate complex sequence y[n] for the Viterbi.
       5. Carrier-phase estimate via fourth-power: for MSK at h=1/2,
          y[n]^4 has constant phase 4·φ₀ irrespective of the data bits,
          so φ̂₀ = arg(Σ y[n]^4) / 4. The 4-fold ambiguity in φ̂₀ is
@@ -30,6 +35,9 @@
          and predecessors (s+3)%4 [via +π/2 transition] and (s+1)%4
          [via -π/2 transition]. Path metrics carry over symbols, back-
          tracking yields the bit decisions.
+      7. ASM search under both polarities to absorb the π-ambiguity
+         from the bias estimate and the rotational symmetry of the
+         Viterbi state graph.
 
     For pure-AWGN MSK this picks up most of the ~3 dB gap between the
     differential receiver and the coherent floor — at very low SNR the

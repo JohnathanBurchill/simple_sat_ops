@@ -40,6 +40,7 @@
 #include "decode_loop.h"
 #include "hmac_keyfile.h"
 #include "modem.h"
+#include "modem_iq.h"
 #include "packet_db.h"
 #include "rx_tui.h"
 #include "sso_audit.h"
@@ -287,17 +288,27 @@ static void usage(FILE *dest, const char *name)
         "                           (auto-enabled when path ends in '.raw').\n"
         "  --iq                     Treat <path> as headerless int16 I,Q\n"
         "                           pairs at --rate (auto-enabled when path\n"
-        "                           ends in '.iq'). Runs the IQ-domain\n"
-        "                           decoder — by default the MSK MLSE\n"
-        "                           Viterbi front-end (modem_viterbi.c),\n"
-        "                           which on AWGN delivers ~2 dB of effective\n"
-        "                           gain over the FM-audio chain. Pass\n"
-        "                           --no-viterbi to fall back to the IQ\n"
-        "                           differential slicer (modem_iq.c).\n"
-        "  --viterbi                Force the Viterbi MLSE in --iq mode\n"
-        "                           (the default).\n"
-        "  --no-viterbi             Use the IQ slicer instead of the\n"
-        "                           Viterbi MLSE in --iq mode.\n"
+        "                           ends in '.iq'). By default runs the\n"
+        "                           two-pass IQ decoder: pass 1 is the\n"
+        "                           differential slicer (modem_iq.c) sliding\n"
+        "                           over the file, pass 2 anchors a tight\n"
+        "                           window on each pass-1 sync candidate\n"
+        "                           and retries with the MSK MLSE Viterbi\n"
+        "                           (modem_viterbi.c). On synthetic h=0.5\n"
+        "                           MSK the Viterbi delivers ~2 dB over\n"
+        "                           the slicer; on the live FrontierSat\n"
+        "                           downlink it currently no-ops (the\n"
+        "                           signal looks like h=1 GFSK and the\n"
+        "                           trellis assumes h=0.5).\n"
+        "  --viterbi                Force the Viterbi MLSE as the only\n"
+        "                           chain in --iq mode (implies\n"
+        "                           --no-two-pass). Useful for AWGN tests.\n"
+        "  --no-viterbi             Disable the Viterbi MLSE entirely;\n"
+        "                           pass-1 slicer only.\n"
+        "  --two-pass               Enable two-pass decode (default in\n"
+        "                           --iq mode).\n"
+        "  --no-two-pass            Run a single pass with whichever chain\n"
+        "                           --viterbi / --no-viterbi selects.\n"
         "  --rate=<hz>              Sample rate for --raw / --iq (default\n"
         "                           48000).\n"
         "  --channels=<n>           Channels for --raw (default 2; ch 0 used).\n"
@@ -376,6 +387,175 @@ static void usage(FILE *dest, const char *name)
         name, HMAC_KEYFILE_DEFAULT_RELPATH);
 }
 
+// Bundle of per-run state the emit helper needs. Built once in main()
+// and shared by pass-1 (slicer sliding window) and pass-2 (anchored
+// Viterbi) so the same dedup ring, observer geometry, and packet-DB
+// hookups apply uniformly to both.
+typedef struct {
+    int             samp_rate;
+    int             sps;
+    int             csp_crc32;
+    int             use_hmac;
+    int             update_mode;
+    int             have_start_utc;
+    double          start_utc_seconds;
+    int             have_pred;
+#ifdef WITH_SGP4SDP4
+    prediction_t   *pred;
+#endif
+    double          nominal_freq_hz;
+    long long       tle_id;
+    const char     *session_dir;
+    packet_db_t    *db;
+    const char     *log_path;
+    int             quiet;
+    int             use_tui;
+    int             force_beacon;
+    const uint8_t  *ref_buf;
+    size_t          ref_buf_len;
+    uint64_t       *recent_pos_quant;
+    int            *recent_idx;
+    int            *recent_count;
+    int             dedup_ring_sz;
+    uint64_t        dedup_quant_samples;
+    int            *n_emitted_p;
+} rx_emit_ctx_t;
+
+// Post-decode pipeline: optional CSP zlib CRC32 trim, dedup by absolute
+// sample position, SGP4 observer state, emit_frame, --update DB writes,
+// TUI mirror, dedup ring update, and n_emitted bump. Used by both
+// pass-1 (slicer sliding window) and pass-2 (anchored Viterbi).
+// Returns 1 if emitted, 0 if skipped by dedup or length check.
+static int rx_emit_decoded(rx_emit_ctx_t *ctx,
+                           uint64_t asm_abs_sample,
+                           uint8_t *packet, ssize_t plen,
+                           int golay_errs, int hmac_ok,
+                           int rs_errs, int used_golay_len,
+                           const int *rs_locs)
+{
+    if (plen < 4) return 0;
+
+    int crc_status = -1;
+    uint32_t crc_computed = 0, crc_le = 0, crc_be = 0;
+    if (!ctx->use_hmac && ctx->csp_crc32 && plen >= 8) {
+        crc_computed = csp_crc32_zlib(packet, (size_t)(plen - 4));
+        crc_le = (uint32_t)packet[plen - 4]
+               | ((uint32_t)packet[plen - 3] << 8)
+               | ((uint32_t)packet[plen - 2] << 16)
+               | ((uint32_t)packet[plen - 1] << 24);
+        crc_be = ((uint32_t)packet[plen - 4] << 24)
+               | ((uint32_t)packet[plen - 3] << 16)
+               | ((uint32_t)packet[plen - 2] <<  8)
+               |  (uint32_t)packet[plen - 1];
+        if (crc_computed == crc_le || crc_computed == crc_be) {
+            crc_status = 1;
+            plen -= 4;
+        } else {
+            crc_status = 0;
+        }
+    }
+
+    uint64_t pos_quant = asm_abs_sample / ctx->dedup_quant_samples;
+    int ring_n = *ctx->recent_count < ctx->dedup_ring_sz
+        ? *ctx->recent_count : ctx->dedup_ring_sz;
+    for (int r = 0; r < ring_n; ++r) {
+        if (ctx->recent_pos_quant[r] == pos_quant) return 0;
+    }
+    ctx->recent_pos_quant[*ctx->recent_idx] = pos_quant;
+    *ctx->recent_idx = (*ctx->recent_idx + 1) % ctx->dedup_ring_sz;
+    if (*ctx->recent_count < ctx->dedup_ring_sz) (*ctx->recent_count)++;
+
+    char ts[32];
+    double t_sec = (double)asm_abs_sample / (double)ctx->samp_rate;
+    snprintf(ts, sizeof ts, "t=%.3fs", t_sec);
+
+    double az_deg = (0.0/0.0), el_deg = (0.0/0.0);
+    double range_km = (0.0/0.0), range_rate_km_s = (0.0/0.0);
+    double doppler_hz = (0.0/0.0);
+#ifdef WITH_SGP4SDP4
+    if (ctx->have_pred && ctx->have_start_utc && ctx->pred != NULL) {
+        double abs_t = ctx->start_utc_seconds + t_sec;
+        time_t epoch = (time_t)abs_t;
+        struct tm utc;
+        gmtime_r(&epoch, &utc);
+        struct timeval tv;
+        tv.tv_sec = epoch;
+        tv.tv_usec = (long)((abs_t - epoch) * 1e6);
+        double jul_utc = Julian_Date(&utc, &tv);
+        update_satellite_position(ctx->pred, jul_utc);
+        az_deg = ctx->pred->satellite_ephem.azimuth;
+        el_deg = ctx->pred->satellite_ephem.elevation;
+        range_km = ctx->pred->satellite_ephem.range_km;
+        range_rate_km_s = ctx->pred->satellite_ephem.range_rate_km_s;
+        doppler_hz = ctx->nominal_freq_hz
+                   * (-range_rate_km_s / 299792.458);
+        int finite_ok = isfinite(az_deg) && isfinite(el_deg)
+                     && isfinite(range_km)
+                     && isfinite(range_rate_km_s)
+                     && isfinite(doppler_hz);
+        int bounds_ok = (range_km >= 0.0 && range_km < 5.0e5)
+                     && (el_deg >= -90.0 && el_deg <= 90.0)
+                     && (az_deg >= -360.0 && az_deg <= 720.0);
+        if (!finite_ok || !bounds_ok) {
+            fprintf(stderr,
+                "rx_replay: implausible geometry (az=%.2f "
+                "el=%.2f range=%.1f rate=%.3f) — dropping\n",
+                az_deg, el_deg, range_km, range_rate_km_s);
+            az_deg = el_deg = range_km = (0.0/0.0);
+            range_rate_km_s = doppler_hz = (0.0/0.0);
+        }
+    }
+#endif
+    decode_loop_set_observer(az_deg, el_deg, range_km,
+                             range_rate_km_s, doppler_hz);
+
+    emit_frame(ctx->log_path, ctx->quiet, ts,
+               packet, (size_t)plen,
+               golay_errs, hmac_ok, ctx->use_hmac,
+               rs_errs, used_golay_len,
+               crc_status, crc_computed, crc_le, crc_be,
+               rs_locs,
+               ctx->ref_buf_len > 0 ? ctx->ref_buf : NULL, ctx->ref_buf_len,
+               ctx->force_beacon);
+
+    if (ctx->update_mode && ctx->db != NULL && plen >= 4) {
+        size_t pl = (size_t)plen;
+        packet_db_update_observer(ctx->db, packet + 4, pl - 4,
+                                  az_deg, el_deg, range_km,
+                                  range_rate_km_s, doppler_hz,
+                                  ctx->tle_id, ctx->session_dir,
+                                  /*force=*/0);
+        if (ctx->have_start_utc) {
+            double abs_t = ctx->start_utc_seconds + t_sec;
+            time_t epoch = (time_t)floor(abs_t);
+            double frac = abs_t - (double)epoch;
+            long ms_long = (long)(frac * 1000.0 + 0.5);
+            if (ms_long >= 1000) { ms_long = 0; epoch += 1; }
+            struct tm utc;
+            gmtime_r(&epoch, &utc);
+            char ts_iso[40];
+            snprintf(ts_iso, sizeof ts_iso,
+                     "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+                     (utc.tm_year + 1900) % 10000,
+                     (utc.tm_mon + 1) % 100,
+                     utc.tm_mday % 100,
+                     utc.tm_hour % 100,
+                     utc.tm_min  % 100,
+                     utc.tm_sec  % 100,
+                     (int)(ms_long % 1000));
+            packet_db_update_replay_ts(ctx->db, packet + 4, pl - 4,
+                                       ts_iso, t_sec);
+        }
+    }
+    if (ctx->use_tui) {
+        rx_tui_observe_frame(ts, packet, (size_t)plen,
+                             golay_errs, hmac_ok, ctx->use_hmac,
+                             rs_errs, crc_status);
+    }
+    (*ctx->n_emitted_p)++;
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     const char *input_path = NULL;
@@ -393,7 +573,26 @@ int main(int argc, char **argv)
     // captures pulls more frames than the FM-discriminated WAV path.
     int iq_mode = 0;
     int iq_mode_explicit = 0;
-    int use_viterbi = 1;  // default ON in iq_mode; --no-viterbi reverts
+    // Viterbi default off pending a fix for the FrontierSat downlink
+    // modulation. Empirically (RAO captures, 2026-05-15 pass) the
+    // symbol-spaced differential phase histogram peaks near ±π — that
+    // is the GFSK h≈1 signature, not the MSK h=0.5 the current 4-state
+    // CPM trellis is built for. The 2nd-power bias estimator then
+    // latches near ±π/2 across the whole pass (independent of Doppler)
+    // and the Viterbi reports no syncs. The slicer survives because
+    // differential decoding doesn't care about the absolute trellis
+    // structure. Pass --viterbi to force it on (e.g. for synthetic
+    // h=0.5 tests).
+    int use_viterbi = 0;
+    // Two-pass IQ decoding. Pass 1: slicer (modem_iq_to_bits) on the
+    // wide sliding window — fast, finds easy frames, populates the
+    // dedup ring. Pass 2: rewalk the file collecting sync candidates
+    // with the slicer, then anchor a tight (~0.4 s) window on each
+    // unseen candidate and try the Viterbi MLSE. Currently a no-op on
+    // FrontierSat downlinks (see use_viterbi note above) but cheap
+    // and harmless; keep on so the wiring stays exercised. Revert
+    // with --no-two-pass.
+    int two_pass = 1;
     int bit_rate = 9600;
     double window_s = 1.5;
     double slide_s = 0.5;
@@ -437,6 +636,8 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--iq") == 0)  { iq_mode = 1;  iq_mode_explicit = 1; }
         else if (strcmp(a, "--viterbi") == 0)    use_viterbi = 1;
         else if (strcmp(a, "--no-viterbi") == 0) use_viterbi = 0;
+        else if (strcmp(a, "--two-pass") == 0)    two_pass = 1;
+        else if (strcmp(a, "--no-two-pass") == 0) two_pass = 0;
         else if (starts_with(a, "--rate="))      raw_rate = atoi(a + 7);
         else if (starts_with(a, "--channels="))  raw_channels = atoi(a + 11);
         else if (starts_with(a, "--bit-rate="))  bit_rate = atoi(a + 11);
@@ -830,6 +1031,43 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
 
     int n_emitted = 0;
+
+    // Build the emit context once: shared by both passes.
+    rx_emit_ctx_t ectx = {
+        .samp_rate = samp_rate,
+        .sps = sps,
+        .csp_crc32 = csp_crc32,
+        .use_hmac = use_hmac,
+        .update_mode = update_mode,
+        .have_start_utc = have_start_utc,
+        .start_utc_seconds = start_utc_seconds,
+        .have_pred = have_pred,
+#ifdef WITH_SGP4SDP4
+        .pred = have_pred ? &pred : NULL,
+#endif
+        .nominal_freq_hz = nominal_freq_hz,
+        .tle_id = tle_id,
+        .session_dir = session_dir_buf,
+        .db = db,
+        .log_path = log_path,
+        .quiet = quiet,
+        .use_tui = use_tui,
+        .force_beacon = force_beacon,
+        .ref_buf = ref_buf_len > 0 ? ref_buf : NULL,
+        .ref_buf_len = ref_buf_len,
+        .recent_pos_quant = recent_pos_quant,
+        .recent_idx = &recent_idx,
+        .recent_count = &recent_count,
+        .dedup_ring_sz = DEDUP_RING_SZ,
+        .dedup_quant_samples = DEDUP_QUANT_SAMPLES,
+        .n_emitted_p = &n_emitted,
+    };
+
+    // Pass 1: the original sliding-window decode. When two_pass is on
+    // and we're in iq_mode, force the slicer chain — Viterbi is run
+    // from pass 2 on anchored tight windows. When two_pass is off the
+    // user's --viterbi / --no-viterbi choice still wins.
+    int pass1_use_viterbi = (iq_mode && two_pass) ? 0 : use_viterbi;
     for (size_t window_start = 0;
          window_start + window_samples <= n_frames && !g_stop;
          window_start += slide_samples)
@@ -847,7 +1085,7 @@ int main(int argc, char **argv)
             int rs_locs[32];
             size_t sync_off_local = 0;
             int decoded;
-            if (iq_mode && use_viterbi) {
+            if (iq_mode && pass1_use_viterbi) {
                 decoded = try_decode_window_viterbi(
                     win, window_samples, &mp, &opts,
                     sync_max_ham, use_hmac, allow_partial_rs,
@@ -885,158 +1123,103 @@ int main(int argc, char **argv)
             inner_min_offset = sync_off_local + 1;
             if (plen < 4 || (size_t)plen > sizeof packet) continue;
 
-            // CSP zlib CRC32 trailer (opt-in via --csp-crc32; mirrors
-            // rx_live so the same bytes produce the same output).
-            int crc_status = -1;
-            uint32_t crc_computed = 0, crc_le = 0, crc_be = 0;
-            if (!use_hmac && csp_crc32 && plen >= 8) {
-                crc_computed = csp_crc32_zlib(packet, (size_t)(plen - 4));
-                crc_le = (uint32_t)packet[plen - 4]
-                       | ((uint32_t)packet[plen - 3] << 8)
-                       | ((uint32_t)packet[plen - 2] << 16)
-                       | ((uint32_t)packet[plen - 1] << 24);
-                crc_be = ((uint32_t)packet[plen - 4] << 24)
-                       | ((uint32_t)packet[plen - 3] << 16)
-                       | ((uint32_t)packet[plen - 2] <<  8)
-                       |  (uint32_t)packet[plen - 1];
-                if (crc_computed == crc_le || crc_computed == crc_be) {
-                    crc_status = 1;
-                    plen -= 4;
-                } else {
-                    crc_status = 0;
-                }
-            }
-
             uint64_t asm_abs_sample = (uint64_t)window_start
                 + (uint64_t)sync_off_local * (uint64_t)sps
                 + (uint64_t)(sps / 2);
-            uint64_t pos_quant = asm_abs_sample / DEDUP_QUANT_SAMPLES;
-            int seen = 0;
-            int ring_n = recent_count < DEDUP_RING_SZ
-                ? recent_count : DEDUP_RING_SZ;
-            for (int r = 0; r < ring_n; r++) {
-                if (recent_pos_quant[r] == pos_quant) { seen = 1; break; }
-            }
-            if (seen) continue;
-            recent_pos_quant[recent_idx] = pos_quant;
-            recent_idx = (recent_idx + 1) % DEDUP_RING_SZ;
-            if (recent_count < DEDUP_RING_SZ) recent_count++;
-
-            char ts[32];
-            double t_sec = (double)asm_abs_sample / (double)samp_rate;
-            snprintf(ts, sizeof ts, "t=%.3fs", t_sec);
-
-            // Observer state for this packet. SGP4-propagate to the
-            // moment in absolute UTC when this burst's ASM was
-            // detected (start_utc + audio_offset_s). Skipped (and the
-            // setter cleared back to NaN) when no TLE / no start_utc
-            // was available.
-            double az_deg = (0.0/0.0), el_deg = (0.0/0.0);
-            double range_km = (0.0/0.0), range_rate_km_s = (0.0/0.0);
-            double doppler_hz = (0.0/0.0);
-#ifdef WITH_SGP4SDP4
-            if (have_pred && have_start_utc) {
-                double abs_t = start_utc_seconds + t_sec;
-                time_t epoch = (time_t)abs_t;
-                struct tm utc;
-                gmtime_r(&epoch, &utc);
-                struct timeval tv;
-                tv.tv_sec = epoch;
-                tv.tv_usec = (long)((abs_t - epoch) * 1e6);
-                double jul_utc = Julian_Date(&utc, &tv);
-                update_satellite_position(&pred, jul_utc);
-                az_deg = pred.satellite_ephem.azimuth;
-                el_deg = pred.satellite_ephem.elevation;
-                range_km = pred.satellite_ephem.range_km;
-                range_rate_km_s = pred.satellite_ephem.range_rate_km_s;
-                doppler_hz = nominal_freq_hz
-                           * (-range_rate_km_s / 299792.458);
-                // Plausibility gate. SGP4 occasionally diverges (very
-                // stale TLE, mode-flip near the deep-space boundary,
-                // etc.) and emits range values like 1e17 km. Drop the
-                // whole geometry row in that case so packet_browser
-                // doesn't show garbage; lunar distance (~400 000 km)
-                // is a comfortable upper bound for the Earth-orbit
-                // satellites this stack tracks. Comparisons against
-                // NaN are always false, so an already-NaN result
-                // (no_observer, or no TLE) is left alone.
-                int finite_ok = isfinite(az_deg) && isfinite(el_deg)
-                             && isfinite(range_km)
-                             && isfinite(range_rate_km_s)
-                             && isfinite(doppler_hz);
-                int bounds_ok = (range_km >= 0.0 && range_km < 5.0e5)
-                             && (el_deg >= -90.0 && el_deg <= 90.0)
-                             && (az_deg >= -360.0 && az_deg <= 720.0);
-                if (!finite_ok || !bounds_ok) {
-                    fprintf(stderr,
-                        "rx_replay: implausible geometry (az=%.2f "
-                        "el=%.2f range=%.1f rate=%.3f) — dropping\n",
-                        az_deg, el_deg, range_km, range_rate_km_s);
-                    az_deg = el_deg = range_km = (0.0/0.0);
-                    range_rate_km_s = doppler_hz = (0.0/0.0);
-                }
-            }
-#endif
-            decode_loop_set_observer(az_deg, el_deg, range_km,
-                                     range_rate_km_s, doppler_hz);
-
-            emit_frame(log_path, quiet, ts,
-                       packet, (size_t)plen,
-                       golay_errs, hmac_ok, use_hmac,
-                       rs_errs, used_golay_len,
-                       crc_status, crc_computed, crc_le, crc_be,
-                       rs_locs,
-                       ref_buf_len > 0 ? ref_buf : NULL, ref_buf_len,
-                       force_beacon);
-
-            // --update mode: emit_frame's INSERT was suppressed (db
-            // passed as NULL above), so backfill the existing rows
-            // for this payload — typically the b210_rx_tx row from
-            // the original capture — with whatever observer state we
-            // have now.
-            if (update_mode && db != NULL && plen >= 4) {
-                size_t pl = (size_t)plen;
-                packet_db_update_observer(db, packet + 4, pl - 4,
-                                          az_deg, el_deg, range_km,
-                                          range_rate_km_s, doppler_hz,
-                                          tle_id,
-                                          session_dir_buf,
-                                          /*force=*/0);
-                // Rewrite ts_received on existing rx_replay rows that
-                // were stamped with wall-clock-of-decode. Scoped to
-                // source_tool='rx_replay' inside the update so live
-                // rows (correctly stamped at reception) don't get
-                // trampled. Only meaningful when we have a UT anchor.
-                if (have_start_utc) {
-                    double abs_t = start_utc_seconds + t_sec;
-                    time_t epoch = (time_t)floor(abs_t);
-                    double frac = abs_t - (double)epoch;
-                    long ms_long = (long)(frac * 1000.0 + 0.5);
-                    if (ms_long >= 1000) { ms_long = 0; epoch += 1; }
-                    struct tm utc;
-                    gmtime_r(&epoch, &utc);
-                    char ts_iso[40];
-                    snprintf(ts_iso, sizeof ts_iso,
-                             "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
-                             (utc.tm_year + 1900) % 10000,
-                             (utc.tm_mon + 1) % 100,
-                             utc.tm_mday % 100,
-                             utc.tm_hour % 100,
-                             utc.tm_min  % 100,
-                             utc.tm_sec  % 100,
-                             (int)(ms_long % 1000));
-                    packet_db_update_replay_ts(db, packet + 4, pl - 4,
-                                               ts_iso, t_sec);
-                }
-            }
-            if (use_tui) {
-                rx_tui_observe_frame(ts, packet, (size_t)plen,
-                                     golay_errs, hmac_ok, use_hmac,
-                                     rs_errs, crc_status);
-            }
-            ++n_emitted;
+            rx_emit_decoded(&ectx, asm_abs_sample, packet, plen,
+                            golay_errs, hmac_ok, rs_errs,
+                            used_golay_len, rs_locs);
         }
         if (use_tui && rx_tui_tick()) goto done;
+    }
+    int pass1_n_emitted = n_emitted;
+
+    // Pass 2: anchored Viterbi on candidates the slicer found but
+    // pass-1 didn't already emit. Only meaningful in iq_mode with
+    // --no-two-pass not set. Tight window so the Viterbi's 4th-power
+    // φ_0 estimate is dominated by signal rather than the seconds of
+    // silence around each burst.
+    int p2_attempts = 0, p2_emitted = 0;
+    if (iq_mode && two_pass && !g_stop) {
+        // Tight Viterbi window: one max-length AX100 frame plus
+        // pre-ASM cushion for M&M timing-loop settling.
+        // Max AX100 payload = ~256 B RS-coded + framing ≈ 2300 bits
+        // ≈ 240 ms @ 9600 baud. Pre-ASM cushion = 50 ms.
+        const double p2_window_s = 0.40;
+        const double p2_pre_anchor_s = 0.05;
+        const size_t p2_window_pairs =
+            (size_t)(p2_window_s * (double)samp_rate);
+        const size_t p2_pre_pairs    =
+            (size_t)(p2_pre_anchor_s * (double)samp_rate);
+
+        for (size_t window_start = 0;
+             window_start + window_samples <= n_frames && !g_stop;
+             window_start += slide_samples)
+        {
+            const int16_t *win = samples + window_start * 2u;
+            size_t inner_min = 0;
+            for (int tries = 0; tries < 64; ++tries) {
+                size_t n_bits_sym = 0, sync_off_bits = 0;
+                int polarity_used = -1;
+                int rc = modem_iq_to_bits(win, window_samples, &mp,
+                                          0, sync_max_ham, inner_min,
+                                          bits_scratch, &n_bits_sym,
+                                          &sync_off_bits, &polarity_used);
+                if (rc != 0) break;
+                inner_min = sync_off_bits + 1;
+
+                uint64_t asm_abs_sample = (uint64_t)window_start
+                    + (uint64_t)sync_off_bits * (uint64_t)sps
+                    + (uint64_t)(sps / 2);
+                uint64_t pos_quant = asm_abs_sample / DEDUP_QUANT_SAMPLES;
+                int seen = 0;
+                int ring_n = recent_count < DEDUP_RING_SZ
+                    ? recent_count : DEDUP_RING_SZ;
+                for (int r = 0; r < ring_n; ++r) {
+                    if (recent_pos_quant[r] == pos_quant) { seen = 1; break; }
+                }
+                if (seen) continue;
+
+                // Anchor a tight window around the candidate ASM.
+                uint64_t tight_start = (asm_abs_sample > (uint64_t)p2_pre_pairs)
+                    ? (asm_abs_sample - (uint64_t)p2_pre_pairs) : 0;
+                if (tight_start + p2_window_pairs > n_frames) {
+                    tight_start = (n_frames > p2_window_pairs)
+                        ? (n_frames - p2_window_pairs) : 0;
+                }
+                size_t tw_pairs = (tight_start + p2_window_pairs <= n_frames)
+                    ? p2_window_pairs : (n_frames - (size_t)tight_start);
+                if (tw_pairs < (size_t)(64 * sps)) continue;
+                const int16_t *tw = samples + tight_start * 2u;
+
+                ssize_t plen2 = -1;
+                int golay2 = 0, hmac2 = -1, rs2 = -1, glen2 = -1;
+                int rs_locs2[32];
+                size_t sync_off2 = 0;
+                int dec2 = try_decode_window_viterbi(
+                    tw, tw_pairs, &mp, &opts,
+                    sync_max_ham, use_hmac, allow_partial_rs,
+                    0,
+                    bits_scratch, bits_cap,
+                    bytes_scratch, bytes_cap,
+                    packet, sizeof packet,
+                    &plen2, &golay2, &hmac2,
+                    &rs2, &glen2,
+                    &sync_off2, rs_locs2);
+                ++p2_attempts;
+                if (!dec2) continue;
+                if (plen2 < 4 || (size_t)plen2 > sizeof packet) continue;
+
+                uint64_t asm_abs_v = tight_start
+                    + (uint64_t)sync_off2 * (uint64_t)sps
+                    + (uint64_t)(sps / 2);
+                if (rx_emit_decoded(&ectx, asm_abs_v, packet, plen2,
+                                    golay2, hmac2, rs2, glen2, rs_locs2)) {
+                    ++p2_emitted;
+                }
+            }
+            if (use_tui && rx_tui_tick()) goto done;
+        }
     }
 
 done:
@@ -1049,11 +1232,23 @@ done:
         if (!g_stop) rx_tui_hold_until_quit();
         rx_tui_close();
     }
-    const char *chain = iq_mode
-        ? (use_viterbi ? "iq+viterbi" : "iq+slicer")
-        : "fm-audio";
+    const char *chain;
+    if (!iq_mode) {
+        chain = "fm-audio";
+    } else if (two_pass) {
+        chain = "iq+slicer+anchored-viterbi";
+    } else {
+        chain = use_viterbi ? "iq+viterbi" : "iq+slicer";
+    }
     fprintf(stderr, "rx_replay: %d frame(s) emitted (chain=%s).\n",
             n_emitted, chain);
+    if (iq_mode && two_pass) {
+        fprintf(stderr,
+                "rx_replay: pass-1 (slicer) emitted %d, "
+                "pass-2 (anchored Viterbi) tried %d candidate(s) "
+                "and rescued %d.\n",
+                pass1_n_emitted, p2_attempts, p2_emitted);
+    }
     free(bits_scratch);
     free(bytes_scratch);
     free(samples);
