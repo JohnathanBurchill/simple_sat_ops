@@ -4470,6 +4470,8 @@ int main(int argc, char **argv)
     clrtoeol();
     mvprintw(keyboard_info_row++, 3, "%s", "t  - Compose TX command");
     clrtoeol();
+    mvprintw(keyboard_info_row++, 3, "%s", "A  - Auto-TCMD (needs --tc-file=)");
+    clrtoeol();
     mvprintw(keyboard_info_row++, 3, "%s", "K  - Lock/unlock keyboard");
     clrtoeol();
     mvprintw(keyboard_info_row++, 3, "%s", "q  - Quit");
