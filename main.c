@@ -84,6 +84,40 @@ static int g_control_mode = 0;
 static int g_viewer_mode = 0;  // bare invocation found a running operator
 static sso_ipc_server_t *g_ipc = NULL;
 static const char *g_operator_user = NULL;
+
+// Signal ribbon: 60-second 1 Hz rolling window of RX peak dBFS rendered
+// as a UTF-8 block-character strip in the RX panel. Oldest sample on
+// the left, newest on the right. Cheap fixed-size; the sampler is
+// gated by monotonic seconds in the main loop.
+#define RIBBON_LEN 60
+static double g_ribbon_peak[RIBBON_LEN];
+static int    g_ribbon_count   = 0;   // number of valid samples (caps at RIBBON_LEN)
+static int    g_ribbon_head    = 0;   // next write index (circular)
+static double g_ribbon_last_t  = 0.0; // monotonic timestamp of last push
+
+static void ribbon_push(double peak_dbfs)
+{
+    g_ribbon_peak[g_ribbon_head] = peak_dbfs;
+    g_ribbon_head = (g_ribbon_head + 1) % RIBBON_LEN;
+    if (g_ribbon_count < RIBBON_LEN) g_ribbon_count++;
+}
+
+// Map a dBFS sample to one of 8 UTF-8 block glyphs (U+2581..U+2588).
+// -90 dBFS or lower renders as a space so silent gaps are visually
+// distinct from "low" signal. 0 dBFS rails to the tallest block.
+static const char *ribbon_glyph(double dbfs)
+{
+    if (!isfinite(dbfs) || dbfs <= -90.0) return " ";
+    double level = (dbfs - (-90.0)) / 11.25;  // 8 bins of ~11.25 dB each
+    int idx = (int)level;
+    if (idx < 0) idx = 0;
+    if (idx > 7) idx = 7;
+    static const char *blocks[8] = {
+        "\xE2\x96\x81", "\xE2\x96\x82", "\xE2\x96\x83", "\xE2\x96\x84",
+        "\xE2\x96\x85", "\xE2\x96\x86", "\xE2\x96\x87", "\xE2\x96\x88",
+    };
+    return blocks[idx];
+}
 // /FrontierSat/Operations/<yyyymmdd>/<hhmmLT>/ for the upcoming
 // pass — created in main() once the AOS prediction is in, then
 // broadcast on every STATE event so b210_rx_tx and tx_frame_sdr
@@ -1687,6 +1721,24 @@ static void render_rx_panel(int *print_row, int print_col)
             mvprintw(row++, col, "%15s   %s", "last frame", last);
             clrtoeol();
         }
+
+        // Signal ribbon: oldest sample on the left, newest on the
+        // right. Each glyph = 1 s of peak dBFS. Empty until the
+        // sampler has accumulated history.
+        if (g_ribbon_count > 0) {
+            mvprintw(row, col, "%15s   ", "ribbon");
+            int start = (g_ribbon_head - g_ribbon_count + RIBBON_LEN)
+                        % RIBBON_LEN;
+            for (int i = 0; i < g_ribbon_count; ++i) {
+                int idx = (start + i) % RIBBON_LEN;
+                addstr(ribbon_glyph(g_ribbon_peak[idx]));
+            }
+            clrtoeol();
+            ++row;
+            mvprintw(row++, col, "%15s   -90 dBFS .. 0 dBFS  (60 s)",
+                     "scale");
+            clrtoeol();
+        }
     }
     *print_row = row;
 #else
@@ -2623,6 +2675,15 @@ int main(int argc, char **argv)
         if (g_rx_session) {
             rx_session_snapshot(g_rx_session, NULL, NULL, NULL,
                                 &snap_freq_hz, NULL, 0);
+        }
+        // Signal ribbon sampler: push one peak-dBFS reading per second
+        // so the ribbon in the RX panel rolls left in real time.
+        if (g_rx_session && (t_now - g_ribbon_last_t) >= 1.0) {
+            double peak = -90.0;
+            rx_session_snapshot(g_rx_session, NULL, &peak, NULL,
+                                NULL, NULL, 0);
+            ribbon_push(peak);
+            g_ribbon_last_t = t_now;
         }
         if (g_rx_session
             && state.doppler_correction_enabled
