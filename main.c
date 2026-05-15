@@ -42,6 +42,7 @@
 #include <locale.h>
 #include <math.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -117,6 +118,160 @@ static const char *ribbon_glyph(double dbfs)
         "\xE2\x96\x85", "\xE2\x96\x86", "\xE2\x96\x87", "\xE2\x96\x88",
     };
     return blocks[idx];
+}
+
+// Command line: vi-style ":" prompt at the bottom of the screen for
+// runtime actions. While g_cmd_active, every key is routed through the
+// command handler instead of the main key switch.
+#define CMD_BUF_SIZE 128
+static int  g_cmd_active = 0;
+static char g_cmd_buf[CMD_BUF_SIZE];
+static int  g_cmd_len = 0;
+static char g_cmd_status[160] = "";
+
+static void cmd_enter(void)
+{
+    g_cmd_active = 1;
+    g_cmd_buf[0] = '\0';
+    g_cmd_len = 0;
+}
+
+static void cmd_set_status(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_cmd_status, sizeof g_cmd_status, fmt, ap);
+    va_end(ap);
+}
+
+// Forward decls so cmd_dispatch can call the existing action helpers,
+// which live further down in the file.
+static void run_tx_compose(void);
+void start_tracking(state_t *state);
+void stop_tracking(state_t *state);
+int  point_to_stationary_target(state_t *state, double azimuth, double elevation);
+
+// Dispatch the typed command. state may be touched by tracking-related
+// commands; nothing else needs it. Returns nothing -- result lands in
+// g_cmd_status for the next redraw.
+static void cmd_dispatch(state_t *state)
+{
+    char buf[CMD_BUF_SIZE];
+    snprintf(buf, sizeof buf, "%s", g_cmd_buf);
+    // Trim leading whitespace; an empty command is a no-op.
+    char *p = buf;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '\0') { cmd_set_status(""); return; }
+
+    char *save = NULL;
+    char *cmd  = strtok_r(p, " \t", &save);
+    char *arg1 = strtok_r(NULL, " \t", &save);
+
+    if (cmd == NULL) {
+        cmd_set_status("");
+        return;
+    }
+    if (strcmp(cmd, "help") == 0 || strcmp(cmd, "h") == 0 || strcmp(cmd, "?") == 0) {
+        cmd_set_status("commands: help tx track stop home quit "
+                       "freq <MHz> rs on|off spectrum [N]");
+    } else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0
+               || strcmp(cmd, "exit") == 0) {
+        state->running = 0;
+        cmd_set_status("quitting");
+    } else if (strcmp(cmd, "tx") == 0) {
+        // Defer the modal until after we leave command-mode so the
+        // bottom prompt doesn't bleed under the modal box.
+        cmd_set_status("opening TX compose...");
+        g_cmd_active = 0;
+        run_tx_compose();
+    } else if (strcmp(cmd, "track") == 0) {
+        start_tracking(state);
+        cmd_set_status("tracking on");
+    } else if (strcmp(cmd, "stop") == 0) {
+        stop_tracking(state);
+        cmd_set_status("tracking stopped");
+    } else if (strcmp(cmd, "home") == 0) {
+        stop_tracking(state);
+        point_to_stationary_target(state, 0.0, 0.0);
+        cmd_set_status("home: az=0 el=0");
+    } else if (strcmp(cmd, "freq") == 0) {
+        if (arg1 == NULL) {
+            cmd_set_status("freq: missing argument (MHz)");
+        } else {
+#ifdef WITH_USRP_B210
+            double v = atof(arg1);
+            double hz = (v < 1e6) ? v * 1e6 : v;   // accept MHz or Hz
+            if (hz < 1e6 || hz > 6e9) {
+                cmd_set_status("freq: %g out of [1 MHz, 6 GHz]", hz);
+            } else if (g_rx_session == NULL) {
+                cmd_set_status("freq: no RX session");
+            } else {
+                rx_session_request_freq(g_rx_session, hz);
+                cmd_set_status("freq -> %.6f MHz", hz / 1e6);
+            }
+#else
+            cmd_set_status("freq: this build has no USRP support");
+#endif
+        }
+    } else if (strcmp(cmd, "rs") == 0) {
+        // Reed-Solomon toggle isn't a runtime knob yet -- rx_session
+        // sets reed_solomon at open() time. Flag this clearly instead
+        // of silently no-op'ing.
+        if (arg1 == NULL) {
+            cmd_set_status("rs: usage: rs on|off (not yet runtime-toggleable)");
+        } else {
+            cmd_set_status("rs %s: NOT YET WIRED -- rx_session_open params only",
+                           arg1);
+        }
+    } else if (strcmp(cmd, "spectrum") == 0) {
+        cmd_set_status("spectrum: not yet implemented");
+    } else {
+        cmd_set_status("unknown command '%s' (try :help)", cmd);
+    }
+}
+
+// Returns 1 if key was consumed by the command line, 0 to fall through.
+static int cmd_handle_key(int key, state_t *state)
+{
+    if (!g_cmd_active) return 0;
+    if (key == ERR) return 1;
+    if (key == 27 /* Esc */) {
+        g_cmd_active = 0;
+        g_cmd_status[0] = '\0';  // clear, don't leave a stale message
+        return 1;
+    }
+    if (key == '\n' || key == '\r' || key == KEY_ENTER) {
+        g_cmd_active = 0;
+        cmd_dispatch(state);
+        return 1;
+    }
+    if (key == KEY_BACKSPACE || key == 127 || key == 8) {
+        if (g_cmd_len > 0) {
+            g_cmd_buf[--g_cmd_len] = '\0';
+        }
+        return 1;
+    }
+    if (key >= 32 && key < 127 && g_cmd_len < (int)sizeof g_cmd_buf - 1) {
+        g_cmd_buf[g_cmd_len++] = (char)key;
+        g_cmd_buf[g_cmd_len] = '\0';
+    }
+    return 1;
+}
+
+// Render the command prompt (or last-result status) on the bottom row.
+static void cmd_render(void)
+{
+    int row = LINES - 1;
+    if (g_cmd_active) {
+        mvprintw(row, 0, ":%s", g_cmd_buf);
+        // Visible cursor block at the typing position.
+        addch(' ' | A_REVERSE);
+    } else if (g_cmd_status[0]) {
+        mvprintw(row, 0, "%s", g_cmd_status);
+    } else {
+        move(row, 0);
+    }
+    clrtoeol();
 }
 // /FrontierSat/Operations/<yyyymmdd>/<hhmmLT>/ for the upcoming
 // pass — created in main() once the AOS prediction is in, then
@@ -2606,10 +2761,15 @@ int main(int argc, char **argv)
         }
 
         key = getch();
-        if (key == 'K') {
+        if (g_cmd_active) {
+            cmd_handle_key(key, &state);
+        } else if (key == 'K') {
             keyboard_unlocked = !keyboard_unlocked;
         } else if (keyboard_unlocked) {
             switch (key) {
+                case ':':
+                    cmd_enter();
+                    break;
                 case 'q':
                     state.running = 0;
                     break;
@@ -2662,6 +2822,8 @@ int main(int argc, char **argv)
                 mvprintw(keyboard_info_row + 2, 0, "%s", "Antenna stationary");
                 clrtoeol();
             }
+
+            cmd_render();
 
             refresh();
             t_last_redraw = t_now;
