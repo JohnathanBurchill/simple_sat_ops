@@ -190,6 +190,17 @@ if (OPENSSL_FOUND)
     target_link_sso_core(rx_replay)
     list(APPEND SSO_TARGETS rx_replay)
 
+    # AX100 framer self-test: structural audit + round trip across the
+    # opts matrix + Golay/RS/HMAC error injection. Needs OpenSSL (HMAC)
+    # so it lives in the OPENSSL_FOUND block.
+    add_executable(ax100_selftest utils/ax100_selftest.c
+                   ax100.c rs.c golay24.c hmac_keyfile.c)
+    target_include_directories(ax100_selftest PRIVATE
+        ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(ax100_selftest PRIVATE ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(ax100_selftest PRIVATE ${OPENSSL_LIBRARIES} m)
+    list(APPEND SSO_TARGETS ax100_selftest)
+
     # CTS1 beacon WAV generator
     add_executable(beacon_gen utils/beacon_gen.c
                    csp.c golay24.c ax100.c rs.c hmac_keyfile.c modem.c)
