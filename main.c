@@ -4797,22 +4797,22 @@ int main(int argc, char **argv)
         // in the ":" prompt we want this every tick (~50 Hz) so each
         // keystroke echoes immediately. Otherwise piggyback on the slow
         // redraw so the row picks up any post-command status string.
-        // When a modal is open we layer it on top of stdscr via
-        // wnoutrefresh + doupdate so the operator's panels can keep
-        // refreshing underneath without flickering the modal off.
+        // When a modal is open we force-redraw it on top of stdscr by
+        // touchwin'ing every modal cell as dirty and wrefresh'ing the
+        // window after stdscr's own refresh. doupdate's incremental
+        // diff is otherwise free to skip "unchanged" modal cells, which
+        // is what was letting panel updates (e.g. the antenna status
+        // row) bleed through and overwrite the modal.
         if (redraw_due || g_cmd_active || g_tx_compose_active
             || g_auto_tcmd_active) {
             cmd_render();
+            refresh();
             if (g_tx_compose_active && g_tx_compose_win) {
-                wnoutrefresh(stdscr);
-                wnoutrefresh(g_tx_compose_win);
-                doupdate();
+                touchwin(g_tx_compose_win);
+                wrefresh(g_tx_compose_win);
             } else if (g_auto_tcmd_active && g_auto_tcmd_win) {
-                wnoutrefresh(stdscr);
-                wnoutrefresh(g_auto_tcmd_win);
-                doupdate();
-            } else {
-                refresh();
+                touchwin(g_auto_tcmd_win);
+                wrefresh(g_auto_tcmd_win);
             }
         }
 
