@@ -3210,11 +3210,13 @@ int main(int argc, char **argv)
 
         // Surface a finished spectrum render so the operator sees the
         // outcome (PNG path or ffmpeg error) in the command-line status.
+        // The reap only joins the worker thread; status_msg is left
+        // alone, so reading it after reap is safe.
         if (g_spec_job.active && g_spec_job.done) {
-            char msg[256];
-            snprintf(msg, sizeof msg, "%s", g_spec_job.status_msg);
+            if (g_spec_job.status_msg[0]) {
+                cmd_set_status("%s", g_spec_job.status_msg);
+            }
             spectrum_job_reap();
-            if (msg[0]) cmd_set_status("%s", msg);
         }
 
         if (state.running) {
