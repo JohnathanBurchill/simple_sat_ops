@@ -141,13 +141,46 @@ int modem_iq_to_bits(const int16_t *iq_pairs, size_t n_pairs,
     size_t df_len = mf_len - (size_t) sps;
     float *dphi = (float *) malloc(df_len * sizeof(float));
     if (dphi == NULL) { free(Imf); free(Qmf); return -1; }
+
+    // First pass: estimate the per-symbol phase bias from any residual
+    // carrier-frequency offset. For uncompensated Doppler / LO mismatch
+    // the differential phase picks up a constant 2π·Δf·sps/fs offset on
+    // every sample — at 9600 baud / 48 kHz this becomes ~127° per
+    // kilohertz of Δf, which on real RAO captures (Doppler ±10 kHz
+    // across a pass) routinely buries the ±π/2 MSK data inside the
+    // wrong half of the slicer. Raising diff to the 4th power strips
+    // the ±π/2 modulation (4·(±π/2) ≡ 0 mod 2π) and the magnitude-
+    // weighted average converges on 4·bias regardless of which bits
+    // were sent. The window-by-window estimate also tracks slow
+    // Doppler drift over the pass for free.
+    double s4r = 0.0, s4i = 0.0;
     for (size_t i = 0; i < df_len; ++i) {
         double I0 = (double) Imf[i],             Q0 = (double) Qmf[i];
         double I1 = (double) Imf[i + (size_t) sps],
                Q1 = (double) Qmf[i + (size_t) sps];
-        double real_p = I1 * I0 + Q1 * Q0;
-        double imag_p = Q1 * I0 - I1 * Q0;
-        dphi[i] = (float) atan2(imag_p, real_p);
+        double a  = I1 * I0 + Q1 * Q0;
+        double b  = Q1 * I0 - I1 * Q0;
+        double a2 = a * a, b2 = b * b;
+        s4r += a2 * a2 - 6.0 * a2 * b2 + b2 * b2;
+        s4i += 4.0 * a * b * (a2 - b2);
+    }
+    double bias = atan2(s4i, s4r) / 4.0;
+    double cb = cos(-bias), sb = sin(-bias);
+
+    // Second pass: dphi with bias removed. Rotating (a + jb) by -bias
+    // before taking arg() lands the data peaks at the canonical ±π/2,
+    // restoring full margin on the slicer at 0. The remaining 4-fold
+    // ambiguity in `bias` collapses to a bit polarity flip — already
+    // handled by the dual-polarity ASM search below.
+    for (size_t i = 0; i < df_len; ++i) {
+        double I0 = (double) Imf[i],             Q0 = (double) Qmf[i];
+        double I1 = (double) Imf[i + (size_t) sps],
+               Q1 = (double) Qmf[i + (size_t) sps];
+        double a = I1 * I0 + Q1 * Q0;
+        double b = Q1 * I0 - I1 * Q0;
+        double a_rot = a * cb - b * sb;
+        double b_rot = a * sb + b * cb;
+        dphi[i] = (float) atan2(b_rot, a_rot);
     }
     free(Imf); free(Qmf);
 
