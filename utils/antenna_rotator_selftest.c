@@ -164,33 +164,45 @@ static void test_home_unwrapped_target(void)
 // --------------------------------------------------------- to_mech_coords
 
 // Contract (per the header doc): with flip=0 or MAX_ELEVATION<=90, the
-// mapping is a pass-through. With flip=1 and MAX_ELEVATION>90, the pass
-// splits around aos_az: |sat_az - aos_az| <= 90 -> first half tracks
-// sat directly; otherwise -> second half uses ((sat_az+180) mod 360,
-// 180 - sat_el) so mech_el sweeps past 90 instead of slewing az at
-// apex. out_half reports 0 or 1.
+// mapping is a pass-through. With flip=1 and MAX_ELEVATION>90, mech_az
+// is lerped from aos_az (progress=0) to (los_az + 180) (progress=1)
+// along the shortest arc, then the sat is projected onto that meridian.
+// For zenith passes (los_az = aos_az + 180), the lerp is constant and
+// the mapping collapses to the simpler aos_az-hold.
 //
-// This module guards the flip remap with a compile-time check on
-// ANTENNA_ROTATOR_MAXIMUM_ELEVATION; verify it before relying on the
-// flip-half assertions below.
+// Most of the assertions below pin to the zenith case via flip_zenith()
+// so the aos_az-hold geometry is preserved. test_to_mech_coords_flip_lerp
+// covers the los_az != aos_az + 180 case explicitly.
+
+// Helper: invoke the flip mapping in the zenith-pass case (los_az
+// implicit at aos+180, progress=0). The lerp delta is 0, so mech_az is
+// held at aos_az regardless of progress -- matches the simpler hold
+// behavior the early tests were written against.
+static void flip_zenith(double aos_az, double sat_az, double sat_el,
+                        double *out_az, double *out_el, int *out_half)
+{
+    antenna_rotator_to_mech_coords(1, aos_az, aos_az + 180.0, 0.0,
+                                   sat_az, sat_el,
+                                   out_az, out_el, out_half);
+}
 static void test_to_mech_coords_passthrough(void)
 {
     fprintf(stderr, "to_mech_coords (pass-through):\n");
     double out_az = -1, out_el = -1;
     int half = -1;
-    antenna_rotator_to_mech_coords(0, 270.0, 120.0, 30.0,
+    // flip=0: passthrough. aos_az/los_az/progress ignored.
+    antenna_rotator_to_mech_coords(0, 270.0, 90.0, 0.5, 120.0, 30.0,
                                    &out_az, &out_el, &half);
     CHECK_APPROX(out_az, 120.0, "flip=0: out_az == sat_az");
     CHECK_APPROX(out_el, 30.0,  "flip=0: out_el == sat_el");
     check(half == 0, "flip=0: half == 0");
 
-    // Flip=1 with a degenerate aos_az still pass-through-equivalent when
-    // sat is essentially at aos_az: first-half branch trivially holds.
-    antenna_rotator_to_mech_coords(1, 100.0, 100.0, 5.0,
+    // flip=1 at AOS (progress=0): mech_az = aos_az regardless of los_az.
+    antenna_rotator_to_mech_coords(1, 100.0, 350.0, 0.0, 100.0, 5.0,
                                    &out_az, &out_el, &half);
-    CHECK_APPROX(out_az, 100.0, "flip=1 sat==aos: out_az == sat_az");
-    CHECK_APPROX(out_el, 5.0,   "flip=1 sat==aos: out_el == sat_el");
-    check(half == 0, "flip=1 sat==aos: half == 0");
+    CHECK_APPROX(out_az, 100.0, "flip=1 progress=0 sat==aos: out_az == aos_az");
+    CHECK_APPROX(out_el, 5.0,   "flip=1 progress=0 sat==aos: out_el == sat_el");
+    check(half == 0, "flip=1 progress=0 sat==aos: half == 0");
 }
 
 // Projection contract under flip mode: mech_az is held at aos_az and the
@@ -210,40 +222,33 @@ static void test_to_mech_coords_flip_on_meridian(void)
     int half;
 
     // Forward meridian: sat_az == aos_az -> mech_el == sat_el, no error.
-    antenna_rotator_to_mech_coords(1, 100.0, 100.0, 45.0,
-                                   &out_az, &out_el, &half);
+    flip_zenith(100.0, 100.0, 45.0, &out_az, &out_el, &half);
     CHECK_APPROX(out_az, 100.0, "sat at (aos, 45): mech_az = aos_az");
     CHECK_APPROX(out_el,  45.0, "sat at (aos, 45): mech_el = 45");
     check(half == 0, "sat at (aos, 45): half = 0");
 
-    antenna_rotator_to_mech_coords(1, 100.0, 100.0, 89.0,
-                                   &out_az, &out_el, &half);
+    flip_zenith(100.0, 100.0, 89.0, &out_az, &out_el, &half);
     CHECK_APPROX(out_el, 89.0, "sat at (aos, 89): mech_el = 89");
 
     // Zenith: ambiguous sat_az, but with sat_az = aos_az the projection
     // pins to mech_el = 90.
-    antenna_rotator_to_mech_coords(1, 100.0, 100.0, 90.0,
-                                   &out_az, &out_el, &half);
+    flip_zenith(100.0, 100.0, 90.0, &out_az, &out_el, &half);
     CHECK_APPROX(out_el, 90.0, "sat at (aos, 90): mech_el = 90 (zenith)");
 
     // Back meridian: sat_az = aos_az + 180 -> mech_el = 180 - sat_el,
     // with the rotator interpreting >90 deg as back-pointing.
-    antenna_rotator_to_mech_coords(1, 100.0, 280.0, 0.0,
-                                   &out_az, &out_el, &half);
+    flip_zenith(100.0, 280.0, 0.0, &out_az, &out_el, &half);
     CHECK_APPROX(out_az, 100.0, "sat at (aos+180, 0): mech_az = aos_az");
     CHECK_APPROX(out_el, 180.0, "sat at (aos+180, 0): mech_el = 180 (LOS)");
 
-    antenna_rotator_to_mech_coords(1, 100.0, 280.0, 30.0,
-                                   &out_az, &out_el, &half);
+    flip_zenith(100.0, 280.0, 30.0, &out_az, &out_el, &half);
     CHECK_APPROX(out_el, 150.0, "sat at (aos+180, 30): mech_el = 180 - 30 = 150");
 
-    antenna_rotator_to_mech_coords(1, 100.0, 280.0, 89.0,
-                                   &out_az, &out_el, &half);
+    flip_zenith(100.0, 280.0, 89.0, &out_az, &out_el, &half);
     CHECK_APPROX(out_el, 91.0, "sat at (aos+180, 89): mech_el = 91");
 
     // AOS wrap: aos=10, sat=350 -> daz = -20. Same projection as daz=+20.
-    antenna_rotator_to_mech_coords(1, 10.0, 350.0, 5.0,
-                                   &out_az, &out_el, &half);
+    flip_zenith(10.0, 350.0, 5.0, &out_az, &out_el, &half);
     CHECK_APPROX(out_az, 10.0, "aos=10 sat=350: mech_az = aos_az = 10");
     // y = cos(5)*cos(-20) = 0.9962*0.9397 = 0.9362; z = sin(5) = 0.0872
     // mech_el = atan2(0.0872, 0.9362) = 5.319 deg
@@ -265,26 +270,22 @@ static void test_to_mech_coords_flip_off_meridian(void)
     // Sat at daz=+90: along-meridian component vanishes, projection
     // pins to mech_el = 90 deg (boom straight up). Worst-case pointing
     // error = (90 - sat_el).
-    antenna_rotator_to_mech_coords(1, 100.0, 190.0, 30.0,
-                                   &out_az, &out_el, &half);
+    flip_zenith(100.0, 190.0, 30.0, &out_az, &out_el, &half);
     CHECK_APPROX(out_az, 100.0, "sat at (aos+90, 30): mech_az = aos_az");
     CHECK_APPROX(out_el,  90.0, "sat at (aos+90, 30): mech_el = 90 (boom up, "
                                 "60 deg pointing error)");
 
-    antenna_rotator_to_mech_coords(1, 100.0, 190.0, 88.0,
-                                   &out_az, &out_el, &half);
+    flip_zenith(100.0, 190.0, 88.0, &out_az, &out_el, &half);
     CHECK_APPROX(out_el, 90.0, "sat at (aos+90, 88): mech_el = 90 "
                                 "(2 deg pointing error -- the high-el case "
                                 "the flip mapping is designed for)");
 
     // Sat at daz=-90: symmetric.
-    antenna_rotator_to_mech_coords(1, 100.0, 10.0, 60.0,
-                                   &out_az, &out_el, &half);
+    flip_zenith(100.0, 10.0, 60.0, &out_az, &out_el, &half);
     CHECK_APPROX(out_el, 90.0, "sat at (aos-90, 60): mech_el = 90 (symmetric)");
 
     // Sat at daz=+45, el=30: partial projection, mech_el ~ 39.2 deg.
-    antenna_rotator_to_mech_coords(1, 100.0, 145.0, 30.0,
-                                   &out_az, &out_el, &half);
+    flip_zenith(100.0, 145.0, 30.0, &out_az, &out_el, &half);
     double expect_el_45_30 = atan2(sin(30.0 * M_PI / 180.0),
                                    cos(30.0 * M_PI / 180.0)
                                        * cos(45.0 * M_PI / 180.0))
@@ -294,8 +295,7 @@ static void test_to_mech_coords_flip_off_meridian(void)
 
     // Past the old half boundary (daz=+91): mech_el just past 90 deg,
     // continuous with daz=+89 result.
-    antenna_rotator_to_mech_coords(1, 100.0, 191.0, 80.0,
-                                   &out_az, &out_el, &half);
+    flip_zenith(100.0, 191.0, 80.0, &out_az, &out_el, &half);
     CHECK_APPROX(out_az, 100.0,
                  "sat at (aos+91, 80): mech_az still = aos_az (no jump)");
     check(out_el > 90.0 && out_el < 91.0,
@@ -317,10 +317,8 @@ static void test_to_mech_coords_flip_continuity(void)
     double az_a, el_a, az_b, el_b;
     int half_a, half_b;
 
-    antenna_rotator_to_mech_coords(1, 100.0, 189.0, 70.0,
-                                   &az_a, &el_a, &half_a);
-    antenna_rotator_to_mech_coords(1, 100.0, 191.0, 70.0,
-                                   &az_b, &el_b, &half_b);
+    flip_zenith(100.0, 189.0, 70.0, &az_a, &el_a, &half_a);
+    flip_zenith(100.0, 191.0, 70.0, &az_b, &el_b, &half_b);
     CHECK_APPROX(az_a, az_b, "mech_az unchanged across daz=+/-90 boundary");
     check(fabs(el_a - el_b) < 1.0,
           "mech_el delta < 1 deg for 2 deg sat_az step across boundary");
@@ -334,8 +332,7 @@ static void test_to_mech_coords_flip_continuity(void)
     double max_step = 0.0;
     for (int i = 0; i <= 8; ++i) {
         double daz = 88.0 + 0.5 * (double)i;
-        antenna_rotator_to_mech_coords(1, 100.0, 100.0 + daz, 70.0,
-                                       &az_a, &el_a, &half_a);
+        flip_zenith(100.0, 100.0 + daz, 70.0, &az_a, &el_a, &half_a);
         if (!isnan(prev_el)) {
             double step = el_a - prev_el;
             if (step < 0) { monotone_ok = 0; }
@@ -349,10 +346,79 @@ static void test_to_mech_coords_flip_continuity(void)
           "no single 0.5 deg sat_az step produces a > 2 deg mech_el jump");
 }
 
+// LOS-interp behavior: when los_az != aos_az + 180 the lerp slowly
+// rotates mech_az across the pass so the boom converges on the
+// satellite at both AOS and LOS.
+static void test_to_mech_coords_flip_lerp(void)
+{
+    if (ANTENNA_ROTATOR_MAXIMUM_ELEVATION <= 90) {
+        fprintf(stderr, "to_mech_coords (flip lerp): SKIP "
+                        "(ANTENNA_ROTATOR_MAXIMUM_ELEVATION <= 90)\n");
+        return;
+    }
+    fprintf(stderr, "to_mech_coords (flip, AOS-LOS lerp):\n");
+    double out_az, out_el;
+    int half;
+
+    // Non-zenith pass: aos=190, los=350 (diff 160 deg, los+180=170 deg).
+    // Lerp shortest arc: aos=190 -> los_target=170, delta=-20 deg.
+    const double aos = 190.0;
+    const double los = 350.0;
+
+    // progress=0: mech_az = aos_az.
+    antenna_rotator_to_mech_coords(1, aos, los, 0.0, aos, 0.0,
+                                   &out_az, &out_el, &half);
+    CHECK_APPROX(out_az, 190.0, "progress=0: mech_az = aos_az");
+    CHECK_APPROX(out_el, 0.0,   "progress=0 sat at AOS: mech_el = 0");
+
+    // progress=1: mech_az = (los_az + 180) mod 360 = 170. Sat at LOS
+    // (350, 0) maps to mech_el = 180 (back-pointing horizon).
+    antenna_rotator_to_mech_coords(1, aos, los, 1.0, los, 0.0,
+                                   &out_az, &out_el, &half);
+    CHECK_APPROX(out_az, 170.0, "progress=1: mech_az = (los_az + 180) mod 360");
+    CHECK_APPROX(out_el, 180.0, "progress=1 sat at LOS: mech_el = 180 "
+                                "(boom points at LOS via back-form)");
+
+    // progress=0.5: mech_az halfway along shortest arc = 180.
+    antenna_rotator_to_mech_coords(1, aos, los, 0.5, 180.0, 88.0,
+                                   &out_az, &out_el, &half);
+    CHECK_APPROX(out_az, 180.0, "progress=0.5: mech_az on shortest-arc midpoint");
+    // Sat (180, 88), boom meridian at 180 -> sat is on the meridian.
+    // daz = 0, y = cos(88)*1, z = sin(88), mech_el = atan2(sin88, cos88) = 88.
+    CHECK_APPROX(out_el, 88.0, "progress=0.5 sat on meridian: mech_el = sat_el");
+
+    // Wraparound: aos near 360, los near 0. shortest arc small.
+    antenna_rotator_to_mech_coords(1, 350.0, 10.0, 1.0, 10.0, 0.0,
+                                   &out_az, &out_el, &half);
+    // los_target = 10 + 180 = 190. delta = 190 - 350 = -160 -> +200 wrap?
+    // wrap_to_pm180(-160) = -160 (in range). mech_az = 350 + 1*(-160) = 190.
+    CHECK_APPROX(out_az, 190.0, "aos=350 los=10 progress=1: mech_az = 190 "
+                                "(short arc -160 deg)");
+
+    // Progress clamping: < 0 behaves as 0.
+    antenna_rotator_to_mech_coords(1, aos, los, -0.5, aos, 0.0,
+                                   &out_az, &out_el, &half);
+    CHECK_APPROX(out_az, aos, "progress=-0.5 clamps to 0");
+
+    // Progress clamping: > 1 behaves as 1.
+    antenna_rotator_to_mech_coords(1, aos, los, 1.5, los, 0.0,
+                                   &out_az, &out_el, &half);
+    CHECK_APPROX(out_az, 170.0, "progress=1.5 clamps to 1");
+
+    // Zenith pass invariance: los = aos + 180 -> delta = 0 -> mech_az
+    // constant regardless of progress.
+    antenna_rotator_to_mech_coords(1, 100.0, 280.0, 0.0, 100.0, 5.0,
+                                   &out_az, &out_el, &half);
+    double az_p0 = out_az;
+    antenna_rotator_to_mech_coords(1, 100.0, 280.0, 1.0, 100.0, 5.0,
+                                   &out_az, &out_el, &half);
+    CHECK_APPROX(out_az, az_p0, "zenith pass: mech_az constant across progress");
+}
+
 // Simulate a near-zenith pass and report the largest one-tick mech_az step
-// flip mode produces. Under the new mapping mech_az is fixed at aos_az
-// for the whole pass, so this number should be 0; we still print it as a
-// regression sentinel.
+// flip mode produces. Under the zenith-case lerp (los=aos+180, delta=0)
+// mech_az stays fixed at aos_az for the whole pass; non-zenith passes
+// would show a small linear ramp instead.
 static void test_to_mech_coords_high_pass_slew(void)
 {
     if (ANTENNA_ROTATOR_MAXIMUM_ELEVATION <= 90) {
@@ -392,8 +458,7 @@ static void test_to_mech_coords_high_pass_slew(void)
 
         double mech_az, mech_el;
         int half;
-        antenna_rotator_to_mech_coords(1, aos_az, az, el,
-                                       &mech_az, &mech_el, &half);
+        flip_zenith(aos_az, az, el, &mech_az, &mech_el, &half);
 
         if (!isnan(prev_mech_az)) {
             double step = fabs(antenna_rotator_wrap_to_pm180(
@@ -834,7 +899,11 @@ static void test_pass_simulation_flip_baseline(void)
 
         double mech_az, mech_el;
         int half;
+        // Synthetic pass models a zenith trajectory (aos -> aos+180 over
+        // t=-1..1). Match that with los_az = aos_az + 180 (lerp delta=0).
+        double progress = (double)i / (double)(N - 1);
         antenna_rotator_to_mech_coords(flip_pass, flip_aos_az,
+                                       flip_aos_az + 180.0, progress,
                                        sat_az, sat_el,
                                        &mech_az, &mech_el, &half);
 
@@ -920,6 +989,7 @@ int main(void)
     test_to_mech_coords_flip_on_meridian();
     test_to_mech_coords_flip_off_meridian();
     test_to_mech_coords_flip_continuity();
+    test_to_mech_coords_flip_lerp();
     test_to_mech_coords_high_pass_slew();
     test_set_unwrapped_limits();
     test_increase_azimuth_base_selection();

@@ -245,7 +245,8 @@ int antenna_rotator_seed_from_status(antenna_rotator_t *antenna_rotator)
     return ANTENNA_ROTATOR_OK;
 }
 
-void antenna_rotator_to_mech_coords(int flip, double aos_az,
+void antenna_rotator_to_mech_coords(int flip, double aos_az, double los_az,
+                                    double progress,
                                     double sat_az, double sat_el,
                                     double *out_az, double *out_el,
                                     int *out_half)
@@ -259,18 +260,27 @@ void antenna_rotator_to_mech_coords(int flip, double aos_az,
         if (out_half) *out_half = 0;
         return;
     }
-    // Hold mech_az at aos_az; project the sat direction onto the boom's
-    // meridian. y is the along-meridian component (forward = +y, back =
-    // -y), z is up. mech_el = atan2(z, y) sweeps continuously 0..180
-    // deg as the sat passes from AOS through zenith to LOS, with values
-    // past 90 deg interpreted by the rotator as back-pointing. The
-    // off-meridian (east-of-boom) component is the un-correctable
-    // pointing error and shows up nowhere in the output.
-    double daz_rad = (sat_az - aos_az) * M_PI / 180.0;
+    if (progress < 0.0) progress = 0.0;
+    if (progress > 1.0) progress = 1.0;
+    // The LOS azimuth maps to mech_az = (los_az + 180) deg under the
+    // rotator's back-pointing form (mech_el = 180 - sat_el looks down
+    // the great circle in reverse). Lerp aos_az -> (los_az + 180)
+    // along the shortest arc so for a near-zenith pass (los_az ~=
+    // aos_az + 180) the lerp is essentially zero and mech_az is held
+    // constant.
+    double los_target = los_az + 180.0;
+    double delta = los_target - aos_az;
+    while (delta > 180.0)   delta -= 360.0;
+    while (delta <= -180.0) delta += 360.0;
+    double mech_az_meridian = aos_az + progress * delta;
+
+    // Project sat onto the (rotated) boom meridian. y is along the
+    // meridian (forward at mech_el=0, back at mech_el=180), z is up.
+    double daz_rad = (sat_az - mech_az_meridian) * M_PI / 180.0;
     double el_rad  = sat_el * M_PI / 180.0;
     double y = cos(el_rad) * cos(daz_rad);
     double z = sin(el_rad);
-    *out_az = aos_az;
+    *out_az = mech_az_meridian;
     *out_el = atan2(z, y) * 180.0 / M_PI;
     if (out_half) *out_half = 0;
 }

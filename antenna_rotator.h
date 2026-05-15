@@ -92,6 +92,13 @@ typedef struct antenna_rotator
     // satellite) or "second half" (sat has crossed to the back hemisphere
     // and the boom tracks via 180-el).
     double flip_aos_az;
+    // Predicted LOS azimuth + AOS/LOS Julian dates, captured at the
+    // same moment as flip_aos_az. Used by the flip mapping to lerp
+    // mech_az from aos_az at progress=0 to (los_az + 180) at progress=1
+    // so the boom converges on the satellite at LOS as well as AOS.
+    double flip_los_az;
+    double flip_aos_jul;
+    double flip_los_jul;
     // One-shot latch: prevents the per-tick re-enable from re-running the
     // flip decision after a mid-pass bailout. Cleared at LOS / s / r.
     int flip_decision_made;
@@ -117,21 +124,32 @@ int antenna_rotator_set_unwrapped(antenna_rotator_t *antenna_rotator, double az_
 // to the mechanical (az, el) the rotator should drive.
 //
 // With flip == 0 or ANTENNA_ROTATOR_MAXIMUM_ELEVATION <= 90 the mapping
-// is a pass-through.
+// is a pass-through; aos_az/los_az/progress are ignored.
 //
-// With flip != 0 and MAXIMUM_ELEVATION > 90, mech_az is held at aos_az
-// for the entire pass and the sat direction is projected orthogonally
-// onto the boom's meridian (the great circle through (aos_az, 0) up
-// through zenith and back down to (aos_az+180, 0)). mech_el comes out
-// in 0..180 deg; values past 90 deg are the rotator's back-pointing
-// representation. This trades a small off-meridian pointing error --
-// bounded by (90 deg - sat_el) at the sat's daz=90 deg crossing -- for
-// zero azimuth slew at apex. There's no AZ axis we can drive to fix
-// the off-meridian component without a roll axis, so we accept it.
+// With flip != 0 and MAXIMUM_ELEVATION > 90, the boom's meridian is
+// linearly interpolated:
 //
-// *out_half is retained for caller compatibility but is now always 0:
-// the new mapping is continuous, with no half-transition.
-void antenna_rotator_to_mech_coords(int flip, double aos_az,
+//   mech_az_meridian(progress) = aos_az + progress * delta
+//   delta = shortest-arc (los_az + 180 - aos_az), in (-180, 180]
+//
+// At progress=0 the boom points along the AOS great circle (boom on
+// target at AOS); at progress=1 it uses (los_az + 180) so mech_el=180
+// looks down the AOS-to-LOS great circle in reverse (boom on target
+// at LOS). progress is clamped to [0, 1].
+//
+// The sat direction is then projected orthogonally onto the current
+// meridian: mech_el = atan2(sin(sat_el), cos(sat_el) * cos(sat_az -
+// mech_az_meridian)), with values past 90 deg interpreted by the
+// rotator as back-pointing. Off-meridian pointing error -- the
+// component perpendicular to the boom's great circle -- is the
+// trade-off and is not correctable without a roll axis.
+//
+// For zenith passes (los_az = aos_az + 180), delta = 0 and mech_az
+// is held constant; the mapping collapses to the simpler aos_az-hold.
+//
+// *out_half is retained for caller compatibility but is now always 0.
+void antenna_rotator_to_mech_coords(int flip, double aos_az, double los_az,
+                                    double progress,
                                     double sat_az, double sat_el,
                                     double *out_az, double *out_el,
                                     int *out_half);

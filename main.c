@@ -1111,6 +1111,10 @@ static void generate_pass_plot(state_t *state, const char *pass_folder,
 
     int flip_mode = 0;
     double aos_az = pred.predicted_ascension_azimuth;
+    double los_az = pred.predicted_descent_azimuth;
+    double aos_jul_pred = pred.predicted_ascension_jul_utc;
+    double los_jul_pred = pred.predicted_descent_jul_utc;
+    double pass_jul = los_jul_pred - aos_jul_pred;
     if (ANTENNA_ROTATOR_MAXIMUM_ELEVATION > 90
         && pred.predicted_max_elevation
                >= ANTENNA_ROTATOR_FLIP_ELEVATION_THRESHOLD) {
@@ -1141,7 +1145,8 @@ static void generate_pass_plot(state_t *state, const char *pass_folder,
     int wrote = 0;
     for (int i = 0; i <= n_steps; ++i) {
         double t_min = i * step_min;
-        update_satellite_position(&pred, aos_jul + t_min / 1440.0);
+        double sample_jul = aos_jul + t_min / 1440.0;
+        update_satellite_position(&pred, sample_jul);
         double sat_az = pred.satellite_ephem.azimuth;
         double sat_el = pred.satellite_ephem.elevation;
         if (sat_el < 0.0) continue;
@@ -1149,7 +1154,12 @@ static void generate_pass_plot(state_t *state, const char *pass_folder,
         double mech_az = sat_az;
         double mech_el = sat_el;
         int half;
-        antenna_rotator_to_mech_coords(flip_mode, aos_az,
+        double progress = 0.0;
+        if (pass_jul > 0.0) {
+            progress = (sample_jul - aos_jul_pred) / pass_jul;
+        }
+        antenna_rotator_to_mech_coords(flip_mode, aos_az, los_az,
+                                       progress,
                                        sat_az, sat_el,
                                        &mech_az, &mech_el, &half);
 
@@ -2384,8 +2394,23 @@ int main(int argc, char **argv)
                         && state.prediction.predicted_max_elevation
                                >= ANTENNA_ROTATOR_FLIP_ELEVATION_THRESHOLD) {
                         state.antenna_rotator.flip_mode_pass = 1;
+                        // Prefer the prediction-derived AOS azimuth (the
+                        // satellite_ephem.azimuth here may be a few deg
+                        // off as we are still pre-AOS); fall back to the
+                        // live position if the pass walk didn't capture
+                        // an ascension sample.
+                        double aos_az_pred =
+                            state.prediction.predicted_ascension_azimuth;
                         state.antenna_rotator.flip_aos_az =
-                            state.prediction.satellite_ephem.azimuth;
+                            (aos_az_pred != 0.0)
+                                ? aos_az_pred
+                                : state.prediction.satellite_ephem.azimuth;
+                        state.antenna_rotator.flip_los_az =
+                            state.prediction.predicted_descent_azimuth;
+                        state.antenna_rotator.flip_aos_jul =
+                            state.prediction.predicted_ascension_jul_utc;
+                        state.antenna_rotator.flip_los_jul =
+                            state.prediction.predicted_descent_jul_utc;
                     }
                     state.antenna_rotator.flip_decision_made = 1;
                     state.antenna_rotator.tracking = 1;
@@ -2405,9 +2430,25 @@ int main(int argc, char **argv)
                     double mech_az = pred_az;
                     double mech_el = pred_el;
                     int half = 0;
+                    // AOS->LOS progress: drives the boom-meridian lerp
+                    // in flip mode. Clamped to [0, 1] inside the
+                    // function. For non-flip passes (and any tick
+                    // where the AOS/LOS times weren't captured) the
+                    // value is ignored.
+                    double progress = 0.0;
+                    double pass_jul =
+                        state.antenna_rotator.flip_los_jul
+                        - state.antenna_rotator.flip_aos_jul;
+                    if (pass_jul > 0.0) {
+                        progress = (jul_utc
+                                    - state.antenna_rotator.flip_aos_jul)
+                                   / pass_jul;
+                    }
                     antenna_rotator_to_mech_coords(
                         state.antenna_rotator.flip_mode_pass,
                         state.antenna_rotator.flip_aos_az,
+                        state.antenna_rotator.flip_los_az,
+                        progress,
                         pred_az, pred_el,
                         &mech_az, &mech_el, &half);
                     if (state.antenna_rotator.flip_mode_pass

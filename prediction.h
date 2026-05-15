@@ -72,6 +72,8 @@ typedef struct prediction
     double predicted_minutes_above_30_degrees;
     double predicted_ascension_azimuth;
     double predicted_ascension_jul_utc;
+    double predicted_descent_azimuth;
+    double predicted_descent_jul_utc;
     // Alternative state source. When non-NULL, update_satellite_position
     // interpolates from this table instead of running SGP4.
     struct oem_table *oem;

@@ -223,6 +223,13 @@ void update_pass_predictions(prediction_t *external_prediction, double jul_utc_s
     double minutes_above_0_degrees = 0.0;
     double minutes_above_30_degrees = 0.0;
     int ascended = 0;
+    // Capture the most recent visible sample so we can record LOS once
+    // elevation drops below zero. predicted_descent_* is initialized
+    // here so a partial / no-pass walk leaves the fields well-defined.
+    external_prediction->predicted_descent_azimuth  = 0.0;
+    external_prediction->predicted_descent_jul_utc  = 0.0;
+    double last_visible_jul = 0.0;
+    double last_visible_az  = 0.0;
     while (current_elevation > -5.0) {
         update_satellite_position(&prediction, jul_utc + pass_duration / 1440.0);
         pass_duration += delta_t_minutes;
@@ -234,6 +241,8 @@ void update_pass_predictions(prediction_t *external_prediction, double jul_utc_s
                 external_prediction->predicted_ascension_jul_utc = jul_utc + pass_duration / 1440.0;
                 external_prediction->predicted_ascension_azimuth = prediction.satellite_ephem.azimuth;
             }
+            last_visible_jul = jul_utc + pass_duration / 1440.0;
+            last_visible_az  = prediction.satellite_ephem.azimuth;
             if (max_altitude < current_altitude) {
                 max_altitude = current_altitude;
             }
@@ -251,6 +260,10 @@ void update_pass_predictions(prediction_t *external_prediction, double jul_utc_s
     external_prediction->predicted_minutes_above_30_degrees = minutes_above_30_degrees;
     external_prediction->predicted_max_elevation = max_elevation;
     external_prediction->predicted_max_altitude = max_altitude;
+    if (ascended) {
+        external_prediction->predicted_descent_jul_utc = last_visible_jul;
+        external_prediction->predicted_descent_azimuth = last_visible_az;
+    }
 
     return;
 }
