@@ -3079,10 +3079,18 @@ int main(int argc, char **argv)
 
     // Slow-cadence work is timestamp-gated so the fast UHD-pump loop
     // doesn't spam viewers or burn CPU on ncurses redraws.
+    //
+    // Two redraw gates: the "slow" one drives the predictions / status
+    // / RX panel / TX log rows and is the one that costs CPU — most
+    // notably report_status, which does a blocking read() against the
+    // rotator serial port (antenna_rotator.c:142). Keep it at 2 Hz so
+    // the rotator isn't hammered. The "fast" path is cmd_render only
+    // — runs every loop tick while the operator is typing in the ":"
+    // prompt so each keystroke echoes immediately.
     double t_last_ipc_broadcast = 0.0;
     double t_last_redraw        = 0.0;
     const double IPC_BROADCAST_PERIOD_S = 0.5;   // 2 Hz
-    const double REDRAW_PERIOD_S        = 0.1;   // 10 Hz
+    const double REDRAW_PERIOD_S        = 0.5;   // 2 Hz
 
     // Per-pass WAV recording: arm 1 min before AOS, hold open through
     // the pass, close 1 min after LOS. Multiple passes during one
@@ -3386,11 +3394,16 @@ int main(int argc, char **argv)
                 mvprintw(keyboard_info_row + 2, 0, "%s", "Antenna stationary");
                 clrtoeol();
             }
-
-            cmd_render();
-
-            refresh();
             t_last_redraw = t_now;
+        }
+
+        // Bottom-row prompt + screen flush. When the operator is typing
+        // in the ":" prompt we want this every tick (~50 Hz) so each
+        // keystroke echoes immediately. Otherwise piggyback on the slow
+        // redraw so the row picks up any post-command status string.
+        if (redraw_due || g_cmd_active) {
+            cmd_render();
+            refresh();
         }
 
 #ifdef WITH_USRP_B210
