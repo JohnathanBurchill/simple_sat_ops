@@ -93,43 +93,30 @@ static const char *g_operator_user = NULL;
 // as a UTF-8 block-character strip in the RX panel. Oldest sample on
 // the left, newest on the right. Cheap fixed-size; the sampler is
 // gated by monotonic seconds in the main loop.
+// Signal ribbon: 1 Hz timeline of "I am alive" marks rendered as a
+// vertical strip on the right side of the screen. Each char represents
+// one second; the most recent sample sits at the bottom of the strip
+// and older samples sit above. Plain ASCII ('.' / '-') so the display
+// works on minimal SSH sessions / TTYs without UTF-8 fonts.
+//
+// Tick semantics: every 20 seconds in absolute push-time gets a bold
+// '-' instead of '.'. Because the tick is keyed to absolute push count
+// (not to a fixed visual position), the tick crawls upward by one row
+// per second — the eye reads the timeline progressing even when the
+// signal is flat.
 #define RIBBON_LEN 60
 static double g_ribbon_peak[RIBBON_LEN];
-static int    g_ribbon_count   = 0;   // number of valid samples (caps at RIBBON_LEN)
-static int    g_ribbon_head    = 0;   // next write index (circular)
-static double g_ribbon_last_t  = 0.0; // monotonic timestamp of last push
+static int    g_ribbon_count       = 0;  // number of valid samples (caps at RIBBON_LEN)
+static int    g_ribbon_head        = 0;  // next write index (circular)
+static double g_ribbon_last_t      = 0.0;
+static long   g_ribbon_push_count  = 0;  // total pushes since startup; drives ticks
 
 static void ribbon_push(double peak_dbfs)
 {
     g_ribbon_peak[g_ribbon_head] = peak_dbfs;
     g_ribbon_head = (g_ribbon_head + 1) % RIBBON_LEN;
     if (g_ribbon_count < RIBBON_LEN) g_ribbon_count++;
-}
-
-// Quantize a peak dBFS sample to a single byte. Wire-friendly: ' ' means
-// silence or non-finite, '0'..'7' tag one of 8 dBFS bins covering -90..0
-// dBFS in ~11.25 dB steps. The 8 bins map straight onto the UTF-8 block
-// glyphs U+2581..U+2588 in ribbon_glyph_from_index. Carried verbatim in
-// SSO_EVT_STATE so viewers can render the same ribbon without seeing
-// the underlying dBFS stream.
-static char ribbon_glyph_index_from_dbfs(double dbfs)
-{
-    if (!isfinite(dbfs) || dbfs <= -90.0) return ' ';
-    double level = (dbfs - (-90.0)) / 11.25;
-    int idx = (int) level;
-    if (idx < 0) idx = 0;
-    if (idx > 7) idx = 7;
-    return (char) ('0' + idx);
-}
-
-static const char *ribbon_glyph_from_index(char c)
-{
-    if (c < '0' || c > '7') return " ";
-    static const char *blocks[8] = {
-        "\xE2\x96\x81", "\xE2\x96\x82", "\xE2\x96\x83", "\xE2\x96\x84",
-        "\xE2\x96\x85", "\xE2\x96\x86", "\xE2\x96\x87", "\xE2\x96\x88",
-    };
-    return blocks[c - '0'];
+    g_ribbon_push_count++;
 }
 
 // Spectrogram render job. The `:spectrum N` REPL command snapshots the
@@ -978,15 +965,21 @@ static void rx_panel_collect_local(rx_panel_data_t *d)
         if (copy > RX_PANEL_PAYLOAD_MAX) copy = RX_PANEL_PAYLOAD_MAX;
         memcpy(d->pt_payload[s], pts[s].last_payload, (size_t) copy);
     }
-    if (g_ribbon_count > 0) {
-        int start = (g_ribbon_head - g_ribbon_count + RIBBON_LEN) % RIBBON_LEN;
-        for (int i = 0; i < g_ribbon_count; ++i) {
-            int idx = (start + i) % RIBBON_LEN;
-            d->ribbon[i] = ribbon_glyph_index_from_dbfs(g_ribbon_peak[idx]);
-        }
-        d->ribbon_n = g_ribbon_count;
-        d->ribbon[g_ribbon_count] = '\0';
+    // Wire format: ribbon[0] is the newest sample, ribbon[ribbon_n-1]
+    // is the oldest. Each char is '.' for a normal second or '-' for
+    // a 20 s tick. Tick test uses absolute push count (P) rather than
+    // a fixed visual position so the tick row visibly walks upward at
+    // 1 row/s; without that the strip looked frozen once it filled.
+    int n = g_ribbon_count;
+    if (n > (int) sizeof d->ribbon - 1) n = (int) sizeof d->ribbon - 1;
+    long P = g_ribbon_push_count;
+    for (int i = 0; i < n; ++i) {
+        long abs_t = P - (long) i;
+        if (abs_t > 0 && (abs_t % 20) == 0) d->ribbon[i] = '-';
+        else                                 d->ribbon[i] = '.';
     }
+    d->ribbon[n] = '\0';
+    d->ribbon_n  = n;
 #endif
 }
 
@@ -1054,18 +1047,33 @@ static void render_rx_panel(const rx_panel_data_t *d,
                  d->pt_payload_len[s] > n_show ? " ..." : "");
         clrtoeol();
     }
-    if (d->ribbon_n > 0) {
-        mvprintw(row, col, "%15s   ", "ribbon");
-        for (int i = 0; i < d->ribbon_n; ++i) {
-            addstr(ribbon_glyph_from_index(d->ribbon[i]));
-        }
-        clrtoeol();
-        ++row;
-        mvprintw(row++, col, "%15s   -90 dBFS .. 0 dBFS  (60 s)",
-                 "scale");
-        clrtoeol();
-    }
+    // No in-panel ribbon: the timeline lives in its own vertical strip
+    // on the right of the screen (render_ribbon_vertical), so the panel
+    // body never wraps onto a second line.
     *print_row = row;
+}
+
+// Vertical ribbon strip. Bottom row (`bot_row`) holds the newest
+// sample; older samples climb upward toward `top_row`. '-' ticks are
+// rendered bold; rows past the available data are cleared so the strip
+// is always a clean column.
+static void render_ribbon_vertical(const rx_panel_data_t *d,
+                                   int top_row, int bot_row, int col)
+{
+    if (d == NULL || bot_row <= top_row) return;
+    int max_rows = bot_row - top_row + 1;
+    for (int i = 0; i < max_rows; ++i) {
+        int row = bot_row - i;
+        char c = (i < d->ribbon_n) ? d->ribbon[i] : ' ';
+        if (c == '\0') c = ' ';
+        if (c == '-') {
+            attron(A_BOLD);
+            mvaddch(row, col, c);
+            attroff(A_BOLD);
+        } else {
+            mvaddch(row, col, c);
+        }
+    }
 }
 
 // Snapshot the operator's RX panel into the wire-side fields of an
@@ -2874,10 +2882,20 @@ static void viewer_render(int connected)
 
         int prow = 5;
         report_position(&g_viewer_state, &prow, 50);
-        // RX panel directly below position (matches the operator's layout
-        // — main.c:3227 does the same +1 then render_rx_panel(&row, 50)).
+        // RX panel directly below position (matches the operator's layout).
         prow++;
         render_rx_panel(&g_viewer_rx_panel, &prow, 50);
+
+        // Vertical ribbon on the right edge, same placement as the
+        // operator. The wire delivers the same '.'/'-' chars the
+        // operator's collector built so both screens crawl in sync.
+        int ribbon_col = COLS - 2;
+        int ribbon_top = 1;
+        int ribbon_bot = LINES - 2;
+        if (ribbon_col >= 60 && ribbon_bot > ribbon_top) {
+            render_ribbon_vertical(&g_viewer_rx_panel,
+                                   ribbon_top, ribbon_bot, ribbon_col);
+        }
 
         int tx_log_row = LINES - TX_LOG_SIZE - 2;
         if (tx_log_row >= 17) {
@@ -3457,6 +3475,16 @@ int main(int argc, char **argv)
             render_rx_panel(&rxd, &row, 50);
 
             clrtoeol();
+
+            // Vertical ribbon on the right edge — bottom = newest, with
+            // a bold '-' tick crawling up one row per second so the
+            // timeline is visibly alive even when the signal is flat.
+            int ribbon_col = COLS - 2;
+            int ribbon_top = 1;
+            int ribbon_bot = LINES - 2;
+            if (ribbon_col >= 60 && ribbon_bot > ribbon_top) {
+                render_ribbon_vertical(&rxd, ribbon_top, ribbon_bot, ribbon_col);
+            }
 
             // TX log lives below the keyboard info / antenna status if
             // the terminal is tall enough to host it without colliding.
