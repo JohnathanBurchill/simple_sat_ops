@@ -285,9 +285,24 @@ static void usage(FILE *dest, const char *name)
         "Input:\n"
         "  --raw                    Treat <path> as headerless S16_LE PCM\n"
         "                           (auto-enabled when path ends in '.raw').\n"
-        "  --rate=<hz>              Sample rate for --raw (default 48000).\n"
+        "  --iq                     Treat <path> as headerless int16 I,Q\n"
+        "                           pairs at --rate (auto-enabled when path\n"
+        "                           ends in '.iq'). Runs the IQ-domain\n"
+        "                           decoder — by default the MSK MLSE\n"
+        "                           Viterbi front-end (modem_viterbi.c),\n"
+        "                           which on AWGN delivers ~2 dB of effective\n"
+        "                           gain over the FM-audio chain. Pass\n"
+        "                           --no-viterbi to fall back to the IQ\n"
+        "                           differential slicer (modem_iq.c).\n"
+        "  --viterbi                Force the Viterbi MLSE in --iq mode\n"
+        "                           (the default).\n"
+        "  --no-viterbi             Use the IQ slicer instead of the\n"
+        "                           Viterbi MLSE in --iq mode.\n"
+        "  --rate=<hz>              Sample rate for --raw / --iq (default\n"
+        "                           48000).\n"
         "  --channels=<n>           Channels for --raw (default 2; ch 0 used).\n"
         "                           Pass --channels=1 for rtl_fm captures.\n"
+        "                           Ignored in --iq mode.\n"
         "\n"
         "Decoder (same defaults as b210_rx_tx):\n"
         "  --bit-rate=<bps>         Default 9600.\n"
@@ -370,6 +385,15 @@ int main(int argc, char **argv)
     int raw_mode_explicit = 0;
     int raw_rate = 48000;
     int raw_channels = 2;
+    // IQ-file mode: treat the input as headerless interleaved int16
+    // I,Q pairs at samp_rate (the format simple_sat_ops writes as the
+    // .iq sidecar next to each pass WAV). Enabled by --iq or auto-
+    // detected from a .iq extension. When on, the decoder runs through
+    // modem_iq / modem_viterbi instead of modem_pcm16, which on noisy
+    // captures pulls more frames than the FM-discriminated WAV path.
+    int iq_mode = 0;
+    int iq_mode_explicit = 0;
+    int use_viterbi = 1;  // default ON in iq_mode; --no-viterbi reverts
     int bit_rate = 9600;
     double window_s = 1.5;
     double slide_s = 0.5;
@@ -410,6 +434,9 @@ int main(int argc, char **argv)
         const char *a = argv[i];
         if (strcmp(a, "--help") == 0) { usage(stdout, argv[0]); return 0; }
         else if (strcmp(a, "--raw") == 0) { raw_mode = 1; raw_mode_explicit = 1; }
+        else if (strcmp(a, "--iq") == 0)  { iq_mode = 1;  iq_mode_explicit = 1; }
+        else if (strcmp(a, "--viterbi") == 0)    use_viterbi = 1;
+        else if (strcmp(a, "--no-viterbi") == 0) use_viterbi = 0;
         else if (starts_with(a, "--rate="))      raw_rate = atoi(a + 7);
         else if (starts_with(a, "--channels="))  raw_channels = atoi(a + 11);
         else if (starts_with(a, "--bit-rate="))  bit_rate = atoi(a + 11);
@@ -514,17 +541,33 @@ int main(int argc, char **argv)
         size_t plen = strlen(input_path);
         if (plen >= 4 && strcmp(input_path + plen - 4, ".raw") == 0) raw_mode = 1;
     }
+    if (!iq_mode_explicit) {
+        size_t plen = strlen(input_path);
+        if (plen >= 3 && strcmp(input_path + plen - 3, ".iq") == 0) iq_mode = 1;
+    }
     if (raw_channels < 1 || raw_channels > 8) {
         fprintf(stderr, "rx_replay: --channels out of range [1,8]\n");
         return 1;
     }
 
-    // Load samples (interleaved if multi-channel) and reduce to ch 0.
+    // Load samples and reduce to mono (PCM mode) or keep interleaved
+    // I,Q pairs (IQ mode). For IQ the file is headerless int16 pairs,
+    // already in the format try_decode_window_iq / _viterbi expect.
     int16_t *samples = NULL;
     size_t n_samples = 0;
     int samp_rate = 0;
     int channels = 1;
-    if (raw_mode) {
+    if (iq_mode) {
+        if (read_raw_pcm16(input_path, &samples, &n_samples) != 0) return 1;
+        samp_rate = raw_rate;
+        if ((n_samples & 1u) != 0) {
+            fprintf(stderr,
+                    "rx_replay: --iq file has odd int16 count (%zu); "
+                    "not interleaved I,Q?\n", n_samples);
+            free(samples);
+            return 1;
+        }
+    } else if (raw_mode) {
         if (read_raw_pcm16(input_path, &samples, &n_samples) != 0) return 1;
         samp_rate = raw_rate;
         channels = raw_channels;
@@ -534,10 +577,15 @@ int main(int argc, char **argv)
             return 1;
         }
     }
-    size_t n_frames = (channels > 1) ? (n_samples / (size_t)channels) : n_samples;
-    if (channels > 1) {
-        for (size_t f = 0; f < n_frames; ++f) {
-            samples[f] = samples[f * (size_t)channels];
+    size_t n_frames;
+    if (iq_mode) {
+        n_frames = n_samples / 2u;        // pairs
+    } else {
+        n_frames = (channels > 1) ? (n_samples / (size_t)channels) : n_samples;
+        if (channels > 1) {
+            for (size_t f = 0; f < n_frames; ++f) {
+                samples[f] = samples[f * (size_t)channels];
+            }
         }
     }
 
@@ -786,7 +834,11 @@ int main(int argc, char **argv)
          window_start + window_samples <= n_frames && !g_stop;
          window_start += slide_samples)
     {
-        const int16_t *win = samples + window_start;
+        // PCM windows index by sample; IQ windows index by pair, where
+        // each pair occupies 2 int16s in the underlying buffer.
+        const int16_t *win = iq_mode
+            ? samples + window_start * 2u
+            : samples + window_start;
         size_t inner_min_offset = 0;
         for (;;) {
             ssize_t plen = -1;
@@ -794,17 +846,42 @@ int main(int argc, char **argv)
             int rs_errs = -1, used_golay_len = -1;
             int rs_locs[32];
             size_t sync_off_local = 0;
-            if (!try_decode_window(win, window_samples, &mp, &opts,
-                                   sync_max_ham, use_hmac,
-                                   allow_partial_rs,
-                                   inner_min_offset,
-                                   bits_scratch, bits_cap,
-                                   bytes_scratch, bytes_cap,
-                                   packet, sizeof packet,
-                                   &plen, &golay_errs, &hmac_ok,
-                                   &rs_errs, &used_golay_len,
-                                   &sync_off_local,
-                                   rs_locs)) break;
+            int decoded;
+            if (iq_mode && use_viterbi) {
+                decoded = try_decode_window_viterbi(
+                    win, window_samples, &mp, &opts,
+                    sync_max_ham, use_hmac, allow_partial_rs,
+                    inner_min_offset,
+                    bits_scratch, bits_cap,
+                    bytes_scratch, bytes_cap,
+                    packet, sizeof packet,
+                    &plen, &golay_errs, &hmac_ok,
+                    &rs_errs, &used_golay_len,
+                    &sync_off_local, rs_locs);
+            } else if (iq_mode) {
+                decoded = try_decode_window_iq(
+                    win, window_samples, &mp, &opts,
+                    sync_max_ham, use_hmac, allow_partial_rs,
+                    inner_min_offset,
+                    bits_scratch, bits_cap,
+                    bytes_scratch, bytes_cap,
+                    packet, sizeof packet,
+                    &plen, &golay_errs, &hmac_ok,
+                    &rs_errs, &used_golay_len,
+                    &sync_off_local, rs_locs);
+            } else {
+                decoded = try_decode_window(
+                    win, window_samples, &mp, &opts,
+                    sync_max_ham, use_hmac, allow_partial_rs,
+                    inner_min_offset,
+                    bits_scratch, bits_cap,
+                    bytes_scratch, bytes_cap,
+                    packet, sizeof packet,
+                    &plen, &golay_errs, &hmac_ok,
+                    &rs_errs, &used_golay_len,
+                    &sync_off_local, rs_locs);
+            }
+            if (!decoded) break;
             inner_min_offset = sync_off_local + 1;
             if (plen < 4 || (size_t)plen > sizeof packet) continue;
 
@@ -972,7 +1049,11 @@ done:
         if (!g_stop) rx_tui_hold_until_quit();
         rx_tui_close();
     }
-    fprintf(stderr, "rx_replay: %d frame(s) emitted.\n", n_emitted);
+    const char *chain = iq_mode
+        ? (use_viterbi ? "iq+viterbi" : "iq+slicer")
+        : "fm-audio";
+    fprintf(stderr, "rx_replay: %d frame(s) emitted (chain=%s).\n",
+            n_emitted, chain);
     free(bits_scratch);
     free(bytes_scratch);
     free(samples);

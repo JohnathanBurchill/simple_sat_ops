@@ -170,16 +170,33 @@ t_other=0
 
 while IFS= read -r -d '' src; do
     t_files=$((t_files + 1))
+    # Compute the .iq sidecar path up front. We prefer it for decode
+    # when present, and we also factor it into the skip-marker check so
+    # an existing .decoded marker doesn't shadow a fresher .iq drop.
+    iq_candidate=""
+    if [[ "${src,,}" == *.wav ]]; then
+        iq_candidate="${src%.wav}.iq"
+        [[ -r "$iq_candidate" ]] || iq_candidate=""
+    fi
     if [[ "$SKIP_DECODED" -eq 1 ]]; then
         marker="${src}.decoded"
         if [[ -f "$marker" && ! "$src" -nt "$marker" ]]; then
-            t_skip_done=$((t_skip_done + 1))
-            continue
+            # Marker is at least as new as the audio — usually skip.
+            # Exception: a sibling .iq newer than the marker indicates
+            # the IQ path now has data the marker run didn't cover, so
+            # force a re-decode.
+            if [[ -n "$iq_candidate" && "$iq_candidate" -nt "$marker" ]]; then
+                :  # fall through to re-decode
+            else
+                t_skip_done=$((t_skip_done + 1))
+                continue
+            fi
         fi
     fi
     origin="$(origin_for_filename "$src")"
     decode_path="$src"
     cleanup_path=""
+    iq_mode=0
 
     case "${src,,}" in
         *.ogg)
@@ -196,6 +213,33 @@ while IFS= read -r -d '' src; do
             fi
             decode_path="$tmp_wav"
             cleanup_path="$tmp_wav"
+            ;;
+        *.wav)
+            # Prefer the .iq sidecar when simple_sat_ops dropped one
+            # next to the WAV — the IQ-domain Viterbi decoder pulls
+            # noticeably more frames out of low-SNR passes. .iq files
+            # don't exist for SatNOGS .ogg or rtl_fm WAV captures, so
+            # this falls back to the WAV when no .iq is present.
+            if [[ -n "$iq_candidate" ]]; then
+                decode_path="$iq_candidate"
+                iq_mode=1
+            else
+                chk="$(wav_check "$src")"
+                case "$chk" in
+                    "OK "*)
+                        ;;
+                    "SKIP not_wav")
+                        echo "[skip] $src  (not a readable WAV)"
+                        t_skip_open=$((t_skip_open + 1))
+                        continue
+                        ;;
+                    SKIP*)
+                        echo "[skip] $src  (${chk#SKIP })"
+                        t_skip_fmt=$((t_skip_fmt + 1))
+                        continue
+                        ;;
+                esac
+            fi
             ;;
         *)
             chk="$(wav_check "$src")"
@@ -271,8 +315,10 @@ while IFS= read -r -d '' src; do
     t_tcmd=$((t_tcmd + tcmd_count))
     t_other=$((t_other + other_count))
 
+    chain_tag=""
+    [[ "$iq_mode" -eq 1 ]] && chain_tag="  [iq+viterbi]"
     echo
-    echo "=== $wav"
+    echo "=== $wav${chain_tag}"
     echo "    frames=${frames}  beacons=${beacon_count}  tcmd_responses=${tcmd_count}  other=${other_count}"
     if [[ "$frames" -gt 0 ]]; then
         # Decoded telemetry, verbatim from rx_replay.
