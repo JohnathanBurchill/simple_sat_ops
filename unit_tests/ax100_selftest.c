@@ -1,6 +1,6 @@
 /*
 
-    Simple Satellite Operations  utils/ax100_selftest.c
+    Simple Satellite Operations  unit_tests/ax100_selftest.c
 
     Coverage:
       - ax100_opts_defaults populates the pycsplink-default profile.
@@ -42,19 +42,14 @@
 #include "ax100.h"
 #include "golay24.h"
 #include "rs.h"
+#include "tap.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static int failures = 0;
-
-static void check(int cond, const char *what)
-{
-    fprintf(stderr, "  %s: %s\n", cond ? "PASS" : "FAIL", what);
-    if (!cond) ++failures;
-}
+#define check(cond, what) tap_ok((cond), (what))
 
 // xorshift32 — deterministic so failures are reproducible without
 // having to also dump the seed.
@@ -540,7 +535,6 @@ static void test_bad_inputs(void)
 
 int main(void)
 {
-    fprintf(stderr, "ax100_selftest: running...\n");
     test_opts_defaults();
     test_hmac_properties();
     test_frame_structure_plain();
@@ -550,11 +544,5 @@ int main(void)
     test_hmac_tamper();
     test_brute_force_length_fallback();
     test_bad_inputs();
-
-    if (failures == 0) {
-        fprintf(stderr, "ax100_selftest: OK\n");
-        return 0;
-    }
-    fprintf(stderr, "ax100_selftest: %d failure(s)\n", failures);
-    return 1;
+    return tap_done();
 }

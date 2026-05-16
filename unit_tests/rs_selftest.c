@@ -1,6 +1,6 @@
 /*
 
-    Simple Satellite Operations  utils/rs_selftest.c
+    Simple Satellite Operations  unit_tests/rs_selftest.c
 
     Round-trip and error-injection test for the rs.c module. Validates
     that the C port matches the reed_solomon_ccsds Python reference in
@@ -26,25 +26,23 @@
 */
 
 #include "rs.h"
+#include "tap.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static int failures = 0;
+#define check(cond, what) tap_ok((cond), (what))
 
-static void check(int cond, const char *what)
-{
-    fprintf(stderr, "  %s: %s\n", cond ? "PASS" : "FAIL", what);
-    if (!cond) ++failures;
-}
-
-// Hex-dump helper for failed comparisons.
+// Hex-dump helper for failed comparisons; emitted as a TAP diagnostic.
 static void dump(const char *label, const uint8_t *buf, size_t len)
 {
-    fprintf(stderr, "    %s (%zu): ", label, len);
-    for (size_t i = 0; i < len; ++i) fprintf(stderr, "%02x", buf[i]);
-    fputc('\n', stderr);
+    char line[3 * 64 + 32];
+    size_t off = (size_t) snprintf(line, sizeof line, "%s (%zu): ", label, len);
+    for (size_t i = 0; i < len && off + 3 < sizeof line; ++i) {
+        off += (size_t) snprintf(line + off, sizeof line - off, "%02x", buf[i]);
+    }
+    tap_diag("%s", line);
 }
 
 // Deterministic pseudo-random fill (xorshift32) so tests are reproducible.
@@ -240,18 +238,11 @@ static void test_pycsp_wrapper(void)
 
 int main(void)
 {
-    fprintf(stderr, "rs_selftest: running...\n");
     test_zero_encode();
     test_known_vector();
     test_clean_decode();
     test_correct_up_to_t();
     test_beyond_capacity();
     test_pycsp_wrapper();
-
-    if (failures == 0) {
-        fprintf(stderr, "rs_selftest: OK\n");
-        return 0;
-    }
-    fprintf(stderr, "rs_selftest: %d failure(s)\n", failures);
-    return 1;
+    return tap_done();
 }

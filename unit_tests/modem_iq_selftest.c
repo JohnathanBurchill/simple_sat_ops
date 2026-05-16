@@ -1,6 +1,6 @@
 /*
 
-    Simple Satellite Operations  utils/modem_iq_selftest.c
+    Simple Satellite Operations  unit_tests/modem_iq_selftest.c
 
     Round-trip and sensitivity tests for modem_iq_to_bits. Synthesizes
     continuous-phase FSK at the same parameters our AX100 link uses
@@ -33,6 +33,7 @@
 #include "modem.h"
 #include "modem_iq.h"
 #include "modem_viterbi.h"
+#include "tap.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -189,14 +190,11 @@ static size_t build_test_frame(uint8_t *bits, size_t bit_cap,
     return n;
 }
 
+// Returns 1 on fail so the caller's `fails +=` semantics are preserved.
 static int check(int cond, const char *msg)
 {
-    if (cond) {
-        printf("PASS  %s\n", msg);
-        return 0;
-    }
-    printf("FAIL  %s\n", msg);
-    return 1;
+    tap_ok(cond, msg);
+    return cond ? 0 : 1;
 }
 
 // ------------------------------------------------------------------
@@ -638,15 +636,13 @@ static int test_viterbi_vs_slicer_low_snr(void)
 int main(void)
 {
     g_rng = (uint32_t) time(NULL);
-    printf("modem_iq_selftest: rng_seed=%u\n", g_rng);
-    int fails = 0;
-    fails += test_clean_decode();
-    fails += test_silence();
-    fails += test_iq_not_worse_than_pcm();
-    fails += test_low_snr_ab();
-    fails += test_viterbi_clean();
-    fails += test_viterbi_silence();
-    fails += test_viterbi_vs_slicer_low_snr();
-    printf("modem_iq_selftest: %d failure(s)\n", fails);
-    return fails == 0 ? 0 : 1;
+    tap_diag("rng_seed=%u", g_rng);
+    (void) test_clean_decode();
+    (void) test_silence();
+    (void) test_iq_not_worse_than_pcm();
+    (void) test_low_snr_ab();
+    (void) test_viterbi_clean();
+    (void) test_viterbi_silence();
+    (void) test_viterbi_vs_slicer_low_snr();
+    return tap_done();
 }

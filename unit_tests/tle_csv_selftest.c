@@ -1,6 +1,6 @@
 /*
 
-    Simple Satellite Operations  utils/tle_csv_selftest.c
+    Simple Satellite Operations  unit_tests/tle_csv_selftest.c
 
     Round-trip tests for tle_csv.c (Celestrak OMM CSV -> classic 3-line
     TLE conversion). Writes synthetic CSV / classic-TLE fixtures to
@@ -27,6 +27,7 @@
 */
 
 #include "tle_csv.h"
+#include "tap.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -34,13 +35,7 @@
 #include <string.h>
 #include <unistd.h>
 
-static int failures = 0;
-
-static void check(int cond, const char *what)
-{
-    fprintf(stderr, "  %s: %s\n", cond ? "PASS" : "FAIL", what);
-    if (!cond) ++failures;
-}
+#define check(cond, what) tap_ok((cond), (what))
 
 static int approx(double a, double b, double tol)
 {
@@ -52,9 +47,9 @@ static int approx(double a, double b, double tol)
         double _a = (actual);                                              \
         double _e = (expected);                                            \
         int _ok = approx(_a, _e, (tol));                                   \
-        check(_ok, (msg));                                                 \
-        if (!_ok) fprintf(stderr, "    expected %.6f +/- %.6f, got %.6f\n",\
-                          _e, (tol), _a);                                  \
+        tap_ok(_ok, (msg));                                                \
+        if (!_ok) tap_diag("expected %.6f +/- %.6f, got %.6f",             \
+                           _e, (tol), _a);                                 \
     } while (0)
 
 // Write `content` to a fresh tempfile in TMPDIR. Returns a heap-allocated
@@ -304,18 +299,11 @@ static void test_csv_missing_required_column(void)
 
 int main(void)
 {
-    fprintf(stderr, "tle_csv_selftest: running...\n");
     test_null_and_empty_passthrough();
     test_classic_tle_passthrough();
     test_nonexistent_path();
     test_csv_conversion();
     test_csv_caching();
     test_csv_missing_required_column();
-
-    if (failures == 0) {
-        fprintf(stderr, "tle_csv_selftest: OK\n");
-        return 0;
-    }
-    fprintf(stderr, "tle_csv_selftest: %d failure(s)\n", failures);
-    return 1;
+    return tap_done();
 }

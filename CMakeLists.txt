@@ -89,9 +89,16 @@ set(SSO_TARGETS)
 
 # ----- Always buildable (no external libs) ----------------------------------
 
+# Unit tests live in unit_tests/. Each *_selftest.c emits TAP
+# (Test Anything Protocol) via unit_tests/tap.h, so the runner can
+# parse per-assertion pass/fail without each test reinventing the
+# wheel. tap.h is shared via the include path below.
+set(UNIT_TESTS_INCLUDE ${CMAKE_SOURCE_DIR}/unit_tests)
+
 # RS self-test: validates rs.c against reed_solomon_ccsds known vectors
-add_executable(rs_selftest utils/rs_selftest.c rs.c)
-target_include_directories(rs_selftest PRIVATE ${CMAKE_SOURCE_DIR})
+add_executable(rs_selftest unit_tests/rs_selftest.c rs.c)
+target_include_directories(rs_selftest PRIVATE
+    ${CMAKE_SOURCE_DIR} ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS rs_selftest)
 
 # Antenna rotator self-test: covers the pure math helpers in
@@ -99,8 +106,9 @@ list(APPEND SSO_TARGETS rs_selftest)
 # home_unwrapped_target, to_mech_coords). No serial/UHD/ncurses deps;
 # builds on every host.
 add_executable(antenna_rotator_selftest
-               utils/antenna_rotator_selftest.c antenna_rotator.c)
-target_include_directories(antenna_rotator_selftest PRIVATE ${CMAKE_SOURCE_DIR})
+               unit_tests/antenna_rotator_selftest.c antenna_rotator.c)
+target_include_directories(antenna_rotator_selftest PRIVATE
+    ${CMAKE_SOURCE_DIR} ${UNIT_TESTS_INCLUDE})
 target_link_libraries(antenna_rotator_selftest PRIVATE m)
 list(APPEND SSO_TARGETS antenna_rotator_selftest)
 
@@ -108,10 +116,24 @@ list(APPEND SSO_TARGETS antenna_rotator_selftest)
 # tle_path_resolve and audits the resulting 3-line TLE. Pure POSIX,
 # no external library deps.
 add_executable(tle_csv_selftest
-               utils/tle_csv_selftest.c tle_csv.c)
-target_include_directories(tle_csv_selftest PRIVATE ${CMAKE_SOURCE_DIR})
+               unit_tests/tle_csv_selftest.c tle_csv.c)
+target_include_directories(tle_csv_selftest PRIVATE
+    ${CMAKE_SOURCE_DIR} ${UNIT_TESTS_INCLUDE})
 target_link_libraries(tle_csv_selftest PRIVATE m)
 list(APPEND SSO_TARGETS tle_csv_selftest)
+
+# Curses test runner: walks the *_selftest binaries built above (and
+# any added later in this file), parses TAP from their stdout, and
+# renders a collapsible group view. Requires ncurses; if not present
+# the runner just isn't built.
+if (NCURSES_FOUND)
+    add_executable(unit_test_runner unit_tests/runner.c)
+    target_include_directories(unit_test_runner PRIVATE
+        ${UNIT_TESTS_INCLUDE} ${NCURSES_INCLUDE_DIRS})
+    target_link_directories(unit_test_runner PRIVATE ${NCURSES_LIBRARY_DIRS})
+    target_link_libraries(unit_test_runner PRIVATE ${NCURSES_LIBRARIES})
+    list(APPEND SSO_TARGETS unit_test_runner)
+endif()
 
 # FM-audio preview tool: baseband WAV -> audible FM-modulated WAV
 add_executable(fm_preview utils/fm_preview.c utils/wav_read.c modem.c)
@@ -138,9 +160,10 @@ list(APPEND SSO_TARGETS gen_waterfall)
 # Synthesizes CPFSK + optional AWGN, round-trips through both chains,
 # and A/B-checks against modem_pcm16_to_bits on the FM-discriminated
 # equivalent.
-add_executable(modem_iq_selftest utils/modem_iq_selftest.c
+add_executable(modem_iq_selftest unit_tests/modem_iq_selftest.c
                modem.c modem_fsk.c modem_iq.c modem_viterbi.c)
-target_include_directories(modem_iq_selftest PRIVATE ${CMAKE_SOURCE_DIR})
+target_include_directories(modem_iq_selftest PRIVATE
+    ${CMAKE_SOURCE_DIR} ${UNIT_TESTS_INCLUDE})
 target_link_libraries(modem_iq_selftest PRIVATE m)
 list(APPEND SSO_TARGETS modem_iq_selftest)
 
@@ -219,10 +242,10 @@ if (OPENSSL_FOUND)
     # AX100 framer self-test: structural audit + round trip across the
     # opts matrix + Golay/RS/HMAC error injection. Needs OpenSSL (HMAC)
     # so it lives in the OPENSSL_FOUND block.
-    add_executable(ax100_selftest utils/ax100_selftest.c
+    add_executable(ax100_selftest unit_tests/ax100_selftest.c
                    ax100.c rs.c golay24.c hmac_keyfile.c)
     target_include_directories(ax100_selftest PRIVATE
-        ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
+        ${CMAKE_SOURCE_DIR} ${UNIT_TESTS_INCLUDE} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(ax100_selftest PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(ax100_selftest PRIVATE ${OPENSSL_LIBRARIES} m)
     list(APPEND SSO_TARGETS ax100_selftest)
@@ -288,9 +311,9 @@ if (SGP4SDP4_LIB)
     # update_pass_predictions, and assert physically-plausible ranges.
     # Pulls oem.c + ncurses through prediction.c's transitive deps.
     add_executable(prediction_selftest
-                   utils/prediction_selftest.c prediction.c oem.c)
+                   unit_tests/prediction_selftest.c prediction.c oem.c)
     target_include_directories(prediction_selftest PRIVATE
-        ${CMAKE_SOURCE_DIR})
+        ${CMAKE_SOURCE_DIR} ${UNIT_TESTS_INCLUDE})
     target_link_libraries(prediction_selftest PRIVATE ${SGP4SDP4_LIB} m)
     if (NCURSES_FOUND)
         target_include_directories(prediction_selftest PRIVATE

@@ -1,6 +1,6 @@
 /*
 
-    Simple Satellite Operations  utils/prediction_selftest.c
+    Simple Satellite Operations  unit_tests/prediction_selftest.c
 
     Smoke tests for prediction.c:
       - tle_default_path: HOME-relative path expansion.
@@ -37,6 +37,7 @@
 */
 
 #include "prediction.h"
+#include "tap.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -46,13 +47,7 @@
 
 #include <sgp4sdp4.h>
 
-static int failures = 0;
-
-static void check(int cond, const char *what)
-{
-    fprintf(stderr, "  %s: %s\n", cond ? "PASS" : "FAIL", what);
-    if (!cond) ++failures;
-}
+#define check(cond, what) tap_ok((cond), (what))
 
 // Known-good 3-line TLE: OSCAR 7 (AO-7), an active LEO at ~1450 km
 // altitude with a ~12.5 rev/day orbit. Frozen in here (not pulled
@@ -293,13 +288,11 @@ static void test_update_pass_predictions(const char *tles_path)
 
 int main(void)
 {
-    fprintf(stderr, "prediction_selftest: running...\n");
-
     test_tle_default_path();
 
     char *tles_path = write_fixture_tle();
     if (!tles_path) {
-        fprintf(stderr, "prediction_selftest: cannot write fixture TLE\n");
+        tap_bail("cannot write fixture TLE");
         return 1;
     }
 
@@ -312,10 +305,5 @@ int main(void)
     unlink(tles_path);
     free(tles_path);
 
-    if (failures == 0) {
-        fprintf(stderr, "prediction_selftest: OK\n");
-        return 0;
-    }
-    fprintf(stderr, "prediction_selftest: %d failure(s)\n", failures);
-    return 1;
+    return tap_done();
 }

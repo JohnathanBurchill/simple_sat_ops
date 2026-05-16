@@ -1,6 +1,6 @@
 /*
 
-    Simple Satellite Operations  utils/antenna_rotator_selftest.c
+    Simple Satellite Operations  unit_tests/antenna_rotator_selftest.c
 
     Unit tests for the pure helpers in antenna_rotator.c:
       - antenna_rotator_wrap_to_pm180
@@ -31,6 +31,7 @@
 */
 
 #include "antenna_rotator.h"
+#include "tap.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -40,13 +41,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-static int failures = 0;
-
-static void check(int cond, const char *what)
-{
-    fprintf(stderr, "  %s: %s\n", cond ? "PASS" : "FAIL", what);
-    if (!cond) ++failures;
-}
+#define check(cond, what) tap_ok((cond), (what))
 
 static int approx(double a, double b, double tol)
 {
@@ -58,8 +53,8 @@ static int approx(double a, double b, double tol)
         double _a = (actual);                                              \
         double _e = (expected);                                            \
         int _ok = approx(_a, _e, 1e-9);                                    \
-        check(_ok, (msg));                                                 \
-        if (!_ok) fprintf(stderr, "    expected %.9f, got %.9f\n", _e, _a);\
+        tap_ok(_ok, (msg));                                                \
+        if (!_ok) tap_diag("expected %.9f, got %.9f", _e, _a);             \
     } while (0)
 
 // ---------------------------------------------------------------- wrap_to_pm180
@@ -981,7 +976,6 @@ static void test_pass_simulation_flip_baseline(void)
 
 int main(void)
 {
-    fprintf(stderr, "antenna_rotator_selftest: running...\n");
     test_wrap_to_pm180();
     test_accumulate_unwrapped();
     test_home_unwrapped_target();
@@ -1000,11 +994,5 @@ int main(void)
     test_seed_from_status();
     test_set_unwrapped_state_update();
     test_pass_simulation_flip_baseline();
-
-    if (failures == 0) {
-        fprintf(stderr, "antenna_rotator_selftest: OK\n");
-        return 0;
-    }
-    fprintf(stderr, "antenna_rotator_selftest: %d failure(s)\n", failures);
-    return 1;
+    return tap_done();
 }
