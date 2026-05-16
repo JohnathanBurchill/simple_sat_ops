@@ -1369,24 +1369,54 @@ static void render_rx_panel(const rx_panel_data_t *d,
 
 // Vertical ribbon strip. Bottom row (`bot_row`) holds the newest
 // sample; older samples climb upward toward `top_row`. Each row is
-// rendered as "%3d <marker>" — right-aligned peak dBFS followed by
-// space + '.' or '-'. '-' ticks render bold. Rows past the available
-// data are blanked so the strip stays a clean column.
-//
-// `col` is the column of the marker char. The integer occupies the 4
-// columns immediately to its left (col-4 .. col-1).
+// a graded peak-above-noise indicator (dots packed leftward from
+// col-1) followed by the timeline marker ('.' or bold '-') at `col`.
+// One dot per RIBBON_DB_PER_DOT dB above the rolling noise floor,
+// capped at RIBBON_DOTS_MAX dots — bursts stand out as clusters of
+// dots without numeric noise. Noise floor is the median of the
+// available ribbon peaks: robust to a few seconds of burst activity
+// per minute, no protocol change needed (peaks are already on the
+// wire as int8 dBFS).
 static void render_ribbon_vertical(const rx_panel_data_t *d,
                                    int top_row, int bot_row, int col)
 {
     if (d == NULL || bot_row <= top_row) return;
     if (col < 4) return;
-    int int_col = col - 4;
+
+    const int RIBBON_DB_PER_DOT = 10;
+    const int RIBBON_DOTS_MAX   = 4;
+
+    // Median-of-peaks noise estimate. With RIBBON_LEN=60 and bursts
+    // lasting a second or two, the median sits firmly in the noise
+    // floor even during a busy pass.
+    int noise_dbfs = -60;
+    if (d->ribbon_n > 0) {
+        int8_t buf[RIBBON_LEN];
+        int n = d->ribbon_n < RIBBON_LEN ? d->ribbon_n : RIBBON_LEN;
+        memcpy(buf, d->ribbon_peak, (size_t) n);
+        for (int a = 1; a < n; ++a) {
+            int8_t v = buf[a];
+            int b = a;
+            while (b > 0 && buf[b - 1] > v) { buf[b] = buf[b - 1]; --b; }
+            buf[b] = v;
+        }
+        noise_dbfs = buf[n / 2];
+    }
+
     int max_rows = bot_row - top_row + 1;
     for (int i = 0; i < max_rows; ++i) {
         int row = bot_row - i;
+        for (int dx = 1; dx <= RIBBON_DOTS_MAX; ++dx) {
+            mvaddch(row, col - dx, ' ');
+        }
         if (i < d->ribbon_n) {
-            int peak = (int) d->ribbon_peak[i];
-            mvprintw(row, int_col, "%3d ", peak);
+            int over = (int) d->ribbon_peak[i] - noise_dbfs;
+            int dots = over / RIBBON_DB_PER_DOT;
+            if (dots < 0)                dots = 0;
+            if (dots > RIBBON_DOTS_MAX)  dots = RIBBON_DOTS_MAX;
+            for (int k = 1; k <= dots; ++k) {
+                mvaddch(row, col - k, '.');
+            }
             char c = d->ribbon[i];
             if (c == '\0') c = ' ';
             if (c == '-') {
@@ -1397,8 +1427,6 @@ static void render_ribbon_vertical(const rx_panel_data_t *d,
                 mvaddch(row, col, c);
             }
         } else {
-            // No data yet for this row — leave it blank.
-            mvprintw(row, int_col, "    ");
             mvaddch(row, col, ' ');
         }
     }
