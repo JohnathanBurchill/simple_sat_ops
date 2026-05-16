@@ -86,14 +86,56 @@ This is the same idea as a lock-in amplifier, but with two phases. Pack the
 two into a single complex number $s(t) = I(t) + i\, Q(t)$ and a passband
 sinusoid at frequency $f_c + \Delta f$ becomes a complex exponential
 $e^{\,i\, 2\pi \Delta f\, t}$ at baseband — i.e. positive $\Delta f$ means
-above the tuner, negative below. Doppler shows up as a slow drift of the
-baseband carrier.
+above the tuner, negative below. Doppler would drift this baseband
+carrier across the pass; the receiver follows it actively, as described
+in the next subsection.
 
 The B210 delivers complex IQ samples to the host at 480 kHz (set by
 `uhd_usrp_set_rx_rate` in `b210_rx_tx_core.c`); a software FIR in
 `fir_decim.c` decimates that by 5 to 96 kHz. With a 9600 baud symbol rate
 that gives us **10 samples per symbol** — comfortable headroom for the
 algorithms below.
+
+### Doppler tracking
+
+The satellite moves at up to $v_r \approx 7.6$ km/s along the line of
+sight, shifting the carrier by
+
+$$
+\Delta f_{\mathrm{dop}} \;\approx\; \pm \frac{v_r}{c}\, f_c
+  \;\approx\; \pm 10\ \text{kHz at 436 MHz}.
+$$
+
+Left untouched that would walk the signal across the 12 kHz LPF and out
+of the matched filter's band by mid-pass. The receiver instead recomputes
+the expected Doppler each iteration from the SGP4 propagator and retunes
+the B210 whenever the prediction has moved by more than 200 Hz from the
+current tune (`main.c:4955-4960`, threshold
+`DOPPLER_SHIFT_RESOLUTION_KHZ`). Near TCA, where the Doppler rate peaks
+at $\sim 50$ Hz/s, retunes fire roughly every 4 s; off TCA, much less
+often.
+
+Every stage downstream was chosen so a retune is a non-event:
+
+- The **FM discriminator is differential** (§3): it uses
+  $\arg(s[n]\, s^{*}[n-1])$, so the absolute LO phase that jumps at each
+  retune cancels. Worst case is one slightly off sample at the retune
+  instant.
+- The **residual carrier offset** between retunes ($\le 200$ Hz) becomes
+  a DC pedestal of at most
+  $2\pi \cdot 200 / 96000 \approx 0.013$ rad/sample on $\Delta\phi$ —
+  far below the $\pm 0.157$ rad/sample signal — and is flattened by the
+  one-pole HPF (§3) within $\sim 1$ ms.
+- **Symbol-clock Doppler** is the same fractional shift:
+  $v_r/c \approx 2.5\times 10^{-5}$, or $\sim 0.24$ Hz at 9600 baud.
+  Gardner+Farrow (§5) handles $\ll 100$ ppm of clock drift trivially.
+- **Frame alignment** is fine because retune events are seconds apart
+  while a frame lasts $\sim 50$ ms. Even when a frame straddles a
+  retune, the single-sample blip averages out in the MF and is well
+  within Reed-Solomon's 16-byte correction budget (§10).
+
+The rest of this document assumes the B210 stays tuned to within ±200 Hz
+of the actual downlink carrier.
 
 ## 2. What's actually on the wire — 2-FSK
 
@@ -455,9 +497,11 @@ $\sim 10\times$ faster than slicing the file once with a wide window.
 
 ## Where things go wrong
 
-- **Doppler too large** — would push the signal beyond the 12 kHz LPF
-  cutoff. Mitigated by tracking-corrected tuning, or by widening the LPF
-  at the cost of SNR.
+- **Doppler tracking lost** — the SGP4 prediction is more than ~10 kHz
+  off the actual carrier (typically: a TLE that's days old, or the wrong
+  TLE entirely). The signal moves out of the LPF and the chain loses
+  lock. Refresh TLEs and restart; the active retune loop (§1) keeps
+  things on track when the prediction is fresh.
 - **Symbol clock drift faster than $\sim 100$ ppm** — Gardner+Farrow
   loses lock. Raise $K_p$ (faster tracking, more jitter) or switch to a
   more aggressive PLL.
