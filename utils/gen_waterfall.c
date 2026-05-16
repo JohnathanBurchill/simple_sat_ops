@@ -41,6 +41,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -311,10 +312,18 @@ static int write_png_rgb(const char *path,
 }
 
 // --------------------------------------------------------------------
-// Spectrogram pipeline
+// Minimal PDF 1.4 writer. Embeds the spectrogram + colorbar as raster
+// XObjects (FlateDecode-wrapped via the same stored-DEFLATE helper the
+// PNG writer uses) and draws axes / ticks / labels with vector PDF ops
+// so the text stays sharp at any zoom — that's the point of the PDF
+// export. Only depends on libc; no libharu, no Cairo.
 // --------------------------------------------------------------------
 
-typedef struct {
+// wf_opts_t holds every knob the spectrogram pipeline reads; defined
+// here (rather than next to build_waterfall) so the PDF writer below
+// can access its members. The axis-formatting helpers are forward-
+// declared too — definitions live further down the file.
+typedef struct wf_opts {
     int    fft_size;
     int    hop;
     int    out_rows;
@@ -328,7 +337,369 @@ typedef struct {
     int    dc_notch_bins; // half-width of the notch in FFT bins (each side)
     double display_bw_hz; // filled in by build_waterfall — the actual rendered BW
     time_t start_utc;     // capture start in UTC; 0 = unknown, render elapsed time
+    float  display_db_lo; // filled in by build_waterfall — the dB range mapped
+    float  display_db_hi; //   onto colormap indices [0..255]; lights the colorbar.
 } wf_opts_t;
+static double pick_tick_step(double range, int target_ticks);
+static double pick_time_step(double range_s, int target_ticks);
+static int    fmt_freq(double hz, char *out, size_t out_cap);
+static int    fmt_time(time_t base_utc, double sec, char *out, size_t out_cap);
+
+typedef struct {
+    FILE   *fp;
+    size_t  off;
+    size_t  obj_offsets[64];  // byte offset of each object body
+    int     n_objs;
+} pdf_writer_t;
+
+static void pdf_write(pdf_writer_t *w, const void *buf, size_t n)
+{
+    fwrite(buf, 1, n, w->fp);
+    w->off += n;
+}
+static void pdf_printf(pdf_writer_t *w, const char *fmt, ...)
+{
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n > 0) pdf_write(w, buf, (size_t) n);
+}
+static int pdf_begin_obj(pdf_writer_t *w)
+{
+    int id = ++w->n_objs;
+    w->obj_offsets[id] = w->off;
+    pdf_printf(w, "%d 0 obj\n", id);
+    return id;
+}
+static void pdf_end_obj(pdf_writer_t *w)
+{
+    pdf_printf(w, "\nendobj\n");
+}
+
+// Build the FlateDecode-wrapped image stream for one RGB raster and
+// emit the corresponding /XObject /Subtype /Image object.
+static int pdf_emit_image_obj(pdf_writer_t *w,
+                              const uint8_t *rgb, int img_w, int img_h)
+{
+    size_t raw_len = (size_t) img_w * (size_t) img_h * 3;
+    size_t z_len = 0;
+    uint8_t *z = zlib_stored_wrap(rgb, raw_len, &z_len);
+    if (z == NULL) return -1;
+    int id = pdf_begin_obj(w);
+    pdf_printf(w,
+        "<< /Type /XObject /Subtype /Image /Width %d /Height %d "
+        "/ColorSpace /DeviceRGB /BitsPerComponent 8 "
+        "/Filter /FlateDecode /Length %zu >>\nstream\n",
+        img_w, img_h, z_len);
+    pdf_write(w, z, z_len);
+    free(z);
+    pdf_printf(w, "\nendstream");
+    pdf_end_obj(w);
+    return id;
+}
+
+// PDF-escape a label so parentheses / backslashes don't break the
+// surrounding (...) string literal. Tick labels are short ASCII; small
+// out buffer is fine.
+static void pdf_escape(const char *in, char *out, size_t out_cap)
+{
+    size_t o = 0;
+    for (const char *p = in; *p && o + 2 < out_cap; ++p) {
+        if (*p == '(' || *p == ')' || *p == '\\') out[o++] = '\\';
+        out[o++] = *p;
+    }
+    out[o] = '\0';
+}
+
+// Vertically-flipped copy of `src` (row 0 of out = last row of src).
+// PDF image XObjects render scanline 0 at the TOP of the destination
+// rectangle, but spec_rgb stores oldest-first → we need to feed it
+// flipped so "start of recording" lands at the BOTTOM of the page, the
+// same convention we adopted for the PNG output.
+static uint8_t *flip_rgb_vertical(const uint8_t *src, int w, int h)
+{
+    size_t row_bytes = (size_t) w * 3;
+    uint8_t *out = (uint8_t *) malloc(row_bytes * (size_t) h);
+    if (out == NULL) return NULL;
+    for (int r = 0; r < h; ++r) {
+        memcpy(out + (size_t) r * row_bytes,
+               src + (size_t)(h - 1 - r) * row_bytes,
+               row_bytes);
+    }
+    return out;
+}
+
+// Build the colorbar pixels (16 wide × spec_h tall). The bar runs from
+// high dB at the top to low dB at the bottom — same orientation as the
+// PNG colorbar in render_with_axes.
+static uint8_t *build_colorbar_rgb(int height, int *out_w)
+{
+    const int W = 16;
+    uint8_t *rgb = (uint8_t *) malloc((size_t) W * (size_t) height * 3);
+    if (rgb == NULL) return NULL;
+    for (int y = 0; y < height; ++y) {
+        float t = 1.0f - (float) y / (float)(height > 1 ? height - 1 : 1);
+        int idx = (int)(t * 255.0f + 0.5f);
+        if (idx < 0) idx = 0;
+        if (idx > 255) idx = 255;
+        uint8_t r = VIRIDIS[idx][0];
+        uint8_t g = VIRIDIS[idx][1];
+        uint8_t b = VIRIDIS[idx][2];
+        for (int x = 0; x < W; ++x) {
+            uint8_t *p = rgb + ((size_t) y * (size_t) W + (size_t) x) * 3;
+            p[0] = r; p[1] = g; p[2] = b;
+        }
+    }
+    *out_w = W;
+    return rgb;
+}
+
+// Write a one-page PDF with the spectrogram + colorbar embedded as
+// XObjects and all axes / ticks / labels emitted as vector PDF
+// operators. Uses Helvetica (standard 14, no embedding). Page size in
+// points = image size in pixels, so screen-zooming the PDF preserves
+// the on-screen scale of the PNG.
+static int write_pdf_with_axes(const char *path,
+                                const uint8_t *spec_rgb, int spec_w, int spec_h,
+                                const wf_opts_t *opt, double duration_s)
+{
+    if (path == NULL || spec_rgb == NULL || spec_w <= 0 || spec_h <= 0) return -1;
+
+    const int LM = 80, TM = 12, BM = 28;
+    const int CB_GAP = 12;
+    const int CB_W   = 16;
+    const int CB_LABEL_SPACE = 60;
+    const int W = LM + spec_w + CB_GAP + CB_W + CB_LABEL_SPACE;
+    const int H = TM + spec_h + BM;
+
+    FILE *fp = fopen(path, "wb");
+    if (fp == NULL) return -1;
+    pdf_writer_t w = { fp, 0, {0}, 0 };
+
+    pdf_printf(&w, "%%PDF-1.4\n%%\xE2\xE3\xCF\xD3\n");
+
+    // Pre-flip the spectrogram so row 0 is the newest sample (top of
+    // page), matching the PNG layout where start-of-recording is at
+    // the bottom of the image.
+    uint8_t *flip = flip_rgb_vertical(spec_rgb, spec_w, spec_h);
+    if (flip == NULL) { fclose(fp); return -1; }
+    int cb_w = 0;
+    uint8_t *cb_rgb = build_colorbar_rgb(spec_h, &cb_w);
+    if (cb_rgb == NULL) { free(flip); fclose(fp); return -1; }
+
+    int spec_id = pdf_emit_image_obj(&w, flip, spec_w, spec_h);
+    free(flip);
+    int cb_id   = pdf_emit_image_obj(&w, cb_rgb, cb_w, spec_h);
+    free(cb_rgb);
+    if (spec_id < 0 || cb_id < 0) { fclose(fp); return -1; }
+
+    // Helvetica (standard 14 PDF font, no embedding needed).
+    int font_id = pdf_begin_obj(&w);
+    pdf_printf(&w,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+        "/Encoding /WinAnsiEncoding >>");
+    pdf_end_obj(&w);
+
+    // Build the content stream in memory so we know its length before
+    // writing the dictionary.
+    size_t cs_cap = 65536;
+    size_t cs_len = 0;
+    char *cs = (char *) malloc(cs_cap);
+    if (cs == NULL) { fclose(fp); return -1; }
+#define CS_APPEND(...) do {                                                   \
+    if (cs_len + 512 > cs_cap) {                                              \
+        cs_cap *= 2;                                                          \
+        char *_nc = (char *) realloc(cs, cs_cap);                             \
+        if (_nc == NULL) { free(cs); fclose(fp); return -1; }                 \
+        cs = _nc;                                                             \
+    }                                                                         \
+    int _n = snprintf(cs + cs_len, cs_cap - cs_len, __VA_ARGS__);             \
+    if (_n > 0) cs_len += (size_t) _n;                                        \
+} while (0)
+
+    // 1. Spectrogram raster. PDF y-up: place at (LM, BM) → (LM+spec_w, BM+spec_h).
+    CS_APPEND("q %d 0 0 %d %d %d cm /Im1 Do Q\n",
+              spec_w, spec_h, LM, BM);
+    // 2. Colorbar raster.
+    int cb_x = LM + spec_w + CB_GAP;
+    CS_APPEND("q %d 0 0 %d %d %d cm /Im2 Do Q\n",
+              CB_W, spec_h, cb_x, BM);
+
+    // 3. Axes: thin gray rule between margins and image. PDF default
+    // line color is black; set to mid-gray for the axes.
+    CS_APPEND("0.65 G 0.5 w\n");
+    // Spectrogram bottom edge (frequency axis baseline)
+    CS_APPEND("%d %d m %d %d l S\n", LM, BM, LM + spec_w, BM);
+    // Spectrogram left edge (time axis baseline)
+    CS_APPEND("%d %d m %d %d l S\n", LM, BM, LM, BM + spec_h);
+    // Colorbar frame
+    CS_APPEND("%d %d %d %d re S\n", cb_x, BM, CB_W, spec_h);
+
+    // 4. Frequency-axis ticks + labels (X axis, below the spectrogram).
+    CS_APPEND("0.7 G\n");
+    double fs = (opt->display_bw_hz > 0.0)
+                ? opt->display_bw_hz : (double) opt->sample_rate;
+    double f_lo = -fs / 2.0, f_hi = +fs / 2.0;
+    double f_step = pick_tick_step(fs, 8);
+    double f0 = ceil(f_lo / f_step) * f_step;
+    CS_APPEND("BT /F1 8 Tf 0 g\n");
+    for (double f = f0; f <= f_hi + 0.5 * f_step; f += f_step) {
+        double frac = (f - f_lo) / fs;
+        double x = (double) LM + frac * (double) spec_w;
+        // Tick below the axis.
+        CS_APPEND("ET 0.65 G %.1f %d m %.1f %d l S BT /F1 8 Tf 0 g\n",
+                  x, BM, x, BM - 4);
+        char buf[24], esc[40];
+        double f_abs = (opt->center_hz != 0.0) ? (opt->center_hz + f) : f;
+        if (opt->center_hz != 0.0) fmt_freq(f_abs, buf, sizeof buf);
+        else                       fmt_freq(f,     buf, sizeof buf);
+        pdf_escape(buf, esc, sizeof esc);
+        // Centre the label under the tick.
+        int label_w_pt = (int) strlen(buf) * 4;  // rough Helvetica 8pt width
+        CS_APPEND("1 0 0 1 %.1f %d Tm (%s) Tj\n",
+                  x - label_w_pt / 2.0, BM - 14, esc);
+    }
+
+    // 5. Time-axis ticks + labels (Y axis, left of the spectrogram).
+    // Major ticks with labels, minor 20 s ticks unlabeled.
+    double t_step = pick_time_step(duration_s, 10);
+    for (double t = 0.0; t <= duration_s + 0.5; t += 20.0) {
+        double mod = fmod(t, t_step);
+        if (fabs(mod) < 1.0 || fabs(mod - t_step) < 1.0) continue;
+        double frac = 1.0 - t / duration_s;
+        double y = BM + frac * (double) spec_h;
+        // Time runs upward in the PDF (y-up), but the start-of-recording
+        // is at the bottom of the spectrogram → flip: y = BM + (1-t/d)*h
+        // means t=0 → y = BM+h (top). Wait, we want t=0 at BOTTOM (BM).
+        // Recompute: bottom = oldest (t=0), top = newest (t=d).
+        y = BM + (t / duration_s) * (double) spec_h;
+        CS_APPEND("ET 0.65 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
+                  LM - 3, y, LM, y);
+    }
+    for (double t = 0.0; t <= duration_s + 0.5 * t_step; t += t_step) {
+        double y = BM + (t / duration_s) * (double) spec_h;
+        CS_APPEND("ET 0.65 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
+                  LM - 6, y, LM, y);
+        char buf[24], esc[40];
+        fmt_time(opt->start_utc, t, buf, sizeof buf);
+        pdf_escape(buf, esc, sizeof esc);
+        int label_w_pt = (int) strlen(buf) * 5;
+        CS_APPEND("1 0 0 1 %d %.1f Tm (%s) Tj\n",
+                  LM - 10 - label_w_pt, y - 3, esc);
+    }
+
+    // 6. Colorbar dB ticks + labels.
+    float db_lo = opt->display_db_lo, db_hi = opt->display_db_hi;
+    float db_range = db_hi - db_lo;
+    if (db_range > 0.0f) {
+        double db_step = pick_tick_step(db_range, 6);
+        double db0 = ceil(db_lo / db_step) * db_step;
+        for (double v = db0; v <= db_hi + 0.5 * db_step; v += db_step) {
+            float frac = (float)((v - db_lo) / db_range);
+            double y = BM + frac * (double) spec_h;
+            CS_APPEND("ET 0.65 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
+                      cb_x + CB_W, y, cb_x + CB_W + 4, y);
+            char buf[24], esc[40];
+            snprintf(buf, sizeof buf, "%.0f", v);
+            pdf_escape(buf, esc, sizeof esc);
+            CS_APPEND("1 0 0 1 %d %.1f Tm (%s) Tj\n",
+                      cb_x + CB_W + 7, y - 3, esc);
+        }
+    }
+
+    CS_APPEND("ET\n");
+#undef CS_APPEND
+
+    // Content stream object.
+    int cs_id = pdf_begin_obj(&w);
+    pdf_printf(&w, "<< /Length %zu >>\nstream\n", cs_len);
+    pdf_write(&w, cs, cs_len);
+    pdf_printf(&w, "\nendstream");
+    pdf_end_obj(&w);
+    free(cs);
+
+    // Page object.
+    int page_id = pdf_begin_obj(&w);
+    pdf_printf(&w,
+        "<< /Type /Page /Parent %%PARENT%% /MediaBox [0 0 %d %d] "
+        "/Resources << /Font << /F1 %d 0 R >> "
+        "/XObject << /Im1 %d 0 R /Im2 %d 0 R >> >> "
+        "/Contents %d 0 R >>",
+        W, H, font_id, spec_id, cb_id, cs_id);
+    pdf_end_obj(&w);
+
+    // Pages object.
+    int pages_id = pdf_begin_obj(&w);
+    pdf_printf(&w,
+        "<< /Type /Pages /Kids [%d 0 R] /Count 1 >>", page_id);
+    pdf_end_obj(&w);
+
+    // We needed the Page object's Parent to point at Pages, but Pages
+    // wasn't assigned until after. Patch via a second pass would be
+    // ugly; instead we substitute the placeholder string we left in
+    // the page's body. Simpler: just rewind, find "%PARENT%", and edit
+    // — but we used stream output. Take the easy way: rewrite the
+    // Page object now that pages_id is known.
+    // (Streamed approach: rebuild and store using the right ID below.)
+    // Patch: seek back to the page object's start and rewrite.
+    long save_off = (long) w.off;
+    if (fseek(w.fp, (long) w.obj_offsets[page_id], SEEK_SET) != 0) {
+        fclose(fp); return -1;
+    }
+    // Calculate the byte count of the original page body so we can
+    // overwrite it in place. The "%PARENT%" token is 8 bytes; the new
+    // "<n> 0 R" is up to 7 bytes — we pad with spaces if shorter.
+    char page_body[512];
+    int n = snprintf(page_body, sizeof page_body,
+        "%d 0 obj\n"
+        "<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %d %d] "
+        "/Resources << /Font << /F1 %d 0 R >> "
+        "/XObject << /Im1 %d 0 R /Im2 %d 0 R >> >> "
+        "/Contents %d 0 R >>\nendobj\n",
+        page_id, pages_id, W, H, font_id, spec_id, cb_id, cs_id);
+    // The original write placed "%PARENT%" (8 chars) where pages_id will
+    // print; the new body is shorter or equal — pad with spaces to keep
+    // file layout intact for the xref.
+    long page_len_old = (long) w.obj_offsets[pages_id]
+                       - (long) w.obj_offsets[page_id];
+    if (n > 0 && n < page_len_old) {
+        memset(page_body + n, ' ', (size_t)(page_len_old - n - 1));
+        page_body[page_len_old - 1] = '\n';
+        fwrite(page_body, 1, (size_t) page_len_old, w.fp);
+    } else if (n > 0) {
+        fwrite(page_body, 1, (size_t) n, w.fp);
+    }
+    fseek(w.fp, save_off, SEEK_SET);
+    w.off = (size_t) save_off;
+
+    // Catalog.
+    int catalog_id = pdf_begin_obj(&w);
+    pdf_printf(&w,
+        "<< /Type /Catalog /Pages %d 0 R >>", pages_id);
+    pdf_end_obj(&w);
+
+    // xref table.
+    size_t xref_off = w.off;
+    pdf_printf(&w, "xref\n0 %d\n", w.n_objs + 1);
+    pdf_printf(&w, "0000000000 65535 f \n");
+    for (int i = 1; i <= w.n_objs; ++i) {
+        pdf_printf(&w, "%010zu 00000 n \n", w.obj_offsets[i]);
+    }
+    pdf_printf(&w,
+        "trailer\n<< /Size %d /Root %d 0 R >>\nstartxref\n%zu\n%%%%EOF\n",
+        w.n_objs + 1, catalog_id, xref_off);
+
+    fclose(fp);
+    return 0;
+}
+
+// --------------------------------------------------------------------
+// Spectrogram pipeline
+// --------------------------------------------------------------------
+
+// (wf_opts_t is defined above, where the PDF writer also needs it.)
 
 // Parse "YYYYMMDDTHHMMSS" out of `s` (a longer suffix like ".698.iq" is
 // fine, sscanf ignores trailing bytes). Returns 0 on parse failure.
@@ -610,6 +981,11 @@ static int build_waterfall(const int16_t *iq, size_t n_pairs,
         }
     }
 
+    // Record the dB range we actually used so render_with_axes can light
+    // a matching colorbar in the right margin.
+    ((wf_opts_t *) opt)->display_db_lo = lo;
+    ((wf_opts_t *) opt)->display_db_hi = hi;
+
     // Map to viridis. Width = N (already fftshift'd). Height = out_rows.
     // The PNG's row 0 is the TOP of the image, so iterate as-is — the
     // first output row corresponds to the earliest IQ samples, which
@@ -801,7 +1177,10 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
                             uint8_t **out_rgb, int *out_w, int *out_h)
 {
     const int LM = 80;
-    const int RM = 12;
+    // RM widened from 12 to 76 to host the dB colorbar: 12 px gap +
+    // 16 px strip + 6 px ticks + ~36 px of label space + a small
+    // breathing-room margin. The colorbar height matches spec_h.
+    const int RM = 76;
     const int TM = 12;
     const int BM = 28;
     int W = spec_w + LM + RM;
@@ -891,6 +1270,52 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
     draw_text(rgb, W, H, 4, TM + 4, "time", 1,
               LBL_R, LBL_G, LBL_B);
 
+    // dB colorbar in the right margin. Top of the strip is the maximum
+    // displayed dB, bottom is the minimum — matches the convention of
+    // "more = up". Same viridis table as the spectrogram.
+    int cb_x_lo = LM + spec_w + 12;
+    int cb_x_hi = cb_x_lo + 16;
+    float db_lo = opt->display_db_lo;
+    float db_hi = opt->display_db_hi;
+    float db_range = db_hi - db_lo;
+    if (db_range <= 0.0f) db_range = 1.0f;
+    for (int y = 0; y < spec_h; ++y) {
+        float t = 1.0f - (float) y / (float)(spec_h > 1 ? spec_h - 1 : 1);
+        int idx = (int)(t * 255.0f + 0.5f);
+        if (idx < 0)   idx = 0;
+        if (idx > 255) idx = 255;
+        for (int x = cb_x_lo; x < cb_x_hi; ++x) {
+            px_set(rgb, W, H, x, TM + y,
+                   VIRIDIS[idx][0], VIRIDIS[idx][1], VIRIDIS[idx][2]);
+        }
+    }
+    // Thin gray frame around the strip so it reads as a discrete plot
+    // element rather than blurring into the spectrogram.
+    for (int y = -1; y <= spec_h; ++y) {
+        px_set(rgb, W, H, cb_x_lo - 1, TM + y, 120, 120, 120);
+        px_set(rgb, W, H, cb_x_hi,     TM + y, 120, 120, 120);
+    }
+    for (int x = cb_x_lo - 1; x <= cb_x_hi; ++x) {
+        px_set(rgb, W, H, x, TM - 1,         120, 120, 120);
+        px_set(rgb, W, H, x, TM + spec_h,    120, 120, 120);
+    }
+
+    // dB ticks + labels on the right side of the strip.
+    double db_step = pick_tick_step(db_range, 6);
+    double db0 = ceil(db_lo / db_step) * db_step;
+    for (double v = db0; v <= db_hi + 0.5 * db_step; v += db_step) {
+        float frac = (float)((v - db_lo) / db_range);
+        int y = TM + (int)((1.0f - frac) * (float)(spec_h - 1) + 0.5f);
+        if (y < TM || y >= TM + spec_h) continue;
+        for (int dx = 0; dx < 5; ++dx) {
+            px_set(rgb, W, H, cb_x_hi + 1 + dx, y, TIC_R, TIC_G, TIC_B);
+        }
+        char buf[16];
+        snprintf(buf, sizeof buf, "%.0f", v);
+        draw_text(rgb, W, H, cb_x_hi + 8, y - 3, buf, 1,
+                  LBL_R, LBL_G, LBL_B);
+    }
+
     *out_rgb = rgb;
     *out_w   = W;
     *out_h   = H;
@@ -969,6 +1394,7 @@ int main(int argc, char **argv)
     const char *iq_path  = argv[1];
     int sample_rate      = atoi(argv[2]);
     const char *out_png  = argv[3];
+    const char *out_pdf  = NULL;  // --pdf=<path>: emit a vector-text PDF too
 
     wf_opts_t opt;
     opt.fft_size      = 1024;
@@ -1037,6 +1463,8 @@ int main(int argc, char **argv)
             opt.start_utc = t;
         } else if (strcmp(argv[i], "--elapsed-time") == 0) {
             opt.start_utc = 0;
+        } else if (strncmp(argv[i], "--pdf=", 6) == 0) {
+            out_pdf = argv[i] + 6;
         } else {
             fprintf(stderr, "gen_waterfall: unknown option '%s'\n", argv[i]);
             usage();
@@ -1090,8 +1518,8 @@ int main(int argc, char **argv)
     int W = 0, H = 0;
     rc = render_with_axes(spec_rgb, spec_w, spec_h, &opt, duration_s,
                           &rgb, &W, &H);
-    free(spec_rgb);
     if (rc != 0) {
+        free(spec_rgb);
         fprintf(stderr, "gen_waterfall: render_with_axes failed\n");
         return 1;
     }
@@ -1099,6 +1527,7 @@ int main(int argc, char **argv)
     rc = write_png_rgb(out_png, rgb, W, H);
     free(rgb);
     if (rc != 0) {
+        free(spec_rgb);
         fprintf(stderr, "gen_waterfall: write %s: %s\n",
                 out_png, strerror(errno));
         return 1;
@@ -1106,5 +1535,18 @@ int main(int argc, char **argv)
     fprintf(stderr,
         "gen_waterfall: %s -> %s (%dx%d, %.1fs, fft=%d)\n",
         iq_path, out_png, W, H, duration_s, opt.fft_size);
+
+    if (out_pdf) {
+        int pdf_rc = write_pdf_with_axes(out_pdf, spec_rgb, spec_w, spec_h,
+                                         &opt, duration_s);
+        if (pdf_rc != 0) {
+            fprintf(stderr, "gen_waterfall: write %s: %s\n",
+                    out_pdf, strerror(errno));
+        } else {
+            fprintf(stderr, "gen_waterfall: %s -> %s (PDF, sharp labels)\n",
+                    iq_path, out_pdf);
+        }
+    }
+    free(spec_rgb);
     return 0;
 }
