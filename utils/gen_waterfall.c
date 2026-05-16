@@ -726,8 +726,32 @@ static int fmt_freq(double hz, char *out, size_t out_cap)
 
 static int fmt_time(double sec, char *out, size_t out_cap)
 {
-    if (sec >= 100.0)      return snprintf(out, out_cap, "%.0fs", sec);
-    else                   return snprintf(out, out_cap, "%.1fs", sec);
+    if (sec < 0.0) sec = 0.0;
+    int total = (int)(sec + 0.5);
+    int h = total / 3600;
+    int m = (total / 60) % 60;
+    int s = total % 60;
+    return snprintf(out, out_cap, "%02d:%02d:%02d", h, m, s);
+}
+
+// Pick a "human" time step from a fixed table (1, 2, 5, 10, 15, 30 s,
+// 1, 2, 5, 10, 15, 30 min, 1, 2, 4 h) so y-axis ticks land on round
+// HH:MM:SS values like 00:01:00 / 00:05:00 rather than 100s / 200s.
+static double pick_time_step(double range_s, int target_ticks)
+{
+    static const double steps[] = {
+        1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400
+    };
+    int n = (int)(sizeof steps / sizeof steps[0]);
+    if (range_s <= 0.0 || target_ticks < 1) return 1.0;
+    double target = range_s / (double) target_ticks;
+    double best = steps[0];
+    double best_d = fabs(steps[0] - target);
+    for (int i = 1; i < n; ++i) {
+        double d = fabs(steps[i] - target);
+        if (d < best_d) { best_d = d; best = steps[i]; }
+    }
+    return best;
 }
 
 // Compose the final PNG: spectrogram pixels in the centre, axis ticks
@@ -737,7 +761,7 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
                             const wf_opts_t *opt, double duration_s,
                             uint8_t **out_rgb, int *out_w, int *out_h)
 {
-    const int LM = 56;
+    const int LM = 80;
     const int RM = 12;
     const int TM = 12;
     const int BM = 28;
@@ -787,7 +811,7 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
     }
 
     // Time axis: 0..duration_s top-to-bottom across spec_h pixels.
-    double t_step = pick_tick_step(duration_s, 10);
+    double t_step = pick_time_step(duration_s, 10);
     double t0 = 0.0;
     for (double t = t0; t <= duration_s + 0.5 * t_step; t += t_step) {
         double frac = t / duration_s;

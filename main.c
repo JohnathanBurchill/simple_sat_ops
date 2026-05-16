@@ -3600,18 +3600,24 @@ static void render_predictions_panel(state_t *state, double jul_utc,
     clrtoeol();
 
     if (state->prediction.predicted_minutes_until_visible > 0) {
-        if (state->prediction.predicted_minutes_until_visible < 1) {
-            mvprintw(row++, col, "%15s   ", "next pass in");
+        double minutes_until = state->prediction.predicted_minutes_until_visible;
+        time_t aos_t = time(NULL) + (time_t)(minutes_until * 60.0);
+        struct tm aos_local;
+        localtime_r(&aos_t, &aos_local);
+        char aos_hhmm[8];
+        snprintf(aos_hhmm, sizeof aos_hhmm, "%02d:%02d",
+                 aos_local.tm_hour, aos_local.tm_min);
+        if (minutes_until < 1) {
+            mvprintw(row++, col, "%15s   %s ", "next pass", aos_hhmm);
             attron(COLOR_PAIR(2));
-            printw("%.0f seconds",
-                   floor(state->prediction.predicted_minutes_until_visible * 60.0));
+            printw("(in %.0fs)", floor(minutes_until * 60.0));
             attroff(COLOR_PAIR(2));
-        } else if (state->prediction.predicted_minutes_until_visible < 10) {
-            mvprintw(row++, col, "%15s   %.1f minutes", "next pass in",
-                     state->prediction.predicted_minutes_until_visible);
+        } else if (minutes_until < 10) {
+            mvprintw(row++, col, "%15s   %s (in %.1fm)", "next pass",
+                     aos_hhmm, minutes_until);
         } else {
-            mvprintw(row++, col, "%15s   %.0f minutes", "next pass in",
-                     state->prediction.predicted_minutes_until_visible);
+            mvprintw(row++, col, "%15s   %s (in %.0fm)", "next pass",
+                     aos_hhmm, minutes_until);
         }
         clrtoeol();
     } else {
