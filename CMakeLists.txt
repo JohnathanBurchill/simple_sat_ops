@@ -30,11 +30,28 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
 # so unconditional add is safe across host compilers.
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wformat-truncation -Wformat-overflow")
 
+# Sources live under src/<area>/. Every #include in the codebase is the
+# bare form `#include "foo.h"`, so we register every area as an include
+# directory once here and avoid editing thousands of include lines. New
+# areas: add the path below and `git mv` files into it.
+include_directories(
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/dsp
+    ${CMAKE_SOURCE_DIR}/src/proto
+    ${CMAKE_SOURCE_DIR}/src/beacon
+    ${CMAKE_SOURCE_DIR}/src/orbit
+    ${CMAKE_SOURCE_DIR}/src/hw
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+    ${CMAKE_SOURCE_DIR}/src/ipc
+    ${CMAKE_SOURCE_DIR}/src/db
+)
+
 # SDR-only build. The CAT-radio dispatcher (radio.c + radio_*.c) and the
 # ALSA-bound tools (tx_tone, tx_white_noise, tx_frame, rx_capture,
 # rx_live) have been retired. Hardware control of the RF chain now goes
 # through the B210 (libuhd) directly; operator coordination is in-band
-# over the sso_ipc socket (see sso_*.c).
+# over the sso_ipc socket (see src/ipc/sso_*.c).
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NCURSES ncurses)
 pkg_check_modules(OPENSSL libcrypto)
@@ -50,7 +67,7 @@ if (NOT SQLITE3_FOUND)
                     "install sqlite` on macOS) for full DB support.")
 endif()
 function(target_link_packet_db target)
-    target_sources(${target} PRIVATE packet_db.c)
+    target_sources(${target} PRIVATE src/db/packet_db.c)
     if (SQLITE3_FOUND)
         target_compile_definitions(${target} PRIVATE WITH_SQLITE3)
         target_include_directories(${target} PRIVATE ${SQLITE3_INCLUDE_DIRS})
@@ -76,10 +93,14 @@ endif()
 # tool plus the audit log. Pure POSIX; builds on every host. Pulled
 # in via target_link_sso_core() rather than a SHARED lib so the build
 # stays single-binary-per-target.
-set(SSO_CORE_SOURCES sso_paths.c sso_audit.c sso_ipc_paths.c sso_ipc.c sso_operator.c)
+set(SSO_CORE_SOURCES
+    src/ipc/sso_paths.c
+    src/ipc/sso_audit.c
+    src/ipc/sso_ipc_paths.c
+    src/ipc/sso_ipc.c
+    src/ipc/sso_operator.c)
 function(target_link_sso_core target)
     target_sources(${target} PRIVATE ${SSO_CORE_SOURCES})
-    target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR})
 endfunction()
 
 # Built-target accumulator. Every successfully-added target is appended
@@ -96,9 +117,8 @@ set(SSO_TARGETS)
 set(UNIT_TESTS_INCLUDE ${CMAKE_SOURCE_DIR}/unit_tests)
 
 # RS self-test: validates rs.c against reed_solomon_ccsds known vectors
-add_executable(rs_selftest unit_tests/rs_selftest.c rs.c)
-target_include_directories(rs_selftest PRIVATE
-    ${CMAKE_SOURCE_DIR} ${UNIT_TESTS_INCLUDE})
+add_executable(rs_selftest unit_tests/rs_selftest.c src/proto/rs.c)
+target_include_directories(rs_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS rs_selftest)
 
 # Antenna rotator self-test: covers the pure math helpers in
@@ -106,9 +126,8 @@ list(APPEND SSO_TARGETS rs_selftest)
 # home_unwrapped_target, to_mech_coords). No serial/UHD/ncurses deps;
 # builds on every host.
 add_executable(antenna_rotator_selftest
-               unit_tests/antenna_rotator_selftest.c antenna_rotator.c)
-target_include_directories(antenna_rotator_selftest PRIVATE
-    ${CMAKE_SOURCE_DIR} ${UNIT_TESTS_INCLUDE})
+               unit_tests/antenna_rotator_selftest.c src/hw/antenna_rotator.c)
+target_include_directories(antenna_rotator_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(antenna_rotator_selftest PRIVATE m)
 list(APPEND SSO_TARGETS antenna_rotator_selftest)
 
@@ -116,9 +135,8 @@ list(APPEND SSO_TARGETS antenna_rotator_selftest)
 # tle_path_resolve and audits the resulting 3-line TLE. Pure POSIX,
 # no external library deps.
 add_executable(tle_csv_selftest
-               unit_tests/tle_csv_selftest.c tle_csv.c)
-target_include_directories(tle_csv_selftest PRIVATE
-    ${CMAKE_SOURCE_DIR} ${UNIT_TESTS_INCLUDE})
+               unit_tests/tle_csv_selftest.c src/orbit/tle_csv.c)
+target_include_directories(tle_csv_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(tle_csv_selftest PRIVATE m)
 list(APPEND SSO_TARGETS tle_csv_selftest)
 
@@ -136,15 +154,14 @@ if (NCURSES_FOUND)
 endif()
 
 # FM-audio preview tool: baseband WAV -> audible FM-modulated WAV
-add_executable(fm_preview utils/fm_preview.c utils/wav_read.c modem.c)
-target_include_directories(fm_preview PRIVATE ${CMAKE_SOURCE_DIR})
+add_executable(fm_preview utils/fm_preview.c utils/wav_read.c
+               src/dsp/modem.c)
 target_link_libraries(fm_preview PRIVATE m)
 list(APPEND SSO_TARGETS fm_preview)
 
 # Beacon-cadence detector for post-pass triage of FM-demoded WAVs.
 add_executable(beacon_detect utils/beacon_detect.c utils/wav_read.c
-               biquad.c monitor_squelch.c)
-target_include_directories(beacon_detect PRIVATE ${CMAKE_SOURCE_DIR})
+               src/dsp/biquad.c src/dsp/monitor_squelch.c)
 target_link_libraries(beacon_detect PRIVATE m)
 list(APPEND SSO_TARGETS beacon_detect)
 
@@ -161,9 +178,9 @@ list(APPEND SSO_TARGETS gen_waterfall)
 # and A/B-checks against modem_pcm16_to_bits on the FM-discriminated
 # equivalent.
 add_executable(modem_iq_selftest unit_tests/modem_iq_selftest.c
-               modem.c modem_fsk.c modem_iq.c modem_viterbi.c)
-target_include_directories(modem_iq_selftest PRIVATE
-    ${CMAKE_SOURCE_DIR} ${UNIT_TESTS_INCLUDE})
+               src/dsp/modem.c src/dsp/modem_fsk.c
+               src/dsp/modem_iq.c src/dsp/modem_viterbi.c)
+target_include_directories(modem_iq_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(modem_iq_selftest PRIVATE m)
 list(APPEND SSO_TARGETS modem_iq_selftest)
 
@@ -171,7 +188,9 @@ list(APPEND SSO_TARGETS modem_iq_selftest)
 
 if (OPENSSL_FOUND)
     # Uplink test tool: builds CSP + AX100 frame, optionally modulates to WAV
-    add_executable(uplink_test uplink_test.c csp.c golay24.c ax100.c rs.c hmac_keyfile.c modem.c)
+    add_executable(uplink_test apps/uplink_test.c
+                   src/proto/csp.c src/proto/golay24.c src/proto/ax100.c
+                   src/proto/rs.c src/proto/hmac_keyfile.c src/dsp/modem.c)
     target_include_directories(uplink_test PRIVATE ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(uplink_test PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(uplink_test PRIVATE ${OPENSSL_LIBRARIES} m)
@@ -179,10 +198,12 @@ if (OPENSSL_FOUND)
 
     # Offline AX100 frame decoder: WAV/RAW -> demod -> ax100_unframe -> CSP
     add_executable(rx_decode utils/rx_decode.c utils/wav_read.c
-                   modem.c modem_fsk.c modem_iq.c modem_viterbi.c
-                   ax100.c rs.c golay24.c csp.c hmac_keyfile.c
-                   beacon_cts1.c decode_loop.c)
-    target_include_directories(rx_decode PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
+                   src/dsp/modem.c src/dsp/modem_fsk.c
+                   src/dsp/modem_iq.c src/dsp/modem_viterbi.c
+                   src/proto/ax100.c src/proto/rs.c src/proto/golay24.c
+                   src/proto/csp.c src/proto/hmac_keyfile.c
+                   src/beacon/beacon_cts1.c src/pipeline/decode_loop.c)
+    target_include_directories(rx_decode PRIVATE ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(rx_decode PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(rx_decode PRIVATE ${OPENSSL_LIBRARIES} m)
     target_link_packet_db(rx_decode)
@@ -191,8 +212,7 @@ if (OPENSSL_FOUND)
 
     # Non-interactive query CLI over the packet DB.
     add_executable(packet_query utils/packet_query.c)
-    target_include_directories(packet_query PRIVATE
-        ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
+    target_include_directories(packet_query PRIVATE ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(packet_query PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(packet_query PRIVATE ${OPENSSL_LIBRARIES} m)
     target_link_packet_db(packet_query)
@@ -205,8 +225,7 @@ if (OPENSSL_FOUND)
         target_compile_definitions(packet_browser PRIVATE
             PACKET_BROWSER_HAVE_NCURSES)
         target_include_directories(packet_browser PRIVATE
-            ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS}
-            ${NCURSES_INCLUDE_DIRS})
+            ${OPENSSL_INCLUDE_DIRS} ${NCURSES_INCLUDE_DIRS})
         target_link_directories(packet_browser PRIVATE
             ${OPENSSL_LIBRARY_DIRS} ${NCURSES_LIBRARY_DIRS})
         target_link_libraries(packet_browser PRIVATE
@@ -217,11 +236,15 @@ if (OPENSSL_FOUND)
     endif()
 
     # Offline sliding-window decoder for WAV / raw S16_LE files.
-    add_executable(rx_replay utils/rx_replay.c utils/wav_read.c decode_loop.c
-                   modem.c modem_fsk.c modem_iq.c modem_viterbi.c
-                   ax100.c rs.c golay24.c csp.c hmac_keyfile.c
-                   beacon_cts1.c rx_tui.c tle_csv.c)
-    target_include_directories(rx_replay PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
+    add_executable(rx_replay utils/rx_replay.c utils/wav_read.c
+                   src/pipeline/decode_loop.c
+                   src/dsp/modem.c src/dsp/modem_fsk.c
+                   src/dsp/modem_iq.c src/dsp/modem_viterbi.c
+                   src/proto/ax100.c src/proto/rs.c src/proto/golay24.c
+                   src/proto/csp.c src/proto/hmac_keyfile.c
+                   src/beacon/beacon_cts1.c src/pipeline/rx_tui.c
+                   src/orbit/tle_csv.c)
+    target_include_directories(rx_replay PRIVATE ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(rx_replay PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(rx_replay PRIVATE ${OPENSSL_LIBRARIES} m)
     if (NCURSES_FOUND)
@@ -232,7 +255,7 @@ if (OPENSSL_FOUND)
     endif()
     if (SGP4SDP4_LIB)
         target_compile_definitions(rx_replay PRIVATE WITH_SGP4SDP4)
-        target_sources(rx_replay PRIVATE prediction.c oem.c)
+        target_sources(rx_replay PRIVATE src/orbit/prediction.c src/orbit/oem.c)
         target_link_libraries(rx_replay PRIVATE ${SGP4SDP4_LIB})
     endif()
     target_link_packet_db(rx_replay)
@@ -243,17 +266,19 @@ if (OPENSSL_FOUND)
     # opts matrix + Golay/RS/HMAC error injection. Needs OpenSSL (HMAC)
     # so it lives in the OPENSSL_FOUND block.
     add_executable(ax100_selftest unit_tests/ax100_selftest.c
-                   ax100.c rs.c golay24.c hmac_keyfile.c)
+                   src/proto/ax100.c src/proto/rs.c
+                   src/proto/golay24.c src/proto/hmac_keyfile.c)
     target_include_directories(ax100_selftest PRIVATE
-        ${CMAKE_SOURCE_DIR} ${UNIT_TESTS_INCLUDE} ${OPENSSL_INCLUDE_DIRS})
+        ${UNIT_TESTS_INCLUDE} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(ax100_selftest PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(ax100_selftest PRIVATE ${OPENSSL_LIBRARIES} m)
     list(APPEND SSO_TARGETS ax100_selftest)
 
     # CTS1 beacon WAV generator
     add_executable(beacon_gen utils/beacon_gen.c
-                   csp.c golay24.c ax100.c rs.c hmac_keyfile.c modem.c)
-    target_include_directories(beacon_gen PRIVATE ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS})
+                   src/proto/csp.c src/proto/golay24.c src/proto/ax100.c
+                   src/proto/rs.c src/proto/hmac_keyfile.c src/dsp/modem.c)
+    target_include_directories(beacon_gen PRIVATE ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(beacon_gen PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(beacon_gen PRIVATE ${OPENSSL_LIBRARIES} m)
     list(APPEND SSO_TARGETS beacon_gen)
@@ -261,9 +286,10 @@ if (OPENSSL_FOUND)
     # SDR single-shot frame transmitter (B210 / libuhd)
     if (WITH_USRP_B210)
         add_executable(tx_frame_sdr utils/tx_frame_sdr.c
-                       csp.c golay24.c ax100.c rs.c hmac_keyfile.c modem.c)
+                       src/proto/csp.c src/proto/golay24.c src/proto/ax100.c
+                       src/proto/rs.c src/proto/hmac_keyfile.c src/dsp/modem.c)
         target_include_directories(tx_frame_sdr PRIVATE
-            ${CMAKE_SOURCE_DIR} ${OPENSSL_INCLUDE_DIRS} ${UHD_INCLUDE_DIRS})
+            ${OPENSSL_INCLUDE_DIRS} ${UHD_INCLUDE_DIRS})
         target_link_directories(tx_frame_sdr PRIVATE
             ${OPENSSL_LIBRARY_DIRS} ${UHD_LIBRARY_DIRS})
         target_link_libraries(tx_frame_sdr PRIVATE
@@ -272,9 +298,10 @@ if (OPENSSL_FOUND)
         list(APPEND SSO_TARGETS tx_frame_sdr)
 
         # B210 record-only RX capture.
-        add_executable(b210_rx_capture utils/b210_rx_capture.c modem.c)
+        add_executable(b210_rx_capture utils/b210_rx_capture.c
+                       src/dsp/modem.c)
         target_include_directories(b210_rx_capture PRIVATE
-            ${CMAKE_SOURCE_DIR} ${UHD_INCLUDE_DIRS})
+            ${UHD_INCLUDE_DIRS})
         target_link_directories(b210_rx_capture PRIVATE
             ${UHD_LIBRARY_DIRS})
         target_link_libraries(b210_rx_capture PRIVATE
@@ -297,12 +324,15 @@ endif()
 
 if (SGP4SDP4_LIB)
     # Next-pass scheduling tool
-    add_executable(next_in_queue next_in_queue.c prediction.c satellite_status.c oem.c tle_csv.c)
+    add_executable(next_in_queue apps/next_in_queue.c
+                   src/orbit/prediction.c src/beacon/satellite_status.c
+                   src/orbit/oem.c src/orbit/tle_csv.c)
     target_link_libraries(next_in_queue PRIVATE ${SGP4SDP4_LIB} m)
     list(APPEND SSO_TARGETS next_in_queue)
 
     # Toy orbit-decay estimator
-    add_executable(lifetime lifetime.c prediction.c oem.c tle_csv.c)
+    add_executable(lifetime apps/lifetime.c
+                   src/orbit/prediction.c src/orbit/oem.c src/orbit/tle_csv.c)
     target_link_libraries(lifetime PRIVATE ${SGP4SDP4_LIB} m)
     list(APPEND SSO_TARGETS lifetime)
 
@@ -311,9 +341,9 @@ if (SGP4SDP4_LIB)
     # update_pass_predictions, and assert physically-plausible ranges.
     # Pulls oem.c + ncurses through prediction.c's transitive deps.
     add_executable(prediction_selftest
-                   unit_tests/prediction_selftest.c prediction.c oem.c)
-    target_include_directories(prediction_selftest PRIVATE
-        ${CMAKE_SOURCE_DIR} ${UNIT_TESTS_INCLUDE})
+                   unit_tests/prediction_selftest.c
+                   src/orbit/prediction.c src/orbit/oem.c)
+    target_include_directories(prediction_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
     target_link_libraries(prediction_selftest PRIVATE ${SGP4SDP4_LIB} m)
     if (NCURSES_FOUND)
         target_include_directories(prediction_selftest PRIVATE
@@ -334,14 +364,21 @@ endif()
 # linked directly; the UHD-dependent pieces sit behind WITH_USRP_B210.
 
 if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
-    add_executable(simple_sat_ops main.c prediction.c
-                   antenna_rotator.c telemetry.c oem.c
-                   decode_loop.c modem.c modem_fsk.c modem_iq.c modem_viterbi.c
-                   ax100.c rs.c golay24.c csp.c
-                   hmac_keyfile.c beacon_cts1.c tle_csv.c
-                   biquad.c monitor_squelch.c)
+    add_executable(simple_sat_ops apps/main.c
+                   src/orbit/prediction.c src/orbit/oem.c
+                   src/hw/antenna_rotator.c
+                   src/beacon/telemetry.c
+                   src/pipeline/decode_loop.c
+                   src/dsp/modem.c src/dsp/modem_fsk.c
+                   src/dsp/modem_iq.c src/dsp/modem_viterbi.c
+                   src/proto/ax100.c src/proto/rs.c
+                   src/proto/golay24.c src/proto/csp.c
+                   src/proto/hmac_keyfile.c
+                   src/beacon/beacon_cts1.c
+                   src/orbit/tle_csv.c
+                   src/dsp/biquad.c src/dsp/monitor_squelch.c)
     target_include_directories(simple_sat_ops PRIVATE
-        ${CMAKE_SOURCE_DIR} ${NCURSES_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
+        ${NCURSES_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(simple_sat_ops PRIVATE
         ${NCURSES_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(simple_sat_ops PRIVATE
@@ -349,7 +386,8 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
     if (WITH_USRP_B210)
         target_compile_definitions(simple_sat_ops PRIVATE WITH_USRP_B210)
         target_sources(simple_sat_ops PRIVATE
-                       b210_rx_tx_core.c fir_decim.c rx_session.c tx_burst.c)
+                       src/hw/b210_rx_tx_core.c src/dsp/fir_decim.c
+                       src/pipeline/rx_session.c src/pipeline/tx_burst.c)
         target_include_directories(simple_sat_ops PRIVATE ${UHD_INCLUDE_DIRS})
         target_link_directories(simple_sat_ops PRIVATE ${UHD_LIBRARY_DIRS})
         target_link_libraries(simple_sat_ops PRIVATE ${UHD_LIBRARIES})
