@@ -4884,16 +4884,14 @@ int main(int argc, char **argv)
         }
 
         if (redraw_due) {
-            mvprintw(keyboard_info_row, 3, "%s : %s", "Keyboard",
+            // Width-padded prints (not clrtoeol) so we don't wipe the
+            // signal ribbon that paints over the right edge of these rows.
+            mvprintw(keyboard_info_row, 3, "%s : %-8s", "Keyboard",
                      keyboard_unlocked ? "unlocked" : "LOCKED");
-            clrtoeol();
-            if (state.antenna_rotator.antenna_is_moving) {
-                mvprintw(keyboard_info_row + 2, 0, "%s", "Antenna moving");
-                clrtoeol();
-            } else {
-                mvprintw(keyboard_info_row + 2, 0, "%s", "Antenna stationary");
-                clrtoeol();
-            }
+            mvprintw(keyboard_info_row + 2, 0, "%-18s",
+                     state.antenna_rotator.antenna_is_moving
+                         ? "Antenna moving"
+                         : "Antenna stationary");
             t_last_redraw = t_now;
         }
 
