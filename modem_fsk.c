@@ -33,8 +33,8 @@
 // Default cutoff is 12 kHz — the empirical sweet spot on the
 // 2026-05-15 RAO capture: tight enough to bring the t≈150/232
 // near-TCA beacons cleanly through RS, wide enough that the FSK
-// pulse shape (deviation 3200, baud 9600) isn't distorted. Override
-// with $FSK_IQ_LPF_HZ for sweeps.
+// pulse shape (deviation 2400, baud 9600 → h=0.5 MSK) isn't
+// distorted. Override with $FSK_IQ_LPF_HZ for sweeps.
 #define FSK_IQ_LPF_LEN 31
 
 // Build a Hamming-windowed sinc LPF kernel for the given cutoff at
