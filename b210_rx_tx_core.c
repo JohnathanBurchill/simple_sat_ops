@@ -137,11 +137,17 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
     if (log_uhd(uhd_usrp_set_rx_antenna(c->dev, rx_antenna, 0), "set_rx_antenna")) goto fail;
 
     {
+        // mode_n=fractional forces the AD9361's fractional-N PLL so the LO
+        // resolution is ~2 Hz; without it UHD defaults to integer-N on
+        // some builds and the actual tune snaps to multi-kHz boundaries.
+        // The fine offset (target - chosen LO) is taken up by the DSP NCO,
+        // which has ~fs/2^32 ≈ 0.0001 Hz step at 480 kSPS.
+        char tune_args[] = "mode_n=fractional";
         uhd_tune_request_t req = {
             .target_freq     = p->freq_hz,
             .rf_freq_policy  = UHD_TUNE_REQUEST_POLICY_AUTO, .rf_freq = 0.0,
             .dsp_freq_policy = UHD_TUNE_REQUEST_POLICY_AUTO, .dsp_freq = 0.0,
-            .args            = NULL,
+            .args            = tune_args,
         };
         uhd_tune_result_t res = {0};
         if (log_uhd(uhd_usrp_set_rx_freq(c->dev, &req, 0, &res), "set_rx_freq")) goto fail;
@@ -370,11 +376,14 @@ ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *c, int16_t *pcm_out, size_t pcm_
 int b210_rx_tx_core_set_freq(b210_rx_tx_core_t *c, double freq_hz)
 {
     if (c == NULL) return -1;
+    // See init for why we pass mode_n=fractional; without it the LO
+    // snaps to multi-kHz boundaries and Doppler retunes are wasted.
+    char tune_args[] = "mode_n=fractional";
     uhd_tune_request_t req = {
         .target_freq     = freq_hz,
         .rf_freq_policy  = UHD_TUNE_REQUEST_POLICY_AUTO, .rf_freq = 0.0,
         .dsp_freq_policy = UHD_TUNE_REQUEST_POLICY_AUTO, .dsp_freq = 0.0,
-        .args            = NULL,
+        .args            = tune_args,
     };
     uhd_tune_result_t res = {0};
     if (log_uhd(uhd_usrp_set_rx_freq(c->dev, &req, 0, &res), "set_rx_freq")) {
