@@ -45,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -326,7 +327,38 @@ typedef struct {
     int    dc_notch;      // 1 = interpolate over DC bin (B210 LO spike); 0 = off
     int    dc_notch_bins; // half-width of the notch in FFT bins (each side)
     double display_bw_hz; // filled in by build_waterfall — the actual rendered BW
+    time_t start_utc;     // capture start in UTC; 0 = unknown, render elapsed time
 } wf_opts_t;
+
+// Parse "YYYYMMDDTHHMMSS" out of `s` (a longer suffix like ".698.iq" is
+// fine, sscanf ignores trailing bytes). Returns 0 on parse failure.
+static time_t parse_ut_string(const char *s)
+{
+    if (s == NULL) return 0;
+    int Y, M, D, h, m, sec;
+    char T;
+    if (sscanf(s, "%4d%2d%2d%c%2d%2d%2d",
+               &Y, &M, &D, &T, &h, &m, &sec) != 7) return 0;
+    if (T != 'T') return 0;
+    struct tm tm = {0};
+    tm.tm_year = Y - 1900;
+    tm.tm_mon  = M - 1;
+    tm.tm_mday = D;
+    tm.tm_hour = h;
+    tm.tm_min  = m;
+    tm.tm_sec  = sec;
+    return timegm(&tm);
+}
+
+// simple_sat_ops names IQ files <prefix>_UT=YYYYMMDDTHHMMSS.fff.iq. Pull
+// the UT timestamp out of the filename. Returns 0 if there is no "UT=".
+static time_t parse_ut_from_path(const char *path)
+{
+    if (path == NULL) return 0;
+    const char *p = strstr(path, "UT=");
+    if (p == NULL) return 0;
+    return parse_ut_string(p + 3);
+}
 
 static float median_inplace(float *buf, int n)
 {
@@ -724,9 +756,16 @@ static int fmt_freq(double hz, char *out, size_t out_cap)
     }
 }
 
-static int fmt_time(double sec, char *out, size_t out_cap)
+static int fmt_time(time_t base_utc, double sec, char *out, size_t out_cap)
 {
     if (sec < 0.0) sec = 0.0;
+    if (base_utc != 0) {
+        time_t t = base_utc + (time_t)(sec + 0.5);
+        struct tm lt;
+        localtime_r(&t, &lt);
+        return snprintf(out, out_cap, "%02d:%02d:%02d",
+                        lt.tm_hour, lt.tm_min, lt.tm_sec);
+    }
     int total = (int)(sec + 0.5);
     int h = total / 3600;
     int m = (total / 60) % 60;
@@ -821,7 +860,7 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
             px_set(rgb, W, H, LM - 1 - dx, y, TIC_R, TIC_G, TIC_B);
         }
         char buf[24];
-        fmt_time(t, buf, sizeof buf);
+        fmt_time(opt->start_utc, t, buf, sizeof buf);
         int lw = text_width(buf, 1);
         draw_text(rgb, W, H, LM - 8 - lw, y - 3, buf, 1,
                   LBL_R, LBL_G, LBL_B);
@@ -931,6 +970,10 @@ int main(int argc, char **argv)
     opt.dc_notch      = 0;
     opt.dc_notch_bins = 4;            // ±4 bins ≈ ±188 Hz at fft=1024 fs=48k
     opt.display_bw_hz = 0.0;          // build_waterfall fills this in
+    // simple_sat_ops names IQ files <prefix>_UT=YYYYMMDDTHHMMSS.fff.iq;
+    // parse that out so the y-axis labels show local clock time. CLI
+    // --start-utc=YYYYMMDDTHHMMSS overrides.
+    opt.start_utc     = parse_ut_from_path(iq_path);
 
     for (int i = 4; i < argc; ++i) {
         int rc = 0;
@@ -965,6 +1008,16 @@ int main(int argc, char **argv)
         } else if ((rc = parse_int_opt(argv[i], "--dc-notch-bins=", &v)) != 0) {
             if (rc < 0) { usage(); return 2; }
             opt.dc_notch_bins = v;
+        } else if (strncmp(argv[i], "--start-utc=", 12) == 0) {
+            time_t t = parse_ut_string(argv[i] + 12);
+            if (t == 0) {
+                fprintf(stderr,
+                    "gen_waterfall: --start-utc must be YYYYMMDDTHHMMSS\n");
+                return 2;
+            }
+            opt.start_utc = t;
+        } else if (strcmp(argv[i], "--elapsed-time") == 0) {
+            opt.start_utc = 0;
         } else {
             fprintf(stderr, "gen_waterfall: unknown option '%s'\n", argv[i]);
             usage();
