@@ -15,30 +15,73 @@
 #include "modem_fsk.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define ASM_BIG_ENDIAN_U32 0x930B51DEu
 
-// 31-tap Hamming-windowed sinc LPF, cutoff 12 kHz at 48 kHz fs. Applied
-// to I and Q separately before the FM discriminator. The atan2 in the
-// discriminator is nonlinear at medium SNR — out-of-band noise that
-// the downstream MF would otherwise reject ends up modulating into
+// IQ low-pass filter (Hamming-windowed sinc) applied separately to
+// I and Q before the FM discriminator. The atan2 inside the
+// discriminator is nonlinear at medium SNR — out-of-band noise the
+// downstream MF would otherwise reject ends up modulating into
 // in-band noise through atan2's "click" behaviour, so trimming the
 // noise bandwidth FIRST gains ~2-3 dB of effective SNR on real RF
-// captures. 12 kHz keeps the full ~10 kHz FrontierSat signal even at
-// the max ~±10 kHz of in-pass Doppler — same approach gr_satellites
-// uses (its quadrature_demod typically follows a bandpass filter).
-static const float fsk_iq_lpf[31] = {
-    -1.700397e-03f, +1.758030e-18f, +2.937332e-03f, -3.276872e-18f, -6.730091e-03f,
-    +6.051933e-18f, +1.409389e-02f, -9.603382e-18f, -2.678504e-02f, +1.331714e-17f,
-    +4.909896e-02f, -1.655106e-17f, -9.693833e-02f, +1.874598e-17f, +3.156196e-01f,
-    +5.008082e-01f, +3.156196e-01f, +1.874598e-17f, -9.693833e-02f, -1.655106e-17f,
-    +4.909896e-02f, +1.331714e-17f, -2.678504e-02f, -9.603382e-18f, +1.409389e-02f,
-    +6.051933e-18f, -6.730091e-03f, -3.276872e-18f, +2.937332e-03f, +1.758030e-18f,
-    -1.700397e-03f,
-};
+// captures. Same approach gr_satellites uses (its quadrature_demod
+// typically follows a bandpass filter).
+//
+// Default cutoff is 12 kHz — the empirical sweet spot on the
+// 2026-05-15 RAO capture: tight enough to bring the t≈150/232
+// near-TCA beacons cleanly through RS, wide enough that the FSK
+// pulse shape (deviation 3200, baud 9600) isn't distorted. Override
+// with $FSK_IQ_LPF_HZ for sweeps.
 #define FSK_IQ_LPF_LEN 31
+
+// Build a Hamming-windowed sinc LPF kernel for the given cutoff at
+// the given sample rate. fc_hz is the -6 dB cutoff; the transition
+// band rolls off over roughly ±fs/(N+1) on either side. Returns the
+// normalised kernel in `out` (DC gain = 1).
+static void fsk_build_iq_lpf(double fc_hz, double fs, float out[FSK_IQ_LPF_LEN])
+{
+    int N = FSK_IQ_LPF_LEN;
+    double sum = 0.0;
+    for (int n = 0; n < N; ++n) {
+        double t = (double) n - (double)(N - 1) / 2.0;
+        double sinc_v;
+        if (t == 0.0) {
+            sinc_v = 1.0;
+        } else {
+            double x = 2.0 * fc_hz / fs * t;
+            sinc_v = sin(M_PI * x) / (M_PI * x);
+        }
+        double w = 0.54 - 0.46 * cos(2.0 * M_PI * (double) n / (double)(N - 1));
+        double k = 2.0 * fc_hz / fs * sinc_v * w;
+        out[n] = (float) k;
+        sum += k;
+    }
+    if (sum != 0.0) {
+        for (int n = 0; n < N; ++n) out[n] = (float)((double) out[n] / sum);
+    }
+}
+
+// Read the LPF cutoff from $FSK_IQ_LPF_HZ if set, otherwise the
+// default 12 kHz that empirically gave the cleanest decodes on the
+// 2026-05-15 RAO capture (low-Doppler bursts at TCA). Cached after
+// first lookup.
+static double fsk_iq_lpf_cutoff_hz(void)
+{
+    static double cached = -1.0;
+    if (cached < 0.0) {
+        const char *env = getenv("FSK_IQ_LPF_HZ");
+        if (env != NULL && *env != '\0') {
+            cached = atof(env);
+            if (cached < 1000.0 || cached > 22000.0) cached = 12000.0;
+        } else {
+            cached = 12000.0;
+        }
+    }
+    return cached;
+}
 
 // Lowest-Hamming ASM finder, same convention as modem_iq.c /
 // modem_viterbi.c (duplicated here so this TU is independent).
@@ -98,6 +141,10 @@ int modem_fsk_iq_to_bits(const int16_t *iq_pairs, size_t n_pairs,
     // 1. Pre-FM-discriminator low-pass filter on I and Q. See the
     //    fsk_iq_lpf comment above for why this matters. Output length
     //    after a valid-only convolution is n_pairs - FSK_IQ_LPF_LEN + 1.
+    float lpf_kernel[FSK_IQ_LPF_LEN];
+    fsk_build_iq_lpf(fsk_iq_lpf_cutoff_hz(), (double) p->samp_rate,
+                     lpf_kernel);
+
     size_t iq_lpf_n = n_pairs - (size_t) FSK_IQ_LPF_LEN + 1u;
     float *I_lpf = (float *) malloc(iq_lpf_n * sizeof(float));
     float *Q_lpf = (float *) malloc(iq_lpf_n * sizeof(float));
@@ -108,7 +155,7 @@ int modem_fsk_iq_to_bits(const int16_t *iq_pairs, size_t n_pairs,
     for (size_t i = 0; i < iq_lpf_n; ++i) {
         double accI = 0.0, accQ = 0.0;
         for (int k = 0; k < FSK_IQ_LPF_LEN; ++k) {
-            double h = (double) fsk_iq_lpf[k];
+            double h = (double) lpf_kernel[k];
             accI += h * (double) iq_pairs[(i + (size_t) k) * 2 + 0];
             accQ += h * (double) iq_pairs[(i + (size_t) k) * 2 + 1];
         }
