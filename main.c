@@ -1085,8 +1085,14 @@ static void tx_log_push(const sso_event_t *evt)
 static void render_tx_log_panel(int start_row, int col)
 {
     int row = start_row;
-    mvprintw(row++, col, "TX log");
-    clrtoeol();
+    // Cap width so clrtoeol-equivalent padding doesn't wipe the
+    // vertical ribbon (rendered at col COLS-2). Leave a 1-col gap.
+    int safe_w = COLS - col - 3;
+    if (safe_w < 8)   safe_w = 8;
+    if (safe_w > 200) safe_w = 200;
+
+    mvprintw(row++, col, "%-*.*s", safe_w, safe_w, "TX log");
+
     for (size_t i = 0; i < g_tx_log_count; ++i) {
         const tx_log_entry_t *e = &g_tx_log[i];
         const char *tag = "sent>  ";
@@ -1098,15 +1104,16 @@ static void render_tx_log_panel(int start_row, int col)
             tag = "ack>   ";
             attr = A_DIM;
         }
-        attron(attr);
+        char line[256];
         if (e->kind == SSO_EVT_TX_ACK && e->tx_ack_status[0]) {
-            mvprintw(row++, col, "%s  %s %.40s  [%s]",
+            snprintf(line, sizeof line, "%s  %s %.40s  [%s]",
                      e->ts, tag, e->ascii, e->tx_ack_status);
         } else {
-            mvprintw(row++, col, "%s  %s %.60s",
+            snprintf(line, sizeof line, "%s  %s %.60s",
                      e->ts, tag, e->ascii);
         }
-        clrtoeol();
+        attron(attr);
+        mvprintw(row++, col, "%-*.*s", safe_w, safe_w, line);
         attroff(attr);
     }
 }
