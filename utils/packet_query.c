@@ -348,12 +348,17 @@ int main(int argc, char **argv)
     }
 
     sqlite3 *db = NULL;
-    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+    // RW (not READONLY) so SQLite can create/mmap the -shm and -wal
+    // sidecar files; see packet_browser.c for the full story. Queries
+    // here are read-only by construction.
+    if (sqlite3_open_v2(db_path, &db,
+                        SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
         fprintf(stderr, "packet_query: open(%s): %s\n",
                 db_path, db ? sqlite3_errmsg(db) : "unknown");
         if (db) sqlite3_close(db);
         return 1;
     }
+    sqlite3_busy_timeout(db, 5000);
 
     char sql[2048];
     int n_params = 0;

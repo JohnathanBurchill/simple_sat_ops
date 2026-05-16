@@ -833,12 +833,19 @@ int main(int argc, char **argv)
     }
 
     sqlite3 *db = NULL;
-    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+    // Open RW (not READONLY) so SQLite can create/mmap the -shm and -wal
+    // sidecar files. Under READONLY a WAL database silently falls back to
+    // "rollback-journal emulation", whose SHARED read lock blocks the
+    // writer (simple_sat_ops) and causes its inserts to time out with
+    // "database is locked". We never issue any UPDATE/INSERT/DELETE here.
+    if (sqlite3_open_v2(db_path, &db,
+                        SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
         fprintf(stderr, "packet_browser: open(%s) failed: %s\n",
                 db_path, db ? sqlite3_errmsg(db) : "?");
         if (db) sqlite3_close(db);
         return 1;
     }
+    sqlite3_busy_timeout(db, 5000);
 
     if (initscr() == NULL) {
         sqlite3_close(db);
