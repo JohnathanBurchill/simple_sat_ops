@@ -337,8 +337,15 @@ typedef struct wf_opts {
     int    dc_notch_bins; // half-width of the notch in FFT bins (each side)
     double display_bw_hz; // filled in by build_waterfall — the actual rendered BW
     time_t start_utc;     // capture start in UTC; 0 = unknown, render elapsed time
-    float  display_db_lo; // filled in by build_waterfall — the dB range mapped
-    float  display_db_hi; //   onto colormap indices [0..255]; lights the colorbar.
+    float  display_db_lo;    // filled in by build_waterfall — the dB range mapped
+    float  display_db_hi;    //   onto colormap indices [0..255]; lights the colorbar.
+    float  display_db_floor; // estimated noise floor in dBFS (median of per-bin
+                             // medians, FFT-window normalised). Added to the
+                             // colorbar tick values so the operator reads
+                             // absolute power rather than "delta above floor".
+    float  power_offset_db;  // optional CLI shift (e.g. dBFS -> dBm); applied
+                             // on top of display_db_floor at label time.
+    char   power_unit[8];    // "dBFS" by default, "dBm" if power_offset_db set.
 } wf_opts_t;
 static double pick_tick_step(double range, int target_ticks);
 static double pick_time_step(double range_s, int target_ticks);
@@ -590,9 +597,14 @@ static int write_pdf_with_axes(const char *path,
                   LM - 10 - label_w_pt, y - 3, esc);
     }
 
-    // 6. Colorbar dB ticks + labels.
+    // 6. Colorbar dB ticks + labels. Same offset trick as the PNG: tick
+    // positions are in median-subtracted space (matching the colormap),
+    // tick labels are absolute power (dBFS by default, dBm if the user
+    // passed --power-offset).
     float db_lo = opt->display_db_lo, db_hi = opt->display_db_hi;
     float db_range = db_hi - db_lo;
+    double label_offset_pdf = (double) opt->display_db_floor
+                            + (double) opt->power_offset_db;
     if (db_range > 0.0f) {
         double db_step = pick_tick_step(db_range, 6);
         double db0 = ceil(db_lo / db_step) * db_step;
@@ -602,11 +614,18 @@ static int write_pdf_with_axes(const char *path,
             CS_APPEND("ET 0.65 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
                       cb_x + CB_W, y, cb_x + CB_W + 4, y);
             char buf[24], esc[40];
-            snprintf(buf, sizeof buf, "%.0f", v);
+            snprintf(buf, sizeof buf, "%.0f", v + label_offset_pdf);
             pdf_escape(buf, esc, sizeof esc);
             CS_APPEND("1 0 0 1 %d %.1f Tm (%s) Tj\n",
                       cb_x + CB_W + 7, y - 3, esc);
         }
+    }
+    // Unit label ("dBFS" / "dBm") above the colorbar in Helvetica.
+    {
+        char esc[16];
+        pdf_escape(opt->power_unit, esc, sizeof esc);
+        CS_APPEND("1 0 0 1 %d %d Tm (%s) Tj\n",
+                  cb_x, BM + spec_h + 4, esc);
     }
 
     CS_APPEND("ET\n");
@@ -842,18 +861,34 @@ static int build_waterfall(const int16_t *iq, size_t n_pairs,
     }
     free(spec);
 
-    // Per-bin median subtraction so the noise floor flattens out.
+    // Per-bin median subtraction so the noise floor flattens out. The
+    // per-bin medians also feed an absolute-dBFS calibration for the
+    // colorbar labels — without that step the bar reads "delta above
+    // bin median", which is mathematically defensible but looks like
+    // "0..10" with no units in the operator's eye.
     float *col = (float *) malloc((size_t) out_rows * sizeof(float));
-    if (!col) { free(binned); return -1; }
+    float *bin_medians = (float *) malloc((size_t) N * sizeof(float));
+    if (!col || !bin_medians) {
+        free(col); free(bin_medians); free(binned); return -1;
+    }
     for (int k = 0; k < N; ++k) {
         for (int r = 0; r < out_rows; ++r) {
             col[r] = binned[(size_t) r * (size_t) N + (size_t) k];
         }
         float med = median_inplace(col, out_rows);
+        bin_medians[k] = med;
         for (int r = 0; r < out_rows; ++r) {
             binned[(size_t) r * (size_t) N + (size_t) k] -= med;
         }
     }
+    // Global noise floor estimate: median of the per-bin medians. The
+    // raw FFT-power values are referenced to peak |Z|^2 = (N/2)^2 for
+    // a full-scale complex tone (Hann coherent gain = 0.5), so subtract
+    // 20*log10(N/2) to land on dBFS. With N=1024 that's ~54 dB.
+    float floor_raw_db = median_inplace(bin_medians, N);
+    float fft_scale_db = 20.0f * (float) log10((double) opt->fft_size / 2.0);
+    ((wf_opts_t *) opt)->display_db_floor = floor_raw_db - fft_scale_db;
+    free(bin_medians);
     free(col);
 
     // B210 direct-conversion LO bleed lands on the DC bin and a couple
@@ -1046,6 +1081,13 @@ static const uint8_t G_t[7]   = {0x08,0x08,0x1E,0x08,0x08,0x09,0x06};
 static const uint8_t G_f[7]   = {0x06,0x09,0x08,0x1E,0x08,0x08,0x08};
 static const uint8_t G_T[7]   = {0x1F,0x04,0x04,0x04,0x04,0x04,0x04};
 static const uint8_t G_sp[7]  = {0,0,0,0,0,0,0};
+// Lowercase d, uppercase B/F/S, lowercase m — needed to render the
+// colorbar unit label ("dBFS" / "dBm") with the same bitmap font.
+static const uint8_t G_d[7]   = {0x01,0x01,0x01,0x0F,0x11,0x11,0x0F};
+static const uint8_t G_B[7]   = {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E};
+static const uint8_t G_F[7]   = {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10};
+static const uint8_t G_S[7]   = {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E};
+static const uint8_t G_m[7]   = {0x00,0x00,0x1A,0x15,0x15,0x15,0x15};
 
 static const uint8_t *glyph_for(char c)
 {
@@ -1061,6 +1103,9 @@ static const uint8_t *glyph_for(char c)
         case 'H': return G_H;   case 'z': return G_z;
         case 's': return G_s;   case 't': return G_t;
         case 'f': return G_f;   case 'T': return G_T;
+        case 'd': return G_d;   case 'B': return G_B;
+        case 'F': return G_F;   case 'S': return G_S;
+        case 'm': return G_m;
         default:  return G_sp;
     }
 }
@@ -1300,9 +1345,15 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
         px_set(rgb, W, H, x, TM + spec_h,    120, 120, 120);
     }
 
-    // dB ticks + labels on the right side of the strip.
+    // dB ticks + labels on the right side of the strip. Tick POSITIONS
+    // are in the median-subtracted ("delta above floor") space so they
+    // line up with the colormap mapping; tick LABELS shift by
+    // display_db_floor (+ optional --power-offset) so the numbers read
+    // as absolute dBFS (or dBm if the user calibrated).
     double db_step = pick_tick_step(db_range, 6);
     double db0 = ceil(db_lo / db_step) * db_step;
+    double label_offset = (double) opt->display_db_floor
+                        + (double) opt->power_offset_db;
     for (double v = db0; v <= db_hi + 0.5 * db_step; v += db_step) {
         float frac = (float)((v - db_lo) / db_range);
         int y = TM + (int)((1.0f - frac) * (float)(spec_h - 1) + 0.5f);
@@ -1311,8 +1362,18 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
             px_set(rgb, W, H, cb_x_hi + 1 + dx, y, TIC_R, TIC_G, TIC_B);
         }
         char buf[16];
-        snprintf(buf, sizeof buf, "%.0f", v);
+        snprintf(buf, sizeof buf, "%.0f", v + label_offset);
         draw_text(rgb, W, H, cb_x_hi + 8, y - 3, buf, 1,
+                  LBL_R, LBL_G, LBL_B);
+    }
+    // Unit label above the colorbar so "0 to 10" doesn't read as
+    // dimensionless any more. Uses the small bitmap font; only chars
+    // present in glyph_for() render — extended chars fall back to a
+    // blank glyph, which is fine for the typical "dBFS"/"dBm" strings.
+    {
+        int unit_x = cb_x_lo - 2;
+        int unit_y = TM - 9;
+        draw_text(rgb, W, H, unit_x, unit_y, opt->power_unit, 1,
                   LBL_R, LBL_G, LBL_B);
     }
 
@@ -1329,16 +1390,20 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
 static void usage(void)
 {
     fprintf(stderr,
-        "usage: gen_waterfall <iq_path> <sample_rate_hz> <out_png>\n"
+        "usage: gen_waterfall <iq_path> <sample_rate_hz> [<out_png>]\n"
+        "                     [--pdf=<out_pdf>]\n"
         "                     [--fft=N] [--rows=N] [--db-min=X]\n"
         "                     [--db-max=X] [--center-hz=F]\n"
         "                     [--zoom-khz=W] [--full-width]\n"
         "                     [--dc-notch] [--dc-notch-bins=N]\n"
+        "                     [--power-offset=X] [--power-unit=U]\n"
         "\n"
         "  Reads raw interleaved int16 I,Q samples (no header) from\n"
         "  <iq_path> at <sample_rate_hz>, builds a SatNOGS-style\n"
-        "  waterfall PNG with viridis colormap, and writes it to\n"
-        "  <out_png>.\n"
+        "  waterfall with viridis colormap, and writes one or both of:\n"
+        "    <out_png>            full-raster PNG (positional arg 3)\n"
+        "    --pdf=<out_pdf>      vector-text PDF (sharp labels at any zoom)\n"
+        "  Either output is fine on its own; supply both to emit both.\n"
         "\n"
         "  Options:\n"
         "    --fft=N              FFT length per frame, power of two.\n"
@@ -1390,11 +1455,19 @@ static int parse_int_opt(const char *arg, const char *prefix, int *out)
 
 int main(int argc, char **argv)
 {
-    if (argc < 4) { usage(); return 2; }
+    if (argc < 3) { usage(); return 2; }
     const char *iq_path  = argv[1];
     int sample_rate      = atoi(argv[2]);
-    const char *out_png  = argv[3];
+    // PNG path is positional but now optional — if argv[3] starts with
+    // "--" it's already an option and the user is asking for PDF-only
+    // (which they must supply via --pdf=...). We validate below.
+    const char *out_png  = NULL;
     const char *out_pdf  = NULL;  // --pdf=<path>: emit a vector-text PDF too
+    int first_opt = 3;
+    if (argc >= 4 && strncmp(argv[3], "--", 2) != 0) {
+        out_png = argv[3];
+        first_opt = 4;
+    }
 
     wf_opts_t opt;
     opt.fft_size      = 1024;
@@ -1414,13 +1487,18 @@ int main(int argc, char **argv)
     // --dc-notch when capturing from an SDR that leaks DC.
     opt.dc_notch      = 0;
     opt.dc_notch_bins = 4;            // ±4 bins ≈ ±188 Hz at fft=1024 fs=48k
-    opt.display_bw_hz = 0.0;          // build_waterfall fills this in
+    opt.display_bw_hz   = 0.0;        // build_waterfall fills this in
+    opt.display_db_lo   = 0.0f;       // (build_waterfall fills these too)
+    opt.display_db_hi   = 0.0f;
+    opt.display_db_floor = 0.0f;
+    opt.power_offset_db  = 0.0f;
+    snprintf(opt.power_unit, sizeof opt.power_unit, "%s", "dBFS");
     // simple_sat_ops names IQ files <prefix>_UT=YYYYMMDDTHHMMSS.fff.iq;
     // parse that out so the y-axis labels show local clock time. CLI
     // --start-utc=YYYYMMDDTHHMMSS overrides.
     opt.start_utc     = parse_ut_from_path(iq_path);
 
-    for (int i = 4; i < argc; ++i) {
+    for (int i = first_opt; i < argc; ++i) {
         int rc = 0;
         double d = 0.0;
         int    v = 0;
@@ -1465,6 +1543,16 @@ int main(int argc, char **argv)
             opt.start_utc = 0;
         } else if (strncmp(argv[i], "--pdf=", 6) == 0) {
             out_pdf = argv[i] + 6;
+        } else if ((rc = parse_double_opt(argv[i], "--power-offset=", &d)) != 0) {
+            if (rc < 0) { usage(); return 2; }
+            opt.power_offset_db = (float) d;
+            // If the user gave us an offset, assume they want dBm
+            // labels unless they also pass --power-unit explicitly.
+            if (strcmp(opt.power_unit, "dBFS") == 0) {
+                snprintf(opt.power_unit, sizeof opt.power_unit, "%s", "dBm");
+            }
+        } else if (strncmp(argv[i], "--power-unit=", 13) == 0) {
+            snprintf(opt.power_unit, sizeof opt.power_unit, "%s", argv[i] + 13);
         } else {
             fprintf(stderr, "gen_waterfall: unknown option '%s'\n", argv[i]);
             usage();
@@ -1475,6 +1563,12 @@ int main(int argc, char **argv)
 
     if (sample_rate <= 0) {
         fprintf(stderr, "gen_waterfall: invalid sample rate %d\n", sample_rate);
+        return 2;
+    }
+    if (out_png == NULL && out_pdf == NULL) {
+        fprintf(stderr,
+            "gen_waterfall: need either <out_png> or --pdf=<path>\n");
+        usage();
         return 2;
     }
 
@@ -1514,27 +1608,39 @@ int main(int argc, char **argv)
     if (rc != 0) return 1;
 
     double duration_s = (double) n_pairs / (double) sample_rate;
-    uint8_t *rgb = NULL;
-    int W = 0, H = 0;
-    rc = render_with_axes(spec_rgb, spec_w, spec_h, &opt, duration_s,
-                          &rgb, &W, &H);
-    if (rc != 0) {
-        free(spec_rgb);
-        fprintf(stderr, "gen_waterfall: render_with_axes failed\n");
-        return 1;
-    }
 
-    rc = write_png_rgb(out_png, rgb, W, H);
-    free(rgb);
-    if (rc != 0) {
-        free(spec_rgb);
-        fprintf(stderr, "gen_waterfall: write %s: %s\n",
-                out_png, strerror(errno));
-        return 1;
+    // The PNG path runs render_with_axes (composes the full image with
+    // bitmap-rendered axes/labels); the PDF path skips that and emits
+    // its own vector axes. We always need build_waterfall's spec_rgb
+    // until both paths have consumed it.
+    if (out_png) {
+        uint8_t *rgb = NULL;
+        int W = 0, H = 0;
+        rc = render_with_axes(spec_rgb, spec_w, spec_h, &opt, duration_s,
+                              &rgb, &W, &H);
+        if (rc != 0) {
+            free(spec_rgb);
+            fprintf(stderr, "gen_waterfall: render_with_axes failed\n");
+            return 1;
+        }
+        rc = write_png_rgb(out_png, rgb, W, H);
+        free(rgb);
+        if (rc != 0) {
+            free(spec_rgb);
+            fprintf(stderr, "gen_waterfall: write %s: %s\n",
+                    out_png, strerror(errno));
+            return 1;
+        }
+        fprintf(stderr,
+            "gen_waterfall: %s -> %s (%dx%d, %.1fs, fft=%d)\n",
+            iq_path, out_png, W, H, duration_s, opt.fft_size);
+    } else {
+        // PDF-only run: build_waterfall sets display_db_floor as a
+        // side-effect, but the auto-clip step (which populates
+        // display_db_lo / display_db_hi) lives inside that same call,
+        // so the PDF writer has the dB range it needs without going
+        // through render_with_axes.
     }
-    fprintf(stderr,
-        "gen_waterfall: %s -> %s (%dx%d, %.1fs, fft=%d)\n",
-        iq_path, out_png, W, H, duration_s, opt.fft_size);
 
     if (out_pdf) {
         int pdf_rc = write_pdf_with_axes(out_pdf, spec_rgb, spec_w, spec_h,
@@ -1543,8 +1649,8 @@ int main(int argc, char **argv)
             fprintf(stderr, "gen_waterfall: write %s: %s\n",
                     out_pdf, strerror(errno));
         } else {
-            fprintf(stderr, "gen_waterfall: %s -> %s (PDF, sharp labels)\n",
-                    iq_path, out_pdf);
+            fprintf(stderr, "gen_waterfall: %s -> %s (PDF, %.1fs, fft=%d)\n",
+                    iq_path, out_pdf, duration_s, opt.fft_size);
         }
     }
     free(spec_rgb);
