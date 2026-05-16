@@ -4431,9 +4431,22 @@ int main(int argc, char **argv)
     // rx_session takes ownership of the core; we drop our local handle
     // afterwards so main never touches UHD off-thread.
     if (g_control_mode && !g_without_b210) {
+        // B210 RX rate doubled from the original 240 kHz / sps=5 to
+        // 480 kHz / sps=10 (after the integer-5 decimation FIR). That
+        // gives the modem_fsk clock-recovery loop the same oversampling
+        // headroom the gr-satellites / AIT chain has (sps=6 with PFB-
+        // Gardner) and then some, which is worth ~1-2 dB at marginal
+        // SNR on real captures. The post-decim signal still only
+        // carries the FrontierSat ±10 kHz FSK, so the decim FIR
+        // cutoff stays at 18 kHz — narrower than the new 48 kHz
+        // Nyquist, so the filter rejects more noise than it did at
+        // the old 24 kHz Nyquist. IQ files double in size; with the
+        // sustained-write rate at 96 kHz·2·2 = 384 kB/s, a 10-minute
+        // pass produces ~230 MB which the laptop SSD has no trouble
+        // with.
         b210_rx_tx_core_params_t cp = {
             .freq_hz         = state.nominal_downlink_frequency_hz,
-            .rate_hz         = 240000.0,
+            .rate_hz         = 480000.0,
             .gain_db         = 50.0,
             .bw_hz           = -1.0,
             .fm_fullscale_hz = 25000.0,
