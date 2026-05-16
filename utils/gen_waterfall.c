@@ -812,8 +812,14 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
     for (size_t i = 0; i < (size_t) W * (size_t) H; ++i) {
         rgb[i*3+0] = 0; rgb[i*3+1] = 0; rgb[i*3+2] = 0;
     }
+    // Flip vertically so the earliest samples land at the BOTTOM of
+    // the image and time progresses upward — matches how an operator
+    // reads a real-time waterfall (newest sample crawling up from the
+    // bottom edge). spec_rgb[0..spec_h) is in capture order (oldest
+    // first); we paint spec row r into image row (spec_h - 1 - r).
     for (int r = 0; r < spec_h; ++r) {
-        memcpy(rgb + ((size_t)(r + TM) * (size_t) W + (size_t) LM) * 3,
+        int dst_row = TM + (spec_h - 1 - r);
+        memcpy(rgb + ((size_t) dst_row * (size_t) W + (size_t) LM) * 3,
                spec_rgb + (size_t) r * (size_t) spec_w * 3,
                (size_t) spec_w * 3);
     }
@@ -849,11 +855,24 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
                   LBL_R, LBL_G, LBL_B);
     }
 
-    // Time axis: 0..duration_s top-to-bottom across spec_h pixels.
+    // Time axis: 0 at the BOTTOM, increasing upward (matches the flipped
+    // spectrogram above). Minor ticks every 20 s without labels; major
+    // ticks at pick_time_step(duration_s, 10) intervals get labels.
     double t_step = pick_time_step(duration_s, 10);
-    double t0 = 0.0;
-    for (double t = t0; t <= duration_s + 0.5 * t_step; t += t_step) {
-        double frac = t / duration_s;
+    for (double t = 0.0; t <= duration_s + 0.5; t += 20.0) {
+        // Skip the minor tick that coincides with a major-tick position;
+        // the major loop below will draw a longer tick there.
+        double mod = fmod(t, t_step);
+        if (fabs(mod) < 1.0 || fabs(mod - t_step) < 1.0) continue;
+        double frac = 1.0 - t / duration_s;
+        int y = TM + (int)(frac * (double) spec_h);
+        if (y < TM || y >= TM + spec_h) continue;
+        for (int dx = 0; dx < 3; ++dx) {
+            px_set(rgb, W, H, LM - 1 - dx, y, TIC_R, TIC_G, TIC_B);
+        }
+    }
+    for (double t = 0.0; t <= duration_s + 0.5 * t_step; t += t_step) {
+        double frac = 1.0 - t / duration_s;
         int y = TM + (int)(frac * (double) spec_h);
         if (y < TM || y >= TM + spec_h) continue;
         for (int dx = 0; dx < 6; ++dx) {
