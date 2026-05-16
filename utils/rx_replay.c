@@ -242,6 +242,30 @@ static int parse_iso_to_unix_seconds(const char *iso, double *out)
     return 0;
 }
 
+// Read just the sample rate from a 16-bit PCM RIFF/WAVE file's header,
+// without loading the data. Used to auto-detect the IQ rate of a .iq
+// sidecar from its companion .wav. Returns the rate in Hz on success,
+// or -1 if the file can't be opened / isn't a valid RIFF/WAVE header.
+static int read_wav_samp_rate(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return -1;
+    uint8_t hdr[44];
+    size_t n = fread(hdr, 1, sizeof hdr, f);
+    fclose(f);
+    if (n < sizeof hdr) return -1;
+    if (memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0
+        || memcmp(hdr + 12, "fmt ", 4) != 0) {
+        return -1;
+    }
+    uint32_t rate = (uint32_t) hdr[24]
+                  | ((uint32_t) hdr[25] << 8)
+                  | ((uint32_t) hdr[26] << 16)
+                  | ((uint32_t) hdr[27] << 24);
+    if (rate < 8000 || rate > 4000000) return -1;
+    return (int) rate;
+}
+
 // Read a raw S16_LE file into a freshly-malloc'd int16 buffer. Returns
 // 0 on success (caller frees *out_samples), -1 on error.
 static int read_raw_pcm16(const char *path, int16_t **out_samples, size_t *out_n)
@@ -569,6 +593,7 @@ int main(int argc, char **argv)
     int raw_mode = 0;
     int raw_mode_explicit = 0;
     int raw_rate = 48000;
+    int raw_rate_explicit = 0;
     int raw_channels = 2;
     // IQ-file mode: treat the input as headerless interleaved int16
     // I,Q pairs at samp_rate (the format simple_sat_ops writes as the
@@ -643,7 +668,10 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--no-viterbi") == 0) use_viterbi = 0;
         else if (strcmp(a, "--two-pass") == 0)    two_pass = 1;
         else if (strcmp(a, "--no-two-pass") == 0) two_pass = 0;
-        else if (starts_with(a, "--rate="))      raw_rate = atoi(a + 7);
+        else if (starts_with(a, "--rate=")) {
+            raw_rate = atoi(a + 7);
+            raw_rate_explicit = 1;
+        }
         else if (starts_with(a, "--channels="))  raw_channels = atoi(a + 11);
         else if (starts_with(a, "--bit-rate="))  bit_rate = atoi(a + 11);
         else if (starts_with(a, "--window-s=")) {
@@ -750,6 +778,35 @@ int main(int argc, char **argv)
     if (!iq_mode_explicit) {
         size_t plen = strlen(input_path);
         if (plen >= 3 && strcmp(input_path + plen - 3, ".iq") == 0) iq_mode = 1;
+    }
+    // When given a .iq without an explicit --rate, look for a companion
+    // .wav alongside it (simple_sat_ops writes them in pairs) and lift
+    // the sample rate from its header. Saves the caller from having
+    // to remember --rate=96000 on captures from the post-Gardner-bump
+    // simple_sat_ops, while keeping 48000 as the fallback for old
+    // recordings and any .iq written without a .wav peer.
+    if (iq_mode && !raw_rate_explicit) {
+        size_t plen = strlen(input_path);
+        if (plen >= 3 && strcmp(input_path + plen - 3, ".iq") == 0) {
+            char wav_path[1024];
+            if (plen < sizeof wav_path - 1) {
+                snprintf(wav_path, sizeof wav_path, "%s", input_path);
+                wav_path[plen - 2] = 'w';
+                wav_path[plen - 1] = 'a';
+                wav_path[plen] = 'v';
+                wav_path[plen + 1] = '\0';
+                int wav_rate = read_wav_samp_rate(wav_path);
+                if (wav_rate > 0) {
+                    if (wav_rate != raw_rate) {
+                        fprintf(stderr,
+                            "rx_replay: auto-detected IQ rate %d Hz "
+                            "from companion %s\n",
+                            wav_rate, wav_path);
+                    }
+                    raw_rate = wav_rate;
+                }
+            }
+        }
     }
     if (raw_channels < 1 || raw_channels > 8) {
         fprintf(stderr, "rx_replay: --channels out of range [1,8]\n");
