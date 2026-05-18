@@ -349,9 +349,16 @@ int beacon_basic_summary(const uint8_t *payload, size_t len,
     if (!beacon_is_basic(payload, len)) return 0;
     COMMS_beacon_basic_packet_t b;
     memcpy(&b, payload, sizeof b);
+    // cts1_state_str / eps_mode_str return a literal for known enum
+    // values and only fall through to the snprintf-into-buf path for
+    // unknown values, so the call's return value is the authoritative
+    // string. Capture it; using the buffer directly leaves it empty in
+    // the common (known-enum) case.
     char state_buf[8], eps_buf[8], obc_buf[16], up_buf[24];
-    cts1_state_str(b.cts1_operation_state, state_buf, sizeof state_buf);
-    eps_mode_str  (b.eps_mode_enum,        eps_buf,   sizeof eps_buf);
+    const char *state_str = cts1_state_str(b.cts1_operation_state,
+                                           state_buf, sizeof state_buf);
+    const char *eps_str   = eps_mode_str  (b.eps_mode_enum,
+                                           eps_buf,   sizeof eps_buf);
     fmt_cC_i32    (obc_buf, sizeof obc_buf, b.obc_temperature_cC);
     fmt_ms_clock  (b.uptime_ms,             up_buf,    sizeof up_buf);
     // Sanitised friendly_message — non-printables become '.' so a
@@ -362,7 +369,7 @@ int beacon_basic_summary(const uint8_t *payload, size_t len,
                        msg, sizeof msg, NULL);
     int n = snprintf(out, out_size,
         "%.4s st=%s eps=%s batt=%.2fV/%u%% obc=%s up=%s cnt=%u \"%s\"",
-        b.satellite_name, state_buf, eps_buf,
+        b.satellite_name, state_str, eps_str,
         b.eps_battery_voltage_mV / 1000.0,
         (unsigned) b.eps_battery_percent,
         obc_buf, up_buf,

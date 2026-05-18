@@ -192,6 +192,16 @@ target_include_directories(sw_nco_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(sw_nco_selftest PRIVATE m)
 list(APPEND SSO_TARGETS sw_nco_selftest)
 
+# CTS1 beacon parser selftest. Audits every byte offset, enum mapping,
+# and length-anchored sniff in beacon_cts1.c. The flight firmware is
+# pinned at sat-1-rc3; a silent regression here shows up as wrong
+# fields on the operator panel during a pass.
+add_executable(beacon_cts1_selftest unit_tests/beacon_cts1_selftest.c
+               src/beacon/beacon_cts1.c)
+target_include_directories(beacon_cts1_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(beacon_cts1_selftest PRIVATE m)
+list(APPEND SSO_TARGETS beacon_cts1_selftest)
+
 # ----- Optional: OpenSSL-dependent (libcrypto) ------------------------------
 
 if (OPENSSL_FOUND)
