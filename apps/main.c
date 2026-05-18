@@ -109,9 +109,12 @@ static const char *g_operator_user = NULL;
 static double g_ribbon_peak[RIBBON_LEN];
 static int    g_ribbon_count       = 0;  // number of valid samples (caps at RIBBON_LEN)
 static int    g_ribbon_head        = 0;  // next write index (circular)
-static double g_ribbon_last_t      = 0.0;
+// Only written by ribbon_push inside #ifdef WITH_USRP_B210; without
+// B210 the variable + helper exist but no one calls them.
+__attribute__((unused)) static double g_ribbon_last_t      = 0.0;
 static long   g_ribbon_push_count  = 0;  // total pushes since startup; drives ticks
 
+__attribute__((unused))
 static void ribbon_push(double peak_dbfs)
 {
     g_ribbon_peak[g_ribbon_head] = peak_dbfs;
@@ -205,6 +208,7 @@ static spectrum_job_t g_spec_job;
 // viridis waterfall, no ffmpeg dependency, signals pop against a
 // flat median-subtracted noise floor. Returns 0 on success, -1 on
 // fork/exec failure or non-zero gen_waterfall exit.
+__attribute__((unused))
 static int generate_full_iq_waterfall(const char *iq_path, int rate_hz,
                                       char *png_out, size_t png_cap)
 {
@@ -245,6 +249,7 @@ static int generate_full_iq_waterfall(const char *iq_path, int rate_hz,
 // Render a finished WAV directly (no slicing) via ffmpeg. Blocks until
 // ffmpeg exits. Returns 0 on success, -1 on fork/exec/exit failure.
 // Used at end-of-pass on the final closed WAV.
+__attribute__((unused))
 static int generate_full_spectrogram(const char *wav_path, char *png_out, size_t png_cap)
 {
     if (wav_path == NULL) return -1;
@@ -349,6 +354,7 @@ static int spectrum_worker_iq(spectrum_job_t *j)
     return -1;
 }
 
+__attribute__((unused))
 static void *spectrum_worker(void *arg)
 {
     spectrum_job_t *j = (spectrum_job_t *) arg;
@@ -4635,9 +4641,11 @@ int main(int argc, char **argv)
     // Per-pass WAV recording: arm 1 min before AOS, hold open through
     // the pass, close 1 min after LOS. Multiple passes during one
     // simple_sat_ops run each get their own file under the pass folder.
-    const double RECORDING_PREROLL_S  = 60.0;
-    const double RECORDING_POSTROLL_S = 60.0;
-    double t_recording_close_at = 0.0;  // monotonic deadline; 0 = unset
+    // All three are consumed only inside #ifdef WITH_USRP_B210; the
+    // attribute keeps gcc-15 quiet on the non-B210 dev build.
+    __attribute__((unused)) const double RECORDING_PREROLL_S  = 60.0;
+    __attribute__((unused)) const double RECORDING_POSTROLL_S = 60.0;
+    __attribute__((unused)) double t_recording_close_at = 0.0;
 
     while (state.running) {
         double t_now = monotonic_seconds();

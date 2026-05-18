@@ -68,6 +68,7 @@ static int tap_ok(int cond, const char *what)
     return cond;
 }
 
+__attribute__((unused, format(printf, 1, 2)))
 static void tap_diag(const char *fmt, ...)
 {
     char buf[512];
@@ -79,6 +80,7 @@ static void tap_diag(const char *fmt, ...)
     fflush(stdout);
 }
 
+__attribute__((unused, format(printf, 1, 2)))
 static void tap_bail(const char *fmt, ...)
 {
     char buf[256];

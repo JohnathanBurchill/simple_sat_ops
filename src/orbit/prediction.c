@@ -464,15 +464,13 @@ int find_passes(prediction_t *external_prediction, double jul_utc_start, double 
     char name[128] = {0};
     char line1[80] = {0};
     char line2[80] = {0};
-    int found_satellite = 0;
 
     prediction_t prediction = {0};
     memcpy(&prediction, external_prediction, sizeof *external_prediction);
-    
+
     // Check every TLE
     int internal_count = 0;
     int internal_number_checked = 0;
-    int ignore_tle = 0;
     regex_t pattern = {0};
     if (criteria->regex != NULL) {
         printf("regex: '%s'\n", criteria->regex);
@@ -628,14 +626,14 @@ int find_passes(prediction_t *external_prediction, double jul_utc_start, double 
 const pass_t *get_pass(int index)
 {
     const pass_t *p = NULL;
-    if (index >= 0 && index < n_passes) {
+    if (index >= 0 && (size_t) index < n_passes) {
         p = &(passes[index]);
     }
 
     return p;
 }
 
-const size_t number_of_passes(void)
+size_t number_of_passes(void)
 {
     return n_passes;
 }

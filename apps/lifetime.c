@@ -29,7 +29,7 @@
 // Returns the first match on prediction->satellite_ephem.name
 double lifetime(prediction_t *prediction, double jul_utc_start, double delta_t_minutes, double max_years, double min_alt_km)
 {
-    int status = load_tle(prediction);
+    (void) load_tle(prediction);
     ClearFlag(ALL_FLAGS);
     select_ephemeris(&prediction->satellite_ephem.tle);
     double jul_utc = jul_utc_start;
@@ -116,7 +116,6 @@ int main(int argc, char **argv)
     double site_longitude = RAO_LONGITUDE;
     double site_altitude = RAO_ALTITUDE;
 
-    int status = 0;
     prediction_t prediction = {0};
 
     int n_options = 0;

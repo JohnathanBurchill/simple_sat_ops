@@ -31,8 +31,6 @@
 
 int antenna_rotator_init(antenna_rotator_t *antenna_rotator)
 {
-    int antenna_rotator_result = ANTENNA_ROTATOR_OK;
-
     // Blocking serial connection
     antenna_rotator_connect(antenna_rotator);
     if (!antenna_rotator->connected) {

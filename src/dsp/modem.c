@@ -211,32 +211,9 @@ int pcm16_write_wav(const char *path,
 // here so modem.c doesn't have to pull ax100.h (keeps it a pure DSP module).
 #define ASM_BIG_ENDIAN_U32  0x930B51DEu
 
-// Given a bit stream (MSB-first), find the offset in bits at which the
-// 32-bit pattern `needle` matches within `max_ham` bit errors, starting
-// the search at or past `min_offset`. Returns the bit offset of the
-// FIRST match, or (size_t)-1 if not found.
-static size_t find_u32_pattern(const uint8_t *bits, size_t n_bits,
-                               uint32_t needle, int max_ham,
-                               size_t min_offset)
-{
-    if (n_bits < 32) return (size_t)-1;
-    size_t start = min_offset;
-    if (start > n_bits - 32) return (size_t)-1;
-    uint32_t window = 0;
-    for (size_t i = 0; i < 32; ++i) {
-        window = (window << 1) | (bits[start + i] & 1u);
-    }
-    if ((int)__builtin_popcount(window ^ needle) <= max_ham) {
-        return start;
-    }
-    for (size_t i = 32; i < n_bits - start; ++i) {
-        window = (window << 1) | (bits[start + i] & 1u);
-        if ((int)__builtin_popcount(window ^ needle) <= max_ham) {
-            return start + i - 31;
-        }
-    }
-    return (size_t)-1;
-}
+// find_u32_pattern (FIRST-match variant) lived here before
+// find_u32_pattern_best replaced it on every call site. Resurrect from
+// git if a future caller wants the "stop at first hit" behaviour.
 
 // Like find_u32_pattern but returns the LOWEST-HAMMING match in
 // [min_offset, end]. Ties broken by earliest position. *out_ham

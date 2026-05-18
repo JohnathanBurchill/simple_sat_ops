@@ -157,7 +157,6 @@ int main(int argc, char **argv)
     double site_longitude = RAO_LONGITUDE;
     double site_altitude = RAO_ALTITUDE;
 
-    int status = 0;
     int list_all = 0;
     int max_passes = -1;
     int show_radio_info = 0;
@@ -476,7 +475,7 @@ int main(int argc, char **argv)
     // TLE plus --list returns just one pass even though we have 7 days
     // of orbits to find passes in.
     int find_all = (list_all || satellite_name != NULL || trajectory_id != NULL) ? 1 : 0;
-    status = find_passes(&state.prediction, jul_utc, 1.0, &criteria, &count, &number_checked, reverse, find_all);
+    (void) find_passes(&state.prediction, jul_utc, 1.0, &criteria, &count, &number_checked, reverse, find_all);
     const size_t n_passes = number_of_passes();
 
     // Satellite radio-info annotation. Only loaded if the user asked for
@@ -494,7 +493,7 @@ int main(int argc, char **argv)
         } else {
             snprintf(radios_file, sizeof(radios_file), "active_radios.txt");
         }
-        status = parse_satellite_status_file(radios_file, &sat_info, &n_entries);
+        (void) parse_satellite_status_file(radios_file, &sat_info, &n_entries);
     }
 
 

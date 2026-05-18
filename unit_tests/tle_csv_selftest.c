@@ -36,21 +36,9 @@
 #include <unistd.h>
 
 #define check(cond, what) tap_ok((cond), (what))
-
-static int approx(double a, double b, double tol)
-{
-    return fabs(a - b) <= tol;
-}
-
-#define CHECK_APPROX(actual, expected, tol, msg)                           \
-    do {                                                                   \
-        double _a = (actual);                                              \
-        double _e = (expected);                                            \
-        int _ok = approx(_a, _e, (tol));                                   \
-        tap_ok(_ok, (msg));                                                \
-        if (!_ok) tap_diag("expected %.6f +/- %.6f, got %.6f",             \
-                           _e, (tol), _a);                                 \
-    } while (0)
+// CHECK_APPROX / approx() were removed when the tolerance-based asserts
+// in this file got replaced by plain integer/string checks. Resurrect
+// from git history if a future tle_csv assertion needs a tolerance.
 
 // Write `content` to a fresh tempfile in TMPDIR. Returns a heap-allocated
 // path the caller must free + unlink, or NULL on failure.

@@ -93,7 +93,7 @@ int load_tle(prediction_t *state);
 int tle_default_path(char *out_path, size_t out_cap);
 int find_passes(prediction_t *external_state, double jul_utc_start, double delta_t_minutes, criteria_t *criteria, int *count, int *number_checked, int reverse_order, int find_all);
 const pass_t *get_pass(int index);
-const size_t number_of_passes(void);
+size_t number_of_passes(void);
 void free_passes(void);
 int get_next_pass(prediction_t *state, double jul_utc_start, double jul_utc_stop, double delta_t_minutes);
 
