@@ -184,6 +184,14 @@ target_include_directories(modem_iq_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(modem_iq_selftest PRIVATE m)
 list(APPEND SSO_TARGETS modem_iq_selftest)
 
+# Software-Doppler NCO selftest. Runs without UHD — the NCO is the
+# DSP core, extracted so it can be exercised on synthesised IQ.
+add_executable(sw_nco_selftest unit_tests/sw_nco_selftest.c
+               src/dsp/sw_nco.c)
+target_include_directories(sw_nco_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(sw_nco_selftest PRIVATE m)
+list(APPEND SSO_TARGETS sw_nco_selftest)
+
 # ----- Optional: OpenSSL-dependent (libcrypto) ------------------------------
 
 if (OPENSSL_FOUND)
@@ -386,7 +394,8 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
     if (WITH_USRP_B210)
         target_compile_definitions(simple_sat_ops PRIVATE WITH_USRP_B210)
         target_sources(simple_sat_ops PRIVATE
-                       src/hw/b210_rx_tx_core.c src/dsp/fir_decim.c
+                       src/hw/b210_rx_tx_core.c
+                       src/dsp/fir_decim.c src/dsp/sw_nco.c
                        src/pipeline/rx_session.c src/pipeline/tx_burst.c)
         target_include_directories(simple_sat_ops PRIVATE ${UHD_INCLUDE_DIRS})
         target_link_directories(simple_sat_ops PRIVATE ${UHD_LIBRARY_DIRS})
