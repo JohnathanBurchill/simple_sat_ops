@@ -401,6 +401,7 @@ int main(int argc, char **argv)
         "beacon_cts1_selftest",
         "csp_selftest",
         "biquad_selftest",
+        "fir_decim_selftest",
     };
     int n_names = (int)(sizeof names / sizeof names[0]);
     group_t groups[16];

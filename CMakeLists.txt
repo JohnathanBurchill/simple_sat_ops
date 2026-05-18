@@ -217,6 +217,16 @@ target_include_directories(biquad_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(biquad_selftest PRIVATE m)
 list(APPEND SSO_TARGETS biquad_selftest)
 
+# FIR decimator selftest. Audits constructor validation, accessors,
+# DC unity gain, passband transparency, anti-alias rejection (> 30 dB
+# in the would-alias stopband), decimation-ratio output count, and
+# state continuity across split push() calls.
+add_executable(fir_decim_selftest unit_tests/fir_decim_selftest.c
+               src/dsp/fir_decim.c)
+target_include_directories(fir_decim_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(fir_decim_selftest PRIVATE m)
+list(APPEND SSO_TARGETS fir_decim_selftest)
+
 # ----- Optional: OpenSSL-dependent (libcrypto) ------------------------------
 
 if (OPENSSL_FOUND)
