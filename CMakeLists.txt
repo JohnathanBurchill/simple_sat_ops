@@ -238,6 +238,29 @@ target_include_directories(monitor_squelch_selftest PRIVATE ${UNIT_TESTS_INCLUDE
 target_link_libraries(monitor_squelch_selftest PRIVATE m)
 list(APPEND SSO_TARGETS monitor_squelch_selftest)
 
+# packet_db selftest. Exercises schema creation, V4 migrations, insert
+# validation, dedup tuple, NaN-to-NULL mapping, register_tle
+# idempotency, and run_id format. Needs OpenSSL (sha1 of payloads) +
+# sqlite3 (the storage backend itself); test also links sqlite3
+# directly to audit row content via independent connections.
+if (OPENSSL_FOUND AND SQLITE3_FOUND)
+    # target_link_packet_db handles sqlite3 + the WITH_SQLITE3 define
+    # and source. The selftest also calls sqlite3_open_v2 directly via
+    # the public headers to audit row content on a separate connection,
+    # which is why we still include SQLITE3_INCLUDE_DIRS explicitly.
+    add_executable(packet_db_selftest unit_tests/packet_db_selftest.c)
+    target_include_directories(packet_db_selftest PRIVATE
+        ${UNIT_TESTS_INCLUDE}
+        ${OPENSSL_INCLUDE_DIRS} ${SQLITE3_INCLUDE_DIRS})
+    target_link_directories(packet_db_selftest PRIVATE
+        ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(packet_db_selftest PRIVATE
+        ${OPENSSL_LIBRARIES} m)
+    target_link_packet_db(packet_db_selftest)
+    target_link_sso_core(packet_db_selftest)
+    list(APPEND SSO_TARGETS packet_db_selftest)
+endif()
+
 # ----- Optional: OpenSSL-dependent (libcrypto) ------------------------------
 
 if (OPENSSL_FOUND)

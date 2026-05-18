@@ -403,6 +403,7 @@ int main(int argc, char **argv)
         "biquad_selftest",
         "fir_decim_selftest",
         "monitor_squelch_selftest",
+        "packet_db_selftest",
     };
     int n_names = (int)(sizeof names / sizeof names[0]);
     group_t groups[16];
