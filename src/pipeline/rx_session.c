@@ -230,6 +230,14 @@ struct rx_session {
     char      iq_path[512];
     uint64_t  iq_pairs_written;
 
+    // Doppler-trajectory sidecar. Each row: monotonic ms since wav
+    // opened, unix_time_ms, doppler_offset_hz. Lets offline tools
+    // reverse the in-pump software Doppler correction if they want to
+    // apply a different ephemeris.
+    FILE     *doppler_fp;
+    char      doppler_path[512];
+    double    doppler_last_log_t;  // monotonic_seconds() at last write
+
     // Frame counters + last-decoded summary.
     uint64_t frames_total;
     unsigned frames_in_window;
@@ -444,6 +452,26 @@ static void worker_wav_start(rx_session_t *rxs)
     rxs->iq_fp = fopen(rxs->iq_path, "wb");
     rxs->iq_pairs_written = 0;
     if (rxs->iq_fp == NULL) rxs->iq_path[0] = '\0';
+
+    // Doppler-trajectory sidecar (same base name + .doppler.csv).
+    // Records the software-NCO offset over time so an offline tool can
+    // undo our correction and try a different ephemeris.
+    if (wlen >= 4 && strcmp(rxs->wav_path + wlen - 4, ".wav") == 0) {
+        int base_len = (int)(wlen - 4);
+        if (base_len > 500) base_len = 500;
+        snprintf(rxs->doppler_path, sizeof rxs->doppler_path,
+                 "%.*s.doppler.csv", base_len, rxs->wav_path);
+    } else {
+        snprintf(rxs->doppler_path, sizeof rxs->doppler_path,
+                 "%.500s.doppler.csv", rxs->wav_path);
+    }
+    rxs->doppler_fp = fopen(rxs->doppler_path, "w");
+    rxs->doppler_last_log_t = 0.0;
+    if (rxs->doppler_fp != NULL) {
+        fputs("# unix_time_ms,doppler_offset_hz\n", rxs->doppler_fp);
+    } else {
+        rxs->doppler_path[0] = '\0';
+    }
     // No stderr print on success either — operator sees [REC] in the
     // UI, and the WAV path is auto-named from the same UTC stamp as
     // every other artifact in the pass folder.
@@ -455,6 +483,10 @@ static void worker_wav_stop(rx_session_t *rxs)
     if (rxs->iq_fp != NULL) {
         fclose(rxs->iq_fp);
         rxs->iq_fp = NULL;
+    }
+    if (rxs->doppler_fp != NULL) {
+        fclose(rxs->doppler_fp);
+        rxs->doppler_fp = NULL;
     }
 }
 
@@ -552,6 +584,20 @@ void rx_session_request_freq(rx_session_t *rxs, double freq_hz)
     rxs->freq_req_hz      = freq_hz;
     pthread_cond_broadcast(&rxs->cv);
     pthread_mutex_unlock(&rxs->mu);
+}
+
+void rx_session_set_doppler_offset(rx_session_t *rxs, double offset_hz)
+{
+    if (rxs == NULL || rxs->core == NULL) return;
+    // Lock-free: the NCO is a single double on the core, and the pump
+    // re-reads it once per chunk. No worker handoff needed.
+    b210_rx_tx_core_set_doppler_offset(rxs->core, offset_hz);
+}
+
+double rx_session_get_doppler_offset(const rx_session_t *rxs)
+{
+    if (rxs == NULL || rxs->core == NULL) return 0.0;
+    return b210_rx_tx_core_get_doppler_offset(rxs->core);
 }
 
 rx_burst_result_t rx_session_request_burst_sync(
@@ -874,6 +920,25 @@ static int worker_pump_once(rx_session_t *rxs)
             rxs->iq_pairs_written += iq_pairs;
         }
     }
+    // Doppler-trajectory sidecar: one line per ~1 s of recording. Lets
+    // an offline tool reverse the in-pump NCO if it wants to try a
+    // different ephemeris. Stamped with wall-clock UNIX ms (the values
+    // we tag the WAV/.iq filenames with), monotonic-aligned by sample
+    // count so the sidecar replays without time drift.
+    if (rxs->doppler_fp && rxs->core != NULL) {
+        double t_now_mono = monotonic_seconds();
+        if (rxs->doppler_last_log_t == 0.0
+            || (t_now_mono - rxs->doppler_last_log_t) >= 1.0) {
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            long long unix_ms =
+                (long long) tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+            double offset = b210_rx_tx_core_get_doppler_offset(rxs->core);
+            fprintf(rxs->doppler_fp, "%lld,%.6f\n", unix_ms, offset);
+            fflush(rxs->doppler_fp);
+            rxs->doppler_last_log_t = t_now_mono;
+        }
+    }
 
     size_t pairs_to_use = iq_pairs;
     if (pairs_to_use > (size_t) n) pairs_to_use = (size_t) n;
@@ -912,7 +977,12 @@ static void worker_update_snapshot(rx_session_t *rxs)
 {
     double peak = 0.0, rms_sq = 0.0;
     b210_rx_tx_core_iq_levels(rxs->core, &peak, &rms_sq);
-    double freq = b210_rx_tx_core_actual_freq(rxs->core);
+    // Effective downlink = SDR LO + software-Doppler NCO offset. With
+    // hardware-retunes gone, the LO is constant for the whole pass and
+    // the NCO carries all the tracking, so the displayed value updates
+    // smoothly at Hz precision instead of stepping in kHz.
+    double freq = b210_rx_tx_core_actual_freq(rxs->core)
+                + b210_rx_tx_core_get_doppler_offset(rxs->core);
     int wav_active = (rxs->wav.fp != NULL);
     pthread_mutex_lock(&rxs->mu);
     rxs->snap_frames_total   = rxs->frames_total;

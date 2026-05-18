@@ -69,6 +69,15 @@ struct b210_rx_tx_core {
     double                  iq_rms_sq;
     double                  iq_peak_release_alpha;
     double                  iq_rms_alpha;
+
+    // Software Doppler NCO. Multiplied into iq_demod after decimation so
+    // a carrier at offset sw_nco_freq_hz is rotated back to DC for the
+    // FM-discriminator, the .iq tap, and the shadow IQ decoder. Phase
+    // is a running accumulator wrapped to [-π, π] periodically; the
+    // setter never resets it, so a continuous Doppler trajectory yields
+    // a phase-coherent baseband signal across pump calls.
+    double                  sw_nco_phase_rad;
+    double                  sw_nco_freq_hz;
 };
 
 static int log_uhd(uhd_error e, const char *what)
@@ -79,6 +88,48 @@ static int log_uhd(uhd_error e, const char *what)
     fprintf(stderr, "b210_rx_tx_core: %s: UHD error %d: %s\n",
             what, (int)e, errbuf[0] ? errbuf : "(no detail)");
     return 1;
+}
+
+// Apply the software-Doppler NCO in place. iq is interleaved sc16 (n
+// pairs); each pair gets multiplied by exp(-j 2π Δf · n / fs). The
+// phase accumulator is global state on the core and persists across
+// pump calls, so we keep cumulative coherence even when the worker
+// pulls samples in irregular chunks. We wrap to [-π, π] each call to
+// stop the double from drifting into low-precision territory after
+// hours of continuous run.
+static void sw_nco_apply(b210_rx_tx_core_t *c, int16_t *iq, size_t n_pairs)
+{
+    if (n_pairs == 0) return;
+    const double f = c->sw_nco_freq_hz;
+    if (f == 0.0) return;  // no-op fast path when Doppler model is off
+
+    const double dphi = -2.0 * M_PI * f / c->actual_rate;
+    double phase = c->sw_nco_phase_rad;
+    for (size_t i = 0; i < n_pairs; ++i) {
+        double cp = cos(phase);
+        double sp = sin(phase);
+        double I = (double) iq[i * 2 + 0];
+        double Q = (double) iq[i * 2 + 1];
+        double rotI = I * cp - Q * sp;
+        double rotQ = I * sp + Q * cp;
+        // Saturate to int16 — the rotated magnitude equals the input
+        // magnitude exactly, but rounding can push a full-scale sample
+        // ±1 past the int16 limit.
+        if (rotI >  32767.0) rotI =  32767.0;
+        else if (rotI < -32768.0) rotI = -32768.0;
+        if (rotQ >  32767.0) rotQ =  32767.0;
+        else if (rotQ < -32768.0) rotQ = -32768.0;
+        iq[i * 2 + 0] = (int16_t) rotI;
+        iq[i * 2 + 1] = (int16_t) rotQ;
+        phase += dphi;
+    }
+    // Wrap once per chunk; cumulative drift over a 10-minute pass at
+    // 96 kSPS is ~5.8e7 samples × 2π × |f|/fs, which would otherwise
+    // grow into ~1e6 radians and start to lose precision.
+    phase = fmod(phase, 2.0 * M_PI);
+    if (phase >  M_PI) phase -= 2.0 * M_PI;
+    if (phase < -M_PI) phase += 2.0 * M_PI;
+    c->sw_nco_phase_rad = phase;
 }
 
 // Pull the actual freq from UHD (after a tune) and update the cached value.
@@ -298,14 +349,19 @@ ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *c, int16_t *pcm_out, size_t pcm_
     // narrowband sc16 IQ stream at actual_rate (== input_rate / M).
     // If the decimator is bypassed the demod runs on the UHD stream
     // directly, same as the pre-FIR design.
-    const int16_t *iq_demod = c->iq_chunk;
+    int16_t *iq_demod_buf = c->iq_chunk;
     size_t n_demod = n_recv;
     if (c->decim != NULL) {
         n_demod = fir_decim_iq_push(c->decim, c->iq_chunk, n_recv,
                                     c->iq_decim, c->max_iq_out);
-        iq_demod = c->iq_decim;
+        iq_demod_buf = c->iq_decim;
         if (n_demod == 0) return 0;
     }
+    // Software Doppler correction — applied in place on the post-decim
+    // buffer so every downstream consumer (.iq writer, FM discriminator,
+    // shadow IQ decoder, IQ tap) sees the same Doppler-corrected stream.
+    sw_nco_apply(c, iq_demod_buf, n_demod);
+    const int16_t *iq_demod = iq_demod_buf;
 
     // IQ level meter. Run before the discriminator so the reading
     // reflects RF input (rises on incoming signal) rather than demod
@@ -397,6 +453,19 @@ double b210_rx_tx_core_actual_rate(const b210_rx_tx_core_t *c) { return c ? c->a
 double b210_rx_tx_core_input_rate (const b210_rx_tx_core_t *c) { return c ? c->input_rate  : 0.0; }
 double b210_rx_tx_core_actual_freq(const b210_rx_tx_core_t *c) { return c ? c->actual_freq : 0.0; }
 size_t b210_rx_tx_core_max_chunk  (const b210_rx_tx_core_t *c) { return c ? c->max_iq_out  : 0; }
+
+void b210_rx_tx_core_set_doppler_offset(b210_rx_tx_core_t *c, double offset_hz)
+{
+    if (c == NULL) return;
+    // Frequency-only update. Phase is preserved across the change so a
+    // smooth Doppler trajectory stays phase-continuous.
+    c->sw_nco_freq_hz = offset_hz;
+}
+
+double b210_rx_tx_core_get_doppler_offset(const b210_rx_tx_core_t *c)
+{
+    return c ? c->sw_nco_freq_hz : 0.0;
+}
 
 int b210_rx_tx_core_iq_levels(const b210_rx_tx_core_t *c,
                            double *peak_env_out, double *rms_sq_out)

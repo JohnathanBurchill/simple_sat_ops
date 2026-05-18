@@ -98,6 +98,18 @@ ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *core,
 // Return: 0 on success, -1 on UHD error.
 int b210_rx_tx_core_set_freq(b210_rx_tx_core_t *core, double freq_hz);
 
+// Software Doppler NCO. After the FIR decimator and before the IQ tap /
+// FM discriminator, every sample is multiplied by exp(-j 2π Δf · t)
+// so a carrier sitting at offset Δf Hz from the LO is rotated back to
+// DC. The phase accumulator is continuous across pump calls and across
+// frequency updates — set_doppler_offset DOES NOT reset the phase, so
+// smooth Doppler trajectories produce a phase-coherent baseband signal.
+//
+// Pass 0.0 to disable (the multiply turns into a no-op fast path).
+void   b210_rx_tx_core_set_doppler_offset(b210_rx_tx_core_t *core,
+                                          double offset_hz);
+double b210_rx_tx_core_get_doppler_offset(const b210_rx_tx_core_t *core);
+
 // Read-back accessors (after b210_rx_tx_core_open succeeded).
 //
 // actual_rate:  post-decimation rate (== input_rate when decim_factor is

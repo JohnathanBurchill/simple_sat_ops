@@ -4976,14 +4976,6 @@ int main(int argc, char **argv)
         }
 
 #ifdef WITH_USRP_B210
-        // Doppler retune — queued for the B210 worker. We read the
-        // current actual_freq from the snapshot instead of caching it
-        // here, since the worker thread owns the core's tune state.
-        double snap_freq_hz = 0.0;
-        if (g_rx_session) {
-            rx_session_snapshot(g_rx_session, NULL, NULL, NULL,
-                                &snap_freq_hz, NULL, 0);
-        }
         // Signal ribbon sampler: push one peak-dBFS reading per second
         // so the ribbon in the RX panel rolls left in real time.
         if (g_rx_session && (t_now - g_ribbon_last_t) >= 1.0) {
@@ -4993,12 +4985,18 @@ int main(int argc, char **argv)
             ribbon_push(peak);
             g_ribbon_last_t = t_now;
         }
-        if (g_rx_session
-            && state.doppler_correction_enabled
-            && fabs(state.doppler_downlink_frequency_hz - snap_freq_hz)
-                   >= DOPPLER_SHIFT_RESOLUTION_KHZ * 1000.0) {
-            rx_session_request_freq(g_rx_session,
-                                     state.doppler_downlink_frequency_hz);
+        // Software Doppler tracking: the SDR LO stays fixed at the
+        // nominal carrier (set once at session open) and we apply the
+        // Doppler correction inside the IQ pump as a complex multiply.
+        // No PLL glitches, sub-Hz resolution, and the displayed RX freq
+        // updates smoothly. The threshold-driven hardware retune that
+        // lived here previously fired every 1–10 seconds during a
+        // pass and caused brief phase resets in the coherent demod
+        // chain; this loop runs every tick at full precision.
+        if (g_rx_session && state.doppler_correction_enabled) {
+            double offset = state.doppler_downlink_frequency_hz
+                          - state.nominal_downlink_frequency_hz;
+            rx_session_set_doppler_offset(g_rx_session, offset);
         }
         if (g_rx_session) {
             double doppler_offset =

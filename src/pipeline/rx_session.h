@@ -67,6 +67,17 @@ void rx_session_close(rx_session_t *rxs);
 // iteration (sub-10 ms typically). Fire-and-forget.
 void rx_session_request_freq(rx_session_t *rxs, double freq_hz);
 
+// Set the software-Doppler NCO offset (Hz, relative to the LO). Lock-
+// free — the NCO is single-double atomic on all targets we care about,
+// and the pump reads it once per chunk. Phase continues across calls,
+// so a smooth Doppler trajectory yields a phase-coherent baseband
+// signal. Pass 0.0 to disable correction entirely.
+void rx_session_set_doppler_offset(rx_session_t *rxs, double offset_hz);
+
+// Latest NCO offset (Hz). Used by the operator UI to display the
+// effective downlink frequency (= nominal + offset).
+double rx_session_get_doppler_offset(const rx_session_t *rxs);
+
 // Async: ask the worker to start recording the post-FIR PCM to a
 // fresh auto-named WAV under the configured pass folder. No-op if
 // already recording.
@@ -120,6 +131,9 @@ rx_burst_result_t rx_session_request_burst_sync(
     char *out_summary, size_t summary_n);
 
 // Snapshot for the UI. Any out-pointer may be NULL.
+// out_actual_freq_hz returns the EFFECTIVE downlink frequency, i.e.
+// the SDR LO plus the current software-Doppler offset — the carrier
+// the IQ stream is centred on after the in-pump NCO correction.
 void rx_session_snapshot(const rx_session_t *rxs,
                          uint64_t *out_frames_total,
                          double   *out_peak_dbfs,
