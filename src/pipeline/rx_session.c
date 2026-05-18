@@ -168,6 +168,11 @@ struct rx_session {
     int            csp_crc32;
     int            force_beacon;
 
+    // SDR LO offset (Hz) below the nominal carrier. Stored so the
+    // snapshot can reconstruct the effective downlink frequency the
+    // operator panel cares about (= LO + lo_offset + NCO offset).
+    double         lo_offset_hz;
+
     // Cached sample-rate-dependent sizes.
     int      samp_rate;
     int      sps;
@@ -399,7 +404,9 @@ int rx_session_open(rx_session_t **out, const rx_session_params_t *p,
     // pumps UHD continuously and services freq retunes / WAV
     // start-stops / TX bursts queued by the main thread.
     rxs->core = core;
-    rxs->snap_actual_freq_hz = b210_rx_tx_core_actual_freq(core);
+    rxs->lo_offset_hz = p->lo_offset_hz;
+    rxs->snap_actual_freq_hz = b210_rx_tx_core_actual_freq(core)
+                             + rxs->lo_offset_hz;
     pthread_mutex_init(&rxs->mu, NULL);
     pthread_cond_init (&rxs->cv, NULL);
     if (pthread_create(&rxs->thread, NULL, rx_session_thread_fn, rxs) != 0) {
@@ -598,6 +605,18 @@ double rx_session_get_doppler_offset(const rx_session_t *rxs)
 {
     if (rxs == NULL || rxs->core == NULL) return 0.0;
     return b210_rx_tx_core_get_doppler_offset(rxs->core);
+}
+
+double rx_session_get_lo_freq_hz(const rx_session_t *rxs)
+{
+    if (rxs == NULL || rxs->core == NULL) return 0.0;
+    return b210_rx_tx_core_actual_freq(rxs->core);
+}
+
+double rx_session_get_bandwidth_hz(const rx_session_t *rxs)
+{
+    if (rxs == NULL || rxs->core == NULL) return 0.0;
+    return b210_rx_tx_core_actual_rate(rxs->core);
 }
 
 rx_burst_result_t rx_session_request_burst_sync(
@@ -977,11 +996,15 @@ static void worker_update_snapshot(rx_session_t *rxs)
 {
     double peak = 0.0, rms_sq = 0.0;
     b210_rx_tx_core_iq_levels(rxs->core, &peak, &rms_sq);
-    // Effective downlink = SDR LO + software-Doppler NCO offset. With
-    // hardware-retunes gone, the LO is constant for the whole pass and
-    // the NCO carries all the tracking, so the displayed value updates
-    // smoothly at Hz precision instead of stepping in kHz.
+    // Effective downlink carrier as the operator thinks of it:
+    //   hardware LO + intentional lo_offset (puts signal off DC)
+    //                + software-Doppler NCO offset (tracks Doppler).
+    // The first two sum to the nominal carrier; the third is the
+    // satellite's instantaneous Doppler shift. Updates smoothly every
+    // tick at Hz precision instead of stepping in kHz like the old
+    // hardware-retune scheme.
     double freq = b210_rx_tx_core_actual_freq(rxs->core)
+                + rxs->lo_offset_hz
                 + b210_rx_tx_core_get_doppler_offset(rxs->core);
     int wav_active = (rxs->wav.fp != NULL);
     pthread_mutex_lock(&rxs->mu);

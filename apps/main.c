@@ -1187,7 +1187,10 @@ static const char *rx_panel_pt_label(int slot)
 typedef struct {
     int        have_session;
     int        rec_active;
-    double     rx_freq_hz;
+    double     rx_freq_hz;         // effective Doppler-shifted carrier
+    double     rx_lo_hz;           // hardware SDR LO (without the
+                                   // intentional LO offset added back)
+    double     rx_bandwidth_hz;    // post-decim sample rate (BW = ±half)
     double     peak_dbfs;
     double     rms_dbfs;
     uint64_t   frames_total;
@@ -1233,6 +1236,11 @@ static void rx_panel_collect_local(rx_panel_data_t *d)
                         last, sizeof last);
     snprintf(d->last_frame_summary, sizeof d->last_frame_summary,
              "%s", last);
+    // Hardware LO and captured bandwidth so the panel can show the
+    // operator where the SDR is actually listening alongside the
+    // Doppler-shifted carrier line.
+    d->rx_lo_hz        = rx_session_get_lo_freq_hz(g_rx_session);
+    d->rx_bandwidth_hz = rx_session_get_bandwidth_hz(g_rx_session);
     d->frames_iq  = rx_session_iq_frames(g_rx_session);
     d->frames_vit = rx_session_viterbi_frames(g_rx_session);
     rx_packet_type_stats_t pts[RX_PT_COUNT];
@@ -1305,6 +1313,17 @@ static void render_rx_panel(const rx_panel_data_t *d,
     }
     mvprintw(row++, col, "%15s   %.6f MHz", "RX freq", d->rx_freq_hz / 1e6);
     clrtoeol();
+    // Show the hardware SDR window underneath the carrier so the
+    // operator can see where the B210 is actually listening: LO ± half
+    // the post-decimation bandwidth. The LO sits deliberately off the
+    // nominal carrier to keep the signal away from DC after software
+    // Doppler tracking — see state.rx_lo_offset_hz.
+    if (d->rx_lo_hz > 0.0 && d->rx_bandwidth_hz > 0.0) {
+        double half_bw_khz = d->rx_bandwidth_hz / 2000.0;
+        mvprintw(row++, col, "%15s   %.6f MHz \xc2\xb1%.0f kHz", "LO",
+                 d->rx_lo_hz / 1e6, half_bw_khz);
+        clrtoeol();
+    }
     mvprintw(row++, col, "%15s   peak %+5.1f  rms %+5.1f dBFS",
              "level", d->peak_dbfs, d->rms_dbfs);
     clrtoeol();
@@ -3744,10 +3763,9 @@ static void render_status_panel(const status_panel_t *p,
              p->viewers && p->viewers[0] ? p->viewers : "(none)");
     clrtoeol();
 
-    mvprintw(row++, col, "%15s   %.6f MHz", "CARRIER", p->carrier_hz / 1e6);
-    clrtoeol();
-    row++;
-
+    // (CARRIER row removed — the same Doppler-shifted carrier is shown
+    // on the RX panel's "RX freq" line, alongside the LO ± BW row that
+    // tells the operator where the SDR is actually listening.)
     if (p->have_rotator) {
         double az_display = p->current_az;
         if (az_display < 0) az_display += 360.0;
@@ -4486,7 +4504,11 @@ int main(int argc, char **argv)
         // pass produces ~230 MB which the laptop SSD has no trouble
         // with.
         b210_rx_tx_core_params_t cp = {
-            .freq_hz         = state.nominal_downlink_frequency_hz,
+            // Tune the SDR LO below the nominal carrier so the corrected
+            // signal lands well off DC and stays clear of the B210's DC
+            // null even when Doppler crosses zero at TCA.
+            .freq_hz         = state.nominal_downlink_frequency_hz
+                             - state.rx_lo_offset_hz,
             .rate_hz         = 480000.0,
             .gain_db         = 50.0,
             .bw_hz           = -1.0,
@@ -4524,6 +4546,7 @@ int main(int argc, char **argv)
                                      ? state.prediction.satellite_ephem.tle.sat_name
                                      : NULL,
                 .session_dir       = g_pass_folder[0] ? g_pass_folder : NULL,
+                .lo_offset_hz      = state.rx_lo_offset_hz,
             };
             if (rx_session_open(&g_rx_session, &rxp, core) != 0) {
                 fprintf(stderr,
@@ -5189,6 +5212,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->doppler_uplink_frequency_hz = state->nominal_uplink_frequency_hz;
     state->doppler_downlink_frequency_hz = state->nominal_downlink_frequency_hz;
     state->doppler_correction_enabled = 1;
+    // 25 kHz default puts the corrected signal at +25 kHz baseband (well
+    // away from the B210's DC null, well inside the 48 kHz half-band).
+    state->rx_lo_offset_hz = 25000.0;
 
     state->run_with_antenna_rotator = 1;
     state->antenna_rotator.device_filename = "/dev/ttyUSB0";
@@ -5270,6 +5296,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strcmp("--no-doppler-correction", argv[i]) == 0) {
             state->n_options++;
             state->doppler_correction_enabled = 0;
+        } else if (strncmp("--lo-offset=", argv[i], 12) == 0) {
+            state->n_options++;
+            // Argument is kHz so an integer is easy to type; we store Hz.
+            state->rx_lo_offset_hz = atof(argv[i] + 12) * 1000.0;
         } else if (strncmp("--rotator-target-elevation=", argv[i], 27) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 28) {

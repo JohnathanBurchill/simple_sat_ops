@@ -53,6 +53,12 @@ typedef struct {
     const char    *tle_path;
     const char    *sat_name;
     const char    *session_dir; // for packet_db (typically pass_folder)
+    // LO offset (Hz) below the satellite's nominal carrier — what main
+    // also stored in state->rx_lo_offset_hz. The hardware LO is already
+    // tuned to (nominal - this) when the core is handed off; rx_session
+    // needs the same value so the snapshot can reconstruct the effective
+    // (Doppler-shifted) carrier frequency for the operator panel.
+    double         lo_offset_hz;
 } rx_session_params_t;
 
 // rx_session takes ownership of `core` and spawns a worker thread that
@@ -77,6 +83,14 @@ void rx_session_set_doppler_offset(rx_session_t *rxs, double offset_hz);
 // Latest NCO offset (Hz). Used by the operator UI to display the
 // effective downlink frequency (= nominal + offset).
 double rx_session_get_doppler_offset(const rx_session_t *rxs);
+
+// Hardware SDR LO (Hz) — i.e. nominal_downlink_freq − lo_offset_hz.
+// Useful for the operator panel to show where the SDR is actually
+// listening alongside the Doppler-shifted carrier.
+double rx_session_get_lo_freq_hz(const rx_session_t *rxs);
+
+// Post-decimation sample rate (Hz) = captured bandwidth.
+double rx_session_get_bandwidth_hz(const rx_session_t *rxs);
 
 // Async: ask the worker to start recording the post-FIR PCM to a
 // fresh auto-named WAV under the configured pass folder. No-op if

@@ -60,6 +60,14 @@ typedef struct state
     double doppler_downlink_frequency_hz;
     int doppler_correction_enabled;
 
+    // SDR LO offset (Hz) below the nominal downlink carrier. Without this,
+    // the corrected signal sits at DC after software Doppler tracking and
+    // gets eaten by the B210's DC blocker whenever Doppler crosses zero
+    // (i.e. exactly at TCA, the worst possible time). Offsetting the LO
+    // by ~25 kHz parks the signal in a clean part of the captured 96 kHz
+    // baseband for the whole pass. Configurable via --lo-offset=<kHz>.
+    double rx_lo_offset_hz;
+
     // Antenna rotator
     antenna_rotator_t antenna_rotator;
     int run_with_antenna_rotator;
