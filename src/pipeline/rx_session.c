@@ -463,14 +463,18 @@ static void worker_wav_start(rx_session_t *rxs)
     // Doppler-trajectory sidecar (same base name + .doppler.csv).
     // Records the software-NCO offset over time so an offline tool can
     // undo our correction and try a different ephemeris.
+    // ".doppler.csv" is 12 bytes; doppler_path is 512 → path body must
+    // fit in 499 bytes so the suffix + NUL lands inside the buffer and
+    // GCC's -Wformat-truncation is satisfied (clang doesn't currently
+    // emit that warning; see TROUBLESHOOTING below for the lint helper).
     if (wlen >= 4 && strcmp(rxs->wav_path + wlen - 4, ".wav") == 0) {
         int base_len = (int)(wlen - 4);
-        if (base_len > 500) base_len = 500;
+        if (base_len > 499) base_len = 499;
         snprintf(rxs->doppler_path, sizeof rxs->doppler_path,
                  "%.*s.doppler.csv", base_len, rxs->wav_path);
     } else {
         snprintf(rxs->doppler_path, sizeof rxs->doppler_path,
-                 "%.500s.doppler.csv", rxs->wav_path);
+                 "%.499s.doppler.csv", rxs->wav_path);
     }
     rxs->doppler_fp = fopen(rxs->doppler_path, "w");
     rxs->doppler_last_log_t = 0.0;

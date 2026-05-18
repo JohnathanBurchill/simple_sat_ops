@@ -161,7 +161,10 @@ static int autodiscover_tle_in_dir(const char *dir, char *out, size_t outn)
         size_t nlen = strlen(de->d_name);
         if (nlen < 4) continue;
         if (strcmp(de->d_name + nlen - 4, ".tle") != 0) continue;
-        snprintf(hit, sizeof hit, "%s/%s", dir, de->d_name);
+        // Cap the dir + name widths so the "/" + NUL always fit in
+        // the 1024-byte buffer. NAME_MAX is 255 on every filesystem
+        // we'll encounter; that leaves plenty of dir headroom.
+        snprintf(hit, sizeof hit, "%.512s/%.510s", dir, de->d_name);
         count++;
         if (count > 1) break;
     }
