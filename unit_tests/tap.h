@@ -62,6 +62,7 @@ static void tap_okf(int cond, const char *fmt, ...)
     fflush(stdout);
 }
 
+__attribute__((unused))
 static int tap_ok(int cond, const char *what)
 {
     tap_okf(cond, "%s", what ? what : "");

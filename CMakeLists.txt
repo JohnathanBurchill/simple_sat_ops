@@ -209,6 +209,14 @@ add_executable(csp_selftest unit_tests/csp_selftest.c src/proto/csp.c)
 target_include_directories(csp_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS csp_selftest)
 
+# Bandpass biquad selftest. Pins the RBJ-cookbook coefficients, peak
+# gain at f0, DC + Nyquist nulls, stopband attenuation, impulse-decay
+# stability, Q < 0.5 floor, and cascade-deepens-stopband behaviour.
+add_executable(biquad_selftest unit_tests/biquad_selftest.c src/dsp/biquad.c)
+target_include_directories(biquad_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(biquad_selftest PRIVATE m)
+list(APPEND SSO_TARGETS biquad_selftest)
+
 # ----- Optional: OpenSSL-dependent (libcrypto) ------------------------------
 
 if (OPENSSL_FOUND)
