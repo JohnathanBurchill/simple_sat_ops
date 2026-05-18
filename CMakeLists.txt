@@ -227,6 +227,17 @@ target_include_directories(fir_decim_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(fir_decim_selftest PRIVATE m)
 list(APPEND SSO_TARGETS fir_decim_selftest)
 
+# Carrier-presence squelch selftest. Pins init defaults, the state-
+# machine transitions (OFF / AUTO_BOOTSTRAPPING → AUTO_ENGAGED / FIXED),
+# pass-through behaviour, hold timer, status-string format, and in-/
+# out- buffer aliasing.
+add_executable(monitor_squelch_selftest
+               unit_tests/monitor_squelch_selftest.c
+               src/dsp/monitor_squelch.c src/dsp/biquad.c)
+target_include_directories(monitor_squelch_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(monitor_squelch_selftest PRIVATE m)
+list(APPEND SSO_TARGETS monitor_squelch_selftest)
+
 # ----- Optional: OpenSSL-dependent (libcrypto) ------------------------------
 
 if (OPENSSL_FOUND)
