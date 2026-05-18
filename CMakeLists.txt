@@ -202,6 +202,13 @@ target_include_directories(beacon_cts1_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(beacon_cts1_selftest PRIVATE m)
 list(APPEND SSO_TARGETS beacon_cts1_selftest)
 
+# CSP v1 header codec + CRC32 selftest. Pins the 32-bit wire layout
+# byte-for-byte, exhaustively round-trips {min,max}^6 corner combos,
+# and audits csp_crc32_zlib against IEEE 802.3 reference vectors.
+add_executable(csp_selftest unit_tests/csp_selftest.c src/proto/csp.c)
+target_include_directories(csp_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+list(APPEND SSO_TARGETS csp_selftest)
+
 # ----- Optional: OpenSSL-dependent (libcrypto) ------------------------------
 
 if (OPENSSL_FOUND)

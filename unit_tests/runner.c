@@ -399,6 +399,7 @@ int main(int argc, char **argv)
         "prediction_selftest",
         "sw_nco_selftest",
         "beacon_cts1_selftest",
+        "csp_selftest",
     };
     int n_names = (int)(sizeof names / sizeof names[0]);
     group_t groups[16];
