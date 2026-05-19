@@ -111,6 +111,11 @@ static int   g_run_live_waterfall = 0;
 static pid_t g_live_waterfall_pid = -1;
 __attribute__((unused))
 static char  g_live_waterfall_iq[512] = "";
+// Write end of the pipe whose read end is dup2'd to the viewer's
+// stdin. Colon commands like :wf_zoom_khz write line-based commands
+// here so the running viewer can adjust without a relaunch. -1 when
+// no viewer is alive.
+static int   g_live_waterfall_stdin_fd = -1;
 
 // HMAC keyfile selection. Path is resolved at startup (CLI override
 // or hmac_keyfile_default_path); the file is loaded into g_hmac_key
@@ -604,7 +609,8 @@ static void cmd_dispatch(state_t *state)
     }
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "h") == 0 || strcmp(cmd, "?") == 0) {
         cmd_set_status("commands: help tx track stop home quit "
-                       "freq <MHz> rs on|off spectrum <sec>");
+                       "freq <MHz> rs on|off spectrum <sec> "
+                       "wf_zoom_khz <N>");
     } else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0
                || strcmp(cmd, "exit") == 0) {
         state->running = 0;
@@ -766,6 +772,32 @@ static void cmd_dispatch(state_t *state)
 #else
         cmd_set_status("spectrum: this build has no USRP support");
 #endif
+    } else if (strcmp(cmd, "wf_zoom_khz") == 0) {
+        // Adjust the live raylib waterfall's visible bandwidth at
+        // runtime. The viewer reads line-based commands from its
+        // stdin (we wired a pipe at fork time); send "zoom N\n".
+        if (arg1 == NULL) {
+            cmd_set_status("wf_zoom_khz: usage `wf_zoom_khz <N>` (kHz)");
+        } else if (g_live_waterfall_stdin_fd < 0) {
+            cmd_set_status("wf_zoom_khz: no live viewer running "
+                           "(launch with --live-waterfall)");
+        } else {
+            double n = atof(arg1);
+            if (n <= 0.0 || n > 1000.0) {
+                cmd_set_status("wf_zoom_khz: %g out of (0, 1000] kHz", n);
+            } else {
+                char line[64];
+                int  ln = snprintf(line, sizeof line, "zoom %g\n", n);
+                ssize_t w = (ln > 0) ? write(g_live_waterfall_stdin_fd,
+                                             line, (size_t) ln) : -1;
+                if (w == ln) {
+                    cmd_set_status("wf_zoom_khz: -> %g kHz", n);
+                } else {
+                    cmd_set_status("wf_zoom_khz: write failed: %s",
+                                   strerror(errno));
+                }
+            }
+        }
     } else {
         cmd_set_status("unknown command '%s' (try :help)", cmd);
     }
@@ -5278,14 +5310,28 @@ int main(int argc, char **argv)
                         waitpid(g_live_waterfall_pid, NULL, 0);
                         g_live_waterfall_pid = -1;
                     }
+                    if (g_live_waterfall_stdin_fd >= 0) {
+                        close(g_live_waterfall_stdin_fd);
+                        g_live_waterfall_stdin_fd = -1;
+                    }
                     snprintf(g_live_waterfall_iq,
                              sizeof g_live_waterfall_iq, "%s", iq_path);
                     char rate_arg[32];
                     snprintf(rate_arg, sizeof rate_arg,
                              "--rate=%d",
                              iq_rate > 0 ? iq_rate : 96000);
+                    // pipe()+dup2 so the parent can shove
+                    // line-based commands (e.g. "zoom 60\n") at the
+                    // viewer's stdin.
+                    int pfd[2] = {-1, -1};
+                    if (pipe(pfd) != 0) { pfd[0] = pfd[1] = -1; }
                     pid_t pid = fork();
                     if (pid == 0) {
+                        if (pfd[0] >= 0) {
+                            close(pfd[1]);
+                            dup2(pfd[0], STDIN_FILENO);
+                            close(pfd[0]);
+                        }
                         char *args[] = {
                             (char *) "live_waterfall",
                             (char *) g_live_waterfall_iq,
@@ -5296,6 +5342,11 @@ int main(int argc, char **argv)
                         _exit(127);
                     } else if (pid > 0) {
                         g_live_waterfall_pid = pid;
+                        if (pfd[0] >= 0) close(pfd[0]);
+                        g_live_waterfall_stdin_fd = pfd[1];
+                    } else {
+                        if (pfd[0] >= 0) close(pfd[0]);
+                        if (pfd[1] >= 0) close(pfd[1]);
                     }
                 }
                 // Reap a viewer that the operator closed via its
@@ -5307,6 +5358,10 @@ int main(int argc, char **argv)
                     if (r == g_live_waterfall_pid) {
                         g_live_waterfall_pid = -1;
                         g_live_waterfall_iq[0] = '\0';
+                        if (g_live_waterfall_stdin_fd >= 0) {
+                            close(g_live_waterfall_stdin_fd);
+                            g_live_waterfall_stdin_fd = -1;
+                        }
                     }
                 }
             }
@@ -5466,6 +5521,10 @@ int main(int argc, char **argv)
             kill(g_live_waterfall_pid, SIGKILL);
             waitpid(g_live_waterfall_pid, NULL, 0);
             g_live_waterfall_pid = -1;
+        }
+        if (g_live_waterfall_stdin_fd >= 0) {
+            close(g_live_waterfall_stdin_fd);
+            g_live_waterfall_stdin_fd = -1;
         }
     }
 #ifdef WITH_USRP_B210

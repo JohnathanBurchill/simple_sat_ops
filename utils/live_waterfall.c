@@ -30,6 +30,7 @@
 #include <raylib.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -276,11 +277,11 @@ static int spec_init(spec_state_t *s, unsigned n_fft, int spec_w, int spec_h,
     if (half_bins > N / 2 - 1) half_bins = N / 2 - 1;
     s->bin_lo = dc - half_bins;
     s->bin_hi = dc + half_bins + 1;
-    int avail_w = s->bin_hi - s->bin_lo;
-    // Render width is bounded by the available bins (oversampling has
-    // no benefit) AND by the requested spec_w. We just shrink spec_w
-    // to avail_w if it's wider.
-    if (avail_w < spec_w) spec_w = avail_w;
+    // spec_w stays at the caller's window width regardless of how few
+    // FFT bins we're showing — when zoom narrows below 1 bin/pixel,
+    // spec_one_frame's nearest-bin mapping just repeats columns. Keeps
+    // the spectrogram filling the layout area when the operator
+    // narrows zoom on the fly.
     s->spec_w = spec_w;
     s->spec_h = spec_h;
     s->win       = (float *)  calloc(N, sizeof(float));
@@ -310,6 +311,33 @@ static void spec_free(spec_state_t *s)
     free(s->win); free(s->re); free(s->im);
     free(s->row_accum); free(s->frame_buf); free(s->rgb);
     free(s->row_time);
+}
+
+// Reset the spec_state for a new zoom width. The window dimensions
+// (spec_w × spec_h) stay the same; only the FFT-bin range and the
+// scrollback content change. Wipes the existing rgb buffer + row_time
+// so the operator sees the new zoom from scratch instead of a mix of
+// pre/post-zoom rows.
+static void spec_set_zoom(spec_state_t *s, double sample_rate_hz,
+                          double zoom_hz)
+{
+    int N = (int) s->n_fft;
+    int dc = N / 2;
+    int half_bins = (int)((zoom_hz / 2.0) / sample_rate_hz * (double) N);
+    if (half_bins < 1) half_bins = 1;
+    if (half_bins > N / 2 - 1) half_bins = N / 2 - 1;
+    s->bin_lo = dc - half_bins;
+    s->bin_hi = dc + half_bins + 1;
+    // Clear scrollback.
+    memset(s->rgb, 0,
+           (size_t) s->spec_w * (size_t) s->spec_h * 3);
+    memset(s->row_time, 0, (size_t) s->spec_h * sizeof(time_t));
+    memset(s->row_accum, 0, (size_t) s->spec_w * sizeof(double));
+    s->row_accum_count = 0;
+    s->frame_filled    = 0;
+    s->have_auto_db    = 0;
+    s->auto_db_min     = 0.0f;
+    s->auto_db_max     = 12.0f;
 }
 
 // Run one FFT on the accumulated frame, fold into row_accum. spec_w is
@@ -479,7 +507,10 @@ int main(int argc, char **argv)
     double rate_hz       = 96000.0;
     unsigned n_fft       = 1024;
     int      row_ms      = 100;
-    double   zoom_khz    = 30.0;
+    // Default = full ±48 kHz around the SDR LO. Operator can narrow
+    // mid-flight via stdin (see :wf_zoom_khz handler in simple_sat_ops),
+    // or pass --zoom-khz=<N> at launch.
+    double   zoom_khz    = 96.0;
     int      cli_w       = 0;
     int      cli_h       = 0;
     for (int i = 2; i < argc; ++i) {
@@ -569,7 +600,47 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // Stdin command channel: simple_sat_ops's --live-waterfall launch
+    // wires its child's stdin to a pipe so colon-commands like
+    // :wf_zoom_khz <N> can adjust this viewer at runtime. Standalone
+    // invocations from a shell never write commands; the non-blocking
+    // read just returns EAGAIN forever and we draw normally.
+    int stdin_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (stdin_flags >= 0) {
+        fcntl(STDIN_FILENO, F_SETFL, stdin_flags | O_NONBLOCK);
+    }
+    char ctl_buf[256] = {0};
+    size_t ctl_buf_len = 0;
+    double current_zoom_khz = zoom_khz;
+
     while (!WindowShouldClose()) {
+        // 0. Drain any pending control commands from stdin. Line-based
+        // protocol; commands today:
+        //     zoom <N>   → reset spec_state to ±N/2 kHz visible
+        ssize_t rn;
+        while ((rn = read(STDIN_FILENO, ctl_buf + ctl_buf_len,
+                          sizeof ctl_buf - ctl_buf_len - 1)) > 0) {
+            ctl_buf_len += (size_t) rn;
+            ctl_buf[ctl_buf_len] = '\0';
+            char *line = ctl_buf;
+            char *nl;
+            while ((nl = strchr(line, '\n')) != NULL) {
+                *nl = '\0';
+                double n;
+                if (sscanf(line, " zoom %lf", &n) == 1
+                    && n > 0.0 && n <= rate_hz / 1000.0) {
+                    current_zoom_khz = n;
+                    spec_set_zoom(&S, rate_hz, n * 1000.0);
+                    fprintf(stderr,
+                        "live_waterfall: zoom set to %g kHz\n", n);
+                }
+                line = nl + 1;
+            }
+            size_t remain = ctl_buf_len - (size_t)(line - ctl_buf);
+            memmove(ctl_buf, line, remain);
+            ctl_buf_len = remain;
+        }
+
         // 1. Drain new IQ samples into the spec accumulator.
         int read_count;
         do {
@@ -604,15 +675,20 @@ int main(int argc, char **argv)
         // ---- Spectrogram --------------------------------------------
         DrawTexture(spec_tex, left_pad, top_bar_h, WHITE);
 
-        // ---- Scrolling time labels on the left -----------------------
-        // Choose a label every ~50 px so they don't crowd. row_time[r]
-        // is the wall-clock time when that row was committed; labels
-        // scroll downward in lockstep with the pixels above them.
-        const int label_step_px = 50;
+        // ---- Time labels that scroll with the spectrogram ----------
+        // Label each row whose row_time[] is on a 10-second boundary
+        // AND is the FIRST row showing that second (i.e. row_time[y]
+        // differs from row_time[y-1]). This produces labels anchored
+        // to the actual time of the pixel row beside them — the
+        // labels drift downward as new rows scroll in, instead of
+        // floating at fixed y while their content jumps.
+        const int label_period_s = 10;
         const Color time_col = (Color){180, 180, 180, 255};
-        for (int y = 0; y < spec_h; y += label_step_px) {
+        for (int y = 0; y < spec_h; ++y) {
             time_t t = S.row_time[y];
-            if (t == 0) continue;   // row not yet filled
+            if (t == 0) continue;
+            if (((long) t % label_period_s) != 0) continue;
+            if (y > 0 && S.row_time[y - 1] == t) continue;
             struct tm lt;
             localtime_r(&t, &lt);
             char buf[16];
@@ -620,24 +696,23 @@ int main(int argc, char **argv)
                      lt.tm_hour, lt.tm_min, lt.tm_sec);
             int draw_y = top_bar_h + y - 5;
             DrawText(buf, 4, draw_y, 11, time_col);
-            // 4-px tick into the spectrogram so the eye picks up which
-            // pixel row the label is anchored to.
             DrawLine(left_pad - 4, top_bar_h + y, left_pad - 1,
                      top_bar_h + y, time_col);
         }
 
         // ---- Frequency ticks at the bottom --------------------------
-        // Round-number ticks at pick_tick_step(zoom_khz, ~5) intervals.
-        // Spectrogram x covers -zoom_khz/2 .. +zoom_khz/2 across spec_w
-        // pixels.
-        double f_lo  = -zoom_khz / 2.0;
-        double f_hi  = +zoom_khz / 2.0;
-        double f_step = pick_tick_step(zoom_khz, 5);
+        // Round-number ticks at pick_tick_step(current_zoom_khz, ~5)
+        // intervals. Spectrogram x covers ±current_zoom_khz/2 across
+        // spec_w pixels (current_zoom_khz tracks runtime adjustments
+        // via the stdin "zoom <N>" command).
+        double f_lo  = -current_zoom_khz / 2.0;
+        double f_hi  = +current_zoom_khz / 2.0;
+        double f_step = pick_tick_step(current_zoom_khz, 5);
         double f0 = ceil(f_lo / f_step) * f_step;
         const Color tick_col  = (Color){160, 160, 160, 255};
         const Color flbl_col  = (Color){200, 200, 200, 255};
         for (double f = f0; f <= f_hi + 0.5 * f_step; f += f_step) {
-            int x = left_pad + (int)((f - f_lo) / zoom_khz * spec_w);
+            int x = left_pad + (int)((f - f_lo) / current_zoom_khz * spec_w);
             // Tick mark hanging below the spectrogram.
             DrawLine(x, top_bar_h + spec_h, x, top_bar_h + spec_h + 4,
                      tick_col);
