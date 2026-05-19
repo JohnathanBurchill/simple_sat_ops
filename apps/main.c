@@ -91,6 +91,14 @@ static int g_viewer_mode = 0;  // bare invocation found a running operator
 static sso_ipc_server_t *g_ipc = NULL;
 static const char *g_operator_user = NULL;
 
+// TX dry-run: synthesise an immediate "ok" ack instead of pushing the
+// burst through rx_session. Lets the operator exercise the auto-tcmd
+// state machine + the TX compose modal on a dev host with no B210 (or
+// with --without-b210 to skip the device). The allow-tx safety
+// checkbox still has to be ticked to enter RUNNING — dry-run is about
+// hardware presence, not about the operator's intent to transmit.
+static int   g_tx_dry_run         = 0;
+
 // Live raylib waterfall viewer. Off by default; --live-waterfall on
 // the command line opts in. When recording starts, fork+exec the
 // live_waterfall binary with the active .iq path. Track the child
@@ -3573,6 +3581,15 @@ void usage(FILE *dest, const char *name, int full)
         "                               its window leaves the recording\n"
         "                               running. Skipped silently if\n"
         "                               live_waterfall isn't on PATH.\n"
+        "  --tx-dry-run                 Synthesize an immediate 'ok' ack for\n"
+        "                               every TX burst instead of routing it\n"
+        "                               through the SDR. Exercises the auto-\n"
+        "                               tcmd state machine + TX compose modal\n"
+        "                               on a dev host that has no B210 (or\n"
+        "                               with --without-b210). The allow-tx\n"
+        "                               safety checkbox still has to be\n"
+        "                               ticked — dry-run is about hardware\n"
+        "                               presence, not operator intent.\n"
         "  --tc-file=<path>             Load a file of ASCII telecommands\n"
         "                               (CTS1+...; one per line; '#' lines\n"
         "                               and blank lines ignored). Press 'A'\n"
@@ -5237,25 +5254,46 @@ int main(int argc, char **argv)
                 doppler_offset);
         }
 
-        // Synchronously service any pending TX request. The B210
-        // worker pauses RX, transmits, resumes RX, then unblocks us.
-        // We block here for the burst duration (~1 s) — that's
-        // intentional; the operator just hit Enter and is staring at
-        // the screen waiting for confirmation.
-        if (g_tx_request.pending && g_rx_session) {
+        // Synchronously service any pending TX request. Three paths:
+        //
+        //   1. --tx-dry-run:    synthesize "ok" without touching the
+        //                       SDR. Auto-tcmd + compose still exercise
+        //                       all their UI state on dev hosts.
+        //   2. g_rx_session up: real burst — B210 worker pauses RX,
+        //                       transmits, resumes RX, then unblocks
+        //                       us. Blocks ~1 s; intentional, the
+        //                       operator just hit Enter.
+        //   3. neither:         reject so auto-tcmd can move on. The
+        //                       operator must have started simple_sat_ops
+        //                       --without-b210 without also passing
+        //                       --tx-dry-run; just clear the pending
+        //                       slot rather than deadlocking.
+        if (g_tx_request.pending) {
             char summary[160];
-            rx_burst_result_t br = rx_session_request_burst_sync(
-                g_rx_session, &g_tx_request, NULL, 0,
-                summary, sizeof summary);
-            const char *ack = "ok";
-            switch (br) {
-                case RX_BURST_OK: break;
-                case RX_BURST_NO_CORE:            ack = "rejected: no B210"; break;
-                case RX_BURST_FRAME_BUILD_FAILED: ack = "rejected: frame build"; break;
-                case RX_BURST_UHD_ERROR:          ack = "uhd-err"; break;
+            const char *ack = NULL;
+            int  cmd_sent = 0;
+            if (g_tx_dry_run) {
+                snprintf(summary, sizeof summary, "%s",
+                         g_tx_request.summary);
+                ack = "dry-run";
+                cmd_sent = 1;
+            } else if (g_rx_session != NULL) {
+                rx_burst_result_t br = rx_session_request_burst_sync(
+                    g_rx_session, &g_tx_request, NULL, 0,
+                    summary, sizeof summary);
+                switch (br) {
+                    case RX_BURST_OK:                 ack = "ok"; cmd_sent = 1; break;
+                    case RX_BURST_NO_CORE:            ack = "rejected: no B210"; break;
+                    case RX_BURST_FRAME_BUILD_FAILED: ack = "rejected: frame build"; break;
+                    case RX_BURST_UHD_ERROR:          ack = "uhd-err"; break;
+                }
+            } else {
+                snprintf(summary, sizeof summary, "%s",
+                         g_tx_request.summary);
+                ack = "rejected: no B210";
             }
             emit_tx_event_local(SSO_EVT_TX_ACK, summary, ack);
-            if (br == RX_BURST_OK) {
+            if (cmd_sent) {
                 emit_tx_event_local(SSO_EVT_TX_COMMAND_SENT, summary, NULL);
             }
             g_tx_request.pending = 0;
@@ -5473,6 +5511,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strcmp("--live-waterfall", argv[i]) == 0) {
             state->n_options++;
             g_run_live_waterfall = 1;
+        } else if (strcmp("--tx-dry-run", argv[i]) == 0) {
+            state->n_options++;
+            g_tx_dry_run = 1;
         } else if (strncmp("--tc-file=", argv[i], 10) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 11) {
