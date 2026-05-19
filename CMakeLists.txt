@@ -238,6 +238,15 @@ target_include_directories(monitor_squelch_selftest PRIVATE ${UNIT_TESTS_INCLUDE
 target_link_libraries(monitor_squelch_selftest PRIVATE m)
 list(APPEND SSO_TARGETS monitor_squelch_selftest)
 
+# Broadband-burst detector selftest. Synthesises CW vs wideband noise
+# inputs through iq_burst and checks bright_bins lands in the right
+# bands (narrow signals → few bins, wideband → many).
+add_executable(iq_burst_selftest unit_tests/iq_burst_selftest.c
+               src/dsp/iq_burst.c)
+target_include_directories(iq_burst_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(iq_burst_selftest PRIVATE m)
+list(APPEND SSO_TARGETS iq_burst_selftest)
+
 # packet_db selftest. Exercises schema creation, V4 migrations, insert
 # validation, dedup tuple, NaN-to-NULL mapping, register_tle
 # idempotency, and run_id format. Needs OpenSSL (sha1 of payloads) +
