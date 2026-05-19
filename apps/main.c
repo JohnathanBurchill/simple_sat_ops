@@ -91,6 +91,18 @@ static int g_viewer_mode = 0;  // bare invocation found a running operator
 static sso_ipc_server_t *g_ipc = NULL;
 static const char *g_operator_user = NULL;
 
+// Live raylib waterfall viewer. Off by default; --live-waterfall on
+// the command line opts in. When recording starts, fork+exec the
+// live_waterfall binary with the active .iq path. Track the child
+// PID so we can SIGTERM it on shutdown. The iq-path scratch is only
+// referenced inside the WITH_USRP_B210 launch block, so tag it
+// unused — the cleanup path at the bottom of main() does use the
+// pid, so that one stays unannotated.
+static int   g_run_live_waterfall = 0;
+static pid_t g_live_waterfall_pid = -1;
+__attribute__((unused))
+static char  g_live_waterfall_iq[512] = "";
+
 // HMAC keyfile selection. Path is resolved at startup (CLI override
 // or hmac_keyfile_default_path); the file is attempted-load once so
 // the operator banner can show "(N bytes ok)" vs "(missing)" vs
@@ -3554,6 +3566,13 @@ void usage(FILE *dest, const char *name, int full)
         "                               viewers still work, so the operator\n"
         "                               can rehearse a telecommand and get\n"
         "                               eyes on it without going on air.\n"
+        "  --live-waterfall             Auto-launch the raylib live_waterfall\n"
+        "                               viewer alongside the terminal UI when\n"
+        "                               a recording starts. The viewer reads\n"
+        "                               the live .iq file directly; closing\n"
+        "                               its window leaves the recording\n"
+        "                               running. Skipped silently if\n"
+        "                               live_waterfall isn't on PATH.\n"
         "  --tc-file=<path>             Load a file of ASCII telecommands\n"
         "                               (CTS1+...; one per line; '#' lines\n"
         "                               and blank lines ignored). Press 'A'\n"
@@ -5140,6 +5159,58 @@ int main(int argc, char **argv)
             rx_session_burst_snapshot(g_rx_session, &burst_bins, NULL);
             ribbon_push(peak, burst_bins);
             g_ribbon_last_t = t_now;
+
+            // Live waterfall: launch the raylib viewer the first time
+            // a recording's .iq path appears, OR if the pass switched
+            // to a new path. We poll once per second on the same
+            // cadence as the ribbon — cheap, and a single second of
+            // lag at viewer-launch is invisible to the operator.
+            if (g_run_live_waterfall) {
+                char iq_path[512] = "";
+                int  iq_rate      = 0;
+                rx_session_iq_snapshot(g_rx_session,
+                                       iq_path, sizeof iq_path,
+                                       NULL, &iq_rate);
+                if (iq_path[0]
+                    && strcmp(iq_path, g_live_waterfall_iq) != 0) {
+                    // Tear down a viewer pointed at a stale path.
+                    if (g_live_waterfall_pid > 0) {
+                        kill(g_live_waterfall_pid, SIGTERM);
+                        waitpid(g_live_waterfall_pid, NULL, 0);
+                        g_live_waterfall_pid = -1;
+                    }
+                    snprintf(g_live_waterfall_iq,
+                             sizeof g_live_waterfall_iq, "%s", iq_path);
+                    char rate_arg[32];
+                    snprintf(rate_arg, sizeof rate_arg,
+                             "--rate=%d",
+                             iq_rate > 0 ? iq_rate : 96000);
+                    pid_t pid = fork();
+                    if (pid == 0) {
+                        char *args[] = {
+                            (char *) "live_waterfall",
+                            (char *) g_live_waterfall_iq,
+                            rate_arg,
+                            NULL
+                        };
+                        execvp("live_waterfall", args);
+                        _exit(127);
+                    } else if (pid > 0) {
+                        g_live_waterfall_pid = pid;
+                    }
+                }
+                // Reap a viewer that the operator closed via its
+                // window — non-blocking so the main loop never stalls.
+                if (g_live_waterfall_pid > 0) {
+                    int status;
+                    pid_t r = waitpid(g_live_waterfall_pid,
+                                      &status, WNOHANG);
+                    if (r == g_live_waterfall_pid) {
+                        g_live_waterfall_pid = -1;
+                        g_live_waterfall_iq[0] = '\0';
+                    }
+                }
+            }
         }
         // Software Doppler tracking: the SDR LO stays fixed at the
         // nominal carrier (set once at session open) and we apply the
@@ -5247,6 +5318,26 @@ int main(int argc, char **argv)
     if (g_ipc) {
         sso_ipc_server_close(g_ipc);
         g_ipc = NULL;
+    }
+    // Politely terminate the live raylib waterfall if we spawned one.
+    // 5 s timeout via WNOHANG polling so the operator doesn't wait on
+    // a hung viewer at shutdown.
+    if (g_live_waterfall_pid > 0) {
+        kill(g_live_waterfall_pid, SIGTERM);
+        for (int t = 0; t < 50; ++t) {
+            int status;
+            pid_t r = waitpid(g_live_waterfall_pid, &status, WNOHANG);
+            if (r == g_live_waterfall_pid) {
+                g_live_waterfall_pid = -1;
+                break;
+            }
+            usleep(100000);
+        }
+        if (g_live_waterfall_pid > 0) {
+            kill(g_live_waterfall_pid, SIGKILL);
+            waitpid(g_live_waterfall_pid, NULL, 0);
+            g_live_waterfall_pid = -1;
+        }
     }
 #ifdef WITH_USRP_B210
     char final_wav_path[512] = "";
@@ -5379,6 +5470,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strcmp("--no-tx", argv[i]) == 0) {
             state->n_options++;
             g_no_tx = 1;
+        } else if (strcmp("--live-waterfall", argv[i]) == 0) {
+            state->n_options++;
+            g_run_live_waterfall = 1;
         } else if (strncmp("--tc-file=", argv[i], 10) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 11) {
