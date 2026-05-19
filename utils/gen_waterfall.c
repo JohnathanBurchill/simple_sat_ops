@@ -329,7 +329,8 @@ typedef struct wf_opts {
     int    out_rows;
     float  db_min;
     float  db_max;
-    int    auto_clip;     // 1 = ignore db_min/db_max, derive from percentiles
+    int    db_min_user_set; // 1 = --db-min was supplied; 0 = derive via percentile
+    int    db_max_user_set; // 1 = --db-max was supplied; 0 = derive via percentile
     int    sample_rate;   // for the time + frequency axis labels
     double center_hz;     // baseband centre frequency for the freq-axis label
     double zoom_hz;       // visible bandwidth around DC; 0 or negative = full
@@ -945,28 +946,31 @@ static int build_waterfall(const int16_t *iq, size_t n_pairs,
         N = zoom_N;
     }
 
-    // Auto-clip the dB range to data percentiles unless the caller
-    // pinned both endpoints. Most real captures have a noise floor a
-    // few dB wide and bright peaks 20-40 dB above it; the old fixed
-    // -3..+20 dB range left the image purple-dim whenever the burst
-    // SNR wasn't already in that band. Walk the post-median-subtraction
-    // values, sample a 5th- and 99th-percentile pair, and use those as
-    // the visible range. The user's --db-min / --db-max still override.
+    // Auto-clip the dB range to data percentiles for any endpoint the
+    // caller didn't pin. Most real captures have a noise floor a few dB
+    // wide and bright peaks 20-40 dB above it; the old fixed -3..+20 dB
+    // range left the image purple-dim whenever the burst SNR wasn't
+    // already in that band. Walk the post-median-subtraction values,
+    // sample a 5th- and 99th-percentile pair, and use those as defaults.
     //
     // Internally the colormap maps from the MEDIAN-SUBTRACTED dB space
     // (each column's noise floor sits at 0 dB) up to whatever bright
     // peaks sit above it. The colorbar LABELS are shifted by
     // display_db_floor + power_offset_db so the operator reads
     // absolute dBFS (or dBm via --power-offset). --db-min / --db-max
-    // take their values in the SAME units the colorbar displays — that
-    // means: subtract display_db_floor + power_offset_db at use-time
-    // to get into the internal median-subtracted space.
-    float lo = opt->db_min, hi = opt->db_max;
-    if (!opt->auto_clip) {
-        lo -= opt->display_db_floor + opt->power_offset_db;
-        hi -= opt->display_db_floor + opt->power_offset_db;
-    }
-    if (opt->auto_clip) {
+    // take their values in the SAME units the colorbar displays — at
+    // override time we subtract display_db_floor + power_offset_db to
+    // get into the internal median-subtracted space.
+    //
+    // Important: if ONLY one of --db-min / --db-max is supplied, we
+    // still run the percentile path to fill the other endpoint —
+    // dropping back to a hard-coded default (0 dBFS for db_max) made
+    // --db-min alone spread the colormap over 100+ dB and left the
+    // image dim. With this mixed mode, --db-min=-115 alone now lets
+    // auto-clip pick a sensible upper end ~ a few dB above the floor.
+    float lo = 0.0f, hi = 0.0f;
+    int need_auto = !opt->db_min_user_set || !opt->db_max_user_set;
+    if (need_auto) {
         size_t n_cells = (size_t) out_rows * (size_t) N;
         // Sample-and-sort a subset to keep the percentile estimate fast.
         size_t sample_n = n_cells / 64;
@@ -1027,6 +1031,16 @@ static int build_waterfall(const int16_t *iq, size_t n_pairs,
             hi = p99;
             if (hi < lo + 12.0f) hi = lo + 12.0f;
         }
+    }
+    // User overrides land in absolute dBFS (the units the colorbar
+    // displays); convert to median-subtracted by subtracting the
+    // floor + power_offset. Either or both may be supplied; the auto-
+    // path above already filled defaults for the missing side.
+    if (opt->db_min_user_set) {
+        lo = opt->db_min - opt->display_db_floor - opt->power_offset_db;
+    }
+    if (opt->db_max_user_set) {
+        hi = opt->db_max - opt->display_db_floor - opt->power_offset_db;
     }
 
     // Record the dB range we actually used so render_with_axes can light
@@ -1469,11 +1483,13 @@ static void usage(void)
         "                         clock time (the default when the UT=\n"
         "                         field is present in the filename).\n"
         "    dB range auto-clipped to the 5th/99th percentile of the\n"
-        "    post-median-subtraction values unless --db-min and --db-max\n"
-        "    are both set. The auto-clip choice is internal (median-\n"
-        "    subtracted) but the colorbar always labels in absolute dBFS\n"
-        "    (or dBm via --power-offset), and --db-min / --db-max take\n"
-        "    their values in the same absolute units the bar displays.\n");
+        "    post-median-subtraction values for any endpoint not pinned\n"
+        "    by --db-min / --db-max. Passing one of them alone leaves\n"
+        "    auto-clip in charge of the other. The auto-clip choice is\n"
+        "    internal (median-subtracted) but the colorbar always labels\n"
+        "    in absolute dBFS (or dBm via --power-offset), and\n"
+        "    --db-min / --db-max take their values in the same absolute\n"
+        "    units the bar displays.\n");
 }
 
 static int parse_double_opt(const char *arg, const char *prefix, double *out)
@@ -1518,9 +1534,10 @@ int main(int argc, char **argv)
     opt.fft_size      = 1024;
     opt.hop           = 0;            // 0 = N/2 default
     opt.out_rows      = 1080;
-    opt.db_min        = 0.0f;
-    opt.db_max        = 0.0f;
-    opt.auto_clip     = 1;            // default: percentile-based dB clip
+    opt.db_min          = 0.0f;
+    opt.db_max          = 0.0f;
+    opt.db_min_user_set = 0;
+    opt.db_max_user_set = 0;
     opt.sample_rate   = sample_rate;
     opt.center_hz     = 0.0;
     opt.zoom_hz       = 30000.0;      // default ±15 kHz; --full-width disables
@@ -1556,11 +1573,11 @@ int main(int argc, char **argv)
         } else if ((rc = parse_double_opt(argv[i], "--db-min=", &d)) != 0) {
             if (rc < 0) { usage(); return 2; }
             opt.db_min = (float) d;
-            opt.auto_clip = 0;
+            opt.db_min_user_set = 1;
         } else if ((rc = parse_double_opt(argv[i], "--db-max=", &d)) != 0) {
             if (rc < 0) { usage(); return 2; }
             opt.db_max = (float) d;
-            opt.auto_clip = 0;
+            opt.db_max_user_set = 1;
         } else if ((rc = parse_double_opt(argv[i], "--center-hz=", &d)) != 0) {
             if (rc < 0) { usage(); return 2; }
             opt.center_hz = d;
