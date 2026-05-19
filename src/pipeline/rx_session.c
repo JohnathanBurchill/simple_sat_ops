@@ -411,8 +411,11 @@ int rx_session_open(rx_session_t **out, const rx_session_params_t *p,
     // start-stops / TX bursts queued by the main thread.
     rxs->core = core;
     rxs->lo_offset_hz = p->lo_offset_hz;
+    // lo_offset_hz is SIGNED: positive → LO above nominal, negative
+    // → LO below. Hardware LO = nominal + lo_offset_hz, so to recover
+    // the nominal carrier from the actual hardware tune we subtract.
     rxs->snap_actual_freq_hz = b210_rx_tx_core_actual_freq(core)
-                             + rxs->lo_offset_hz;
+                             - rxs->lo_offset_hz;
     pthread_mutex_init(&rxs->mu, NULL);
     pthread_cond_init (&rxs->cv, NULL);
     if (pthread_create(&rxs->thread, NULL, rx_session_thread_fn, rxs) != 0) {
@@ -1010,14 +1013,15 @@ static void worker_update_snapshot(rx_session_t *rxs)
     double burst_excess = 0.0;
     b210_rx_tx_core_burst_snapshot(rxs->core, &burst_bins, &burst_excess);
     // Effective downlink carrier as the operator thinks of it:
-    //   hardware LO + intentional lo_offset (puts signal off DC)
-    //                + software-Doppler NCO offset (tracks Doppler).
-    // The first two sum to the nominal carrier; the third is the
-    // satellite's instantaneous Doppler shift. Updates smoothly every
-    // tick at Hz precision instead of stepping in kHz like the old
-    // hardware-retune scheme.
+    //   hardware LO − lo_offset (recovers the nominal carrier)
+    //              + software-Doppler NCO offset (tracks Doppler).
+    // The first two sum to the nominal carrier (lo_offset_hz is the
+    // SIGNED offset of the hardware LO from nominal, so subtracting it
+    // gives nominal back); the third is the Doppler shift. Updates
+    // smoothly every tick at Hz precision instead of stepping in kHz
+    // like the old hardware-retune scheme.
     double freq = b210_rx_tx_core_actual_freq(rxs->core)
-                + rxs->lo_offset_hz
+                - rxs->lo_offset_hz
                 + b210_rx_tx_core_get_doppler_offset(rxs->core);
     int wav_active = (rxs->wav.fp != NULL);
     pthread_mutex_lock(&rxs->mu);

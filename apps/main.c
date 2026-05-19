@@ -4666,11 +4666,14 @@ int main(int argc, char **argv)
         // pass produces ~230 MB which the laptop SSD has no trouble
         // with.
         b210_rx_tx_core_params_t cp = {
-            // Tune the SDR LO below the nominal carrier so the corrected
-            // signal lands well off DC and stays clear of the B210's DC
-            // null even when Doppler crosses zero at TCA.
+            // Tune the SDR LO off the nominal carrier so the corrected
+            // signal lands well off DC. rx_lo_offset_hz is SIGNED:
+            // positive → LO above nominal (signal at negative baseband),
+            // negative → LO below (signal at positive baseband). Default
+            // -25 kHz keeps existing pipelines unchanged; operator can
+            // shift to dodge fixed-pattern noise.
             .freq_hz         = state.nominal_downlink_frequency_hz
-                             - state.rx_lo_offset_hz,
+                             + state.rx_lo_offset_hz,
             .rate_hz         = 480000.0,
             .gain_db         = 50.0,
             .bw_hz           = -1.0,
@@ -5474,9 +5477,15 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->doppler_uplink_frequency_hz = state->nominal_uplink_frequency_hz;
     state->doppler_downlink_frequency_hz = state->nominal_downlink_frequency_hz;
     state->doppler_correction_enabled = 1;
-    // 25 kHz default puts the corrected signal at +25 kHz baseband (well
-    // away from the B210's DC null, well inside the 48 kHz half-band).
-    state->rx_lo_offset_hz = 25000.0;
+    // SIGNED LO offset from the nominal carrier. Positive → LO ABOVE
+    // nominal (signal lands at negative baseband). Negative → LO
+    // BELOW nominal (signal at positive baseband). Default -25 kHz
+    // puts the corrected signal at +25 kHz baseband, away from the
+    // B210's DC null. Operator can shift it to dodge fixed-pattern
+    // spurs — comfortable range is roughly ±5..±35 kHz: at least
+    // 5 kHz to clear DC, and at most ~35 kHz so the ±10 kHz Doppler
+    // swing stays inside the 48 kHz post-decim half-band.
+    state->rx_lo_offset_hz = -25000.0;
 
     state->run_with_antenna_rotator = 1;
     state->antenna_rotator.device_filename = "/dev/ttyUSB0";

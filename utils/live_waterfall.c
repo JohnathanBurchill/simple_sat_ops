@@ -255,6 +255,12 @@ typedef struct {
     // at higher indices.
     uint8_t *rgb;
     int      rgb_stride;        // bytes per row = spec_w * 3
+
+    // Wall-clock timestamp per row (UNIX seconds). Mirrored into
+    // every scroll so a label drawn at y reads row_time[y] and shows
+    // the time of THAT pixel — the labels appear to scroll with the
+    // spectrogram. Filled with 0 until the row has been committed.
+    time_t  *row_time;
 } spec_state_t;
 
 static int spec_init(spec_state_t *s, unsigned n_fft, int spec_w, int spec_h,
@@ -283,9 +289,10 @@ static int spec_init(spec_state_t *s, unsigned n_fft, int spec_w, int spec_h,
     s->row_accum = (double *) calloc((size_t) spec_w, sizeof(double));
     s->frame_buf = (int16_t *)calloc((size_t) N * 2, sizeof(int16_t));
     s->rgb       = (uint8_t *)calloc((size_t) spec_w * (size_t) spec_h * 3, 1);
+    s->row_time  = (time_t *) calloc((size_t) spec_h, sizeof(time_t));
     s->rgb_stride = spec_w * 3;
     if (!s->win || !s->re || !s->im || !s->row_accum
-        || !s->frame_buf || !s->rgb) return -1;
+        || !s->frame_buf || !s->rgb || !s->row_time) return -1;
     for (int k = 0; k < N; ++k) {
         s->win[k] = 0.5f * (1.0f - cosf(2.0f * (float) M_PI * (float) k
                                         / (float)(N - 1)));
@@ -302,6 +309,7 @@ static void spec_free(spec_state_t *s)
 {
     free(s->win); free(s->re); free(s->im);
     free(s->row_accum); free(s->frame_buf); free(s->rgb);
+    free(s->row_time);
 }
 
 // Run one FFT on the accumulated frame, fold into row_accum. spec_w is
@@ -387,6 +395,10 @@ static void spec_commit_row(spec_state_t *s)
     memmove(s->rgb + (size_t) s->rgb_stride,
             s->rgb,
             (size_t) s->rgb_stride * (size_t)(H - 1));
+    // Scroll the timestamp array in lock-step so the labels follow
+    // their row pixels as the spectrogram crawls down.
+    memmove(s->row_time + 1, s->row_time, (size_t)(H - 1) * sizeof(time_t));
+    s->row_time[0] = time(NULL);
     // Paint new row at index 0.
     uint8_t *dst = s->rgb;
     for (int x = 0; x < W; ++x) {
@@ -423,6 +435,22 @@ static void spec_push_iq(spec_state_t *s, const int16_t *iq, int n_pairs)
             s->frame_filled = 0;
         }
     }
+}
+
+// Return a "nice" tick step (1, 2, 5, 10, ...) approximating the
+// requested ratio of the full range so labels land at round numbers.
+// Mirrors pick_tick_step in gen_waterfall.c.
+static double pick_tick_step(double range, int approx_n)
+{
+    if (range <= 0 || approx_n < 1) return 1.0;
+    double raw = range / (double) approx_n;
+    double mag = pow(10.0, floor(log10(raw)));
+    double mul = raw / mag;
+    if      (mul < 1.5) mul = 1.0;
+    else if (mul < 3.5) mul = 2.0;
+    else if (mul < 7.5) mul = 5.0;
+    else                mul = 10.0;
+    return mul * mag;
 }
 
 // --------------------------------------------------------------------
@@ -486,11 +514,17 @@ int main(int argc, char **argv)
     SetWindowTitle("live_waterfall");
     SetTargetFPS(30);
 
-    // Layout: small top status bar, big spectrogram, freq labels at bottom.
+    // Layout:
+    //   left_pad  — time labels (HH:MM:SS) every label_step_rows
+    //   top_bar_h — status (REC / waiting) + dB scale readout
+    //   colorbar  — 14 px viridis strip on the right edge with dB labels
+    //   bottom_bar_h — freq tick labels (kHz)
     const int top_bar_h    = 22;
-    const int bottom_bar_h = 18;
-    const int left_pad     = 4;
-    const int right_pad    = 4;
+    const int bottom_bar_h = 22;
+    const int left_pad     = 60;    // room for "HH:MM:SS"
+    const int cb_w         = 14;    // colorbar strip
+    const int cb_label_w   = 28;    // room for "+0..-90" labels
+    const int right_pad    = cb_w + cb_label_w + 4;
     int spec_w = win_w - left_pad - right_pad;
     int spec_h = win_h - top_bar_h - bottom_bar_h;
     if (spec_w < 64) spec_w = 64;
@@ -560,28 +594,99 @@ int main(int argc, char **argv)
         // 3. Draw.
         BeginDrawing();
         ClearBackground(BLACK);
-        // Top status bar.
+
+        // ---- Top status bar -----------------------------------------
         const char *status = (tail.fp != NULL) ? "REC" : "(waiting for .iq)";
         Color status_col = (tail.fp != NULL) ? (Color){80, 200, 80, 255}
                                               : (Color){200, 180, 80, 255};
         DrawText(status, left_pad, 4, 14, status_col);
-        // Spectrogram.
+
+        // ---- Spectrogram --------------------------------------------
         DrawTexture(spec_tex, left_pad, top_bar_h, WHITE);
-        // Freq labels (just centre + edges).
-        char buf[24];
-        int fy = top_bar_h + spec_h + 2;
-        snprintf(buf, sizeof buf, "-%g", zoom_khz / 2);
-        DrawText(buf, left_pad, fy, 12, GRAY);
-        snprintf(buf, sizeof buf, "0");
-        DrawText(buf, left_pad + spec_w / 2 - 4, fy, 12, GRAY);
-        snprintf(buf, sizeof buf, "+%g", zoom_khz / 2);
-        int tw = MeasureText(buf, 12);
-        DrawText(buf, left_pad + spec_w - tw, fy, 12, GRAY);
-        // dB scale info, top-right.
-        snprintf(buf, sizeof buf, "%+.0f..%+.0fdB",
-                 S.auto_db_min, S.auto_db_max);
-        int dw = MeasureText(buf, 12);
-        DrawText(buf, win_w - right_pad - dw, 6, 12, LIGHTGRAY);
+
+        // ---- Scrolling time labels on the left -----------------------
+        // Choose a label every ~50 px so they don't crowd. row_time[r]
+        // is the wall-clock time when that row was committed; labels
+        // scroll downward in lockstep with the pixels above them.
+        const int label_step_px = 50;
+        const Color time_col = (Color){180, 180, 180, 255};
+        for (int y = 0; y < spec_h; y += label_step_px) {
+            time_t t = S.row_time[y];
+            if (t == 0) continue;   // row not yet filled
+            struct tm lt;
+            localtime_r(&t, &lt);
+            char buf[16];
+            snprintf(buf, sizeof buf, "%02d:%02d:%02d",
+                     lt.tm_hour, lt.tm_min, lt.tm_sec);
+            int draw_y = top_bar_h + y - 5;
+            DrawText(buf, 4, draw_y, 11, time_col);
+            // 4-px tick into the spectrogram so the eye picks up which
+            // pixel row the label is anchored to.
+            DrawLine(left_pad - 4, top_bar_h + y, left_pad - 1,
+                     top_bar_h + y, time_col);
+        }
+
+        // ---- Frequency ticks at the bottom --------------------------
+        // Round-number ticks at pick_tick_step(zoom_khz, ~5) intervals.
+        // Spectrogram x covers -zoom_khz/2 .. +zoom_khz/2 across spec_w
+        // pixels.
+        double f_lo  = -zoom_khz / 2.0;
+        double f_hi  = +zoom_khz / 2.0;
+        double f_step = pick_tick_step(zoom_khz, 5);
+        double f0 = ceil(f_lo / f_step) * f_step;
+        const Color tick_col  = (Color){160, 160, 160, 255};
+        const Color flbl_col  = (Color){200, 200, 200, 255};
+        for (double f = f0; f <= f_hi + 0.5 * f_step; f += f_step) {
+            int x = left_pad + (int)((f - f_lo) / zoom_khz * spec_w);
+            // Tick mark hanging below the spectrogram.
+            DrawLine(x, top_bar_h + spec_h, x, top_bar_h + spec_h + 4,
+                     tick_col);
+            char buf[16];
+            if (fabs(f) < 0.05) snprintf(buf, sizeof buf, "0");
+            else if (fabs(f - floor(f + 0.5)) < 0.05)
+                snprintf(buf, sizeof buf, "%+d", (int) f);
+            else snprintf(buf, sizeof buf, "%+.1f", f);
+            int tw = MeasureText(buf, 11);
+            DrawText(buf, x - tw / 2,
+                     top_bar_h + spec_h + 6, 11, flbl_col);
+        }
+        // "kHz" unit at far right.
+        DrawText("kHz", left_pad + spec_w - 20,
+                 top_bar_h + spec_h + 10, 10, GRAY);
+
+        // ---- Colorbar on the right ----------------------------------
+        // 14 px wide viridis strip with dB labels (auto_db_max at top,
+        // auto_db_min at bottom). Hand-drawn one row at a time so we
+        // don't need a second texture.
+        int cb_x = win_w - right_pad + 2;
+        int cb_top = top_bar_h;
+        int cb_bot = top_bar_h + spec_h - 1;
+        int cb_h   = cb_bot - cb_top + 1;
+        for (int yy = 0; yy < cb_h; ++yy) {
+            // Top of bar = high dB = bright viridis (index 255), so
+            // map y=0 → idx=255, y=cb_h-1 → idx=0.
+            int idx = (int)(255.0 * (1.0 - (double) yy / (cb_h - 1)));
+            if (idx < 0)   idx = 0;
+            if (idx > 255) idx = 255;
+            Color c = {VIRIDIS[idx][0], VIRIDIS[idx][1], VIRIDIS[idx][2], 255};
+            DrawRectangle(cb_x, cb_top + yy, cb_w, 1, c);
+        }
+        // Frame around colorbar.
+        DrawRectangleLines(cb_x, cb_top, cb_w, cb_h, GRAY);
+        // dB labels (3 levels: max at top, mid, min at bottom).
+        {
+            char buf[24];
+            float lo_db = S.auto_db_min, hi_db = S.auto_db_max;
+            // Top label.
+            snprintf(buf, sizeof buf, "%+.0f", hi_db);
+            DrawText(buf, cb_x + cb_w + 3, cb_top - 2, 10, flbl_col);
+            // Bottom label.
+            snprintf(buf, sizeof buf, "%+.0f", lo_db);
+            DrawText(buf, cb_x + cb_w + 3, cb_bot - 8, 10, flbl_col);
+            // "dB" unit just above the bar.
+            DrawText("dB", cb_x - 3, cb_top - 14, 10, GRAY);
+        }
+
         EndDrawing();
     }
 
