@@ -40,6 +40,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <locale.h>
 #include <math.h>
 #include <pthread.h>
@@ -3239,6 +3240,53 @@ static void update_operations_current_symlink(const char *target)
 }
 
 // Compute a fresh AOS prediction off `state`'s current position and
+// Scan a YYYYMMDD parent dir for an existing HHMMLT folder whose
+// HHMM is within `window_minutes` of (target_hh, target_mm).
+// Restarting simple_sat_ops near a pass time shifts the predicted
+// AOS by a minute or two between launches, which would otherwise
+// spawn a fresh 1115LT/ alongside the 1114LT/ the operator was
+// already writing to. With this lookup the second start reuses
+// the existing folder. Returns 0 + fills out_path on a hit; -1 on
+// miss (or any I/O failure — caller should fall back to creating
+// a fresh folder).
+static int find_nearby_pass_folder(const char *parent_dir,
+                                   int target_hh, int target_mm,
+                                   int window_minutes,
+                                   char *out_path, size_t out_path_cap)
+{
+    DIR *d = opendir(parent_dir);
+    if (d == NULL) return -1;
+    int best_diff = INT_MAX;
+    char best_name[16] = "";
+    int target_mod = target_hh * 60 + target_mm;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        // HHMMLT name pattern: exactly 6 chars, [0-9]{4} then "LT".
+        const char *n = de->d_name;
+        if (strlen(n) != 6) continue;
+        if (!isdigit((unsigned char) n[0]) || !isdigit((unsigned char) n[1])
+         || !isdigit((unsigned char) n[2]) || !isdigit((unsigned char) n[3])
+         || n[4] != 'L' || n[5] != 'T') continue;
+        int hh = (n[0] - '0') * 10 + (n[1] - '0');
+        int mm = (n[2] - '0') * 10 + (n[3] - '0');
+        if (hh >= 24 || mm >= 60) continue;
+        int mod = hh * 60 + mm;
+        int diff = abs(mod - target_mod);
+        if (diff > 12 * 60) diff = 24 * 60 - diff;   // wrap across midnight
+        if (diff <= window_minutes && diff < best_diff) {
+            best_diff = diff;
+            // Filter above guarantees strlen(n) == 6, but gcc can't
+            // prove that — pin the width to keep -Wformat-truncation
+            // satisfied with our 16-byte best_name.
+            snprintf(best_name, sizeof best_name, "%.6s", n);
+        }
+    }
+    closedir(d);
+    if (best_name[0] == '\0') return -1;
+    int n = snprintf(out_path, out_path_cap, "%s/%s", parent_dir, best_name);
+    return (n > 0 && (size_t) n < out_path_cap) ? 0 : -1;
+}
+
 // build /FrontierSat/Operations/<yyyymmdd>/<hhmmLT>/. Stashes the
 // result in g_pass_folder so ipc_broadcast_state can publish it on
 // every tick.
@@ -3278,19 +3326,40 @@ static void setup_pass_folder(state_t *state, double jul_utc_now)
     time_t aos = jul_to_unix(aos_jul);
     struct tm aos_local;
     localtime_r(&aos, &aos_local);
-    char folder[256];
-    int n = snprintf(folder, sizeof folder,
-                     "%s/%04d%02d%02d/%02d%02dLT",
-                     sso_operations_dir(),
-                     aos_local.tm_year + 1900,
-                     aos_local.tm_mon + 1,
-                     aos_local.tm_mday,
-                     aos_local.tm_hour,
-                     aos_local.tm_min);
-    if (n <= 0 || (size_t)n >= sizeof folder) {
+    char parent_dir[256];
+    int pn = snprintf(parent_dir, sizeof parent_dir,
+                      "%s/%04d%02d%02d",
+                      sso_operations_dir(),
+                      aos_local.tm_year + 1900,
+                      aos_local.tm_mon + 1,
+                      aos_local.tm_mday);
+    if (pn <= 0 || (size_t) pn >= sizeof parent_dir) {
         fprintf(stderr,
-                "simple_sat_ops: pass folder name too long; skipping\n");
+                "simple_sat_ops: pass folder parent path too long; skipping\n");
         return;
+    }
+    char folder[256];
+    // Look for an existing HHMMLT folder for THIS pass within ±10
+    // minutes of the predicted AOS — re-runs of simple_sat_ops near
+    // a pass time can drift the prediction by a minute or two, and
+    // we want to keep recording into the same folder.
+    if (find_nearby_pass_folder(parent_dir,
+                                aos_local.tm_hour, aos_local.tm_min,
+                                10, folder, sizeof folder) == 0) {
+        fprintf(stderr,
+                "simple_sat_ops: reusing pass folder %s "
+                "(predicted AOS %02d:%02dLT within 10 min)\n",
+                folder, aos_local.tm_hour, aos_local.tm_min);
+    } else {
+        int n = snprintf(folder, sizeof folder,
+                         "%s/%02d%02dLT",
+                         parent_dir,
+                         aos_local.tm_hour, aos_local.tm_min);
+        if (n <= 0 || (size_t) n >= sizeof folder) {
+            fprintf(stderr,
+                "simple_sat_ops: pass folder name too long; skipping\n");
+            return;
+        }
     }
     if (sso_mkdir_p(folder) != 0) {
         fprintf(stderr,
