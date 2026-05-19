@@ -112,11 +112,12 @@ __attribute__((unused))
 static char  g_live_waterfall_iq[512] = "";
 
 // HMAC keyfile selection. Path is resolved at startup (CLI override
-// or hmac_keyfile_default_path); the file is attempted-load once so
-// the operator banner can show "(N bytes ok)" vs "(missing)" vs
-// "(bad)". The bytes themselves are not retained — display only.
-// TX integration (passing the key into rx_session_request_burst_sync)
-// is a separate change.
+// or hmac_keyfile_default_path); the file is loaded into g_hmac_key
+// once so (a) the operator banner can show "(N bytes ok)" / "(missing)"
+// / "(bad)" and (b) every TX burst signs the AX100 frame with these
+// bytes. The CTS1 flight firmware expects HMAC on every uplink — if
+// the keyfile is missing or won't parse, TX is REFUSED rather than
+// sending unsigned frames the satellite would silently drop.
 typedef enum {
     HMAC_DISPLAY_UNSET   = 0,
     HMAC_DISPLAY_OK      = 1,
@@ -125,7 +126,8 @@ typedef enum {
 } hmac_display_status_t;
 static char                  g_hmac_keyfile_path[512] = "";
 static hmac_display_status_t g_hmac_display_status    = HMAC_DISPLAY_UNSET;
-static ssize_t               g_hmac_key_bytes         = 0;
+static uint8_t               g_hmac_key[64];
+static size_t                g_hmac_key_len           = 0;
 
 // Signal ribbon: 60-second 1 Hz rolling window of RX peak dBFS rendered
 // as a UTF-8 block-character strip in the RX panel. Oldest sample on
@@ -3964,7 +3966,7 @@ void report_status(state_t *state, int *print_row, int print_col)
 
     p.hmac_path   = g_hmac_keyfile_path;
     p.hmac_status = g_hmac_display_status;
-    p.hmac_bytes  = g_hmac_key_bytes;
+    p.hmac_bytes  = (ssize_t) g_hmac_key_len;
 
     p.have_rotator = state->have_antenna_rotator;
     if (state->have_antenna_rotator) {
@@ -4552,11 +4554,12 @@ int main(int argc, char **argv)
         return run_viewer(argv[0]);
     }
 
-    // Resolve + sanity-load the HMAC keyfile so the operator banner can
-    // show which file is in play. We don't keep the bytes — the goal is
-    // visual confirmation that the right file resolves and parses; TX
-    // wiring is a separate change. If --hmac-keyfile= wasn't given, fall
-    // back to hmac_keyfile_default_path (shared first, per-user second).
+    // Resolve + load the HMAC keyfile. The bytes feed every TX burst's
+    // AX100 frame (CTS1 firmware expects HMAC on every uplink), AND
+    // light the operator banner — "(N bytes ok)" means TX is armed,
+    // "(MISSING)" / "(BAD)" means the next TX request will be refused
+    // before keying the PA. If --hmac-keyfile= wasn't given, fall back
+    // to hmac_keyfile_default_path (shared first, per-user second).
     if (g_hmac_keyfile_path[0] == '\0') {
         if (hmac_keyfile_default_path(g_hmac_keyfile_path,
                                       sizeof g_hmac_keyfile_path) != 0) {
@@ -4569,16 +4572,16 @@ int main(int argc, char **argv)
         if (stat(g_hmac_keyfile_path, &st) != 0) {
             g_hmac_display_status = HMAC_DISPLAY_MISSING;
         } else {
-            uint8_t scratch[256];
             ssize_t got = hmac_keyfile_load(g_hmac_keyfile_path,
-                                            scratch, sizeof scratch);
-            // Wipe the bytes immediately — we only wanted to verify.
-            memset(scratch, 0, sizeof scratch);
+                                            g_hmac_key,
+                                            sizeof g_hmac_key);
             if (got > 0) {
                 g_hmac_display_status = HMAC_DISPLAY_OK;
-                g_hmac_key_bytes      = got;
+                g_hmac_key_len        = (size_t) got;
             } else {
                 g_hmac_display_status = HMAC_DISPLAY_BAD;
+                g_hmac_key_len        = 0;
+                memset(g_hmac_key, 0, sizeof g_hmac_key);
             }
         }
     }
@@ -5287,9 +5290,18 @@ int main(int argc, char **argv)
                          g_tx_request.summary);
                 ack = "dry-run";
                 cmd_sent = 1;
+            } else if (g_hmac_key_len == 0) {
+                // CTS1 expects HMAC on every uplink. Without a valid
+                // key the burst would go out unsigned and the satellite
+                // would silently drop it. Refuse here so the operator
+                // sees a clear error instead of a misleading "ok" ack.
+                snprintf(summary, sizeof summary, "%s",
+                         g_tx_request.summary);
+                ack = "rejected: no HMAC key (see banner)";
             } else if (g_rx_session != NULL) {
                 rx_burst_result_t br = rx_session_request_burst_sync(
-                    g_rx_session, &g_tx_request, NULL, 0,
+                    g_rx_session, &g_tx_request,
+                    g_hmac_key, g_hmac_key_len,
                     summary, sizeof summary);
                 switch (br) {
                     case RX_BURST_OK:                 ack = "ok"; cmd_sent = 1; break;
