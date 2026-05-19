@@ -104,6 +104,14 @@ static void test_init_defaults(void)
     tap_okf(fabs(s.auto_offset_db - 3.0) < 1e-12,
             "init: default auto_offset_db == 3.0 (got %.3f)",
             s.auto_offset_db);
+    // carrier_lockout_samples = 1.5 s * fs (default 1.5 s when param == 0).
+    tap_okf(s.carrier_lockout_samples == (size_t)(1.5 * FS),
+            "init: default carrier_lockout_samples == %zu (got %zu)",
+            (size_t)(1.5 * FS), s.carrier_lockout_samples);
+    // lockout_release_samples = 0.5 s * fs (default 0.5 s).
+    tap_okf(s.lockout_release_samples == (size_t)(0.5 * FS),
+            "init: default lockout_release_samples == %zu (got %zu)",
+            (size_t)(0.5 * FS), s.lockout_release_samples);
     // Default init_mode (uninitialised in the params struct → 0 == MSQ_OFF).
     tap_ok(s.mode == MSQ_OFF, "init: default mode == MSQ_OFF");
 }
@@ -384,6 +392,92 @@ static void test_alias_safe(void)
            "alias-safe: MSQ_OFF passthrough still matches input");
 }
 
+// ------------------------------------------------------------------
+// 11. Carrier lockout: a sustained above-threshold ratio (a Doppler-
+// swept carrier dwelling in the signal band, not a real packet)
+// stops refreshing the hold timer after carrier_lockout_s, and the
+// lockout clears after lockout_release_s of below-threshold gap.
+// ------------------------------------------------------------------
+
+static void test_carrier_lockout(void)
+{
+    monitor_squelch_t s;
+    monitor_squelch_params_t p = {
+        .rate_hz           = FS, .init_mode = MSQ_FIXED,
+        .init_thresh_db    = 3.0,
+        .hold_s            = 0.020,    // 20 ms — fast drain to expose lockout
+        .smooth_tau_s      = 0.001,
+        .carrier_lockout_s = 0.040,    // 1920 samples
+        .lockout_release_s = 0.010,    // 480 samples
+    };
+    monitor_squelch_init(&s, &p);
+
+    // Brief tone burst (under carrier_lockout_samples) — gate should
+    // open normally and lockout should NOT engage.
+    int16_t tone[1000], out[8000];
+    fill_tone(tone, 1000, 4800.0, FS, 8000.0);
+    monitor_squelch_process(&s, tone, out, 1000);
+    tap_okf(s.lockout_active == 0,
+            "lockout: stays off after short burst (lockout_active=%d)",
+            s.lockout_active);
+    tap_okf(s.hold_samples_remaining > 0,
+            "lockout: short burst still refreshed hold timer (%zu)",
+            s.hold_samples_remaining);
+
+    // Now feed a SUSTAINED tone long enough to trip the lockout
+    // (carrier_lockout_samples = 0.040 * 48000 = 1920, so 4000 samples
+    // is well past that). After processing, lockout_active should be 1.
+    int16_t sustained[4000];
+    fill_tone(sustained, 4000, 4800.0, FS, 8000.0);
+    monitor_squelch_init(&s, &p);  // reset
+    monitor_squelch_process(&s, sustained, out, 4000);
+    tap_okf(s.lockout_active == 1,
+            "lockout: sustained above-thresh trips lockout "
+            "(above=%zu, threshold=%zu)",
+            s.above_thresh_samples, s.carrier_lockout_samples);
+
+    // Feed enough silence to release the lockout
+    // (lockout_release_samples = 0.010 * 48000 = 480).
+    int16_t silence[2000] = {0};
+    monitor_squelch_process(&s, silence, out, 2000);
+    tap_okf(s.lockout_active == 0,
+            "lockout: clears after release gap of silence");
+
+    // A second short burst should now open the gate again.
+    fill_tone(tone, 1000, 4800.0, FS, 8000.0);
+    monitor_squelch_process(&s, tone, out, 1000);
+    tap_okf(s.hold_samples_remaining > 0,
+            "lockout: gate re-opens for a new burst after release");
+}
+
+// ------------------------------------------------------------------
+// 12. carrier_lockout_s < 0 disables the feature entirely.
+// ------------------------------------------------------------------
+
+static void test_lockout_disabled(void)
+{
+    monitor_squelch_t s;
+    monitor_squelch_params_t p = {
+        .rate_hz           = FS, .init_mode = MSQ_FIXED,
+        .init_thresh_db    = 3.0,
+        .smooth_tau_s      = 0.001,
+        .carrier_lockout_s = -1.0,     // disabled
+    };
+    monitor_squelch_init(&s, &p);
+    tap_okf(s.carrier_lockout_samples == 0,
+            "disabled: carrier_lockout_samples == 0 when param < 0 "
+            "(got %zu)", s.carrier_lockout_samples);
+
+    // Long sustained tone — lockout never engages.
+    int16_t sustained[8000], out[8000];
+    fill_tone(sustained, 8000, 4800.0, FS, 8000.0);
+    monitor_squelch_process(&s, sustained, out, 8000);
+    tap_okf(s.lockout_active == 0,
+            "disabled: long sustained tone leaves lockout_active=0");
+    tap_okf(s.hold_samples_remaining > 0,
+            "disabled: hold timer still refreshes throughout");
+}
+
 int main(void)
 {
     test_init_defaults();
@@ -396,5 +490,7 @@ int main(void)
     test_bootstrap_engages();
     test_status_strings();
     test_alias_safe();
+    test_carrier_lockout();
+    test_lockout_disabled();
     return tap_done();
 }

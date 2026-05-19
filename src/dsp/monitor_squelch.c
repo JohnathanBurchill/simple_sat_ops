@@ -32,6 +32,12 @@ void monitor_squelch_init(monitor_squelch_t *s,
     double hold_s     = p->hold_s        > 0 ? p->hold_s        : 0.5;
     double boot_s     = p->boot_window_s > 0 ? p->boot_window_s : 1.0;
     double offset_db  = p->auto_offset_db != 0 ? p->auto_offset_db : 3.0;
+    // Carrier-lockout. carrier_lockout_s defaults to 1.5 s; pass < 0
+    // to disable (set to 0 internally → never trips). lockout_release_s
+    // defaults to 0.5 s.
+    double lockout_s  = (p->carrier_lockout_s < 0.0) ? 0.0
+                      : (p->carrier_lockout_s == 0.0 ? 1.5 : p->carrier_lockout_s);
+    double release_s  = p->lockout_release_s > 0.0 ? p->lockout_release_s : 0.5;
 
     if (noise_hi >= 0.5 * fs) noise_hi = 0.5 * fs - 1000.0;
 
@@ -48,6 +54,8 @@ void monitor_squelch_init(monitor_squelch_t *s,
     s->hold_duration  = (size_t)(hold_s * fs);
     s->boot_target    = (size_t)(boot_s * fs);
     s->auto_offset_db = offset_db;
+    s->carrier_lockout_samples = (size_t)(lockout_s * fs);
+    s->lockout_release_samples = (size_t)(release_s * fs);
 
     if (p->init_mode == MSQ_AUTO_BOOTSTRAPPING) {
         s->mode = MSQ_AUTO_BOOTSTRAPPING;
@@ -67,6 +75,9 @@ void monitor_squelch_set_auto(monitor_squelch_t *s)
     s->boot_floor_db    = 0.0;
     s->thresh_db        = 0.0;
     s->hold_samples_remaining = 0;
+    s->above_thresh_samples   = 0;
+    s->below_thresh_samples   = 0;
+    s->lockout_active         = 0;
 }
 
 void monitor_squelch_set_off(monitor_squelch_t *s)
@@ -79,6 +90,9 @@ void monitor_squelch_set_fixed_db(monitor_squelch_t *s, double thresh_db)
     s->mode      = MSQ_FIXED;
     s->thresh_db = thresh_db;
     s->hold_samples_remaining = 0;
+    s->above_thresh_samples   = 0;
+    s->below_thresh_samples   = 0;
+    s->lockout_active         = 0;
 }
 
 void monitor_squelch_status(const monitor_squelch_t *s, char *buf, size_t cap)
@@ -139,11 +153,37 @@ void monitor_squelch_process(monitor_squelch_t *s,
             continue;
         }
 
+        // Carrier-lockout bookkeeping. Tracks how long the ratio has
+        // stayed above (or below) the threshold across consecutive
+        // samples; toggles lockout_active when the above-thresh run
+        // exceeds carrier_lockout_samples, clears it once we get a
+        // sustained below-thresh gap. Skipped when the feature is
+        // disabled (carrier_lockout_samples == 0).
+        if (s->carrier_lockout_samples > 0) {
+            if (s->ratio_db > s->thresh_db) {
+                s->above_thresh_samples++;
+                s->below_thresh_samples = 0;
+                if (s->above_thresh_samples > s->carrier_lockout_samples) {
+                    s->lockout_active = 1;
+                }
+            } else {
+                s->above_thresh_samples = 0;
+                s->below_thresh_samples++;
+                if (s->below_thresh_samples >= s->lockout_release_samples) {
+                    s->lockout_active = 0;
+                }
+            }
+        }
+
         int open;
         if (s->mode == MSQ_OFF) {
             open = 1;
         } else {
-            if (s->ratio_db > s->thresh_db) {
+            // Only refresh the hold timer if we're not in a carrier
+            // lockout. The lockout still lets any already-running hold
+            // counter drain naturally, so the tail end of a real packet
+            // that happened JUST before the lockout engaged is heard.
+            if (s->ratio_db > s->thresh_db && !s->lockout_active) {
                 s->hold_samples_remaining = s->hold_duration;
             }
             open = (s->hold_samples_remaining > 0);

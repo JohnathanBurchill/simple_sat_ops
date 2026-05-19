@@ -60,6 +60,21 @@ typedef struct monitor_squelch {
     size_t hold_samples_remaining;
     size_t hold_duration;
 
+    // Carrier-lockout state. A real packet burst is brief — tens of
+    // milliseconds to a couple of seconds at most. A satellite carrier
+    // sweeping through the signal band by Doppler can hold the ratio
+    // above threshold for many seconds, which the basic gate would
+    // misread as a continuous packet train. above_thresh_samples is
+    // the running count of consecutive samples with ratio_db above
+    // thresh_db; once it exceeds carrier_lockout_samples the gate
+    // locks shut for the remainder of the dwell. The lockout clears
+    // when ratio drops below threshold for lockout_release_samples.
+    size_t above_thresh_samples;
+    size_t below_thresh_samples;
+    int    lockout_active;
+    size_t carrier_lockout_samples;   // 0 = lockout feature disabled
+    size_t lockout_release_samples;
+
     // Bootstrap state for AUTO mode.
     size_t boot_target;
     size_t boot_count;
@@ -83,6 +98,12 @@ typedef struct monitor_squelch_params {
     double hold_s;           // default 0.5
     double boot_window_s;    // default 1.0
     double auto_offset_db;   // default 3.0
+
+    // Carrier-lockout (see struct doc above). carrier_lockout_s == 0
+    // disables the feature; the gate then behaves like the basic
+    // threshold + hold-timer state machine.
+    double carrier_lockout_s;  // default 1.5 (0 → disabled)
+    double lockout_release_s;  // default 0.5
 
     msq_mode_t init_mode;    // OFF / AUTO_BOOTSTRAPPING / FIXED
     double init_thresh_db;   // for FIXED only

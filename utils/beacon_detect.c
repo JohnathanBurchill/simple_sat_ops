@@ -190,6 +190,11 @@ static void usage(FILE *dest, const char *prog)
         "  --lattice-period-s=<f>   Beacon cadence for lattice filter\n"
         "                           (default 20; 0 disables)\n"
         "  --lattice-tol-s=<f>      Tolerance around lattice (default 2.0)\n"
+        "  --max-burst-s=<f>        Drop peaks inside an above-threshold\n"
+        "                           run longer than this (default 1.5).\n"
+        "                           Suppresses Doppler-swept carriers\n"
+        "                           that hang in the signal band for\n"
+        "                           seconds. 0 disables.\n"
         "\n"
         "Output:\n"
         "  --csv=<path>             CSV path (default stdout)\n"
@@ -267,6 +272,13 @@ int main(int argc, char **argv)
     double min_spacing_s     = 15.0;
     double lattice_period_s  = 20.0;
     double lattice_tol_s     = 2.0;
+    // Carrier-suppression: drop peaks that sit inside an above-threshold
+    // run longer than max_burst_s. A real packet's ratio_db crosses
+    // threshold for tens of ms to a couple of seconds; a Doppler-swept
+    // carrier dwelling in the signal band can hold for many seconds and
+    // would otherwise produce a string of "detections". Set 0 to
+    // disable.
+    double max_burst_s       = 1.5;
     const char *csv_path     = NULL;
     int    quiet             = 0;
     int    render_png        = 0;
@@ -290,6 +302,7 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--min-spacing-s="))    min_spacing_s = atof(a + 16);
         else if (starts_with(a, "--lattice-period-s=")) lattice_period_s = atof(a + 19);
         else if (starts_with(a, "--lattice-tol-s="))    lattice_tol_s = atof(a + 16);
+        else if (starts_with(a, "--max-burst-s="))      max_burst_s = atof(a + 14);
         else if (starts_with(a, "--csv="))              csv_path = a + 6;
         else if (strcmp(a, "--quiet") == 0)             quiet = 1;
         else if (strcmp(a, "--render-png") == 0)        render_png = 1;
@@ -430,6 +443,40 @@ int main(int argc, char **argv)
     if (!quiet) {
         fprintf(stderr, "  raw detections: %zu\n", n_peaks);
     }
+
+    // Carrier-suppression filter. For each peak, walk left then right
+    // and count consecutive cells with ratio_db > threshold. If the
+    // run length is longer than max_burst_s, the peak is inside a
+    // sustained carrier dwell rather than a brief packet — drop it.
+    // Mirrors the carrier-lockout in monitor_squelch.
+    if (max_burst_s > 0.0 && n_peaks > 0) {
+        size_t max_burst_cells = (size_t)(max_burst_s / cell_s);
+        if (max_burst_cells < 1) max_burst_cells = 1;
+        size_t kept = 0;
+        for (size_t i = 0; i < n_peaks; ++i) {
+            size_t k = peak_idx[i];
+            // Walk left while still above threshold.
+            size_t run = 1;
+            size_t j = k;
+            while (j > 0 && ratio_db[j - 1] > threshold && run <= max_burst_cells + 1) {
+                --j; ++run;
+            }
+            j = k;
+            while (j + 1 < n_env && ratio_db[j + 1] > threshold && run <= max_burst_cells + 1) {
+                ++j; ++run;
+            }
+            if (run <= max_burst_cells) {
+                peak_idx[kept++] = k;
+            }
+        }
+        if (!quiet) {
+            fprintf(stderr,
+                "  after max-burst filter (%.2fs): %zu (dropped %zu)\n",
+                max_burst_s, kept, n_peaks - kept);
+        }
+        n_peaks = kept;
+    }
+
     n_peaks = lattice_filter(peak_idx, n_peaks, ratio_db,
                              cell_s, lattice_period_s, lattice_tol_s);
     if (!quiet) {
