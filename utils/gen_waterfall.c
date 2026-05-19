@@ -952,7 +952,20 @@ static int build_waterfall(const int16_t *iq, size_t n_pairs,
     // SNR wasn't already in that band. Walk the post-median-subtraction
     // values, sample a 5th- and 99th-percentile pair, and use those as
     // the visible range. The user's --db-min / --db-max still override.
+    //
+    // Internally the colormap maps from the MEDIAN-SUBTRACTED dB space
+    // (each column's noise floor sits at 0 dB) up to whatever bright
+    // peaks sit above it. The colorbar LABELS are shifted by
+    // display_db_floor + power_offset_db so the operator reads
+    // absolute dBFS (or dBm via --power-offset). --db-min / --db-max
+    // take their values in the SAME units the colorbar displays — that
+    // means: subtract display_db_floor + power_offset_db at use-time
+    // to get into the internal median-subtracted space.
     float lo = opt->db_min, hi = opt->db_max;
+    if (!opt->auto_clip) {
+        lo -= opt->display_db_floor + opt->power_offset_db;
+        hi -= opt->display_db_floor + opt->power_offset_db;
+    }
     if (opt->auto_clip) {
         size_t n_cells = (size_t) out_rows * (size_t) N;
         // Sample-and-sort a subset to keep the percentile estimate fast.
@@ -1436,6 +1449,17 @@ static void usage(void)
         "                         Default 'dBFS'; auto-switches to 'dBm'\n"
         "                         when --power-offset is non-zero unless\n"
         "                         overridden here. Any short ASCII works.\n"
+        "    --db-min=X           Lower end of the displayed dB range, in\n"
+        "                         the SAME units shown on the colorbar\n"
+        "                         (absolute dBFS by default; dBm if you've\n"
+        "                         passed --power-offset). Cells at or below\n"
+        "                         this value map to the darkest viridis\n"
+        "                         pixel. Setting this disables the\n"
+        "                         percentile auto-clip; pass with --db-max.\n"
+        "    --db-max=X           Upper end of the displayed dB range, same\n"
+        "                         units as --db-min. Cells at or above this\n"
+        "                         value map to the brightest viridis pixel.\n"
+        "                         Setting this disables auto-clip.\n"
         "    --start-utc=YYYYMMDDTHHMMSS\n"
         "                         Override the capture-start UTC time used\n"
         "                         for the time-axis labels. Default: parse\n"
@@ -1446,7 +1470,10 @@ static void usage(void)
         "                         field is present in the filename).\n"
         "    dB range auto-clipped to the 5th/99th percentile of the\n"
         "    post-median-subtraction values unless --db-min and --db-max\n"
-        "    are both set.\n");
+        "    are both set. The auto-clip choice is internal (median-\n"
+        "    subtracted) but the colorbar always labels in absolute dBFS\n"
+        "    (or dBm via --power-offset), and --db-min / --db-max take\n"
+        "    their values in the same absolute units the bar displays.\n");
 }
 
 static int parse_double_opt(const char *arg, const char *prefix, double *out)
