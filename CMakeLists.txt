@@ -56,6 +56,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(NCURSES ncurses)
 pkg_check_modules(OPENSSL libcrypto)
 pkg_check_modules(SQLITE3 sqlite3)
+pkg_check_modules(RAYLIB raylib)
 find_library(SGP4SDP4_LIB sgp4sdp4)
 
 # packet_db is a shared dependency of every receiver: rx_decode,
@@ -172,6 +173,33 @@ list(APPEND SSO_TARGETS beacon_detect)
 add_executable(gen_waterfall utils/gen_waterfall.c)
 target_link_libraries(gen_waterfall PRIVATE m)
 list(APPEND SSO_TARGETS gen_waterfall)
+
+# live_waterfall — raylib-backed real-time spectrogram viewer. Tails
+# the .iq file simple_sat_ops is writing and renders a scrolling
+# viridis waterfall in a tall narrow window beside the operator UI.
+# Optional: skipped if raylib isn't installed.
+if (RAYLIB_FOUND)
+    add_executable(live_waterfall utils/live_waterfall.c)
+    target_include_directories(live_waterfall PRIVATE ${RAYLIB_INCLUDE_DIRS})
+    target_link_directories(live_waterfall PRIVATE ${RAYLIB_LIBRARY_DIRS})
+    target_link_libraries(live_waterfall PRIVATE ${RAYLIB_LIBRARIES} m)
+    # Homebrew's raylib.pc on macOS doesn't list the Cocoa / OpenGL /
+    # IOKit frameworks the static lib pulls in (and the dylib variant
+    # isn't always installed). Add them explicitly on Darwin; harmless
+    # on Linux where these frameworks don't exist (the find_library
+    # below returns NOTFOUND-suffixed strings which we filter out).
+    if (APPLE)
+        target_link_libraries(live_waterfall PRIVATE
+            "-framework Cocoa"
+            "-framework OpenGL"
+            "-framework IOKit"
+            "-framework CoreVideo"
+            "-framework Foundation")
+    endif()
+    list(APPEND SSO_TARGETS live_waterfall)
+else()
+    message(STATUS "raylib not found via pkg-config; live_waterfall skipped.")
+endif()
 
 # Selftest for the IQ-domain demods (modem_iq.c, modem_viterbi.c).
 # Synthesizes CPFSK + optional AWGN, round-trips through both chains,
