@@ -39,6 +39,7 @@
 
 #define _GNU_SOURCE
 
+#include <ctype.h>
 #include <errno.h>
 #include <math.h>
 #include <stdarg.h>
@@ -338,6 +339,10 @@ typedef struct wf_opts {
     // global floor estimate).
     int    detrend_mode;
     double detrend_tau_s;   // time constant for detrend=hpf, seconds
+    // Optional CSV of beacon-detection times to overlay on the time
+    // axis as horizontal marks. Format is beacon_detect's CSV: header
+    // line `idx,t_s,...`, '#' comment lines, t_s in seconds-since-start.
+    const char *marks_csv_path;
     int    sample_rate;   // for the time + frequency axis labels
     double center_hz;     // baseband centre frequency for the freq-axis label
     double zoom_hz;       // visible bandwidth around DC; 0 or negative = full
@@ -1406,6 +1411,63 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
     draw_text(rgb, W, H, 4, TM + 4, "time", 1,
               LBL_R, LBL_G, LBL_B);
 
+    // Marks overlay: read a CSV with `idx,t_s,...` rows and draw a
+    // bright orange tick on the left edge plus a faint line across the
+    // spectrogram at each t_s. Lets the operator eyeball whether a
+    // detector's hits land on real bursts in the waterfall.
+    if (opt->marks_csv_path != NULL && opt->marks_csv_path[0] != '\0') {
+        FILE *fp = fopen(opt->marks_csv_path, "r");
+        if (fp == NULL) {
+            fprintf(stderr,
+                "gen_waterfall: --marks-csv: cannot open %s: %s\n",
+                opt->marks_csv_path, strerror(errno));
+        } else {
+            const uint8_t MARK_R = 255, MARK_G = 140, MARK_B = 0;
+            const uint8_t LINE_R = 255, LINE_G = 90,  LINE_B = 0;
+            char line[512];
+            int n_drawn = 0;
+            while (fgets(line, sizeof line, fp) != NULL) {
+                // Skip comments and the header row.
+                if (line[0] == '#' || line[0] == '\n' || line[0] == '\0')
+                    continue;
+                if (!isdigit((unsigned char) line[0]) && line[0] != '-'
+                    && line[0] != '+') continue;
+                // Format: idx,t_s,...  — locate the first comma, parse
+                // t_s after it. Skip header row by checking it starts
+                // with a digit (idx column is numeric).
+                const char *comma = strchr(line, ',');
+                if (comma == NULL) continue;
+                double t_s = strtod(comma + 1, NULL);
+                if (t_s < 0.0 || t_s > duration_s + 0.5) continue;
+                double frac = 1.0 - t_s / duration_s;
+                int y = TM + (int)(frac * (double) spec_h);
+                if (y < TM || y >= TM + spec_h) continue;
+                // Bright tick into the left margin (12 px), thicker than
+                // the time-axis ticks so it stands out.
+                for (int dx = 0; dx < 12; ++dx) {
+                    px_set(rgb, W, H, LM - 1 - dx, y,
+                           MARK_R, MARK_G, MARK_B);
+                    px_set(rgb, W, H, LM - 1 - dx, y - 1,
+                           MARK_R, MARK_G, MARK_B);
+                }
+                // Faint horizontal line across the spectrogram so the
+                // detection is locatable in frequency too.
+                for (int x = LM; x < LM + spec_w; ++x) {
+                    // Every-other-pixel for "faint" so it doesn't cover
+                    // the underlying signal.
+                    if ((x & 1) == 0) {
+                        px_set(rgb, W, H, x, y, LINE_R, LINE_G, LINE_B);
+                    }
+                }
+                ++n_drawn;
+            }
+            fclose(fp);
+            fprintf(stderr,
+                "gen_waterfall: marked %d detection(s) from %s\n",
+                n_drawn, opt->marks_csv_path);
+        }
+    }
+
     // dB colorbar in the right margin. Top of the strip is the maximum
     // displayed dB, bottom is the minimum — matches the convention of
     // "more = up". Same viridis table as the spectrogram.
@@ -1557,6 +1619,16 @@ static void usage(void)
         "                         use T = 120…300 in that case so the\n"
         "                         HPF doesn't subtract the carrier's own\n"
         "                         energy out of itself.\n"
+        "    --marks-csv=<path>   Overlay horizontal tick marks on the\n"
+        "                         time axis at the times listed in the\n"
+        "                         CSV. Format matches beacon_detect's\n"
+        "                         output: '#'-comment lines and a header\n"
+        "                         row, then one detection per row with\n"
+        "                         t_s in the second column. Bright orange\n"
+        "                         tick into the left margin + faint\n"
+        "                         dotted line across the spectrogram, so\n"
+        "                         each detection is easy to cross-check\n"
+        "                         against visible bursts.\n"
         "    --start-utc=YYYYMMDDTHHMMSS\n"
         "                         Override the capture-start UTC time used\n"
         "                         for the time-axis labels. Default: parse\n"
@@ -1623,6 +1695,7 @@ int main(int argc, char **argv)
     opt.db_max_user_set = 0;
     opt.detrend_mode    = 0;        // median (backwards compatible default)
     opt.detrend_tau_s   = 30.0;     // typical AGC ramps die in ~30 s
+    opt.marks_csv_path  = NULL;
     opt.sample_rate   = sample_rate;
     opt.center_hz     = 0.0;
     opt.zoom_hz       = 30000.0;      // default ±15 kHz; --full-width disables
@@ -1682,6 +1755,8 @@ int main(int argc, char **argv)
                 return 2;
             }
             opt.detrend_tau_s = d;
+        } else if (strncmp(argv[i], "--marks-csv=", 12) == 0) {
+            opt.marks_csv_path = argv[i] + 12;
         } else if ((rc = parse_double_opt(argv[i], "--center-hz=", &d)) != 0) {
             if (rc < 0) { usage(); return 2; }
             opt.center_hz = d;
