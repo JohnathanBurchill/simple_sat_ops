@@ -1321,7 +1321,7 @@ static void rx_panel_collect_local(rx_panel_data_t *d)
         int idx = (g_ribbon_head - 1 - i + RIBBON_LEN) % RIBBON_LEN;
         int bright = g_ribbon_bright[idx];
         if (bright >= BRIGHT_HI)             d->ribbon[i] = '#';
-        else if (abs_t > 0 && (abs_t % 20) == 0) d->ribbon[i] = '-';
+        else if (abs_t > 0 && (abs_t % 20) == 0) d->ribbon[i] = '_';
         else                                 d->ribbon[i] = '.';
         double dbfs = g_ribbon_peak[idx];
         long lr = lround(dbfs);
@@ -1491,7 +1491,7 @@ static void render_ribbon_vertical(const rx_panel_data_t *d,
             if (c == '\0') c = ' ';
             // Bold both the 20-s tick AND the broadband-burst marker
             // so they stand out against the quiet '.' background.
-            if (c == '-' || c == '#') {
+            if (c == '_' || c == '#') {
                 attron(A_BOLD);
                 mvaddch(row, col, c);
                 attroff(A_BOLD);
