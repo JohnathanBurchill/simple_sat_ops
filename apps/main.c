@@ -243,12 +243,21 @@ static int generate_full_iq_waterfall(const char *iq_path, int rate_hz,
     char rate_buf[16];
     snprintf(rate_buf, sizeof rate_buf, "%d", rate_hz);
 
+    // Detrend defaults: the operator's IQ stream is Doppler-corrected,
+    // so the target carrier sits at a fixed baseband bin for the whole
+    // pass. With the column-median or long-tau HPF, that fixed-bin
+    // signal gets subtracted out of itself; a short HPF time constant
+    // (~ a couple of seconds) preserves anything modulated faster than
+    // ~10 Hz (the 9600 baud envelope, beacons, packet bursts) while
+    // still flattening the slow drift inside the pass.
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
         char *args[] = {
             "gen_waterfall",
             (char *) iq_path, rate_buf, png,
+            (char *) "--detrend=hpf",
+            (char *) "--detrend-tau-s=2",
             NULL,
         };
         execvp("gen_waterfall", args);
@@ -346,9 +355,14 @@ static int spectrum_worker_iq(spectrum_job_t *j)
     pid_t pid = fork();
     int rc = -1;
     if (pid == 0) {
+        // See generate_full_iq_waterfall for the detrend rationale —
+        // the slice path renders the same Doppler-corrected IQ data
+        // and benefits from the same short-tau HPF.
         char *args[] = {
             "gen_waterfall",
             tmp_iq, rate_buf, j->png_out,
+            (char *) "--detrend=hpf",
+            (char *) "--detrend-tau-s=2",
             NULL,
         };
         execvp("gen_waterfall", args);
