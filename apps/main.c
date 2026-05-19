@@ -4683,6 +4683,13 @@ int main(int argc, char **argv)
             .decim_factor    = 5u,
             .decim_cutoff_hz = 18000.0,
             .decim_taps      = 96u,
+            // FM-path LO compensation: the IQ tap stays at the LO-
+            // offset baseband (so .iq + waterfall stay readable), but
+            // the FM discriminator needs the carrier at DC or its
+            // ±25 kHz scale clips the FSK upper level. Pass the LO
+            // offset through; the core's second NCO subtracts it for
+            // the demod path only.
+            .fm_lo_compensation_hz = state.rx_lo_offset_hz,
         };
         b210_rx_tx_core_t *core = NULL;
         if (b210_rx_tx_core_open(&cp, &core) != 0) {

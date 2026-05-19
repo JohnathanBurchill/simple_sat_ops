@@ -60,6 +60,23 @@ typedef struct b210_rx_tx_core_params {
     unsigned    decim_factor;
     double      decim_cutoff_hz;
     unsigned    decim_taps;
+
+    // FM-demod LO compensation. With a non-zero LO offset (the
+    // hardware LO is tuned off the nominal carrier to dodge the DC
+    // null), the Doppler-corrected signal sits at +lo_offset_hz of
+    // baseband — well outside the ±fm_fullscale_hz the discriminator
+    // is calibrated for. The result is a clipped, asymmetric FSK
+    // waveform that won't bit-slice cleanly.
+    //
+    // The pump applies a SECOND NCO between the IQ tap (which keeps
+    // the LO-offset signal so the .iq file + waterfall stay readable)
+    // and the FM discriminator (which gets the same stream rotated by
+    // -fm_lo_compensation_hz so the carrier lands at DC). Pass the
+    // operator's lo_offset_hz here (i.e. nominal − actual_LO) so the
+    // demod path sees an at-DC signal.
+    //
+    // 0 disables — the FM demod runs on the post-Doppler IQ as-is.
+    double      fm_lo_compensation_hz;
 } b210_rx_tx_core_params_t;
 
 typedef struct b210_rx_tx_core b210_rx_tx_core_t;

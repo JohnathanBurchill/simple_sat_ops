@@ -79,6 +79,16 @@ struct b210_rx_tx_core {
     // set_freq() so a smooth Doppler trajectory stays phase-coherent.
     // Lives in src/dsp/sw_nco for unit-testability.
     sw_nco_t                sw_nco;
+    // Second NCO that runs ONLY on the FM-discriminator path. Cancels
+    // the constant lo_offset so the FSK signal lands at DC for the
+    // discriminator (which is calibrated for ±fm_fullscale_hz around
+    // DC; a non-zero baseband offset clips the FSK upper level). The
+    // public IQ tap, .iq writer, and broadband-burst detector all run
+    // BEFORE this NCO so they keep the LO-offset signal visible.
+    sw_nco_t                fm_lo_nco;
+    int                     fm_lo_nco_active;
+    int16_t                *iq_fm_scratch;     // scratch buf for the FM path
+    size_t                  iq_fm_scratch_cap_pairs;
 
     // Broadband-burst detector — FFTs the post-NCO IQ and counts how
     // many bins simultaneously exceed their per-bin running floor.
@@ -157,6 +167,25 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
     c->iq_rms_alpha          = exp(-1.0 / (0.030 * c->actual_rate));
     // Software-Doppler NCO runs at the post-decimation rate.
     sw_nco_init(&c->sw_nco, c->actual_rate);
+
+    // FM-path LO-compensation NCO: shifts the post-Doppler IQ to DC
+    // for the discriminator. fm_lo_compensation_hz is the SIGNED
+    // offset of the hardware LO from nominal — the NCO subtracts it
+    // (rotates by exp(-j 2π · (-comp) · n/fs) = exp(+j 2π · comp · n/fs))
+    // to put the carrier back at 0 Hz baseband. 0 → disable, FM path
+    // runs straight off the post-Doppler buffer.
+    sw_nco_init(&c->fm_lo_nco, c->actual_rate);
+    if (p->fm_lo_compensation_hz != 0.0) {
+        // sw_nco_apply rotates by exp(-j 2π · f · n/fs). To shift a
+        // tone at +offset to DC we set f = +offset. The operator's
+        // lo_offset_hz is "LO minus nominal", so the signal lives at
+        // -lo_offset_hz baseband. Setting f = -lo_offset_hz brings
+        // it to DC.
+        sw_nco_set_freq(&c->fm_lo_nco, -p->fm_lo_compensation_hz);
+        c->fm_lo_nco_active = 1;
+    }
+    c->iq_fm_scratch = NULL;
+    c->iq_fm_scratch_cap_pairs = 0;
 
     // Broadband-burst detector at the post-decim rate. N=512 → ~187 Hz
     // bin width at 96 kS/s. 10 dB threshold + 2 s floor τ is the same
@@ -283,6 +312,7 @@ void b210_rx_tx_core_close(b210_rx_tx_core_t *c)
     if (c->iq_burst_det != NULL) iq_burst_free(c->iq_burst_det);
     free(c->iq_chunk);
     free(c->iq_decim);
+    free(c->iq_fm_scratch);
     free(c);
 }
 
@@ -396,6 +426,31 @@ ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *c, int16_t *pcm_out, size_t pcm_
         if (pairs * 2 > iq_cap) pairs = iq_cap / 2;
         memcpy(iq_out, iq_demod, pairs * 2 * sizeof(int16_t));
         if (out_iq_pairs) *out_iq_pairs = pairs;
+    }
+
+    // FM-path LO compensation: shift the Doppler-corrected stream by
+    // an additional fixed offset so the carrier lands at DC for the
+    // discriminator. We DON'T mutate iq_demod_buf in place because
+    // the IQ tap above just sampled it — we need it intact for the
+    // .iq file (which is supposed to keep the LO-offset baseband for
+    // operator-visible waterfalls). Copy into a scratch buffer and
+    // run the second NCO on the copy.
+    if (c->fm_lo_nco_active) {
+        if (c->iq_fm_scratch_cap_pairs < n_demod) {
+            free(c->iq_fm_scratch);
+            c->iq_fm_scratch = (int16_t *) malloc(n_demod * 2
+                                                  * sizeof(int16_t));
+            c->iq_fm_scratch_cap_pairs = c->iq_fm_scratch ? n_demod : 0;
+        }
+        if (c->iq_fm_scratch != NULL) {
+            memcpy(c->iq_fm_scratch, iq_demod,
+                   n_demod * 2 * sizeof(int16_t));
+            sw_nco_apply(&c->fm_lo_nco, c->iq_fm_scratch, n_demod);
+            iq_demod = c->iq_fm_scratch;
+        }
+        // If the scratch alloc failed we silently fall through to the
+        // un-compensated stream — at worst the FM discriminator clips
+        // again, same as before this fix.
     }
 
     // FM discriminator: pcm[k] = arg(z[k] * conj(z[k-1])) * k_scale,
