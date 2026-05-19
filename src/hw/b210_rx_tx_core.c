@@ -520,6 +520,21 @@ double b210_rx_tx_core_get_doppler_offset(const b210_rx_tx_core_t *c)
     return c ? sw_nco_get_freq(&c->sw_nco) : 0.0;
 }
 
+void b210_rx_tx_core_set_fm_lo_compensation(b210_rx_tx_core_t *c,
+                                            double lo_offset_hz)
+{
+    if (c == NULL) return;
+    if (lo_offset_hz == 0.0) {
+        c->fm_lo_nco_active = 0;
+        sw_nco_set_freq(&c->fm_lo_nco, 0.0);
+    } else {
+        // Frequency-only update — preserve phase so a small adjustment
+        // doesn't pop the discriminator output.
+        sw_nco_set_freq(&c->fm_lo_nco, -lo_offset_hz);
+        c->fm_lo_nco_active = 1;
+    }
+}
+
 int b210_rx_tx_core_iq_levels(const b210_rx_tx_core_t *c,
                            double *peak_env_out, double *rms_sq_out)
 {

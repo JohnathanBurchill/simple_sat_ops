@@ -73,6 +73,16 @@ void rx_session_close(rx_session_t *rxs);
 // iteration (sub-10 ms typically). Fire-and-forget.
 void rx_session_request_freq(rx_session_t *rxs, double freq_hz);
 
+// Update the hardware LO offset at runtime. Retunes the SDR LO to
+// nominal_freq_hz + new_lo_offset_hz and updates the FM-path
+// compensation NCO so the discriminator still sees the carrier at
+// DC. Brief glitch in the IQ stream while the AD9361 PLL settles
+// (~tens of ms); use for occasional manual nudges, NOT continuous
+// tracking.
+void rx_session_set_lo_offset(rx_session_t *rxs,
+                              double nominal_freq_hz,
+                              double new_lo_offset_hz);
+
 // Set the software-Doppler NCO offset (Hz, relative to the LO). Lock-
 // free — the NCO is single-double atomic on all targets we care about,
 // and the pump reads it once per chunk. Phase continues across calls,

@@ -609,8 +609,8 @@ static void cmd_dispatch(state_t *state)
     }
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "h") == 0 || strcmp(cmd, "?") == 0) {
         cmd_set_status("commands: help tx track stop home quit "
-                       "freq <MHz> rs on|off spectrum <sec> "
-                       "wf_zoom_khz <N>");
+                       "freq <MHz> lo_offset <±kHz> rs on|off "
+                       "spectrum <sec> wf_zoom_khz <N>");
     } else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0
                || strcmp(cmd, "exit") == 0) {
         state->running = 0;
@@ -772,6 +772,36 @@ static void cmd_dispatch(state_t *state)
 #else
         cmd_set_status("spectrum: this build has no USRP support");
 #endif
+    } else if (strcmp(cmd, "lo_offset") == 0) {
+        // Move the hardware LO mid-pass to dodge a baseband artifact.
+        // SIGNED kHz: positive → LO above nominal (signal at NEGATIVE
+        // baseband); negative → LO below (signal at POSITIVE baseband).
+        // Brief PLL-settle glitch — decode skips a few frames. Comfort
+        // range ~±5..±40 kHz; clipped here to ±45 kHz so the worst
+        // case still keeps a 3 kHz margin to the post-decim band edge.
+        if (arg1 == NULL) {
+            cmd_set_status("lo_offset: usage `lo_offset <signed_kHz>` "
+                           "(comfort range ±5..±40)");
+        } else {
+#ifdef WITH_USRP_B210
+            double khz = atof(arg1);
+            if (khz < -45.0 || khz > 45.0) {
+                cmd_set_status("lo_offset: %g kHz out of [-45, +45]", khz);
+            } else if (g_rx_session == NULL) {
+                cmd_set_status("lo_offset: no RX session");
+            } else {
+                double new_offset_hz = khz * 1000.0;
+                state->rx_lo_offset_hz = new_offset_hz;
+                rx_session_set_lo_offset(g_rx_session,
+                                         state->nominal_downlink_frequency_hz,
+                                         new_offset_hz);
+                cmd_set_status("lo_offset -> %+.1f kHz (PLL glitching, "
+                               "decode resumes shortly)", khz);
+            }
+#else
+            cmd_set_status("lo_offset: this build has no USRP support");
+#endif
+        }
     } else if (strcmp(cmd, "wf_zoom_khz") == 0) {
         // Adjust the live raylib waterfall's visible bandwidth at
         // runtime. The viewer reads line-based commands from its

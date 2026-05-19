@@ -614,6 +614,27 @@ void rx_session_set_doppler_offset(rx_session_t *rxs, double offset_hz)
     b210_rx_tx_core_set_doppler_offset(rxs->core, offset_hz);
 }
 
+void rx_session_set_lo_offset(rx_session_t *rxs,
+                              double nominal_freq_hz,
+                              double new_lo_offset_hz)
+{
+    if (rxs == NULL || rxs->core == NULL) return;
+    // Two coordinated changes: retune the hardware LO to
+    // (nominal + new_lo_offset) and update the FM-path compensation
+    // NCO to match. Without the second step the discriminator would
+    // see the carrier somewhere other than DC and clip the FSK upper
+    // level (same bug we fixed at session-open time, but now for
+    // runtime adjustments).
+    //
+    // The hardware retune is forwarded through the existing worker
+    // handoff (freq_req_pending) so we don't touch the UHD streamer
+    // from this thread. The fm_lo_nco update is lock-free — same
+    // pattern as set_doppler_offset above.
+    rxs->lo_offset_hz = new_lo_offset_hz;
+    b210_rx_tx_core_set_fm_lo_compensation(rxs->core, new_lo_offset_hz);
+    rx_session_request_freq(rxs, nominal_freq_hz + new_lo_offset_hz);
+}
+
 double rx_session_get_doppler_offset(const rx_session_t *rxs)
 {
     if (rxs == NULL || rxs->core == NULL) return 0.0;

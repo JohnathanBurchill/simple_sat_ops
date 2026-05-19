@@ -127,6 +127,16 @@ void   b210_rx_tx_core_set_doppler_offset(b210_rx_tx_core_t *core,
                                           double offset_hz);
 double b210_rx_tx_core_get_doppler_offset(const b210_rx_tx_core_t *core);
 
+// Update the FM-path LO-compensation NCO at runtime. lo_offset_hz is
+// the SIGNED operator offset of the hardware LO from nominal (the
+// same value plumbed via fm_lo_compensation_hz at open). Used by the
+// :lo_offset colon command to chase a noisier baseband band — pair
+// with a hardware retune via b210_rx_tx_core_set_freq so the SDR LO
+// and the demod-path compensation stay consistent. 0 disables the
+// second NCO entirely.
+void b210_rx_tx_core_set_fm_lo_compensation(b210_rx_tx_core_t *core,
+                                            double lo_offset_hz);
+
 // Read-back accessors (after b210_rx_tx_core_open succeeded).
 //
 // actual_rate:  post-decimation rate (== input_rate when decim_factor is
