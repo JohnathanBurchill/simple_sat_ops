@@ -45,6 +45,7 @@
 #include "packet_db.h"
 #include "rx_tui.h"
 #include "sso_audit.h"
+#include "sw_nco.h"
 #include "tle_csv.h"
 #include "wav_read.h"
 
@@ -332,6 +333,19 @@ static void usage(FILE *dest, const char *name)
         "  --channels=<n>           Channels for --raw (default 2; ch 0 used).\n"
         "                           Pass --channels=1 for rtl_fm captures.\n"
         "                           Ignored in --iq mode.\n"
+        "  --lo-shift-khz=<N>       NCO-shift the loaded IQ by -N kHz\n"
+        "                           before the decode loop runs. Use\n"
+        "                           when the .iq was recorded with a\n"
+        "                           non-zero LO offset and the carrier\n"
+        "                           sits at +N kHz baseband. modem_iq's\n"
+        "                           differential slicer expects DC, so\n"
+        "                           a captured carrier at +25 kHz needs\n"
+        "                           --lo-shift-khz=25. Sign matches the\n"
+        "                           baseband location of the carrier in\n"
+        "                           the .iq file, NOT the operator's\n"
+        "                           rx_lo_offset_hz (which is signed the\n"
+        "                           opposite way around). Default 0 (no\n"
+        "                           shift). --iq only.\n"
         "\n"
         "Decoder (same defaults as b210_rx_tx):\n"
         "  --bit-rate=<bps>         Default 9600.\n"
@@ -592,6 +606,17 @@ int main(int argc, char **argv)
     // captures pulls more frames than the FM-discriminated WAV path.
     int iq_mode = 0;
     int iq_mode_explicit = 0;
+    // Optional pre-demod NCO shift (Hz). For .iq files captured with
+    // simple_sat_ops's LO offset feature, the carrier sits at
+    // -lo_offset_hz of baseband (e.g. +25 kHz with the default -25
+    // kHz offset). modem_iq's differential slicer expects the signal
+    // near DC, so a non-zero baseband offset wrecks bit recovery.
+    // Pass --lo-shift-khz=N to NCO-shift the loaded IQ by -N kHz
+    // before the decode loop runs — i.e. N should equal the operator's
+    // (negative of) lo_offset_hz so the carrier lands at 0 baseband.
+    // For an .iq recorded with the default -25 kHz offset (LO 25 kHz
+    // below nominal, signal at +25 kHz baseband), pass --lo-shift-khz=25.
+    double lo_shift_hz = 0.0;
     // Viterbi default off pending a fix for the FrontierSat downlink
     // modulation. Empirically (RAO captures, 2026-05-15 pass) the
     // symbol-spaced differential phase histogram peaks near ±π — that
@@ -653,6 +678,9 @@ int main(int argc, char **argv)
         if (strcmp(a, "--help") == 0) { usage(stdout, argv[0]); return 0; }
         else if (strcmp(a, "--raw") == 0) { raw_mode = 1; raw_mode_explicit = 1; }
         else if (strcmp(a, "--iq") == 0)  { iq_mode = 1;  iq_mode_explicit = 1; }
+        else if (starts_with(a, "--lo-shift-khz=")) {
+            lo_shift_hz = atof(a + 15) * 1000.0;
+        }
         else if (strcmp(a, "--viterbi") == 0)    use_viterbi = 1;
         else if (strcmp(a, "--no-viterbi") == 0) use_viterbi = 0;
         else if (strcmp(a, "--two-pass") == 0)    two_pass = 1;
@@ -818,6 +846,23 @@ int main(int argc, char **argv)
                     "not interleaved I,Q?\n", n_samples);
             free(samples);
             return 1;
+        }
+        // Apply --lo-shift-khz BEFORE the decode loop. sw_nco_apply
+        // rotates by exp(-j 2π f · n/fs), so positive lo_shift_hz
+        // moves a signal at +lo_shift_hz baseband down to DC — which
+        // is what we want for an .iq recorded with the operator's
+        // default -25 kHz LO offset (signal sits at +25 kHz). The
+        // shift is one-shot across the whole captured file; no need
+        // for phase persistence across chunks.
+        if (lo_shift_hz != 0.0) {
+            sw_nco_t nco;
+            sw_nco_init(&nco, (double) samp_rate);
+            sw_nco_set_freq(&nco, lo_shift_hz);
+            size_t n_pairs = n_samples / 2u;
+            sw_nco_apply(&nco, samples, n_pairs);
+            fprintf(stderr,
+                "rx_replay: applied --lo-shift-khz=%g (sw NCO over %zu IQ pairs)\n",
+                lo_shift_hz / 1000.0, n_pairs);
         }
     } else if (raw_mode) {
         if (read_raw_pcm16(input_path, &samples, &n_samples) != 0) return 1;

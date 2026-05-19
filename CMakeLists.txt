@@ -354,6 +354,7 @@ if (OPENSSL_FOUND)
                    src/pipeline/decode_loop.c
                    src/dsp/modem.c src/dsp/modem_fsk.c
                    src/dsp/modem_iq.c src/dsp/modem_viterbi.c
+                   src/dsp/sw_nco.c
                    src/proto/ax100.c src/proto/rs.c src/proto/golay24.c
                    src/proto/csp.c src/proto/hmac_keyfile.c
                    src/beacon/beacon_cts1.c src/pipeline/rx_tui.c
