@@ -331,6 +331,13 @@ typedef struct wf_opts {
     float  db_max;
     int    db_min_user_set; // 1 = --db-min was supplied; 0 = derive via percentile
     int    db_max_user_set; // 1 = --db-max was supplied; 0 = derive via percentile
+    // Per-column detrend mode. 0 = median (whole-pass median per column,
+    // backwards compatible); 1 = hpf (zero-phase 1-pole HPF along time,
+    // tracks slow AGC-like drift while preserving short transients);
+    // 2 = none (do nothing; cells map straight to colormap above the
+    // global floor estimate).
+    int    detrend_mode;
+    double detrend_tau_s;   // time constant for detrend=hpf, seconds
     int    sample_rate;   // for the time + frequency axis labels
     double center_hz;     // baseband centre frequency for the freq-axis label
     double zoom_hz;       // visible bandwidth around DC; 0 or negative = full
@@ -862,33 +869,90 @@ static int build_waterfall(const int16_t *iq, size_t n_pairs,
     }
     free(spec);
 
-    // Per-bin median subtraction so the noise floor flattens out. The
-    // per-bin medians also feed an absolute-dBFS calibration for the
-    // colorbar labels — without that step the bar reads "delta above
-    // bin median", which is mathematically defensible but looks like
-    // "0..10" with no units in the operator's eye.
+    // Per-column detrend so the noise floor flattens out. Three modes:
+    //   median  (default, backwards compatible): subtract the whole-pass
+    //           median of each frequency column. Cheap and robust to
+    //           bursty signals; constant across time.
+    //   hpf:    zero-phase 1-pole HPF (forward+backward IIR) along time
+    //           per column. Tracks slow drift inside a pass — AGC ramps,
+    //           gain wandering, gradual antenna-temp changes — while
+    //           preserving the short transients (beacons, packets) we
+    //           actually care about. Better when median+single-value
+    //           subtraction would still leave a visible tilt.
+    //   none:   leave the cells alone. The colorbar still labels in
+    //           absolute dBFS using the per-bin median estimate below.
+    // In every mode we ALWAYS compute the per-bin median so the floor
+    // estimate (display_db_floor) stays consistent across modes — the
+    // colorbar labels always read in absolute dBFS regardless.
     float *col = (float *) malloc((size_t) out_rows * sizeof(float));
     float *bin_medians = (float *) malloc((size_t) N * sizeof(float));
     if (!col || !bin_medians) {
         free(col); free(bin_medians); free(binned); return -1;
     }
+    // For HPF mode, the LPF time step is duration_per_row.
+    double duration_s = (double) n_pairs / (double) opt->sample_rate;
+    double row_dt_s   = (out_rows > 0) ? (duration_s / (double) out_rows) : 1.0;
+    double hpf_alpha  = (opt->detrend_mode == 1 && opt->detrend_tau_s > 0.0)
+                       ? exp(-row_dt_s / opt->detrend_tau_s) : 0.0;
+
     for (int k = 0; k < N; ++k) {
+        // Always: per-bin median for the floor estimate (cheap).
         for (int r = 0; r < out_rows; ++r) {
             col[r] = binned[(size_t) r * (size_t) N + (size_t) k];
         }
-        float med = median_inplace(col, out_rows);
-        bin_medians[k] = med;
-        for (int r = 0; r < out_rows; ++r) {
-            binned[(size_t) r * (size_t) N + (size_t) k] -= med;
+        bin_medians[k] = median_inplace(col, out_rows);
+
+        if (opt->detrend_mode == 1) {
+            // HPF: zero-phase 1-pole LPF (forward then backward), then
+            // subtract from the original cells. median_inplace mutated
+            // `col` so re-extract the originals before filtering.
+            for (int r = 0; r < out_rows; ++r) {
+                col[r] = binned[(size_t) r * (size_t) N + (size_t) k];
+            }
+            double a = hpf_alpha;
+            double lp = (double) col[0];
+            for (int r = 0; r < out_rows; ++r) {
+                lp = a * lp + (1.0 - a) * (double) col[r];
+                col[r] = (float) lp;
+            }
+            lp = (double) col[out_rows - 1];
+            for (int r = out_rows - 1; r >= 0; --r) {
+                lp = a * lp + (1.0 - a) * (double) col[r];
+                col[r] = (float) lp;
+            }
+            for (int r = 0; r < out_rows; ++r) {
+                binned[(size_t) r * (size_t) N + (size_t) k] -= col[r];
+            }
+        } else if (opt->detrend_mode == 0) {
+            // Median (default): subtract the per-column whole-pass median.
+            float med = bin_medians[k];
+            for (int r = 0; r < out_rows; ++r) {
+                binned[(size_t) r * (size_t) N + (size_t) k] -= med;
+            }
         }
+        // else mode == 2 (none): cells unchanged.
     }
     // Global noise floor estimate: median of the per-bin medians. The
     // raw FFT-power values are referenced to peak |Z|^2 = (N/2)^2 for
     // a full-scale complex tone (Hann coherent gain = 0.5), so subtract
     // 20*log10(N/2) to land on dBFS. With N=1024 that's ~54 dB.
+    //
+    // The colorbar labels each cell via cell + display_db_floor +
+    // power_offset_db. The right value of display_db_floor depends on
+    // what's IN the cell:
+    //   median / hpf: cell is "delta above the baseline that was just
+    //                  subtracted out", so display_db_floor must
+    //                  include the floor's absolute value to label
+    //                  correctly → floor_raw_db - fft_scale_db.
+    //   none:         cell is raw FFT-power dB (nothing subtracted), so
+    //                  the only offset is the FFT scale → -fft_scale_db.
     float floor_raw_db = median_inplace(bin_medians, N);
     float fft_scale_db = 20.0f * (float) log10((double) opt->fft_size / 2.0);
-    ((wf_opts_t *) opt)->display_db_floor = floor_raw_db - fft_scale_db;
+    if (opt->detrend_mode == 2) {
+        ((wf_opts_t *) opt)->display_db_floor = -fft_scale_db;
+    } else {
+        ((wf_opts_t *) opt)->display_db_floor = floor_raw_db - fft_scale_db;
+    }
     free(bin_medians);
     free(col);
 
@@ -1468,12 +1532,31 @@ static void usage(void)
         "                         (absolute dBFS by default; dBm if you've\n"
         "                         passed --power-offset). Cells at or below\n"
         "                         this value map to the darkest viridis\n"
-        "                         pixel. Setting this disables the\n"
-        "                         percentile auto-clip; pass with --db-max.\n"
+        "                         pixel. Either endpoint left unset\n"
+        "                         falls back to the percentile auto-clip.\n"
         "    --db-max=X           Upper end of the displayed dB range, same\n"
         "                         units as --db-min. Cells at or above this\n"
         "                         value map to the brightest viridis pixel.\n"
-        "                         Setting this disables auto-clip.\n"
+        "    --detrend=MODE       How to subtract the slowly-varying\n"
+        "                         background. Default 'median' (whole-pass\n"
+        "                         median per frequency column; cheap and\n"
+        "                         robust). 'hpf' = zero-phase 1-pole\n"
+        "                         highpass along time per column —\n"
+        "                         tracks AGC-like drift inside the pass\n"
+        "                         while preserving short transients\n"
+        "                         (beacons, packets). 'none' = leave\n"
+        "                         cells untouched, label colorbar in\n"
+        "                         absolute dBFS via the FFT scale.\n"
+        "    --detrend-tau-s=T    Time constant for --detrend=hpf, in\n"
+        "                         seconds. Default 30 (preserves anything\n"
+        "                         shorter than ~10 s; aggressive flattens\n"
+        "                         AGC drift over minutes). For an IQ\n"
+        "                         capture without Doppler correction the\n"
+        "                         carrier dwells in each frequency bin\n"
+        "                         for tens of seconds as it sweeps —\n"
+        "                         use T = 120…300 in that case so the\n"
+        "                         HPF doesn't subtract the carrier's own\n"
+        "                         energy out of itself.\n"
         "    --start-utc=YYYYMMDDTHHMMSS\n"
         "                         Override the capture-start UTC time used\n"
         "                         for the time-axis labels. Default: parse\n"
@@ -1538,6 +1621,8 @@ int main(int argc, char **argv)
     opt.db_max          = 0.0f;
     opt.db_min_user_set = 0;
     opt.db_max_user_set = 0;
+    opt.detrend_mode    = 0;        // median (backwards compatible default)
+    opt.detrend_tau_s   = 30.0;     // typical AGC ramps die in ~30 s
     opt.sample_rate   = sample_rate;
     opt.center_hz     = 0.0;
     opt.zoom_hz       = 30000.0;      // default ±15 kHz; --full-width disables
@@ -1578,6 +1663,25 @@ int main(int argc, char **argv)
             if (rc < 0) { usage(); return 2; }
             opt.db_max = (float) d;
             opt.db_max_user_set = 1;
+        } else if (strncmp(argv[i], "--detrend=", 10) == 0) {
+            const char *m = argv[i] + 10;
+            if      (strcmp(m, "median") == 0) opt.detrend_mode = 0;
+            else if (strcmp(m, "hpf")    == 0) opt.detrend_mode = 1;
+            else if (strcmp(m, "none")   == 0) opt.detrend_mode = 2;
+            else {
+                fprintf(stderr,
+                    "gen_waterfall: --detrend=%s: expected one of "
+                    "median, hpf, none\n", m);
+                usage(); return 2;
+            }
+        } else if ((rc = parse_double_opt(argv[i], "--detrend-tau-s=", &d)) != 0) {
+            if (rc < 0) { usage(); return 2; }
+            if (d <= 0.0) {
+                fprintf(stderr,
+                    "gen_waterfall: --detrend-tau-s=%g: must be > 0\n", d);
+                return 2;
+            }
+            opt.detrend_tau_s = d;
         } else if ((rc = parse_double_opt(argv[i], "--center-hz=", &d)) != 0) {
             if (rc < 0) { usage(); return 2; }
             opt.center_hz = d;
