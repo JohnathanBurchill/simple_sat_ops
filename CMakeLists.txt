@@ -474,6 +474,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
         target_sources(simple_sat_ops PRIVATE
                        src/hw/b210_rx_tx_core.c
                        src/dsp/fir_decim.c src/dsp/sw_nco.c
+                       src/dsp/iq_burst.c
                        src/pipeline/rx_session.c src/pipeline/tx_burst.c)
         target_include_directories(simple_sat_ops PRIVATE ${UHD_INCLUDE_DIRS})
         target_link_directories(simple_sat_ops PRIVATE ${UHD_LIBRARY_DIRS})

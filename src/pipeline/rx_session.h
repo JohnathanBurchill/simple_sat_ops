@@ -155,6 +155,14 @@ void rx_session_snapshot(const rx_session_t *rxs,
                          double   *out_actual_freq_hz,
                          char     *out_last_summary, size_t summary_n);
 
+// Broadband-burst snapshot: distinguishes CW / Doppler-swept carrier
+// (out_bright_bins ≈ 1-6) from a wideband packet (tens to hundreds).
+// out_peak_excess_db is the brightest single bin's dB above its floor.
+// Either pointer may be NULL.
+void rx_session_burst_snapshot(const rx_session_t *rxs,
+                               int    *out_bright_bins,
+                               double *out_peak_excess_db);
+
 // Packet-type buckets that rx_session keeps live counters for. Matches
 // the COMMS_PACKET_TYPE_* constants in beacon_cts1.h (low byte of the
 // CSP payload). Anything we don't recognise lands in RX_PT_OTHER.

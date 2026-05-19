@@ -12,6 +12,7 @@
 
 #include "b210_rx_tx_core.h"
 #include "fir_decim.h"
+#include "iq_burst.h"
 #include "sw_nco.h"
 
 #include <math.h>
@@ -78,6 +79,16 @@ struct b210_rx_tx_core {
     // set_freq() so a smooth Doppler trajectory stays phase-coherent.
     // Lives in src/dsp/sw_nco for unit-testability.
     sw_nco_t                sw_nco;
+
+    // Broadband-burst detector — FFTs the post-NCO IQ and counts how
+    // many bins simultaneously exceed their per-bin running floor.
+    // Narrowband (carrier) ⇒ 1-6 bins lit; wideband (packet) ⇒ many.
+    // Lets the operator ribbon visually distinguish the two. Owned by
+    // the core and pumped inline so the live and recorded-IQ paths
+    // see the same numbers. Allocated in open(), freed in close().
+    struct iq_burst        *iq_burst_det;
+    int                     last_burst_bright_bins;
+    double                  last_burst_peak_excess_db;
 };
 
 static int log_uhd(uhd_error e, const char *what)
@@ -146,6 +157,18 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
     c->iq_rms_alpha          = exp(-1.0 / (0.030 * c->actual_rate));
     // Software-Doppler NCO runs at the post-decimation rate.
     sw_nco_init(&c->sw_nco, c->actual_rate);
+
+    // Broadband-burst detector at the post-decim rate. N=512 → ~187 Hz
+    // bin width at 96 kS/s. 10 dB threshold + 2 s floor τ is the same
+    // pair the unit test pinned. Allocation failure is non-fatal: we
+    // just leave the pointer NULL and the pump skips the FFT.
+    c->iq_burst_det = iq_burst_new(512u, c->actual_rate, 10.0, 2.0);
+    if (c->iq_burst_det == NULL) {
+        fprintf(stderr, "b210_rx_tx_core: iq_burst_new failed; "
+                "ribbon will not report broadband-burst counts.\n");
+    }
+    c->last_burst_bright_bins   = 0;
+    c->last_burst_peak_excess_db = 0.0;
 
     if (log_uhd(uhd_usrp_set_rx_gain(c->dev, p->gain_db, 0, ""), "set_rx_gain")) goto fail;
     if (log_uhd(uhd_usrp_set_rx_bandwidth(c->dev, bw_hz, 0), "set_rx_bandwidth")) goto fail;
@@ -257,6 +280,7 @@ void b210_rx_tx_core_close(b210_rx_tx_core_t *c)
     if (c->tx_stream != NULL) uhd_tx_streamer_free(&c->tx_stream);
     if (c->dev       != NULL) uhd_usrp_free(&c->dev);
     if (c->decim     != NULL) fir_decim_iq_free(c->decim);
+    if (c->iq_burst_det != NULL) iq_burst_free(c->iq_burst_det);
     free(c->iq_chunk);
     free(c->iq_decim);
     free(c);
@@ -326,6 +350,16 @@ ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *c, int16_t *pcm_out, size_t pcm_
     // shadow IQ decoder, IQ tap) sees the same Doppler-corrected stream.
     sw_nco_apply(&c->sw_nco, iq_demod_buf, n_demod);
     const int16_t *iq_demod = iq_demod_buf;
+
+    // Broadband-burst detector: feed the post-NCO IQ in and snapshot
+    // the latest count. Internally it accumulates into 512-sample
+    // FFT frames so one push usually triggers 0-2 frame completions
+    // at typical UHD chunk sizes.
+    if (c->iq_burst_det != NULL) {
+        iq_burst_push(c->iq_burst_det, iq_demod, n_demod);
+        c->last_burst_bright_bins    = iq_burst_bright_bins(c->iq_burst_det);
+        c->last_burst_peak_excess_db = iq_burst_peak_excess_db(c->iq_burst_det);
+    }
 
     // IQ level meter. Run before the discriminator so the reading
     // reflects RF input (rises on incoming signal) rather than demod
@@ -437,6 +471,16 @@ int b210_rx_tx_core_iq_levels(const b210_rx_tx_core_t *c,
     if (c == NULL) return -1;
     if (peak_env_out != NULL) *peak_env_out = c->iq_peak_env;
     if (rms_sq_out   != NULL) *rms_sq_out   = c->iq_rms_sq;
+    return 0;
+}
+
+int b210_rx_tx_core_burst_snapshot(const b210_rx_tx_core_t *c,
+                                   int *out_bright_bins,
+                                   double *out_peak_excess_db)
+{
+    if (c == NULL) return -1;
+    if (out_bright_bins    != NULL) *out_bright_bins    = c->last_burst_bright_bins;
+    if (out_peak_excess_db != NULL) *out_peak_excess_db = c->last_burst_peak_excess_db;
     return 0;
 }
 

@@ -124,6 +124,11 @@ static ssize_t               g_hmac_key_bytes         = 0;
 // signal is flat.
 #define RIBBON_LEN 60
 static double g_ribbon_peak[RIBBON_LEN];
+// Parallel bright-bin samples from iq_burst, indexed in lock-step
+// with g_ribbon_peak. Lets the renderer pick a different character
+// for broadband bursts (many bright bins) vs narrowband / carrier
+// (few bright bins) at the same peak-dBFS level.
+static int    g_ribbon_bright[RIBBON_LEN];
 static int    g_ribbon_count       = 0;  // number of valid samples (caps at RIBBON_LEN)
 static int    g_ribbon_head        = 0;  // next write index (circular)
 // Only written by ribbon_push inside #ifdef WITH_USRP_B210; without
@@ -132,9 +137,10 @@ __attribute__((unused)) static double g_ribbon_last_t      = 0.0;
 static long   g_ribbon_push_count  = 0;  // total pushes since startup; drives ticks
 
 __attribute__((unused))
-static void ribbon_push(double peak_dbfs)
+static void ribbon_push(double peak_dbfs, int bright_bins)
 {
-    g_ribbon_peak[g_ribbon_head] = peak_dbfs;
+    g_ribbon_peak[g_ribbon_head]   = peak_dbfs;
+    g_ribbon_bright[g_ribbon_head] = bright_bins;
     g_ribbon_head = (g_ribbon_head + 1) % RIBBON_LEN;
     if (g_ribbon_count < RIBBON_LEN) g_ribbon_count++;
     g_ribbon_push_count++;
@@ -1304,11 +1310,19 @@ static void rx_panel_collect_local(rx_panel_data_t *d)
     int n = g_ribbon_count;
     if (n > (int) sizeof d->ribbon - 1) n = (int) sizeof d->ribbon - 1;
     long P = g_ribbon_push_count;
+    // Bright-bin thresholds for ribbon character selection. With
+    // iq_burst's 10 dB / N=512 FFT, stationary noise lights ~30 bins
+    // and a CW carrier adds ~5-6 more. A wideband packet burst lights
+    // 80+. Pick BRIGHT_HI well above the noise floor so '#' fires
+    // only on real broadband events.
+    const int BRIGHT_HI = 80;   // broadband — '#'
     for (int i = 0; i < n; ++i) {
         long abs_t = P - (long) i;
-        if (abs_t > 0 && (abs_t % 20) == 0) d->ribbon[i] = '-';
-        else                                 d->ribbon[i] = '.';
         int idx = (g_ribbon_head - 1 - i + RIBBON_LEN) % RIBBON_LEN;
+        int bright = g_ribbon_bright[idx];
+        if (bright >= BRIGHT_HI)             d->ribbon[i] = '#';
+        else if (abs_t > 0 && (abs_t % 20) == 0) d->ribbon[i] = '-';
+        else                                 d->ribbon[i] = '.';
         double dbfs = g_ribbon_peak[idx];
         long lr = lround(dbfs);
         if (lr > 127)  lr = 127;
@@ -1475,7 +1489,9 @@ static void render_ribbon_vertical(const rx_panel_data_t *d,
             }
             char c = d->ribbon[i];
             if (c == '\0') c = ' ';
-            if (c == '-') {
+            // Bold both the 20-s tick AND the broadband-burst marker
+            // so they stand out against the quiet '.' background.
+            if (c == '-' || c == '#') {
                 attron(A_BOLD);
                 mvaddch(row, col, c);
                 attroff(A_BOLD);
@@ -5112,12 +5128,17 @@ int main(int argc, char **argv)
 
 #ifdef WITH_USRP_B210
         // Signal ribbon sampler: push one peak-dBFS reading per second
-        // so the ribbon in the RX panel rolls left in real time.
+        // so the ribbon in the RX panel rolls left in real time. Also
+        // grab the iq_burst bright-bin count so the renderer can pick
+        // a character that distinguishes broadband packets from a CW
+        // carrier at the same peak level.
         if (g_rx_session && (t_now - g_ribbon_last_t) >= 1.0) {
             double peak = -90.0;
             rx_session_snapshot(g_rx_session, NULL, &peak, NULL,
                                 NULL, NULL, 0);
-            ribbon_push(peak);
+            int burst_bins = 0;
+            rx_session_burst_snapshot(g_rx_session, &burst_bins, NULL);
+            ribbon_push(peak, burst_bins);
             g_ribbon_last_t = t_now;
         }
         // Software Doppler tracking: the SDR LO stays fixed at the

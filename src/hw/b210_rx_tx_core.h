@@ -139,6 +139,18 @@ size_t b210_rx_tx_core_max_chunk  (const b210_rx_tx_core_t *core);
 int b210_rx_tx_core_iq_levels(const b210_rx_tx_core_t *core,
                            double *peak_env_out, double *rms_sq_out);
 
+// Broadband-burst snapshot from the iq_burst detector running on the
+// post-NCO IQ. out_bright_bins: number of FFT bins above floor +
+// threshold in the latest completed frame — a CW carrier reads 1-6
+// (target bin + Hann sidelobes), wideband packets read tens to
+// hundreds, stationary noise reads ~5-30 (false-positive rate of the
+// 10 dB threshold). out_peak_excess_db: brightest bin's dB excess
+// above its floor. Either pointer may be NULL. Returns 0 on success,
+// -1 if core is NULL.
+int b210_rx_tx_core_burst_snapshot(const b210_rx_tx_core_t *core,
+                                   int *out_bright_bins,
+                                   double *out_peak_excess_db);
+
 typedef struct b210_rx_tx_core_burst_params {
     const int16_t *iq;          // pre-built sc16 interleaved, n_samps pairs
     size_t         n_samps;

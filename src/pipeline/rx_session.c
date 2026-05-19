@@ -293,6 +293,12 @@ struct rx_session {
     double   snap_peak;
     double   snap_rms_sq;
     double   snap_actual_freq_hz;
+    // Broadband-burst snapshot from the iq_burst detector. snap_burst_
+    // bright_bins is the FFT bins-above-floor count; the operator
+    // ribbon uses this to distinguish CW carriers (low count) from
+    // wideband packet bursts (high count).
+    int      snap_burst_bright_bins;
+    double   snap_burst_peak_excess_db;
     char     snap_last_frame_ts[24];
     int      snap_last_frame_len;
     int      snap_wav_active;
@@ -1000,6 +1006,9 @@ static void worker_update_snapshot(rx_session_t *rxs)
 {
     double peak = 0.0, rms_sq = 0.0;
     b210_rx_tx_core_iq_levels(rxs->core, &peak, &rms_sq);
+    int    burst_bins = 0;
+    double burst_excess = 0.0;
+    b210_rx_tx_core_burst_snapshot(rxs->core, &burst_bins, &burst_excess);
     // Effective downlink carrier as the operator thinks of it:
     //   hardware LO + intentional lo_offset (puts signal off DC)
     //                + software-Doppler NCO offset (tracks Doppler).
@@ -1016,6 +1025,8 @@ static void worker_update_snapshot(rx_session_t *rxs)
     rxs->snap_peak           = peak;
     rxs->snap_rms_sq         = rms_sq;
     rxs->snap_actual_freq_hz = freq;
+    rxs->snap_burst_bright_bins    = burst_bins;
+    rxs->snap_burst_peak_excess_db = burst_excess;
     rxs->snap_wav_active     = wav_active;
     rxs->snap_wav_n_samples  = (long) rxs->wav.n_samples;
     rxs->snap_iq_pairs       = (long) rxs->iq_pairs_written;
@@ -1147,6 +1158,23 @@ void rx_session_snapshot(const rx_session_t *rxs,
                             "%s  %d bytes", ts, len);
         else       out_last_summary[0] = '\0';
     }
+}
+
+void rx_session_burst_snapshot(const rx_session_t *rxs,
+                               int    *out_bright_bins,
+                               double *out_peak_excess_db)
+{
+    if (rxs == NULL) {
+        if (out_bright_bins)    *out_bright_bins    = 0;
+        if (out_peak_excess_db) *out_peak_excess_db = 0.0;
+        return;
+    }
+    pthread_mutex_lock((pthread_mutex_t *) &rxs->mu);
+    int    bins   = rxs->snap_burst_bright_bins;
+    double excess = rxs->snap_burst_peak_excess_db;
+    pthread_mutex_unlock((pthread_mutex_t *) &rxs->mu);
+    if (out_bright_bins)    *out_bright_bins    = bins;
+    if (out_peak_excess_db) *out_peak_excess_db = excess;
 }
 
 void rx_session_update_observer(rx_session_t *rxs,
