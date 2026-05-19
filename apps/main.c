@@ -29,6 +29,7 @@
 #include "sso_paths.h"
 #include "tle_csv.h"
 #include "frontiersat.h"
+#include "hmac_keyfile.h"
 
 #ifdef WITH_USRP_B210
 #include "b210_rx_tx_core.h"
@@ -89,6 +90,22 @@ static int g_control_mode = 0;
 static int g_viewer_mode = 0;  // bare invocation found a running operator
 static sso_ipc_server_t *g_ipc = NULL;
 static const char *g_operator_user = NULL;
+
+// HMAC keyfile selection. Path is resolved at startup (CLI override
+// or hmac_keyfile_default_path); the file is attempted-load once so
+// the operator banner can show "(N bytes ok)" vs "(missing)" vs
+// "(bad)". The bytes themselves are not retained — display only.
+// TX integration (passing the key into rx_session_request_burst_sync)
+// is a separate change.
+typedef enum {
+    HMAC_DISPLAY_UNSET   = 0,
+    HMAC_DISPLAY_OK      = 1,
+    HMAC_DISPLAY_MISSING = 2,
+    HMAC_DISPLAY_BAD     = 3,
+} hmac_display_status_t;
+static char                  g_hmac_keyfile_path[512] = "";
+static hmac_display_status_t g_hmac_display_status    = HMAC_DISPLAY_UNSET;
+static ssize_t               g_hmac_key_bytes         = 0;
 
 // Signal ribbon: 60-second 1 Hz rolling window of RX peak dBFS rendered
 // as a UTF-8 block-character strip in the RX panel. Oldest sample on
@@ -3484,6 +3501,15 @@ void usage(FILE *dest, const char *name, int full)
         "                               (auto-populated by --control without a\n"
         "                               positional satellite_id).\n"
         "\n"
+        "HMAC keyfile:\n"
+        "  --hmac-keyfile=<path>        HMAC key file shown on the operator banner\n"
+        "                               for visual confirmation. Default: shared\n"
+        "                               " HMAC_KEYFILE_SHARED_PATH ",\n"
+        "                               falling back to $HOME/" HMAC_KEYFILE_USER_RELPATH ".\n"
+        "                               The file is opened + validated at startup;\n"
+        "                               the banner shows \"(N bytes ok)\" / \"(MISSING)\"\n"
+        "                               / \"(BAD)\". The bytes never reach the UI.\n"
+        "\n"
         "Hardware (rotator + B210):\n"
         "  --without-rotator            Skip the SPID Rot2Prog. Default is on:\n"
         "                               the tracker initialises and commands\n"
@@ -3754,6 +3780,11 @@ typedef struct {
     double target_az;
     double target_el;
     int    flip;
+    // HMAC keyfile display. Only the operator process fills these; the
+    // viewer leaves status == HMAC_DISPLAY_UNSET so the row is skipped.
+    const char           *hmac_path;
+    hmac_display_status_t hmac_status;
+    ssize_t               hmac_bytes;
 } status_panel_t;
 
 static void render_status_panel(const status_panel_t *p,
@@ -3768,6 +3799,30 @@ static void render_status_panel(const status_panel_t *p,
              p->operator_user ? p->operator_user : "?",
              p->viewers && p->viewers[0] ? p->viewers : "(none)");
     clrtoeol();
+
+    // HMAC keyfile selection. Path-only display — no key bytes ever
+    // reach the UI. The operator uses this to verify they're pointed
+    // at the right key for this pass (operations vs dev, shared vs
+    // per-user fallback). Viewer process skips this line.
+    if (p->control_mode == 1) {
+        const char *path = (p->hmac_path && p->hmac_path[0])
+                           ? p->hmac_path : "(unresolved)";
+        const char *tag;
+        char tag_buf[40];
+        switch (p->hmac_status) {
+        case HMAC_DISPLAY_OK:
+            snprintf(tag_buf, sizeof tag_buf, "(%zd bytes ok)",
+                     p->hmac_bytes);
+            tag = tag_buf;
+            break;
+        case HMAC_DISPLAY_MISSING: tag = "(MISSING)";      break;
+        case HMAC_DISPLAY_BAD:     tag = "(BAD — see log)"; break;
+        case HMAC_DISPLAY_UNSET:
+        default:                   tag = "(unset)";        break;
+        }
+        mvprintw(1, 0, "%-15s %s  %s", "HMAC keyfile", path, tag);
+        clrtoeol();
+    }
 
     // (CARRIER row removed — the same Doppler-shifted carrier is shown
     // on the RX panel's "RX freq" line, alongside the LO ± BW row that
@@ -3840,6 +3895,10 @@ void report_status(state_t *state, int *print_row, int print_col)
     double display_dl_hz = state->doppler_downlink_frequency_hz;
     if (display_dl_hz == 0.0) display_dl_hz = state->nominal_downlink_frequency_hz;
     p.carrier_hz = display_dl_hz;
+
+    p.hmac_path   = g_hmac_keyfile_path;
+    p.hmac_status = g_hmac_display_status;
+    p.hmac_bytes  = g_hmac_key_bytes;
 
     p.have_rotator = state->have_antenna_rotator;
     if (state->have_antenna_rotator) {
@@ -4425,6 +4484,37 @@ int main(int argc, char **argv)
     // viewer and skip the rest of the operator/standalone bring-up.
     if (g_viewer_mode) {
         return run_viewer(argv[0]);
+    }
+
+    // Resolve + sanity-load the HMAC keyfile so the operator banner can
+    // show which file is in play. We don't keep the bytes — the goal is
+    // visual confirmation that the right file resolves and parses; TX
+    // wiring is a separate change. If --hmac-keyfile= wasn't given, fall
+    // back to hmac_keyfile_default_path (shared first, per-user second).
+    if (g_hmac_keyfile_path[0] == '\0') {
+        if (hmac_keyfile_default_path(g_hmac_keyfile_path,
+                                      sizeof g_hmac_keyfile_path) != 0) {
+            g_hmac_keyfile_path[0] = '\0';
+            g_hmac_display_status  = HMAC_DISPLAY_MISSING;
+        }
+    }
+    if (g_hmac_keyfile_path[0] != '\0') {
+        struct stat st;
+        if (stat(g_hmac_keyfile_path, &st) != 0) {
+            g_hmac_display_status = HMAC_DISPLAY_MISSING;
+        } else {
+            uint8_t scratch[256];
+            ssize_t got = hmac_keyfile_load(g_hmac_keyfile_path,
+                                            scratch, sizeof scratch);
+            // Wipe the bytes immediately — we only wanted to verify.
+            memset(scratch, 0, sizeof scratch);
+            if (got > 0) {
+                g_hmac_display_status = HMAC_DISPLAY_OK;
+                g_hmac_key_bytes      = got;
+            } else {
+                g_hmac_display_status = HMAC_DISPLAY_BAD;
+            }
+        }
     }
 
     // Audit + operator IPC bring-up.
@@ -5262,6 +5352,14 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             }
             snprintf(g_auto_tcmd_file_path, sizeof g_auto_tcmd_file_path,
                      "%s", argv[i] + 10);
+        } else if (strncmp("--hmac-keyfile=", argv[i], 15) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 16) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            snprintf(g_hmac_keyfile_path, sizeof g_hmac_keyfile_path,
+                     "%s", argv[i] + 15);
         } else if (strncmp("--tle=", argv[i], 6) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 7) {
