@@ -356,6 +356,7 @@ typedef struct wf_opts {
     int    dc_notch_bins; // half-width of the notch in FFT bins (each side)
     double display_bw_hz; // filled in by build_waterfall — the actual rendered BW
     time_t start_utc;     // capture start in UTC; 0 = unknown, render elapsed time
+    double start_utc_subsec; // [0, 1) — fractional seconds parsed from UT=...HHMMSS.fff
     float  display_db_lo;    // filled in by build_waterfall — the dB range mapped
     float  display_db_hi;    //   onto colormap indices [0..255]; lights the colorbar.
     float  display_db_floor; // estimated noise floor in dBFS (median of per-bin
@@ -802,8 +803,12 @@ static int write_pdf_with_axes(const char *path,
 
 // Parse "YYYYMMDDTHHMMSS" out of `s` (a longer suffix like ".698.iq" is
 // fine, sscanf ignores trailing bytes). Returns 0 on parse failure.
-static time_t parse_ut_string(const char *s)
+// Parse YYYYMMDDTHHMMSS[.fff] into time_t (whole seconds) plus optional
+// fractional seconds into *out_subsec ([0,1)). Returns 0 on parse failure.
+// out_subsec may be NULL when the caller only wants whole seconds.
+static time_t parse_ut_string_frac(const char *s, double *out_subsec)
 {
+    if (out_subsec != NULL) *out_subsec = 0.0;
     if (s == NULL) return 0;
     int Y, M, D, h, m, sec;
     char T;
@@ -817,17 +822,35 @@ static time_t parse_ut_string(const char *s)
     tm.tm_hour = h;
     tm.tm_min  = m;
     tm.tm_sec  = sec;
-    return timegm(&tm);
+    time_t t = timegm(&tm);
+    if (out_subsec != NULL) {
+        // Optional .fff fractional seconds follow the integer-second field.
+        const char *dot = strchr(s, '.');
+        if (dot != NULL) {
+            int ms = 0;
+            if (sscanf(dot + 1, "%3d", &ms) == 1 && ms >= 0 && ms < 1000) {
+                *out_subsec = ms / 1000.0;
+            }
+        }
+    }
+    return t;
+}
+
+static time_t parse_ut_string(const char *s)
+{
+    return parse_ut_string_frac(s, NULL);
 }
 
 // simple_sat_ops names IQ files <prefix>_UT=YYYYMMDDTHHMMSS.fff.iq. Pull
 // the UT timestamp out of the filename. Returns 0 if there is no "UT=".
-static time_t parse_ut_from_path(const char *path)
+// *out_subsec gets the .fff fractional seconds (0 if absent / NULL).
+static time_t parse_ut_from_path(const char *path, double *out_subsec)
 {
+    if (out_subsec != NULL) *out_subsec = 0.0;
     if (path == NULL) return 0;
     const char *p = strstr(path, "UT=");
     if (p == NULL) return 0;
-    return parse_ut_string(p + 3);
+    return parse_ut_string_frac(p + 3, out_subsec);
 }
 
 static float median_inplace(float *buf, int n)
@@ -1631,8 +1654,14 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
             const uint8_t ARROW_R = 0, ARROW_G = 255, ARROW_B = 255;
             char line[512];
             int n_drawn = 0;
+            // Carry the .fff fractional seconds parsed from the IQ filename
+            // through to start_ms so arrows line up with rx_replay's
+            // sub-second-precision burst timestamps (rx_replay keeps the
+            // .fff; without it every arrow is ~0.5 s off vertically).
             long long start_ms = (opt->start_utc != 0)
-                ? (long long) opt->start_utc * 1000LL : 0;
+                ? (long long) opt->start_utc * 1000LL
+                    + (long long)(opt->start_utc_subsec * 1000.0 + 0.5)
+                : 0;
             while (fgets(line, sizeof line, fp) != NULL) {
                 if (line[0] == '#' || line[0] == '\n' || line[0] == '\0'
                                    || line[0] == '\r') continue;
@@ -1920,7 +1949,7 @@ int main(int argc, char **argv)
     // simple_sat_ops names IQ files <prefix>_UT=YYYYMMDDTHHMMSS.fff.iq;
     // parse that out so the y-axis labels show local clock time. CLI
     // --start-utc=YYYYMMDDTHHMMSS overrides.
-    opt.start_utc     = parse_ut_from_path(iq_path);
+    opt.start_utc     = parse_ut_from_path(iq_path, &opt.start_utc_subsec);
 
     for (int i = first_opt; i < argc; ++i) {
         int rc = 0;
@@ -1979,15 +2008,18 @@ int main(int argc, char **argv)
             if (rc < 0) { usage(); return 2; }
             opt.dc_notch_bins = v;
         } else if (strncmp(argv[i], "--start-utc=", 12) == 0) {
-            time_t t = parse_ut_string(argv[i] + 12);
+            double subsec = 0.0;
+            time_t t = parse_ut_string_frac(argv[i] + 12, &subsec);
             if (t == 0) {
                 fprintf(stderr,
-                    "gen_waterfall: --start-utc must be YYYYMMDDTHHMMSS\n");
+                    "gen_waterfall: --start-utc must be YYYYMMDDTHHMMSS[.fff]\n");
                 return 2;
             }
             opt.start_utc = t;
+            opt.start_utc_subsec = subsec;
         } else if (strcmp(argv[i], "--elapsed-time") == 0) {
             opt.start_utc = 0;
+            opt.start_utc_subsec = 0.0;
         } else if (strncmp(argv[i], "--pdf=", 6) == 0) {
             out_pdf = argv[i] + 6;
         } else if ((rc = parse_double_opt(argv[i], "--power-offset=", &d)) != 0) {
