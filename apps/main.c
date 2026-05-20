@@ -1087,6 +1087,14 @@ static int  g_without_b210 = 0;
 // over.
 static rx_session_t      *g_rx_session  = NULL;
 static tx_request_slot_t  g_tx_request  = {0};
+// Doppler-corrected uplink carrier (Hz). Refreshed every main-loop
+// tick from range_rate_km_s. The compose-preview, modal commit, and
+// auto-tcmd staging all snapshot this so the burst is keyed at the
+// frequency the satellite actually hears the nominal carrier on.
+// Falls back to the bare nominal when Doppler correction is off or
+// before SGP4 has produced a valid range_rate.
+static long               g_tx_freq_hz_doppler =
+                              (long) FRONTIERSAT_CARRIER_HZ;
 #endif
 
 // CLI gate: --no-tx blocks the compose modal from actually committing
@@ -2074,7 +2082,11 @@ static void tx_compose_fill_event(const tx_compose_t *c, sso_event_t *evt) {
     evt->tx_csp_dport = 7;
     evt->tx_csp_sport = 16;
     evt->tx_csp_prio  = 2;
+#ifdef WITH_USRP_B210
+    evt->tx_freq_hz   = g_tx_freq_hz_doppler;
+#else
     evt->tx_freq_hz   = (long) FRONTIERSAT_CARRIER_HZ;
+#endif
     evt->tx_gain_db   = atof(c->power);
     evt->tx_repeat    = 1;
     evt->tx_gap_ms    = 200;
@@ -2462,7 +2474,7 @@ static int tx_compose_commit(const tx_compose_t *c, char *err, size_t err_size) 
     g_tx_request.csp_hdr      = (csp_v1_header_t){
         .prio  = 2, .src = 10, .dst = 1, .dport = 7, .sport = 16, .flags = 0,
     };
-    g_tx_request.tx_freq_hz       = (long) FRONTIERSAT_CARRIER_HZ;
+    g_tx_request.tx_freq_hz       = g_tx_freq_hz_doppler;
     g_tx_request.tx_gain_db       = atof(c->power);
     g_tx_request.repeat           = 1;
     g_tx_request.gap_ms           = 200;
@@ -3116,7 +3128,7 @@ static void auto_tcmd_tick(state_t *state) {
     g_tx_request.csp_hdr      = (csp_v1_header_t){
         .prio  = 2, .src = 10, .dst = 1, .dport = 7, .sport = 16, .flags = 0,
     };
-    g_tx_request.tx_freq_hz       = (long) FRONTIERSAT_CARRIER_HZ;
+    g_tx_request.tx_freq_hz       = g_tx_freq_hz_doppler;
     g_tx_request.tx_gain_db       = atof(a->power);
     g_tx_request.repeat           = 1;
     g_tx_request.gap_ms           = 200;
@@ -4965,6 +4977,29 @@ int main(int argc, char **argv)
             current_uplink_frequency   = state.doppler_uplink_frequency_hz;
             current_downlink_frequency = state.doppler_downlink_frequency_hz;
         }
+
+#ifdef WITH_USRP_B210
+        // TX-side Doppler: transmit at the frequency that places the
+        // nominal carrier at the satellite. Sign: range_rate_km_s > 0
+        // when the satellite is receding (LOS end of a pass), so the
+        // ground must transmit higher to compensate for redshift at
+        // the moving receiver. Mirror of the RX-side correction,
+        // applied to FRONTIERSAT_CARRIER_HZ (the actual TX carrier) —
+        // state.doppler_uplink_frequency_hz is computed from the 2 m
+        // amateur nominal and would give the wrong absolute frequency
+        // here. Off when doppler_correction_enabled is false (e.g.
+        // bench loopback) so RX and TX share one constant carrier.
+        if (state.doppler_correction_enabled) {
+            double rr = state.prediction.satellite_ephem.range_rate_km_s;
+            double factor = 1.0 - rr / 299792.458;
+            if (factor > 1e-9) {
+                g_tx_freq_hz_doppler =
+                    (long)(FRONTIERSAT_CARRIER_HZ / factor + 0.5);
+            }
+        } else {
+            g_tx_freq_hz_doppler = (long) FRONTIERSAT_CARRIER_HZ;
+        }
+#endif
 
 #ifdef WITH_USRP_B210
         // Auto-record per pass: open the WAV 1 min before AOS (or as
