@@ -1985,6 +1985,11 @@ typedef struct {
     double delay_s_val;    // parsed from delay_s at start
     long   next_send_ns;
     int    sends_total;    // running tally — every queued burst
+    // On-air seconds accumulated and total, computed from each
+    // command's payload length using the AX100/9600/preroll/postroll
+    // math in tx_burst.c. Drives the Progress "TX:" sub-line.
+    double tx_seconds_spent;
+    double tx_seconds_total;
     char   last_sent[160];
     char   status_msg[160];
 } auto_tcmd_t;
@@ -1995,6 +2000,38 @@ static auto_tcmd_t  g_auto_tcmd;
 // Path captured from --tc-file. The modal reads this lazily so the
 // CLI can be parsed before all the modal infrastructure is up.
 static char         g_auto_tcmd_file_path[512]   = "";
+
+// On-air seconds for a single AX100 burst with the given ASCII
+// payload length. Mirrors the framing math in tx_burst.c's build_iq:
+//
+//   frame_bytes = prefill(32) + ASM(4) + Golay(3)
+//                 + csp_hdr(4) + payload + hmac(4) + rs_parity(32)
+//                 + tailfill(1)
+//               = 80 + payload
+//
+//   on_air_s    = preroll(0.100) + frame_bytes * 8 / bit_rate
+//                 + postroll(0.050)
+//
+// auto-tcmd always sets repeat=1, gap=200ms (line 3164 region) — the
+// gap and any repeat>1 multiplier are folded in by the caller, not
+// here, so this helper stays a pure per-burst quantum.
+static double auto_tcmd_burst_seconds(size_t payload_len) {
+    const double preroll_s  = 0.100;
+    const double postroll_s = 0.050;
+    const double bit_rate   = 9600.0;
+    size_t frame_bytes = 80 + payload_len;
+    return preroll_s + ((double)(frame_bytes * 8) / bit_rate) + postroll_s;
+}
+
+// "Xm Ys" formatter for the Progress line. Caller's buffer needs ~16
+// chars to be safe across reasonable durations.
+static void fmt_minsec(double seconds, char *out, size_t cap) {
+    if (seconds < 0.0) seconds = 0.0;
+    long total = (long)(seconds + 0.5);
+    long m = total / 60;
+    long s = total % 60;
+    snprintf(out, cap, "%ldm %lds", m, s);
+}
 
 // Trim leading and trailing whitespace in place; returns the (possibly
 // advanced) start pointer. Used by the auto-tcmd file loader so the
@@ -2860,12 +2897,17 @@ static void auto_tcmd_draw(void) {
     wclrtoeol(w);
     if (a->n_commands > 0) {
         int rt = a->repeats_total > 0 ? a->repeats_total : 0;
+        char tx_spent[16], tx_total[16];
+        fmt_minsec(a->tx_seconds_spent, tx_spent, sizeof tx_spent);
+        fmt_minsec(a->tx_seconds_total, tx_total, sizeof tx_total);
         mvwprintw(w, 10, 2,
-                  "Progress: cmd %d/%d   send %d/%d   total sent: %d",
+                  "Progress: cmd %d/%d   send %d/%d   total sent: %d   "
+                  "(TX: %s / %s)",
                   a->cmd_idx + (a->state == AUTO_STATE_RUNNING ? 1 : 0),
                   a->n_commands,
                   a->repeat_idx, rt,
-                  a->sends_total);
+                  a->sends_total,
+                  tx_spent, tx_total);
     } else {
         mvwprintw(w, 10, 2, "Progress: (no commands loaded)");
     }
@@ -3017,6 +3059,12 @@ static int auto_tcmd_start(void) {
     a->cmd_idx       = 0;
     a->repeat_idx    = 0;
     a->sends_total   = 0;
+    a->tx_seconds_spent = 0.0;
+    a->tx_seconds_total = 0.0;
+    for (int i = 0; i < a->n_commands; ++i) {
+        a->tx_seconds_total +=
+            auto_tcmd_burst_seconds(strlen(a->commands[i])) * (double) repeats;
+    }
     a->next_send_ns  = ts_now_ns();  // first send fires immediately
     a->state         = AUTO_STATE_RUNNING;
     snprintf(a->status_msg, sizeof a->status_msg,
@@ -3164,6 +3212,7 @@ static void auto_tcmd_tick(state_t *state) {
     g_tx_request.pending = 1;
     snprintf(a->last_sent, sizeof a->last_sent, "%s", cmd);
     a->sends_total++;
+    a->tx_seconds_spent += auto_tcmd_burst_seconds(n);
 
     a->repeat_idx++;
     if (a->repeat_idx >= a->repeats_total) {
