@@ -237,7 +237,7 @@ tx_burst_result_t tx_burst_run(b210_rx_tx_core_t *core,
     int postroll_ms  = 50;
     double ramp_ms   = 1.0;
     double start_delay_s = 0.5;
-    double tx_gain_db    = req->tx_gain_db > 0 ? req->tx_gain_db : 30.0;
+    double tx_gain_db    = req->tx_gain_db > 0 ? req->tx_gain_db : 70.0;
     long   tx_freq_hz    = req->tx_freq_hz > 0 ? req->tx_freq_hz : 436150000L;
 
     int16_t *iq = NULL;

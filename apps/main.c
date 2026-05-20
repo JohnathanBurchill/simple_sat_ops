@@ -1358,11 +1358,12 @@ typedef struct {
     // Parallel array: peak dBFS for the i-th second back. Clamped into
     // int8 (dBFS is naturally -90..0, well inside int8's range).
     int8_t     ribbon_peak[RIBBON_LEN];
-    // Shadow IQ-demod frame count (modem_iq.c). Reported alongside
-    // frames_total so the operator can A/B the IQ vs FM-audio chains.
-    uint64_t   frames_iq;
-    // Shadow Viterbi-MLSE frame count (modem_viterbi.c). Third A/B
-    // counter on the same IQ window.
+    // frames_total above is the live IQ-domain chain (the one that
+    // writes the DB + drives the per-type panel). The two fields
+    // below are the shadow counts from the PCM/FM-audio and Viterbi
+    // MLSE chains running in parallel on the same window — pure A/B
+    // diagnostics so the operator can spot a chain regression.
+    uint64_t   frames_pcm;
     uint64_t   frames_vit;
     // Optional warning row (e.g., low-disk). Empty when no warning.
     char       warning[80];
@@ -1391,7 +1392,7 @@ static void rx_panel_collect_local(rx_panel_data_t *d)
     // Doppler-shifted carrier line.
     d->rx_lo_hz        = rx_session_get_lo_freq_hz(g_rx_session);
     d->rx_bandwidth_hz = rx_session_get_bandwidth_hz(g_rx_session);
-    d->frames_iq  = rx_session_iq_frames(g_rx_session);
+    d->frames_pcm = rx_session_pcm_frames(g_rx_session);
     d->frames_vit = rx_session_viterbi_frames(g_rx_session);
     rx_packet_type_stats_t pts[RX_PT_COUNT];
     rx_session_stats_snapshot(g_rx_session, pts, &d->age_s);
@@ -1485,9 +1486,12 @@ static void render_rx_panel(const rx_panel_data_t *d,
     mvprintw(row++, col, "%15s   peak %+5.1f  rms %+5.1f dBFS",
              "level", d->peak_dbfs, d->rms_dbfs);
     clrtoeol();
-    mvprintw(row++, col, "%15s   %llu  (iq=%llu vit=%llu)", "frames",
+    // frames_total = live IQ chain (DB-writer). pcm/vit shown as
+    // shadow A/B counts so a chain regression is obvious at a glance.
+    mvprintw(row++, col, "%15s   %llu iq (live)  pcm=%llu vit=%llu",
+             "frames",
              (unsigned long long) d->frames_total,
-             (unsigned long long) d->frames_iq,
+             (unsigned long long) d->frames_pcm,
              (unsigned long long) d->frames_vit);
     clrtoeol();
     if (d->last_frame_summary[0]) {
@@ -1628,7 +1632,7 @@ static void ipc_fill_rx_panel(sso_event_t *evt)
     evt->rx_peak_dbfs    = d.peak_dbfs;
     evt->rx_rms_dbfs     = d.rms_dbfs;
     evt->rx_frames_total = (long) d.frames_total;
-    evt->rx_frames_iq    = (long) d.frames_iq;
+    evt->rx_frames_pcm   = (long) d.frames_pcm;
     evt->rx_frames_vit   = (long) d.frames_vit;
     snprintf(evt->rx_last_frame_summary,
              sizeof evt->rx_last_frame_summary, "%s", d.last_frame_summary);
@@ -1900,7 +1904,7 @@ typedef struct {
 // previous typed string. First open seeds it with "CTS1+" — the OBC's
 // CTS1 telecommand prefix.
 static char g_tx_last_payload[160] = "CTS1+";
-static char g_tx_last_power[12]    = "30.0";
+static char g_tx_last_power[12]    = "70.0";
 // Same idea for the --allow-tx checkbox: operators commonly send a
 // series of commands during a pass and would rather not re-arm the
 // safety gate between every one. Survives Esc + commit; cleared by
@@ -2929,7 +2933,7 @@ static void auto_tcmd_open(void) {
     snprintf(g_auto_tcmd.file_path, sizeof g_auto_tcmd.file_path,
              "%.*s", (int)(sizeof g_auto_tcmd.file_path - 1),
              g_auto_tcmd_file_path);
-    snprintf(g_auto_tcmd.power,   sizeof g_auto_tcmd.power,   "30.0");
+    snprintf(g_auto_tcmd.power,   sizeof g_auto_tcmd.power,   "70.0");
     snprintf(g_auto_tcmd.repeats, sizeof g_auto_tcmd.repeats, "3");
     snprintf(g_auto_tcmd.delay_s, sizeof g_auto_tcmd.delay_s, "2.0");
     g_auto_tcmd.allow_tx = 0;
@@ -3705,13 +3709,13 @@ void usage(FILE *dest, const char *name, int full)
         "                               Optional when --control is given.\n"
         "\n"
         "TLE source:\n"
-        "  --tle=<path>                 Path to a TLE file (2 or 3-line format).\n"
+        "  --tle <path>                 Path to a TLE file (2 or 3-line format).\n"
         "                               Default: $HOME/.local/state/simple_sat_ops/active.tle\n"
         "                               (auto-populated by --control without a\n"
         "                               positional satellite_id).\n"
         "\n"
         "HMAC keyfile:\n"
-        "  --hmac-keyfile=<path>        HMAC key file shown on the operator banner\n"
+        "  --hmac-keyfile <path>        HMAC key file shown on the operator banner\n"
         "                               for visual confirmation. Default: shared\n"
         "                               " HMAC_KEYFILE_SHARED_PATH ",\n"
         "                               falling back to $HOME/" HMAC_KEYFILE_USER_RELPATH ".\n"
@@ -3749,7 +3753,7 @@ void usage(FILE *dest, const char *name, int full)
         "                               safety checkbox still has to be\n"
         "                               ticked — dry-run is about hardware\n"
         "                               presence, not operator intent.\n"
-        "  --tc-file=<path>             Load a file of ASCII telecommands\n"
+        "  --tc-file <path>             Load a file of ASCII telecommands\n"
         "                               (CTS1+...; one per line; '#' lines\n"
         "                               and blank lines ignored). Press 'A'\n"
         "                               (or `:auto`) in the operator UI to\n"
@@ -3777,7 +3781,7 @@ void usage(FILE *dest, const char *name, int full)
         "  --no-doppler-correction      Display nominal freqs without Doppler\n"
         "\n"
         "Rotator overrides:\n"
-        "  --rotator-device=<path>           SPID Rot2Prog tty. Default\n"
+        "  --rotator-device <path>           SPID Rot2Prog tty. Default\n"
         "                                    /dev/ttyUSB0 (Linux).\n"
         "  --rotator-target-azimuth=<deg>    Park on a fixed azimuth\n"
         "  --rotator-target-elevation=<deg>  Park on a fixed elevation\n"
@@ -4337,7 +4341,7 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
         g_viewer_rx_panel.peak_dbfs      = evt->rx_peak_dbfs;
         g_viewer_rx_panel.rms_dbfs       = evt->rx_rms_dbfs;
         g_viewer_rx_panel.frames_total   = (uint64_t) evt->rx_frames_total;
-        g_viewer_rx_panel.frames_iq      = (uint64_t) evt->rx_frames_iq;
+        g_viewer_rx_panel.frames_pcm     = (uint64_t) evt->rx_frames_pcm;
         g_viewer_rx_panel.frames_vit     = (uint64_t) evt->rx_frames_vit;
         snprintf(g_viewer_rx_panel.last_frame_summary,
                  sizeof g_viewer_rx_panel.last_frame_summary,
@@ -4485,10 +4489,8 @@ static void viewer_take_control(sso_ipc_client_t *cli, const char *argv0)
     endwin();
 
     // Re-exec self as --control with inherited TLE and pass folder.
-    char tle_arg[280];
-    char pass_arg[280];
-    snprintf(tle_arg,  sizeof tle_arg,  "--tle=%s",         g_viewer_tle_path);
-    snprintf(pass_arg, sizeof pass_arg, "--pass-folder=%s", g_viewer_pass_folder);
+    // Filename args use the space form so the spawned child sees the
+    // same TAB-completable spelling the user types.
     char self_path[1024];
     ssize_t n = readlink("/proc/self/exe", self_path, sizeof self_path - 1);
     const char *exe = (n > 0) ? (self_path[n] = '\0', self_path) : argv0;
@@ -4496,14 +4498,18 @@ static void viewer_take_control(sso_ipc_client_t *cli, const char *argv0)
     int ai = 0;
     new_argv[ai++] = (char *) exe;
     new_argv[ai++] = "--control";
-    new_argv[ai++] = tle_arg;
-    if (g_viewer_pass_folder[0]) new_argv[ai++] = pass_arg;
+    new_argv[ai++] = "--tle";
+    new_argv[ai++] = g_viewer_tle_path;
+    if (g_viewer_pass_folder[0]) {
+        new_argv[ai++] = "--pass-folder";
+        new_argv[ai++] = g_viewer_pass_folder;
+    }
     new_argv[ai] = NULL;
     fprintf(stderr,
-        "simple_sat_ops: taking control with %s%s%s\n",
-        tle_arg,
-        g_viewer_pass_folder[0] ? "  " : "",
-        g_viewer_pass_folder[0] ? pass_arg : "");
+        "simple_sat_ops: taking control with --tle %s%s%s\n",
+        g_viewer_tle_path,
+        g_viewer_pass_folder[0] ? "  --pass-folder " : "",
+        g_viewer_pass_folder[0] ? g_viewer_pass_folder : "");
     execv(exe, new_argv);
     // If we got here exec failed — best to bail loudly.
     fprintf(stderr,
@@ -4782,10 +4788,22 @@ static void self_test_report(const state_t *state, FILE *out, int argc, char **a
 
     // Doppler --- both the display correction and the TX-side burst
     // staging key off state->doppler_correction_enabled. On by
-    // default; --no-doppler-correction clears it.
+    // default; --no-doppler-correction clears it. Report RX and TX
+    // separately so the operator can see where the correction is
+    // applied: RX is software (sw_nco on post-decim IQ, no hardware
+    // LO retune mid-pass — the threshold-driven retune was removed
+    // because it caused phase resets in the coherent demod), TX is
+    // hardware (b210_rx_tx_core_burst tunes the B210 LO to the
+    // Doppler-corrected frequency for every burst).
     fprintf(out, "doppler-correction: %s\n",
             state->doppler_correction_enabled ? "enabled (default)"
                                               : "DISABLED (--no-doppler-correction)");
+    fprintf(out, "doppler-rx: %s (software sw_nco on post-decim IQ; hardware LO fixed)\n",
+            state->doppler_correction_enabled ? "enabled" : "disabled");
+    fprintf(out, "doppler-tx: %s (hardware B210 LO retune per burst, f=carrier/(1-rr/c))\n",
+            (!b210_compiled || g_without_b210)
+                ? "n/a (no B210)"
+                : (state->doppler_correction_enabled ? "enabled" : "disabled"));
     fprintf(out, "uplink-nominal-mhz: %.6f\n",
             state->nominal_uplink_frequency_hz / 1e6);
     fprintf(out, "downlink-nominal-mhz: %.6f\n",
@@ -5894,47 +5912,75 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strcmp("--tx-dry-run", argv[i]) == 0) {
             state->n_options++;
             g_tx_dry_run = 1;
-        } else if (strncmp("--tc-file=", argv[i], 10) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 11) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+        // Filename args use the space form (--foo <path>) so bash
+        // tab-completion works. The old --foo=<path> form is rejected
+        // with a one-line hint pointing at the new spelling.
+        } else if (strcmp("--tc-file", argv[i]) == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--tc-file: missing <path>\n");
                 return EXIT_FAILURE;
             }
+            state->n_options += 2;
             snprintf(g_auto_tcmd_file_path, sizeof g_auto_tcmd_file_path,
-                     "%s", argv[i] + 10);
-        } else if (strncmp("--hmac-keyfile=", argv[i], 15) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 16) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                     "%s", argv[++i]);
+        } else if (strncmp("--tc-file=", argv[i], 10) == 0) {
+            fprintf(stderr,
+                "--tc-file=<path> is no longer accepted; "
+                "use `--tc-file <path>` (TAB-completes the filename)\n");
+            return EXIT_FAILURE;
+        } else if (strcmp("--hmac-keyfile", argv[i]) == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--hmac-keyfile: missing <path>\n");
                 return EXIT_FAILURE;
             }
+            state->n_options += 2;
             snprintf(g_hmac_keyfile_path, sizeof g_hmac_keyfile_path,
-                     "%s", argv[i] + 15);
+                     "%s", argv[++i]);
+        } else if (strncmp("--hmac-keyfile=", argv[i], 15) == 0) {
+            fprintf(stderr,
+                "--hmac-keyfile=<path> is no longer accepted; "
+                "use `--hmac-keyfile <path>` (TAB-completes the filename)\n");
+            return EXIT_FAILURE;
+        } else if (strcmp("--tle", argv[i]) == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--tle: missing <path>\n");
+                return EXIT_FAILURE;
+            }
+            state->n_options += 2;
+            state->prediction.tles_filename = tle_path_resolve(argv[++i]);
         } else if (strncmp("--tle=", argv[i], 6) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 7) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+            fprintf(stderr,
+                "--tle=<path> is no longer accepted; "
+                "use `--tle <path>` (TAB-completes the filename)\n");
+            return EXIT_FAILURE;
+        } else if (strcmp("--pass-folder", argv[i]) == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--pass-folder: missing <path>\n");
                 return EXIT_FAILURE;
             }
-            state->prediction.tles_filename = tle_path_resolve(argv[i] + 6);
-        } else if (strncmp("--pass-folder=", argv[i], 14) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 15) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
+            state->n_options += 2;
             // Pre-seed g_pass_folder; setup_pass_folder() then skips
             // its AOS-driven auto-discovery and uses the inherited
             // path (handoff case: new operator picks up the previous
             // operator's pass folder).
-            snprintf(g_pass_folder, sizeof g_pass_folder, "%s", argv[i] + 14);
-        } else if (strncmp("--rotator-device=", argv[i], 17) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 18) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+            snprintf(g_pass_folder, sizeof g_pass_folder, "%s", argv[++i]);
+        } else if (strncmp("--pass-folder=", argv[i], 14) == 0) {
+            fprintf(stderr,
+                "--pass-folder=<path> is no longer accepted; "
+                "use `--pass-folder <path>` (TAB-completes the filename)\n");
+            return EXIT_FAILURE;
+        } else if (strcmp("--rotator-device", argv[i]) == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--rotator-device: missing <path>\n");
                 return EXIT_FAILURE;
             }
-            state->antenna_rotator.device_filename = argv[i] + 17;
+            state->n_options += 2;
+            state->antenna_rotator.device_filename = argv[++i];
+        } else if (strncmp("--rotator-device=", argv[i], 17) == 0) {
+            fprintf(stderr,
+                "--rotator-device=<path> is no longer accepted; "
+                "use `--rotator-device <path>` (TAB-completes the filename)\n");
+            return EXIT_FAILURE;
         } else if (strncmp("--uplink-freq-mhz=", argv[i], 18) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 19) {

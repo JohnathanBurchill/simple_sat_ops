@@ -510,9 +510,9 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
             if (json_field_double(&p, end, &first, "rx_pk",  evt->rx_peak_dbfs) < 0) return -1;
             if (json_field_double(&p, end, &first, "rx_rm",  evt->rx_rms_dbfs) < 0) return -1;
             if (json_field_int   (&p, end, &first, "rx_fr",  evt->rx_frames_total) < 0) return -1;
-            if (evt->rx_frames_iq) {
-                if (json_field_int(&p, end, &first, "rx_fr_iq",
-                                   evt->rx_frames_iq) < 0) return -1;
+            if (evt->rx_frames_pcm) {
+                if (json_field_int(&p, end, &first, "rx_fr_pcm",
+                                   evt->rx_frames_pcm) < 0) return -1;
             }
             if (evt->rx_frames_vit) {
                 if (json_field_int(&p, end, &first, "rx_fr_vt",
@@ -732,7 +732,7 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
     json_get_double(line, "rx_rm",  &evt->rx_rms_dbfs);
     long rx_long = 0;
     if (json_get_int(line, "rx_fr", &rx_long) > 0) evt->rx_frames_total = rx_long;
-    if (json_get_int(line, "rx_fr_iq", &rx_long) > 0) evt->rx_frames_iq = rx_long;
+    if (json_get_int(line, "rx_fr_pcm", &rx_long) > 0) evt->rx_frames_pcm = rx_long;
     if (json_get_int(line, "rx_fr_vt", &rx_long) > 0) evt->rx_frames_vit = rx_long;
     json_get_string(line, "rx_lf",
                     evt->rx_last_frame_summary,

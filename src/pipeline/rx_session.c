@@ -198,23 +198,29 @@ struct rx_session {
     size_t   bytes_cap;
     uint8_t  packet[4200];
 
-    // Dedup ring (quantised ASM absolute sample index).
+    // Dedup ring (quantised ASM absolute sample index). frames_total +
+    // emit_frame + per-type bookkeeping below all drive off the IQ
+    // chain now — the IQ-domain demod is the live primary because the
+    // FM-discriminator path gives up ~14 dB of avoidable SNR. The PCM
+    // and Viterbi chains keep running in parallel, each with their own
+    // dedup ring + counter, purely as A/B shadows the operator can use
+    // to spot regressions.
     uint64_t recent_pos_quant[DEDUP_RING_SZ];
     int      recent_idx;
     int      recent_count;
     uint64_t total_window_samples;
-    // Parallel dedup ring for the shadow IQ chain. Independent of the
-    // PCM ring so a frame both chains decode counts in BOTH `frames_total`
-    // and `frames_iq_total` — that's the A/B signal.
-    uint64_t iq_recent_pos_quant[DEDUP_RING_SZ];
-    int      iq_recent_idx;
-    int      iq_recent_count;
-    uint64_t iq_frames_total;
+    // PCM/FM-audio shadow counter. Same window, independent dedup so
+    // any frame both chains catch ticks BOTH frames_total (the IQ
+    // primary) and pcm_frames_total — that's the A signal.
+    uint64_t pcm_recent_pos_quant[DEDUP_RING_SZ];
+    int      pcm_recent_idx;
+    int      pcm_recent_count;
+    uint64_t pcm_frames_total;
 
-    // Third decode chain: MSK-MLSE Viterbi over the same IQ window. Same
-    // measurement role as the IQ slicer above — counts frames only, no
-    // packet_db write, so the live pipeline stays single-source until
-    // the new chain has earned a promotion on real RF.
+    // Viterbi MSK-MLSE shadow counter. Same role as the PCM shadow —
+    // count only, no DB write, no panel update — so an operator who
+    // suspects the live chain is missing frames can compare against
+    // the other two before believing a regression.
     uint64_t vit_recent_pos_quant[DEDUP_RING_SZ];
     int      vit_recent_idx;
     int      vit_recent_count;
@@ -311,8 +317,14 @@ struct rx_session {
     long     snap_wav_n_samples;
     char     snap_iq_path[512];
     long     snap_iq_pairs;
-    uint64_t snap_iq_frames_total;
+    uint64_t snap_pcm_frames_total;
     uint64_t snap_vit_frames_total;
+
+    // lo_offset.csv sidecar: same lifecycle as doppler.csv (opens with
+    // the WAV, closes with it). One row per change of lo_offset_hz so
+    // offline reprocessing of the .iq can replay the exact LO history.
+    FILE     *lo_offset_fp;
+    char      lo_offset_path[512];
 };
 
 static void *rx_session_thread_fn(void *arg);
@@ -492,6 +504,32 @@ static void worker_wav_start(rx_session_t *rxs)
     } else {
         rxs->doppler_path[0] = '\0';
     }
+
+    // lo_offset sidecar: one row per change of the operator's SDR LO
+    // offset (typed as `:lo_offset <±kHz>` in the UI). Seeded with the
+    // current value at file open so a reader can reconstruct the LO
+    // history without needing the CLI flag context. Same lifecycle as
+    // doppler.csv: opens with the WAV, closes when it does.
+    if (wlen >= 4 && strcmp(rxs->wav_path + wlen - 4, ".wav") == 0) {
+        int base_len = (int)(wlen - 4);
+        if (base_len > 498) base_len = 498;
+        snprintf(rxs->lo_offset_path, sizeof rxs->lo_offset_path,
+                 "%.*s.lo_offset.csv", base_len, rxs->wav_path);
+    } else {
+        snprintf(rxs->lo_offset_path, sizeof rxs->lo_offset_path,
+                 "%.498s.lo_offset.csv", rxs->wav_path);
+    }
+    rxs->lo_offset_fp = fopen(rxs->lo_offset_path, "w");
+    if (rxs->lo_offset_fp != NULL) {
+        fputs("# unix_time_ms,lo_offset_hz\n", rxs->lo_offset_fp);
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        long long unix_ms = (long long) tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+        fprintf(rxs->lo_offset_fp, "%lld,%.6f\n", unix_ms, rxs->lo_offset_hz);
+        fflush(rxs->lo_offset_fp);
+    } else {
+        rxs->lo_offset_path[0] = '\0';
+    }
     // No stderr print on success either — operator sees [REC] in the
     // UI, and the WAV path is auto-named from the same UTC stamp as
     // every other artifact in the pass folder.
@@ -507,6 +545,10 @@ static void worker_wav_stop(rx_session_t *rxs)
     if (rxs->doppler_fp != NULL) {
         fclose(rxs->doppler_fp);
         rxs->doppler_fp = NULL;
+    }
+    if (rxs->lo_offset_fp != NULL) {
+        fclose(rxs->lo_offset_fp);
+        rxs->lo_offset_fp = NULL;
     }
 }
 
@@ -587,11 +629,11 @@ uint64_t rx_session_viterbi_frames(const rx_session_t *rxs)
     return v;
 }
 
-uint64_t rx_session_iq_frames(const rx_session_t *rxs)
+uint64_t rx_session_pcm_frames(const rx_session_t *rxs)
 {
     if (rxs == NULL) return 0;
     pthread_mutex_lock((pthread_mutex_t *) &rxs->mu);
-    uint64_t v = rxs->snap_iq_frames_total;
+    uint64_t v = rxs->snap_pcm_frames_total;
     pthread_mutex_unlock((pthread_mutex_t *) &rxs->mu);
     return v;
 }
@@ -633,6 +675,21 @@ void rx_session_set_lo_offset(rx_session_t *rxs,
     rxs->lo_offset_hz = new_lo_offset_hz;
     b210_rx_tx_core_set_fm_lo_compensation(rxs->core, new_lo_offset_hz);
     rx_session_request_freq(rxs, nominal_freq_hz + new_lo_offset_hz);
+
+    // Append to the per-pass lo_offset.csv so offline reprocessing of
+    // the .iq sidecar can replay the same LO history. mu protects the
+    // file pointer against worker-side close-on-wav-stop. No-op when
+    // the WAV isn't open (sidecar lifecycle matches the .iq we'd be
+    // re-tuning against).
+    pthread_mutex_lock(&rxs->mu);
+    if (rxs->lo_offset_fp != NULL) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        long long unix_ms = (long long) tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+        fprintf(rxs->lo_offset_fp, "%lld,%.6f\n", unix_ms, new_lo_offset_hz);
+        fflush(rxs->lo_offset_fp);
+    }
+    pthread_mutex_unlock(&rxs->mu);
 }
 
 double rx_session_get_doppler_offset(const rx_session_t *rxs)
@@ -711,6 +768,11 @@ void rx_session_close(rx_session_t *rxs)
     free(rxs);
 }
 
+// PCM/FM-audio shadow chain: dedup + bump pcm_frames_total. No
+// emit_frame, no DB insert, no per-type bookkeeping — the IQ chain
+// owns those now (see try_decode_iq_at_window). Counted purely so the
+// operator panel + IPC can show the A signal alongside the live IQ
+// count.
 static void try_decode_at_window(rx_session_t *rxs)
 {
     size_t inner_min_offset = 0;
@@ -736,6 +798,58 @@ static void try_decode_at_window(rx_session_t *rxs)
         inner_min_offset = sync_off_local + 1;
         if (plen < 4 || (size_t) plen > sizeof rxs->packet) continue;
 
+        uint64_t window_start_abs =
+            rxs->total_window_samples - (uint64_t) rxs->window_samples;
+        uint64_t asm_abs_sample = window_start_abs
+            + (uint64_t) sync_off_local * (uint64_t) rxs->sps
+            + (uint64_t)(rxs->sps / 2);
+        uint64_t pos_quant = asm_abs_sample / rxs->dedup_quant;
+        int seen = 0;
+        int ring_n = rxs->pcm_recent_count < DEDUP_RING_SZ
+                   ? rxs->pcm_recent_count : DEDUP_RING_SZ;
+        for (int r = 0; r < ring_n; r++) {
+            if (rxs->pcm_recent_pos_quant[r] == pos_quant) { seen = 1; break; }
+        }
+        if (seen) continue;
+        rxs->pcm_recent_pos_quant[rxs->pcm_recent_idx] = pos_quant;
+        rxs->pcm_recent_idx = (rxs->pcm_recent_idx + 1) % DEDUP_RING_SZ;
+        if (rxs->pcm_recent_count < DEDUP_RING_SZ) rxs->pcm_recent_count++;
+
+        rxs->pcm_frames_total++;
+    }
+}
+
+// IQ-domain decoder — the LIVE primary chain. Runs the IQ-slicer on
+// post-decim IQ (~14 dB SNR-better than the FM-discriminator path),
+// dedupes via the main `recent_pos_quant` ring, then emits to the DB
+// and packet log, updates per-type bookkeeping + last-frame state,
+// and bumps frames_total. The PCM and Viterbi chains are shadow
+// counters — see try_decode_at_window / try_decode_viterbi_at_window.
+static void try_decode_iq_at_window(rx_session_t *rxs)
+{
+    size_t inner_min_offset = 0;
+    for (;;) {
+        ssize_t plen = -1;
+        int golay_errs = 0, hmac_ok = -1;
+        int rs_errs = -1, used_golay_len = -1;
+        int rs_locs[32];
+        size_t sync_off_local = 0;
+        if (!try_decode_window_iq(rxs->iq_window, rxs->window_samples,
+                                  &rxs->mp, &rxs->opts,
+                                  rxs->sync_max_ham, rxs->use_hmac,
+                                  /*allow_partial_rs=*/1,
+                                  inner_min_offset,
+                                  rxs->bits_scratch, rxs->bits_cap,
+                                  rxs->bytes_scratch, rxs->bytes_cap,
+                                  rxs->packet, sizeof rxs->packet,
+                                  &plen, &golay_errs, &hmac_ok,
+                                  &rs_errs, &used_golay_len,
+                                  &sync_off_local, rs_locs)) {
+            break;
+        }
+        inner_min_offset = sync_off_local + 1;
+        if (plen < 4 || (size_t) plen > sizeof rxs->packet) continue;
+
         int       crc_status   = -1;
         uint32_t  crc_computed = 0, crc_le = 0, crc_be = 0;
         if (!rxs->use_hmac && rxs->csp_crc32 && plen >= 8) {
@@ -756,7 +870,10 @@ static void try_decode_at_window(rx_session_t *rxs)
             }
         }
 
-        // Dedup by quantised absolute ASM sample index.
+        // Dedup by quantised absolute ASM sample index. Uses the main
+        // recent_pos_quant ring (shared with the live emit path) so
+        // the same physical frame caught in two overlapping windows
+        // only writes once.
         uint64_t window_start_abs =
             rxs->total_window_samples - (uint64_t) rxs->window_samples;
         uint64_t asm_abs_sample = window_start_abs
@@ -765,7 +882,7 @@ static void try_decode_at_window(rx_session_t *rxs)
         uint64_t pos_quant = asm_abs_sample / rxs->dedup_quant;
         int seen = 0;
         int ring_n = rxs->recent_count < DEDUP_RING_SZ
-            ? rxs->recent_count : DEDUP_RING_SZ;
+                   ? rxs->recent_count : DEDUP_RING_SZ;
         for (int r = 0; r < ring_n; r++) {
             if (rxs->recent_pos_quant[r] == pos_quant) { seen = 1; break; }
         }
@@ -793,7 +910,6 @@ static void try_decode_at_window(rx_session_t *rxs)
 
         // Per-type bookkeeping. FrontierSat tags packet_type in the
         // first byte of the CSP payload (after the 4-byte CSP header).
-        // CSP_HDR_LEN = 4. Map to the public RX_PT_* slot.
         rx_packet_type_slot_t slot = RX_PT_OTHER;
         if (plen >= 5) {
             uint8_t ptype = rxs->packet[4];
@@ -810,12 +926,6 @@ static void try_decode_at_window(rx_session_t *rxs)
         int copy = (plen < RX_LAST_PAYLOAD_MAX) ? (int)plen : RX_LAST_PAYLOAD_MAX;
         rxs->per_type_last_len[slot] = copy;
         memcpy(rxs->per_type_last_payload[slot], rxs->packet, (size_t)copy);
-        // Build the decoded one-line summary while we still have the
-        // full plen bytes (the per-type payload buffer is capped at 64
-        // which isn't enough for a 130-byte beacon). beacon_*_summary
-        // re-runs the sniff so a payload that almost-but-not-quite
-        // matches the slot's type just leaves an empty summary; the
-        // panel renderer falls back to hex in that case.
         char *sum_out  = rxs->per_type_last_summary[slot];
         size_t sum_cap = sizeof rxs->per_type_last_summary[slot];
         sum_out[0] = '\0';
@@ -833,8 +943,6 @@ static void try_decode_at_window(rx_session_t *rxs)
                                     sum_out, sum_cap);
                 break;
             default:
-                // Beacon-peripheral / bulk_file / OTHER fall through —
-                // panel renders the existing hex preview.
                 break;
         }
 
@@ -846,66 +954,9 @@ static void try_decode_at_window(rx_session_t *rxs)
     }
 }
 
-// Worker-internal: pump UHD until it returns 0 (transient), feeding
-// PCM into the WAV and the decode window.
-// Shadow IQ decoder. Counts frames the IQ-domain chain extracts from
-// the same sliding window the PCM chain just chewed on — no packet_db
-// write, no event emit, no packet-type bookkeeping. We only need the
-// frame count to A/B the front ends; the rest of the pipeline keeps
-// reading from the PCM chain so behaviour on live RF is unchanged
-// until we're sure the IQ chain is at least as reliable.
-static void try_decode_iq_at_window(rx_session_t *rxs)
-{
-    size_t inner_min_offset = 0;
-    for (;;) {
-        ssize_t plen = -1;
-        int golay_errs = 0, hmac_ok = -1;
-        int rs_errs = -1, used_golay_len = -1;
-        int rs_locs[32];
-        size_t sync_off_local = 0;
-        if (!try_decode_window_iq(rxs->iq_window, rxs->window_samples,
-                                  &rxs->mp, &rxs->opts,
-                                  rxs->sync_max_ham, rxs->use_hmac,
-                                  /*allow_partial_rs=*/1,
-                                  inner_min_offset,
-                                  rxs->bits_scratch, rxs->bits_cap,
-                                  rxs->bytes_scratch, rxs->bytes_cap,
-                                  rxs->packet, sizeof rxs->packet,
-                                  &plen, &golay_errs, &hmac_ok,
-                                  &rs_errs, &used_golay_len,
-                                  &sync_off_local, rs_locs)) {
-            break;
-        }
-        inner_min_offset = sync_off_local + 1;
-        if (plen < 4 || (size_t) plen > sizeof rxs->packet) continue;
-
-        // Independent dedup against the IQ ring so a frame both chains
-        // decode counts in BOTH frames_total and iq_frames_total.
-        uint64_t window_start_abs =
-            rxs->total_window_samples - (uint64_t) rxs->window_samples;
-        uint64_t asm_abs_sample = window_start_abs
-            + (uint64_t) sync_off_local * (uint64_t) rxs->sps
-            + (uint64_t)(rxs->sps / 2);
-        uint64_t pos_quant = asm_abs_sample / rxs->dedup_quant;
-        int seen = 0;
-        int ring_n = rxs->iq_recent_count < DEDUP_RING_SZ
-                   ? rxs->iq_recent_count : DEDUP_RING_SZ;
-        for (int r = 0; r < ring_n; r++) {
-            if (rxs->iq_recent_pos_quant[r] == pos_quant) { seen = 1; break; }
-        }
-        if (seen) continue;
-        rxs->iq_recent_pos_quant[rxs->iq_recent_idx] = pos_quant;
-        rxs->iq_recent_idx = (rxs->iq_recent_idx + 1) % DEDUP_RING_SZ;
-        if (rxs->iq_recent_count < DEDUP_RING_SZ) rxs->iq_recent_count++;
-
-        rxs->iq_frames_total++;
-    }
-}
-
-// Same shape as try_decode_iq_at_window but runs the Viterbi MLSE
-// front-end. Independent dedup ring so a frame all three chains
-// decode counts everywhere (frames_total, iq_frames_total, AND
-// vit_frames_total) — that's the operator's A/B/C signal.
+// Viterbi MLSE shadow chain. Counts only — no DB write, no panel
+// update. Independent dedup ring so any frame all three chains catch
+// shows up in PCM, IQ (live), AND Viterbi counters separately.
 static void try_decode_viterbi_at_window(rx_session_t *rxs)
 {
     size_t inner_min_offset = 0;
@@ -1055,7 +1106,7 @@ static void worker_update_snapshot(rx_session_t *rxs)
     rxs->snap_wav_active     = wav_active;
     rxs->snap_wav_n_samples  = (long) rxs->wav.n_samples;
     rxs->snap_iq_pairs       = (long) rxs->iq_pairs_written;
-    rxs->snap_iq_frames_total = rxs->iq_frames_total;
+    rxs->snap_pcm_frames_total = rxs->pcm_frames_total;
     rxs->snap_vit_frames_total = rxs->vit_frames_total;
     // Persist the last-known paths even after a close so that the
     // end-of-pass renderer (which runs post-close) can still find them.

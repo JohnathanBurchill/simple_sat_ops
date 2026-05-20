@@ -160,6 +160,12 @@ add_executable(fm_preview utils/fm_preview.c utils/wav_read.c
 target_link_libraries(fm_preview PRIVATE m)
 list(APPEND SSO_TARGETS fm_preview)
 
+# agenda_check: TC-file reviewer. Humanizes @tssent=/@tsexec= unix-ms
+# values into ISO timestamps (UTC or --local-time) and flags verbatim-
+# duplicate command lines. Pure POSIX; no external libs.
+add_executable(agenda_check utils/agenda_check.c)
+list(APPEND SSO_TARGETS agenda_check)
+
 # Beacon-cadence detector for post-pass triage of FM-demoded WAVs.
 add_executable(beacon_detect utils/beacon_detect.c utils/wav_read.c
                src/dsp/biquad.c src/dsp/monitor_squelch.c)

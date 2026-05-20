@@ -134,14 +134,15 @@ void rx_session_iq_snapshot(const rx_session_t *rxs,
                             long *out_pairs,
                             int  *out_sample_rate);
 
-// Frame count from the shadow IQ-domain demod (modem_iq.c). Runs in
-// parallel with the primary PCM demod purely as a measurement. Use
-// alongside rx_session_snapshot's frames_total to A/B the two chains.
-uint64_t rx_session_iq_frames(const rx_session_t *rxs);
+// Frame count from the shadow PCM/FM-audio demod (modem.c run on the
+// post-FIR PCM stream). The IQ-domain chain is the live primary that
+// writes the DB + drives the panel; PCM runs in parallel as a count-
+// only A signal. rx_session_snapshot's frames_total is the IQ count.
+uint64_t rx_session_pcm_frames(const rx_session_t *rxs);
 
 // Frame count from the shadow MSK-MLSE Viterbi demod
-// (modem_viterbi.c). Same role as rx_session_iq_frames — a third A/B
-// counter on the same IQ window.
+// (modem_viterbi.c). Same role as rx_session_pcm_frames — a count-
+// only B signal on the same IQ window the live IQ chain uses.
 uint64_t rx_session_viterbi_frames(const rx_session_t *rxs);
 
 // Sync: hand a TX burst request to the worker, block until it pauses
