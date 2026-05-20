@@ -488,7 +488,10 @@ static int write_pdf_with_axes(const char *path,
     if (path == NULL || spec_rgb == NULL || spec_w <= 0 || spec_h <= 0) return -1;
 
     const int LM = 80, TM = 12, BM = 28;
-    const int CB_GAP = 12;
+    // CB_GAP widened so right-side time tick labels (HH:MM:SS, ~40 pt
+    // wide at Helvetica 8) have room between the spectrogram edge and
+    // the colorbar.
+    const int CB_GAP = 60;
     const int CB_W   = 16;
     const int CB_LABEL_SPACE = 60;
     const int W = LM + spec_w + CB_GAP + CB_W + CB_LABEL_SPACE;
@@ -582,24 +585,42 @@ static int write_pdf_with_axes(const char *path,
                   x - label_w_pt / 2.0, BM - 14, esc);
     }
 
-    // 5. Time-axis ticks + labels (Y axis, left of the spectrogram).
-    // Major ticks with labels, minor 20 s ticks unlabeled.
+    // 5. Time-axis ticks + labels. Time runs upward (t=0 at the
+    // bottom). Three tiers of tick density, mirrored on both axes:
+    //
+    //   1 s ultra-minor  — short (2 pt), gated to duration <= 120 s
+    //                      so a long capture doesn't render as a
+    //                      noisy gray fringe;
+    //   20 s minor       — medium (3 pt), unlabeled;
+    //   major (pick_time_step) — long (6 pt) with HH:MM:SS labels
+    //                      on both sides.
+    //
+    // The right-side ticks/labels are mirrors of the left so the
+    // operator can read a time off whichever edge is closer to a
+    // feature of interest in the spectrogram.
+    int    right_edge = LM + spec_w;
     double t_step = pick_time_step(duration_s, 10);
+    if (duration_s <= 120.0) {
+        for (double t = 0.0; t <= duration_s + 0.5; t += 1.0) {
+            double y = BM + (t / duration_s) * (double) spec_h;
+            CS_APPEND("ET 0.78 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
+                      LM - 2, y, LM, y);
+            CS_APPEND("ET 0.78 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
+                      right_edge, y, right_edge + 2, y);
+        }
+    }
     for (double t = 0.0; t <= duration_s + 0.5; t += 20.0) {
         double mod = fmod(t, t_step);
         if (fabs(mod) < 1.0 || fabs(mod - t_step) < 1.0) continue;
-        double frac = 1.0 - t / duration_s;
-        double y = BM + frac * (double) spec_h;
-        // Time runs upward in the PDF (y-up), but the start-of-recording
-        // is at the bottom of the spectrogram → flip: y = BM + (1-t/d)*h
-        // means t=0 → y = BM+h (top). Wait, we want t=0 at BOTTOM (BM).
-        // Recompute: bottom = oldest (t=0), top = newest (t=d).
-        y = BM + (t / duration_s) * (double) spec_h;
+        double y = BM + (t / duration_s) * (double) spec_h;
         CS_APPEND("ET 0.65 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
                   LM - 3, y, LM, y);
+        CS_APPEND("ET 0.65 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
+                  right_edge, y, right_edge + 3, y);
     }
     for (double t = 0.0; t <= duration_s + 0.5 * t_step; t += t_step) {
         double y = BM + (t / duration_s) * (double) spec_h;
+        // Left tick + label.
         CS_APPEND("ET 0.65 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
                   LM - 6, y, LM, y);
         char buf[24], esc[40];
@@ -608,6 +629,11 @@ static int write_pdf_with_axes(const char *path,
         int label_w_pt = (int) strlen(buf) * 5;
         CS_APPEND("1 0 0 1 %d %.1f Tm (%s) Tj\n",
                   LM - 10 - label_w_pt, y - 3, esc);
+        // Right tick + label (same timestamp, mirror placement).
+        CS_APPEND("ET 0.65 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
+                  right_edge, y, right_edge + 6, y);
+        CS_APPEND("1 0 0 1 %d %.1f Tm (%s) Tj\n",
+                  right_edge + 10, y - 3, esc);
     }
 
     // 6. Colorbar dB ticks + labels. Same offset trick as the PNG: tick
@@ -1318,10 +1344,15 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
                             uint8_t **out_rgb, int *out_w, int *out_h)
 {
     const int LM = 80;
-    // RM widened from 12 to 76 to host the dB colorbar: 12 px gap +
-    // 16 px strip + 6 px ticks + ~36 px of label space + a small
-    // breathing-room margin. The colorbar height matches spec_h.
-    const int RM = 76;
+    // RM hosts the right-side time tick labels (mirroring the left)
+    // PLUS the dB colorbar. Budget:
+    //   60 px right-axis-label gap (6 tick + ~40 px HH:MM:SS + breathing)
+    //   16 px colorbar strip
+    //    6 px colorbar ticks
+    //   ~36 px colorbar label space
+    //    ~6 px breathing
+    // = 124 px total.
+    const int RM = 124;
     const int TM = 12;
     const int BM = 28;
     int W = spec_w + LM + RM;
@@ -1375,13 +1406,31 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
                   LBL_R, LBL_G, LBL_B);
     }
 
-    // Time axis: 0 at the BOTTOM, increasing upward (matches the flipped
-    // spectrogram above). Minor ticks every 20 s without labels; major
-    // ticks at pick_time_step(duration_s, 10) intervals get labels.
+    // Time axis: 0 at the BOTTOM, increasing upward (matches the
+    // flipped spectrogram above). Three tiers, all mirrored on the
+    // right edge of the spectrogram:
+    //   1 s ultra-minor  — 2 px, only when duration <= 120 s
+    //   20 s minor       — 3 px, unlabeled
+    //   major            — 6 px + HH:MM:SS label
+    // Mirroring lets the operator read a time off whichever edge is
+    // closer to the feature they're squinting at.
+    int    right_edge = LM + spec_w;
     double t_step = pick_time_step(duration_s, 10);
+    const uint8_t FINE_R = 140, FINE_G = 140, FINE_B = 140;
+    if (duration_s <= 120.0) {
+        for (double t = 0.0; t <= duration_s + 0.5; t += 1.0) {
+            double frac = 1.0 - t / duration_s;
+            int y = TM + (int)(frac * (double) spec_h);
+            if (y < TM || y >= TM + spec_h) continue;
+            for (int dx = 0; dx < 2; ++dx) {
+                px_set(rgb, W, H, LM - 1 - dx, y, FINE_R, FINE_G, FINE_B);
+                px_set(rgb, W, H, right_edge + dx, y, FINE_R, FINE_G, FINE_B);
+            }
+        }
+    }
     for (double t = 0.0; t <= duration_s + 0.5; t += 20.0) {
-        // Skip the minor tick that coincides with a major-tick position;
-        // the major loop below will draw a longer tick there.
+        // Skip the minor that coincides with a major; the major loop
+        // below will draw a longer tick at that position.
         double mod = fmod(t, t_step);
         if (fabs(mod) < 1.0 || fabs(mod - t_step) < 1.0) continue;
         double frac = 1.0 - t / duration_s;
@@ -1389,6 +1438,7 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
         if (y < TM || y >= TM + spec_h) continue;
         for (int dx = 0; dx < 3; ++dx) {
             px_set(rgb, W, H, LM - 1 - dx, y, TIC_R, TIC_G, TIC_B);
+            px_set(rgb, W, H, right_edge + dx, y, TIC_R, TIC_G, TIC_B);
         }
     }
     for (double t = 0.0; t <= duration_s + 0.5 * t_step; t += t_step) {
@@ -1397,11 +1447,16 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
         if (y < TM || y >= TM + spec_h) continue;
         for (int dx = 0; dx < 6; ++dx) {
             px_set(rgb, W, H, LM - 1 - dx, y, TIC_R, TIC_G, TIC_B);
+            px_set(rgb, W, H, right_edge + dx, y, TIC_R, TIC_G, TIC_B);
         }
         char buf[24];
         fmt_time(opt->start_utc, t, buf, sizeof buf);
         int lw = text_width(buf, 1);
         draw_text(rgb, W, H, LM - 8 - lw, y - 3, buf, 1,
+                  LBL_R, LBL_G, LBL_B);
+        // Right-side label: same timestamp, placed just past the
+        // right-side tick stubs.
+        draw_text(rgb, W, H, right_edge + 9, y - 3, buf, 1,
                   LBL_R, LBL_G, LBL_B);
     }
 
@@ -1471,7 +1526,10 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
     // dB colorbar in the right margin. Top of the strip is the maximum
     // displayed dB, bottom is the minimum — matches the convention of
     // "more = up". Same viridis table as the spectrogram.
-    int cb_x_lo = LM + spec_w + 12;
+    // Colorbar pushed past the right-side time-axis label gutter so
+    // the HH:MM:SS strings drawn just past `right_edge` don't collide
+    // with the colorbar strip. Must match the RM budget above.
+    int cb_x_lo = LM + spec_w + 60;
     int cb_x_hi = cb_x_lo + 16;
     float db_lo = opt->display_db_lo;
     float db_hi = opt->display_db_hi;
