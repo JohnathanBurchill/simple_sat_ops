@@ -58,10 +58,11 @@
 #include <ncurses.h>
 #include <unistd.h>
 
-// Carrier defaults (used only for display + IPC publication; the
-// actual radio is now driven externally by tx_frame_sdr / b210_rx_tx
-// over the sso_ipc socket).
-#define UPLINK_FREQ_MHZ   145.150000
+// Carrier defaults. FrontierSat is simplex on 436.150 MHz — uplink
+// and downlink share the same frequency — so both default to the
+// same value. Overridable with --uplink-freq-mhz= / --downlink-freq-mhz=
+// for any future split-band bird.
+#define UPLINK_FREQ_MHZ   436.150000
 #define DOWNLINK_FREQ_MHZ 436.150000
 
 // Doppler retune threshold (Hz). Frequencies update on the display
