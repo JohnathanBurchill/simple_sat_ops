@@ -343,6 +343,12 @@ typedef struct wf_opts {
     // axis as horizontal marks. Format is beacon_detect's CSV: header
     // line `idx,t_s,...`, '#' comment lines, t_s in seconds-since-start.
     const char *marks_csv_path;
+    // Optional burst.csv (rx_replay --burst-csv format) to overlay as
+    // right-pointing arrows at each burst_start row. Lets the
+    // operator visually verify the burst detector against the
+    // spectrogram. CSV format: event,unix_time_ms,bright_bins,
+    // peak_excess_db,duration_ms.
+    const char *show_tm_csv_path;
     int    sample_rate;   // for the time + frequency axis labels
     double center_hz;     // baseband centre frequency for the freq-axis label
     double zoom_hz;       // visible bandwidth around DC; 0 or negative = full
@@ -1609,6 +1615,54 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
         }
     }
 
+    // --show-tm overlay: read an rx_replay burst.csv and draw a
+    // right-pointing cyan arrow in the left margin at each
+    // burst_start row. unix_time_ms in the CSV gets converted to
+    // seconds-since-start using opt->start_utc; rows without a
+    // start_utc fall back to elapsed seconds. Lets the operator
+    // verify the burst detector visually against the spectrogram.
+    if (opt->show_tm_csv_path != NULL && opt->show_tm_csv_path[0] != '\0') {
+        FILE *fp = fopen(opt->show_tm_csv_path, "r");
+        if (fp == NULL) {
+            fprintf(stderr,
+                "gen_waterfall: --show-tm: cannot open %s: %s\n",
+                opt->show_tm_csv_path, strerror(errno));
+        } else {
+            const uint8_t ARROW_R = 0, ARROW_G = 255, ARROW_B = 255;
+            char line[512];
+            int n_drawn = 0;
+            long long start_ms = (opt->start_utc != 0)
+                ? (long long) opt->start_utc * 1000LL : 0;
+            while (fgets(line, sizeof line, fp) != NULL) {
+                if (line[0] == '#' || line[0] == '\n' || line[0] == '\0'
+                                   || line[0] == '\r') continue;
+                if (strncmp(line, "burst_start,", 12) != 0) continue;
+                long long u_ms = atoll(line + 12);
+                double t_s = (u_ms - start_ms) / 1000.0;
+                if (t_s < 0.0 || t_s > duration_s + 0.5) continue;
+                double frac = 1.0 - t_s / duration_s;
+                int y = TM + (int)(frac * (double) spec_h);
+                if (y < TM + 4 || y >= TM + spec_h - 4) continue;
+                // Right-pointing triangle, 8 px tall × 8 px wide. Tip at
+                // x = LM - 1 (just outside the spectrogram), base at
+                // x = LM - 8. Symmetric around y.
+                for (int dy = -3; dy <= 4; ++dy) {
+                    int half = (dy >= 0) ? (4 - dy) : (4 + dy);
+                    if (half < 0) continue;
+                    for (int dx = 0; dx <= half; ++dx) {
+                        px_set(rgb, W, H, LM - 1 - dx, y + dy,
+                               ARROW_R, ARROW_G, ARROW_B);
+                    }
+                }
+                ++n_drawn;
+            }
+            fclose(fp);
+            fprintf(stderr,
+                "gen_waterfall: --show-tm marked %d burst_start(s) from %s\n",
+                n_drawn, opt->show_tm_csv_path);
+        }
+    }
+
     // dB colorbar in the right margin. Top of the strip is the maximum
     // displayed dB, bottom is the minimum — matches the convention of
     // "more = up". Same viridis table as the spectrogram.
@@ -1773,6 +1827,11 @@ static void usage(void)
         "                         dotted line across the spectrogram, so\n"
         "                         each detection is easy to cross-check\n"
         "                         against visible bursts.\n"
+        "    --show-tm=<path>     Overlay cyan right-pointing arrows in the\n"
+        "                         left margin at each burst_start row of an\n"
+        "                         rx_replay --burst-csv output. unix_time_ms\n"
+        "                         is converted to seconds-since-start using\n"
+        "                         the same start_utc the time axis uses.\n"
         "    --start-utc=YYYYMMDDTHHMMSS\n"
         "                         Override the capture-start UTC time used\n"
         "                         for the time-axis labels. Default: parse\n"
@@ -1840,6 +1899,7 @@ int main(int argc, char **argv)
     opt.detrend_mode    = 0;        // median (backwards compatible default)
     opt.detrend_tau_s   = 30.0;     // typical AGC ramps die in ~30 s
     opt.marks_csv_path  = NULL;
+    opt.show_tm_csv_path = NULL;
     opt.sample_rate   = sample_rate;
     opt.center_hz     = 0.0;
     opt.zoom_hz       = 30000.0;      // default ±15 kHz; --full-width disables
@@ -1901,6 +1961,8 @@ int main(int argc, char **argv)
             opt.detrend_tau_s = d;
         } else if (strncmp(argv[i], "--marks-csv=", 12) == 0) {
             opt.marks_csv_path = argv[i] + 12;
+        } else if (strncmp(argv[i], "--show-tm=", 10) == 0) {
+            opt.show_tm_csv_path = argv[i] + 10;
         } else if ((rc = parse_double_opt(argv[i], "--center-hz=", &d)) != 0) {
             if (rc < 0) { usage(); return 2; }
             opt.center_hz = d;
