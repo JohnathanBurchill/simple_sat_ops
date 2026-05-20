@@ -340,6 +340,11 @@ int rx_session_open(rx_session_t **out, const rx_session_params_t *p,
 
     modem_params_defaults(&rxs->mp);
     rxs->mp.bit_rate  = p->bit_rate > 0 ? p->bit_rate : 9600;
+    // Propagate the operator's no_dc_block choice to the PCM/FM-audio
+    // demod (used by the shadow PCM chain). The IQ + Viterbi chains
+    // don't have an HPF anyway — they read complex IQ directly. Default
+    // 0 keeps the HPF on, matching rx_replay's default.
+    rxs->mp.rx_disable_dc_block = p->no_dc_block ? 1 : 0;
     double actual_rate = b210_rx_tx_core_actual_rate(core);
     rxs->samp_rate    = (int) actual_rate;
     rxs->mp.samp_rate = rxs->samp_rate;
