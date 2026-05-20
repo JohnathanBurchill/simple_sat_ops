@@ -77,19 +77,53 @@ int modem_iq_to_bits(const int16_t *iq_pairs, size_t n_pairs,
     int sps = p->samp_rate / p->bit_rate;
     if (sps <= 1 || n_pairs < (size_t) sps * 32u) return -1;
 
-    // 1. AGC on complex baseband. RMS magnitude = sqrt(<I² + Q²>).
+    // 1. Complex DC-block. 1-pole IIR HPF (α=0.995, ~76 Hz at 96 kHz)
+    //    on I and Q separately. Removes the SDR's static DC bias which
+    //    would otherwise add a constant phase rotation to the
+    //    matched-filter output, biasing the bit slicer. Skipped when
+    //    p->rx_disable_dc_block is set. The signal sits at DC after
+    //    the fm_lo_nco rotation upstream, but it's NEVER pure DC —
+    //    9600 GFSK with deviation 2400 puts the modulation sidebands
+    //    at ±2400 Hz, well above the HPF's ~76 Hz cutoff.
+    float *Ihp = NULL;
+    float *Qhp = NULL;
+    if (!p->rx_disable_dc_block) {
+        Ihp = (float *) malloc(n_pairs * sizeof(float));
+        Qhp = (float *) malloc(n_pairs * sizeof(float));
+        if (Ihp == NULL || Qhp == NULL) { free(Ihp); free(Qhp); return -1; }
+        const float alpha = 0.995f;
+        float xI_prev = (float) iq_pairs[0];
+        float xQ_prev = (float) iq_pairs[1];
+        float yI = 0.0f, yQ = 0.0f;
+        Ihp[0] = 0.0f; Qhp[0] = 0.0f;
+        for (size_t i = 1; i < n_pairs; ++i) {
+            float xI = (float) iq_pairs[i * 2 + 0];
+            float xQ = (float) iq_pairs[i * 2 + 1];
+            yI = xI - xI_prev + alpha * yI;
+            yQ = xQ - xQ_prev + alpha * yQ;
+            xI_prev = xI; xQ_prev = xQ;
+            Ihp[i] = yI; Qhp[i] = yQ;
+        }
+    }
+    // Helper macros so the AGC + matched-filter loops below can read
+    // from either iq_pairs (HPF off, int16 doubles) or Ihp/Qhp (HPF
+    // on, floats) without branching per sample.
+#define IQ_I(idx) (Ihp ? (double) Ihp[(idx)] : (double) iq_pairs[(idx) * 2 + 0])
+#define IQ_Q(idx) (Qhp ? (double) Qhp[(idx)] : (double) iq_pairs[(idx) * 2 + 1])
+
+    // 2. AGC on complex baseband. RMS magnitude = sqrt(<I² + Q²>).
     //    Floor avoids division blow-up on near-silent input.
     double sum_sq = 0.0;
     for (size_t i = 0; i < n_pairs; ++i) {
-        double I = (double) iq_pairs[i * 2 + 0];
-        double Q = (double) iq_pairs[i * 2 + 1];
+        double I = IQ_I(i);
+        double Q = IQ_Q(i);
         sum_sq += I * I + Q * Q;
     }
     double rms = sqrt(sum_sq / (double) n_pairs);
     if (rms < 1.0) rms = 1.0;
     double agc_inv = 1.0 / rms;
 
-    // 2. Matched filter on I and Q separately. Sliding boxcar of length
+    // 3. Matched filter on I and Q separately. Sliding boxcar of length
     //    sps — same NRZ-matched shape the PCM chain uses, but applied
     //    BEFORE the non-linear arg() collapses I,Q into a scalar.
     //    Output length = n_pairs - sps + 1 complex samples at sample rate.
@@ -97,27 +131,30 @@ int modem_iq_to_bits(const int16_t *iq_pairs, size_t n_pairs,
     float *Imf = (float *) malloc(mf_len * sizeof(float));
     float *Qmf = (float *) malloc(mf_len * sizeof(float));
     if (Imf == NULL || Qmf == NULL) {
-        free(Imf); free(Qmf);
+        free(Imf); free(Qmf); free(Ihp); free(Qhp);
         return -1;
     }
     {
         const double inv_sps = 1.0 / (double) sps;
         double sumI = 0.0, sumQ = 0.0;
         for (int k = 0; k < sps; ++k) {
-            sumI += (double) iq_pairs[k * 2 + 0];
-            sumQ += (double) iq_pairs[k * 2 + 1];
+            sumI += IQ_I(k);
+            sumQ += IQ_Q(k);
         }
         Imf[0] = (float)(sumI * agc_inv * inv_sps);
         Qmf[0] = (float)(sumQ * agc_inv * inv_sps);
         for (size_t i = 1; i < mf_len; ++i) {
-            sumI -= (double) iq_pairs[(i - 1) * 2 + 0];
-            sumQ -= (double) iq_pairs[(i - 1) * 2 + 1];
-            sumI += (double) iq_pairs[(i + (size_t) sps - 1) * 2 + 0];
-            sumQ += (double) iq_pairs[(i + (size_t) sps - 1) * 2 + 1];
+            sumI -= IQ_I(i - 1);
+            sumQ -= IQ_Q(i - 1);
+            sumI += IQ_I(i + (size_t) sps - 1);
+            sumQ += IQ_Q(i + (size_t) sps - 1);
             Imf[i] = (float)(sumI * agc_inv * inv_sps);
             Qmf[i] = (float)(sumQ * agc_inv * inv_sps);
         }
     }
+    free(Ihp); free(Qhp);
+#undef IQ_I
+#undef IQ_Q
 
     // 3. Differential phase: y[k] = arg(z[k] * conj(z[k-1])). The first
     //    output is at index 1; index 0 is undefined (no prev). Use atan2
