@@ -600,13 +600,19 @@ static int write_pdf_with_axes(const char *path,
     // feature of interest in the spectrogram.
     int    right_edge = LM + spec_w;
     double t_step = pick_time_step(duration_s, 10);
+    // Same length hierarchy as the PNG path: 1 s = 3 pt (half of
+    // 20 s), 20 s = 6 pt, major = 10 pt. 1 s in white (1 G); 20 s +
+    // major in the 0.65 G axis shade.
+    const int PDF_TICK_1S  = 3;
+    const int PDF_TICK_20S = 6;
+    const int PDF_TICK_MAJ = 10;
     if (duration_s <= 120.0) {
         for (double t = 0.0; t <= duration_s + 0.5; t += 1.0) {
             double y = BM + (t / duration_s) * (double) spec_h;
-            CS_APPEND("ET 0.78 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
-                      LM - 2, y, LM, y);
-            CS_APPEND("ET 0.78 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
-                      right_edge, y, right_edge + 2, y);
+            CS_APPEND("ET 1 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
+                      LM - PDF_TICK_1S, y, LM, y);
+            CS_APPEND("ET 1 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
+                      right_edge, y, right_edge + PDF_TICK_1S, y);
         }
     }
     for (double t = 0.0; t <= duration_s + 0.5; t += 20.0) {
@@ -614,26 +620,24 @@ static int write_pdf_with_axes(const char *path,
         if (fabs(mod) < 1.0 || fabs(mod - t_step) < 1.0) continue;
         double y = BM + (t / duration_s) * (double) spec_h;
         CS_APPEND("ET 0.65 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
-                  LM - 3, y, LM, y);
+                  LM - PDF_TICK_20S, y, LM, y);
         CS_APPEND("ET 0.65 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
-                  right_edge, y, right_edge + 3, y);
+                  right_edge, y, right_edge + PDF_TICK_20S, y);
     }
     for (double t = 0.0; t <= duration_s + 0.5 * t_step; t += t_step) {
         double y = BM + (t / duration_s) * (double) spec_h;
-        // Left tick + label.
         CS_APPEND("ET 0.65 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
-                  LM - 6, y, LM, y);
+                  LM - PDF_TICK_MAJ, y, LM, y);
         char buf[24], esc[40];
         fmt_time(opt->start_utc, t, buf, sizeof buf);
         pdf_escape(buf, esc, sizeof esc);
         int label_w_pt = (int) strlen(buf) * 5;
         CS_APPEND("1 0 0 1 %d %.1f Tm (%s) Tj\n",
-                  LM - 10 - label_w_pt, y - 3, esc);
-        // Right tick + label (same timestamp, mirror placement).
+                  LM - (PDF_TICK_MAJ + 4) - label_w_pt, y - 3, esc);
         CS_APPEND("ET 0.65 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
-                  right_edge, y, right_edge + 6, y);
+                  right_edge, y, right_edge + PDF_TICK_MAJ, y);
         CS_APPEND("1 0 0 1 %d %.1f Tm (%s) Tj\n",
-                  right_edge + 10, y - 3, esc);
+                  right_edge + PDF_TICK_MAJ + 4, y - 3, esc);
     }
 
     // 6. Colorbar dB ticks + labels. Same offset trick as the PNG: tick
@@ -1416,13 +1420,26 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
     // closer to the feature they're squinting at.
     int    right_edge = LM + spec_w;
     double t_step = pick_time_step(duration_s, 10);
-    const uint8_t FINE_R = 140, FINE_G = 140, FINE_B = 140;
+    // Tick-length hierarchy (px, aimed outward from the spectrogram
+    // edge into the margin):
+    //   1 s   ultra-minor  TICK_1S  = 3  (half of TICK_20S)
+    //   20 s  minor        TICK_20S = 6
+    //   major              TICK_MAJ = 10
+    // First version used 1/3/6 which was technically half-the-width
+    // for 1 s vs 20 s but too subtle to see in a 80-px margin —
+    // bumped uniformly so the hierarchy reads at a glance.
+    const int TICK_1S  = 3;
+    const int TICK_20S = 6;
+    const int TICK_MAJ = 10;
+    // 1 s ticks: pure white for contrast against the dark margin.
+    // 20 s + major use the same gray TIC_* shade.
+    const uint8_t FINE_R = 255, FINE_G = 255, FINE_B = 255;
     if (duration_s <= 120.0) {
         for (double t = 0.0; t <= duration_s + 0.5; t += 1.0) {
             double frac = 1.0 - t / duration_s;
             int y = TM + (int)(frac * (double) spec_h);
             if (y < TM || y >= TM + spec_h) continue;
-            for (int dx = 0; dx < 2; ++dx) {
+            for (int dx = 0; dx < TICK_1S; ++dx) {
                 px_set(rgb, W, H, LM - 1 - dx, y, FINE_R, FINE_G, FINE_B);
                 px_set(rgb, W, H, right_edge + dx, y, FINE_R, FINE_G, FINE_B);
             }
@@ -1436,7 +1453,7 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
         double frac = 1.0 - t / duration_s;
         int y = TM + (int)(frac * (double) spec_h);
         if (y < TM || y >= TM + spec_h) continue;
-        for (int dx = 0; dx < 3; ++dx) {
+        for (int dx = 0; dx < TICK_20S; ++dx) {
             px_set(rgb, W, H, LM - 1 - dx, y, TIC_R, TIC_G, TIC_B);
             px_set(rgb, W, H, right_edge + dx, y, TIC_R, TIC_G, TIC_B);
         }
@@ -1445,18 +1462,17 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
         double frac = 1.0 - t / duration_s;
         int y = TM + (int)(frac * (double) spec_h);
         if (y < TM || y >= TM + spec_h) continue;
-        for (int dx = 0; dx < 6; ++dx) {
+        for (int dx = 0; dx < TICK_MAJ; ++dx) {
             px_set(rgb, W, H, LM - 1 - dx, y, TIC_R, TIC_G, TIC_B);
             px_set(rgb, W, H, right_edge + dx, y, TIC_R, TIC_G, TIC_B);
         }
         char buf[24];
         fmt_time(opt->start_utc, t, buf, sizeof buf);
         int lw = text_width(buf, 1);
-        draw_text(rgb, W, H, LM - 8 - lw, y - 3, buf, 1,
+        // Labels back off enough to clear the bumped major-tick stub.
+        draw_text(rgb, W, H, LM - (TICK_MAJ + 2) - lw, y - 3, buf, 1,
                   LBL_R, LBL_G, LBL_B);
-        // Right-side label: same timestamp, placed just past the
-        // right-side tick stubs.
-        draw_text(rgb, W, H, right_edge + 9, y - 3, buf, 1,
+        draw_text(rgb, W, H, right_edge + TICK_MAJ + 3, y - 3, buf, 1,
                   LBL_R, LBL_G, LBL_B);
     }
 
