@@ -68,12 +68,18 @@ typedef struct b210_rx_tx_core_params {
     // is calibrated for. The result is a clipped, asymmetric FSK
     // waveform that won't bit-slice cleanly.
     //
-    // The pump applies a SECOND NCO between the IQ tap (which keeps
-    // the LO-offset signal so the .iq file + waterfall stay readable)
-    // and the FM discriminator (which gets the same stream rotated by
-    // -fm_lo_compensation_hz so the carrier lands at DC). Pass the
-    // operator's lo_offset_hz here (i.e. nominal − actual_LO) so the
-    // demod path sees an at-DC signal.
+    // The pump applies a SECOND NCO to the post-decim/post-Doppler
+    // stream IN PLACE, rotating by -fm_lo_compensation_hz so the
+    // carrier lands at DC. The rotation happens BEFORE the IQ tap
+    // so every downstream consumer (.iq sidecar, live waterfall,
+    // shadow IQ decoder, FM discriminator) sees the centered signal.
+    // The spectrum is periodic in fs so the rotation wraps the far
+    // edge — for a single-carrier sat that's invisible; for a noisy
+    // neighbour at original +/-(fs/2 - lo_offset) baseband it'll show
+    // up mirrored on the opposite edge.
+    //
+    // Pass the operator's lo_offset_hz here (i.e. nominal − actual_LO)
+    // so the demod path sees an at-DC signal.
     //
     // 0 disables — the FM demod runs on the post-Doppler IQ as-is.
     double      fm_lo_compensation_hz;

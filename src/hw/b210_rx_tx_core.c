@@ -82,13 +82,15 @@ struct b210_rx_tx_core {
     // Second NCO that runs ONLY on the FM-discriminator path. Cancels
     // the constant lo_offset so the FSK signal lands at DC for the
     // discriminator (which is calibrated for ±fm_fullscale_hz around
-    // DC; a non-zero baseband offset clips the FSK upper level). The
-    // public IQ tap, .iq writer, and broadband-burst detector all run
-    // BEFORE this NCO so they keep the LO-offset signal visible.
+    // DC; a non-zero baseband offset clips the FSK upper level).
+    // Applied IN PLACE on the post-decim/post-Doppler stream BEFORE
+    // the IQ tap, so the .iq sidecar + live waterfall + shadow IQ
+    // decoder all see the signal centered at DC. The spectrum is
+    // periodic in fs so the rotation wraps the [-fs/2, -lo_offset]
+    // chunk around to the right edge of the post-rotation baseband
+    // (faithful but visually unfamiliar for wideband neighbours).
     sw_nco_t                fm_lo_nco;
     int                     fm_lo_nco_active;
-    int16_t                *iq_fm_scratch;     // scratch buf for the FM path
-    size_t                  iq_fm_scratch_cap_pairs;
 
     // Broadband-burst detector — FFTs the post-NCO IQ and counts how
     // many bins simultaneously exceed their per-bin running floor.
@@ -184,8 +186,6 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
         sw_nco_set_freq(&c->fm_lo_nco, -p->fm_lo_compensation_hz);
         c->fm_lo_nco_active = 1;
     }
-    c->iq_fm_scratch = NULL;
-    c->iq_fm_scratch_cap_pairs = 0;
 
     // Broadband-burst detector at the post-decim rate. N=512 → ~187 Hz
     // bin width at 96 kS/s. 10 dB threshold + 2 s floor τ is the same
@@ -312,7 +312,6 @@ void b210_rx_tx_core_close(b210_rx_tx_core_t *c)
     if (c->iq_burst_det != NULL) iq_burst_free(c->iq_burst_det);
     free(c->iq_chunk);
     free(c->iq_decim);
-    free(c->iq_fm_scratch);
     free(c);
 }
 
@@ -416,41 +415,31 @@ ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *c, int16_t *pcm_out, size_t pcm_
         c->iq_rms_sq   = rms;
     }
 
-    // IQ tap: copy the post-decim IQ stream to the caller's buffer
-    // before we run the discriminator on it. Same sample timing as
-    // the PCM output (one IQ pair per PCM sample) so a downstream
-    // recorder can pair them. Caller decides the cap; the count we
-    // actually delivered lands in *out_iq_pairs.
+    // FM-path LO compensation, applied IN PLACE before the IQ tap so
+    // every downstream consumer (.iq sidecar, live waterfall, shadow
+    // IQ decoder, FM discriminator) sees the signal at DC. Earlier
+    // design kept the LO offset in the IQ tap so the waterfall would
+    // show the raw baseband (DC null + fixed-pattern spurs at known
+    // positions). Operator preference is now "centered carrier" —
+    // the spectrum [-fs/2, +fs/2] wraps circularly as a result, so
+    // the rightmost ~lo_offset_hz of the post-rotation waterfall is
+    // the original spectrum from just below the LO, aliased around.
+    // For a single-carrier sat that's invisible; for wideband
+    // neighbours it'd show up as a mirror image on the far edge.
+    if (c->fm_lo_nco_active) {
+        sw_nco_apply(&c->fm_lo_nco, iq_demod_buf, n_demod);
+    }
+
+    // IQ tap: copy the post-rotation IQ stream to the caller's
+    // buffer. Same sample timing as the PCM output (one IQ pair per
+    // PCM sample) so a downstream recorder can pair them. Caller
+    // decides the cap; the count we actually delivered lands in
+    // *out_iq_pairs.
     if (iq_out != NULL && iq_cap >= 2) {
         size_t pairs = n_demod;
         if (pairs * 2 > iq_cap) pairs = iq_cap / 2;
         memcpy(iq_out, iq_demod, pairs * 2 * sizeof(int16_t));
         if (out_iq_pairs) *out_iq_pairs = pairs;
-    }
-
-    // FM-path LO compensation: shift the Doppler-corrected stream by
-    // an additional fixed offset so the carrier lands at DC for the
-    // discriminator. We DON'T mutate iq_demod_buf in place because
-    // the IQ tap above just sampled it — we need it intact for the
-    // .iq file (which is supposed to keep the LO-offset baseband for
-    // operator-visible waterfalls). Copy into a scratch buffer and
-    // run the second NCO on the copy.
-    if (c->fm_lo_nco_active) {
-        if (c->iq_fm_scratch_cap_pairs < n_demod) {
-            free(c->iq_fm_scratch);
-            c->iq_fm_scratch = (int16_t *) malloc(n_demod * 2
-                                                  * sizeof(int16_t));
-            c->iq_fm_scratch_cap_pairs = c->iq_fm_scratch ? n_demod : 0;
-        }
-        if (c->iq_fm_scratch != NULL) {
-            memcpy(c->iq_fm_scratch, iq_demod,
-                   n_demod * 2 * sizeof(int16_t));
-            sw_nco_apply(&c->fm_lo_nco, c->iq_fm_scratch, n_demod);
-            iq_demod = c->iq_fm_scratch;
-        }
-        // If the scratch alloc failed we silently fall through to the
-        // un-compensated stream — at worst the FM discriminator clips
-        // again, same as before this fix.
     }
 
     // FM discriminator: pcm[k] = arg(z[k] * conj(z[k-1])) * k_scale,
