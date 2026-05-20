@@ -606,6 +606,21 @@ static int write_pdf_with_axes(const char *path,
     const int PDF_TICK_1S  = 3;
     const int PDF_TICK_20S = 6;
     const int PDF_TICK_MAJ = 10;
+    // Wall-clock alignment for the major + 20 s minor tiers — see
+    // the matching block in the PNG renderer for the full rationale.
+    double pdf_major_offset   = 0.0;
+    double pdf_minor20_offset = 0.0;
+    if (opt->start_utc != 0) {
+        long step_maj = (long)(t_step + 0.5);
+        if (step_maj > 0) {
+            long mod = ((long) opt->start_utc) % step_maj;
+            if (mod < 0) mod += step_maj;
+            pdf_major_offset = (double)((step_maj - mod) % step_maj);
+        }
+        long mod20 = ((long) opt->start_utc) % 20L;
+        if (mod20 < 0) mod20 += 20L;
+        pdf_minor20_offset = (double)((20L - mod20) % 20L);
+    }
     // Same density gate as the PNG renderer — see the comment there.
     double pdf_px_per_s = (duration_s > 0.0)
                           ? (double) spec_h / duration_s : 0.0;
@@ -618,16 +633,29 @@ static int write_pdf_with_axes(const char *path,
                       right_edge, y, right_edge + PDF_TICK_1S, y);
         }
     }
-    for (double t = 0.0; t <= duration_s + 0.5; t += 20.0) {
-        double mod = fmod(t, t_step);
+    for (double t = pdf_minor20_offset; t <= duration_s + 0.5; t += 20.0) {
+        double mod = fmod(t - pdf_major_offset, t_step);
         if (fabs(mod) < 1.0 || fabs(mod - t_step) < 1.0) continue;
         double y = BM + (t / duration_s) * (double) spec_h;
         CS_APPEND("ET 0.65 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
                   LM - PDF_TICK_20S, y, LM, y);
         CS_APPEND("ET 0.65 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
                   right_edge, y, right_edge + PDF_TICK_20S, y);
+        // ":SS" label right-aligned with the major-label tail.
+        if (opt->start_utc != 0) {
+            int sec = (int) ((((long) opt->start_utc + (long)(t + 0.5))
+                              % 60L + 60L) % 60L);
+            char ssbuf[8], ssesc[12];
+            snprintf(ssbuf, sizeof ssbuf, ":%02d", sec);
+            pdf_escape(ssbuf, ssesc, sizeof ssesc);
+            int ss_w_pt = (int) strlen(ssbuf) * 5;
+            CS_APPEND("1 0 0 1 %d %.1f Tm (%s) Tj\n",
+                      LM - (PDF_TICK_MAJ + 4) - ss_w_pt, y - 3, ssesc);
+            CS_APPEND("1 0 0 1 %d %.1f Tm (%s) Tj\n",
+                      right_edge + PDF_TICK_MAJ + 4, y - 3, ssesc);
+        }
     }
-    for (double t = 0.0; t <= duration_s + 0.5 * t_step; t += t_step) {
+    for (double t = pdf_major_offset; t <= duration_s + 0.5 * t_step; t += t_step) {
         double y = BM + (t / duration_s) * (double) spec_h;
         CS_APPEND("ET 0.65 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
                   LM - PDF_TICK_MAJ, y, LM, y);
@@ -1423,6 +1451,24 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
     // closer to the feature they're squinting at.
     int    right_edge = LM + spec_w;
     double t_step = pick_time_step(duration_s, 10);
+    // Align the major + 20 s minor sequences to wall-clock boundaries
+    // (e.g. :00 of each minute) when start_utc is known, so labels
+    // read "16:58:00" instead of "16:57:16". With start_utc=0
+    // (unknown — fmt_time falls back to elapsed seconds), both
+    // offsets are 0 and the loops walk from t=0 unchanged.
+    double major_offset   = 0.0;
+    double minor20_offset = 0.0;
+    if (opt->start_utc != 0) {
+        long step_maj = (long)(t_step + 0.5);
+        if (step_maj > 0) {
+            long mod = ((long) opt->start_utc) % step_maj;
+            if (mod < 0) mod += step_maj;
+            major_offset = (double)((step_maj - mod) % step_maj);
+        }
+        long mod20 = ((long) opt->start_utc) % 20L;
+        if (mod20 < 0) mod20 += 20L;
+        minor20_offset = (double)((20L - mod20) % 20L);
+    }
     // Tick-length hierarchy (px, aimed outward from the spectrogram
     // edge into the margin):
     //   1 s   ultra-minor  TICK_1S  = 3  (half of TICK_20S)
@@ -1454,10 +1500,10 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
             }
         }
     }
-    for (double t = 0.0; t <= duration_s + 0.5; t += 20.0) {
+    for (double t = minor20_offset; t <= duration_s + 0.5; t += 20.0) {
         // Skip the minor that coincides with a major; the major loop
         // below will draw a longer tick at that position.
-        double mod = fmod(t, t_step);
+        double mod = fmod(t - major_offset, t_step);
         if (fabs(mod) < 1.0 || fabs(mod - t_step) < 1.0) continue;
         double frac = 1.0 - t / duration_s;
         int y = TM + (int)(frac * (double) spec_h);
@@ -1466,8 +1512,23 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
             px_set(rgb, W, H, LM - 1 - dx, y, TIC_R, TIC_G, TIC_B);
             px_set(rgb, W, H, right_edge + dx, y, TIC_R, TIC_G, TIC_B);
         }
+        // ":SS" label right-aligned with the major-label tail so the
+        // sub-minute mark slots cleanly into the column the HH:MM:SS
+        // labels occupy (no HH:MM prefix — the operator reads that
+        // from the nearest major label above/below).
+        if (opt->start_utc != 0) {
+            int sec = (int) ((((long) opt->start_utc + (long)(t + 0.5))
+                              % 60L + 60L) % 60L);
+            char ssbuf[8];
+            snprintf(ssbuf, sizeof ssbuf, ":%02d", sec);
+            int ssw = text_width(ssbuf, 1);
+            draw_text(rgb, W, H, LM - (TICK_MAJ + 2) - ssw, y - 3,
+                      ssbuf, 1, LBL_R, LBL_G, LBL_B);
+            draw_text(rgb, W, H, right_edge + TICK_MAJ + 3, y - 3,
+                      ssbuf, 1, LBL_R, LBL_G, LBL_B);
+        }
     }
-    for (double t = 0.0; t <= duration_s + 0.5 * t_step; t += t_step) {
+    for (double t = major_offset; t <= duration_s + 0.5 * t_step; t += t_step) {
         double frac = 1.0 - t / duration_s;
         int y = TM + (int)(frac * (double) spec_h);
         if (y < TM || y >= TM + spec_h) continue;
