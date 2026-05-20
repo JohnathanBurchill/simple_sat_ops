@@ -492,9 +492,9 @@ static void usage(void)
         "  --rate=<Hz>        IQ rate (default 96000)\n"
         "  --fft=<N>          FFT size, power of two (default 1024)\n"
         "  --row-ms=<ms>      Time per spectrogram row (default 100)\n"
-        "  --zoom-khz=<W>     Visible BW around DC (default 30)\n"
-        "  --width=<px>       Window width override\n"
-        "  --height=<px>      Window height override\n");
+        "  --zoom-khz=<W>     Visible BW around DC (default = full rate)\n"
+        "  --width=<px>       Window width override (default = monitor/3)\n"
+        "  --height=<px>      Window height override (default = 95%% of monitor)\n");
 }
 
 int main(int argc, char **argv)
@@ -537,7 +537,10 @@ int main(int argc, char **argv)
     int monitor = GetCurrentMonitor();
     int mon_w = GetMonitorWidth(monitor);
     int mon_h = GetMonitorHeight(monitor);
-    int win_w = (cli_w > 0) ? cli_w : (mon_w / 6);
+    // Default window is monitor/3 wide — twice the old monitor/6 — so
+    // 96 kHz of bandwidth is readable next to the operator UI without
+    // the whole spectrum getting smushed into one bin per pixel.
+    int win_w = (cli_w > 0) ? cli_w : (mon_w / 3);
     int win_h = (cli_h > 0) ? cli_h : (int)(mon_h * 0.95);
     if (win_w < 200) win_w = 200;
     if (win_h < 400) win_h = 400;
@@ -616,7 +619,8 @@ int main(int argc, char **argv)
     while (!WindowShouldClose()) {
         // 0. Drain any pending control commands from stdin. Line-based
         // protocol; commands today:
-        //     zoom <N>   → reset spec_state to ±N/2 kHz visible
+        //     bandwidth <N>  → reset spec_state to ±N/2 kHz visible
+        //     zoom <N>       → legacy alias for `bandwidth` (same effect)
         ssize_t rn;
         while ((rn = read(STDIN_FILENO, ctl_buf + ctl_buf_len,
                           sizeof ctl_buf - ctl_buf_len - 1)) > 0) {
@@ -627,12 +631,13 @@ int main(int argc, char **argv)
             while ((nl = strchr(line, '\n')) != NULL) {
                 *nl = '\0';
                 double n;
-                if (sscanf(line, " zoom %lf", &n) == 1
+                if ((sscanf(line, " bandwidth %lf", &n) == 1
+                     || sscanf(line, " zoom %lf",    &n) == 1)
                     && n > 0.0 && n <= rate_hz / 1000.0) {
                     current_zoom_khz = n;
                     spec_set_zoom(&S, rate_hz, n * 1000.0);
                     fprintf(stderr,
-                        "live_waterfall: zoom set to %g kHz\n", n);
+                        "live_waterfall: bandwidth set to %g kHz\n", n);
                 }
                 line = nl + 1;
             }

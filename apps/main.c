@@ -618,8 +618,8 @@ static void cmd_dispatch(state_t *state)
     }
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "h") == 0 || strcmp(cmd, "?") == 0) {
         cmd_set_status("commands: help tx track stop home quit "
-                       "freq <MHz> lo_offset <±kHz> rs on|off "
-                       "spectrum <sec> wf_zoom_khz <N>");
+                       "freq <MHz> lo_offset <±kHz> lo_bandwidth <kHz> "
+                       "rs on|off spectrum <sec>");
     } else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0
                || strcmp(cmd, "exit") == 0) {
         state->running = 0;
@@ -811,28 +811,30 @@ static void cmd_dispatch(state_t *state)
             cmd_set_status("lo_offset: this build has no USRP support");
 #endif
         }
-    } else if (strcmp(cmd, "wf_zoom_khz") == 0) {
+    } else if (strcmp(cmd, "lo_bandwidth") == 0) {
         // Adjust the live raylib waterfall's visible bandwidth at
         // runtime. The viewer reads line-based commands from its
-        // stdin (we wired a pipe at fork time); send "zoom N\n".
+        // stdin (we wired a pipe at fork time); send
+        // "bandwidth N\n". Name mirrors :lo_offset so both LO-
+        // relative knobs live in the same command family.
         if (arg1 == NULL) {
-            cmd_set_status("wf_zoom_khz: usage `wf_zoom_khz <N>` (kHz)");
+            cmd_set_status("lo_bandwidth: usage `lo_bandwidth <N>` (kHz)");
         } else if (g_live_waterfall_stdin_fd < 0) {
-            cmd_set_status("wf_zoom_khz: no live viewer running "
+            cmd_set_status("lo_bandwidth: no live viewer running "
                            "(launch with --live-waterfall)");
         } else {
             double n = atof(arg1);
             if (n <= 0.0 || n > 1000.0) {
-                cmd_set_status("wf_zoom_khz: %g out of (0, 1000] kHz", n);
+                cmd_set_status("lo_bandwidth: %g out of (0, 1000] kHz", n);
             } else {
                 char line[64];
-                int  ln = snprintf(line, sizeof line, "zoom %g\n", n);
+                int  ln = snprintf(line, sizeof line, "bandwidth %g\n", n);
                 ssize_t w = (ln > 0) ? write(g_live_waterfall_stdin_fd,
                                              line, (size_t) ln) : -1;
                 if (w == ln) {
-                    cmd_set_status("wf_zoom_khz: -> %g kHz", n);
+                    cmd_set_status("lo_bandwidth: -> %g kHz", n);
                 } else {
-                    cmd_set_status("wf_zoom_khz: write failed: %s",
+                    cmd_set_status("lo_bandwidth: write failed: %s",
                                    strerror(errno));
                 }
             }
