@@ -606,10 +606,10 @@ static int write_pdf_with_axes(const char *path,
     const int PDF_TICK_1S  = 3;
     const int PDF_TICK_20S = 6;
     const int PDF_TICK_MAJ = 10;
-    // Same two-way gate as the PNG renderer — see the comment there.
+    // Same density gate as the PNG renderer — see the comment there.
     double pdf_px_per_s = (duration_s > 0.0)
                           ? (double) spec_h / duration_s : 0.0;
-    if (duration_s <= 120.0 && pdf_px_per_s >= 3.0) {
+    if (pdf_px_per_s >= 3.0) {
         for (double t = 0.0; t <= duration_s + 0.5; t += 1.0) {
             double y = BM + (t / duration_s) * (double) spec_h;
             CS_APPEND("ET 1 G %d %.1f m %d %.1f l S BT /F1 8 Tf 0 g\n",
@@ -1437,14 +1437,13 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
     // 1 s ticks: pure white for contrast against the dark margin.
     // 20 s + major use the same gray TIC_* shade.
     const uint8_t FINE_R = 255, FINE_G = 255, FINE_B = 255;
-    // Two-way gate: short enough duration that 1 s ticks aren't a
-    // featureless ruling AND enough vertical resolution (≥3 px per
-    // second) that adjacent ticks don't merge into a continuous bar.
-    // --rows=60 on a 60 s capture gives 1 px/s, which would collapse
-    // every second tick into the same row — gate it off in that case.
+    // Single density gate: require ≥3 px per second so adjacent
+    // 1 s ticks don't merge into a continuous bar. No duration cap —
+    // a long pass with --rows scaled up still gets readable 1 s
+    // ticks; a short capture with small --rows correctly drops them.
     double px_per_s = (duration_s > 0.0)
                       ? (double) spec_h / duration_s : 0.0;
-    if (duration_s <= 120.0 && px_per_s >= 3.0) {
+    if (px_per_s >= 3.0) {
         for (double t = 0.0; t <= duration_s + 0.5; t += 1.0) {
             double frac = 1.0 - t / duration_s;
             int y = TM + (int)(frac * (double) spec_h);
