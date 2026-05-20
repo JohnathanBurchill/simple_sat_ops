@@ -39,6 +39,7 @@
 #include "csp.h"
 #include "decode_loop.h"
 #include "hmac_keyfile.h"
+#include "iq_burst.h"
 #include "modem.h"
 #include "modem_fsk.h"
 #include "modem_iq.h"
@@ -662,6 +663,13 @@ int main(int argc, char **argv)
     const char *session_dir_arg = NULL;
     const char *capture_origin = NULL;
     int update_mode = 0;
+    // Burst detector (iq_burst) output — same writer as the live
+    // rx_session's burst.csv. Default path is "<input>.burst.csv";
+    // --burst-csv= overrides; --no-burst-csv suppresses.
+    const char *burst_csv_arg     = NULL;
+    int         burst_csv_suppress = 0;
+    int         burst_bins_threshold = 16;
+    int         burst_min_quiet      = 5;
     double obs_lat_deg = 50.8688;   // RAO defaults; overridden by flags
     double obs_lon_deg = -114.2910;
     double obs_alt_m   = 1279.0;
@@ -678,6 +686,16 @@ int main(int argc, char **argv)
         if (strcmp(a, "--help") == 0) { usage(stdout, argv[0]); return 0; }
         else if (strcmp(a, "--raw") == 0) { raw_mode = 1; raw_mode_explicit = 1; }
         else if (strcmp(a, "--iq") == 0)  { iq_mode = 1;  iq_mode_explicit = 1; }
+        else if (starts_with(a, "--burst-csv="))   burst_csv_arg = a + 12;
+        else if (strcmp(a, "--no-burst-csv") == 0) burst_csv_suppress = 1;
+        else if (starts_with(a, "--burst-bins-threshold=")) {
+            burst_bins_threshold = atoi(a + 23);
+            if (burst_bins_threshold < 1) burst_bins_threshold = 1;
+        }
+        else if (starts_with(a, "--burst-min-quiet=")) {
+            burst_min_quiet = atoi(a + 18);
+            if (burst_min_quiet < 1) burst_min_quiet = 1;
+        }
         else if (starts_with(a, "--lo-shift-khz=")) {
             lo_shift_hz = atof(a + 15) * 1000.0;
         }
@@ -1023,6 +1041,102 @@ int main(int argc, char **argv)
                     "not set; falling back to file mtime\n");
         }
     }
+
+    // Burst-detect pass (iq_mode only). Pushes the captured IQ
+    // through iq_burst in n_fft-sample chunks, runs the same
+    // start/end debounce state machine the live rx_session writes,
+    // and produces a burst.csv that's bit-for-bit format-compatible
+    // with the live file. Done BEFORE the sliding-window decode
+    // loop so the burst.csv exists even if the decode pass crashes
+    // or is interrupted with Ctrl-C.
+    if (iq_mode && !burst_csv_suppress) {
+        char burst_path[1024];
+        if (burst_csv_arg != NULL) {
+            snprintf(burst_path, sizeof burst_path, "%s", burst_csv_arg);
+        } else {
+            snprintf(burst_path, sizeof burst_path, "%s.burst.csv",
+                     input_path);
+        }
+        FILE *bfp = fopen(burst_path, "w");
+        if (bfp == NULL) {
+            fprintf(stderr,
+                "rx_replay: --burst-csv: cannot open %s: %s (skipping)\n",
+                burst_path, strerror(errno));
+        } else {
+            const unsigned BURST_NFFT = 512u;
+            iq_burst_t *bdet = iq_burst_new(BURST_NFFT, (double) samp_rate,
+                                            /*threshold_db=*/10.0,
+                                            /*floor_tau_s=*/2.0);
+            if (bdet == NULL) {
+                fprintf(stderr, "rx_replay: iq_burst_new failed; "
+                                "skipping burst.csv\n");
+                fclose(bfp);
+            } else {
+                fputs("# event,unix_time_ms,bright_bins,peak_excess_db,"
+                      "duration_ms\n",
+                      bfp);
+                long long start_unix_ms =
+                    have_start_utc
+                    ? (long long)(start_utc_seconds * 1000.0 + 0.5) : 0;
+                size_t n_pairs = n_samples / 2u;
+                int  in_burst = 0;
+                int  quiet    = 0;
+                int  peak_bins = 0;
+                double peak_db = 0.0;
+                long long start_ms = 0;
+                // Push in BURST_NFFT-pair chunks so we poll
+                // bright_bins after every FFT frame. The last partial
+                // chunk gets pushed without a fresh frame trigger; ok
+                // — coalesced as in_burst end-of-file below.
+                for (size_t off = 0; off < n_pairs; off += BURST_NFFT) {
+                    size_t take = n_pairs - off;
+                    if (take > BURST_NFFT) take = BURST_NFFT;
+                    iq_burst_push(bdet, samples + off * 2, take);
+                    int    bins   = iq_burst_bright_bins(bdet);
+                    double excess = iq_burst_peak_excess_db(bdet);
+                    long long t_ms = start_unix_ms
+                        + (long long)((double)(off + take)
+                                       / (double) samp_rate * 1000.0);
+                    if (bins >= burst_bins_threshold) {
+                        if (!in_burst) {
+                            in_burst   = 1;
+                            start_ms   = t_ms;
+                            peak_bins  = bins;
+                            peak_db    = excess;
+                            quiet      = 0;
+                            fprintf(bfp, "burst_start,%lld,%d,%.2f,\n",
+                                    t_ms, bins, excess);
+                        } else {
+                            if (bins > peak_bins) peak_bins = bins;
+                            if (excess > peak_db) peak_db = excess;
+                            quiet = 0;
+                        }
+                    } else if (in_burst) {
+                        quiet++;
+                        if (quiet >= burst_min_quiet) {
+                            fprintf(bfp, "burst_end,%lld,%d,%.2f,%lld\n",
+                                    t_ms, peak_bins, peak_db,
+                                    t_ms - start_ms);
+                            in_burst = 0;
+                        }
+                    }
+                }
+                if (in_burst) {
+                    long long t_ms = start_unix_ms
+                        + (long long)((double) n_pairs
+                                       / (double) samp_rate * 1000.0);
+                    fprintf(bfp, "burst_end,%lld,%d,%.2f,%lld\n",
+                            t_ms, peak_bins, peak_db, t_ms - start_ms);
+                }
+                fflush(bfp);
+                iq_burst_free(bdet);
+                fclose(bfp);
+                fprintf(stderr, "rx_replay: burst.csv -> %s\n",
+                        burst_path);
+            }
+        }
+    }
+
     // Plumb the anchor into decode_loop so emit_frame's "t=NN.NNNs"
     // entry stamps ts_received with the actual transmission UTC
     // (anchor + offset) rather than wall-clock-of-decode. NaN tells
