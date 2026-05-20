@@ -56,6 +56,38 @@ tx_burst_result_t tx_burst_run(b210_rx_tx_core_t *core,
 // byte count on success, -1 on bad input.
 ssize_t tx_burst_parse_hex(const char *hex, uint8_t *out, size_t cap);
 
+// Compute the Doppler-corrected TX carrier (Hz) for a flying satellite.
+// `nominal_carrier_hz` is the satellite's published RX frequency (e.g.
+// FRONTIERSAT_CARRIER_HZ = 436.150 MHz). `range_rate_km_s` is the
+// classical range rate: positive means receding (LOS end of pass).
+// To make the satellite hear the nominal carrier, the ground must
+// transmit at carrier / (1 - rr/c) — higher when receding, lower
+// when approaching.
+//
+// enable=0 short-circuits to (long) nominal_carrier_hz so callers can
+// pin the "Doppler-disabled" behaviour with the same helper.
+//
+// Returns the bare nominal when the computed factor would underflow
+// (defensive: never returns a negative or zero frequency).
+long tx_burst_doppler_freq_hz(double nominal_carrier_hz,
+                              double range_rate_km_s,
+                              int enable);
+
+// Build the on-wire AX100 frame bytes (CSP-encoded payload + AX100
+// framing including optional HMAC trailer and RS parity) the burst is
+// about to transmit. Suitable for unit tests that want to inspect what
+// goes on the wire without keying a B210. Mirrors the framing path
+// inside tx_burst_run exactly (use_rs=1, default ax100 opts).
+//
+// hmac_key=NULL / hmac_key_len=0 disables HMAC signing — useful for
+// confirming the default-on behaviour by toggling the key alone.
+//
+// Returns frame length on success, -1 on error.
+ssize_t tx_burst_build_frame(const uint8_t *payload, size_t payload_len,
+                              const csp_v1_header_t *csp_hdr,
+                              const uint8_t *hmac_key, size_t hmac_key_len,
+                              uint8_t *out_frame, size_t out_cap);
+
 #ifdef __cplusplus
 }
 #endif

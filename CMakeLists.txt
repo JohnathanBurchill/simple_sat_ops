@@ -389,6 +389,27 @@ if (OPENSSL_FOUND)
     target_link_libraries(ax100_selftest PRIVATE ${OPENSSL_LIBRARIES} m)
     list(APPEND SSO_TARGETS ax100_selftest)
 
+    # tx_burst selftest: pins the two simple_sat_ops TX policies the
+    # operator depends on every pass — HMAC default-on (key passes
+    # through to ax100 trailer; can be disabled by passing key=NULL)
+    # and TX Doppler default-on (formula matches f_tx = carrier/(1-rr/c);
+    # enable=0 short-circuits to nominal). Stubs out the UHD-touching
+    # b210_rx_tx_core_burst symbol so we can link tx_burst.c without
+    # libuhd.
+    add_executable(tx_burst_selftest unit_tests/tx_burst_selftest.c
+                   src/pipeline/tx_burst.c
+                   src/proto/csp.c src/proto/ax100.c
+                   src/proto/rs.c src/proto/golay24.c
+                   src/proto/hmac_keyfile.c
+                   src/dsp/modem.c)
+    target_include_directories(tx_burst_selftest PRIVATE
+        ${UNIT_TESTS_INCLUDE} ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(tx_burst_selftest PRIVATE
+        ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(tx_burst_selftest PRIVATE
+        ${OPENSSL_LIBRARIES} m)
+    list(APPEND SSO_TARGETS tx_burst_selftest)
+
     # CTS1 beacon WAV generator
     add_executable(beacon_gen utils/beacon_gen.c
                    src/proto/csp.c src/proto/golay24.c src/proto/ax100.c

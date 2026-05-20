@@ -405,6 +405,7 @@ int main(int argc, char **argv)
         "monitor_squelch_selftest",
         "iq_burst_selftest",
         "packet_db_selftest",
+        "tx_burst_selftest",
     };
     int n_names = (int)(sizeof names / sizeof names[0]);
     group_t groups[16];

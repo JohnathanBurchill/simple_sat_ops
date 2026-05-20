@@ -92,6 +92,14 @@ static int g_viewer_mode = 0;  // bare invocation found a running operator
 static sso_ipc_server_t *g_ipc = NULL;
 static const char *g_operator_user = NULL;
 
+// --self-test: after CLI parse + HMAC keyfile load, print the resolved
+// configuration to stdout and exit 0 — BEFORE opening the IPC socket,
+// the rotator, the B210, or loading the TLE. Useful for confirming
+// "did my command line do what I think?" without keying any hardware
+// or claiming any shared resource. Skips the no-arg viewer-probe in
+// apply_args too (which is itself a side effect).
+static int g_self_test = 0;
+
 // TX dry-run: synthesise an immediate "ok" ack instead of pushing the
 // burst through rx_session. Lets the operator exercise the auto-tcmd
 // state machine + the TX compose modal on a dev host with no B210 (or
@@ -1103,7 +1111,9 @@ static long               g_tx_freq_hz_doppler =
 static int g_no_tx = 0;
 
 // TX log ring buffer — last few PREVIEW/SENT/ACK events for display.
-// Shared by operator and viewer renderers.
+// Shared by operator and viewer renderers. ascii is sized to fit the
+// full upstream payload buffer (sso_event_t.ascii = 160) so the panel
+// renders the entire command text instead of a truncated preview.
 typedef struct {
     sso_event_type_t kind;     // PREVIEW | TX_COMMAND_SENT | TX_ACK
     char             ts[16];   // HH:MM:SS
@@ -1240,12 +1250,16 @@ static void render_tx_log_panel(int start_row, int col)
             tag = "ack>   ";
             attr = A_DIM;
         }
+        // Render the FULL payload — let safe_w (the column width)
+        // be the only truncation. Hard-coded 40/60-char caps here
+        // chopped the operator's command text mid-string for any
+        // payload longer than that, even when the panel had room.
         char line[256];
         if (e->kind == SSO_EVT_TX_ACK && e->tx_ack_status[0]) {
-            snprintf(line, sizeof line, "%s  %s %.40s  [%s]",
+            snprintf(line, sizeof line, "%s  %s %s  [%s]",
                      e->ts, tag, e->ascii, e->tx_ack_status);
         } else {
-            snprintf(line, sizeof line, "%s  %s %.60s",
+            snprintf(line, sizeof line, "%s  %s %s",
                      e->ts, tag, e->ascii);
         }
         attron(attr);
@@ -3783,6 +3797,14 @@ void usage(FILE *dest, const char *name, int full)
         "\n"
         "Other:\n"
         "  --verbose=<level>            Verbosity integer\n"
+        "  --self-test                  Parse the rest of the command line,\n"
+        "                               resolve the HMAC keyfile, print the\n"
+        "                               settings simple_sat_ops would run\n"
+        "                               with (HMAC, TX Doppler, freqs,\n"
+        "                               rotator, B210, TX gates, ...) to\n"
+        "                               stdout, and exit 0. No socket, no\n"
+        "                               hardware, no TLE open — safe to run\n"
+        "                               while another operator is live.\n"
         "  --help                       Short help (this message)\n"
         "  --help-full                  Detailed help with keyboard layout\n",
         name, name, name, name,
@@ -4675,6 +4697,139 @@ static int run_viewer(const char *argv0)
     return 0;
 }
 
+// --- --self-test report -------------------------------------------
+//
+// Prints the resolved configuration after CLI parse + HMAC keyfile
+// load, in a stable key: value layout so test harnesses can grep it.
+// Every line is "key: value" with no surrounding quoting; values are
+// short enough to fit on one line. The "self-test:" header line is
+// the contract — downstream scripts can use it as a sentinel.
+
+static const char *hmac_status_str(hmac_display_status_t s)
+{
+    switch (s) {
+        case HMAC_DISPLAY_OK:      return "ok";
+        case HMAC_DISPLAY_MISSING: return "missing";
+        case HMAC_DISPLAY_BAD:     return "bad";
+        case HMAC_DISPLAY_UNSET:   /* fall through */
+        default:                   return "unset";
+    }
+}
+
+static const char *baud_str(int speed_const)
+{
+    // antenna_rotator stores the serial speed as the POSIX termios
+    // constant (B600 etc), not the integer baud rate. Map the ones
+    // the rotator actually uses; "?" everything else so a change to
+    // antenna_rotator.c shows up in the report instead of crashing
+    // it.
+    switch (speed_const) {
+        case B600:    return "600";
+        case B1200:   return "1200";
+        case B2400:   return "2400";
+        case B4800:   return "4800";
+        case B9600:   return "9600";
+        case B19200:  return "19200";
+        case B38400:  return "38400";
+        case B57600:  return "57600";
+        case B115200: return "115200";
+        default:      return "?";
+    }
+}
+
+static void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
+{
+    fprintf(out, "self-test: simple_sat_ops configuration snapshot\n");
+
+    // Echo the command line so the report is self-describing — the
+    // reader can see at a glance which flags produced this snapshot.
+    fprintf(out, "argv:");
+    for (int i = 1; i < argc; ++i) {
+        fprintf(out, " %s", argv[i]);
+    }
+    fprintf(out, "\n");
+
+    // Mode. apply_args has already set g_control_mode / g_viewer_mode
+    // (the latter only via the auto-probe path, which --self-test
+    // skips). Standalone is the default.
+    const char *mode = g_control_mode ? "operator (--control)"
+                     : g_viewer_mode  ? "viewer (auto-detected)"
+                                       : "standalone";
+    fprintf(out, "mode: %s\n", mode);
+
+#ifdef WITH_USRP_B210
+    int b210_compiled = 1;
+#else
+    int b210_compiled = 0;
+#endif
+    fprintf(out, "build: WITH_USRP_B210=%s\n", b210_compiled ? "on" : "off");
+
+    fprintf(out, "tle: %s\n",
+            state->prediction.tles_filename
+                ? state->prediction.tles_filename
+                : "(auto-discover at startup)");
+
+    // HMAC --- the operator's banner-and-sign state. CTS1 firmware
+    // expects every uplink to be HMAC-signed; the dispatcher refuses
+    // to key the PA if g_hmac_key_len == 0, so this line is the
+    // single most-important pre-flight check.
+    fprintf(out,
+            "hmac: %s (path=%s, status=%s, bytes=%zu)\n",
+            g_hmac_key_len > 0 ? "enabled (default)" : "DISABLED",
+            g_hmac_keyfile_path[0] ? g_hmac_keyfile_path : "(unresolved)",
+            hmac_status_str(g_hmac_display_status),
+            g_hmac_key_len);
+
+    // Doppler --- both the display correction and the TX-side burst
+    // staging key off state->doppler_correction_enabled. On by
+    // default; --no-doppler-correction clears it.
+    fprintf(out, "doppler-correction: %s\n",
+            state->doppler_correction_enabled ? "enabled (default)"
+                                              : "DISABLED (--no-doppler-correction)");
+    fprintf(out, "uplink-nominal-mhz: %.6f\n",
+            state->nominal_uplink_frequency_hz / 1e6);
+    fprintf(out, "downlink-nominal-mhz: %.6f\n",
+            state->nominal_downlink_frequency_hz / 1e6);
+    fprintf(out, "rx-lo-offset-khz: %+.3f\n", state->rx_lo_offset_hz / 1000.0);
+
+    // TX safety / staging gates the operator might have set.
+    fprintf(out, "tx-no-tx: %s\n", g_no_tx ? "on (--no-tx)" : "off");
+    fprintf(out, "tx-dry-run: %s\n", g_tx_dry_run ? "on (--tx-dry-run)" : "off");
+    fprintf(out, "tx-auto-tcmd-file: %s\n",
+            g_auto_tcmd_file_path[0] ? g_auto_tcmd_file_path : "(none)");
+
+    // Hardware. The flags don't reflect "is it physically present" —
+    // they reflect "does this run intend to talk to it". The actual
+    // open happens after the self-test exit.
+    fprintf(out, "rotator: %s (device=%s, baud=%s)\n",
+            state->run_with_antenna_rotator ? "enabled"
+                                            : "disabled (--without-rotator)",
+            state->antenna_rotator.device_filename,
+            baud_str(state->antenna_rotator.serial_speed));
+    fprintf(out, "b210: %s\n",
+            (!b210_compiled || g_without_b210)
+                ? "disabled (--without-b210 or build-time)"
+                : "enabled");
+
+    fprintf(out, "live-waterfall: %s\n",
+            g_run_live_waterfall ? "on (--live-waterfall)" : "off");
+
+    fprintf(out, "pass-folder-seed: %s\n",
+            g_pass_folder[0] ? g_pass_folder : "(auto)");
+
+    // Observer location. apply_args stored these in radians on the
+    // ephem struct — convert back to degrees for the report.
+    fprintf(out, "observer-lat-deg: %.6f\n",
+            state->prediction.observer_ephem.position_geodetic.lat * 180.0 / M_PI);
+    fprintf(out, "observer-lon-deg: %.6f\n",
+            state->prediction.observer_ephem.position_geodetic.lon * 180.0 / M_PI);
+    fprintf(out, "observer-alt-m: %.1f\n",
+            state->prediction.observer_ephem.position_geodetic.alt * 1000.0);
+
+    fprintf(out, "self-test: ok\n");
+    fflush(out);
+}
+
 // --- main ---------------------------------------------------------
 
 int main(int argc, char **argv)
@@ -4727,6 +4882,16 @@ int main(int argc, char **argv)
                 memset(g_hmac_key, 0, sizeof g_hmac_key);
             }
         }
+    }
+
+    // --self-test: configuration snapshot, then exit. Runs after CLI
+    // parse + HMAC keyfile load so every TX-relevant policy is
+    // resolved; runs BEFORE the IPC socket bind, the rotator open,
+    // the B210 open, and load_tle, so the process makes no observable
+    // changes to the rest of the system.
+    if (g_self_test) {
+        self_test_report(&state, stdout, argc, argv);
+        return 0;
     }
 
     // Audit + operator IPC bring-up.
@@ -4989,16 +5154,10 @@ int main(int argc, char **argv)
         // amateur nominal and would give the wrong absolute frequency
         // here. Off when doppler_correction_enabled is false (e.g.
         // bench loopback) so RX and TX share one constant carrier.
-        if (state.doppler_correction_enabled) {
-            double rr = state.prediction.satellite_ephem.range_rate_km_s;
-            double factor = 1.0 - rr / 299792.458;
-            if (factor > 1e-9) {
-                g_tx_freq_hz_doppler =
-                    (long)(FRONTIERSAT_CARRIER_HZ / factor + 0.5);
-            }
-        } else {
-            g_tx_freq_hz_doppler = (long) FRONTIERSAT_CARRIER_HZ;
-        }
+        g_tx_freq_hz_doppler = tx_burst_doppler_freq_hz(
+            FRONTIERSAT_CARRIER_HZ,
+            state.prediction.satellite_ephem.range_rate_km_s,
+            state.doppler_correction_enabled);
 #endif
 
 #ifdef WITH_USRP_B210
@@ -5896,6 +6055,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strcmp("--control", argv[i]) == 0) {
             state->n_options++;
             g_control_mode = 1;
+        } else if (strcmp("--self-test", argv[i]) == 0) {
+            state->n_options++;
+            g_self_test = 1;
         } else if (strncmp("--", argv[i], 2) == 0) {
             fprintf(stderr, "Unable to parse option '%s'\n", argv[i]);
             return 3;
@@ -5920,8 +6082,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     // Bare invocation (no satellite_id, no --control): the standalone
     // tracker is being phased out in favour of the operator+viewer
     // split. Probe for the running operator and bail with a hint
-    // either way.
-    if (n_positional == 0 && !g_control_mode) {
+    // either way. --self-test skips the probe (a side effect) so the
+    // config dump runs cleanly without a live operator anywhere.
+    if (n_positional == 0 && !g_control_mode && !g_self_test) {
         sso_ipc_client_t *probe = sso_ipc_client_connect("simple_sat_ops");
         if (probe == NULL) {
             fprintf(stderr,
@@ -5987,7 +6150,11 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         state->prediction.satellite_ephem.name = positional;
     }
 
-    if (strcmp(state->prediction.satellite_ephem.name, "next") == 0) {
+    // --self-test exits before TLE/pass-search anyway, and the bare
+    // form (no positional, no --control) leaves .name == NULL; skip
+    // the auto-pass search rather than feeding NULL to strcmp.
+    if (state->prediction.satellite_ephem.name != NULL
+        && strcmp(state->prediction.satellite_ephem.name, "next") == 0) {
         state->prediction.auto_sat = 1;
         criteria_t criteria = {
             .min_altitude_km = min_altitude_km,

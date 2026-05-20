@@ -74,6 +74,41 @@ static void apply_ramp(int16_t *iq, size_t n_samps, size_t ramp_n)
     }
 }
 
+long tx_burst_doppler_freq_hz(double nominal_carrier_hz,
+                              double range_rate_km_s,
+                              int enable)
+{
+    if (!enable) return (long) nominal_carrier_hz;
+    const double c = 299792.458;
+    double factor = 1.0 - range_rate_km_s / c;
+    // factor can only be <=0 for unphysical range rates (|rr|>c). Treat
+    // that and anything tiny-positive as "don't divide" — fall back to
+    // the bare nominal rather than emit a wild frequency.
+    if (factor < 1e-9) return (long) nominal_carrier_hz;
+    return (long)(nominal_carrier_hz / factor + 0.5);
+}
+
+ssize_t tx_burst_build_frame(const uint8_t *payload, size_t payload_len,
+                              const csp_v1_header_t *csp_hdr,
+                              const uint8_t *hmac_key, size_t hmac_key_len,
+                              uint8_t *out_frame, size_t out_cap)
+{
+    if (csp_hdr == NULL || out_frame == NULL) return -1;
+    uint8_t csp_packet[4096];
+    ssize_t csp_len = csp_v1_encode(csp_hdr, payload, payload_len,
+                                    csp_packet, sizeof csp_packet);
+    if (csp_len < 0) return -1;
+
+    ax100_opts_t opts;
+    ax100_opts_defaults(&opts);
+    if (hmac_key && hmac_key_len > 0) {
+        opts.hmac_key = hmac_key; opts.hmac_key_len = hmac_key_len;
+    }
+    opts.reed_solomon = 1;
+    return ax100_frame(csp_packet, (size_t) csp_len, &opts,
+                       out_frame, out_cap);
+}
+
 static int build_iq(const uint8_t *payload, size_t payload_len,
                     const csp_v1_header_t *csp_hdr,
                     const uint8_t *hmac_key, size_t hmac_key_len,
@@ -86,20 +121,14 @@ static int build_iq(const uint8_t *payload, size_t payload_len,
     if (out_iq == NULL || out_n == NULL) return -1;
     *out_iq = NULL; *out_n = 0;
 
-    uint8_t csp_packet[4096];
-    ssize_t csp_len = csp_v1_encode(csp_hdr, payload, payload_len,
-                                    csp_packet, sizeof csp_packet);
-    if (csp_len < 0) return -1;
-
-    ax100_opts_t opts;
-    ax100_opts_defaults(&opts);
-    if (hmac_key && hmac_key_len > 0) {
-        opts.hmac_key = hmac_key; opts.hmac_key_len = hmac_key_len;
-    }
-    opts.reed_solomon = use_rs;
+    // use_rs is pinned to 1 by every caller (tx_burst_run); the
+    // build_frame helper bakes that in. If a future caller needs
+    // RS off this is the place to fork.
+    (void) use_rs;
     uint8_t frame[4200];
-    ssize_t frame_len = ax100_frame(csp_packet, (size_t) csp_len, &opts,
-                                    frame, sizeof frame);
+    ssize_t frame_len = tx_burst_build_frame(payload, payload_len, csp_hdr,
+                                              hmac_key, hmac_key_len,
+                                              frame, sizeof frame);
     if (frame_len < 0) return -1;
 
     modem_params_t mp;
