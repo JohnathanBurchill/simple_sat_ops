@@ -510,14 +510,19 @@ static void worker_wav_start(rx_session_t *rxs)
     // current value at file open so a reader can reconstruct the LO
     // history without needing the CLI flag context. Same lifecycle as
     // doppler.csv: opens with the WAV, closes when it does.
+    // ".lo_offset.csv" is 14 bytes; lo_offset_path is 512 → path body
+    // must fit in 497 bytes so the suffix + NUL lands inside the
+    // buffer and gcc's -Wformat-truncation is satisfied (clang
+    // doesn't currently emit that warning — same trap the doppler.csv
+    // path notes above).
     if (wlen >= 4 && strcmp(rxs->wav_path + wlen - 4, ".wav") == 0) {
         int base_len = (int)(wlen - 4);
-        if (base_len > 498) base_len = 498;
+        if (base_len > 497) base_len = 497;
         snprintf(rxs->lo_offset_path, sizeof rxs->lo_offset_path,
                  "%.*s.lo_offset.csv", base_len, rxs->wav_path);
     } else {
         snprintf(rxs->lo_offset_path, sizeof rxs->lo_offset_path,
-                 "%.498s.lo_offset.csv", rxs->wav_path);
+                 "%.497s.lo_offset.csv", rxs->wav_path);
     }
     rxs->lo_offset_fp = fopen(rxs->lo_offset_path, "w");
     if (rxs->lo_offset_fp != NULL) {
