@@ -325,6 +325,22 @@ struct rx_session {
     // offline reprocessing of the .iq can replay the exact LO history.
     FILE     *lo_offset_fp;
     char      lo_offset_path[512];
+
+    // burst.csv sidecar: wideband-burst events. Same lifecycle as the
+    // doppler/lo_offset CSVs. Lets the operator A/B the waterfall
+    // against "what the detector thought looked like a packet" — a
+    // foundation for gating the decoder on bursts later. State below
+    // is a small debouncer so a brief mid-burst dropout doesn't split
+    // one beacon into two rows.
+    FILE     *burst_fp;
+    char      burst_path[512];
+    int       burst_in_progress;
+    int       burst_bins_threshold;   // min bright_bins to start a burst
+    int       burst_quiet_frames;     // consecutive frames < threshold
+    int       burst_min_quiet;        // debounce: frames to declare "end"
+    long long burst_start_unix_ms;
+    int       burst_peak_bins;
+    double    burst_peak_excess_db;
 };
 
 static void *rx_session_thread_fn(void *arg);
@@ -345,6 +361,15 @@ int rx_session_open(rx_session_t **out, const rx_session_params_t *p,
     // don't have an HPF anyway — they read complex IQ directly. Default
     // 0 keeps the HPF on, matching rx_replay's default.
     rxs->mp.rx_disable_dc_block = p->no_dc_block ? 1 : 0;
+
+    // Burst detector thresholds for the burst.csv writer. ~16 lit FFT
+    // bins is "wideband packet" territory at our 96 kHz / 512-FFT
+    // setup (bin width 187.5 Hz; a 12 kHz GFSK lights up ~64 bins).
+    // burst_min_quiet=5 debounces a beacon that briefly drops below
+    // threshold mid-packet. Both can be tuned with sat-side data once
+    // we see how the log lines up with the waterfall.
+    rxs->burst_bins_threshold = 16;
+    rxs->burst_min_quiet      = 5;
     double actual_rate = b210_rx_tx_core_actual_rate(core);
     rxs->samp_rate    = (int) actual_rate;
     rxs->mp.samp_rate = rxs->samp_rate;
@@ -540,6 +565,32 @@ static void worker_wav_start(rx_session_t *rxs)
     } else {
         rxs->lo_offset_path[0] = '\0';
     }
+
+    // burst.csv sidecar. Same naming convention. Detector lives in
+    // b210_rx_tx_core (iq_burst), we just persist the snapshots.
+    if (wlen >= 4 && strcmp(rxs->wav_path + wlen - 4, ".wav") == 0) {
+        int base_len = (int)(wlen - 4);
+        if (base_len > 501) base_len = 501;
+        snprintf(rxs->burst_path, sizeof rxs->burst_path,
+                 "%.*s.burst.csv", base_len, rxs->wav_path);
+    } else {
+        snprintf(rxs->burst_path, sizeof rxs->burst_path,
+                 "%.501s.burst.csv", rxs->wav_path);
+    }
+    rxs->burst_fp = fopen(rxs->burst_path, "w");
+    if (rxs->burst_fp != NULL) {
+        fputs("# event,unix_time_ms,bright_bins,peak_excess_db,"
+              "duration_ms\n",
+              rxs->burst_fp);
+        fflush(rxs->burst_fp);
+    } else {
+        rxs->burst_path[0] = '\0';
+    }
+    rxs->burst_in_progress    = 0;
+    rxs->burst_quiet_frames   = 0;
+    rxs->burst_peak_bins      = 0;
+    rxs->burst_peak_excess_db = 0.0;
+
     // No stderr print on success either — operator sees [REC] in the
     // UI, and the WAV path is auto-named from the same UTC stamp as
     // every other artifact in the pass folder.
@@ -559,6 +610,25 @@ static void worker_wav_stop(rx_session_t *rxs)
     if (rxs->lo_offset_fp != NULL) {
         fclose(rxs->lo_offset_fp);
         rxs->lo_offset_fp = NULL;
+    }
+    if (rxs->burst_fp != NULL) {
+        // Close any in-flight burst as an "end" row so a clean exit
+        // doesn't lose the last event. Duration is current_time - start.
+        if (rxs->burst_in_progress) {
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            long long now_ms =
+                (long long) tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+            fprintf(rxs->burst_fp,
+                "burst_end,%lld,%d,%.2f,%lld\n",
+                now_ms, rxs->burst_peak_bins,
+                rxs->burst_peak_excess_db,
+                now_ms - rxs->burst_start_unix_ms);
+            fflush(rxs->burst_fp);
+            rxs->burst_in_progress = 0;
+        }
+        fclose(rxs->burst_fp);
+        rxs->burst_fp = NULL;
     }
 }
 
@@ -1087,6 +1157,54 @@ static int worker_pump_once(rx_session_t *rxs)
     return (int) n;
 }
 
+// Coalesce raw iq_burst snapshots into burst-start / burst-end rows
+// in the per-pass burst.csv. A burst opens when bright_bins crosses
+// up through burst_bins_threshold and closes after burst_min_quiet
+// consecutive snapshots below threshold (debounce, so a brief
+// mid-packet noise dip doesn't split one beacon in two). Called once
+// per pump iteration — sample cadence matches snapshot cadence.
+static void burst_log_step(rx_session_t *rxs, int bins, double excess_db)
+{
+    if (rxs->burst_fp == NULL) return;
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    long long now_ms = (long long) tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+
+    if (bins >= rxs->burst_bins_threshold) {
+        if (!rxs->burst_in_progress) {
+            rxs->burst_in_progress    = 1;
+            rxs->burst_start_unix_ms  = now_ms;
+            rxs->burst_peak_bins      = bins;
+            rxs->burst_peak_excess_db = excess_db;
+            rxs->burst_quiet_frames   = 0;
+            fprintf(rxs->burst_fp,
+                "burst_start,%lld,%d,%.2f,\n",
+                now_ms, bins, excess_db);
+            fflush(rxs->burst_fp);
+        } else {
+            if (bins > rxs->burst_peak_bins) rxs->burst_peak_bins = bins;
+            if (excess_db > rxs->burst_peak_excess_db) {
+                rxs->burst_peak_excess_db = excess_db;
+            }
+            rxs->burst_quiet_frames = 0;
+        }
+    } else if (rxs->burst_in_progress) {
+        rxs->burst_quiet_frames++;
+        if (rxs->burst_quiet_frames >= rxs->burst_min_quiet) {
+            fprintf(rxs->burst_fp,
+                "burst_end,%lld,%d,%.2f,%lld\n",
+                now_ms, rxs->burst_peak_bins, rxs->burst_peak_excess_db,
+                now_ms - rxs->burst_start_unix_ms);
+            fflush(rxs->burst_fp);
+            rxs->burst_in_progress    = 0;
+            rxs->burst_quiet_frames   = 0;
+            rxs->burst_peak_bins      = 0;
+            rxs->burst_peak_excess_db = 0.0;
+        }
+    }
+}
+
 static void worker_update_snapshot(rx_session_t *rxs)
 {
     double peak = 0.0, rms_sq = 0.0;
@@ -1094,6 +1212,7 @@ static void worker_update_snapshot(rx_session_t *rxs)
     int    burst_bins = 0;
     double burst_excess = 0.0;
     b210_rx_tx_core_burst_snapshot(rxs->core, &burst_bins, &burst_excess);
+    burst_log_step(rxs, burst_bins, burst_excess);
     // Effective downlink carrier as the operator thinks of it:
     //   hardware LO − lo_offset (recovers the nominal carrier)
     //              + software-Doppler NCO offset (tracks Doppler).
