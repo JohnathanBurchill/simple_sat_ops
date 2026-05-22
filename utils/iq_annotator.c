@@ -1539,7 +1539,7 @@ int main(int argc, char **argv)
                     fclose(fo);
                     char cmd[512];
                     snprintf(cmd, sizeof cmd,
-                        "rx_replay %s %d --iq >%s 2>&1",
+                        "rx_replay %s --iq --rate=%d >%s 2>&1",
                         tmp_iq, iqb.samp_rate, tmp_txt);
                     int rc = system(cmd);
                     // Slurp the captured output.
