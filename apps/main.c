@@ -656,13 +656,18 @@ static void cmd_dispatch(state_t *state)
     } else if (strcmp(cmd, "track") == 0) {
         start_tracking(state);
         cmd_set_status("tracking on");
+        sso_audit_event("track-on",
+            state->prediction.satellite_ephem.tle.sat_name[0]
+                ? state->prediction.satellite_ephem.tle.sat_name : "");
     } else if (strcmp(cmd, "stop") == 0) {
         stop_tracking(state);
         cmd_set_status("tracking stopped");
+        sso_audit_event("track-off", "");
     } else if (strcmp(cmd, "home") == 0) {
         stop_tracking(state);
         point_to_stationary_target(state, 0.0, 0.0);
         cmd_set_status("home: az=0 el=0");
+        sso_audit_event("rotator-home", "az=0 el=0");
     } else if (strcmp(cmd, "freq") == 0) {
         if (arg1 == NULL) {
             cmd_set_status("freq: missing argument (MHz)");
@@ -1014,6 +1019,17 @@ static int cmd_handle_key(int key, state_t *state)
         snprintf(executed, sizeof executed, "%s", g_cmd_buf);
         g_cmd_active = 0;
         cmd_dispatch(state);
+        // Audit: one line per `:` command the operator pressed Enter on,
+        // with the post-dispatch status so a reviewer sees both the
+        // request and the immediate result (e.g. "freq 437.5" /
+        // "freq -> 437.500000 MHz").
+        if (executed[0]) {
+            char det[480];
+            snprintf(det, sizeof det,
+                     "input=\"%.100s\" result=\"%.150s\"",
+                     executed, g_cmd_status);
+            sso_audit_event("cmd", det);
+        }
         // After dispatch, g_cmd_status holds the result string. Mirror
         // both to viewers so they see exactly what the operator sees.
         cmd_broadcast_executed(executed);
@@ -2555,6 +2571,20 @@ static int tx_compose_commit(const tx_compose_t *c, char *err, size_t err_size) 
     g_tx_request.allow_hf_tx      = 0;
     tx_compose_summary(c, g_tx_request.summary, sizeof g_tx_request.summary);
     g_tx_request.pending = 1;
+    {
+        // Audit: TX commit — the moment the operator pressed Enter in
+        // the compose modal and the burst was queued for the main loop
+        // to actually transmit. The matching tx-ack event lands when
+        // the burst returns (see emit_tx_event_local site below).
+        char det[512];
+        snprintf(det, sizeof det,
+                 "len=%zu freq_hz=%ld gain_db=%.1f payload=\"%.200s\"",
+                 g_tx_request.payload_len,
+                 (long) g_tx_request.tx_freq_hz,
+                 g_tx_request.tx_gain_db,
+                 c->payload);
+        sso_audit_event("tx-commit", det);
+    }
     return 0;
 #else
     (void) c;
@@ -3087,6 +3117,15 @@ static int auto_tcmd_start(void) {
     snprintf(a->status_msg, sizeof a->status_msg,
              "running: %d cmds × %d repeats, %.2f s delay",
              a->n_commands, repeats, delay);
+    {
+        char det[256];
+        snprintf(det, sizeof det,
+                 "n_commands=%d repeats=%d delay_s=%.2f "
+                 "allow_tx=%d power=%.100s file=\"%.100s\"",
+                 a->n_commands, repeats, delay, a->allow_tx,
+                 a->power, a->file_path);
+        sso_audit_event("auto-tcmd-start", det);
+    }
     return 0;
 }
 
@@ -3098,6 +3137,14 @@ static void auto_tcmd_stop(const char *reason) {
     a->state = AUTO_STATE_STOPPED;
     snprintf(a->status_msg, sizeof a->status_msg, "stopped: %s",
              reason ? reason : "user");
+    {
+        char det[128];
+        snprintf(det, sizeof det,
+                 "reason=\"%.100s\" sends_total=%d",
+                 reason ? reason : "user",
+                 a->sends_total);
+        sso_audit_event("auto-tcmd-stop", det);
+    }
 }
 
 static int auto_tcmd_handle_key(int key) {
@@ -3463,6 +3510,12 @@ static void setup_pass_folder(state_t *state, double jul_utc_now)
         update_operations_current_symlink(g_pass_folder);
         fprintf(stderr, "simple_sat_ops: using inherited pass folder %s\n",
                 g_pass_folder);
+        {
+            char det[600];
+            snprintf(det, sizeof det,
+                     "mode=inherited path=\"%.500s\"", g_pass_folder);
+            sso_audit_event("pass-folder", det);
+        }
         return;
     }
     // --testing: bench run, not a pass. Land the folder under the
@@ -3499,6 +3552,12 @@ static void setup_pass_folder(state_t *state, double jul_utc_now)
         // by looking at the symlink).
         fprintf(stderr,
             "simple_sat_ops: --testing folder %s\n", g_pass_folder);
+        {
+            char det[600];
+            snprintf(det, sizeof det,
+                     "mode=testing path=\"%.500s\"", g_pass_folder);
+            sso_audit_event("pass-folder", det);
+        }
         return;
     }
     minutes_until_visible(&state->prediction, jul_utc_now,
@@ -3590,6 +3649,12 @@ static void setup_pass_folder(state_t *state, double jul_utc_now)
     snprintf(g_pass_folder, sizeof g_pass_folder, "%s", folder);
     update_operations_current_symlink(folder);
     fprintf(stderr, "simple_sat_ops: pass folder %s\n", folder);
+    {
+        char det[600];
+        snprintf(det, sizeof det,
+                 "mode=aos path=\"%.500s\"", g_pass_folder);
+        sso_audit_event("pass-folder", det);
+    }
 }
 
 // Sample the upcoming pass on a local prediction_t copy and render a
@@ -5037,6 +5102,23 @@ int main(int argc, char **argv)
     g_operator_user = sso_unix_user();
     sso_audit_start("simple_sat_ops",
                     g_control_mode ? "operator" : "standalone");
+    // Record the exact command line so post-incident review can tie
+    // every operator action back to the flags the session was started
+    // with (recording mode, --tx settings, TLE, etc.). One line, tab-
+    // safe (sso_audit's sanitiser replaces tabs/newlines with spaces).
+    {
+        char argv_buf[1024];
+        size_t off = 0;
+        argv_buf[0] = '\0';
+        for (int i = 0; i < argc && off + 2 < sizeof argv_buf; ++i) {
+            int n = snprintf(argv_buf + off, sizeof argv_buf - off,
+                             "%s%s", (i == 0) ? "" : " ", argv[i]);
+            if (n <= 0) break;
+            off += (size_t) n;
+            if (off >= sizeof argv_buf) { off = sizeof argv_buf - 1; break; }
+        }
+        sso_audit_event("argv", argv_buf);
+    }
     if (g_control_mode) {
         g_ipc = sso_ipc_server_open("simple_sat_ops");
         if (g_ipc == NULL) {
@@ -5146,11 +5228,21 @@ int main(int argc, char **argv)
             fprintf(stderr,
                 "simple_sat_ops: B210 open failed — continuing without RF "
                 "(rotator + UI only). Pass --without-b210 to silence.\n");
+            sso_audit_event("b210-open-failed", "");
         } else {
             fprintf(stderr,
                 "simple_sat_ops: B210 open at %.6f MHz (post-decim rate %.0f)\n",
                 b210_rx_tx_core_actual_freq(core) / 1e6,
                 b210_rx_tx_core_actual_rate(core));
+            {
+                char det[256];
+                snprintf(det, sizeof det,
+                    "freq_hz=%.0f rate_hz=%.0f lo_offset_hz=%.0f",
+                    b210_rx_tx_core_actual_freq(core),
+                    b210_rx_tx_core_actual_rate(core),
+                    state.rx_lo_offset_hz);
+                sso_audit_event("b210-open", det);
+            }
             rx_session_params_t rxp = {
                 .bit_rate          = 9600,
                 .window_s          = 1.5,
@@ -5186,6 +5278,7 @@ int main(int argc, char **argv)
                 fprintf(stderr,
                     "simple_sat_ops: --always-record on — WAV/IQ "
                     "capture started, pass gating disabled\n");
+                sso_audit_event("rec-start", "trigger=always-record");
             }
         }
     }
@@ -5332,6 +5425,13 @@ int main(int argc, char **argv)
             if (!active && (visible || in_preroll)) {
                 rx_session_request_wav_start(g_rx_session);
                 t_recording_close_at = 0.0;
+                char det[64];
+                snprintf(det, sizeof det,
+                    "trigger=%s sec_to_aos=%.1f el=%.1f",
+                    visible ? "elevation" : "preroll",
+                    sec_to_aos,
+                    state.prediction.satellite_ephem.elevation);
+                sso_audit_event("rec-start", det);
             } else if (active) {
                 if (visible) {
                     t_recording_close_at = 0.0;  // cancel any pending close
@@ -5340,6 +5440,7 @@ int main(int argc, char **argv)
                 } else if (t_now >= t_recording_close_at) {
                     rx_session_request_wav_stop(g_rx_session);
                     t_recording_close_at = 0.0;
+                    sso_audit_event("rec-stop", "trigger=postroll-expired");
                 }
             }
         }
@@ -5817,6 +5918,17 @@ int main(int argc, char **argv)
             emit_tx_event_local(SSO_EVT_TX_ACK, summary, ack);
             if (cmd_sent) {
                 emit_tx_event_local(SSO_EVT_TX_COMMAND_SENT, summary, NULL);
+            }
+            // Audit: the result of the just-queued TX burst, so post-
+            // incident review can correlate every tx-commit with its
+            // ack (ok / uhd-err / rejected reason). cmd_sent=1 means
+            // the burst actually left the radio.
+            {
+                char det[512];
+                snprintf(det, sizeof det,
+                         "ack=\"%.80s\" sent=%d summary=\"%.300s\"",
+                         ack ? ack : "?", cmd_sent, summary);
+                sso_audit_event("tx-ack", det);
             }
             g_tx_request.pending = 0;
         }
