@@ -1611,6 +1611,29 @@ int main(int argc, char **argv)
             draw_text(tag, x_lo + 4, label_y, LABEL_PT, col);
         }
 
+        // In-app crosshair at the mouse position over the spec area.
+        // The OS arrow blends into the waterfall colour map; this
+        // overlays a bright crosshair with a dark backing stroke so
+        // it's legible against any colour underneath.
+        if (in_spec) {
+            int cx = (int) m.x;
+            int cy = (int) m.y;
+            const int arm = 14;   // arm length, px
+            const int gap = 3;    // centre gap so the exact pixel isn't masked
+            // Dark backing (1 px thicker, drawn first).
+            DrawLine(cx - arm - 1, cy, cx - gap + 1, cy, BLACK);
+            DrawLine(cx + gap - 1, cy, cx + arm + 1, cy, BLACK);
+            DrawLine(cx, cy - arm - 1, cx, cy - gap + 1, BLACK);
+            DrawLine(cx, cy + gap - 1, cx, cy + arm + 1, BLACK);
+            // Bright foreground.
+            DrawLine(cx - arm, cy, cx - gap, cy, YELLOW);
+            DrawLine(cx + gap, cy, cx + arm, cy, YELLOW);
+            DrawLine(cx, cy - arm, cx, cy - gap, YELLOW);
+            DrawLine(cx, cy + gap, cx, cy + arm, YELLOW);
+            // Centre dot.
+            DrawRectangle(cx - 1, cy - 1, 3, 3, YELLOW);
+        }
+
         // Ongoing drag rectangle (in screen space — drag_start was a
         // screen-px coordinate at the start of the drag, and we want
         // the rectangle to track the cursor in screen space).
