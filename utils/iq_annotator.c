@@ -54,6 +54,7 @@ extern void  iq_annotator_install_pinch_monitor(void);
 #include <libgen.h>
 #include <limits.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -467,6 +468,18 @@ static void fmt_mmss_ms(double t_s, char *buf, size_t cap)
     fmt_mmss_ndec(t_s, 3, buf, cap);
 }
 
+// HH-MM-SS.sss for filenames — colons are visually odd in Finder /
+// can be problematic on FAT, so the hh/mm/ss separators are hyphens.
+static void fmt_hhmmss_filename(double t_s, char *buf, size_t cap)
+{
+    if (!isfinite(t_s) || t_s < 0.0) t_s = 0.0;
+    int hh = (int)(t_s / 3600.0);
+    double rem = t_s - hh * 3600.0;
+    int mm = (int)(rem / 60.0);
+    double ss = rem - mm * 60.0;
+    snprintf(buf, cap, "%02d-%02d-%06.3f", hh, mm, ss);
+}
+
 // ---------------------------------------------------------------------------
 // IQ-sample buffer. The whole .iq file is mmap'd or read into memory
 // once so the waveform panel can slice into it for any selected box
@@ -505,6 +518,385 @@ static int iq_buf_load(iq_buf_t *b, const char *path, int samp_rate)
 static void iq_buf_free(iq_buf_t *b)
 {
     free(b->samples); b->samples = NULL; b->n_pairs = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Minimal vector PDF writer (pattern lifted from ~/src/lorentz_tracer's
+// pdf_export.c, cut down to the bare minimum we need for one figure:
+// a single page, Standard-14 fonts (Helvetica + Courier), stroked lines
+// + rectangles, filled rectangles, ASCII text only, full opacity. The
+// content stream is buffered in memory until pdf_end() so we know its
+// length. Coordinates use raylib screen-pixel space (Y down); the
+// PDFY macro flips to PDF page space (Y up).
+// ---------------------------------------------------------------------------
+
+#define PDFMAX_OBJ 64
+
+typedef struct {
+    FILE *fp;
+    long  bytes;
+    long  obj_off[PDFMAX_OBJ];
+    int   n_objects;
+    char *cs;
+    size_t cs_len, cs_cap;
+    float page_w, page_h;
+    int catalog_obj, pages_obj, page_obj, content_obj;
+    int font_helv, font_cour;
+} pdfw_t;
+
+static void pdfw_cs_append(pdfw_t *w, const char *s, size_t n)
+{
+    if (w->cs_len + n + 1 > w->cs_cap) {
+        size_t nc = w->cs_cap ? w->cs_cap * 2 : 8192;
+        while (nc < w->cs_len + n + 1) nc *= 2;
+        char *p = (char *) realloc(w->cs, nc);
+        if (p == NULL) return;
+        w->cs = p; w->cs_cap = nc;
+    }
+    memcpy(w->cs + w->cs_len, s, n);
+    w->cs_len += n;
+    w->cs[w->cs_len] = '\0';
+}
+
+__attribute__((format(printf, 2, 3)))
+static void pdfw_csf(pdfw_t *w, const char *fmt, ...)
+{
+    char buf[1024];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n > 0 && n < (int) sizeof buf) pdfw_cs_append(w, buf, (size_t) n);
+}
+
+__attribute__((format(printf, 2, 3)))
+static void pdfw_writef(pdfw_t *w, const char *fmt, ...)
+{
+    char buf[1024];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n > 0) { fwrite(buf, 1, (size_t) n, w->fp); w->bytes += n; }
+}
+
+#define PDFY(W, Y) ((W)->page_h - (float)(Y))
+
+static pdfw_t *pdfw_begin(const char *path, float page_w, float page_h)
+{
+    pdfw_t *w = (pdfw_t *) calloc(1, sizeof(*w));
+    if (w == NULL) return NULL;
+    w->fp = fopen(path, "wb");
+    if (w->fp == NULL) { free(w); return NULL; }
+    w->page_w = page_w; w->page_h = page_h;
+    static const char hdr[] = "%PDF-1.4\n%\xe2\xe3\xcf\xd3\n";
+    fwrite(hdr, 1, sizeof hdr - 1, w->fp);
+    w->bytes = (long)(sizeof hdr - 1);
+    return w;
+}
+
+static int pdfw_next_obj(pdfw_t *w)
+{
+    if (w->n_objects + 1 >= PDFMAX_OBJ) return -1;
+    return ++w->n_objects;
+}
+
+static void pdfw_set_stroke(pdfw_t *w, Color c)
+{
+    pdfw_csf(w, "%.4f %.4f %.4f RG\n", c.r/255.0, c.g/255.0, c.b/255.0);
+}
+static void pdfw_set_fill(pdfw_t *w, Color c)
+{
+    pdfw_csf(w, "%.4f %.4f %.4f rg\n", c.r/255.0, c.g/255.0, c.b/255.0);
+}
+static void pdfw_lw(pdfw_t *w, float lw) { pdfw_csf(w, "%.3f w\n", lw); }
+static void pdfw_line(pdfw_t *w, float x1, float y1, float x2, float y2)
+{
+    pdfw_csf(w, "%.4f %.4f m %.4f %.4f l S\n",
+             x1, PDFY(w, y1), x2, PDFY(w, y2));
+}
+static void pdfw_rect_stroke(pdfw_t *w, float x, float y, float ww, float hh)
+{
+    pdfw_csf(w, "%.4f %.4f %.4f %.4f re S\n",
+             x, PDFY(w, y + hh), ww, hh);
+}
+static void pdfw_rect_fill(pdfw_t *w, float x, float y, float ww, float hh)
+{
+    pdfw_csf(w, "%.4f %.4f %.4f %.4f re f\n",
+             x, PDFY(w, y + hh), ww, hh);
+}
+static void pdfw_text(pdfw_t *w, float x, float y_top,
+                      const char *s, float fsz, int mono)
+{
+    if (s == NULL || !*s) return;
+    float baseline_y = y_top + fsz * 0.8f;
+    pdfw_csf(w, "BT /F%d %.2f Tf %.4f %.4f Td (", mono ? 1 : 0,
+             fsz, x, PDFY(w, baseline_y));
+    for (const char *p = s; *p; ++p) {
+        unsigned char c = (unsigned char) *p;
+        if (c == '(' || c == ')' || c == '\\') {
+            char b[2] = {'\\', (char) c}; pdfw_cs_append(w, b, 2);
+        } else if (c < 0x20 || c > 0x7E) {
+            pdfw_cs_append(w, "?", 1);
+        } else {
+            pdfw_cs_append(w, (const char *) &c, 1);
+        }
+    }
+    pdfw_cs_append(w, ") Tj ET\n", 8);
+}
+static float pdfw_str_width(const char *s, float fsz, int mono)
+{
+    if (s == NULL) return 0.0f;
+    int n = (int) strlen(s);
+    return n * (mono ? 0.60f : 0.55f) * fsz;
+}
+
+static int pdfw_end(pdfw_t *w)
+{
+    w->catalog_obj = pdfw_next_obj(w);
+    w->pages_obj   = pdfw_next_obj(w);
+    w->page_obj    = pdfw_next_obj(w);
+    w->content_obj = pdfw_next_obj(w);
+    w->font_helv   = pdfw_next_obj(w);
+    w->font_cour   = pdfw_next_obj(w);
+    if (w->font_cour < 0) { fclose(w->fp); free(w->cs); free(w); return -1; }
+
+    w->obj_off[w->catalog_obj] = w->bytes;
+    pdfw_writef(w, "%d 0 obj\n<< /Type /Catalog /Pages %d 0 R >>\nendobj\n",
+                w->catalog_obj, w->pages_obj);
+    w->obj_off[w->pages_obj] = w->bytes;
+    pdfw_writef(w,
+        "%d 0 obj\n<< /Type /Pages /Count 1 /Kids [%d 0 R] >>\nendobj\n",
+        w->pages_obj, w->page_obj);
+    w->obj_off[w->page_obj] = w->bytes;
+    pdfw_writef(w,
+        "%d 0 obj\n<< /Type /Page /Parent %d 0 R "
+        "/MediaBox [0 0 %.4f %.4f] /Contents %d 0 R "
+        "/Resources << /Font << /F0 %d 0 R /F1 %d 0 R >> >> "
+        ">>\nendobj\n",
+        w->page_obj, w->pages_obj, w->page_w, w->page_h,
+        w->content_obj, w->font_helv, w->font_cour);
+    w->obj_off[w->content_obj] = w->bytes;
+    pdfw_writef(w, "%d 0 obj\n<< /Length %zu >>\nstream\n",
+                w->content_obj, w->cs_len);
+    if (w->cs_len > 0) {
+        fwrite(w->cs, 1, w->cs_len, w->fp);
+        w->bytes += (long) w->cs_len;
+    }
+    pdfw_writef(w, "\nendstream\nendobj\n");
+    w->obj_off[w->font_helv] = w->bytes;
+    pdfw_writef(w,
+        "%d 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+        "/Encoding /WinAnsiEncoding >>\nendobj\n", w->font_helv);
+    w->obj_off[w->font_cour] = w->bytes;
+    pdfw_writef(w,
+        "%d 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Courier "
+        "/Encoding /WinAnsiEncoding >>\nendobj\n", w->font_cour);
+
+    long xref_off = w->bytes;
+    pdfw_writef(w, "xref\n0 %d\n0000000000 65535 f \n",
+                w->n_objects + 1);
+    for (int i = 1; i <= w->n_objects; ++i)
+        pdfw_writef(w, "%010ld 00000 n \n", w->obj_off[i]);
+    pdfw_writef(w,
+        "trailer\n<< /Size %d /Root %d 0 R >>\nstartxref\n%ld\n%%%%EOF\n",
+        w->n_objects + 1, w->catalog_obj, xref_off);
+    fclose(w->fp);
+    free(w->cs);
+    free(w);
+    return 0;
+}
+
+// Render the current waveform-panel view to a one-page PDF.
+// iq_show_mode: 0=both, 1=I only, 2=Q only.
+static int pdf_write_waveform(const char *path,
+                              const iq_buf_t *iqb,
+                              double wf_t_lo, double wf_t_hi,
+                              const char *iq_path,
+                              const char *box_info,
+                              int iq_show_mode)
+{
+    // Wider/shorter page than letter landscape — operator asked for
+    // a less-tall plot. 11" × 6.5" in points = 792 × 468.
+    const float page_w = 792.0f;
+    const float page_h = 468.0f;
+    pdfw_t *w = pdfw_begin(path, page_w, page_h);
+    if (w == NULL) {
+        fprintf(stderr, "iq_annotator: pdf open %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+
+    const float MARGIN = 36.0f;
+    const float HEADER_H = 84.0f;
+    const float FOOTER_H = 24.0f;
+    pdfw_set_fill(w, (Color){250, 250, 252, 255});
+    pdfw_rect_fill(w, MARGIN, MARGIN, page_w - 2*MARGIN, HEADER_H);
+    pdfw_set_stroke(w, (Color){80, 80, 80, 255});
+    pdfw_lw(w, 0.7f);
+    pdfw_rect_stroke(w, MARGIN, MARGIN, page_w - 2*MARGIN, HEADER_H);
+    pdfw_set_fill(w, BLACK);
+    pdfw_text(w, MARGIN + 8, MARGIN + 6,
+              "iq_annotator -- waveform export", 14.0f, 0);
+    pdfw_text(w, MARGIN + 8, MARGIN + 26,
+              iq_path ? iq_path : "", 9.0f, 1);
+
+    char ts0[32], ts1[32];
+    int hdr_nd = decimals_for_step((wf_t_hi - wf_t_lo) / 8.0);
+    if (hdr_nd < 3) hdr_nd = 3;
+    fmt_mmss_ndec(wf_t_lo, hdr_nd, ts0, sizeof ts0);
+    fmt_mmss_ndec(wf_t_hi, hdr_nd, ts1, sizeof ts1);
+    int64_t i_lo = (int64_t)(wf_t_lo * iqb->samp_rate);
+    int64_t i_hi = (int64_t)(wf_t_hi * iqb->samp_rate);
+    if (i_lo < 0) i_lo = 0;
+    if (i_hi > (int64_t) iqb->n_pairs) i_hi = (int64_t) iqb->n_pairs;
+    int64_t n_pairs_vis = i_hi - i_lo;
+    char line3[256];
+    snprintf(line3, sizeof line3,
+        "window  %s -> %s   span %.*f s   %lld samples @ %d Hz",
+        ts0, ts1, hdr_nd, wf_t_hi - wf_t_lo,
+        (long long) n_pairs_vis, iqb->samp_rate);
+    pdfw_text(w, MARGIN + 8, MARGIN + 42, line3, 9.0f, 1);
+    if (box_info && box_info[0]) {
+        pdfw_text(w, MARGIN + 8, MARGIN + 58, box_info, 9.0f, 1);
+    }
+
+    const float pL = MARGIN + 70.0f;
+    const float pR = page_w - MARGIN - 8.0f;
+    const float pT = MARGIN + HEADER_H + 20.0f;
+    const float pB = page_h - MARGIN - FOOTER_H - 30.0f;
+    const float plot_w = pR - pL;
+    const float plot_h = pB - pT;
+    pdfw_set_stroke(w, (Color){100, 100, 110, 255});
+    pdfw_lw(w, 0.8f);
+    pdfw_rect_stroke(w, pL, pT, plot_w, plot_h);
+
+    int amp_max = 1;
+    if (n_pairs_vis > 0) {
+        int64_t step_s = (n_pairs_vis > 4096) ? n_pairs_vis / 2048 : 1;
+        for (int64_t k = i_lo; k < i_hi; k += step_s) {
+            int I = iqb->samples[k * 2 + 0];
+            int Q = iqb->samples[k * 2 + 1];
+            if (abs(I) > amp_max) amp_max = abs(I);
+            if (abs(Q) > amp_max) amp_max = abs(Q);
+        }
+    }
+    if (amp_max < 32) amp_max = 32;
+
+    float mid_y = pT + plot_h * 0.5f;
+    pdfw_set_stroke(w, (Color){200, 200, 210, 255});
+    pdfw_lw(w, 0.3f);
+    pdfw_line(w, pL, mid_y, pR, mid_y);
+
+    pdfw_set_stroke(w, (Color){80, 80, 80, 255});
+    pdfw_lw(w, 0.5f);
+    pdfw_set_fill(w, BLACK);
+    for (int k = -2; k <= 2; ++k) {
+        float y = mid_y - (float)(k * plot_h / 4);
+        pdfw_line(w, pL - 4, y, pL, y);
+        char buf[24];
+        snprintf(buf, sizeof buf, "%+d", (int)(k * amp_max / 2));
+        float tw = pdfw_str_width(buf, 9.0f, 1);
+        pdfw_text(w, pL - 6 - tw, y - 4, buf, 9.0f, 1);
+    }
+
+    double span = wf_t_hi - wf_t_lo;
+    double raw_step = span / 8.0;
+    double mag = pow(10.0, floor(log10(raw_step)));
+    double mul = raw_step / mag;
+    if      (mul < 1.5) mul = 1.0;
+    else if (mul < 3.5) mul = 2.0;
+    else if (mul < 7.5) mul = 5.0;
+    else                mul = 10.0;
+    double t_step = mul * mag;
+    int    t_nd   = decimals_for_step(t_step);
+    double t0_aligned = ceil(wf_t_lo / t_step) * t_step;
+    for (double t = t0_aligned; t <= wf_t_hi + 0.5 * t_step; t += t_step) {
+        float x = pL + (float)((t - wf_t_lo) / span * plot_w);
+        if (x < pL || x > pR) continue;
+        pdfw_line(w, x, pB, x, pB + 4);
+        char buf[40];
+        fmt_mmss_ndec(t, t_nd, buf, sizeof buf);
+        float tw = pdfw_str_width(buf, 9.0f, 1);
+        pdfw_text(w, x - tw * 0.5f, pB + 6, buf, 9.0f, 1);
+    }
+    pdfw_text(w, (pL + pR) * 0.5f - pdfw_str_width("time", 9, 0) * 0.5f,
+              pB + 22, "time", 9.0f, 0);
+
+    int show_i = (iq_show_mode != 2);
+    int show_q = (iq_show_mode != 1);
+    pdfw_text(w, MARGIN + 4, pT - 14,
+              "amplitude (int16)", 9.0f, 0);
+    if (show_i) pdfw_text(w, MARGIN + 4, pT + 4,  "I = cyan",    9.0f, 0);
+    if (show_q) pdfw_text(w, MARGIN + 4, pT + 16, "Q = magenta", 9.0f, 0);
+
+    if (n_pairs_vis > 0 && plot_w > 8.0f) {
+        float y_scale = (plot_h * 0.5f) / (float) amp_max;
+        Color I_col = (Color){0, 170, 200, 255};
+        Color Q_col = (Color){190, 60, 180, 255};
+        int plot_w_px = (int) plot_w;
+        if (n_pairs_vis <= (int64_t) plot_w_px * 2) {
+            pdfw_lw(w, 0.5f);
+            float prev_xi = -1, prev_yi = 0, prev_xq = -1, prev_yq = 0;
+            for (int64_t k = i_lo; k < i_hi; ++k) {
+                double t = (double) k / iqb->samp_rate;
+                float x = pL + (float)((t - wf_t_lo) / span * plot_w);
+                if (x < pL || x > pR) continue;
+                float yI = mid_y - iqb->samples[k*2+0] * y_scale;
+                float yQ = mid_y - iqb->samples[k*2+1] * y_scale;
+                if (show_q && prev_xq > 0) {
+                    pdfw_set_stroke(w, Q_col);
+                    pdfw_line(w, prev_xq, prev_yq, x, yQ);
+                }
+                if (show_i && prev_xi > 0) {
+                    pdfw_set_stroke(w, I_col);
+                    pdfw_line(w, prev_xi, prev_yi, x, yI);
+                }
+                prev_xi = x; prev_yi = yI;
+                prev_xq = x; prev_yq = yQ;
+            }
+        } else {
+            pdfw_lw(w, 0.5f);
+            for (int x = 0; x < plot_w_px; ++x) {
+                int64_t s0 = i_lo + (int64_t) x * n_pairs_vis / plot_w_px;
+                int64_t s1 = i_lo + (int64_t)(x+1) * n_pairs_vis / plot_w_px;
+                if (s1 <= s0) s1 = s0 + 1;
+                if (s1 > i_hi) s1 = i_hi;
+                int iMin =  INT_MAX, iMax = INT_MIN;
+                int qMin =  INT_MAX, qMax = INT_MIN;
+                for (int64_t k = s0; k < s1; ++k) {
+                    int I = iqb->samples[k*2+0];
+                    int Q = iqb->samples[k*2+1];
+                    if (I < iMin) iMin = I;
+                    if (I > iMax) iMax = I;
+                    if (Q < qMin) qMin = Q;
+                    if (Q > qMax) qMax = Q;
+                }
+                float xpx = pL + (float) x;
+                if (show_q) {
+                    pdfw_set_stroke(w, Q_col);
+                    pdfw_line(w, xpx, mid_y - qMax * y_scale,
+                                 xpx, mid_y - qMin * y_scale);
+                }
+                if (show_i) {
+                    pdfw_set_stroke(w, I_col);
+                    pdfw_line(w, xpx, mid_y - iMax * y_scale,
+                                 xpx, mid_y - iMin * y_scale);
+                }
+            }
+        }
+    }
+
+    char foot[256];
+    time_t now = time(NULL);
+    struct tm utc;
+    gmtime_r(&now, &utc);
+    snprintf(foot, sizeof foot,
+        "generated %04d-%02d-%02dT%02d:%02d:%02dZ  by iq_annotator",
+        utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+        utc.tm_hour, utc.tm_min, utc.tm_sec);
+    pdfw_set_fill(w, (Color){120, 120, 120, 255});
+    pdfw_text(w, MARGIN, page_h - MARGIN - 12, foot, 9.0f, 1);
+
+    return pdfw_end(w);
 }
 
 static void usage(void)
@@ -712,6 +1104,25 @@ int main(int argc, char **argv)
     float zoom    = 1.0f;
     float view_x  = 0.0f;     // image pixel at screen x=0
     float view_y  = 0.0f;     // image pixel at screen y=0
+    // Which channels to show in the waveform panel + PDF.
+    // 0 = both (default), 1 = I only, 2 = Q only.  Cycle with the
+    // `i` key: both → I → Q → both → ...
+    int iq_show_mode = 0;
+    // Smooth +/- zoom animation. When the user presses + (or =) the
+    // target is set to 2× the current zoom centred on the cursor;
+    // the per-frame interpolation eases over `anim_dur` seconds.
+    float anim_t      = 0.0f;
+    float anim_dur    = 1.00f;
+    int   anim_active = 0;
+    float anim_z_from = 0.0f, anim_z_to = 0.0f;
+    // Anchor: image-pixel that was under the cursor at the moment +/-
+    // was pressed, and the cursor's screen-pixel coords at that moment.
+    // We recompute view_x/view_y each animation frame from the current
+    // zoom so that THIS image point keeps sitting under that same
+    // screen position throughout the animation — i.e. exactly the
+    // pinch-zoom behaviour, just driven by a key + linear ramp.
+    float anim_anchor_sx = 0.0f, anim_anchor_sy = 0.0f;
+    float anim_anchor_ix = 0.0f, anim_anchor_iy = 0.0f;
     int   dragging = 0;       // 1 = drawing a new box
     Vector2 drag_start = {0, 0};
     char  status[256] = "";
@@ -801,10 +1212,50 @@ int main(int argc, char **argv)
         // Zoom resets.
         if (IsKeyPressed(KEY_ZERO) || IsKeyPressed(KEY_KP_0)) {
             zoom = 1.0f; view_x = 0; view_y = 0;
+            anim_active = 0;
         }
-        // Clamp view to image extents.
+        // +/= zooms in by 5×, − zooms out by 1/5×, both anchoring on
+        // the point currently under the cursor (same semantics as
+        // trackpad pinch — the image point stays put, the world
+        // around it just scales). Animation is a straight-line ramp
+        // on `zoom`; view_x/view_y are recomputed from the anchor
+        // each frame so the anchor doesn't drift.
+        int zoom_in_press  = IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD);
+        int zoom_out_press = IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT);
+        if (zoom_in_press || zoom_out_press) {
+            float new_zoom = zoom * (zoom_in_press ? 5.0f : 0.2f);
+            if (new_zoom < 0.1f)        new_zoom = 0.1f;
+            if (new_zoom > 1.0e6f)      new_zoom = 1.0e6f;
+            anim_anchor_sx = m.x;
+            anim_anchor_sy = m.y;
+            anim_anchor_ix = view_x + m.x / zoom;
+            anim_anchor_iy = view_y + m.y / zoom;
+            anim_z_from = zoom;
+            anim_z_to   = new_zoom;
+            anim_t = 0.0f;
+            anim_active = 1;
+        }
+        // Per-frame animation step — linear ramp on zoom; recompute
+        // view so anim_anchor_i stays under anim_anchor_s for the
+        // whole animation (no wobble toward a moving target).
+        if (anim_active) {
+            anim_t += GetFrameTime();
+            float u = anim_t / anim_dur;
+            if (u >= 1.0f) { u = 1.0f; anim_active = 0; }
+            zoom   = anim_z_from + u * (anim_z_to - anim_z_from);
+            view_x = anim_anchor_ix - anim_anchor_sx / zoom;
+            view_y = anim_anchor_iy - anim_anchor_sy / zoom;
+        }
+        // Clamp view to image extents. The spec drawing area on
+        // screen goes from y=0 to y=spec_screen_h; the waveform
+        // panel (when open) and the status bar replace the bottom
+        // of the window so the spec doesn't render behind them.
+        int   bar_h_clamp = 2 * (STATUS_PT + 6);
+        int   spec_screen_h = wf_open
+            ? (sh - wf_panel_h) : (sh - bar_h_clamp);
+        if (spec_screen_h < 32) spec_screen_h = 32;
         float visible_w = sw / zoom;
-        float visible_h = sh / zoom;
+        float visible_h = spec_screen_h / zoom;
         if (view_x < 0) view_x = 0;
         if (view_y < 0) view_y = 0;
         if (visible_w >= img_w) view_x = 0;
@@ -827,6 +1278,18 @@ int main(int argc, char **argv)
                 "waveform panel %s (follows spectrogram time range)",
                 wf_open ? "ON" : "OFF");
         }
+        if (IsKeyPressed(KEY_I)) {
+            iq_show_mode = (iq_show_mode + 1) % 3;
+            const char *mode_label =
+                (iq_show_mode == 0) ? "I + Q"
+              : (iq_show_mode == 1) ? "I only" : "Q only";
+            snprintf(status, sizeof status,
+                "waveform channels: %s", mode_label);
+        }
+        // P → write the current waveform panel to a vector PDF
+        // alongside the .iq. Deferred until after wf_t_lo/wf_t_hi
+        // and box_info are computed later in the frame.
+        int pdf_requested = IsKeyPressed(KEY_P);
         if (IsKeyPressed(KEY_Q)) break;
 
         // Cursor → image px → (t, f).
@@ -839,8 +1302,11 @@ int main(int argc, char **argv)
         // box drawing / selection / resize on the spectrogram above.
         int   in_panel_now =
             wf_open && (int) m.y >= sh - wf_panel_h && (int) m.y < sh;
+        // Spec is drawn from screen y=0 down to spec_screen_h; below
+        // that is the panel (when open) or the status bar.
         int   in_spec = (img_x >= WF_LM && img_x < WF_LM + spec_w
                       && img_y >= WF_TM && img_y < WF_TM + spec_h
+                      && (int) m.y < spec_screen_h
                       && !in_panel_now);
         double cursor_t = 0.0, cursor_f = 0.0;
         if (in_spec) {
@@ -1133,25 +1599,30 @@ int main(int argc, char **argv)
         // events whose y is in the panel).
         int wf_y0 = sh - wf_panel_h;
         // The waveform panel shows whatever time range is visible in
-        // the spectrogram above. Convert the spec view's screen y-range
-        // to a time range using gen_waterfall's row mapping:
-        //   image_row = WF_TM + (spec_h - 1 - spec_row)
-        //   t         = spec_row / spec_h * duration_s
-        // Screen y=0 maps to image_y = view_y; screen y=bar_top maps to
-        // image_y = view_y + bar_top/zoom.
+        // the spectrogram above. gen_waterfall flips the spec so
+        // image-row WF_TM is the NEWEST sample (t = duration) and
+        // image-row WF_TM + spec_h is the OLDEST (t = 0). Each row
+        // covers a time interval of duration/spec_h; the top edge of
+        // the top row is at t = duration and the bottom edge of the
+        // bottom row is at t = 0. We map fractional image-y to time
+        // using the FRACTION of the spec height (not a discrete row
+        // index) to avoid an off-by-one row-width gap at each end.
         int bar_h_for_wf = 2 * (STATUS_PT + 6);
         int spec_bot_y_screen =
             (wf_open ? wf_y0 : (sh - bar_h_for_wf));
-        double img_y_top = (double) view_y;
-        double img_y_bot = (double) view_y
-                         + (double) spec_bot_y_screen / (double) zoom;
-        // Top of view = NEWEST visible time; bottom = OLDEST.
-        double spec_row_at_top = (double) WF_TM + (double) spec_h - 1.0 - img_y_top;
-        double spec_row_at_bot = (double) WF_TM + (double) spec_h - 1.0 - img_y_bot;
-        if (spec_row_at_top > spec_h - 1) spec_row_at_top = spec_h - 1;
-        if (spec_row_at_bot < 0)          spec_row_at_bot = 0;
-        double wf_t_lo = spec_row_at_bot / (double) spec_h * duration_s;
-        double wf_t_hi = spec_row_at_top / (double) spec_h * duration_s;
+        double vis_top_img = (double) view_y;
+        double vis_bot_img = (double) view_y
+                           + (double) spec_bot_y_screen / (double) zoom;
+        // Clamp to the spec area; if the view extends into either of
+        // gen_waterfall's margins (top axis labels / bottom freq axis +
+        // colorbar), the panel just shows the inside-spec portion.
+        if (vis_top_img < WF_TM) vis_top_img = WF_TM;
+        if (vis_bot_img > WF_TM + spec_h) vis_bot_img = WF_TM + spec_h;
+        if (vis_bot_img < vis_top_img)    vis_bot_img = vis_top_img;
+        double frac_top = (vis_top_img - WF_TM) / (double) spec_h;
+        double frac_bot = (vis_bot_img - WF_TM) / (double) spec_h;
+        double wf_t_hi = (1.0 - frac_top) * duration_s;
+        double wf_t_lo = (1.0 - frac_bot) * duration_s;
         if (wf_t_hi < wf_t_lo) {
             double tmp = wf_t_lo; wf_t_lo = wf_t_hi; wf_t_hi = tmp;
         }
@@ -1177,6 +1648,29 @@ int main(int argc, char **argv)
                 b->f_lo_hz, b->f_hi_hz, dbw / 1000.0);
         }
 
+        // Deferred PDF export — fires once when P was pressed this
+        // frame. Uses the time range and box-info we just computed.
+        if (pdf_requested && iqb.samples != NULL) {
+            char t0fn[32], t1fn[32];
+            fmt_hhmmss_filename(wf_t_lo, t0fn, sizeof t0fn);
+            fmt_hhmmss_filename(wf_t_hi, t1fn, sizeof t1fn);
+            char pdf_path[1100];
+            snprintf(pdf_path, sizeof pdf_path,
+                     "%.900s.timeseries.%s_%s.pdf",
+                     iq_path, t0fn, t1fn);
+            int rc = pdf_write_waveform(pdf_path, &iqb,
+                                        wf_t_lo, wf_t_hi,
+                                        iq_path, box_info,
+                                        iq_show_mode);
+            if (rc == 0) {
+                snprintf(status, sizeof status,
+                    "wrote %s", pdf_path);
+            } else {
+                snprintf(status, sizeof status,
+                    "PDF write failed");
+            }
+        }
+
         // Status bar — two lines now: top = box info, bottom = cursor
         // / keys / status messages.
         int bar_h = 2 * (STATUS_PT + 6);
@@ -1189,12 +1683,12 @@ int main(int argc, char **argv)
         char info[512];
         if (in_spec) {
             snprintf(info, sizeof info,
-                "cursor t=%.3fs  f=%+.0f Hz  zoom=%.2fx  boxes=%d  hover=%d sel=%d  | drag=new pinch=zoom scroll=pan W=waveform T=label S=save L=load 0=reset Del=del-hover Q=quit",
+                "cursor t=%.3fs  f=%+.0f Hz  zoom=%.2fx  boxes=%d  hover=%d sel=%d  | drag=new pinch=zoom +/-=5x@cursor-anchor scroll=pan W=wave I=ch P=pdf T=label S=save L=load 0=reset Del=del-hover Q=quit",
                 cursor_t, cursor_f, (double) zoom,
                 boxes.n, hovered, boxes.selected);
         } else {
             snprintf(info, sizeof info,
-                "zoom=%.2fx  boxes=%d  | drag=new pinch=zoom scroll=pan W=waveform T=label S=save L=load 0=reset Del=del-hover Q=quit",
+                "zoom=%.2fx  boxes=%d  | drag=new pinch=zoom +/-=5x@cursor-anchor scroll=pan W=wave I=ch P=pdf T=label S=save L=load 0=reset Del=del-hover Q=quit",
                 (double) zoom, boxes.n);
         }
         draw_text(info, 6, sh - bar_h + STATUS_PT + 8, STATUS_PT, LIGHTGRAY);
@@ -1255,7 +1749,7 @@ int main(int argc, char **argv)
                     char buf[24];
                     snprintf(buf, sizeof buf, "%+d",
                              (int)(k * amp_max / 2));
-                    const int AMP_PT = 28;
+                    const int AMP_PT = 19;
                     int tw = measure_text(buf, AMP_PT);
                     draw_text(buf, plot_x0 - 6 - tw, y - AMP_PT/2,
                               AMP_PT, GRAY);
@@ -1272,7 +1766,7 @@ int main(int argc, char **argv)
                 else                mul = 10.0;
                 double step = mul * mag;
                 double t0_aligned = ceil(wf_t_lo / step) * step;
-                const int T_PT = 28;
+                const int T_PT = 19;
                 // Fractional-second precision scales with the tick
                 // step so labels at deep zoom can read sub-millisecond.
                 int t_nd = decimals_for_step(step);
@@ -1293,6 +1787,8 @@ int main(int argc, char **argv)
                 if (n_pairs_vis > 0) {
                     int mid_y = plot_y0 + plot_h / 2;
                     float y_scale = (float) plot_h / 2.0f / (float) amp_max;
+                    int show_i = (iq_show_mode != 2);  // 0 both, 1 I only
+                    int show_q = (iq_show_mode != 1);  // 0 both, 2 Q only
                     if (n_pairs_vis <= (int64_t) plot_w * 2) {
                         // Point/line plot for sparse data.
                         int prev_xi = -1, prev_yi = 0, prev_xq = -1, prev_yq = 0;
@@ -1304,9 +1800,9 @@ int main(int argc, char **argv)
                             int yI = mid_y - (int)(iqb.samples[k*2+0] * y_scale);
                             int yQ = mid_y - (int)(iqb.samples[k*2+1] * y_scale);
                             // Underlay Q in violet first, I in cyan on top.
-                            if (prev_xq >= 0)
+                            if (show_q && prev_xq >= 0)
                                 DrawLine(prev_xq, prev_yq, x, yQ, (Color){200,90,220,200});
-                            if (prev_xi >= 0)
+                            if (show_i && prev_xi >= 0)
                                 DrawLine(prev_xi, prev_yi, x, yI, (Color){80,200,220,255});
                             prev_xi = x; prev_yi = yI;
                             prev_xq = x; prev_yq = yQ;
@@ -1329,12 +1825,14 @@ int main(int argc, char **argv)
                                 if (Q > qMax) qMax = Q;
                             }
                             int xpx = plot_x0 + x;
-                            DrawLine(xpx, mid_y - (int)(qMax * y_scale),
-                                     xpx, mid_y - (int)(qMin * y_scale),
-                                     (Color){200,90,220,160});
-                            DrawLine(xpx, mid_y - (int)(iMax * y_scale),
-                                     xpx, mid_y - (int)(iMin * y_scale),
-                                     (Color){80,200,220,220});
+                            if (show_q)
+                                DrawLine(xpx, mid_y - (int)(qMax * y_scale),
+                                         xpx, mid_y - (int)(qMin * y_scale),
+                                         (Color){200,90,220,160});
+                            if (show_i)
+                                DrawLine(xpx, mid_y - (int)(iMax * y_scale),
+                                         xpx, mid_y - (int)(iMin * y_scale),
+                                         (Color){80,200,220,220});
                         }
                     }
                 }
@@ -1369,11 +1867,15 @@ int main(int argc, char **argv)
                 }
 
                 // Title (span + sample count). Color matches body text.
-                const int TITLE_PT = 26;
+                const int TITLE_PT = 17;
+                const char *chans =
+                    (iq_show_mode == 0) ? "I cyan  Q violet"
+                  : (iq_show_mode == 1) ? "I only (cyan)"
+                  : "Q only (violet)";
                 char title[256];
                 snprintf(title, sizeof title,
-                    "I/Q  span=%.3f s  (%lld samples)   I cyan  Q violet",
-                    span, (long long) n_pairs_vis);
+                    "I/Q  span=%.3f s  (%lld samples)   %s   [i=cycle]",
+                    span, (long long) n_pairs_vis, chans);
                 draw_text(title, plot_x0 + 6, plot_y0 + 2, TITLE_PT,
                           (Color){200, 200, 220, 255});
             }
