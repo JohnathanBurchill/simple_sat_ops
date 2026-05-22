@@ -1126,9 +1126,43 @@ int main(int argc, char **argv)
         CloseWindow(); return 1;
     }
 
-    double display_bw_hz = (ropts.zoom_khz > 0.0)
-        ? ropts.zoom_khz * 1000.0
-        : (double) samp_rate;
+    // Read the sidecar gen_waterfall writes next to the PNG. The
+    // sidecar carries display_bw_hz — the BANDWIDTH gen_waterfall
+    // actually rendered after applying its --zoom-khz default (30 kHz)
+    // and any bin-rounding. Computing it independently from
+    // ropts.zoom_khz would silently differ when the user didn't pass
+    // an explicit zoom flag (because gen_waterfall ALSO applies a
+    // default), which is exactly when boxes get drawn at the wrong
+    // width.
+    double display_bw_hz = 0.0;
+    {
+        char meta_path[1200];
+        snprintf(meta_path, sizeof meta_path, "%.1100s.meta", png_path);
+        FILE *mf = fopen(meta_path, "r");
+        if (mf != NULL) {
+            char line[256];
+            while (fgets(line, sizeof line, mf) != NULL) {
+                double v = 0.0;
+                if (sscanf(line, "display_bw_hz=%lf", &v) == 1) {
+                    display_bw_hz = v;
+                    break;
+                }
+            }
+            fclose(mf);
+        }
+    }
+    if (display_bw_hz <= 0.0) {
+        // Sidecar missing or unparseable — fall back to the heuristic
+        // (right for explicit --zoom-khz / --full-width, wrong for the
+        // default case where gen_waterfall implicitly zooms to ±15 kHz).
+        display_bw_hz = (ropts.zoom_khz > 0.0)
+            ? ropts.zoom_khz * 1000.0
+            : (double) samp_rate;
+        fprintf(stderr,
+            "iq_annotator: WARNING no sidecar metadata — "
+            "guessing display_bw_hz=%.1f kHz from CLI flags\n",
+            display_bw_hz / 1e3);
+    }
 
     fprintf(stderr,
         "iq_annotator: PNG %dx%d, spec %dx%d, BW %.1f kHz\n",
@@ -1587,6 +1621,26 @@ int main(int argc, char **argv)
             else if (resize_edge_y == +1) b->t0_s = t_at;  // bottom = earlier t
         }
         if (resize_box >= 0 && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
+            // raylib reports IsMouseButtonDown == false on the frame
+            // the button is released, so the live-update block above
+            // is skipped for THIS frame. Capture the release-frame
+            // mouse position here so the user's final movement
+            // actually lands on the box (without this, the box sticks
+            // at the previous-frame position — what the user saw as
+            // "start/stop times aren't the most recently adjusted").
+            if (in_spec) {
+                box_t *b = &boxes.items[resize_box];
+                float ix = view_x + m.x / zoom;
+                float iy = view_y + m.y / zoom;
+                double col_frac = (ix - WF_LM) / (double) spec_w;
+                double row_frac_top = (iy - WF_TM) / (double) spec_h;
+                double t_at = (1.0 - row_frac_top) * duration_s;
+                double f_at = (col_frac - 0.5) * display_bw_hz;
+                if (resize_edge_x == -1) b->f_lo_hz = f_at;
+                else if (resize_edge_x == +1) b->f_hi_hz = f_at;
+                if (resize_edge_y == -1) b->t1_s = t_at;
+                else if (resize_edge_y == +1) b->t0_s = t_at;
+            }
             box_normalize(&boxes.items[resize_box]);
             // Take a copy of the just-resized box BEFORE sorting, so we
             // can report its position after re-indexing.

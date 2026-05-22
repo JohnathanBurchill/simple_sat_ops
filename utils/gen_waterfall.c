@@ -2143,6 +2143,31 @@ int main(int argc, char **argv)
                     out_png, strerror(errno));
             return 1;
         }
+        // Sidecar metadata so downstream readers (iq_annotator) can
+        // map PNG pixel columns to absolute frequency without having
+        // to replicate gen_waterfall's bin-rounding rules. The PNG's
+        // displayed bandwidth is opt.display_bw_hz (set inside
+        // build_waterfall after --zoom-khz / --full-width are
+        // applied), NOT the raw sample rate, so reading it from here
+        // is the authoritative source.
+        {
+            char meta_path[1200];
+            snprintf(meta_path, sizeof meta_path, "%.1100s.meta", out_png);
+            FILE *mf = fopen(meta_path, "w");
+            if (mf != NULL) {
+                fprintf(mf, "# gen_waterfall PNG metadata\n");
+                fprintf(mf, "img_w=%d\n", W);
+                fprintf(mf, "img_h=%d\n", H);
+                fprintf(mf, "spec_w=%d\n", spec_w);
+                fprintf(mf, "spec_h=%d\n", spec_h);
+                fprintf(mf, "display_bw_hz=%.6f\n", opt.display_bw_hz);
+                fprintf(mf, "sample_rate=%d\n", opt.sample_rate);
+                fprintf(mf, "center_hz=%.6f\n", opt.center_hz);
+                fprintf(mf, "duration_s=%.6f\n", duration_s);
+                fprintf(mf, "fft_size=%d\n", opt.fft_size);
+                fclose(mf);
+            }
+        }
         fprintf(stderr,
             "gen_waterfall: %s -> %s (%dx%d, %.1fs, fft=%d)\n",
             iq_path, out_png, W, H, duration_s, opt.fft_size);
