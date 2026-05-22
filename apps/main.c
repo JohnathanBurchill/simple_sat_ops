@@ -5172,9 +5172,27 @@ int main(int argc, char **argv)
         state.have_antenna_rotator = 1;
         // Adopt whatever extended position the SPID is already at so the
         // unwrapped accumulator starts grounded in reality.
+        //
+        // BUT: seed_from_status also overwrites target_azimuth /
+        // target_elevation / target_azimuth_unwrapped with the rotator's
+        // current physical position — fine when nobody asked for a
+        // specific park position, but a problem when the operator passed
+        // --rotator-target-azimuth / --rotator-target-elevation: those
+        // user-specified targets would be silently clobbered before T
+        // ever fired. Snapshot them and restore after seeding.
+        double sav_az    = state.antenna_rotator.target_azimuth;
+        double sav_el    = state.antenna_rotator.target_elevation;
+        double sav_az_uw = state.antenna_rotator.target_azimuth_unwrapped;
+        int    sav_uw_ok = state.antenna_rotator.unwrapped_target_valid;
         if (antenna_rotator_seed_from_status(&state.antenna_rotator) != ANTENNA_ROTATOR_OK) {
             fprintf(stderr, "Warning: could not read SPID position; "
                             "check that the Rot2ProG is in 'A' mode\n");
+        }
+        if (state.antenna_rotator.fixed_target) {
+            state.antenna_rotator.target_azimuth            = sav_az;
+            state.antenna_rotator.target_elevation          = sav_el;
+            state.antenna_rotator.target_azimuth_unwrapped  = sav_az_uw;
+            state.antenna_rotator.unwrapped_target_valid    = sav_uw_ok;
         }
     }
 
@@ -5663,6 +5681,18 @@ int main(int argc, char **argv)
                     break;
                 case 'T':
                     start_tracking(&state);
+                    if (state.antenna_rotator.fixed_target) {
+                        char det[128];
+                        snprintf(det, sizeof det,
+                            "mode=fixed-target az=%.1f el=%.1f",
+                            state.antenna_rotator.target_azimuth,
+                            state.antenna_rotator.target_elevation);
+                        sso_audit_event("track-on", det);
+                    } else {
+                        sso_audit_event("track-on",
+                            state.prediction.satellite_ephem.tle.sat_name[0]
+                                ? state.prediction.satellite_ephem.tle.sat_name : "");
+                    }
                     break;
                 case 's':
                     stop_tracking(&state);
