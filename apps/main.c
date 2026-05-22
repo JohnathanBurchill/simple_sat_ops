@@ -132,6 +132,27 @@ static int   g_always_record      = 0;
 // out of the operational Operations/ tree and skips the "no AOS in
 // next N minutes" abort in setup_pass_folder.
 static int   g_testing_mode       = 0;
+
+// --scan-sky: rebinds T to "scan the sky" — drive the rotator through
+// a grid of (az, el) targets spaced for roughly equal solid angle,
+// dwelling at each for SCAN_DWELL_S seconds, while writing per-target
+// arrival timestamps to a CSV in the pass folder. Intended for noise-
+// floor / antenna-pattern characterisation runs where the operator
+// wants the same orientation sweep every time. 's' stops mid-scan.
+static int    g_scan_sky_mode     = 0;
+static double g_scan_step_deg     = 15.0;  // elevation ring spacing (default)
+#define SCAN_DWELL_S 5.0
+#define SCAN_MAX_TARGETS 512
+typedef struct { double az_deg; double el_deg; } scan_target_t;
+static scan_target_t g_scan_targets[SCAN_MAX_TARGETS];
+static int    g_scan_n_targets    = 0;
+static int    g_scan_active       = 0;
+static int    g_scan_idx          = 0;
+// Set to t_now when the rotator's motion-flag clears at a target;
+// the dwell expires SCAN_DWELL_S later. 0 means "haven't arrived yet".
+static double g_scan_dwell_start_s = 0.0;
+static FILE  *g_scan_csv_fp       = NULL;
+static char   g_scan_csv_path[640] = "";
 static pid_t g_live_waterfall_pid = -1;
 __attribute__((unused))
 static char  g_live_waterfall_iq[512] = "";
@@ -599,6 +620,9 @@ static void auto_tcmd_open(void);
 void start_tracking(state_t *state);
 void stop_tracking(state_t *state);
 int  point_to_stationary_target(state_t *state, double azimuth, double elevation);
+static void scan_sky_start(state_t *state);
+static void scan_sky_stop(state_t *state, const char *reason);
+static void scan_sky_tick(state_t *state, double t_now);
 // g_rx_session is referenced here in cmd_dispatch but its definition
 // sits with the rest of the B210 globals further down. Forward-declare
 // it so the compiler doesn't reject the references; the symbol resolves
@@ -3300,6 +3324,9 @@ static void auto_tcmd_tick(state_t *state) {
 void start_tracking(state_t *state);
 void stop_tracking(state_t *state);
 int  point_to_stationary_target(state_t *state, double azimuth, double elevation);
+static void scan_sky_start(state_t *state);
+static void scan_sky_stop(state_t *state, const char *reason);
+static void scan_sky_tick(state_t *state, double t_now);
 void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, double downlink_freq);
 int  apply_args(state_t *state, int argc, char **argv, double jul_utc);
 
@@ -3930,6 +3957,19 @@ void usage(FILE *dest, const char *name, int full)
         "                               tree (plus its 'current' symlink) is left\n"
         "                               untouched. Usually paired with\n"
         "                               --always-record and --without-rotator.\n"
+        "  --scan-sky                   Rebind T to walk the rotator through a\n"
+        "                               sky grid (roughly equal-solid-angle\n"
+        "                               (az, el) targets), dwelling 5 s at each.\n"
+        "                               First target is (0, 0); azimuth stays in\n"
+        "                               (-180, 180) so the rotator never crosses\n"
+        "                               the wrap boundary. Each arrival is\n"
+        "                               appended to scan_sky_UT=*.csv in the pass\n"
+        "                               folder. Press s to stop mid-scan. TLE /\n"
+        "                               in-pass state is ignored.\n"
+        "  --scan-step=<deg>            Elevation ring spacing for --scan-sky\n"
+        "                               (default 15.0, clamped to [1, 45]). Az\n"
+        "                               samples per ring scale with cos(el) so\n"
+        "                               cells stay approximately equal area.\n"
         "  --tx-dry-run                 Synthesize an immediate 'ok' ack for\n"
         "                               every TX burst instead of routing it\n"
         "                               through the SDR. Exercises the auto-\n"
@@ -5488,6 +5528,13 @@ int main(int argc, char **argv)
             state.antenna_rotator.homing_in_progress = 0;
             state.antenna_rotator.home_pending_final_az = 0.0;
         }
+        // --scan-sky: drives a sky grid one target at a time, dwelling
+        // SCAN_DWELL_S at each. Bypasses the satellite_tracking +
+        // pass-timing gate below entirely, so the operator can scan
+        // regardless of TLE / pass state. 's' stops mid-scan.
+        if (g_scan_active) {
+            scan_sky_tick(&state, t_now);
+        }
         if (state.satellite_tracking
             && state.prediction.predicted_minutes_until_visible
                    < state.antenna_rotator.tracking_prep_time_minutes) {
@@ -5680,21 +5727,28 @@ int main(int argc, char **argv)
                     state.running = 0;
                     break;
                 case 'T':
-                    start_tracking(&state);
-                    if (state.antenna_rotator.fixed_target) {
-                        char det[128];
-                        snprintf(det, sizeof det,
-                            "mode=fixed-target az=%.1f el=%.1f",
-                            state.antenna_rotator.target_azimuth,
-                            state.antenna_rotator.target_elevation);
-                        sso_audit_event("track-on", det);
+                    if (g_scan_sky_mode) {
+                        scan_sky_start(&state);
                     } else {
-                        sso_audit_event("track-on",
-                            state.prediction.satellite_ephem.tle.sat_name[0]
-                                ? state.prediction.satellite_ephem.tle.sat_name : "");
+                        start_tracking(&state);
+                        if (state.antenna_rotator.fixed_target) {
+                            char det[128];
+                            snprintf(det, sizeof det,
+                                "mode=fixed-target az=%.1f el=%.1f",
+                                state.antenna_rotator.target_azimuth,
+                                state.antenna_rotator.target_elevation);
+                            sso_audit_event("track-on", det);
+                        } else {
+                            sso_audit_event("track-on",
+                                state.prediction.satellite_ephem.tle.sat_name[0]
+                                    ? state.prediction.satellite_ephem.tle.sat_name : "");
+                        }
                     }
                     break;
                 case 's':
+                    if (g_scan_active) {
+                        scan_sky_stop(&state, "user");
+                    }
                     stop_tracking(&state);
                     break;
                 case 'r':
@@ -6191,6 +6245,14 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strcmp("--testing", argv[i]) == 0) {
             state->n_options++;
             g_testing_mode = 1;
+        } else if (strcmp("--scan-sky", argv[i]) == 0) {
+            state->n_options++;
+            g_scan_sky_mode = 1;
+        } else if (strncmp("--scan-step=", argv[i], 12) == 0) {
+            state->n_options++;
+            g_scan_step_deg = atof(argv[i] + 12);
+            if (g_scan_step_deg < 1.0)  g_scan_step_deg = 1.0;
+            if (g_scan_step_deg > 45.0) g_scan_step_deg = 45.0;
         } else if (strcmp("--tx-dry-run", argv[i]) == 0) {
             state->n_options++;
             g_tx_dry_run = 1;
@@ -6620,6 +6682,213 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
         state->antenna_rotator.antenna_is_moving = 1;
     }
     return rc;
+}
+
+// -------------------------------------------------------------------
+// --scan-sky helpers
+// -------------------------------------------------------------------
+//
+// scan_build_targets fills g_scan_targets with a roughly equal-solid-
+// angle grid covering the sky above the horizon. Elevation rings are
+// spaced del_deg apart; at each ring, the azimuth count is round(
+// 360/del_deg * cos(el)) so high-elevation rings (which subtend less
+// solid angle on the sphere) carry proportionally fewer az samples.
+// Ring direction alternates so consecutive targets across rings sit
+// close in azimuth (snake pattern, minimises rotator transit).
+//
+// Azimuths are emitted in the range (-180, 180), with the exact
+// boundary skipped so the rotator never tries to drive past its
+// mechanical wrap limits (range is [-179, 539]; we stay well inside).
+// The first target is forced to (0, 0) so every run starts from a
+// known reference.
+
+static int scan_build_targets(double del_deg)
+{
+    if (del_deg < 1.0) del_deg = 1.0;
+    if (del_deg > 45.0) del_deg = 45.0;
+    int n = 0;
+    // Force the starting target.
+    g_scan_targets[n].az_deg = 0.0;
+    g_scan_targets[n].el_deg = 0.0;
+    ++n;
+    int direction = 1;
+    int el_steps  = (int) round(90.0 / del_deg);
+    for (int eli = 0; eli <= el_steps && n < SCAN_MAX_TARGETS; ++eli) {
+        double el = (double) eli * del_deg;
+        if (el > 90.0) el = 90.0;
+        int n_az;
+        if (el >= 90.0 - 0.001) {
+            n_az = 1;
+        } else {
+            double cos_el = cos(el * M_PI / 180.0);
+            n_az = (int) round(360.0 / del_deg * cos_el);
+            if (n_az < 1) n_az = 1;
+        }
+        for (int i = 0; i < n_az && n < SCAN_MAX_TARGETS; ++i) {
+            int idx = (direction > 0) ? i : (n_az - 1 - i);
+            double az;
+            if (n_az == 1) {
+                az = 0.0;
+            } else {
+                az = (double) idx * 360.0 / (double) n_az;
+                if (az >= 180.0) az -= 360.0;
+            }
+            // Stay strictly inside the rotator's [-179, +179] safe window.
+            if (az <= -179.0) continue;
+            if (az >= 179.5)  az = 179.0;
+            // First sample on ring 0 is (0,0) — we already emitted it
+            // as the forced starting target; skip the dup.
+            if (eli == 0 && fabs(az) < 0.001 && n > 0
+                && g_scan_targets[0].az_deg == 0.0
+                && g_scan_targets[0].el_deg == 0.0
+                && n == 1) {
+                continue;
+            }
+            g_scan_targets[n].az_deg = az;
+            g_scan_targets[n].el_deg = el;
+            ++n;
+        }
+        direction = -direction;
+    }
+    g_scan_n_targets = n;
+    return n;
+}
+
+static void scan_csv_open(void)
+{
+    if (g_scan_csv_fp != NULL) return;
+    struct timeval tv;
+    struct tm utc;
+    if (gettimeofday(&tv, NULL) != 0 || gmtime_r(&tv.tv_sec, &utc) == NULL) {
+        return;
+    }
+    const char *dir = g_pass_folder[0] ? g_pass_folder : ".";
+    int n = snprintf(g_scan_csv_path, sizeof g_scan_csv_path,
+                     "%s/scan_sky_UT=%04d%02d%02dT%02d%02d%02dZ.csv",
+                     dir,
+                     utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                     utc.tm_hour, utc.tm_min, utc.tm_sec);
+    if (n <= 0 || (size_t) n >= sizeof g_scan_csv_path) {
+        g_scan_csv_path[0] = '\0';
+        return;
+    }
+    g_scan_csv_fp = fopen(g_scan_csv_path, "w");
+    if (g_scan_csv_fp == NULL) {
+        g_scan_csv_path[0] = '\0';
+        return;
+    }
+    fputs("# scan-sky log\n"
+          "# unix_time_ms,target_az_deg,target_el_deg,"
+          "actual_az_deg,actual_el_deg,event\n",
+          g_scan_csv_fp);
+    fflush(g_scan_csv_fp);
+}
+
+static void scan_csv_log(double tgt_az, double tgt_el,
+                          double act_az, double act_el,
+                          const char *event)
+{
+    if (g_scan_csv_fp == NULL) return;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    long long u_ms = (long long) tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+    fprintf(g_scan_csv_fp, "%lld,%.3f,%.3f,%.3f,%.3f,%s\n",
+            u_ms, tgt_az, tgt_el, act_az, act_el,
+            (event && event[0]) ? event : "");
+    fflush(g_scan_csv_fp);
+}
+
+static void scan_csv_close(void)
+{
+    if (g_scan_csv_fp != NULL) {
+        fclose(g_scan_csv_fp);
+        g_scan_csv_fp = NULL;
+    }
+}
+
+static void scan_sky_start(state_t *state)
+{
+    if (g_scan_active) return;
+    if (g_scan_n_targets == 0) scan_build_targets(g_scan_step_deg);
+    if (g_scan_n_targets == 0) return;
+    scan_csv_open();
+    g_scan_active        = 1;
+    g_scan_idx           = 0;
+    g_scan_dwell_start_s = 0.0;
+    // Make sure no concurrent satellite-tracking logic competes for
+    // the rotator.
+    state->satellite_tracking         = 0;
+    state->antenna_rotator.tracking   = 0;
+    state->antenna_rotator.flip_mode_pass     = 0;
+    state->antenna_rotator.flip_decision_made = 0;
+    state->antenna_rotator.flip_half  = 0;
+    // Command the first target via point_to_stationary_target so the
+    // two-step homing handles wraparound shortest-path correctly.
+    point_to_stationary_target(state,
+                                g_scan_targets[0].az_deg,
+                                g_scan_targets[0].el_deg);
+    {
+        char det[160];
+        snprintf(det, sizeof det,
+            "n_targets=%d step_deg=%.1f dwell_s=%.1f csv=\"%.100s\"",
+            g_scan_n_targets, g_scan_step_deg, SCAN_DWELL_S,
+            g_scan_csv_path[0] ? g_scan_csv_path : "(none)");
+        sso_audit_event("scan-sky-start", det);
+    }
+}
+
+static void scan_sky_stop(state_t *state, const char *reason)
+{
+    if (!g_scan_active) return;
+    scan_csv_log(NAN, NAN,
+                 state->antenna_rotator.azimuth,
+                 state->antenna_rotator.elevation,
+                 reason ? reason : "stop");
+    scan_csv_close();
+    int done_idx = g_scan_idx;
+    int total    = g_scan_n_targets;
+    g_scan_active        = 0;
+    g_scan_idx           = 0;
+    g_scan_dwell_start_s = 0.0;
+    {
+        char det[160];
+        snprintf(det, sizeof det,
+            "reason=\"%.60s\" completed=%d/%d",
+            reason ? reason : "?", done_idx, total);
+        sso_audit_event("scan-sky-stop", det);
+    }
+}
+
+// Drive the scan state machine. Called once per tick of the main loop
+// while g_scan_active is 1.
+static void scan_sky_tick(state_t *state, double t_now)
+{
+    if (!g_scan_active) return;
+    if (g_scan_idx >= g_scan_n_targets) {
+        scan_sky_stop(state, "complete");
+        return;
+    }
+    // Wait for the rotator to settle before dwelling.
+    if (state->antenna_rotator.antenna_is_moving) return;
+    if (g_scan_dwell_start_s <= 0.0) {
+        g_scan_dwell_start_s = t_now;
+        const scan_target_t *t = &g_scan_targets[g_scan_idx];
+        scan_csv_log(t->az_deg, t->el_deg,
+                     state->antenna_rotator.azimuth,
+                     state->antenna_rotator.elevation,
+                     "arrived");
+        return;
+    }
+    if (t_now - g_scan_dwell_start_s < SCAN_DWELL_S) return;
+    // Dwell expired — advance to the next target.
+    ++g_scan_idx;
+    g_scan_dwell_start_s = 0.0;
+    if (g_scan_idx >= g_scan_n_targets) {
+        scan_sky_stop(state, "complete");
+        return;
+    }
+    const scan_target_t *t = &g_scan_targets[g_scan_idx];
+    point_to_stationary_target(state, t->az_deg, t->el_deg);
 }
 
 void update_doppler_shifted_frequencies(state_t *state,
