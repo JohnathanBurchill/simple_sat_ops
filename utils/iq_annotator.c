@@ -49,8 +49,10 @@ extern float g_iq_annotator_pinch_delta;
 extern void  iq_annotator_install_pinch_monitor(void);
 #endif
 
+#include <ctype.h>
 #include <errno.h>
 #include <libgen.h>
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -350,6 +352,161 @@ static void parse_render_opts(const char **passthru, int n,
 // CLI usage
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// TTF font loader (pattern lifted from ~/src/ved/ui.c). Looks for the
+// bundled SourceCodePro-Regular.ttf next to the binary, in the project
+// assets/ dir, or in $XDG_DATA_HOME/simple_sat_ops/. Falls back to
+// raylib's bitmap default if none of those exist.
+// ---------------------------------------------------------------------------
+
+static Font g_ui_font;
+static int  g_ui_font_loaded = 0;
+static float g_ui_font_spacing = 1.0f;
+
+static int load_ttf_from_known_paths(void)
+{
+    const char *home = getenv("HOME");
+    char candidates[6][1024];
+    int n = 0;
+    const char *xdg = getenv("XDG_DATA_HOME");
+    if (xdg && xdg[0]) {
+        snprintf(candidates[n++], sizeof candidates[0],
+                 "%s/simple_sat_ops/SourceCodePro-Regular.ttf", xdg);
+    }
+    if (home && home[0]) {
+        snprintf(candidates[n++], sizeof candidates[0],
+                 "%s/.local/share/simple_sat_ops/"
+                 "SourceCodePro-Regular.ttf", home);
+        snprintf(candidates[n++], sizeof candidates[0],
+                 "%s/src/simple_sat_ops/assets/"
+                 "SourceCodePro-Regular.ttf", home);
+    }
+    snprintf(candidates[n++], sizeof candidates[0],
+             "assets/SourceCodePro-Regular.ttf");
+    snprintf(candidates[n++], sizeof candidates[0],
+             "../assets/SourceCodePro-Regular.ttf");
+    for (int i = 0; i < n; ++i) {
+        if (FileExists(candidates[i])) {
+            g_ui_font = LoadFontEx(candidates[i], 48, NULL, 0);
+            if (g_ui_font.texture.id != 0) {
+                SetTextureFilter(g_ui_font.texture,
+                                 TEXTURE_FILTER_BILINEAR);
+                fprintf(stderr,
+                    "iq_annotator: loaded font %s\n", candidates[i]);
+                return 1;
+            }
+        }
+    }
+    fprintf(stderr,
+        "iq_annotator: TTF font not found; using raylib default\n");
+    return 0;
+}
+
+static void draw_text(const char *s, int x, int y, int size, Color c)
+{
+    if (g_ui_font_loaded) {
+        DrawTextEx(g_ui_font, s, (Vector2){ (float)x, (float)y },
+                   (float)size, g_ui_font_spacing, c);
+    } else {
+        DrawText(s, x, y, size, c);
+    }
+}
+
+static int measure_text(const char *s, int size)
+{
+    if (g_ui_font_loaded) {
+        return (int) MeasureTextEx(g_ui_font, s,
+                                   (float)size, g_ui_font_spacing).x;
+    }
+    return MeasureText(s, size);
+}
+
+// Pick how many decimals to show on a seconds label given the
+// tick step (or the resolution of interest). Range: 0 (whole-second
+// ticks) up to 7 (~100 ns precision — well below the 96 kSPS sample
+// period at extreme zoom).
+static int decimals_for_step(double step_s)
+{
+    if (!isfinite(step_s) || step_s <= 0.0) return 3;
+    if (step_s >= 0.5)        return 0;
+    if (step_s >= 0.05)       return 1;
+    if (step_s >= 0.005)      return 2;
+    if (step_s >= 0.0005)     return 3;
+    if (step_s >= 0.00005)    return 4;
+    if (step_s >= 0.000005)   return 5;
+    if (step_s >= 0.0000005)  return 6;
+    return 7;
+}
+
+// Format seconds as mm:ss.<n decimals>.
+static void fmt_mmss_ndec(double t_s, int nd, char *buf, size_t cap)
+{
+    if (!isfinite(t_s)) {
+        snprintf(buf, cap, "--:--%s%.*s",
+                 nd > 0 ? "." : "", nd, "-------");
+        return;
+    }
+    if (nd < 0) nd = 0;
+    if (nd > 7) nd = 7;
+    int sign = (t_s < 0.0) ? -1 : +1;
+    double abs_s = fabs(t_s);
+    int mm = (int)(abs_s / 60.0);
+    double rem = abs_s - mm * 60.0;
+    // Width: 2 digits + '.' + nd decimals when nd > 0, else 2.
+    int width = (nd > 0) ? (3 + nd) : 2;
+    snprintf(buf, cap, "%s%02d:%0*.*f",
+             sign < 0 ? "-" : "", mm, width, nd, rem);
+}
+
+// Backwards-compatible mm:ss.sss (3 decimals) wrapper used where the
+// caller doesn't know an appropriate step size — e.g. the box-info
+// status line, where the box duration drives the precision (computed
+// below at the call site).
+static void fmt_mmss_ms(double t_s, char *buf, size_t cap)
+{
+    fmt_mmss_ndec(t_s, 3, buf, cap);
+}
+
+// ---------------------------------------------------------------------------
+// IQ-sample buffer. The whole .iq file is mmap'd or read into memory
+// once so the waveform panel can slice into it for any selected box
+// without re-reading the file.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    int16_t *samples;     // interleaved I,Q (2 int16 per pair)
+    size_t   n_pairs;
+    int      samp_rate;
+} iq_buf_t;
+
+static int iq_buf_load(iq_buf_t *b, const char *path, int samp_rate)
+{
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) {
+        fprintf(stderr, "iq_annotator: open %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz <= 0) { fclose(fp); return -1; }
+    b->samples = (int16_t *) malloc((size_t) sz);
+    if (b->samples == NULL) { fclose(fp); return -1; }
+    if (fread(b->samples, 1, (size_t) sz, fp) != (size_t) sz) {
+        fclose(fp); free(b->samples); b->samples = NULL; return -1;
+    }
+    fclose(fp);
+    b->n_pairs   = (size_t) sz / 4;
+    b->samp_rate = samp_rate;
+    return 0;
+}
+
+static void iq_buf_free(iq_buf_t *b)
+{
+    free(b->samples); b->samples = NULL; b->n_pairs = 0;
+}
+
 static void usage(void)
 {
     fprintf(stderr,
@@ -460,20 +617,65 @@ int main(int argc, char **argv)
 #ifdef __APPLE__
     iq_annotator_install_pinch_monitor();
 #endif
+    g_ui_font_loaded = load_ttf_from_known_paths();
+
+    // Load the raw IQ samples once — the waveform panel slices into
+    // this buffer for any selected box. Half a gig is fine on modern
+    // hardware and avoids per-zoom file I/O.
+    iq_buf_t iqb = {0};
+    if (iq_buf_load(&iqb, iq_path, samp_rate) != 0) {
+        fprintf(stderr,
+            "iq_annotator: failed to load %s for waveform panel\n",
+            iq_path);
+    } else {
+        fprintf(stderr,
+            "iq_annotator: IQ buffer loaded (%zu pairs)\n",
+            iqb.n_pairs);
+    }
 
     Image img = LoadImage(png_path);
     if (img.data == NULL) {
         fprintf(stderr, "iq_annotator: LoadImage failed: %s\n", png_path);
         CloseWindow(); return 1;
     }
-    Texture2D tex = LoadTextureFromImage(img);
-    if (tex.id == 0) {
-        fprintf(stderr, "iq_annotator: LoadTextureFromImage failed\n");
-        UnloadImage(img); CloseWindow(); return 1;
-    }
     int img_w = img.width;
     int img_h = img.height;
+
+    // GL drivers cap texture dimensions (8K-16K on common GPUs); a
+    // huge --rows produces a PNG taller than that and the upload
+    // silently fails ("texture unloadable"). Slice the PNG into
+    // TILE_H-tall row tiles, each uploaded as its own texture, and
+    // composite at draw time. With TILE_H = 4096, even --rows=131072
+    // is fine (32 tiles × ~15 MB on a 1228-px-wide PNG).
+    const int TILE_H = 4096;
+    int n_tiles = (img_h + TILE_H - 1) / TILE_H;
+    Texture2D *tiles = (Texture2D *) calloc((size_t) n_tiles,
+                                            sizeof(Texture2D));
+    if (tiles == NULL) {
+        fprintf(stderr, "iq_annotator: oom on tile array\n");
+        UnloadImage(img); CloseWindow(); return 1;
+    }
+    for (int t = 0; t < n_tiles; ++t) {
+        int y0  = t * TILE_H;
+        int h   = (y0 + TILE_H <= img_h) ? TILE_H : (img_h - y0);
+        Image sub = ImageFromImage(img, (Rectangle){0, (float) y0,
+                                                     (float) img_w,
+                                                     (float) h});
+        tiles[t] = LoadTextureFromImage(sub);
+        UnloadImage(sub);
+        if (tiles[t].id == 0) {
+            fprintf(stderr,
+                "iq_annotator: tile %d upload failed (%dx%d)\n",
+                t, img_w, h);
+        } else {
+            // Point filtering keeps cells crisp at extreme zoom.
+            SetTextureFilter(tiles[t], TEXTURE_FILTER_POINT);
+        }
+    }
     UnloadImage(img);
+    fprintf(stderr,
+        "iq_annotator: PNG split into %d tile(s) of up to %d rows\n",
+        n_tiles, TILE_H);
 
     int spec_w = img_w - WF_LM - WF_RM;
     int spec_h = img_h - WF_TM - WF_BM;
@@ -481,7 +683,11 @@ int main(int argc, char **argv)
         fprintf(stderr,
             "iq_annotator: rendered image too small (%dx%d)\n",
             img_w, img_h);
-        UnloadTexture(tex); CloseWindow(); return 1;
+        for (int t = 0; t < n_tiles; ++t) {
+            if (tiles[t].id != 0) UnloadTexture(tiles[t]);
+        }
+        free(tiles);
+        CloseWindow(); return 1;
     }
 
     double display_bw_hz = (ropts.zoom_khz > 0.0)
@@ -506,10 +712,32 @@ int main(int argc, char **argv)
     float zoom    = 1.0f;
     float view_x  = 0.0f;     // image pixel at screen x=0
     float view_y  = 0.0f;     // image pixel at screen y=0
-    int   dragging = 0;
+    int   dragging = 0;       // 1 = drawing a new box
     Vector2 drag_start = {0, 0};
     char  status[256] = "";
     int   label_cycle_idx = 0;
+
+    // Drag-to-resize state. `resize_box` = box index being resized, or
+    // -1 if no resize in progress. `resize_edge_x/y` are -1, 0, +1 to
+    // mean "drag the low side / no drag / drag the high side" of that
+    // axis. (1,0) → right edge; (-1,-1) → top-left corner; etc.
+    int resize_box   = -1;
+    int resize_edge_x = 0;
+    int resize_edge_y = 0;
+    // Edge-grab tolerance in screen pixels.
+    const int HIT_TOL = 8;
+    // Label font size — large enough to read at typical viewing
+    // distance over the spectrogram colours.
+    const int LABEL_PT = 16;
+    const int STATUS_PT = 14;
+
+    // Waveform-panel state: toggle with W. When on, the bottom 240 px
+    // of the window become an I/Q time-series plot of the time range
+    // currently visible in the spectrogram above. The panel has no
+    // independent zoom / pan — pinch / scroll on the spectrogram move
+    // both the waterfall and the time-series in lockstep.
+    int   wf_open       = 0;
+    int   wf_panel_h    = 240;
 
     while (!WindowShouldClose()) {
         int sw = GetScreenWidth();
@@ -517,34 +745,39 @@ int main(int argc, char **argv)
         Vector2 m = GetMousePosition();
 
         // ----- input -----
-        // Trackpad pinch → zoom centred on cursor. NSEvent.magnification
-        // accumulates per-event deltas in [-1, +1]; convert to a
-        // multiplicative zoom factor via exp() so successive pinches
-        // compose smoothly. raylib/GLFW drop magnify events, so we
-        // pull the accumulated delta from the macOS-side global.
+        // Capture pinch + wheel ONCE per frame so we can route them
+        // to whichever panel the cursor is over.
         float pinch = 0.0f;
 #ifdef __APPLE__
         pinch = g_iq_annotator_pinch_delta;
         g_iq_annotator_pinch_delta = 0.0f;
 #endif
-        if (pinch != 0.0f) {
+        Vector2 wheel_v = GetMouseWheelMoveV();
+        int in_panel_for_input =
+            wf_open && (int) m.y >= sh - wf_panel_h && (int) m.y < sh;
+
+        // Spectrogram-view pinch/scroll (only when cursor is NOT
+        // in the waveform panel — the panel uses identical input
+        // semantics but applies to its own time-zoom/pan state).
+        if (!in_panel_for_input && pinch != 0.0f) {
             float img_x_under = view_x + m.x / zoom;
             float img_y_under = view_y + m.y / zoom;
             float new_zoom = zoom * expf(pinch);
-            if (new_zoom < 0.1f)  new_zoom = 0.1f;
-            if (new_zoom > 32.0f) new_zoom = 32.0f;
+            // Allow extreme zoom — enough that the waveform panel
+            // (which mirrors the spec view's visible time range) can
+            // reach the bit level (~10 samples at 96 kSPS). At a
+            // 4096-row render of a 784-s pass, one image row covers
+            // ~0.19 s; to show 10 samples (~0.1 ms) needs roughly
+            // 5×10⁴–10⁵× zoom. We cap at 1e6 to leave headroom and
+            // avoid FP precision issues in the view-coord math.
+            if (new_zoom < 0.1f)        new_zoom = 0.1f;
+            if (new_zoom > 1.0e6f)      new_zoom = 1.0e6f;
             zoom = new_zoom;
             view_x = img_x_under - m.x / zoom;
             view_y = img_y_under - m.y / zoom;
         }
-        // Two-finger scroll (trackpad) or mouse wheel → pan. Vertical
-        // wheel pans the y-axis; horizontal wheel pans x. macOS sends
-        // both axes via GetMouseWheelMoveV.
-        Vector2 wheel_v = GetMouseWheelMoveV();
-        if (wheel_v.x != 0.0f || wheel_v.y != 0.0f) {
-            // Sign: wheel.y > 0 = scroll up. We want scroll-up to
-            // reveal earlier rows (move view UP), which means
-            // view_y decreasing.
+        if (!in_panel_for_input
+            && (wheel_v.x != 0.0f || wheel_v.y != 0.0f)) {
             view_x -= wheel_v.x * 12.0f / zoom;
             view_y -= wheel_v.y * 12.0f / zoom;
         }
@@ -588,6 +821,12 @@ int main(int argc, char **argv)
             boxes_load(&boxes, iq_path);
             snprintf(status, sizeof status, "loaded %d box(es)", boxes.n);
         }
+        if (IsKeyPressed(KEY_W)) {
+            wf_open = !wf_open;
+            snprintf(status, sizeof status,
+                "waveform panel %s (follows spectrogram time range)",
+                wf_open ? "ON" : "OFF");
+        }
         if (IsKeyPressed(KEY_Q)) break;
 
         // Cursor → image px → (t, f).
@@ -595,8 +834,14 @@ int main(int argc, char **argv)
         float img_y_f = view_y + m.y / zoom;
         int   img_x   = (int) img_x_f;
         int   img_y   = (int) img_y_f;
+        // When the waveform panel is open, exclude its area from
+        // "in_spec" so clicks/drags in the panel don't also drive
+        // box drawing / selection / resize on the spectrogram above.
+        int   in_panel_now =
+            wf_open && (int) m.y >= sh - wf_panel_h && (int) m.y < sh;
         int   in_spec = (img_x >= WF_LM && img_x < WF_LM + spec_w
-                      && img_y >= WF_TM && img_y < WF_TM + spec_h);
+                      && img_y >= WF_TM && img_y < WF_TM + spec_h
+                      && !in_panel_now);
         double cursor_t = 0.0, cursor_f = 0.0;
         if (in_spec) {
             double col_frac = (img_x_f - WF_LM) / (double) spec_w;
@@ -655,8 +900,65 @@ int main(int argc, char **argv)
             }
         }
 
+        // Edge / corner hit test on the hovered box. Reports which
+        // sides are within HIT_TOL screen-pixels of the cursor, so a
+        // click on the edge starts a resize-drag instead of a select.
+        int edge_hit_x = 0;  // -1 left, +1 right, 0 none
+        int edge_hit_y = 0;  // -1 top,  +1 bottom, 0 none
+        if (hovered >= 0) {
+            const box_t *b = &boxes.items[hovered];
+            int x0_img = WF_LM + (int)(((b->f_lo_hz / display_bw_hz) + 0.5) * spec_w);
+            int x1_img = WF_LM + (int)(((b->f_hi_hz / display_bw_hz) + 0.5) * spec_w);
+            int y0_img = WF_TM + (int)((1.0 - b->t0_s / duration_s) * spec_h);
+            int y1_img = WF_TM + (int)((1.0 - b->t1_s / duration_s) * spec_h);
+            int xL = (x0_img < x1_img) ? x0_img : x1_img;
+            int xR = (x0_img < x1_img) ? x1_img : x0_img;
+            int yT = (y0_img < y1_img) ? y0_img : y1_img;
+            int yB = (y0_img < y1_img) ? y1_img : y0_img;
+            int sx_l = (int)((xL - view_x) * zoom);
+            int sx_r = (int)((xR - view_x) * zoom);
+            int sy_t = (int)((yT - view_y) * zoom);
+            int sy_b = (int)((yB - view_y) * zoom);
+            if (abs((int) m.x - sx_l) <= HIT_TOL) edge_hit_x = -1;
+            else if (abs((int) m.x - sx_r) <= HIT_TOL) edge_hit_x = +1;
+            if (abs((int) m.y - sy_t) <= HIT_TOL) edge_hit_y = -1;
+            else if (abs((int) m.y - sy_b) <= HIT_TOL) edge_hit_y = +1;
+        }
+        // Mouse-cursor feedback for the hit kind.
+        if (resize_box >= 0) {
+            int ax = (resize_edge_x != 0), ay = (resize_edge_y != 0);
+            if (ax && ay)      SetMouseCursor(MOUSE_CURSOR_RESIZE_NWSE);
+            else if (ax)       SetMouseCursor(MOUSE_CURSOR_RESIZE_EW);
+            else if (ay)       SetMouseCursor(MOUSE_CURSOR_RESIZE_NS);
+            else               SetMouseCursor(MOUSE_CURSOR_DEFAULT);
+        } else if (hovered >= 0 && (edge_hit_x || edge_hit_y)) {
+            int diag = (edge_hit_x != 0 && edge_hit_y != 0);
+            // ↘ for TL+BR, ↗ for TR+BL — raylib only ships NWSE/NESW.
+            int nwse = diag && ((edge_hit_x == -1 && edge_hit_y == -1)
+                              || (edge_hit_x == +1 && edge_hit_y == +1));
+            if (diag) SetMouseCursor(nwse ? MOUSE_CURSOR_RESIZE_NWSE
+                                          : MOUSE_CURSOR_RESIZE_NESW);
+            else if (edge_hit_x != 0) SetMouseCursor(MOUSE_CURSOR_RESIZE_EW);
+            else                      SetMouseCursor(MOUSE_CURSOR_RESIZE_NS);
+        } else {
+            SetMouseCursor(MOUSE_CURSOR_DEFAULT);
+        }
+
         if (in_spec && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-            if (hovered >= 0) {
+            if (hovered >= 0 && (edge_hit_x || edge_hit_y)) {
+                // Start resize drag.
+                resize_box    = hovered;
+                resize_edge_x = edge_hit_x;
+                resize_edge_y = edge_hit_y;
+                boxes.selected = hovered;
+                snprintf(status, sizeof status,
+                    "resizing box %d (%s%s)",
+                    hovered,
+                    edge_hit_y < 0 ? "top"   : edge_hit_y > 0 ? "bottom" : "",
+                    edge_hit_x < 0 ? (edge_hit_y ? "-left"  : "left")
+                                   : edge_hit_x > 0 ? (edge_hit_y ? "-right" : "right")
+                                                    : "");
+            } else if (hovered >= 0) {
                 boxes.selected = hovered;
                 const box_t *b = &boxes.items[hovered];
                 snprintf(status, sizeof status,
@@ -668,6 +970,32 @@ int main(int argc, char **argv)
                 drag_start = m;
                 boxes.selected = -1;
             }
+        }
+        // Live update during resize drag.
+        if (resize_box >= 0 && IsMouseButtonDown(MOUSE_LEFT_BUTTON) && in_spec) {
+            box_t *b = &boxes.items[resize_box];
+            float ix = view_x + m.x / zoom;
+            float iy = view_y + m.y / zoom;
+            double col_frac = (ix - WF_LM) / (double) spec_w;
+            double row_frac_top = (iy - WF_TM) / (double) spec_h;
+            double t_at = (1.0 - row_frac_top) * duration_s;
+            double f_at = (col_frac - 0.5) * display_bw_hz;
+            // Box is stored as (t0_s, t1_s) — order isn't normalised
+            // here; we adjust the EDGE the user grabbed. After release
+            // we re-normalise so t0_s ≤ t1_s, f_lo_hz ≤ f_hi_hz.
+            if (resize_edge_x == -1) b->f_lo_hz = f_at;
+            else if (resize_edge_x == +1) b->f_hi_hz = f_at;
+            if (resize_edge_y == -1) b->t1_s = t_at;  // top edge = later t
+            else if (resize_edge_y == +1) b->t0_s = t_at;  // bottom = earlier t
+        }
+        if (resize_box >= 0 && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
+            box_normalize(&boxes.items[resize_box]);
+            snprintf(status, sizeof status,
+                "resized box %d (t=%.3f..%.3fs, f=%.0f..%.0f Hz)",
+                resize_box,
+                boxes.items[resize_box].t0_s, boxes.items[resize_box].t1_s,
+                boxes.items[resize_box].f_lo_hz, boxes.items[resize_box].f_hi_hz);
+            resize_box = -1; resize_edge_x = 0; resize_edge_y = 0;
         }
         if (dragging && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
             dragging = 0;
@@ -713,25 +1041,44 @@ int main(int argc, char **argv)
         BeginDrawing();
         ClearBackground(BLACK);
 
-        // Draw the PNG: source = (view_x, view_y, visible_w, visible_h);
-        // dest = the whole window. Clamp source to image bounds so we
-        // don't sample undefined texels.
+        // Draw the PNG by tile. Each tile covers TILE_H rows of the
+        // image (yielding sub-textures small enough to stay under the
+        // GPU's max texture size); composite the visible portion of
+        // each tile that intersects the view.
         float src_w_clamped = (view_x + visible_w > img_w)
             ? (img_w - view_x) : visible_w;
-        float src_h_clamped = (view_y + visible_h > img_h)
-            ? (img_h - view_y) : visible_h;
         if (src_w_clamped < 0) src_w_clamped = 0;
-        if (src_h_clamped < 0) src_h_clamped = 0;
-        Rectangle src = {
-            .x = view_x, .y = view_y,
-            .width = src_w_clamped, .height = src_h_clamped,
-        };
-        Rectangle dst = {
-            .x = 0, .y = 0,
-            .width  = src_w_clamped * zoom,
-            .height = src_h_clamped * zoom,
-        };
-        DrawTexturePro(tex, src, dst, (Vector2){0, 0}, 0.0f, WHITE);
+        double view_y_top = view_y;
+        double view_y_bot = view_y + visible_h;
+        if (view_y_bot > img_h) view_y_bot = img_h;
+        int t_first = (int)(view_y_top / TILE_H);
+        int t_last  = (int)((view_y_bot - 1) / TILE_H);
+        if (t_first < 0)         t_first = 0;
+        if (t_last  >= n_tiles)  t_last  = n_tiles - 1;
+        for (int t = t_first; t <= t_last; ++t) {
+            if (tiles[t].id == 0) continue;
+            int tile_y_img = t * TILE_H;
+            int tile_h     = (tile_y_img + TILE_H <= img_h)
+                             ? TILE_H : (img_h - tile_y_img);
+            double vis_top_img = (view_y_top > tile_y_img)
+                                 ? view_y_top : (double) tile_y_img;
+            double vis_bot_img = (view_y_bot < tile_y_img + tile_h)
+                                 ? view_y_bot : (double)(tile_y_img + tile_h);
+            if (vis_bot_img <= vis_top_img) continue;
+            Rectangle src = {
+                .x = (float) view_x,
+                .y = (float)(vis_top_img - tile_y_img),
+                .width  = src_w_clamped,
+                .height = (float)(vis_bot_img - vis_top_img),
+            };
+            Rectangle dst = {
+                .x = 0.0f,
+                .y = (float)((vis_top_img - view_y_top) * zoom),
+                .width  = src_w_clamped * zoom,
+                .height = (float)((vis_bot_img - vis_top_img) * zoom),
+            };
+            DrawTexturePro(tiles[t], src, dst, (Vector2){0, 0}, 0.0f, WHITE);
+        }
 
         // Boxes: (t, f) → image px → screen px = (img_px - view_xy) * zoom.
         for (int i = 0; i < boxes.n; ++i) {
@@ -760,7 +1107,9 @@ int main(int argc, char **argv)
             DrawRectangleLinesEx(r, (float) thickness, col);
             char tag[64];
             snprintf(tag, sizeof tag, "%d:%s", i, b->label);
-            DrawText(tag, x_lo + 2, y_lo - 12, 10, col);
+            int label_y = y_lo - (LABEL_PT + 2);
+            if (label_y < 2) label_y = y_lo + 2;
+            draw_text(tag, x_lo + 4, label_y, LABEL_PT, col);
         }
 
         // Ongoing drag rectangle (in screen space — drag_start was a
@@ -774,29 +1123,271 @@ int main(int argc, char **argv)
             DrawRectangleLines(x_lo, y_lo, x_hi - x_lo, y_hi - y_lo, RED);
         }
 
-        // Status bar.
-        int bar_h = 24;
-        DrawRectangle(0, sh - bar_h, sw, bar_h, (Color){0, 0, 0, 200});
+        // ----- waveform panel (toggle W) -----
+        // Reserves the bottom wf_panel_h pixels of the window. Inside
+        // the panel, the mouse wheel zooms the time-axis (centred on
+        // cursor) and click-drag pans. Outside the panel, those inputs
+        // still drive the spectrogram view above. We process panel
+        // input AFTER spectrogram input (the panel input handlers
+        // overwrite the spectrogram-input view changes for mouse
+        // events whose y is in the panel).
+        int wf_y0 = sh - wf_panel_h;
+        // The waveform panel shows whatever time range is visible in
+        // the spectrogram above. Convert the spec view's screen y-range
+        // to a time range using gen_waterfall's row mapping:
+        //   image_row = WF_TM + (spec_h - 1 - spec_row)
+        //   t         = spec_row / spec_h * duration_s
+        // Screen y=0 maps to image_y = view_y; screen y=bar_top maps to
+        // image_y = view_y + bar_top/zoom.
+        int bar_h_for_wf = 2 * (STATUS_PT + 6);
+        int spec_bot_y_screen =
+            (wf_open ? wf_y0 : (sh - bar_h_for_wf));
+        double img_y_top = (double) view_y;
+        double img_y_bot = (double) view_y
+                         + (double) spec_bot_y_screen / (double) zoom;
+        // Top of view = NEWEST visible time; bottom = OLDEST.
+        double spec_row_at_top = (double) WF_TM + (double) spec_h - 1.0 - img_y_top;
+        double spec_row_at_bot = (double) WF_TM + (double) spec_h - 1.0 - img_y_bot;
+        if (spec_row_at_top > spec_h - 1) spec_row_at_top = spec_h - 1;
+        if (spec_row_at_bot < 0)          spec_row_at_bot = 0;
+        double wf_t_lo = spec_row_at_bot / (double) spec_h * duration_s;
+        double wf_t_hi = spec_row_at_top / (double) spec_h * duration_s;
+        if (wf_t_hi < wf_t_lo) {
+            double tmp = wf_t_lo; wf_t_lo = wf_t_hi; wf_t_hi = tmp;
+        }
+        // Box-info status line content.
+        char box_info[256] = "";
+        int  box_for_status = (boxes.selected >= 0) ? boxes.selected : hovered;
+        if (box_for_status >= 0 && box_for_status < boxes.n) {
+            const box_t *b = &boxes.items[box_for_status];
+            double dt   = b->t1_s - b->t0_s;
+            double dbw  = (b->f_hi_hz - b->f_lo_hz);
+            // Pick fractional-second precision from the box DURATION:
+            // a 10 ms box gets 4 decimals; a 10 µs box gets 7. The
+            // duration field shows the same precision.
+            int nd = decimals_for_step(fabs(dt) / 10.0);
+            if (nd < 3) nd = 3;
+            char ts0[32], ts1[32];
+            fmt_mmss_ndec(b->t0_s, nd, ts0, sizeof ts0);
+            fmt_mmss_ndec(b->t1_s, nd, ts1, sizeof ts1);
+            snprintf(box_info, sizeof box_info,
+                "box %d [%s]  t %s -> %s  (%.*f s)   f %+.0f -> %+.0f Hz  (%.2f kHz)",
+                box_for_status, b->label,
+                ts0, ts1, nd, dt,
+                b->f_lo_hz, b->f_hi_hz, dbw / 1000.0);
+        }
+
+        // Status bar — two lines now: top = box info, bottom = cursor
+        // / keys / status messages.
+        int bar_h = 2 * (STATUS_PT + 6);
+        DrawRectangle(0, sh - bar_h, sw, bar_h, (Color){0, 0, 0, 210});
+        if (box_info[0]) {
+            draw_text(box_info, 6, sh - bar_h + 4, STATUS_PT,
+                      (boxes.selected >= 0 && boxes.selected == box_for_status)
+                        ? YELLOW : ORANGE);
+        }
         char info[512];
         if (in_spec) {
             snprintf(info, sizeof info,
-                "cursor t=%.3fs  f=%+.0f Hz   zoom=%.2fx   hover=%d sel=%d   keys: drag=new pinch=zoom scroll=pan T=label S=save L=load 0=reset Del=del-hover Q=quit",
-                cursor_t, cursor_f, (double) zoom, hovered, boxes.selected);
+                "cursor t=%.3fs  f=%+.0f Hz  zoom=%.2fx  boxes=%d  hover=%d sel=%d  | drag=new pinch=zoom scroll=pan W=waveform T=label S=save L=load 0=reset Del=del-hover Q=quit",
+                cursor_t, cursor_f, (double) zoom,
+                boxes.n, hovered, boxes.selected);
         } else {
             snprintf(info, sizeof info,
-                "zoom=%.2fx   boxes=%d   keys: drag=new pinch=zoom scroll=pan T=label S=save L=load 0=reset Del=del-hover Q=quit",
+                "zoom=%.2fx  boxes=%d  | drag=new pinch=zoom scroll=pan W=waveform T=label S=save L=load 0=reset Del=del-hover Q=quit",
                 (double) zoom, boxes.n);
         }
-        DrawText(info, 6, sh - bar_h + 6, 11, LIGHTGRAY);
+        draw_text(info, 6, sh - bar_h + STATUS_PT + 8, STATUS_PT, LIGHTGRAY);
         if (status[0]) {
-            int tw = MeasureText(status, 11);
-            DrawText(status, sw - tw - 8, sh - bar_h + 6, 11, YELLOW);
+            int tw = measure_text(status, STATUS_PT);
+            draw_text(status, sw - tw - 8,
+                      sh - bar_h + STATUS_PT + 8, STATUS_PT, YELLOW);
+        }
+
+        // ----- waveform panel rendering (above the status bar) -----
+        // Time range is derived from the spectrogram view above (see
+        // wf_t_lo / wf_t_hi computed earlier this frame). The panel
+        // has no independent zoom/pan — pinch & scroll on the
+        // spectrogram move both views together.
+        if (wf_open && iqb.samples != NULL) {
+            // Background.
+            DrawRectangle(0, wf_y0, sw, wf_panel_h, (Color){15, 15, 20, 230});
+            DrawLine(0, wf_y0, sw, wf_y0, GRAY);
+
+            // Layout inside the panel — bigger margins so the larger
+            // TTF labels fit.
+            int pL = 96, pR = 8, pT = 6, pB = 52;
+            int plot_x0 = pL;
+            int plot_x1 = sw - pR;
+            int plot_y0 = wf_y0 + pT;
+            int plot_y1 = sh - bar_h - pB;
+            int plot_w  = plot_x1 - plot_x0;
+            int plot_h  = plot_y1 - plot_y0;
+            if (plot_w > 16 && plot_h > 16 && wf_t_hi > wf_t_lo) {
+                // Sample bounds.
+                int64_t i_lo = (int64_t)(wf_t_lo * iqb.samp_rate);
+                int64_t i_hi = (int64_t)(wf_t_hi * iqb.samp_rate);
+                if (i_lo < 0) i_lo = 0;
+                if (i_hi > (int64_t) iqb.n_pairs) i_hi = iqb.n_pairs;
+                int64_t n_pairs_vis = i_hi - i_lo;
+
+                // Find the magnitude scale (auto). Take the max |I|,|Q|.
+                int amp_max = 1;
+                if (n_pairs_vis > 0) {
+                    int64_t step = (n_pairs_vis > 4096)
+                        ? n_pairs_vis / 2048 : 1;
+                    for (int64_t k = i_lo; k < i_hi; k += step) {
+                        int I = iqb.samples[k * 2 + 0];
+                        int Q = iqb.samples[k * 2 + 1];
+                        if (abs(I) > amp_max) amp_max = abs(I);
+                        if (abs(Q) > amp_max) amp_max = abs(Q);
+                    }
+                }
+                if (amp_max < 32) amp_max = 32;
+
+                // Centre amp axis on 0; one tick per integer 1/4 of scale.
+                DrawLine(plot_x0, plot_y0 + plot_h/2,
+                         plot_x1, plot_y0 + plot_h/2,
+                         (Color){50, 50, 60, 255});
+                for (int k = -2; k <= 2; ++k) {
+                    int y = plot_y0 + plot_h/2 - (k * plot_h / 4);
+                    DrawLine(plot_x0 - 4, y, plot_x0, y, GRAY);
+                    char buf[24];
+                    snprintf(buf, sizeof buf, "%+d",
+                             (int)(k * amp_max / 2));
+                    const int AMP_PT = 28;
+                    int tw = measure_text(buf, AMP_PT);
+                    draw_text(buf, plot_x0 - 6 - tw, y - AMP_PT/2,
+                              AMP_PT, GRAY);
+                }
+
+                // Time-axis ticks.
+                double span = wf_t_hi - wf_t_lo;
+                double raw_step = span / 6.0;
+                double mag = pow(10.0, floor(log10(raw_step)));
+                double mul = raw_step / mag;
+                if      (mul < 1.5) mul = 1.0;
+                else if (mul < 3.5) mul = 2.0;
+                else if (mul < 7.5) mul = 5.0;
+                else                mul = 10.0;
+                double step = mul * mag;
+                double t0_aligned = ceil(wf_t_lo / step) * step;
+                const int T_PT = 28;
+                // Fractional-second precision scales with the tick
+                // step so labels at deep zoom can read sub-millisecond.
+                int t_nd = decimals_for_step(step);
+                for (double t = t0_aligned; t <= wf_t_hi + 0.5*step; t += step) {
+                    int x = plot_x0
+                          + (int)((t - wf_t_lo) / span * plot_w);
+                    if (x < plot_x0 || x > plot_x1) continue;
+                    DrawLine(x, plot_y1, x, plot_y1 + 6, GRAY);
+                    char buf[40];
+                    fmt_mmss_ndec(t, t_nd, buf, sizeof buf);
+                    int tw = measure_text(buf, T_PT);
+                    draw_text(buf, x - tw/2, plot_y1 + 8, T_PT, GRAY);
+                }
+
+                // Draw the waveforms. Decimate when n_pairs_vis > plot_w
+                // by taking per-column min/max (so individual bit
+                // transitions stay visible).
+                if (n_pairs_vis > 0) {
+                    int mid_y = plot_y0 + plot_h / 2;
+                    float y_scale = (float) plot_h / 2.0f / (float) amp_max;
+                    if (n_pairs_vis <= (int64_t) plot_w * 2) {
+                        // Point/line plot for sparse data.
+                        int prev_xi = -1, prev_yi = 0, prev_xq = -1, prev_yq = 0;
+                        for (int64_t k = i_lo; k < i_hi; ++k) {
+                            double t = (double) k / iqb.samp_rate;
+                            int x = plot_x0
+                                  + (int)((t - wf_t_lo) / span * plot_w);
+                            if (x < plot_x0 || x > plot_x1) continue;
+                            int yI = mid_y - (int)(iqb.samples[k*2+0] * y_scale);
+                            int yQ = mid_y - (int)(iqb.samples[k*2+1] * y_scale);
+                            // Underlay Q in violet first, I in cyan on top.
+                            if (prev_xq >= 0)
+                                DrawLine(prev_xq, prev_yq, x, yQ, (Color){200,90,220,200});
+                            if (prev_xi >= 0)
+                                DrawLine(prev_xi, prev_yi, x, yI, (Color){80,200,220,255});
+                            prev_xi = x; prev_yi = yI;
+                            prev_xq = x; prev_yq = yQ;
+                        }
+                    } else {
+                        // Per-column min/max for dense data.
+                        for (int x = 0; x < plot_w; ++x) {
+                            int64_t s0 = i_lo + (int64_t) x * n_pairs_vis / plot_w;
+                            int64_t s1 = i_lo + (int64_t)(x+1) * n_pairs_vis / plot_w;
+                            if (s1 <= s0) s1 = s0 + 1;
+                            if (s1 > i_hi) s1 = i_hi;
+                            int iMin =  INT_MAX, iMax = INT_MIN;
+                            int qMin =  INT_MAX, qMax = INT_MIN;
+                            for (int64_t k = s0; k < s1; ++k) {
+                                int I = iqb.samples[k*2+0];
+                                int Q = iqb.samples[k*2+1];
+                                if (I < iMin) iMin = I;
+                                if (I > iMax) iMax = I;
+                                if (Q < qMin) qMin = Q;
+                                if (Q > qMax) qMax = Q;
+                            }
+                            int xpx = plot_x0 + x;
+                            DrawLine(xpx, mid_y - (int)(qMax * y_scale),
+                                     xpx, mid_y - (int)(qMin * y_scale),
+                                     (Color){200,90,220,160});
+                            DrawLine(xpx, mid_y - (int)(iMax * y_scale),
+                                     xpx, mid_y - (int)(iMin * y_scale),
+                                     (Color){80,200,220,220});
+                        }
+                    }
+                }
+
+                // Border around plot.
+                DrawRectangleLines(plot_x0, plot_y0,
+                                   plot_w, plot_h, DARKGRAY);
+
+                // Cursor indicator: short upward-pointing arrow on the
+                // time axis at the spectrogram cursor's time position,
+                // so the operator can see where the mouse over the
+                // waterfall above maps into the waveform below. Only
+                // drawn while the cursor is in the spectrogram and its
+                // time falls inside the panel's visible window.
+                if (in_spec
+                    && cursor_t >= wf_t_lo - 1e-12
+                    && cursor_t <= wf_t_hi + 1e-12) {
+                    int cx = plot_x0
+                           + (int)((cursor_t - wf_t_lo) / span * plot_w);
+                    if (cx >= plot_x0 && cx <= plot_x1) {
+                        // Triangle: tip up (apex INSIDE plot, base on
+                        // the axis line below). 10 px tall × 12 px wide.
+                        Vector2 apex = {(float) cx, (float)(plot_y1 - 1)};
+                        Vector2 bl   = {(float)(cx - 6), (float)(plot_y1 + 9)};
+                        Vector2 br   = {(float)(cx + 6), (float)(plot_y1 + 9)};
+                        // raylib's DrawTriangle wants CCW order.
+                        DrawTriangle(apex, br, bl, YELLOW);
+                        // Thin guide line up into the plot for context.
+                        DrawLine(cx, plot_y0, cx, plot_y1,
+                                 (Color){255, 230, 60, 60});
+                    }
+                }
+
+                // Title (span + sample count). Color matches body text.
+                const int TITLE_PT = 26;
+                char title[256];
+                snprintf(title, sizeof title,
+                    "I/Q  span=%.3f s  (%lld samples)   I cyan  Q violet",
+                    span, (long long) n_pairs_vis);
+                draw_text(title, plot_x0 + 6, plot_y0 + 2, TITLE_PT,
+                          (Color){200, 200, 220, 255});
+            }
         }
 
         EndDrawing();
     }
 
-    UnloadTexture(tex);
+    for (int t = 0; t < n_tiles; ++t) {
+        if (tiles[t].id != 0) UnloadTexture(tiles[t]);
+    }
+    free(tiles);
+    iq_buf_free(&iqb);
+    if (g_ui_font_loaded) UnloadFont(g_ui_font);
     CloseWindow();
     return 0;
 }
