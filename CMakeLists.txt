@@ -203,8 +203,33 @@ if (RAYLIB_FOUND)
             "-framework Foundation")
     endif()
     list(APPEND SSO_TARGETS live_waterfall)
+
+    # iq_annotator — raylib-backed interactive viewer for offline .iq
+    # captures. Lets the operator mouse-draw time × freq boxes around
+    # bursts they want to feed back into rx_replay --anchor-csv.
+    set(IQ_ANNOTATOR_SRCS utils/iq_annotator.c)
+    if (APPLE)
+        # raylib/GLFW drop NSEventTypeMagnify (trackpad pinch); this
+        # ObjC shim installs a global NSEvent monitor and accumulates
+        # magnification into a global the C side reads each frame.
+        list(APPEND IQ_ANNOTATOR_SRCS utils/iq_annotator_macos.m)
+    endif()
+    add_executable(iq_annotator ${IQ_ANNOTATOR_SRCS})
+    target_include_directories(iq_annotator PRIVATE ${RAYLIB_INCLUDE_DIRS})
+    target_link_directories(iq_annotator PRIVATE ${RAYLIB_LIBRARY_DIRS})
+    target_link_libraries(iq_annotator PRIVATE ${RAYLIB_LIBRARIES} m)
+    if (APPLE)
+        target_link_libraries(iq_annotator PRIVATE
+            "-framework Cocoa"
+            "-framework AppKit"
+            "-framework OpenGL"
+            "-framework IOKit"
+            "-framework CoreVideo"
+            "-framework Foundation")
+    endif()
+    list(APPEND SSO_TARGETS iq_annotator)
 else()
-    message(STATUS "raylib not found via pkg-config; live_waterfall skipped.")
+    message(STATUS "raylib not found via pkg-config; live_waterfall + iq_annotator skipped.")
 endif()
 
 # Selftest for the IQ-domain demods (modem_iq.c, modem_viterbi.c).
