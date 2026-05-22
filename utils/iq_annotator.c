@@ -1359,43 +1359,62 @@ int main(int argc, char **argv)
         // '[' → step back to the START of the previous box.
         // Zoom and horizontal pan stay put — only view_y moves so the
         // selected box's t0_s sits in the middle of the spec area.
-        // Anchor for "next/previous" is the time at the centre of the
-        // current view, so repeated presses walk the boxes in order.
+        //
+        // Boxes are kept sorted chronologically (see boxes_sort). When
+        // a box is selected we walk by INDEX (selected ± 1) — that's
+        // robust to the view-clamp pulling view_y back to 0 when the
+        // whole pass fits in the window, which used to lock the anchor
+        // at duration/2 forever. With no selection we fall back to a
+        // t0-based search anchored on the time at the centre of the view.
         int walk_fwd  = IsKeyPressed(KEY_RIGHT_BRACKET);
         int walk_back = IsKeyPressed(KEY_LEFT_BRACKET);
         if ((walk_fwd || walk_back) && boxes.n > 0) {
-            double center_img_y = (double) view_y + (double) visible_h * 0.5;
-            double ref_t =
-                (1.0 - (center_img_y - WF_TM) / (double) spec_h) * duration_s;
-            // ε so a box already at ref_t isn't considered "next".
-            const double eps = 1e-6;
-            int    best   = -1;
-            double best_t = 0.0;
-            for (int i = 0; i < boxes.n; ++i) {
-                double t0 = boxes.items[i].t0_s;
+            int target = -1;
+            if (boxes.selected >= 0 && boxes.selected < boxes.n) {
+                int step = walk_fwd ? +1 : -1;
+                int cand = boxes.selected + step;
+                if (cand >= 0 && cand < boxes.n) target = cand;
+            } else {
+                // No selection — find the first / last box past the
+                // centre of the current view.
+                double center_img_y =
+                    (double) view_y + (double) visible_h * 0.5;
+                double ref_t = (1.0 - (center_img_y - WF_TM)
+                                / (double) spec_h) * duration_s;
+                const double eps = 1e-6;
                 if (walk_fwd) {
-                    if (t0 > ref_t + eps && (best < 0 || t0 < best_t)) {
-                        best = i; best_t = t0;
+                    for (int i = 0; i < boxes.n; ++i) {
+                        if (boxes.items[i].t0_s > ref_t + eps) {
+                            target = i; break;
+                        }
                     }
                 } else {
-                    if (t0 < ref_t - eps && (best < 0 || t0 > best_t)) {
-                        best = i; best_t = t0;
+                    for (int i = boxes.n - 1; i >= 0; --i) {
+                        if (boxes.items[i].t0_s < ref_t - eps) {
+                            target = i; break;
+                        }
                     }
                 }
             }
-            if (best >= 0) {
+            if (target >= 0) {
+                double best_t = boxes.items[target].t0_s;
                 double target_img_y =
                     WF_TM + (1.0 - best_t / duration_s) * (double) spec_h;
                 view_y = (float)(target_img_y - (double) visible_h * 0.5);
-                boxes.selected = best;
+                boxes.selected = target;
                 snprintf(status, sizeof status,
-                    "%s box %d (%s, t0=%.3fs)",
+                    "%s box %d/%d (%s, t0=%.3fs)",
                     walk_back ? "rewind to" : "advance to",
-                    best, boxes.items[best].label, best_t);
+                    target + 1, boxes.n,
+                    boxes.items[target].label, best_t);
             } else {
+                int at_end =
+                    (boxes.selected >= 0 && boxes.selected < boxes.n);
                 snprintf(status, sizeof status,
-                    "no %s box from t=%.3fs",
-                    walk_back ? "previous" : "next", ref_t);
+                    "%s",
+                    walk_fwd
+                      ? (at_end ? "at last box" : "no next box")
+                      : (at_end ? "at first box" : "no previous box"));
             }
         }
 
