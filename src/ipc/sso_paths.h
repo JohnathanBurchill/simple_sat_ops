@@ -33,6 +33,11 @@ const char *sso_operations_current_symlink(void);
 const char *sso_satnogs_archive_dir(void);
 const char *sso_captures_dir(void);
 const char *sso_packet_db_path(void);
+// Bench / characterisation captures live under a sibling tree so they
+// don't fight the pass-folder layout under Operations/. Same yyyymmdd /
+// hhmmLT date layering, but the timestamp is "now" (the moment the
+// operator hit start), not a predicted AOS.
+const char *sso_testing_dir(void);
 
 // Compose <root>/<subdir> into the caller's buffer. Returns 0 on
 // success, -1 on overflow. <subdir> may include further slashes.

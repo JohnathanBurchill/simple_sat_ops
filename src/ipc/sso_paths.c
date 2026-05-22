@@ -68,6 +68,7 @@ const char *sso_operations_current_symlink(void) {
 const char *sso_satnogs_archive_dir(void)    { return static_subpath("satnogs_archive"); }
 const char *sso_captures_dir(void)           { return static_subpath("captures"); }
 const char *sso_packet_db_path(void)         { return static_subpath("packet_db.sqlite"); }
+const char *sso_testing_dir(void)            { return static_subpath("Testing"); }
 
 int sso_mkdir_p(const char *path) {
     if (!path || !path[0]) {

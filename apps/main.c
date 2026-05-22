@@ -125,6 +125,13 @@ static int   g_run_live_waterfall = 0;
 // gain stability over hours) where the operator wants continuous
 // capture without a satellite pass to drive AOS / LOS.
 static int   g_always_record      = 0;
+
+// --testing: bench / characterisation runs that aren't tied to a
+// pass. Pass folder lands under <root>/Testing/yyyymmdd/hhmmLT/ using
+// the CURRENT local time, not a predicted AOS — keeps test captures
+// out of the operational Operations/ tree and skips the "no AOS in
+// next N minutes" abort in setup_pass_folder.
+static int   g_testing_mode       = 0;
 static pid_t g_live_waterfall_pid = -1;
 __attribute__((unused))
 static char  g_live_waterfall_iq[512] = "";
@@ -3458,6 +3465,42 @@ static void setup_pass_folder(state_t *state, double jul_utc_now)
                 g_pass_folder);
         return;
     }
+    // --testing: bench run, not a pass. Land the folder under the
+    // sibling Testing/ tree using the CURRENT local time so we don't
+    // need a TLE / prediction at all.
+    if (g_testing_mode) {
+        time_t now = time(NULL);
+        struct tm now_local;
+        localtime_r(&now, &now_local);
+        char folder[256];
+        int n = snprintf(folder, sizeof folder,
+                         "%s/%04d%02d%02d/%02d%02dLT",
+                         sso_testing_dir(),
+                         now_local.tm_year + 1900,
+                         now_local.tm_mon + 1,
+                         now_local.tm_mday,
+                         now_local.tm_hour,
+                         now_local.tm_min);
+        if (n <= 0 || (size_t) n >= sizeof folder) {
+            fprintf(stderr,
+                "simple_sat_ops: --testing folder path too long; skipping\n");
+            return;
+        }
+        if (sso_mkdir_p(folder) != 0) {
+            fprintf(stderr,
+                "simple_sat_ops: --testing: mkdir -p %s failed: %s\n",
+                folder, strerror(errno));
+            return;
+        }
+        snprintf(g_pass_folder, sizeof g_pass_folder, "%s", folder);
+        // Skip update_operations_current_symlink — keep the
+        // Operations/current pointer aimed at real passes, not bench
+        // runs (avoids confusing operators who scrub recent activity
+        // by looking at the symlink).
+        fprintf(stderr,
+            "simple_sat_ops: --testing folder %s\n", g_pass_folder);
+        return;
+    }
     minutes_until_visible(&state->prediction, jul_utc_now,
                           jul_utc_now + MAX_MINUTES_TO_PREDICT / 1440.0,
                           1.0);
@@ -3815,6 +3858,13 @@ void usage(FILE *dest, const char *name, int full)
         "                               still produce a continuous capture.\n"
         "                               Pair with --pass-folder to land the files\n"
         "                               somewhere specific.\n"
+        "  --testing                    Bench / characterisation mode. Pass folder\n"
+        "                               lands under <root>/Testing/yyyymmdd/hhmmLT/\n"
+        "                               using the CURRENT local time — no TLE\n"
+        "                               prediction needed, and the Operations/\n"
+        "                               tree (plus its 'current' symlink) is left\n"
+        "                               untouched. Usually paired with\n"
+        "                               --always-record and --without-rotator.\n"
         "  --tx-dry-run                 Synthesize an immediate 'ok' ack for\n"
         "                               every TX burst instead of routing it\n"
         "                               through the SDR. Exercises the auto-\n"
@@ -5996,6 +6046,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strcmp("--always-record", argv[i]) == 0) {
             state->n_options++;
             g_always_record = 1;
+        } else if (strcmp("--testing", argv[i]) == 0) {
+            state->n_options++;
+            g_testing_mode = 1;
         } else if (strcmp("--tx-dry-run", argv[i]) == 0) {
             state->n_options++;
             g_tx_dry_run = 1;
