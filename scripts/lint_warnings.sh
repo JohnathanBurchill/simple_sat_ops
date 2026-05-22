@@ -75,24 +75,33 @@ fi
 
 cd "$BUILD_DIR"
 
-# Run the build, tee warnings/errors to stdout. We strip noisy "In file
-# included from..." chains so the operator sees the actual diagnostic
-# lines first; the full log lives in build-lint/build.log.
+# Run the build, tee the full output to build.log; show ONLY diagnostic
+# lines from project .c/.h files. gcc-15 can't parse Objective-C, so
+# compiling iq_annotator_macos.m emits hundreds of irrelevant errors
+# from the AppKit / Foundation headers — we drop those entirely.
 make -j4 2>&1 | tee build.log | \
     grep -E "warning:|error:" | \
-    grep -v "include-fixed/" || true
+    grep -v "include-fixed/" | \
+    grep -E "/(utils|src|sgp4sdp4|include)/.+\.(c|h):" || true
 
-# Exit code policy: fail only on hard errors and on the format-truncation
-# / format-overflow diagnostics that motivated this script — the GCC
-# bounds prover Apple clang lacks. Pre-existing -Wunused / -Wsign-compare
-# noise is reported above but doesn't block the build.
+# Exit code policy: fail only on diagnostics in OUR .c files. Hard
+# errors from gcc-15 trying to compile the .m shim or follow-on linker
+# failures don't count — the script's job is to surface format-truncation
+# / format-overflow bugs that Apple clang can't, not to be a full CI.
+relevant_diag() {
+    grep -E "warning:|error:" build.log \
+        | grep -v "include-fixed/" \
+        | grep -v "framework/Headers/" \
+        | grep -v "\.m:" \
+        | grep -E "\.(c|h):"
+}
 fail=0
-if grep -qE "error:" build.log; then fail=1; fi
-if grep -qE "format-truncation|format-overflow" build.log; then fail=1; fi
+if relevant_diag | grep -qE "error:"; then fail=1; fi
+if relevant_diag | grep -qE "format-truncation|format-overflow"; then fail=1; fi
 if [[ $fail -ne 0 ]]; then
     echo
-    echo "lint_warnings: hard error or format-truncation found (full log: $BUILD_DIR/build.log)" >&2
+    echo "lint_warnings: project-source error or format-truncation found (full log: $BUILD_DIR/build.log)" >&2
     exit 1
 fi
-n_warn=$(grep -cE "warning:" build.log || true)
-echo "lint_warnings: clean ($GCC, $n_warn non-fatal warning(s) — full log: $BUILD_DIR/build.log)"
+n_warn=$(relevant_diag | grep -cE "warning:" || true)
+echo "lint_warnings: clean ($GCC, $n_warn non-fatal warning(s) in project sources — full log: $BUILD_DIR/build.log)"

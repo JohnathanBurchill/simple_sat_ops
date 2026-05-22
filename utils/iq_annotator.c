@@ -145,6 +145,45 @@ static void box_normalize(box_t *b)
     }
 }
 
+static int box_cmp_t0(const void *pa, const void *pb)
+{
+    const box_t *a = (const box_t *) pa;
+    const box_t *b = (const box_t *) pb;
+    if (a->t0_s < b->t0_s) return -1;
+    if (a->t0_s > b->t0_s) return  1;
+    // Stable secondary key on t1 so ties don't reorder on every sort.
+    if (a->t1_s < b->t1_s) return -1;
+    if (a->t1_s > b->t1_s) return  1;
+    return 0;
+}
+
+// Sort boxes by t0_s ascending so they are numbered 1..n chronologically
+// across the pass. Preserves the identity of the currently-selected box
+// (by content-match) so the user's selection follows the data, not the
+// old index.
+static void boxes_sort(box_list_t *bl)
+{
+    if (bl->n <= 1) return;
+    box_t sel_copy = {0};
+    int   has_sel  = (bl->selected >= 0 && bl->selected < bl->n);
+    if (has_sel) sel_copy = bl->items[bl->selected];
+    qsort(bl->items, (size_t) bl->n, sizeof bl->items[0], box_cmp_t0);
+    if (has_sel) {
+        bl->selected = -1;
+        for (int i = 0; i < bl->n; ++i) {
+            const box_t *x = &bl->items[i];
+            if (x->t0_s == sel_copy.t0_s
+             && x->t1_s == sel_copy.t1_s
+             && x->f_lo_hz == sel_copy.f_lo_hz
+             && x->f_hi_hz == sel_copy.f_hi_hz
+             && strcmp(x->label, sel_copy.label) == 0) {
+                bl->selected = i;
+                break;
+            }
+        }
+    }
+}
+
 static int boxes_save(const box_list_t *bl, const char *iq_path)
 {
     char path[1100];
@@ -216,6 +255,11 @@ static int boxes_load(box_list_t *bl, const char *iq_path)
         bl->items[bl->n++] = b;
     }
     fclose(f);
+    // Older CSVs may have been written in insertion order. Sort so the
+    // in-memory list is chronological from frame 1.
+    if (bl->n > 1) {
+        qsort(bl->items, (size_t) bl->n, sizeof bl->items[0], box_cmp_t0);
+    }
     fprintf(stderr, "iq_annotator: loaded %d box(es) from %s\n",
             bl->n, path);
     return 0;
@@ -1525,11 +1569,17 @@ int main(int argc, char **argv)
         }
         if (resize_box >= 0 && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
             box_normalize(&boxes.items[resize_box]);
+            // Take a copy of the just-resized box BEFORE sorting, so we
+            // can report its position after re-indexing.
+            box_t resized_copy = boxes.items[resize_box];
+            boxes.selected = resize_box;
+            boxes_sort(&boxes);  // t0 may have moved; renumber chronologically.
+            int new_idx = (boxes.selected >= 0) ? boxes.selected : resize_box;
             snprintf(status, sizeof status,
                 "resized box %d (t=%.3f..%.3fs, f=%.0f..%.0f Hz)",
-                resize_box,
-                boxes.items[resize_box].t0_s, boxes.items[resize_box].t1_s,
-                boxes.items[resize_box].f_lo_hz, boxes.items[resize_box].f_hi_hz);
+                new_idx,
+                resized_copy.t0_s, resized_copy.t1_s,
+                resized_copy.f_lo_hz, resized_copy.f_hi_hz);
             resize_box = -1; resize_edge_x = 0; resize_edge_y = 0;
         }
         if (dragging && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
@@ -1565,9 +1615,14 @@ int main(int argc, char **argv)
                 boxes.items[boxes.n] = b;
                 boxes.selected = boxes.n;
                 ++boxes.n;
+                // Renumber chronologically so ']' / '[' walk 1..n in
+                // time order and the user's mental model matches.
+                boxes_sort(&boxes);
+                int new_idx = (boxes.selected >= 0)
+                              ? boxes.selected : boxes.n - 1;
                 snprintf(status, sizeof status,
                     "added box %d (%s, %.3fs × %.0fHz)",
-                    boxes.n - 1, b.label,
+                    new_idx, b.label,
                     b.t1_s - b.t0_s, b.f_hi_hz - b.f_lo_hz);
             }
         }
@@ -1740,8 +1795,11 @@ int main(int argc, char **argv)
                                         iq_path, box_info,
                                         iq_show_mode);
             if (rc == 0) {
-                snprintf(status, sizeof status,
-                    "wrote %s", pdf_path);
+                // Status bar is narrow — show just the file name, not
+                // the full pdf_path (avoids snprintf truncation warning).
+                const char *base = strrchr(pdf_path, '/');
+                base = (base != NULL) ? base + 1 : pdf_path;
+                snprintf(status, sizeof status, "wrote %.200s", base);
             } else {
                 snprintf(status, sizeof status,
                     "PDF write failed");
