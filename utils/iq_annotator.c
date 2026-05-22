@@ -1311,6 +1311,49 @@ int main(int argc, char **argv)
             snprintf(status, sizeof status,
                 "waveform channels: %s", mode_label);
         }
+        // ';' → advance to the START of the next box (in time).
+        // ':' (shift+;) → step back to the START of the previous box.
+        // Zoom and horizontal pan stay put — only view_y moves so the
+        // selected box's t0_s sits in the middle of the spec area.
+        // Anchor for "next/previous" is the time at the centre of the
+        // current view, so repeated presses walk the boxes in order.
+        if (IsKeyPressed(KEY_SEMICOLON) && boxes.n > 0) {
+            int shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+            double center_img_y = (double) view_y + (double) visible_h * 0.5;
+            double ref_t =
+                (1.0 - (center_img_y - WF_TM) / (double) spec_h) * duration_s;
+            // ε so a box already at ref_t isn't considered "next".
+            const double eps = 1e-6;
+            int    best   = -1;
+            double best_t = 0.0;
+            for (int i = 0; i < boxes.n; ++i) {
+                double t0 = boxes.items[i].t0_s;
+                if (!shift) {
+                    if (t0 > ref_t + eps && (best < 0 || t0 < best_t)) {
+                        best = i; best_t = t0;
+                    }
+                } else {
+                    if (t0 < ref_t - eps && (best < 0 || t0 > best_t)) {
+                        best = i; best_t = t0;
+                    }
+                }
+            }
+            if (best >= 0) {
+                double target_img_y =
+                    WF_TM + (1.0 - best_t / duration_s) * (double) spec_h;
+                view_y = (float)(target_img_y - (double) visible_h * 0.5);
+                boxes.selected = best;
+                snprintf(status, sizeof status,
+                    "%s box %d (%s, t0=%.3fs)",
+                    shift ? "rewind to" : "advance to",
+                    best, boxes.items[best].label, best_t);
+            } else {
+                snprintf(status, sizeof status,
+                    "no %s box from t=%.3fs",
+                    shift ? "previous" : "next", ref_t);
+            }
+        }
+
         // P → write the current waveform panel to a vector PDF
         // alongside the .iq. Deferred until after wf_t_lo/wf_t_hi
         // and box_info are computed later in the frame.
