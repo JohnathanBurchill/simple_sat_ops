@@ -1655,29 +1655,6 @@ int main(int argc, char **argv)
             draw_text(tag, x_lo + 4, label_y, LABEL_PT, col);
         }
 
-        // In-app crosshair at the mouse position over the spec area.
-        // The OS arrow blends into the waterfall colour map; this
-        // overlays a bright crosshair with a dark backing stroke so
-        // it's legible against any colour underneath.
-        if (in_spec) {
-            int cx = (int) m.x;
-            int cy = (int) m.y;
-            const int arm = 14;   // arm length, px
-            const int gap = 3;    // centre gap so the exact pixel isn't masked
-            // Dark backing (1 px thicker, drawn first).
-            DrawLine(cx - arm - 1, cy, cx - gap + 1, cy, BLACK);
-            DrawLine(cx + gap - 1, cy, cx + arm + 1, cy, BLACK);
-            DrawLine(cx, cy - arm - 1, cx, cy - gap + 1, BLACK);
-            DrawLine(cx, cy + gap - 1, cx, cy + arm + 1, BLACK);
-            // Bright foreground.
-            DrawLine(cx - arm, cy, cx - gap, cy, YELLOW);
-            DrawLine(cx + gap, cy, cx + arm, cy, YELLOW);
-            DrawLine(cx, cy - arm, cx, cy - gap, YELLOW);
-            DrawLine(cx, cy + gap, cx, cy + arm, YELLOW);
-            // Centre dot.
-            DrawRectangle(cx - 1, cy - 1, 3, 3, YELLOW);
-        }
-
         // Ongoing drag rectangle (in screen space — drag_start was a
         // screen-px coordinate at the start of the drag, and we want
         // the rectangle to track the cursor in screen space).
@@ -1941,29 +1918,66 @@ int main(int argc, char **argv)
                 DrawRectangleLines(plot_x0, plot_y0,
                                    plot_w, plot_h, DARKGRAY);
 
-                // Cursor indicator: short upward-pointing arrow on the
-                // time axis at the spectrogram cursor's time position,
-                // so the operator can see where the mouse over the
-                // waterfall above maps into the waveform below. Only
-                // drawn while the cursor is in the spectrogram and its
-                // time falls inside the panel's visible window.
+                // Cursor indicator: bright full-height line through
+                // the plot, with arrowheads at top and bottom, marking
+                // where the spectrogram cursor's time falls inside the
+                // panel. The line has a dark backing stroke so it's
+                // legible over both the cyan/violet traces and the
+                // dark plot background. Drawn while the cursor is in
+                // the spec AND its time is inside the panel window.
                 if (in_spec
                     && cursor_t >= wf_t_lo - 1e-12
                     && cursor_t <= wf_t_hi + 1e-12) {
                     int cx = plot_x0
                            + (int)((cursor_t - wf_t_lo) / span * plot_w);
                     if (cx >= plot_x0 && cx <= plot_x1) {
-                        // Triangle: tip up (apex INSIDE plot, base on
-                        // the axis line below). 10 px tall × 12 px wide.
-                        Vector2 apex = {(float) cx, (float)(plot_y1 - 1)};
-                        Vector2 bl   = {(float)(cx - 6), (float)(plot_y1 + 9)};
-                        Vector2 br   = {(float)(cx + 6), (float)(plot_y1 + 9)};
-                        // raylib's DrawTriangle wants CCW order.
-                        DrawTriangle(apex, br, bl, YELLOW);
-                        // Thin guide line up into the plot for context.
-                        DrawLine(cx, plot_y0, cx, plot_y1,
-                                 (Color){255, 230, 60, 60});
+                        // Dark backing — 1 px wider than the bright
+                        // line on each side so it shows up against
+                        // anything underneath.
+                        DrawLine(cx - 1, plot_y0, cx - 1, plot_y1 + 1, BLACK);
+                        DrawLine(cx + 1, plot_y0, cx + 1, plot_y1 + 1, BLACK);
+                        // Bright opaque guide line.
+                        DrawLine(cx, plot_y0, cx, plot_y1 + 1, YELLOW);
+                        // Bottom arrowhead — apex inside the plot, base
+                        // on the axis. 12 px × 14 px.
+                        {
+                            Vector2 apex = {(float) cx, (float)(plot_y1 - 1)};
+                            Vector2 bl = {(float)(cx - 7), (float)(plot_y1 + 11)};
+                            Vector2 br = {(float)(cx + 7), (float)(plot_y1 + 11)};
+                            DrawTriangle(apex, br, bl, YELLOW);
+                            DrawTriangleLines(apex, br, bl, BLACK);
+                        }
+                        // Top arrowhead — apex pointing down into the
+                        // plot, base just above the top border.
+                        {
+                            Vector2 apex = {(float) cx, (float)(plot_y0 + 1)};
+                            Vector2 bl = {(float)(cx - 7), (float)(plot_y0 - 11)};
+                            Vector2 br = {(float)(cx + 7), (float)(plot_y0 - 11)};
+                            DrawTriangle(apex, bl, br, YELLOW);
+                            DrawTriangleLines(apex, bl, br, BLACK);
+                        }
                     }
+                }
+                // When the mouse is in the panel itself, draw a small
+                // crosshair at the mouse position so the operator can
+                // pinpoint exactly which sample they're over (the OS
+                // arrow tip is hard to read against the I/Q traces).
+                if (in_panel_now
+                    && (int) m.x >= plot_x0 && (int) m.x <= plot_x1
+                    && (int) m.y >= plot_y0 && (int) m.y <= plot_y1) {
+                    int cx = (int) m.x;
+                    int cy = (int) m.y;
+                    const int arm = 12;
+                    const int gap = 3;
+                    DrawLine(cx - arm - 1, cy, cx - gap + 1, cy, BLACK);
+                    DrawLine(cx + gap - 1, cy, cx + arm + 1, cy, BLACK);
+                    DrawLine(cx, cy - arm - 1, cx, cy - gap + 1, BLACK);
+                    DrawLine(cx, cy + gap - 1, cx, cy + arm + 1, BLACK);
+                    DrawLine(cx - arm, cy, cx - gap, cy, YELLOW);
+                    DrawLine(cx + gap, cy, cx + arm, cy, YELLOW);
+                    DrawLine(cx, cy - arm, cx, cy - gap, YELLOW);
+                    DrawLine(cx, cy + gap, cx, cy + arm, YELLOW);
+                    DrawRectangle(cx - 1, cy - 1, 3, 3, YELLOW);
                 }
 
                 // Title (span + sample count). Color matches body text.
