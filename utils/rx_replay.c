@@ -1361,18 +1361,26 @@ int main(int argc, char **argv)
     };
 
     // Pass 1: the original sliding-window decode. In iq_mode the
-    // default chain is now modem_fsk (FM-discriminator + DC-block +
-    // AGC + boxcar MF + M&M + slicer — same chain gr_satellites uses,
-    // and modulation-index-agnostic so it handles FrontierSat's h≈2/3
-    // FSK rather than only h=0.5 MSK). Set RX_REPLAY_USE_DIFF_SLICER=1
-    // to fall back to modem_iq's complex-differential slicer for A/B
-    // testing. When two_pass is on, pass-1 always uses the slicer
-    // family — the Viterbi (still h=0.5-only) runs in pass 2.
+    // default chain is modem_iq (complex-differential slicer with
+    // 2nd-power bias removal) — same chain the live rx_session uses,
+    // so "rx_replay on the .iq" reproduces live decodes by default.
+    // FrontierSat's modulation is MSK h=0.5 (dev=2400 Hz at 9600 baud)
+    // — modem_iq's MSK-tuned arg(z[n]·conj(z[n-sps])) front-end is the
+    // right match. Set RX_REPLAY_USE_FSK=1 to switch to modem_fsk's
+    // FM-discriminator chain (modulation-index-agnostic; preferred
+    // when the bird is not MSK). When two_pass is on, pass-1 always
+    // uses the slicer family — the Viterbi runs in pass 2.
+    //
+    // Skipped entirely when --anchor-csv is set: anchored-decode mode
+    // is "decode only the boxed parts", not "boxed parts in addition
+    // to a full sweep".
     int pass1_use_viterbi = (iq_mode && two_pass) ? 0 : use_viterbi;
-    int pass1_use_fsk = iq_mode && !getenv("RX_REPLAY_USE_DIFF_SLICER")
+    int pass1_use_fsk = iq_mode && getenv("RX_REPLAY_USE_FSK") != NULL
                         && !pass1_use_viterbi;
+    int anchored_only = (anchor_csv_arg != NULL);
     for (size_t window_start = 0;
-         window_start + window_samples <= n_frames && !g_stop;
+         window_start + window_samples <= n_frames && !g_stop
+         && !anchored_only;
          window_start += slide_samples)
     {
         // PCM windows index by sample; IQ windows index by pair, where
@@ -1454,7 +1462,7 @@ int main(int argc, char **argv)
     // φ_0 estimate is dominated by signal rather than the seconds of
     // silence around each burst.
     int p2_attempts = 0, p2_emitted = 0;
-    if (iq_mode && two_pass && !g_stop) {
+    if (iq_mode && two_pass && !g_stop && !anchored_only) {
         // Tight Viterbi window: one max-length AX100 frame plus
         // pre-ASM cushion for M&M timing-loop settling.
         // Max AX100 payload = ~256 B RS-coded + framing ≈ 2300 bits
@@ -1675,7 +1683,9 @@ done:
         rx_tui_close();
     }
     const char *chain;
-    if (!iq_mode) {
+    if (anchored_only) {
+        chain = "anchored-csv (fsk)";
+    } else if (!iq_mode) {
         chain = "fm-audio";
     } else if (two_pass) {
         chain = pass1_use_fsk ? "iq+fsk+anchored-fsk"
@@ -1689,7 +1699,7 @@ done:
     }
     fprintf(stderr, "rx_replay: %d frame(s) emitted (chain=%s).\n",
             n_emitted, chain);
-    if (iq_mode && two_pass) {
+    if (iq_mode && two_pass && !anchored_only) {
         fprintf(stderr,
                 "rx_replay: pass-1 emitted %d, pass-2 (anchored FSK) "
                 "tried %d candidate(s) and rescued %d.\n",
