@@ -117,6 +117,14 @@ static int   g_tx_dry_run         = 0;
 // unused — the cleanup path at the bottom of main() does use the
 // pid, so that one stays unannotated.
 static int   g_run_live_waterfall = 0;
+
+// --always-record: start the WAV / IQ / sidecar recording as soon
+// as rx_session opens and keep it open until shutdown, ignoring the
+// usual per-pass elevation gate. Intended for bench characterisation
+// runs (noise floor vs. antenna orientation, no-antenna baseline,
+// gain stability over hours) where the operator wants continuous
+// capture without a satellite pass to drive AOS / LOS.
+static int   g_always_record      = 0;
 static pid_t g_live_waterfall_pid = -1;
 __attribute__((unused))
 static char  g_live_waterfall_iq[512] = "";
@@ -3796,6 +3804,17 @@ void usage(FILE *dest, const char *name, int full)
         "                               its window leaves the recording\n"
         "                               running. Skipped silently if\n"
         "                               live_waterfall isn't on PATH.\n"
+        "  --always-record              Start WAV/IQ recording (and the .doppler,\n"
+        "                               .lo_offset, .burst sidecars) as soon as\n"
+        "                               the B210 opens, and keep it open until\n"
+        "                               shutdown. Skips the usual elevation-driven\n"
+        "                               per-pass start/stop, so bench runs that\n"
+        "                               aren't tied to a satellite (noise-floor\n"
+        "                               vs. antenna orientation, no-antenna\n"
+        "                               baseline, hours of gain-stability data)\n"
+        "                               still produce a continuous capture.\n"
+        "                               Pair with --pass-folder to land the files\n"
+        "                               somewhere specific.\n"
         "  --tx-dry-run                 Synthesize an immediate 'ok' ack for\n"
         "                               every TX burst instead of routing it\n"
         "                               through the SDR. Exercises the auto-\n"
@@ -5108,6 +5127,16 @@ int main(int argc, char **argv)
             }
             // rx_session_open succeeded → it owns `core` now.
             core = NULL;
+            // --always-record: start WAV + .iq + sidecars right now,
+            // before any pass logic gets a chance to gate them. The
+            // per-pass start/stop block in the tracking loop checks
+            // g_always_record and skips itself when this is on.
+            if (g_always_record && g_rx_session) {
+                rx_session_request_wav_start(g_rx_session);
+                fprintf(stderr,
+                    "simple_sat_ops: --always-record on — WAV/IQ "
+                    "capture started, pass gating disabled\n");
+            }
         }
     }
 #endif
@@ -5240,7 +5269,10 @@ int main(int argc, char **argv)
         // state.in_pass — the latter flips several minutes before AOS
         // (tracking_prep_time_minutes) so the rotator can pre-position,
         // which is far too early to start the WAV.
-        if (g_rx_session) {
+        //
+        // --always-record disables this gate entirely: recording was
+        // started once at rx_session_open and stays open until shutdown.
+        if (g_rx_session && !g_always_record) {
             double sec_to_aos =
                 state.prediction.predicted_minutes_until_visible * 60.0;
             int visible   = (state.prediction.satellite_ephem.elevation > 0.0);
@@ -5961,6 +5993,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strcmp("--live-waterfall", argv[i]) == 0) {
             state->n_options++;
             g_run_live_waterfall = 1;
+        } else if (strcmp("--always-record", argv[i]) == 0) {
+            state->n_options++;
+            g_always_record = 1;
         } else if (strcmp("--tx-dry-run", argv[i]) == 0) {
             state->n_options++;
             g_tx_dry_run = 1;
