@@ -1662,25 +1662,58 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
                 ? (long long) opt->start_utc * 1000LL
                     + (long long)(opt->start_utc_subsec * 1000.0 + 0.5)
                 : 0;
+            // CSV format: burst_start,unix_time_ms,bright_bins,peak_excess_db,duration_ms[,freq_hz]
+            // When freq_hz (6th field) is present, the marker is drawn AT
+            // the (time, freq) point in the spectrogram as a hollow 11×11
+            // crosshair, so the operator can see what detection landed on
+            // what feature. When freq_hz is absent, fall back to the
+            // left-margin right-pointing-triangle arrow.
+            double fs = (opt->display_bw_hz > 0.0)
+                        ? opt->display_bw_hz : (double) opt->sample_rate;
+            double f_lo_disp = -fs / 2.0;
             while (fgets(line, sizeof line, fp) != NULL) {
                 if (line[0] == '#' || line[0] == '\n' || line[0] == '\0'
                                    || line[0] == '\r') continue;
                 if (strncmp(line, "burst_start,", 12) != 0) continue;
-                long long u_ms = atoll(line + 12);
+                long long u_ms = 0;
+                int    dummy_bins = 0;
+                double dummy_db = 0.0, dummy_dur = 0.0, freq_hz = 0.0;
+                int got = sscanf(line + 12, "%lld,%d,%lf,%lf,%lf",
+                                 &u_ms, &dummy_bins, &dummy_db,
+                                 &dummy_dur, &freq_hz);
+                int have_freq = (got >= 5);
                 double t_s = (u_ms - start_ms) / 1000.0;
                 if (t_s < 0.0 || t_s > duration_s + 0.5) continue;
                 double frac = 1.0 - t_s / duration_s;
                 int y = TM + (int)(frac * (double) spec_h);
                 if (y < TM + 4 || y >= TM + spec_h - 4) continue;
-                // Right-pointing triangle, 8 px tall × 8 px wide. Tip at
-                // x = LM - 1 (just outside the spectrogram), base at
-                // x = LM - 8. Symmetric around y.
-                for (int dy = -3; dy <= 4; ++dy) {
-                    int half = (dy >= 0) ? (4 - dy) : (4 + dy);
-                    if (half < 0) continue;
-                    for (int dx = 0; dx <= half; ++dx) {
-                        px_set(rgb, W, H, LM - 1 - dx, y + dy,
+                if (have_freq) {
+                    double xf = (freq_hz - f_lo_disp) / fs;
+                    if (xf < 0.0 || xf > 1.0) continue;
+                    int x = LM + (int)(xf * (double) spec_w);
+                    if (x < LM + 6 || x >= LM + spec_w - 6) continue;
+                    // 11×11 hollow crosshair centered on (x,y). Horizontal
+                    // and vertical bars go through center but the centre
+                    // pixel itself is left clear so the underlying signal
+                    // can still be read.
+                    for (int d = -5; d <= 5; ++d) {
+                        if (d == 0) continue;
+                        px_set(rgb, W, H, x + d, y,
                                ARROW_R, ARROW_G, ARROW_B);
+                        px_set(rgb, W, H, x, y + d,
+                               ARROW_R, ARROW_G, ARROW_B);
+                    }
+                } else {
+                    // Right-pointing triangle, 8 px tall × 8 px wide. Tip at
+                    // x = LM - 1 (just outside the spectrogram), base at
+                    // x = LM - 8. Symmetric around y.
+                    for (int dy = -3; dy <= 4; ++dy) {
+                        int half = (dy >= 0) ? (4 - dy) : (4 + dy);
+                        if (half < 0) continue;
+                        for (int dx = 0; dx <= half; ++dx) {
+                            px_set(rgb, W, H, LM - 1 - dx, y + dy,
+                                   ARROW_R, ARROW_G, ARROW_B);
+                        }
                     }
                 }
                 ++n_drawn;
