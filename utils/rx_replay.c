@@ -416,6 +416,23 @@ static void usage(FILE *dest, const char *name)
         "                           multiple sites keeps one row per\n"
         "                           origin so cross-site decodes are\n"
         "                           visible. Default: unset (NULL).\n"
+        "  --anchor-csv=<path>      Decode at external (time, freq)\n"
+        "                           anchors instead of (in addition to)\n"
+        "                           the sliding-window pass. Reads the\n"
+        "                           burst.csv schema gen_waterfall\n"
+        "                           --show-tm consumes — burst_start\n"
+        "                           rows with the optional 6th freq_hz\n"
+        "                           field. For each anchor the IQ is\n"
+        "                           NCO-mixed to DC at freq_hz over a\n"
+        "                           tight window around the anchor\n"
+        "                           time and run through the FSK chain.\n"
+        "                           Use when the packet sits far off DC\n"
+        "                           (e.g. LO-offset baseband at +25 kHz)\n"
+        "                           past the matched filter's passband.\n"
+        "  --anchor-window-s=<f>    Tight window around each anchor\n"
+        "                           (default 0.40).\n"
+        "  --anchor-pre-s=<f>       Pre-anchor cushion for M&M settling\n"
+        "                           (default 0.05).\n"
         "  --help                   Show this help.\n",
         name, HMAC_KEYFILE_DEFAULT_RELPATH);
 }
@@ -670,6 +687,12 @@ int main(int argc, char **argv)
     int         burst_csv_suppress = 0;
     int         burst_bins_threshold = 16;
     int         burst_min_quiet      = 5;
+    // Collapse adjacent burst events into one when the gap between
+    // burst_end[k] and burst_start[k+1] is shorter than this. Tracks
+    // the operator's intuitive "beacon arrival" rather than the
+    // detector's finer-grained start/end transitions inside one
+    // packet (FSK modulation produces brief mid-packet dropouts).
+    int         burst_merge_ms       = 400;
     double obs_lat_deg = 50.8688;   // RAO defaults; overridden by flags
     double obs_lon_deg = -114.2910;
     double obs_alt_m   = 1279.0;
@@ -680,6 +703,16 @@ int main(int argc, char **argv)
     // attribute the pass to RAO.
     int no_observer = 0;
     double nominal_freq_hz = 436150000.0; // FrontierSat carrier
+    // Anchored-decode mode: read (time, freq) anchors from a CSV (same
+    // schema gen_waterfall --show-tm consumes — burst_start rows with
+    // the optional 6th freq_hz field). For each anchor we mix the IQ
+    // to DC at the given freq and run the FSK chain on a tight window
+    // around the anchor time. Useful when the beacon sits far off DC
+    // and the wide sliding-window pass can't see it through the
+    // matched filter's ±10 kHz passband.
+    const char *anchor_csv_arg = NULL;
+    double anchor_window_s = 0.40;     // tight window around each anchor
+    double anchor_pre_s    = 0.05;     // pre-anchor cushion for M&M lock
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
@@ -695,6 +728,10 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--burst-min-quiet=")) {
             burst_min_quiet = atoi(a + 18);
             if (burst_min_quiet < 1) burst_min_quiet = 1;
+        }
+        else if (starts_with(a, "--burst-merge-ms=")) {
+            burst_merge_ms = atoi(a + 17);
+            if (burst_merge_ms < 0) burst_merge_ms = 0;
         }
         else if (starts_with(a, "--lo-shift-khz=")) {
             lo_shift_hz = atof(a + 15) * 1000.0;
@@ -753,6 +790,9 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--alt="))             obs_alt_m   = atof(a + 6);
         else if (strcmp(a, "--no-observer") == 0)      no_observer = 1;
         else if (starts_with(a, "--carrier-mhz="))     nominal_freq_hz = atof(a + 14) * 1e6;
+        else if (starts_with(a, "--anchor-csv="))      anchor_csv_arg  = a + 13;
+        else if (starts_with(a, "--anchor-window-s=")) anchor_window_s = atof(a + 18);
+        else if (starts_with(a, "--anchor-pre-s="))    anchor_pre_s    = atof(a + 14);
         else if (a[0] == '-') {
             fprintf(stderr, "rx_replay: unknown option '%s'\n", a);
             usage(stderr, argv[0]);
@@ -1084,10 +1124,17 @@ int main(int argc, char **argv)
                 int  peak_bins = 0;
                 double peak_db = 0.0;
                 long long start_ms = 0;
-                // Push in BURST_NFFT-pair chunks so we poll
-                // bright_bins after every FFT frame. The last partial
-                // chunk gets pushed without a fresh frame trigger; ok
-                // — coalesced as in_burst end-of-file below.
+                // burst_merge_ms collapse: a burst_end is "pending"
+                // until either (a) the next burst_start arrives within
+                // merge_ms, in which case we silently absorb the gap
+                // and the new sub-burst into the current one, or (b)
+                // merge_ms elapses without a new start, in which case
+                // we flush the pending end as a real event.
+                int       pending_end       = 0;
+                long long pending_end_ms    = 0;
+                int       pending_peak_bins = 0;
+                double    pending_peak_db   = 0.0;
+                long long pending_start_ms  = 0;  // start of the merged group
                 for (size_t off = 0; off < n_pairs; off += BURST_NFFT) {
                     size_t take = n_pairs - off;
                     if (take > BURST_NFFT) take = BURST_NFFT;
@@ -1097,15 +1144,45 @@ int main(int argc, char **argv)
                     long long t_ms = start_unix_ms
                         + (long long)((double)(off + take)
                                        / (double) samp_rate * 1000.0);
+                    // Flush a pending end if its merge window has
+                    // expired with no new start — i.e. this snapshot
+                    // is below threshold AND we're past pending_end +
+                    // merge_ms.
+                    if (pending_end && !in_burst
+                        && (t_ms - pending_end_ms) >= burst_merge_ms) {
+                        fprintf(bfp,
+                            "burst_end,%lld,%d,%.2f,%lld\n",
+                            pending_end_ms, pending_peak_bins,
+                            pending_peak_db,
+                            pending_end_ms - pending_start_ms);
+                        pending_end = 0;
+                    }
                     if (bins >= burst_bins_threshold) {
                         if (!in_burst) {
-                            in_burst   = 1;
-                            start_ms   = t_ms;
-                            peak_bins  = bins;
-                            peak_db    = excess;
-                            quiet      = 0;
-                            fprintf(bfp, "burst_start,%lld,%d,%.2f,\n",
+                            if (pending_end
+                                && (t_ms - pending_end_ms) < burst_merge_ms) {
+                                // Resume the previous merged group —
+                                // suppress this burst_start row and
+                                // accumulate into the existing peaks.
+                                in_burst   = 1;
+                                start_ms   = pending_start_ms;
+                                peak_bins  = pending_peak_bins;
+                                peak_db    = pending_peak_db;
+                                pending_end = 0;
+                                if (bins > peak_bins) peak_bins = bins;
+                                if (excess > peak_db) peak_db = excess;
+                                quiet = 0;
+                            } else {
+                                in_burst   = 1;
+                                start_ms   = t_ms;
+                                peak_bins  = bins;
+                                peak_db    = excess;
+                                quiet      = 0;
+                                pending_start_ms = t_ms;
+                                fprintf(bfp,
+                                    "burst_start,%lld,%d,%.2f,\n",
                                     t_ms, bins, excess);
+                            }
                         } else {
                             if (bins > peak_bins) peak_bins = bins;
                             if (excess > peak_db) peak_db = excess;
@@ -1114,19 +1191,29 @@ int main(int argc, char **argv)
                     } else if (in_burst) {
                         quiet++;
                         if (quiet >= burst_min_quiet) {
-                            fprintf(bfp, "burst_end,%lld,%d,%.2f,%lld\n",
-                                    t_ms, peak_bins, peak_db,
-                                    t_ms - start_ms);
-                            in_burst = 0;
+                            // Stash as pending — flushed later if no
+                            // new start within merge_ms.
+                            pending_end       = 1;
+                            pending_end_ms    = t_ms;
+                            pending_peak_bins = peak_bins;
+                            pending_peak_db   = peak_db;
+                            in_burst          = 0;
                         }
                     }
                 }
+                // End-of-file: drain any in-flight or pending burst.
+                long long file_end_ms = start_unix_ms
+                    + (long long)((double) n_pairs
+                                   / (double) samp_rate * 1000.0);
                 if (in_burst) {
-                    long long t_ms = start_unix_ms
-                        + (long long)((double) n_pairs
-                                       / (double) samp_rate * 1000.0);
                     fprintf(bfp, "burst_end,%lld,%d,%.2f,%lld\n",
-                            t_ms, peak_bins, peak_db, t_ms - start_ms);
+                            file_end_ms, peak_bins, peak_db,
+                            file_end_ms - start_ms);
+                } else if (pending_end) {
+                    fprintf(bfp, "burst_end,%lld,%d,%.2f,%lld\n",
+                            pending_end_ms, pending_peak_bins,
+                            pending_peak_db,
+                            pending_end_ms - pending_start_ms);
                 }
                 fflush(bfp);
                 iq_burst_free(bdet);
@@ -1455,6 +1542,125 @@ int main(int argc, char **argv)
                 }
             }
             if (use_tui && rx_tui_tick()) goto done;
+        }
+    }
+
+    // Anchored decode at external (time, freq) anchors. Reads a CSV in
+    // the same format gen_waterfall --show-tm consumes: lines starting
+    // with "burst_start," with the optional 6th freq_hz field. For each
+    // anchor we mix the IQ to DC at freq_hz over a tight window around
+    // the anchor time and run the FSK chain on the mixed buffer. Lets
+    // us decode packets that sit far off DC (e.g. the LO-offset
+    // baseband signal at +25 kHz) where the sliding-window pass can't
+    // reach them through the matched filter's ±10 kHz passband.
+    int anc_attempts = 0, anc_emitted = 0;
+    if (iq_mode && anchor_csv_arg != NULL && !g_stop) {
+        FILE *afp = fopen(anchor_csv_arg, "r");
+        if (afp == NULL) {
+            fprintf(stderr,
+                "rx_replay: --anchor-csv: cannot open %s: %s\n",
+                anchor_csv_arg, strerror(errno));
+        } else if (!have_start_utc) {
+            fprintf(stderr,
+                "rx_replay: --anchor-csv requires a UT start time "
+                "(parse filename / --start-utc / mtime fallback)\n");
+            fclose(afp);
+        } else {
+            const long long start_unix_ms_ll =
+                (long long)(start_utc_seconds * 1000.0 + 0.5);
+            const size_t anc_window_pairs =
+                (size_t)(anchor_window_s * (double)samp_rate);
+            const size_t anc_pre_pairs =
+                (size_t)(anchor_pre_s    * (double)samp_rate);
+            int16_t *mix_buf = (int16_t *)
+                malloc(anc_window_pairs * 2 * sizeof(int16_t));
+            if (mix_buf == NULL) {
+                fprintf(stderr, "rx_replay: --anchor-csv: oom\n");
+                fclose(afp);
+            } else {
+                char line[512];
+                while (fgets(line, sizeof line, afp) != NULL) {
+                    if (line[0] == '#' || line[0] == '\n'
+                                       || line[0] == '\0'
+                                       || line[0] == '\r') continue;
+                    if (strncmp(line, "burst_start,", 12) != 0) continue;
+                    long long u_ms = 0;
+                    int  bins = 0;
+                    double db = 0.0, dur = 0.0, fhz = 0.0;
+                    int got = sscanf(line + 12,
+                                     "%lld,%d,%lf,%lf,%lf",
+                                     &u_ms, &bins, &db, &dur, &fhz);
+                    if (got < 5) continue;
+                    double t_s = (u_ms - start_unix_ms_ll) / 1000.0;
+                    if (t_s < 0.0) continue;
+                    uint64_t anc_pos = (uint64_t)
+                        (t_s * (double)samp_rate + 0.5);
+                    if (anc_pos >= n_frames) continue;
+                    uint64_t tight_start =
+                        (anc_pos > (uint64_t)anc_pre_pairs)
+                            ? (anc_pos - (uint64_t)anc_pre_pairs) : 0;
+                    if (tight_start + anc_window_pairs > n_frames) {
+                        tight_start = (n_frames > anc_window_pairs)
+                            ? (n_frames - anc_window_pairs) : 0;
+                    }
+                    size_t tw_pairs =
+                        (tight_start + anc_window_pairs <= n_frames)
+                            ? anc_window_pairs
+                            : (n_frames - (size_t)tight_start);
+                    if (tw_pairs < (size_t)(64 * sps)) continue;
+
+                    // Copy and NCO-mix to DC at fhz. sw_nco_apply
+                    // rotates by exp(-j 2π · f · n/fs), so a signal
+                    // at +fhz lands at DC.
+                    memcpy(mix_buf,
+                           samples + tight_start * 2u,
+                           tw_pairs * 2 * sizeof(int16_t));
+                    sw_nco_t nco;
+                    sw_nco_init(&nco, (double)samp_rate);
+                    sw_nco_set_freq(&nco, fhz);
+                    sw_nco_apply(&nco, mix_buf, tw_pairs);
+
+                    ssize_t plen_a = -1;
+                    int golay_a = 0, hmac_a = -1, rs_a = -1, glen_a = -1;
+                    int rs_locs_a[32];
+                    size_t sync_off_a = 0;
+                    int dec_a = try_decode_window_fsk(
+                        mix_buf, tw_pairs, &mp, &opts,
+                        sync_max_ham, use_hmac, allow_partial_rs,
+                        0,
+                        bits_scratch, bits_cap,
+                        bytes_scratch, bytes_cap,
+                        packet, sizeof packet,
+                        &plen_a, &golay_a, &hmac_a,
+                        &rs_a, &glen_a,
+                        &sync_off_a, rs_locs_a);
+                    ++anc_attempts;
+                    if (!dec_a) continue;
+                    if (plen_a < 4 || (size_t)plen_a > sizeof packet)
+                        continue;
+
+                    uint64_t asm_abs_a = tight_start
+                        + (uint64_t)sync_off_a * (uint64_t)sps
+                        + (uint64_t)(sps / 2);
+                    if (rx_emit_decoded(&ectx, asm_abs_a,
+                                        packet, plen_a,
+                                        golay_a, hmac_a, rs_a, glen_a,
+                                        rs_locs_a)) {
+                        ++anc_emitted;
+                    }
+                    if (use_tui && rx_tui_tick()) {
+                        free(mix_buf);
+                        fclose(afp);
+                        goto done;
+                    }
+                }
+                free(mix_buf);
+                fclose(afp);
+                fprintf(stderr,
+                    "rx_replay: --anchor-csv: %d anchor(s) tried, "
+                    "%d emitted from %s\n",
+                    anc_attempts, anc_emitted, anchor_csv_arg);
+            }
         }
     }
 
