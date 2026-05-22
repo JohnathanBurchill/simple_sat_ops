@@ -1101,9 +1101,13 @@ int main(int argc, char **argv)
     //   screen_y = (img_y - view_y) * zoom
     // zoom=1 is 1:1 pixels (gen_waterfall axes/labels at their original
     // typography). zoom>1 zooms in on the cursor; <1 zooms out.
+    // view_x may be negative when the image is narrower than the
+    // window — that's how horizontal centring is expressed: the screen
+    // origin lies to the left of the image's left edge.
     float zoom    = 1.0f;
     float view_x  = 0.0f;     // image pixel at screen x=0
     float view_y  = 0.0f;     // image pixel at screen y=0
+    int   first_frame = 1;    // set initial fit-to-window view on frame 1
     // Which channels to show in the waveform panel + PDF.
     // 0 = both (default), 1 = I only, 2 = Q only.  Cycle with the
     // `i` key: both → I → Q → both → ...
@@ -1209,9 +1213,9 @@ int main(int argc, char **argv)
         if (IsKeyPressed(KEY_PAGE_UP))   view_y -= page_step;
         if (IsKeyPressed(KEY_HOME)) view_y = 0;
         if (IsKeyPressed(KEY_END))  view_y = img_h - sh / zoom;
-        // Zoom resets.
+        // Zoom resets — back to fit-image-in-window, centred.
         if (IsKeyPressed(KEY_ZERO) || IsKeyPressed(KEY_KP_0)) {
-            zoom = 1.0f; view_x = 0; view_y = 0;
+            first_frame = 1;
             anim_active = 0;
         }
         // +/= zooms in by 5×, − zooms out by 1/5×, both anchoring on
@@ -1254,12 +1258,33 @@ int main(int argc, char **argv)
         int   spec_screen_h = wf_open
             ? (sh - wf_panel_h) : (sh - bar_h_clamp);
         if (spec_screen_h < 32) spec_screen_h = 32;
+
+        // First frame: zoom so the entire image height fits in the
+        // current spec area, and centre the image horizontally in the
+        // window. Negative view_x represents a centring offset.
+        if (first_frame) {
+            zoom = (float) spec_screen_h / (float) img_h;
+            if (zoom < 0.001f) zoom = 1.0f;
+            view_y = 0.0f;
+            float img_screen_w = (float) img_w * zoom;
+            view_x = (img_screen_w < sw)
+                ? -((float) sw / zoom - (float) img_w) * 0.5f
+                : 0.0f;
+            first_frame = 0;
+        }
+
         float visible_w = sw / zoom;
         float visible_h = spec_screen_h / zoom;
-        if (view_x < 0) view_x = 0;
+        // Horizontal: if image fits in window, lock to a centred view
+        // (visualised as negative view_x). Otherwise allow pan within
+        // image extents.
+        if (visible_w >= img_w) {
+            view_x = -(visible_w - (float) img_w) * 0.5f;
+        } else {
+            if (view_x < 0) view_x = 0;
+            if (view_x > img_w - visible_w) view_x = img_w - visible_w;
+        }
         if (view_y < 0) view_y = 0;
-        if (visible_w >= img_w) view_x = 0;
-        else if (view_x > img_w - visible_w) view_x = img_w - visible_w;
         if (visible_h >= img_h) view_y = 0;
         else if (view_y > img_h - visible_h) view_y = img_h - visible_h;
 
@@ -1511,9 +1536,17 @@ int main(int argc, char **argv)
         // image (yielding sub-textures small enough to stay under the
         // GPU's max texture size); composite the visible portion of
         // each tile that intersects the view.
-        float src_w_clamped = (view_x + visible_w > img_w)
-            ? (img_w - view_x) : visible_w;
-        if (src_w_clamped < 0) src_w_clamped = 0;
+        //
+        // When view_x < 0 the image is narrower than the window and
+        // we want it centred — the screen origin then sits to the
+        // left of the image. We clamp the source rect to [0,img_w]
+        // and shift the destination rect right by |view_x|*zoom.
+        double src_x_img = (view_x > 0.0f) ? view_x : 0.0;
+        double src_right_img = (double) view_x + visible_w;
+        if (src_right_img > img_w) src_right_img = img_w;
+        double src_w_img = src_right_img - src_x_img;
+        if (src_w_img < 0) src_w_img = 0;
+        double dst_x_screen = (view_x < 0.0f) ? (-(double) view_x * zoom) : 0.0;
         double view_y_top = view_y;
         double view_y_bot = view_y + visible_h;
         if (view_y_bot > img_h) view_y_bot = img_h;
@@ -1532,15 +1565,15 @@ int main(int argc, char **argv)
                                  ? view_y_bot : (double)(tile_y_img + tile_h);
             if (vis_bot_img <= vis_top_img) continue;
             Rectangle src = {
-                .x = (float) view_x,
+                .x = (float) src_x_img,
                 .y = (float)(vis_top_img - tile_y_img),
-                .width  = src_w_clamped,
+                .width  = (float) src_w_img,
                 .height = (float)(vis_bot_img - vis_top_img),
             };
             Rectangle dst = {
-                .x = 0.0f,
+                .x = (float) dst_x_screen,
                 .y = (float)((vis_top_img - view_y_top) * zoom),
-                .width  = src_w_clamped * zoom,
+                .width  = (float)(src_w_img * zoom),
                 .height = (float)((vis_bot_img - vis_top_img) * zoom),
             };
             DrawTexturePro(tiles[t], src, dst, (Vector2){0, 0}, 0.0f, WHITE);
