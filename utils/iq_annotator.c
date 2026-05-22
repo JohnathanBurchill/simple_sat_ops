@@ -1232,6 +1232,15 @@ int main(int argc, char **argv)
     int   wf_open       = 0;
     int   wf_panel_h    = 240;
 
+    // Decode side panel: D presses spawn rx_replay over the IQ slice
+    // covering the currently-visible time range and capture its stderr
+    // into this buffer. The panel persists on the right until Esc.
+    int    decode_open      = 0;
+    char  *decode_text      = NULL;
+    size_t decode_text_len  = 0;
+    int    decode_panel_w   = 520;
+    int    decode_scroll    = 0;   // first visible line (panel scroll pos)
+
     while (!WindowShouldClose()) {
         int sw = GetScreenWidth();
         int sh = GetScreenHeight();
@@ -1248,11 +1257,18 @@ int main(int argc, char **argv)
         Vector2 wheel_v = GetMouseWheelMoveV();
         int in_panel_for_input =
             wf_open && (int) m.y >= sh - wf_panel_h && (int) m.y < sh;
+        // Decode side panel occupies the right strip when open.
+        int in_decode_panel_input =
+            decode_open && (int) m.x >= sw - decode_panel_w && (int) m.x < sw;
+        if (in_decode_panel_input && wheel_v.y != 0.0f) {
+            decode_scroll -= (int)(wheel_v.y * 3.0f);
+            if (decode_scroll < 0) decode_scroll = 0;
+        }
 
         // Spectrogram-view pinch/scroll (only when cursor is NOT
         // in the waveform panel — the panel uses identical input
         // semantics but applies to its own time-zoom/pan state).
-        if (!in_panel_for_input && pinch != 0.0f) {
+        if (!in_panel_for_input && !in_decode_panel_input && pinch != 0.0f) {
             float img_x_under = view_x + m.x / zoom;
             float img_y_under = view_y + m.y / zoom;
             float new_zoom = zoom * expf(pinch);
@@ -1269,7 +1285,7 @@ int main(int argc, char **argv)
             view_x = img_x_under - m.x / zoom;
             view_y = img_y_under - m.y / zoom;
         }
-        if (!in_panel_for_input
+        if (!in_panel_for_input && !in_decode_panel_input
             && (wheel_v.x != 0.0f || wheel_v.y != 0.0f)) {
             view_x -= wheel_v.x * 12.0f / zoom;
             view_y -= wheel_v.y * 12.0f / zoom;
@@ -1332,26 +1348,31 @@ int main(int argc, char **argv)
         // screen goes from y=0 to y=spec_screen_h; the waveform
         // panel (when open) and the status bar replace the bottom
         // of the window so the spec doesn't render behind them.
+        // Likewise spec_screen_w shrinks when the decode side panel
+        // is open so the spec doesn't render behind that strip.
         int   bar_h_clamp = 2 * (STATUS_PT + 6);
         int   spec_screen_h = wf_open
             ? (sh - wf_panel_h) : (sh - bar_h_clamp);
         if (spec_screen_h < 32) spec_screen_h = 32;
+        int   spec_screen_w = decode_open ? (sw - decode_panel_w) : sw;
+        if (spec_screen_w < 64) spec_screen_w = 64;
 
         // First frame: zoom so the entire image height fits in the
         // current spec area, and centre the image horizontally in the
-        // window. Negative view_x represents a centring offset.
+        // (spec portion of the) window. Negative view_x represents a
+        // centring offset.
         if (first_frame) {
             zoom = (float) spec_screen_h / (float) img_h;
             if (zoom < 0.001f) zoom = 1.0f;
             view_y = 0.0f;
             float img_screen_w = (float) img_w * zoom;
-            view_x = (img_screen_w < sw)
-                ? -((float) sw / zoom - (float) img_w) * 0.5f
+            view_x = (img_screen_w < spec_screen_w)
+                ? -((float) spec_screen_w / zoom - (float) img_w) * 0.5f
                 : 0.0f;
             first_frame = 0;
         }
 
-        float visible_w = sw / zoom;
+        float visible_w = spec_screen_w / zoom;
         float visible_h = spec_screen_h / zoom;
         // Horizontal: if image fits in window, lock to a centred view
         // (visualised as negative view_x). Otherwise allow pan within
@@ -1458,6 +1479,104 @@ int main(int argc, char **argv)
         int pdf_requested = IsKeyPressed(KEY_P);
         if (IsKeyPressed(KEY_Q)) break;
 
+        // Esc closes the decode side panel (does NOT quit — SetExitKey(0)
+        // disabled raylib's default Esc-to-exit at startup).
+        if (IsKeyPressed(KEY_ESCAPE)) {
+            if (decode_open) {
+                decode_open = 0;
+                snprintf(status, sizeof status, "decode panel closed");
+            }
+        }
+
+        // D → spawn rx_replay over the IQ slice covering the currently-
+        // visible time range and show its output in the side panel.
+        // Synchronous (typically a few hundred ms for the slice sizes
+        // operators use); the UI freezes for that long. Esc clears.
+        if (IsKeyPressed(KEY_D) && iqb.samples != NULL) {
+            // Visible time range, mirroring how wf_t_lo / wf_t_hi are
+            // computed for the waveform panel further down.
+            double vis_top_img = (double) view_y;
+            double vis_bot_img = (double) view_y + (double) visible_h;
+            if (vis_top_img < WF_TM) vis_top_img = WF_TM;
+            if (vis_bot_img > WF_TM + spec_h) vis_bot_img = WF_TM + spec_h;
+            if (vis_bot_img < vis_top_img) vis_bot_img = vis_top_img;
+            double frac_top = (vis_top_img - WF_TM) / (double) spec_h;
+            double frac_bot = (vis_bot_img - WF_TM) / (double) spec_h;
+            double t_hi = (1.0 - frac_top) * duration_s;
+            double t_lo = (1.0 - frac_bot) * duration_s;
+            if (t_hi < t_lo) { double tmp = t_lo; t_lo = t_hi; t_hi = tmp; }
+            // Pad ±1 s so rx_replay's 1.5 s sliding window always has
+            // enough samples even when the operator zoomed into one
+            // burst. Clamp to file extents.
+            double t0 = t_lo - 1.0;
+            double t1 = t_hi + 1.0;
+            if (t0 < 0.0) t0 = 0.0;
+            if (t1 > duration_s) t1 = duration_s;
+            int64_t i_lo = (int64_t)(t0 * iqb.samp_rate);
+            int64_t i_hi = (int64_t)(t1 * iqb.samp_rate);
+            if (i_lo < 0) i_lo = 0;
+            if (i_hi > (int64_t) iqb.n_pairs) i_hi = (int64_t) iqb.n_pairs;
+            int64_t n_pairs_dec = i_hi - i_lo;
+            if (n_pairs_dec < (int64_t) iqb.samp_rate) {
+                snprintf(status, sizeof status,
+                    "decode: window too small (%.3fs)", t1 - t0);
+            } else {
+                char tmp_iq[128], tmp_txt[128];
+                snprintf(tmp_iq, sizeof tmp_iq,
+                    "/tmp/iqa_decode_%d.iq", (int) getpid());
+                snprintf(tmp_txt, sizeof tmp_txt,
+                    "/tmp/iqa_decode_%d.txt", (int) getpid());
+                FILE *fo = fopen(tmp_iq, "wb");
+                if (fo == NULL) {
+                    snprintf(status, sizeof status,
+                        "decode: open %s: %s",
+                        tmp_iq, strerror(errno));
+                } else {
+                    size_t want_pairs = (size_t) n_pairs_dec;
+                    fwrite(iqb.samples + i_lo * 2,
+                           sizeof(int16_t),
+                           want_pairs * 2, fo);
+                    fclose(fo);
+                    char cmd[512];
+                    snprintf(cmd, sizeof cmd,
+                        "rx_replay %s %d --iq >%s 2>&1",
+                        tmp_iq, iqb.samp_rate, tmp_txt);
+                    int rc = system(cmd);
+                    // Slurp the captured output.
+                    FILE *fi = fopen(tmp_txt, "r");
+                    if (fi != NULL) {
+                        fseek(fi, 0, SEEK_END);
+                        long sz = ftell(fi);
+                        fseek(fi, 0, SEEK_SET);
+                        free(decode_text);
+                        decode_text = NULL;
+                        decode_text_len = 0;
+                        if (sz > 0) {
+                            decode_text = (char *) malloc((size_t)(sz + 1));
+                            if (decode_text != NULL) {
+                                size_t r = fread(decode_text, 1, (size_t) sz, fi);
+                                decode_text[r] = '\0';
+                                decode_text_len = r;
+                            }
+                        }
+                        fclose(fi);
+                    }
+                    unlink(tmp_iq);
+                    unlink(tmp_txt);
+                    decode_open = 1;
+                    decode_scroll = 0;
+                    if (rc == 0) {
+                        snprintf(status, sizeof status,
+                            "decode: rx_replay over %.2fs window "
+                            "(t=%.2fs..%.2fs)", t1 - t0, t0, t1);
+                    } else {
+                        snprintf(status, sizeof status,
+                            "decode: rx_replay rc=%d (is it on PATH?)", rc);
+                    }
+                }
+            }
+        }
+
         // Cursor → image px → (t, f).
         float img_x_f = view_x + m.x / zoom;
         float img_y_f = view_y + m.y / zoom;
@@ -1468,12 +1587,16 @@ int main(int argc, char **argv)
         // box drawing / selection / resize on the spectrogram above.
         int   in_panel_now =
             wf_open && (int) m.y >= sh - wf_panel_h && (int) m.y < sh;
-        // Spec is drawn from screen y=0 down to spec_screen_h; below
-        // that is the panel (when open) or the status bar.
+        int   in_decode_now =
+            decode_open && (int) m.x >= spec_screen_w;
+        // Spec is drawn from screen (0,0) to (spec_screen_w, spec_screen_h);
+        // below that is the waveform panel (when open) or the status bar,
+        // and to the right is the decode side panel (when open).
         int   in_spec = (img_x >= WF_LM && img_x < WF_LM + spec_w
                       && img_y >= WF_TM && img_y < WF_TM + spec_h
+                      && (int) m.x < spec_screen_w
                       && (int) m.y < spec_screen_h
-                      && !in_panel_now);
+                      && !in_panel_now && !in_decode_now);
         double cursor_t = 0.0, cursor_f = 0.0;
         if (in_spec) {
             double col_frac = (img_x_f - WF_LM) / (double) spec_w;
@@ -1882,7 +2005,9 @@ int main(int argc, char **argv)
         // Status bar — two lines now: top = box info, bottom = cursor
         // / keys / status messages.
         int bar_h = 2 * (STATUS_PT + 6);
-        DrawRectangle(0, sh - bar_h, sw, bar_h, (Color){0, 0, 0, 210});
+        // Status bar runs only as wide as the spec area so it doesn't
+        // sit under the decode side panel.
+        DrawRectangle(0, sh - bar_h, spec_screen_w, bar_h, (Color){0, 0, 0, 210});
         if (box_info[0]) {
             draw_text(box_info, 6, sh - bar_h + 4, STATUS_PT,
                       (boxes.selected >= 0 && boxes.selected == box_for_status)
@@ -1912,15 +2037,17 @@ int main(int argc, char **argv)
         // has no independent zoom/pan — pinch & scroll on the
         // spectrogram move both views together.
         if (wf_open && iqb.samples != NULL) {
-            // Background.
-            DrawRectangle(0, wf_y0, sw, wf_panel_h, (Color){15, 15, 20, 230});
-            DrawLine(0, wf_y0, sw, wf_y0, GRAY);
+            // Background — only the area to the left of the decode panel
+            // (if open) so the two panels don't overlap.
+            int wf_right = spec_screen_w;
+            DrawRectangle(0, wf_y0, wf_right, wf_panel_h, (Color){15, 15, 20, 230});
+            DrawLine(0, wf_y0, wf_right, wf_y0, GRAY);
 
             // Layout inside the panel — bigger margins so the larger
             // TTF labels fit.
             int pL = 96, pR = 8, pT = 6, pB = 52;
             int plot_x0 = pL;
-            int plot_x1 = sw - pR;
+            int plot_x1 = wf_right - pR;
             int plot_y0 = wf_y0 + pT;
             int plot_y1 = sh - bar_h - pB;
             int plot_w  = plot_x1 - plot_x0;
@@ -2126,6 +2253,75 @@ int main(int argc, char **argv)
             }
         }
 
+        // ----- decode side panel (D to (re)decode, Esc to close) -----
+        if (decode_open) {
+            int dpx = spec_screen_w;
+            int dpw = decode_panel_w;
+            DrawRectangle(dpx, 0, dpw, sh, (Color){12, 12, 18, 255});
+            DrawLine(dpx, 0, dpx, sh, GRAY);
+
+            const int DEC_TITLE_PT = 16;
+            const int DEC_BODY_PT  = 13;
+            const int dec_line_h   = DEC_BODY_PT + 3;
+            draw_text("Decode  [Esc=close  D=rerun  wheel=scroll]",
+                      dpx + 8, 6, DEC_TITLE_PT,
+                      (Color){200, 220, 240, 255});
+            int body_y0 = 6 + DEC_TITLE_PT + 10;
+            int body_y_max = sh - 4;
+
+            // Count lines for scroll clamping.
+            int n_lines = 0;
+            if (decode_text != NULL) {
+                for (const char *p = decode_text; *p != '\0'; ++p) {
+                    if (*p == '\n') ++n_lines;
+                }
+                if (decode_text_len > 0
+                    && decode_text[decode_text_len - 1] != '\n') {
+                    ++n_lines;
+                }
+            }
+            int max_scroll =
+                n_lines - (body_y_max - body_y0) / dec_line_h;
+            if (max_scroll < 0) max_scroll = 0;
+            if (decode_scroll > max_scroll) decode_scroll = max_scroll;
+
+            // Walk lines, render those in [decode_scroll, ...].
+            if (decode_text != NULL) {
+                const char *p = decode_text;
+                int line_idx = 0;
+                int y = body_y0;
+                while (*p != '\0' && y < body_y_max) {
+                    const char *eol = strchr(p, '\n');
+                    int len = (eol != NULL) ? (int)(eol - p) : (int) strlen(p);
+                    if (line_idx >= decode_scroll) {
+                        char buf[512];
+                        int copy = len;
+                        if (copy >= (int)(sizeof buf)) copy = (int) sizeof buf - 1;
+                        memcpy(buf, p, (size_t) copy);
+                        buf[copy] = '\0';
+                        draw_text(buf, dpx + 8, y, DEC_BODY_PT,
+                                  (Color){210, 210, 215, 255});
+                        y += dec_line_h;
+                    }
+                    ++line_idx;
+                    if (eol == NULL) break;
+                    p = eol + 1;
+                }
+            } else {
+                draw_text("(no output)", dpx + 8, body_y0, DEC_BODY_PT,
+                          (Color){140, 140, 150, 255});
+            }
+            // Scroll indicator at bottom-right of panel.
+            if (n_lines > 0) {
+                char sb[64];
+                snprintf(sb, sizeof sb,
+                    "%d / %d lines", decode_scroll, n_lines);
+                int tw = measure_text(sb, DEC_BODY_PT);
+                draw_text(sb, dpx + dpw - tw - 8, sh - DEC_BODY_PT - 4,
+                          DEC_BODY_PT, (Color){140, 140, 160, 255});
+            }
+        }
+
         EndDrawing();
     }
 
@@ -2134,6 +2330,7 @@ int main(int argc, char **argv)
     }
     free(tiles);
     iq_buf_free(&iqb);
+    free(decode_text);
     if (g_ui_font_loaded) UnloadFont(g_ui_font);
     CloseWindow();
     return 0;
