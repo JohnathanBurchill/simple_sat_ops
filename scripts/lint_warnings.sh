@@ -62,6 +62,16 @@ if [[ "${1:-}" == "--quick" ]]; then
     mode="quick"
 fi
 
+# UHD coverage: turn on WITH_USRP_B210 when the libuhd headers are
+# discoverable via pkg-config, so format-truncation bugs in B210-
+# specific utilities (b210_rx_capture, b210_gain_sweep, tx_frame_sdr)
+# are caught here rather than only on the Linux ground machine. Mac
+# hosts without `brew install uhd` fall back to the off-mode build.
+USRP_FLAG="-DWITH_USRP_B210=OFF"
+if pkg-config --exists uhd 2>/dev/null; then
+    USRP_FLAG="-DWITH_USRP_B210=ON"
+fi
+
 if [[ "$mode" == "full" || ! -d "$BUILD_DIR" ]]; then
     rm -rf "$BUILD_DIR"
     mkdir -p "$BUILD_DIR"
@@ -69,7 +79,7 @@ if [[ "$mode" == "full" || ! -d "$BUILD_DIR" ]]; then
     cmake "$ROOT" \
         -DCMAKE_C_COMPILER="$GCC" \
         -DCMAKE_C_FLAGS="${WFLAGS[*]} ${SGP4SDP4_INC}" \
-        -DWITH_USRP_B210=OFF \
+        "$USRP_FLAG" \
         >cmake.log 2>&1 || { cat cmake.log; exit 1; }
 fi
 

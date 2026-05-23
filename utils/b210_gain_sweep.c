@@ -286,8 +286,11 @@ int main(int argc, char *argv[])
 
         FILE *iq_fp = NULL;
         if (iq_prefix != NULL) {
+            // 512 - "_<gg.g>dB.iq" (12) - NUL = 499 path chars max.
+            // %.499s bounds the prefix so GCC's -Wformat-truncation
+            // proves the snprintf can't overflow.
             char path[512];
-            snprintf(path, sizeof path, "%s_%05.1fdB.iq", iq_prefix, g);
+            snprintf(path, sizeof path, "%.499s_%05.1fdB.iq", iq_prefix, g);
             iq_fp = fopen(path, "wb");
             if (iq_fp == NULL) {
                 fprintf(stderr, "%s: %s\n", path, strerror(errno));
