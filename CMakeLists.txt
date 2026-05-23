@@ -476,6 +476,24 @@ if (OPENSSL_FOUND)
         target_link_sso_core(b210_rx_capture)
         list(APPEND SSO_TARGETS b210_rx_capture)
 
+        # B210 RX-gain sweep: open at each gain step, dwell, measure
+        # mean(I² + Q²). Uses the same b210_rx_tx_core wrapper that
+        # simple_sat_ops' live receiver does, so the measurement
+        # conditions (rate, decim, FIR cutoff) match operationally.
+        add_executable(b210_gain_sweep utils/b210_gain_sweep.c
+                       src/hw/b210_rx_tx_core.c
+                       src/dsp/fir_decim.c src/dsp/sw_nco.c
+                       src/dsp/iq_burst.c
+                       src/dsp/modem.c)
+        target_include_directories(b210_gain_sweep PRIVATE
+            ${UHD_INCLUDE_DIRS})
+        target_link_directories(b210_gain_sweep PRIVATE
+            ${UHD_LIBRARY_DIRS})
+        target_link_libraries(b210_gain_sweep PRIVATE
+            ${UHD_LIBRARIES} m)
+        target_link_sso_core(b210_gain_sweep)
+        list(APPEND SSO_TARGETS b210_gain_sweep)
+
         # Live B210 RX + TX is no longer a separate target — the
         # daemon was folded into simple_sat_ops (FLYUFLS), which now
         # owns the device end-to-end. b210_rx_capture survives for
