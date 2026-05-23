@@ -90,6 +90,13 @@ void rx_session_set_lo_offset(rx_session_t *rxs,
 // signal. Pass 0.0 to disable correction entirely.
 void rx_session_set_doppler_offset(rx_session_t *rxs, double offset_hz);
 
+// Change the AD9361 RX gain at runtime. Routed through the worker
+// thread (same handoff pattern as freq retunes) so the UHD streamer
+// isn't touched from the caller's thread. Brief noise discontinuity
+// in the IQ stream while the gain table swaps stages, but the stream
+// keeps running.
+void rx_session_set_gain(rx_session_t *rxs, double gain_db);
+
 // Latest NCO offset (Hz). Used by the operator UI to display the
 // effective downlink frequency (= nominal + offset).
 double rx_session_get_doppler_offset(const rx_session_t *rxs);

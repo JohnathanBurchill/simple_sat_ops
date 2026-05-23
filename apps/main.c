@@ -658,7 +658,7 @@ static void cmd_dispatch(state_t *state)
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "h") == 0 || strcmp(cmd, "?") == 0) {
         cmd_set_status("commands: help tx track stop home quit "
                        "freq <MHz> lo_offset <±kHz> lo_bandwidth <kHz> "
-                       "rs on|off spectrum <sec>");
+                       "gain <dB> rs on|off spectrum <sec>");
     } else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0
                || strcmp(cmd, "exit") == 0) {
         state->running = 0;
@@ -882,6 +882,30 @@ static void cmd_dispatch(state_t *state)
                                    strerror(errno));
                 }
             }
+        }
+    } else if (strcmp(cmd, "gain") == 0) {
+        // Change the AD9361 RX gain mid-pass. The current operating
+        // point lives in state->rx_gain_db; routed through the
+        // worker thread so we don't touch the UHD streamer from this
+        // thread (same handoff as :lo_offset).
+        if (arg1 == NULL) {
+            cmd_set_status("gain: usage `gain <dB>` (range 0-76; current %.1f)",
+                           state->rx_gain_db);
+        } else {
+#ifdef WITH_USRP_B210
+            double g = atof(arg1);
+            if (g < 0.0 || g > 76.0) {
+                cmd_set_status("gain: %g dB out of [0, 76]", g);
+            } else if (g_rx_session == NULL) {
+                cmd_set_status("gain: no RX session");
+            } else {
+                state->rx_gain_db = g;
+                rx_session_set_gain(g_rx_session, g);
+                cmd_set_status("gain -> %.1f dB", g);
+            }
+#else
+            cmd_set_status("gain: this build has no USRP support");
+#endif
         }
     } else {
         cmd_set_status("unknown command '%s' (try :help)", cmd);
@@ -3970,6 +3994,15 @@ void usage(FILE *dest, const char *name, int full)
         "                               (default 15.0, clamped to [1, 45]). Az\n"
         "                               samples per ring scale with cos(el) so\n"
         "                               cells stay approximately equal area.\n"
+        "  --rx-gain=<dB>               AD9361 RX gain at session open, dB.\n"
+        "                               Default 50; range [0, 76]. Pick from a\n"
+        "                               b210_gain_sweep run — operate ~5 dB above\n"
+        "                               the knee where the noise floor stops\n"
+        "                               tracking gain 1:1. Adjustable mid-pass\n"
+        "                               via the ':gain <dB>' colon command.\n"
+        "  --lo-offset=<kHz>            Park the SDR LO this far off the nominal\n"
+        "                               carrier (signed, default -25). Adjustable\n"
+        "                               mid-pass via ':lo_offset <signed_kHz>'.\n"
         "  --tx-dry-run                 Synthesize an immediate 'ok' ack for\n"
         "                               every TX burst instead of routing it\n"
         "                               through the SDR. Exercises the auto-\n"
@@ -5265,7 +5298,7 @@ int main(int argc, char **argv)
             .freq_hz         = state.nominal_downlink_frequency_hz
                              + state.rx_lo_offset_hz,
             .rate_hz         = 480000.0,
-            .gain_db         = 50.0,
+            .gain_db         = state.rx_gain_db,
             .bw_hz           = -1.0,
             .fm_fullscale_hz = 25000.0,
             .device_args     = "type=b200",
@@ -6205,6 +6238,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     // 5 kHz to clear DC, and at most ~35 kHz so the ±10 kHz Doppler
     // swing stays inside the 48 kHz post-decim half-band.
     state->rx_lo_offset_hz = -25000.0;
+    state->rx_gain_db      = 50.0;
 
     state->run_with_antenna_rotator = 1;
     state->antenna_rotator.device_filename = "/dev/ttyUSB0";
@@ -6346,6 +6380,15 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             state->n_options++;
             // Argument is kHz so an integer is easy to type; we store Hz.
             state->rx_lo_offset_hz = atof(argv[i] + 12) * 1000.0;
+        } else if (strncmp("--rx-gain=", argv[i], 10) == 0) {
+            state->n_options++;
+            double g = atof(argv[i] + 10);
+            // AD9361 RX gain range is 0-76 dB; UHD coerces values outside
+            // this and prints a warning, but we clip here so the value in
+            // state matches what the hardware will use.
+            if (g < 0.0)       g = 0.0;
+            else if (g > 76.0) g = 76.0;
+            state->rx_gain_db = g;
         } else if (strncmp("--rotator-target-elevation=", argv[i], 27) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 28) {

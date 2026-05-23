@@ -121,6 +121,13 @@ ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *core,
 // Return: 0 on success, -1 on UHD error.
 int b210_rx_tx_core_set_freq(b210_rx_tx_core_t *core, double freq_hz);
 
+// Update the AD9361 RX gain on RX channel 0. The streamer keeps
+// running; the AD9361 accepts the change inline and the next pump
+// returns samples at the new gain after a brief settle.  Clipped
+// to [0, 76] dB by the AD9361 itself; pass values outside that and
+// UHD will coerce / warn.  Return: 0 on success, -1 on UHD error.
+int b210_rx_tx_core_set_gain(b210_rx_tx_core_t *core, double gain_db);
+
 // Software Doppler NCO. After the FIR decimator and before the IQ tap /
 // FM discriminator, every sample is multiplied by exp(-j 2π Δf · t)
 // so a carrier sitting at offset Δf Hz from the LO is rotated back to

@@ -68,6 +68,11 @@ typedef struct state
     // baseband for the whole pass. Configurable via --lo-offset=<kHz>.
     double rx_lo_offset_hz;
 
+    // AD9361 RX gain (dB) — fed to b210_rx_tx_core at session open.
+    // Configurable via --rx-gain=<dB>; runtime adjustment is via the
+    // :gain colon command in the operator UI.
+    double rx_gain_db;
+
     // Antenna rotator
     antenna_rotator_t antenna_rotator;
     int run_with_antenna_rotator;

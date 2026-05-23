@@ -282,6 +282,8 @@ struct rx_session {
     // Requests from main thread (set under mu, picked up by worker).
     int     freq_req_pending;
     double  freq_req_hz;
+    int     gain_req_pending;
+    double  gain_req_db;
     int     wav_start_req;
     int     wav_stop_req;
 
@@ -734,6 +736,18 @@ void rx_session_set_doppler_offset(rx_session_t *rxs, double offset_hz)
     // Lock-free: the NCO is a single double on the core, and the pump
     // re-reads it once per chunk. No worker handoff needed.
     b210_rx_tx_core_set_doppler_offset(rxs->core, offset_hz);
+}
+
+void rx_session_set_gain(rx_session_t *rxs, double gain_db)
+{
+    if (rxs == NULL) return;
+    // Same worker-thread handoff as freq retunes — the UHD streamer
+    // lives on the worker, so we queue the change and wake it.
+    pthread_mutex_lock(&rxs->mu);
+    rxs->gain_req_pending = 1;
+    rxs->gain_req_db      = gain_db;
+    pthread_cond_broadcast(&rxs->cv);
+    pthread_mutex_unlock(&rxs->mu);
 }
 
 void rx_session_set_lo_offset(rx_session_t *rxs,
@@ -1272,6 +1286,8 @@ static void *rx_session_thread_fn(void *arg)
         int stop          = rxs->stop_requested;
         int freq_change   = rxs->freq_req_pending;
         double new_freq   = rxs->freq_req_hz;
+        int gain_change   = rxs->gain_req_pending;
+        double new_gain   = rxs->gain_req_db;
         int do_wav_start  = rxs->wav_start_req;
         int do_wav_stop   = rxs->wav_stop_req;
         int do_burst      = rxs->burst_req_pending && !rxs->burst_complete;
@@ -1285,6 +1301,7 @@ static void *rx_session_thread_fn(void *arg)
                 memcpy(hmac_local, rxs->burst_hmac_key, hmac_local_len);
         }
         rxs->freq_req_pending = 0;
+        rxs->gain_req_pending = 0;
         rxs->wav_start_req    = 0;
         rxs->wav_stop_req     = 0;
         pthread_mutex_unlock(&rxs->mu);
@@ -1293,6 +1310,9 @@ static void *rx_session_thread_fn(void *arg)
 
         if (freq_change) {
             b210_rx_tx_core_set_freq(rxs->core, new_freq);
+        }
+        if (gain_change) {
+            b210_rx_tx_core_set_gain(rxs->core, new_gain);
         }
         if (do_wav_start) worker_wav_start(rxs);
         if (do_wav_stop)  worker_wav_stop(rxs);

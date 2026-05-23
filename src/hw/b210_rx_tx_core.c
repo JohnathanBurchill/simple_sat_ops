@@ -491,6 +491,15 @@ int b210_rx_tx_core_set_freq(b210_rx_tx_core_t *c, double freq_hz)
     return 0;
 }
 
+int b210_rx_tx_core_set_gain(b210_rx_tx_core_t *c, double gain_db)
+{
+    if (c == NULL) return -1;
+    if (log_uhd(uhd_usrp_set_rx_gain(c->dev, gain_db, 0, ""), "set_rx_gain")) {
+        return -1;
+    }
+    return 0;
+}
+
 double b210_rx_tx_core_actual_rate(const b210_rx_tx_core_t *c) { return c ? c->actual_rate : 0.0; }
 double b210_rx_tx_core_input_rate (const b210_rx_tx_core_t *c) { return c ? c->input_rate  : 0.0; }
 double b210_rx_tx_core_actual_freq(const b210_rx_tx_core_t *c) { return c ? c->actual_freq : 0.0; }
