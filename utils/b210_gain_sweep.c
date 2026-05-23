@@ -39,6 +39,7 @@
 
 #include "b210_rx_tx_core.h"
 #include "frontiersat.h"
+#include "sso_paths.h"
 
 #include <errno.h>
 #include <math.h>
@@ -90,6 +91,10 @@ static void usage(const char *argv0)
         "                                   mean_sq_dbfs,peak_env\n"
         "  --iq-prefix=PATH     also dump per-step IQ to\n"
         "                       PATH_<gain>dB.iq (raw int16 I,Q pairs)\n"
+        "  --testing            auto-create a bench folder under\n"
+        "                       <FrontierSat>/Testing/YYYYMMDD/HHMMLT_gain_sweep/\n"
+        "                       and default --csv / --iq-prefix into it\n"
+        "                       unless you also passed them explicitly.\n"
         "\n"
         "Output: one row per gain on stdout — column \"mean_dBFS\" is\n"
         "10*log10(mean(I^2+Q^2) / 32767^2). Plot dBFS vs gain; the knee\n"
@@ -114,6 +119,7 @@ int main(int argc, char *argv[])
 
     const char *csv_path      = NULL;
     const char *iq_prefix     = NULL;
+    int         testing_mode  = 0;
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
@@ -132,6 +138,7 @@ int main(int argc, char *argv[])
         else if (starts_with(a, "--settle="))         settle_s     = atof(a + 9);
         else if (starts_with(a, "--csv="))            csv_path     = a + 6;
         else if (starts_with(a, "--iq-prefix="))      iq_prefix    = a + 12;
+        else if (strcmp(a, "--testing") == 0)         testing_mode = 1;
         else {
             fprintf(stderr, "unknown option: %s\n", a);
             usage(argv[0]); return 2;
@@ -141,6 +148,49 @@ int main(int argc, char *argv[])
     if (gain_step <= 0.0) { fprintf(stderr, "--gain-step must be > 0\n"); return 2; }
     if (gain_end < gain_start) { fprintf(stderr, "--gain-end < --gain-start\n"); return 2; }
     if (dwell_s <= 0.0) { fprintf(stderr, "--dwell must be > 0\n"); return 2; }
+
+    // --testing: bench-mode pass folder under
+    //   <FrontierSat>/Testing/YYYYMMDD/HHMMLT_gain_sweep/
+    // Suffix distinguishes the gain sweep run from a simple_sat_ops
+    // --testing pass that might start in the same minute.  CSV and IQ
+    // outputs default into the folder; explicit --csv / --iq-prefix
+    // still win.
+    char testing_folder[512];
+    char testing_csv[640];
+    char testing_iq[640];
+    if (testing_mode) {
+        time_t now = time(NULL);
+        struct tm now_local;
+        localtime_r(&now, &now_local);
+        int n = snprintf(testing_folder, sizeof testing_folder,
+                         "%s/%04d%02d%02d/%02d%02dLT_gain_sweep",
+                         sso_testing_dir(),
+                         now_local.tm_year + 1900,
+                         now_local.tm_mon + 1,
+                         now_local.tm_mday,
+                         now_local.tm_hour,
+                         now_local.tm_min);
+        if (n <= 0 || (size_t) n >= sizeof testing_folder) {
+            fprintf(stderr, "b210_gain_sweep: --testing folder path too long\n");
+            return 1;
+        }
+        if (sso_mkdir_p(testing_folder) != 0) {
+            fprintf(stderr, "b210_gain_sweep: mkdir -p %s failed: %s\n",
+                    testing_folder, strerror(errno));
+            return 1;
+        }
+        fprintf(stderr, "b210_gain_sweep: --testing folder %s\n", testing_folder);
+        if (csv_path == NULL) {
+            snprintf(testing_csv, sizeof testing_csv,
+                     "%s/sweep.csv", testing_folder);
+            csv_path = testing_csv;
+        }
+        if (iq_prefix == NULL) {
+            snprintf(testing_iq, sizeof testing_iq,
+                     "%s/spur", testing_folder);
+            iq_prefix = testing_iq;
+        }
+    }
 
     signal(SIGINT,  on_sigint);
     signal(SIGTERM, on_sigint);
