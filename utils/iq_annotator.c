@@ -40,6 +40,8 @@
 
 #include <raylib.h>
 
+#include "pdf_writer.h"
+
 #ifdef __APPLE__
 // Trackpad pinch is delivered as NSEventTypeMagnify, which raylib/GLFW
 // don't forward. utils/iq_annotator_macos.m installs an NSEvent local
@@ -564,191 +566,6 @@ static void iq_buf_free(iq_buf_t *b)
     free(b->samples); b->samples = NULL; b->n_pairs = 0;
 }
 
-// ---------------------------------------------------------------------------
-// Minimal vector PDF writer (pattern lifted from ~/src/lorentz_tracer's
-// pdf_export.c, cut down to the bare minimum we need for one figure:
-// a single page, Standard-14 fonts (Helvetica + Courier), stroked lines
-// + rectangles, filled rectangles, ASCII text only, full opacity. The
-// content stream is buffered in memory until pdf_end() so we know its
-// length. Coordinates use raylib screen-pixel space (Y down); the
-// PDFY macro flips to PDF page space (Y up).
-// ---------------------------------------------------------------------------
-
-#define PDFMAX_OBJ 64
-
-typedef struct {
-    FILE *fp;
-    long  bytes;
-    long  obj_off[PDFMAX_OBJ];
-    int   n_objects;
-    char *cs;
-    size_t cs_len, cs_cap;
-    float page_w, page_h;
-    int catalog_obj, pages_obj, page_obj, content_obj;
-    int font_helv, font_cour;
-} pdfw_t;
-
-static void pdfw_cs_append(pdfw_t *w, const char *s, size_t n)
-{
-    if (w->cs_len + n + 1 > w->cs_cap) {
-        size_t nc = w->cs_cap ? w->cs_cap * 2 : 8192;
-        while (nc < w->cs_len + n + 1) nc *= 2;
-        char *p = (char *) realloc(w->cs, nc);
-        if (p == NULL) return;
-        w->cs = p; w->cs_cap = nc;
-    }
-    memcpy(w->cs + w->cs_len, s, n);
-    w->cs_len += n;
-    w->cs[w->cs_len] = '\0';
-}
-
-__attribute__((format(printf, 2, 3)))
-static void pdfw_csf(pdfw_t *w, const char *fmt, ...)
-{
-    char buf[1024];
-    va_list ap; va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    if (n > 0 && n < (int) sizeof buf) pdfw_cs_append(w, buf, (size_t) n);
-}
-
-__attribute__((format(printf, 2, 3)))
-static void pdfw_writef(pdfw_t *w, const char *fmt, ...)
-{
-    char buf[1024];
-    va_list ap; va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    if (n > 0) { fwrite(buf, 1, (size_t) n, w->fp); w->bytes += n; }
-}
-
-#define PDFY(W, Y) ((W)->page_h - (float)(Y))
-
-static pdfw_t *pdfw_begin(const char *path, float page_w, float page_h)
-{
-    pdfw_t *w = (pdfw_t *) calloc(1, sizeof(*w));
-    if (w == NULL) return NULL;
-    w->fp = fopen(path, "wb");
-    if (w->fp == NULL) { free(w); return NULL; }
-    w->page_w = page_w; w->page_h = page_h;
-    static const char hdr[] = "%PDF-1.4\n%\xe2\xe3\xcf\xd3\n";
-    fwrite(hdr, 1, sizeof hdr - 1, w->fp);
-    w->bytes = (long)(sizeof hdr - 1);
-    return w;
-}
-
-static int pdfw_next_obj(pdfw_t *w)
-{
-    if (w->n_objects + 1 >= PDFMAX_OBJ) return -1;
-    return ++w->n_objects;
-}
-
-static void pdfw_set_stroke(pdfw_t *w, Color c)
-{
-    pdfw_csf(w, "%.4f %.4f %.4f RG\n", c.r/255.0, c.g/255.0, c.b/255.0);
-}
-static void pdfw_set_fill(pdfw_t *w, Color c)
-{
-    pdfw_csf(w, "%.4f %.4f %.4f rg\n", c.r/255.0, c.g/255.0, c.b/255.0);
-}
-static void pdfw_lw(pdfw_t *w, float lw) { pdfw_csf(w, "%.3f w\n", lw); }
-static void pdfw_line(pdfw_t *w, float x1, float y1, float x2, float y2)
-{
-    pdfw_csf(w, "%.4f %.4f m %.4f %.4f l S\n",
-             x1, PDFY(w, y1), x2, PDFY(w, y2));
-}
-static void pdfw_rect_stroke(pdfw_t *w, float x, float y, float ww, float hh)
-{
-    pdfw_csf(w, "%.4f %.4f %.4f %.4f re S\n",
-             x, PDFY(w, y + hh), ww, hh);
-}
-static void pdfw_rect_fill(pdfw_t *w, float x, float y, float ww, float hh)
-{
-    pdfw_csf(w, "%.4f %.4f %.4f %.4f re f\n",
-             x, PDFY(w, y + hh), ww, hh);
-}
-static void pdfw_text(pdfw_t *w, float x, float y_top,
-                      const char *s, float fsz, int mono)
-{
-    if (s == NULL || !*s) return;
-    float baseline_y = y_top + fsz * 0.8f;
-    pdfw_csf(w, "BT /F%d %.2f Tf %.4f %.4f Td (", mono ? 1 : 0,
-             fsz, x, PDFY(w, baseline_y));
-    for (const char *p = s; *p; ++p) {
-        unsigned char c = (unsigned char) *p;
-        if (c == '(' || c == ')' || c == '\\') {
-            char b[2] = {'\\', (char) c}; pdfw_cs_append(w, b, 2);
-        } else if (c < 0x20 || c > 0x7E) {
-            pdfw_cs_append(w, "?", 1);
-        } else {
-            pdfw_cs_append(w, (const char *) &c, 1);
-        }
-    }
-    pdfw_cs_append(w, ") Tj ET\n", 8);
-}
-static float pdfw_str_width(const char *s, float fsz, int mono)
-{
-    if (s == NULL) return 0.0f;
-    int n = (int) strlen(s);
-    return n * (mono ? 0.60f : 0.55f) * fsz;
-}
-
-static int pdfw_end(pdfw_t *w)
-{
-    w->catalog_obj = pdfw_next_obj(w);
-    w->pages_obj   = pdfw_next_obj(w);
-    w->page_obj    = pdfw_next_obj(w);
-    w->content_obj = pdfw_next_obj(w);
-    w->font_helv   = pdfw_next_obj(w);
-    w->font_cour   = pdfw_next_obj(w);
-    if (w->font_cour < 0) { fclose(w->fp); free(w->cs); free(w); return -1; }
-
-    w->obj_off[w->catalog_obj] = w->bytes;
-    pdfw_writef(w, "%d 0 obj\n<< /Type /Catalog /Pages %d 0 R >>\nendobj\n",
-                w->catalog_obj, w->pages_obj);
-    w->obj_off[w->pages_obj] = w->bytes;
-    pdfw_writef(w,
-        "%d 0 obj\n<< /Type /Pages /Count 1 /Kids [%d 0 R] >>\nendobj\n",
-        w->pages_obj, w->page_obj);
-    w->obj_off[w->page_obj] = w->bytes;
-    pdfw_writef(w,
-        "%d 0 obj\n<< /Type /Page /Parent %d 0 R "
-        "/MediaBox [0 0 %.4f %.4f] /Contents %d 0 R "
-        "/Resources << /Font << /F0 %d 0 R /F1 %d 0 R >> >> "
-        ">>\nendobj\n",
-        w->page_obj, w->pages_obj, w->page_w, w->page_h,
-        w->content_obj, w->font_helv, w->font_cour);
-    w->obj_off[w->content_obj] = w->bytes;
-    pdfw_writef(w, "%d 0 obj\n<< /Length %zu >>\nstream\n",
-                w->content_obj, w->cs_len);
-    if (w->cs_len > 0) {
-        fwrite(w->cs, 1, w->cs_len, w->fp);
-        w->bytes += (long) w->cs_len;
-    }
-    pdfw_writef(w, "\nendstream\nendobj\n");
-    w->obj_off[w->font_helv] = w->bytes;
-    pdfw_writef(w,
-        "%d 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
-        "/Encoding /WinAnsiEncoding >>\nendobj\n", w->font_helv);
-    w->obj_off[w->font_cour] = w->bytes;
-    pdfw_writef(w,
-        "%d 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Courier "
-        "/Encoding /WinAnsiEncoding >>\nendobj\n", w->font_cour);
-
-    long xref_off = w->bytes;
-    pdfw_writef(w, "xref\n0 %d\n0000000000 65535 f \n",
-                w->n_objects + 1);
-    for (int i = 1; i <= w->n_objects; ++i)
-        pdfw_writef(w, "%010ld 00000 n \n", w->obj_off[i]);
-    pdfw_writef(w,
-        "trailer\n<< /Size %d /Root %d 0 R >>\nstartxref\n%ld\n%%%%EOF\n",
-        w->n_objects + 1, w->catalog_obj, xref_off);
-    fclose(w->fp);
-    free(w->cs);
-    free(w);
-    return 0;
-}
-
 // Render the current waveform-panel view to a one-page PDF.
 // iq_show_mode: 0=both, 1=I only, 2=Q only.
 static int pdf_write_waveform(const char *path,
@@ -772,12 +589,12 @@ static int pdf_write_waveform(const char *path,
     const float MARGIN = 36.0f;
     const float HEADER_H = 84.0f;
     const float FOOTER_H = 24.0f;
-    pdfw_set_fill(w, (Color){250, 250, 252, 255});
+    pdfw_set_fill(w, (pdfw_rgb_t){250, 250, 252, 255});
     pdfw_rect_fill(w, MARGIN, MARGIN, page_w - 2*MARGIN, HEADER_H);
-    pdfw_set_stroke(w, (Color){80, 80, 80, 255});
+    pdfw_set_stroke(w, PDFW_DGREY);
     pdfw_lw(w, 0.7f);
     pdfw_rect_stroke(w, MARGIN, MARGIN, page_w - 2*MARGIN, HEADER_H);
-    pdfw_set_fill(w, BLACK);
+    pdfw_set_fill(w, PDFW_BLACK);
     pdfw_text(w, MARGIN + 8, MARGIN + 6,
               "iq_annotator -- waveform export", 14.0f, 0);
     pdfw_text(w, MARGIN + 8, MARGIN + 26,
@@ -809,7 +626,7 @@ static int pdf_write_waveform(const char *path,
     const float pB = page_h - MARGIN - FOOTER_H - 30.0f;
     const float plot_w = pR - pL;
     const float plot_h = pB - pT;
-    pdfw_set_stroke(w, (Color){100, 100, 110, 255});
+    pdfw_set_stroke(w, (pdfw_rgb_t){100, 100, 110, 255});
     pdfw_lw(w, 0.8f);
     pdfw_rect_stroke(w, pL, pT, plot_w, plot_h);
 
@@ -826,13 +643,13 @@ static int pdf_write_waveform(const char *path,
     if (amp_max < 32) amp_max = 32;
 
     float mid_y = pT + plot_h * 0.5f;
-    pdfw_set_stroke(w, (Color){200, 200, 210, 255});
+    pdfw_set_stroke(w, PDFW_LGREY);
     pdfw_lw(w, 0.3f);
     pdfw_line(w, pL, mid_y, pR, mid_y);
 
-    pdfw_set_stroke(w, (Color){80, 80, 80, 255});
+    pdfw_set_stroke(w, PDFW_DGREY);
     pdfw_lw(w, 0.5f);
-    pdfw_set_fill(w, BLACK);
+    pdfw_set_fill(w, PDFW_BLACK);
     for (int k = -2; k <= 2; ++k) {
         float y = mid_y - (float)(k * plot_h / 4);
         pdfw_line(w, pL - 4, y, pL, y);
@@ -874,8 +691,8 @@ static int pdf_write_waveform(const char *path,
 
     if (n_pairs_vis > 0 && plot_w > 8.0f) {
         float y_scale = (plot_h * 0.5f) / (float) amp_max;
-        Color I_col = (Color){0, 170, 200, 255};
-        Color Q_col = (Color){190, 60, 180, 255};
+        pdfw_rgb_t I_col = (pdfw_rgb_t){0, 170, 200, 255};
+        pdfw_rgb_t Q_col = (pdfw_rgb_t){190, 60, 180, 255};
         int plot_w_px = (int) plot_w;
         if (n_pairs_vis <= (int64_t) plot_w_px * 2) {
             pdfw_lw(w, 0.5f);
@@ -937,7 +754,7 @@ static int pdf_write_waveform(const char *path,
         "generated %04d-%02d-%02dT%02d:%02d:%02dZ  by iq_annotator",
         utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
         utc.tm_hour, utc.tm_min, utc.tm_sec);
-    pdfw_set_fill(w, (Color){120, 120, 120, 255});
+    pdfw_set_fill(w, PDFW_GREY);
     pdfw_text(w, MARGIN, page_h - MARGIN - 12, foot, 9.0f, 1);
 
     return pdfw_end(w);

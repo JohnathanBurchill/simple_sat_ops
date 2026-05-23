@@ -207,7 +207,7 @@ if (RAYLIB_FOUND)
     # iq_annotator — raylib-backed interactive viewer for offline .iq
     # captures. Lets the operator mouse-draw time × freq boxes around
     # bursts they want to feed back into rx_replay --anchor-csv.
-    set(IQ_ANNOTATOR_SRCS utils/iq_annotator.c)
+    set(IQ_ANNOTATOR_SRCS utils/iq_annotator.c utils/pdf_writer.c)
     if (APPLE)
         # raylib/GLFW drop NSEventTypeMagnify (trackpad pinch); this
         # ObjC shim installs a global NSEvent monitor and accumulates
@@ -481,6 +481,7 @@ if (OPENSSL_FOUND)
         # simple_sat_ops' live receiver does, so the measurement
         # conditions (rate, decim, FIR cutoff) match operationally.
         add_executable(b210_gain_sweep utils/b210_gain_sweep.c
+                       utils/pdf_writer.c
                        src/hw/b210_rx_tx_core.c
                        src/dsp/fir_decim.c src/dsp/sw_nco.c
                        src/dsp/iq_burst.c
