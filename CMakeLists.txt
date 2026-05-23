@@ -172,12 +172,21 @@ add_executable(beacon_detect utils/beacon_detect.c utils/wav_read.c
 target_link_libraries(beacon_detect PRIVATE m)
 list(APPEND SSO_TARGETS beacon_detect)
 
+# Shared FFT / dB / detrend / notch / zoom pipeline. Used by both the
+# CLI waterfall renderer (gen_waterfall) and the interactive annotator
+# (iq_annotator, which uses it to compute the spectrogram in-process
+# and re-colour on the GPU rather than regenerating a PNG every time
+# the operator nudges the dB range).
+add_library(waterfall_core STATIC utils/waterfall_core.c)
+target_include_directories(waterfall_core PUBLIC utils)
+target_link_libraries(waterfall_core PUBLIC m)
+
 # SatNOGS-style waterfall renderer: raw int16 IQ → viridis PNG.
 # Self-contained — no libpng or libz dependency (stored-DEFLATE PNG +
 # inlined radix-2 FFT). simple_sat_ops invokes it for `:spectrum N` and
 # end-of-pass renders when an IQ sidecar is available.
 add_executable(gen_waterfall utils/gen_waterfall.c)
-target_link_libraries(gen_waterfall PRIVATE m)
+target_link_libraries(gen_waterfall PRIVATE waterfall_core m)
 list(APPEND SSO_TARGETS gen_waterfall)
 
 # live_waterfall — raylib-backed real-time spectrogram viewer. Tails
@@ -217,7 +226,7 @@ if (RAYLIB_FOUND)
     add_executable(iq_annotator ${IQ_ANNOTATOR_SRCS})
     target_include_directories(iq_annotator PRIVATE ${RAYLIB_INCLUDE_DIRS})
     target_link_directories(iq_annotator PRIVATE ${RAYLIB_LIBRARY_DIRS})
-    target_link_libraries(iq_annotator PRIVATE ${RAYLIB_LIBRARIES} m)
+    target_link_libraries(iq_annotator PRIVATE ${RAYLIB_LIBRARIES} waterfall_core m)
     if (APPLE)
         target_link_libraries(iq_annotator PRIVATE
             "-framework Cocoa"

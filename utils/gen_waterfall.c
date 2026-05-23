@@ -39,6 +39,8 @@
 
 #define _GNU_SOURCE
 
+#include "waterfall_core.h"
+
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
@@ -54,115 +56,16 @@
 #endif
 
 // --------------------------------------------------------------------
-// Radix-2 in-place complex FFT (Cooley-Tukey, iterative).
-// Operates on a pair of float arrays (re, im) of length n where n must
-// be a power of two. Forward transform; we don't need the inverse.
+// FFT, viridis colormap, build_waterfall, median_inplace, and the
+// tick / time / freq formatters live in utils/waterfall_core.{c,h}.
+// The aliases below let the bitmap-axes / PDF-axes code that still
+// lives in this file keep using the short names.
 // --------------------------------------------------------------------
-
-static int is_pow2(unsigned n) { return n > 0 && (n & (n - 1)) == 0; }
-
-static void fft_bit_reverse(float *re, float *im, unsigned n)
-{
-    unsigned j = 0;
-    for (unsigned i = 1; i < n; ++i) {
-        unsigned bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) {
-            float tr = re[i]; re[i] = re[j]; re[j] = tr;
-            float ti = im[i]; im[i] = im[j]; im[j] = ti;
-        }
-    }
-}
-
-static void fft_forward(float *re, float *im, unsigned n)
-{
-    fft_bit_reverse(re, im, n);
-    for (unsigned len = 2; len <= n; len <<= 1) {
-        double ang = -2.0 * M_PI / (double) len;
-        double wr_step = cos(ang);
-        double wi_step = sin(ang);
-        unsigned half = len >> 1;
-        for (unsigned i = 0; i < n; i += len) {
-            double wr = 1.0, wi = 0.0;
-            for (unsigned k = 0; k < half; ++k) {
-                unsigned a = i + k;
-                unsigned b = a + half;
-                double tr = wr * re[b] - wi * im[b];
-                double ti = wr * im[b] + wi * re[b];
-                re[b] = (float)(re[a] - tr);
-                im[b] = (float)(im[a] - ti);
-                re[a] = (float)(re[a] + tr);
-                im[a] = (float)(im[a] + ti);
-                double nwr = wr * wr_step - wi * wi_step;
-                double nwi = wr * wi_step + wi * wr_step;
-                wr = nwr;
-                wi = nwi;
-            }
-        }
-    }
-}
-
-// --------------------------------------------------------------------
-// Viridis colormap (256 RGB entries, generated from matplotlib's
-// table). Embedded as a constant so we don't need matplotlib or any
-// runtime dependency. Each row is R,G,B in 0..255.
-// --------------------------------------------------------------------
-
-static const uint8_t VIRIDIS[256][3] = {
-    { 68,  1, 84},{ 68,  2, 86},{ 69,  4, 87},{ 69,  5, 89},{ 70,  7, 90},
-    { 70,  8, 92},{ 70, 10, 93},{ 70, 11, 94},{ 71, 13, 96},{ 71, 14, 97},
-    { 71, 16, 99},{ 71, 17,100},{ 71, 19,101},{ 72, 20,103},{ 72, 22,104},
-    { 72, 23,105},{ 72, 24,106},{ 72, 26,108},{ 72, 27,109},{ 72, 28,110},
-    { 72, 29,111},{ 72, 31,112},{ 72, 32,113},{ 72, 33,115},{ 72, 35,116},
-    { 72, 36,117},{ 72, 37,118},{ 72, 38,119},{ 72, 40,120},{ 72, 41,121},
-    { 71, 42,122},{ 71, 44,122},{ 71, 45,123},{ 71, 46,124},{ 71, 47,125},
-    { 70, 48,126},{ 70, 50,126},{ 70, 51,127},{ 70, 52,128},{ 69, 53,129},
-    { 69, 55,129},{ 69, 56,130},{ 68, 57,131},{ 68, 58,131},{ 68, 59,132},
-    { 67, 61,132},{ 67, 62,133},{ 66, 63,133},{ 66, 64,134},{ 66, 65,134},
-    { 65, 66,135},{ 65, 68,135},{ 64, 69,136},{ 64, 70,136},{ 63, 71,136},
-    { 63, 72,137},{ 62, 73,137},{ 62, 74,137},{ 62, 76,138},{ 61, 77,138},
-    { 61, 78,138},{ 60, 79,138},{ 60, 80,139},{ 59, 81,139},{ 59, 82,139},
-    { 58, 83,139},{ 58, 84,140},{ 57, 85,140},{ 57, 86,140},{ 56, 88,140},
-    { 56, 89,140},{ 55, 90,140},{ 55, 91,141},{ 54, 92,141},{ 54, 93,141},
-    { 53, 94,141},{ 53, 95,141},{ 52, 96,141},{ 52, 97,141},{ 51, 98,141},
-    { 51, 99,141},{ 50,100,142},{ 50,101,142},{ 49,102,142},{ 49,103,142},
-    { 49,104,142},{ 48,105,142},{ 48,106,142},{ 47,107,142},{ 47,108,142},
-    { 46,109,142},{ 46,110,142},{ 46,111,142},{ 45,112,142},{ 45,113,142},
-    { 44,113,142},{ 44,114,142},{ 44,115,142},{ 43,116,142},{ 43,117,142},
-    { 42,118,142},{ 42,119,142},{ 42,120,142},{ 41,121,142},{ 41,122,142},
-    { 41,123,142},{ 40,124,142},{ 40,125,142},{ 39,126,142},{ 39,127,142},
-    { 39,128,142},{ 38,129,142},{ 38,130,142},{ 38,130,142},{ 37,131,142},
-    { 37,132,142},{ 37,133,142},{ 36,134,142},{ 36,135,142},{ 35,136,142},
-    { 35,137,142},{ 35,138,141},{ 34,139,141},{ 34,140,141},{ 34,141,141},
-    { 33,142,141},{ 33,143,141},{ 33,144,141},{ 33,145,140},{ 32,146,140},
-    { 32,146,140},{ 32,147,140},{ 31,148,140},{ 31,149,139},{ 31,150,139},
-    { 31,151,139},{ 31,152,139},{ 31,153,138},{ 31,154,138},{ 30,155,138},
-    { 30,156,137},{ 30,157,137},{ 31,158,137},{ 31,159,136},{ 31,160,136},
-    { 31,161,136},{ 31,161,135},{ 31,162,135},{ 32,163,134},{ 32,164,134},
-    { 33,165,133},{ 33,166,133},{ 34,167,133},{ 34,168,132},{ 35,169,131},
-    { 36,170,131},{ 37,171,130},{ 37,172,130},{ 38,173,129},{ 39,173,129},
-    { 40,174,128},{ 41,175,127},{ 42,176,127},{ 44,177,126},{ 45,178,125},
-    { 46,179,124},{ 47,180,124},{ 49,181,123},{ 50,182,122},{ 52,182,121},
-    { 53,183,121},{ 55,184,120},{ 56,185,119},{ 58,186,118},{ 59,187,117},
-    { 61,188,116},{ 63,188,115},{ 64,189,114},{ 66,190,113},{ 68,191,112},
-    { 70,192,111},{ 72,193,110},{ 74,193,109},{ 76,194,108},{ 78,195,107},
-    { 80,196,106},{ 82,197,105},{ 84,197,104},{ 86,198,103},{ 88,199,101},
-    { 90,200,100},{ 92,200, 99},{ 94,201, 98},{ 96,202, 96},{ 99,203, 95},
-    {101,203, 94},{103,204, 92},{105,205, 91},{108,205, 90},{110,206, 88},
-    {112,207, 87},{115,208, 86},{117,208, 84},{119,209, 83},{122,209, 81},
-    {124,210, 80},{127,211, 78},{129,211, 77},{132,212, 75},{134,213, 73},
-    {137,213, 72},{139,214, 70},{142,214, 69},{144,215, 67},{147,215, 65},
-    {149,216, 64},{152,216, 62},{155,217, 60},{157,217, 59},{160,218, 57},
-    {162,218, 55},{165,219, 54},{168,219, 52},{170,220, 50},{173,220, 48},
-    {176,221, 47},{178,221, 45},{181,222, 43},{184,222, 41},{186,222, 40},
-    {189,223, 38},{192,223, 37},{194,223, 35},{197,224, 33},{200,224, 32},
-    {202,225, 31},{205,225, 29},{208,225, 28},{210,226, 27},{213,226, 26},
-    {216,226, 25},{218,227, 25},{221,227, 24},{223,227, 24},{226,228, 24},
-    {229,228, 25},{231,228, 25},{234,229, 26},{236,229, 27},{239,229, 28},
-    {241,229, 29},{244,230, 30},{246,230, 32},{248,230, 33},{251,231, 35},
-    {253,231, 37}
-};
+#define VIRIDIS         WF_VIRIDIS
+#define pick_tick_step  wf_pick_tick_step
+#define pick_time_step  wf_pick_time_step
+#define fmt_freq        wf_fmt_freq
+#define fmt_time        wf_fmt_time
 
 // --------------------------------------------------------------------
 // Minimal PNG writer (stored DEFLATE, no compression).
@@ -320,57 +223,8 @@ static int write_png_rgb(const char *path,
 // export. Only depends on libc; no libharu, no Cairo.
 // --------------------------------------------------------------------
 
-// wf_opts_t holds every knob the spectrogram pipeline reads; defined
-// here (rather than next to build_waterfall) so the PDF writer below
-// can access its members. The axis-formatting helpers are forward-
-// declared too — definitions live further down the file.
-typedef struct wf_opts {
-    int    fft_size;
-    int    hop;
-    int    out_rows;
-    float  db_min;
-    float  db_max;
-    int    db_min_user_set; // 1 = --db-min was supplied; 0 = derive via percentile
-    int    db_max_user_set; // 1 = --db-max was supplied; 0 = derive via percentile
-    // Per-column detrend mode. 0 = median (whole-pass median per column,
-    // backwards compatible); 1 = hpf (zero-phase 1-pole HPF along time,
-    // tracks slow AGC-like drift while preserving short transients);
-    // 2 = none (do nothing; cells map straight to colormap above the
-    // global floor estimate).
-    int    detrend_mode;
-    double detrend_tau_s;   // time constant for detrend=hpf, seconds
-    // Optional CSV of beacon-detection times to overlay on the time
-    // axis as horizontal marks. Format is beacon_detect's CSV: header
-    // line `idx,t_s,...`, '#' comment lines, t_s in seconds-since-start.
-    const char *marks_csv_path;
-    // Optional burst.csv (rx_replay --burst-csv format) to overlay as
-    // right-pointing arrows at each burst_start row. Lets the
-    // operator visually verify the burst detector against the
-    // spectrogram. CSV format: event,unix_time_ms,bright_bins,
-    // peak_excess_db,duration_ms.
-    const char *show_tm_csv_path;
-    int    sample_rate;   // for the time + frequency axis labels
-    double center_hz;     // baseband centre frequency for the freq-axis label
-    double zoom_hz;       // visible bandwidth around DC; 0 or negative = full
-    int    dc_notch;      // 1 = interpolate over DC bin (B210 LO spike); 0 = off
-    int    dc_notch_bins; // half-width of the notch in FFT bins (each side)
-    double display_bw_hz; // filled in by build_waterfall — the actual rendered BW
-    time_t start_utc;     // capture start in UTC; 0 = unknown, render elapsed time
-    double start_utc_subsec; // [0, 1) — fractional seconds parsed from UT=...HHMMSS.fff
-    float  display_db_lo;    // filled in by build_waterfall — the dB range mapped
-    float  display_db_hi;    //   onto colormap indices [0..255]; lights the colorbar.
-    float  display_db_floor; // estimated noise floor in dBFS (median of per-bin
-                             // medians, FFT-window normalised). Added to the
-                             // colorbar tick values so the operator reads
-                             // absolute power rather than "delta above floor".
-    float  power_offset_db;  // optional CLI shift (e.g. dBFS -> dBm); applied
-                             // on top of display_db_floor at label time.
-    char   power_unit[8];    // "dBFS" by default, "dBm" if power_offset_db set.
-} wf_opts_t;
-static double pick_tick_step(double range, int target_ticks);
-static double pick_time_step(double range_s, int target_ticks);
-static int    fmt_freq(double hz, char *out, size_t out_cap);
-static int    fmt_time(time_t base_utc, double sec, char *out, size_t out_cap);
+// wf_opts_t and the axis-formatting helpers live in waterfall_core.h
+// (already included at the top).
 
 typedef struct {
     FILE   *fp;
@@ -853,31 +707,48 @@ static time_t parse_ut_from_path(const char *path, double *out_subsec)
     return parse_ut_string_frac(p + 3, out_subsec);
 }
 
-static float median_inplace(float *buf, int n)
+// Thin wrapper around wf_compute that keeps gen_waterfall's existing
+// callers happy: it computes the dB grid in waterfall_core, then maps
+// it through VIRIDIS to produce the RGB buffer the bitmap-axes and PDF
+// writers consume.
+static int build_waterfall(const int16_t *iq, size_t n_pairs,
+                            wf_opts_t *opt,
+                            uint8_t **out_rgb, int *out_w, int *out_h)
 {
-    // Quickselect-style nth_element. Mutates buf. Good enough for our
-    // per-bin background subtraction; n is at most a few thousand.
-    if (n <= 0) return 0.0f;
-    int lo = 0, hi = n - 1, k = n / 2;
-    while (lo < hi) {
-        float pivot = buf[(lo + hi) / 2];
-        int i = lo, j = hi;
-        while (i <= j) {
-            while (buf[i] < pivot) ++i;
-            while (buf[j] > pivot) --j;
-            if (i <= j) {
-                float t = buf[i]; buf[i] = buf[j]; buf[j] = t;
-                ++i; --j;
-            }
+    float *db = NULL;
+    int w = 0, h = 0;
+    int rc = wf_compute(iq, n_pairs, opt, &db, &w, &h);
+    if (rc != 0) return rc;
+
+    uint8_t *rgb = (uint8_t *) malloc((size_t) w * (size_t) h * 3);
+    if (rgb == NULL) { free(db); return -1; }
+    float lo = opt->display_db_lo;
+    float hi = opt->display_db_hi;
+    float scale = (hi > lo) ? (255.0f / (hi - lo)) : 1.0f;
+    for (int r = 0; r < h; ++r) {
+        for (int k = 0; k < w; ++k) {
+            float v = db[(size_t) r * (size_t) w + (size_t) k];
+            int idx = (int)((v - lo) * scale);
+            if (idx < 0) idx = 0;
+            if (idx > 255) idx = 255;
+            uint8_t *p = rgb + ((size_t) r * (size_t) w + (size_t) k) * 3;
+            p[0] = VIRIDIS[idx][0];
+            p[1] = VIRIDIS[idx][1];
+            p[2] = VIRIDIS[idx][2];
         }
-        if (k <= j) hi = j;
-        else if (k >= i) lo = i;
-        else return buf[k];
     }
-    return buf[k];
+    free(db);
+    *out_rgb = rgb;
+    *out_w   = w;
+    *out_h   = h;
+    return 0;
 }
 
-static int build_waterfall(const int16_t *iq, size_t n_pairs,
+// Legacy in-file build_waterfall body removed — wf_compute carries the
+// real implementation now. Skip down to render_with_axes for the bitmap
+// axes / colorbar / overlay code that still lives here.
+#if 0
+static int build_waterfall_legacy(const int16_t *iq, size_t n_pairs,
                             const wf_opts_t *opt,
                             uint8_t **out_rgb, int *out_w, int *out_h)
 {
@@ -1234,6 +1105,7 @@ static int build_waterfall(const int16_t *iq, size_t n_pairs,
     *out_h = out_rows;
     return 0;
 }
+#endif // legacy build_waterfall_legacy
 
 // --------------------------------------------------------------------
 // Bitmap font + axis renderer
@@ -1334,71 +1206,10 @@ static int text_width(const char *s, int scale) {
     return n * 6 * scale;
 }
 
-// Pick a "nice" tick step (1·10ⁿ, 2·10ⁿ, or 5·10ⁿ) close to range/target.
-static double pick_tick_step(double range, int target_ticks)
-{
-    if (range <= 0.0 || target_ticks < 1) return 1.0;
-    double raw = range / (double) target_ticks;
-    double p = pow(10.0, floor(log10(raw)));
-    double frac = raw / p;
-    double mul;
-    if      (frac < 1.5) mul = 1.0;
-    else if (frac < 3.5) mul = 2.0;
-    else if (frac < 7.0) mul = 5.0;
-    else                 mul = 10.0;
-    return p * mul;
-}
-
-// Format a frequency value as "<n>kHz" or "<n.n>MHz" (no centre-Hz
-// baseline added — pass the absolute or relative Hz the caller wants).
-// Returns bytes written.
-static int fmt_freq(double hz, char *out, size_t out_cap)
-{
-    double abs_hz = (hz < 0.0) ? -hz : hz;
-    const char *sgn = (hz < 0.0) ? "-" : "+";
-    if (abs_hz >= 1.0e6 - 1.0) {
-        return snprintf(out, out_cap, "%s%.2fMHz", sgn, abs_hz / 1.0e6);
-    } else {
-        return snprintf(out, out_cap, "%s%.1fkHz", sgn, abs_hz / 1.0e3);
-    }
-}
-
-static int fmt_time(time_t base_utc, double sec, char *out, size_t out_cap)
-{
-    if (sec < 0.0) sec = 0.0;
-    if (base_utc != 0) {
-        time_t t = base_utc + (time_t)(sec + 0.5);
-        struct tm lt;
-        localtime_r(&t, &lt);
-        return snprintf(out, out_cap, "%02d:%02d:%02d",
-                        lt.tm_hour, lt.tm_min, lt.tm_sec);
-    }
-    int total = (int)(sec + 0.5);
-    int h = total / 3600;
-    int m = (total / 60) % 60;
-    int s = total % 60;
-    return snprintf(out, out_cap, "%02d:%02d:%02d", h, m, s);
-}
-
-// Pick a "human" time step from a fixed table (1, 2, 5, 10, 15, 30 s,
-// 1, 2, 5, 10, 15, 30 min, 1, 2, 4 h) so y-axis ticks land on round
-// HH:MM:SS values like 00:01:00 / 00:05:00 rather than 100s / 200s.
-static double pick_time_step(double range_s, int target_ticks)
-{
-    static const double steps[] = {
-        1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400
-    };
-    int n = (int)(sizeof steps / sizeof steps[0]);
-    if (range_s <= 0.0 || target_ticks < 1) return 1.0;
-    double target = range_s / (double) target_ticks;
-    double best = steps[0];
-    double best_d = fabs(steps[0] - target);
-    for (int i = 1; i < n; ++i) {
-        double d = fabs(steps[i] - target);
-        if (d < best_d) { best_d = d; best = steps[i]; }
-    }
-    return best;
-}
+// Tick-step / freq-fmt / time-fmt helpers live in waterfall_core.{c,h}.
+// The #define aliases at the top of this file route the original names
+// (pick_tick_step / pick_time_step / fmt_freq / fmt_time) to the
+// library functions.
 
 // Compose the final PNG: spectrogram pixels in the centre, axis ticks
 // + labels in the surrounding margins. Caller owns spec_rgb; the
