@@ -6,14 +6,13 @@
     time × frequency boxes around bursts in an .iq capture, then save
     them as anchors for rx_replay.
 
-    Rendering is delegated to gen_waterfall: iq_annotator shells out to
-    gen_waterfall to produce a PNG with the operator's chosen options
-    (--rows, --zoom-khz, --detrend, --detrend-tau-s, --center-hz,
-    --dc-notch, --dc-notch-bins, --db-min, --db-max, --power-offset,
-    --start-utc, --elapsed-time), loads the PNG as a raylib texture,
-    and overlays interactive box drawing + cursor read-outs on top.
-    The waterfall image looks identical to whatever gen_waterfall
-    would have written to disk.
+    Pipeline: the FFT / dB / detrend / notch / zoom logic lives in
+    utils/waterfall_core.{c,h} and runs in-process at startup; no
+    subprocess, no /tmp PNG. The resulting float dB grid is uploaded
+    to a tiled R32F GPU texture and re-coloured live by a fragment
+    shader (analytic viridis polynomial), so the colour-scale keys
+    (',' '.' '<' '>' 'R') are uniform updates rather than full
+    re-renders.
 
     Output:
         <iq_path>.boxes.csv          — t_start_s,t_end_s,f_lo_hz,f_hi_hz,label
@@ -28,22 +27,22 @@
         L                    Load <iq>.boxes.csv
         , / .                Decrease / increase color-scale floor (db-min)
         < / >                Decrease / increase color-scale ceiling (db-max)
-        R                    Reset color scale to gen_waterfall auto
+        R                    Reset color scale to percentile auto-clip
         ↑/↓, PgUp/PgDn,      Scroll
         Home/End, wheel
         Q                    Quit
 
     CLI: same flag forms gen_waterfall accepts, plus:
         --width=<px>, --height=<px>  raylib window size
-        --tmp-png=<path>             override the rendered PNG path
-                                     (default: /tmp/iq_annotator_<pid>.png)
 
     Copyright (C) 2026  Johnathan K Burchill  --  GPLv3 or later.
 */
 
 #include <raylib.h>
+#include <rlgl.h>
 
 #include "pdf_writer.h"
+#include "waterfall_core.h"
 
 #ifdef __APPLE__
 // Trackpad pinch is delivered as NSEventTypeMagnify, which raylib/GLFW
@@ -59,6 +58,7 @@ extern void  iq_annotator_install_pinch_monitor(void);
 #include <libgen.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -271,18 +271,18 @@ static int boxes_load(box_list_t *bl, const char *iq_path)
 }
 
 // ---------------------------------------------------------------------------
-// Spawn gen_waterfall to render the PNG with the operator's flags.
+// Operator-flag passthru — same names gen_waterfall accepts; iq_annotator
+// now consumes them directly into a wf_opts_t and runs the spectrogram
+// in-process via waterfall_core.
 // ---------------------------------------------------------------------------
 
 #define MAX_PASSTHRU 32
 static const char *PASSTHRU_FLAGS[] = {
-    // exact-match flags
     "--full-width", "--dc-notch", "--no-dc-notch", "--elapsed-time",
     NULL
 };
 static const char *PASSTHRU_PREFIXES[] = {
-    // prefix flags ("--name=value")
-    "--rows=", "--zoom-khz=", "--detrend=", "--detrend-tau-s=",
+    "--fft-time-bin-s=", "--zoom-khz=", "--detrend=", "--detrend-tau-s=",
     "--center-hz=", "--dc-notch-bins=", "--db-min=", "--db-max=",
     "--power-offset=", "--start-utc=", "--fft=", "--hop=",
     "--marks-csv=", "--show-tm=",
@@ -300,82 +300,99 @@ static int is_passthru(const char *arg)
     return 0;
 }
 
-// Build and run: gen_waterfall <iq> <rate> <png> <passthru flags...>.
-// db_min / db_max are passed in separately from the static passthru
-// list so the operator can adjust them mid-session without touching
-// the rest of the flag set; pass *_set = 0 to omit the corresponding
-// flag entirely and let gen_waterfall fall back to its percentile-
-// derived defaults.
-static int run_gen_waterfall(const char *iq_path, int samp_rate,
-                             const char *png_path,
-                             const char **passthru, int n_passthru);
-static int render_waterfall(const char *iq_path, int samp_rate,
-                            const char *png_path,
-                            const char **passthru, int n_passthru,
-                            double db_min, int db_min_set,
-                            double db_max, int db_max_set)
+// Translate the passthru flag list into a wf_opts_t. opt->out_rows is
+// derived from --fft-time-bin-s (= seconds of IQ per output row) and
+// the capture duration the caller passes in. Default time bin 0.5 s.
+static int parse_wf_opts_from_passthru(const char **passthru, int n_passthru,
+                                       int samp_rate, double duration_s,
+                                       wf_opts_t *opt)
 {
-    char db_min_buf[32];
-    char db_max_buf[32];
-    const char *combined[64];
-    int n = 0;
-    int cap = (int)(sizeof combined / sizeof combined[0]);
-    for (int i = 0; i < n_passthru && n < cap; ++i) {
-        combined[n++] = passthru[i];
-    }
-    if (db_min_set && n < cap) {
-        snprintf(db_min_buf, sizeof db_min_buf, "--db-min=%g", db_min);
-        combined[n++] = db_min_buf;
-    }
-    if (db_max_set && n < cap) {
-        snprintf(db_max_buf, sizeof db_max_buf, "--db-max=%g", db_max);
-        combined[n++] = db_max_buf;
-    }
-    return run_gen_waterfall(iq_path, samp_rate, png_path, combined, n);
-}
+    memset(opt, 0, sizeof *opt);
+    opt->fft_size       = 1024;
+    opt->hop            = 256;
+    double time_bin_s   = 0.5;
+    opt->db_min         = -3.0f;
+    opt->db_max         = 20.0f;
+    opt->detrend_mode   = 0;
+    opt->detrend_tau_s  = 0.0;
+    opt->sample_rate    = samp_rate;
+    opt->center_hz      = 0.0;
+    opt->zoom_hz        = 30000.0;
+    opt->dc_notch       = 0;
+    opt->dc_notch_bins  = 2;
+    snprintf(opt->power_unit, sizeof opt->power_unit, "dBFS");
 
-static int run_gen_waterfall(const char *iq_path, int samp_rate,
-                             const char *png_path,
-                             const char **passthru, int n_passthru)
-{
-    // Use system() with a constructed command line; pass each token
-    // through shellquote since paths can contain spaces.
-    // Simpler: use execvp via fork.
-    pid_t pid = fork();
-    if (pid < 0) {
-        fprintf(stderr, "iq_annotator: fork: %s\n", strerror(errno));
-        return -1;
+    for (int i = 0; i < n_passthru; ++i) {
+        const char *a = passthru[i];
+        if (strncmp(a, "--fft=", 6) == 0) {
+            opt->fft_size = atoi(a + 6);
+            if (opt->hop > opt->fft_size) opt->hop = opt->fft_size / 4;
+        } else if (strncmp(a, "--fft-time-bin-s=", 17) == 0) {
+            time_bin_s = atof(a + 17);
+            if (time_bin_s <= 0.0) time_bin_s = 0.5;
+        } else if (strncmp(a, "--hop=", 6) == 0) {
+            opt->hop = atoi(a + 6);
+        } else if (strncmp(a, "--db-min=", 9) == 0) {
+            opt->db_min = (float) atof(a + 9);
+            opt->db_min_user_set = 1;
+        } else if (strncmp(a, "--db-max=", 9) == 0) {
+            opt->db_max = (float) atof(a + 9);
+            opt->db_max_user_set = 1;
+        } else if (strncmp(a, "--detrend=", 10) == 0) {
+            const char *m = a + 10;
+            if      (strcmp(m, "median") == 0) opt->detrend_mode = 0;
+            else if (strcmp(m, "hpf")    == 0) opt->detrend_mode = 1;
+            else if (strcmp(m, "none")   == 0) opt->detrend_mode = 2;
+        } else if (strncmp(a, "--detrend-tau-s=", 16) == 0) {
+            opt->detrend_tau_s = atof(a + 16);
+        } else if (strncmp(a, "--center-hz=", 12) == 0) {
+            opt->center_hz = atof(a + 12);
+        } else if (strncmp(a, "--zoom-khz=", 11) == 0) {
+            opt->zoom_hz = atof(a + 11) * 1000.0;
+        } else if (strcmp(a, "--full-width") == 0) {
+            opt->zoom_hz = 0.0;
+        } else if (strcmp(a, "--dc-notch") == 0) {
+            opt->dc_notch = 1;
+        } else if (strcmp(a, "--no-dc-notch") == 0) {
+            opt->dc_notch = 0;
+        } else if (strncmp(a, "--dc-notch-bins=", 16) == 0) {
+            opt->dc_notch_bins = atoi(a + 16);
+        } else if (strncmp(a, "--power-offset=", 15) == 0) {
+            opt->power_offset_db = (float) atof(a + 15);
+            snprintf(opt->power_unit, sizeof opt->power_unit, "dBm");
+        } else if (strncmp(a, "--marks-csv=", 12) == 0) {
+            opt->marks_csv_path = a + 12;
+        } else if (strncmp(a, "--show-tm=", 10) == 0) {
+            opt->show_tm_csv_path = a + 10;
+        } else if (strncmp(a, "--start-utc=", 12) == 0) {
+            int yr, mo, d, h, mi, s, ms = 0;
+            int got = sscanf(a + 12, "%4d%2d%2dT%2d%2d%2d.%3d",
+                             &yr, &mo, &d, &h, &mi, &s, &ms);
+            if (got >= 6) {
+                struct tm utc = {0};
+                utc.tm_year = yr - 1900; utc.tm_mon = mo - 1;
+                utc.tm_mday = d; utc.tm_hour = h;
+                utc.tm_min = mi; utc.tm_sec = s;
+                time_t t = timegm(&utc);
+                if (t != (time_t)-1) {
+                    opt->start_utc = t;
+                    opt->start_utc_subsec = ms / 1000.0;
+                }
+            }
+        }
+        // --elapsed-time is iq_annotator's render_opts concern, not wf_opts_t's.
     }
-    if (pid == 0) {
-        // child
-        char rate_buf[16];
-        snprintf(rate_buf, sizeof rate_buf, "%d", samp_rate);
-        const char *argv_fixed[] = {
-            "gen_waterfall", iq_path, rate_buf, png_path,
-        };
-        int n_fixed = (int)(sizeof argv_fixed / sizeof argv_fixed[0]);
-        int total = n_fixed + n_passthru + 1;
-        const char **argv2 = (const char **) calloc((size_t) total, sizeof(char *));
-        if (argv2 == NULL) _exit(127);
-        int j = 0;
-        for (int i = 0; i < n_fixed; ++i) argv2[j++] = argv_fixed[i];
-        for (int i = 0; i < n_passthru; ++i) argv2[j++] = passthru[i];
-        argv2[j] = NULL;
-        execvp("gen_waterfall", (char *const *) argv2);
-        fprintf(stderr, "iq_annotator: exec gen_waterfall: %s\n",
-                strerror(errno));
-        _exit(127);
-    }
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        fprintf(stderr, "iq_annotator: waitpid: %s\n", strerror(errno));
-        return -1;
-    }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        fprintf(stderr,
-            "iq_annotator: gen_waterfall failed (status=%d)\n",
-            WIFEXITED(status) ? WEXITSTATUS(status) : -1);
-        return -1;
+    // Resolve out_rows from the duration + time-bin hint. Clamp to a
+    // sane range so a 14-second capture with time-bin=0.5 doesn't end
+    // up with 28 rows (unreadable), and a huge multi-hour capture at
+    // time-bin=0.01 doesn't try to allocate gigabyte-scale buffers.
+    if (duration_s > 0.0 && time_bin_s > 0.0) {
+        double rows = duration_s / time_bin_s;
+        if (rows < 64.0)     rows = 64.0;
+        if (rows > 200000.0) rows = 200000.0;
+        opt->out_rows = (int)(rows + 0.5);
+    } else {
+        opt->out_rows = 1080;
     }
     return 0;
 }
@@ -574,7 +591,13 @@ typedef struct {
     int      samp_rate;
 } iq_buf_t;
 
-static int iq_buf_load(iq_buf_t *b, const char *path, int samp_rate)
+// Reads a raw int16 I/Q file into b->samples. When `progress_pct_out`
+// is non-NULL, the function writes a 0..1 fraction to it after each
+// chunk so a UI thread can render a progress bar — the file is read in
+// 8 MB chunks rather than one big fread() to make the granularity
+// useful on multi-hundred-MB passes.
+static int iq_buf_load_progress(iq_buf_t *b, const char *path, int samp_rate,
+                                volatile float *progress_pct_out)
 {
     FILE *fp = fopen(path, "rb");
     if (fp == NULL) {
@@ -588,18 +611,150 @@ static int iq_buf_load(iq_buf_t *b, const char *path, int samp_rate)
     if (sz <= 0) { fclose(fp); return -1; }
     b->samples = (int16_t *) malloc((size_t) sz);
     if (b->samples == NULL) { fclose(fp); return -1; }
-    if (fread(b->samples, 1, (size_t) sz, fp) != (size_t) sz) {
-        fclose(fp); free(b->samples); b->samples = NULL; return -1;
+
+    const size_t chunk = 8u * 1024u * 1024u;
+    size_t total      = (size_t) sz;
+    size_t read_total = 0;
+    char  *dst        = (char *) b->samples;
+    while (read_total < total) {
+        size_t want = chunk;
+        if (read_total + want > total) want = total - read_total;
+        size_t got = fread(dst + read_total, 1, want, fp);
+        if (got == 0) {
+            fclose(fp);
+            free(b->samples); b->samples = NULL;
+            return -1;
+        }
+        read_total += got;
+        if (progress_pct_out != NULL) {
+            *progress_pct_out = (float)((double) read_total / (double) total);
+        }
     }
     fclose(fp);
-    b->n_pairs   = (size_t) sz / 4;
+    b->n_pairs   = total / 4;
     b->samp_rate = samp_rate;
+    if (progress_pct_out != NULL) *progress_pct_out = 1.0f;
     return 0;
+}
+
+static int iq_buf_load(iq_buf_t *b, const char *path, int samp_rate)
+{
+    return iq_buf_load_progress(b, path, samp_rate, NULL);
+}
+
+// Format an unsigned 64-bit value with thousand separators (US-style
+// commas — locale-independent so it doesn't depend on a setlocale()
+// call at startup).  Returns the number of bytes written (excluding
+// the terminator), or -1 if the buffer was too small.
+static int fmt_thousands(char *out, size_t cap, uint64_t n)
+{
+    if (out == NULL || cap == 0) return -1;
+    char tmp[32];
+    int len = snprintf(tmp, sizeof tmp, "%llu", (unsigned long long) n);
+    if (len < 0) return -1;
+    int first_group = ((len - 1) % 3) + 1;
+    int needed = len + (len - first_group) / 3;
+    if ((size_t) needed + 1 > cap) return -1;
+    int oi = 0;
+    for (int i = 0; i < first_group; ++i) out[oi++] = tmp[i];
+    for (int i = first_group; i < len; i += 3) {
+        out[oi++] = ',';
+        out[oi++] = tmp[i];
+        out[oi++] = tmp[i + 1];
+        out[oi++] = tmp[i + 2];
+    }
+    out[oi] = '\0';
+    return oi;
 }
 
 static void iq_buf_free(iq_buf_t *b)
 {
     free(b->samples); b->samples = NULL; b->n_pairs = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Background loader: IQ-file read + wf_compute on a worker thread.
+// Lets InitWindow happen on the main thread first so the operator sees a
+// "Loading..." / "Computing spectrogram..." splash instead of a dead
+// terminal for the several seconds the FFT can take on a 200 MB pass.
+// All GPU-touching work (texture upload, shader compile) stays on the
+// main thread after pthread_join, because the OpenGL context belongs to
+// it (macOS in particular pukes if you try to use GL from another
+// thread).
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    const char     *iq_path;
+    int             samp_rate;
+    wf_opts_t      *opt;
+    // Outputs (set by the worker; readable by main once `done` is non-zero).
+    iq_buf_t        iqb;
+    float          *spec_db;
+    int             spec_w;
+    int             spec_h;
+    // Progress + status. status_msg is under `lock` (variable-length).
+    // phase + phase_progress are read lock-free from the splash — a
+    // torn read just shows last-frame's bar position, which is fine.
+    char            status_msg[128];
+    int             phase;          // 0 = loading IQ, 1 = computing FFT
+    volatile float  phase_progress; // 0..1, current phase only
+    int             error;
+    int             done;
+    pthread_mutex_t lock;
+} loader_ctx_t;
+
+static void loader_set_status(loader_ctx_t *ctx, int phase, const char *fmt, ...)
+{
+    pthread_mutex_lock(&ctx->lock);
+    ctx->phase = phase;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(ctx->status_msg, sizeof ctx->status_msg, fmt, ap);
+    va_end(ap);
+    pthread_mutex_unlock(&ctx->lock);
+}
+
+static void *loader_thread_fn(void *arg)
+{
+    loader_ctx_t *ctx = (loader_ctx_t *) arg;
+    loader_set_status(ctx, 0, "Loading IQ samples...");
+    ctx->phase_progress = 0.0f;
+    if (iq_buf_load_progress(&ctx->iqb, ctx->iq_path, ctx->samp_rate,
+                             &ctx->phase_progress) != 0) {
+        pthread_mutex_lock(&ctx->lock);
+        ctx->error = 1;
+        snprintf(ctx->status_msg, sizeof ctx->status_msg,
+                 "Failed to load %s", ctx->iq_path);
+        ctx->done = 1;
+        pthread_mutex_unlock(&ctx->lock);
+        return NULL;
+    }
+    char pair_buf[32];
+    fmt_thousands(pair_buf, sizeof pair_buf,
+                  (uint64_t) ctx->iqb.n_pairs);
+    loader_set_status(ctx, 1, "Computing spectrogram (%s pairs)...",
+                      pair_buf);
+    ctx->phase_progress = 0.0f;
+    // Hand the same progress field to wf_compute so the bar keeps
+    // advancing through the FFT loop.
+    ctx->opt->progress_pct_out = &ctx->phase_progress;
+    if (wf_compute(ctx->iqb.samples, ctx->iqb.n_pairs,
+                   ctx->opt, &ctx->spec_db,
+                   &ctx->spec_w, &ctx->spec_h) != 0) {
+        ctx->opt->progress_pct_out = NULL;
+        pthread_mutex_lock(&ctx->lock);
+        ctx->error = 1;
+        snprintf(ctx->status_msg, sizeof ctx->status_msg,
+                 "wf_compute failed");
+        ctx->done = 1;
+        pthread_mutex_unlock(&ctx->lock);
+        return NULL;
+    }
+    ctx->opt->progress_pct_out = NULL;
+    pthread_mutex_lock(&ctx->lock);
+    ctx->done = 1;
+    pthread_mutex_unlock(&ctx->lock);
+    return NULL;
 }
 
 // Render the current waveform-panel view to a one-page PDF.
@@ -801,15 +956,14 @@ static void usage(void)
     fprintf(stderr,
         "usage: iq_annotator <iq_path> [options]\n"
         "  All gen_waterfall options are accepted and forwarded\n"
-        "  (--rows, --zoom-khz, --detrend, --detrend-tau-s, --center-hz,\n"
+        "  (--fft-time-bin-s, --zoom-khz, --detrend, --detrend-tau-s, --center-hz,\n"
         "   --dc-notch, --dc-notch-bins, --db-min, --db-max,\n"
         "   --power-offset, --start-utc, --elapsed-time, --fft, --hop,\n"
         "   --marks-csv, --show-tm, --full-width)\n"
         "Annotator-specific:\n"
         "  --rate=<Hz>          IQ rate (default = auto from companion .wav)\n"
         "  --width=<px>         Window width  (default 1280)\n"
-        "  --height=<px>        Window height (default 900)\n"
-        "  --tmp-png=<path>     Rendered PNG path (default /tmp/iq_annotator_<pid>.png)\n");
+        "  --height=<px>        Window height (default 900)\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -829,7 +983,6 @@ int main(int argc, char **argv)
     int    samp_rate = 0;
     int    win_w     = 1280;
     int    win_h     = 900;
-    char   png_path[1100] = "";
 
     const char *passthru[MAX_PASSTHRU];
     int n_passthru = 0;
@@ -842,8 +995,6 @@ int main(int argc, char **argv)
             win_w = atoi(a + 8);
         } else if (strncmp(a, "--height=", 9) == 0) {
             win_h = atoi(a + 9);
-        } else if (strncmp(a, "--tmp-png=", 10) == 0) {
-            snprintf(png_path, sizeof png_path, "%s", a + 10);
         } else if (is_passthru(a)) {
             if (n_passthru >= MAX_PASSTHRU) {
                 fprintf(stderr,
@@ -881,17 +1032,17 @@ int main(int argc, char **argv)
     }
     size_t n_pairs = (size_t) st.st_size / 4;
     double duration_s = (double) n_pairs / (double) samp_rate;
-    fprintf(stderr, "iq_annotator: duration=%.3fs (%zu pairs)\n",
-            duration_s, n_pairs);
-
-    if (png_path[0] == '\0') {
-        snprintf(png_path, sizeof png_path,
-                 "/tmp/iq_annotator_%d.png", (int) getpid());
+    {
+        char pb[32];
+        fmt_thousands(pb, sizeof pb, (uint64_t) n_pairs);
+        fprintf(stderr, "iq_annotator: duration=%.3fs (%s pairs)\n",
+                duration_s, pb);
     }
 
     // Pull --db-min / --db-max out of passthru into mutable locals so
     // the operator can adjust them at runtime ( ',' / '.' / '<' / '>' /
-    // 'R' keys). They get re-added on every render via render_waterfall.
+    // 'R' keys). These get folded into wf_opts_t just before the
+    // in-process spectrogram runs.
     double wf_db_min     = 0.0;
     double wf_db_max     = 0.0;
     int    wf_db_min_set = 0;
@@ -912,19 +1063,29 @@ int main(int argc, char **argv)
         n_passthru = dst;
     }
 
-    fprintf(stderr, "iq_annotator: rendering with gen_waterfall → %s\n",
-            png_path);
-    if (render_waterfall(iq_path, samp_rate, png_path,
-                         passthru, n_passthru,
-                         wf_db_min, wf_db_min_set,
-                         wf_db_max, wf_db_max_set) != 0) {
-        return 1;
-    }
-
     render_opts_t ropts;
     parse_render_opts(passthru, n_passthru, iq_path, &ropts);
 
-    // ----- raylib window + load PNG -----
+    // Translate the same passthru flags into the wf_opts_t that
+    // waterfall_core takes. db-min / db-max overrides (already pulled
+    // out into mutable locals above) get re-applied here.
+    wf_opts_t wf_opt;
+    parse_wf_opts_from_passthru(passthru, n_passthru, samp_rate,
+                                duration_s, &wf_opt);
+    if (wf_db_min_set) { wf_opt.db_min = (float) wf_db_min; wf_opt.db_min_user_set = 1; }
+    if (wf_db_max_set) { wf_opt.db_max = (float) wf_db_max; wf_opt.db_max_user_set = 1; }
+    // Bridge ropts → wf_opt: parse_render_opts also picks up
+    // UT=YYYYMMDDTHHMMSS from the file path, which is how every
+    // sso-captured .iq carries its start time. Threading that into
+    // wf_opt.start_utc is what makes the left/right time axes render
+    // in local HH:MM:SS rather than elapsed seconds. --elapsed-time
+    // forces elapsed mode even when the UT is known.
+    if (ropts.have_start_utc && !ropts.elapsed_time) {
+        wf_opt.start_utc = (time_t) ropts.start_utc_s;
+        wf_opt.start_utc_subsec = ropts.start_utc_s - (double) wf_opt.start_utc;
+    }
+
+    // ----- raylib window + IQ load + in-process spectrogram -----
     SetTraceLogLevel(LOG_WARNING);
     InitWindow(win_w, win_h, "iq_annotator");
     SetTargetFPS(60);
@@ -934,155 +1095,295 @@ int main(int argc, char **argv)
 #endif
     g_ui_font_loaded = load_ttf_from_known_paths();
 
-    // Load the raw IQ samples once — the waveform panel slices into
-    // this buffer for any selected box. Half a gig is fine on modern
-    // hardware and avoids per-zoom file I/O.
-    iq_buf_t iqb = {0};
-    if (iq_buf_load(&iqb, iq_path, samp_rate) != 0) {
-        fprintf(stderr,
-            "iq_annotator: failed to load %s for waveform panel\n",
-            iq_path);
-    } else {
-        fprintf(stderr,
-            "iq_annotator: IQ buffer loaded (%zu pairs)\n",
-            iqb.n_pairs);
-    }
+    // Spawn the loader thread that handles iq_buf_load + wf_compute, and
+    // run a tiny "Loading..." render loop on the main thread until it
+    // finishes. Doing the FFT off the main thread keeps the window
+    // responsive (and showing progress) for the few seconds a long-pass
+    // FFT can take.
+    fprintf(stderr,
+        "iq_annotator: computing spectrogram (fft=%d, rows=%d, "
+        "zoom=%.1f kHz, detrend=%d)...\n",
+        wf_opt.fft_size, wf_opt.out_rows,
+        wf_opt.zoom_hz / 1e3, wf_opt.detrend_mode);
 
-    Image img = LoadImage(png_path);
-    if (img.data == NULL) {
-        fprintf(stderr, "iq_annotator: LoadImage failed: %s\n", png_path);
+    loader_ctx_t lctx = {0};
+    lctx.iq_path   = iq_path;
+    lctx.samp_rate = samp_rate;
+    lctx.opt       = &wf_opt;
+    snprintf(lctx.status_msg, sizeof lctx.status_msg, "Loading IQ samples...");
+    pthread_mutex_init(&lctx.lock, NULL);
+
+    pthread_t loader_thread;
+    if (pthread_create(&loader_thread, NULL,
+                       loader_thread_fn, &lctx) != 0) {
+        fprintf(stderr, "iq_annotator: pthread_create: %s\n",
+                strerror(errno));
+        pthread_mutex_destroy(&lctx.lock);
         CloseWindow(); return 1;
     }
-    int img_w = img.width;
-    int img_h = img.height;
 
-    // GL drivers cap texture dimensions (8K-16K on common GPUs); a
-    // huge --rows produces a PNG taller than that and the upload
-    // silently fails ("texture unloadable"). Slice the PNG into
-    // TILE_H-tall row tiles, each uploaded as its own texture, and
-    // composite at draw time. With TILE_H = 4096, even --rows=131072
-    // is fine (32 tiles × ~15 MB on a 1228-px-wide PNG).
+    {
+        // STATUS_PT is declared further down inside the render-state
+        // block; mirror its value here for the splash sizing.
+        int splash_pt = 14 * 3;
+        int quit_pressed = 0;
+        for (;;) {
+            pthread_mutex_lock(&lctx.lock);
+            int done = lctx.done;
+            int err  = lctx.error;
+            char msg[128];
+            memcpy(msg, lctx.status_msg, sizeof msg);
+            pthread_mutex_unlock(&lctx.lock);
+
+            // Operator can ask to quit during the splash; we still have
+            // to wait for wf_compute to finish (no cancellation point),
+            // but we'll exit cleanly the moment it does.
+            if (WindowShouldClose() || IsKeyPressed(KEY_Q)) quit_pressed = 1;
+
+            // Snapshot the progress fields (lock-free reads are fine —
+            // a torn value just shows last-frame's bar; both fields
+            // settle within milliseconds). The bar reflects the
+            // CURRENT phase's progress (0..1), not a weighted overall —
+            // the FFT phase dominates wall-clock time and weighting it
+            // to start at 50 % made every launch feel half-loaded
+            // already. The status text labels which phase is active.
+            float phase_pp = lctx.phase_progress;
+            if (phase_pp < 0.0f) phase_pp = 0.0f;
+            if (phase_pp > 1.0f) phase_pp = 1.0f;
+            float overall = phase_pp;
+
+            BeginDrawing();
+            ClearBackground(BLACK);
+            int win_sw = GetScreenWidth();
+            int win_sh = GetScreenHeight();
+            int tw = measure_text(msg, splash_pt);
+            draw_text(msg,
+                      (win_sw - tw) / 2,
+                      (win_sh - splash_pt) / 2,
+                      splash_pt,
+                      (Color){240, 240, 240, 255});
+
+            // Progress bar: 60 % of the window wide, sits a comfortable
+            // gap below the status text. Outline + filled inner rect.
+            {
+                int bar_w  = (win_sw * 6) / 10;
+                int bar_h  = 22;
+                int bar_x  = (win_sw - bar_w) / 2;
+                int bar_y  = (win_sh - splash_pt) / 2 + splash_pt + 24;
+                int fill_w = (int)((float) bar_w * overall + 0.5f);
+                if (fill_w < 0)        fill_w = 0;
+                if (fill_w > bar_w)    fill_w = bar_w;
+                DrawRectangle(bar_x, bar_y, fill_w, bar_h,
+                              (Color){180, 200, 230, 255});
+                DrawRectangleLines(bar_x, bar_y, bar_w, bar_h,
+                                   (Color){140, 140, 150, 255});
+                char pct_buf[16];
+                snprintf(pct_buf, sizeof pct_buf, "%.0f %%",
+                         overall * 100.0f);
+                int pct_pt = 14;
+                int pct_tw = measure_text(pct_buf, pct_pt);
+                draw_text(pct_buf,
+                          (win_sw - pct_tw) / 2,
+                          bar_y + bar_h + 6,
+                          pct_pt,
+                          (Color){200, 200, 210, 255});
+            }
+            if (quit_pressed) {
+                const char *q = "Quit pending -- exiting when FFT finishes...";
+                int qpt = 14;
+                int qw  = measure_text(q, qpt);
+                draw_text(q,
+                          (win_sw - qw) / 2,
+                          (win_sh - splash_pt) / 2 + splash_pt + 80,
+                          qpt,
+                          (Color){200, 200, 200, 255});
+            }
+            EndDrawing();
+
+            if (done) break;
+        }
+        pthread_join(loader_thread, NULL);
+        pthread_mutex_destroy(&lctx.lock);
+        if (lctx.error || quit_pressed) {
+            if (lctx.error) {
+                fprintf(stderr, "iq_annotator: %s\n", lctx.status_msg);
+            }
+            if (lctx.spec_db) free(lctx.spec_db);
+            iq_buf_free(&lctx.iqb);
+            CloseWindow();
+            return lctx.error ? 1 : 0;
+        }
+    }
+
+    iq_buf_t iqb     = lctx.iqb;
+    float   *spec_db = lctx.spec_db;
+    int      spec_w  = lctx.spec_w;
+    int      spec_h  = lctx.spec_h;
+    {
+        char pb[32];
+        fmt_thousands(pb, sizeof pb, (uint64_t) iqb.n_pairs);
+        fprintf(stderr,
+            "iq_annotator: IQ buffer loaded (%s pairs)\n", pb);
+    }
+    if (spec_w < 16 || spec_h < 16) {
+        fprintf(stderr,
+            "iq_annotator: spectrogram too small (%dx%d)\n",
+            spec_w, spec_h);
+        free(spec_db); iq_buf_free(&iqb); CloseWindow(); return 1;
+    }
+    // wf_compute returns row 0 = earliest sample. gen_waterfall's
+    // render_with_axes then flips that so its PNG reads "newest at
+    // top of spec, earliest at bottom" — the convention every other
+    // bit of iq_annotator already assumes (box→pixel math and the
+    // waveform-panel time mapping both use 1 - t/duration). Flip the
+    // float grid here, once, so the GPU texture is in the same
+    // orientation gen_waterfall's PNG was.
+    {
+        float *tmp_row = (float *) malloc((size_t) spec_w * sizeof(float));
+        if (tmp_row != NULL) {
+            for (int r = 0; r < spec_h / 2; ++r) {
+                int r2 = spec_h - 1 - r;
+                memcpy(tmp_row,
+                       spec_db + (size_t) r * (size_t) spec_w,
+                       (size_t) spec_w * sizeof(float));
+                memcpy(spec_db + (size_t) r  * (size_t) spec_w,
+                       spec_db + (size_t) r2 * (size_t) spec_w,
+                       (size_t) spec_w * sizeof(float));
+                memcpy(spec_db + (size_t) r2 * (size_t) spec_w,
+                       tmp_row,
+                       (size_t) spec_w * sizeof(float));
+            }
+            free(tmp_row);
+        }
+    }
+    double display_bw_hz = wf_opt.display_bw_hz;
+    int img_w = WF_LM + spec_w + WF_RM;
+    int img_h = WF_TM + spec_h + WF_BM;
+
+    // Operator-mutable dB range. Track the absolute-dBFS values the
+    // shader uses for the colorbar labels, plus a "set" flag so 'R'
+    // can drop back to the percentile auto-clip from the cached grid.
+    float dbmin_abs = wf_opt.display_db_lo
+                    + wf_opt.display_db_floor + wf_opt.power_offset_db;
+    float dbmax_abs = wf_opt.display_db_hi
+                    + wf_opt.display_db_floor + wf_opt.power_offset_db;
+    wf_db_min = dbmin_abs;
+    wf_db_max = dbmax_abs;
+
+    // Slice the dB grid into row tiles small enough to fit under any
+    // reasonable GL_MAX_TEXTURE_SIZE (8K-16K on common GPUs). Each
+    // tile is an R32F texture; the fragment shader samples it and
+    // looks up the colour in a 256×1 viridis LUT.
     const int TILE_H = 4096;
-    int n_tiles = (img_h + TILE_H - 1) / TILE_H;
+    int n_tiles = (spec_h + TILE_H - 1) / TILE_H;
     Texture2D *tiles = (Texture2D *) calloc((size_t) n_tiles,
                                             sizeof(Texture2D));
     if (tiles == NULL) {
         fprintf(stderr, "iq_annotator: oom on tile array\n");
-        UnloadImage(img); CloseWindow(); return 1;
+        free(spec_db); iq_buf_free(&iqb); CloseWindow(); return 1;
     }
     for (int t = 0; t < n_tiles; ++t) {
-        int y0  = t * TILE_H;
-        int h   = (y0 + TILE_H <= img_h) ? TILE_H : (img_h - y0);
-        Image sub = ImageFromImage(img, (Rectangle){0, (float) y0,
-                                                     (float) img_w,
-                                                     (float) h});
-        tiles[t] = LoadTextureFromImage(sub);
-        UnloadImage(sub);
+        int y0 = t * TILE_H;
+        int h  = (y0 + TILE_H <= spec_h) ? TILE_H : (spec_h - y0);
+        Image im = {
+            .data    = spec_db + (size_t) y0 * (size_t) spec_w,
+            .width   = spec_w,
+            .height  = h,
+            .mipmaps = 1,
+            .format  = PIXELFORMAT_UNCOMPRESSED_R32,
+        };
+        tiles[t] = LoadTextureFromImage(im);
         if (tiles[t].id == 0) {
             fprintf(stderr,
                 "iq_annotator: tile %d upload failed (%dx%d)\n",
-                t, img_w, h);
+                t, spec_w, h);
         } else {
-            // Point filtering keeps cells crisp at extreme zoom.
             SetTextureFilter(tiles[t], TEXTURE_FILTER_POINT);
         }
     }
-    UnloadImage(img);
     fprintf(stderr,
-        "iq_annotator: PNG split into %d tile(s) of up to %d rows\n",
-        n_tiles, TILE_H);
+        "iq_annotator: spec %dx%d, %d tile(s) of up to %d rows, "
+        "BW %.1f kHz, floor=%.1f dBFS\n",
+        spec_w, spec_h, n_tiles, TILE_H, display_bw_hz / 1e3,
+        wf_opt.display_db_floor + wf_opt.power_offset_db);
 
-    int spec_w = img_w - WF_LM - WF_RM;
-    int spec_h = img_h - WF_TM - WF_BM;
-    if (spec_w < 16 || spec_h < 16) {
-        fprintf(stderr,
-            "iq_annotator: rendered image too small (%dx%d)\n",
-            img_w, img_h);
-        for (int t = 0; t < n_tiles; ++t) {
-            if (tiles[t].id != 0) UnloadTexture(tiles[t]);
-        }
-        free(tiles);
-        CloseWindow(); return 1;
-    }
+    // Fragment shader: take the R32F sample (dB), normalise against the
+    // operator's current [db_min, db_max] range, and evaluate viridis
+    // analytically (Inigo Quilez's 6-term polynomial fit — matches
+    // matplotlib's viridis within ~1% per channel and avoids the
+    // sampler-completeness pitfalls that a separate LUT texture runs
+    // into on Apple's OpenGL 4.1 stack).
+    static const char *FRAG_SRC =
+        "#version 330\n"
+        "in vec2 fragTexCoord;\n"
+        "in vec4 fragColor;\n"
+        "uniform sampler2D texture0;\n"
+        // db_min / db_max are in the SAME median-subtracted space the
+        // texture carries (the operator's absolute dBFS minus the
+        // current layer's display_db_floor + power_offset). When we
+        // switch between coarse and detail layers — they have different
+        // medians — we re-push db_min / db_max accordingly.
+        "uniform float db_min;\n"
+        "uniform float db_max;\n"
+        "out vec4 finalColor;\n"
+        "vec3 viridis(float t) {\n"
+        "    const vec3 c0 = vec3( 0.2777273272234177,  0.005407344544966578,  0.3340998053353061);\n"
+        "    const vec3 c1 = vec3( 0.1050930431667207,  1.4046135298985746,    1.3845901625946856);\n"
+        "    const vec3 c2 = vec3(-0.3308618287255563,  0.2148475594682130,    0.0950951630282366);\n"
+        "    const vec3 c3 = vec3(-4.6342304989834860, -5.7991009733515850,  -19.3324409562798700);\n"
+        "    const vec3 c4 = vec3( 6.2282699363470810, 14.1799333668050900,   56.6905526006810500);\n"
+        "    const vec3 c5 = vec3( 4.7763849976702880,-13.7451453777460100,  -65.3530326333723400);\n"
+        "    const vec3 c6 = vec3(-5.4354558559346310,  4.6458526121785350,   26.3124352495832000);\n"
+        "    return c0 + t*(c1 + t*(c2 + t*(c3 + t*(c4 + t*(c5 + t*c6)))));\n"
+        "}\n"
+        "void main() {\n"
+        "    float v = texture(texture0, fragTexCoord).r;\n"
+        "    float t = (v - db_min) / max(db_max - db_min, 1e-6);\n"
+        "    t = clamp(t, 0.0, 1.0);\n"
+        "    finalColor = vec4(viridis(t), 1.0) * fragColor;\n"
+        "}\n";
+    Shader wf_shader = LoadShaderFromMemory(NULL, FRAG_SRC);
+    int loc_dbmin    = GetShaderLocation(wf_shader, "db_min");
+    int loc_dbmax    = GetShaderLocation(wf_shader, "db_max");
 
-    // Read the sidecar gen_waterfall writes next to the PNG. The
-    // sidecar carries display_bw_hz — the BANDWIDTH gen_waterfall
-    // actually rendered after applying its --zoom-khz default (30 kHz)
-    // and any bin-rounding. Computing it independently from
-    // ropts.zoom_khz would silently differ when the user didn't pass
-    // an explicit zoom flag (because gen_waterfall ALSO applies a
-    // default), which is exactly when boxes get drawn at the wrong
-    // width.
-    double display_bw_hz = 0.0;
+    // Pre-baked colorbar (1×256 RGBA8). Top row = brightest viridis,
+    // bottom row = darkest — i.e. row index i carries WF_VIRIDIS[255-i].
+    // Apple's GL is happy with plain RGBA8 textures, so the colorbar
+    // doesn't fight with the R32F + shader path.
+    Texture2D cb_texture;
     {
-        char meta_path[1200];
-        snprintf(meta_path, sizeof meta_path, "%.1100s.meta", png_path);
-        FILE *mf = fopen(meta_path, "r");
-        if (mf != NULL) {
-            char line[256];
-            while (fgets(line, sizeof line, mf) != NULL) {
-                double v = 0.0;
-                if (sscanf(line, "display_bw_hz=%lf", &v) == 1) {
-                    display_bw_hz = v;
-                    break;
-                }
-            }
-            fclose(mf);
+        uint8_t cb_pixels[256 * 4];
+        for (int i = 0; i < 256; ++i) {
+            int j = 255 - i;
+            cb_pixels[i * 4 + 0] = WF_VIRIDIS[j][0];
+            cb_pixels[i * 4 + 1] = WF_VIRIDIS[j][1];
+            cb_pixels[i * 4 + 2] = WF_VIRIDIS[j][2];
+            cb_pixels[i * 4 + 3] = 255;
         }
+        Image cb_img = {
+            .data    = cb_pixels,
+            .width   = 1,
+            .height  = 256,
+            .mipmaps = 1,
+            .format  = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
+        };
+        cb_texture = LoadTextureFromImage(cb_img);
+        SetTextureFilter(cb_texture, TEXTURE_FILTER_BILINEAR);
+        SetTextureWrap(cb_texture, TEXTURE_WRAP_CLAMP);
     }
-    if (display_bw_hz <= 0.0) {
-        // Sidecar missing or unparseable — fall back to the heuristic
-        // (right for explicit --zoom-khz / --full-width, wrong for the
-        // default case where gen_waterfall implicitly zooms to ±15 kHz).
-        display_bw_hz = (ropts.zoom_khz > 0.0)
-            ? ropts.zoom_khz * 1000.0
-            : (double) samp_rate;
-        fprintf(stderr,
-            "iq_annotator: WARNING no sidecar metadata — "
-            "guessing display_bw_hz=%.1f kHz from CLI flags\n",
-            display_bw_hz / 1e3);
+    // Push the initial dB range, in the coarse layer's median-subtracted
+    // space. The detail draw re-pushes its own range right before
+    // drawing.
+    {
+        float dbmin_co = dbmin_abs
+            - wf_opt.display_db_floor - wf_opt.power_offset_db;
+        float dbmax_co = dbmax_abs
+            - wf_opt.display_db_floor - wf_opt.power_offset_db;
+        SetShaderValue(wf_shader, loc_dbmin, &dbmin_co,
+                       SHADER_UNIFORM_FLOAT);
+        SetShaderValue(wf_shader, loc_dbmax, &dbmax_co,
+                       SHADER_UNIFORM_FLOAT);
     }
-
-    fprintf(stderr,
-        "iq_annotator: PNG %dx%d, spec %dx%d, BW %.1f kHz\n",
-        img_w, img_h, spec_w, spec_h, display_bw_hz / 1e3);
-
-    // Reload the tile textures from a freshly rendered PNG.  Uses a
-    // do/while so a `break` falls through to the standard return
-    // value; tile slot is left at id=0 on failure so the draw code
-    // skips it (rather than crashing on a stale handle).
-    #define RELOAD_TILES_FROM_PNG()                                        \
-    do {                                                                   \
-        for (int t = 0; t < n_tiles; ++t) {                                \
-            if (tiles[t].id != 0) {                                        \
-                UnloadTexture(tiles[t]);                                   \
-                tiles[t].id = 0;                                           \
-            }                                                              \
-        }                                                                  \
-        Image _rimg = LoadImage(png_path);                                 \
-        if (_rimg.data == NULL) {                                          \
-            fprintf(stderr,                                                \
-                "iq_annotator: reload LoadImage failed: %s\n", png_path);  \
-        } else if (_rimg.width != img_w || _rimg.height != img_h) {        \
-            fprintf(stderr,                                                \
-                "iq_annotator: regen size changed (%dx%d -> %dx%d), "      \
-                "ignoring\n", img_w, img_h, _rimg.width, _rimg.height);    \
-            UnloadImage(_rimg);                                            \
-        } else {                                                           \
-            for (int t = 0; t < n_tiles; ++t) {                            \
-                int _y0 = t * TILE_H;                                      \
-                int _h  = (_y0 + TILE_H <= img_h) ? TILE_H : (img_h - _y0); \
-                Image _sub = ImageFromImage(_rimg,                         \
-                    (Rectangle){0, (float) _y0,                            \
-                                (float) img_w, (float) _h});               \
-                tiles[t] = LoadTextureFromImage(_sub);                     \
-                UnloadImage(_sub);                                         \
-                if (tiles[t].id != 0)                                      \
-                    SetTextureFilter(tiles[t], TEXTURE_FILTER_POINT);      \
-            }                                                              \
-            UnloadImage(_rimg);                                            \
-        }                                                                  \
-    } while (0)
 
     // Boxes.
     box_list_t boxes = {0};
@@ -1326,51 +1627,53 @@ int main(int argc, char **argv)
             snprintf(status, sizeof status,
                 "waveform channels: %s", mode_label);
         }
-        // Color-scale controls — comma/period adjust db-min (floor),
-        // shifted (',' / '.' with shift = '<' / '>') adjust db-max
-        // (ceiling), 'R' resets both to auto.  Each step is 3 dB.
-        // We re-run gen_waterfall synchronously and reload textures.
+        // Color-scale controls — instantaneous now: the keystroke just
+        // nudges dbmin_abs / dbmax_abs and pushes the new uniforms; the
+        // GPU re-colours on the next frame. 'R' drops back to the
+        // percentile auto-clip computed from the cached dB grid
+        // (cheap; no FFT redo).
         {
             int shift_down = IsKeyDown(KEY_LEFT_SHIFT)
                           || IsKeyDown(KEY_RIGHT_SHIFT);
-            int regen      = 0;
-            const double STEP_DB = 3.0;
+            int changed = 0;
+            const float STEP_DB = 3.0f;
             if (IsKeyPressed(KEY_COMMA)) {
-                if (!wf_db_min_set) wf_db_min = -100.0;
-                if (!wf_db_max_set) wf_db_max =    0.0;
-                if (shift_down) { wf_db_max -= STEP_DB; wf_db_max_set = 1; }
-                else            { wf_db_min -= STEP_DB; wf_db_min_set = 1; }
-                regen = 1;
+                if (shift_down) dbmax_abs -= STEP_DB;
+                else            dbmin_abs -= STEP_DB;
+                changed = 1;
             } else if (IsKeyPressed(KEY_PERIOD)) {
-                if (!wf_db_min_set) wf_db_min = -100.0;
-                if (!wf_db_max_set) wf_db_max =    0.0;
-                if (shift_down) { wf_db_max += STEP_DB; wf_db_max_set = 1; }
-                else            { wf_db_min += STEP_DB; wf_db_min_set = 1; }
-                regen = 1;
+                if (shift_down) dbmax_abs += STEP_DB;
+                else            dbmin_abs += STEP_DB;
+                changed = 1;
             } else if (IsKeyPressed(KEY_R)) {
-                wf_db_min_set = 0;
-                wf_db_max_set = 0;
-                regen = 1;
+                float lo_internal = 0.0f, hi_internal = 0.0f;
+                wf_auto_db_range(spec_db, spec_w, spec_h,
+                                 &lo_internal, &hi_internal);
+                dbmin_abs = lo_internal
+                          + wf_opt.display_db_floor + wf_opt.power_offset_db;
+                dbmax_abs = hi_internal
+                          + wf_opt.display_db_floor + wf_opt.power_offset_db;
+                changed = 1;
             }
-            if (regen) {
+            if (changed) {
+                if (dbmax_abs < dbmin_abs + 1.0f) dbmax_abs = dbmin_abs + 1.0f;
+                // Color key uniforms always reflect the coarse layer;
+                // detail draw re-pushes its own values.
+                float dbmin_co = dbmin_abs
+                    - wf_opt.display_db_floor - wf_opt.power_offset_db;
+                float dbmax_co = dbmax_abs
+                    - wf_opt.display_db_floor - wf_opt.power_offset_db;
+                SetShaderValue(wf_shader, loc_dbmin, &dbmin_co,
+                               SHADER_UNIFORM_FLOAT);
+                SetShaderValue(wf_shader, loc_dbmax, &dbmax_co,
+                               SHADER_UNIFORM_FLOAT);
+                wf_db_min = dbmin_abs;
+                wf_db_max = dbmax_abs;
+                wf_db_min_set = wf_db_max_set = 1;
                 snprintf(status, sizeof status,
-                    "rendering waterfall (db-min=%s%g db-max=%s%g)...",
-                    wf_db_min_set ? "" : "auto:", wf_db_min,
-                    wf_db_max_set ? "" : "auto:", wf_db_max);
-                // Best-effort: even if the regen errors, the previous
-                // textures stay onscreen and the operator can keep
-                // working.  An aborted render is reported via the
-                // existing stderr path inside run_gen_waterfall.
-                if (render_waterfall(iq_path, samp_rate, png_path,
-                                     (const char **) passthru, n_passthru,
-                                     wf_db_min, wf_db_min_set,
-                                     wf_db_max, wf_db_max_set) == 0) {
-                    RELOAD_TILES_FROM_PNG();
-                }
-                snprintf(status, sizeof status,
-                    "color: db-min=%s%g db-max=%s%g  (',/.': floor  '<>': ceiling  'R': reset)",
-                    wf_db_min_set ? "" : "auto:", wf_db_min,
-                    wf_db_max_set ? "" : "auto:", wf_db_max);
+                    "color: db-min=%.1f dBFS  db-max=%.1f dBFS  "
+                    "(',/.': floor  '<>': ceiling  'R': auto)",
+                    dbmin_abs, dbmax_abs);
             }
         }
         // ']' → advance to the START of the next box (in time).
@@ -1790,51 +2093,338 @@ int main(int argc, char **argv)
         BeginDrawing();
         ClearBackground(BLACK);
 
-        // Draw the PNG by tile. Each tile covers TILE_H rows of the
-        // image (yielding sub-textures small enough to stay under the
-        // GPU's max texture size); composite the visible portion of
-        // each tile that intersects the view.
-        //
-        // When view_x < 0 the image is narrower than the window and
-        // we want it centred — the screen origin then sits to the
-        // left of the image. We clamp the source rect to [0,img_w]
-        // and shift the destination rect right by |view_x|*zoom.
-        double src_x_img = (view_x > 0.0f) ? view_x : 0.0;
+        // The spec area lives in image-space at
+        //   x ∈ [WF_LM, WF_LM + spec_w)
+        //   y ∈ [WF_TM, WF_TM + spec_h)
+        // (the WF_* margins are still here so the axes/labels/colorbar
+        // in task 5 have somewhere to sit). Tiles tile the spec area
+        // vertically into TILE_H-row R32F slabs; the fragment shader
+        // does the dB → viridis mapping live, so dragging the dB range
+        // costs one SetShaderValue / frame and no recomputation.
+        double spec_left_img  = (double) WF_LM;
+        double spec_right_img = (double)(WF_LM + spec_w);
+        double spec_top_img   = (double) WF_TM;
+        double spec_bot_img   = (double)(WF_TM + spec_h);
+
+        double src_x_img = (double) view_x;
+        if (src_x_img < spec_left_img) src_x_img = spec_left_img;
         double src_right_img = (double) view_x + visible_w;
-        if (src_right_img > img_w) src_right_img = img_w;
+        if (src_right_img > spec_right_img) src_right_img = spec_right_img;
         double src_w_img = src_right_img - src_x_img;
-        if (src_w_img < 0) src_w_img = 0;
-        double dst_x_screen = (view_x < 0.0f) ? (-(double) view_x * zoom) : 0.0;
-        double view_y_top = view_y;
-        double view_y_bot = view_y + visible_h;
-        if (view_y_bot > img_h) view_y_bot = img_h;
-        int t_first = (int)(view_y_top / TILE_H);
-        int t_last  = (int)((view_y_bot - 1) / TILE_H);
-        if (t_first < 0)         t_first = 0;
-        if (t_last  >= n_tiles)  t_last  = n_tiles - 1;
-        for (int t = t_first; t <= t_last; ++t) {
-            if (tiles[t].id == 0) continue;
-            int tile_y_img = t * TILE_H;
-            int tile_h     = (tile_y_img + TILE_H <= img_h)
-                             ? TILE_H : (img_h - tile_y_img);
-            double vis_top_img = (view_y_top > tile_y_img)
-                                 ? view_y_top : (double) tile_y_img;
-            double vis_bot_img = (view_y_bot < tile_y_img + tile_h)
-                                 ? view_y_bot : (double)(tile_y_img + tile_h);
-            if (vis_bot_img <= vis_top_img) continue;
-            Rectangle src = {
-                .x = (float) src_x_img,
-                .y = (float)(vis_top_img - tile_y_img),
-                .width  = (float) src_w_img,
-                .height = (float)(vis_bot_img - vis_top_img),
-            };
-            Rectangle dst = {
-                .x = (float) dst_x_screen,
-                .y = (float)((vis_top_img - view_y_top) * zoom),
-                .width  = (float)(src_w_img * zoom),
-                .height = (float)((vis_bot_img - vis_top_img) * zoom),
-            };
-            DrawTexturePro(tiles[t], src, dst, (Vector2){0, 0}, 0.0f, WHITE);
+
+        double view_y_top = (double) view_y;
+        if (view_y_top < spec_top_img) view_y_top = spec_top_img;
+        double view_y_bot = (double) view_y + visible_h;
+        if (view_y_bot > spec_bot_img) view_y_bot = spec_bot_img;
+
+        if (src_w_img > 0.0 && view_y_bot > view_y_top) {
+            int t_first = (int)((view_y_top - spec_top_img) / TILE_H);
+            int t_last  = (int)((view_y_bot - 1.0 - spec_top_img) / TILE_H);
+            if (t_first < 0)         t_first = 0;
+            if (t_last  >= n_tiles)  t_last  = n_tiles - 1;
+            BeginShaderMode(wf_shader);
+            for (int t = t_first; t <= t_last; ++t) {
+                if (tiles[t].id == 0) continue;
+                double tile_top_img = spec_top_img + (double)(t * TILE_H);
+                int    tile_rows    = (t * TILE_H + TILE_H <= spec_h)
+                                       ? TILE_H : (spec_h - t * TILE_H);
+                double tile_bot_img = tile_top_img + (double) tile_rows;
+                double vis_top_img = (view_y_top > tile_top_img)
+                                     ? view_y_top : tile_top_img;
+                double vis_bot_img = (view_y_bot < tile_bot_img)
+                                     ? view_y_bot : tile_bot_img;
+                if (vis_bot_img <= vis_top_img) continue;
+                Rectangle src = {
+                    .x = (float)(src_x_img - spec_left_img),
+                    .y = (float)(vis_top_img - tile_top_img),
+                    .width  = (float) src_w_img,
+                    .height = (float)(vis_bot_img - vis_top_img),
+                };
+                Rectangle dst = {
+                    .x = (float)((src_x_img - (double) view_x) * zoom),
+                    .y = (float)((vis_top_img - (double) view_y) * zoom),
+                    .width  = (float)(src_w_img * zoom),
+                    .height = (float)((vis_bot_img - vis_top_img) * zoom),
+                };
+                DrawTexturePro(tiles[t], src, dst, (Vector2){0, 0}, 0.0f, WHITE);
+            }
+            EndShaderMode();
+        }
+
+        // ----- axes / labels / colorbar (drawn at image-space tick
+        // positions; both text size and tick lengths scale with zoom
+        // so the axes grow with the spec — same behaviour gen_waterfall
+        // got "for free" from baking labels into the PNG). -----
+        {
+            const int   AXIS_PT_BASE = STATUS_PT;
+            // Scaled label point sizes. Clamp to a minimum so labels
+            // don't collapse to 0 px at extreme zoom-out.
+            int lpt_axis = (int)((float) AXIS_PT_BASE * zoom + 0.5f);
+            int lpt_sub  = (int)((float)(AXIS_PT_BASE - 2) * zoom + 0.5f);
+            if (lpt_axis < 2) lpt_axis = 2;
+            if (lpt_sub  < 2) lpt_sub  = 2;
+            const Color AXIS_COL = (Color){200, 200, 200, 255};
+            const Color TICK_COL = (Color){160, 160, 160, 255};
+
+            // Bottom freq axis — ticks every pick_tick_step Hz across
+            // the rendered bandwidth (display_bw_hz).
+            {
+                int axis_y_img    = WF_TM + spec_h + 3;
+                int axis_y_screen = (int)(((double) axis_y_img
+                                           - (double) view_y) * zoom);
+                int tick_len      = (int)(4.0f * zoom + 0.5f);
+                if (tick_len < 2) tick_len = 2;
+                if (axis_y_screen >= 0 && axis_y_screen < sh - lpt_axis - 2) {
+                    double f_step = wf_pick_tick_step(display_bw_hz, 8);
+                    double f_lo   = -display_bw_hz / 2.0;
+                    double f_hi   =  display_bw_hz / 2.0;
+                    double f_first = ceil(f_lo / f_step) * f_step;
+                    for (double f = f_first; f <= f_hi + 1e-6; f += f_step) {
+                        float x_img = WF_LM + (float)(((f / display_bw_hz)
+                                                      + 0.5) * spec_w);
+                        int sx = (int)(((double) x_img - (double) view_x) * zoom);
+                        if (sx < 0 || sx >= sw) continue;
+                        DrawLine(sx, axis_y_screen,
+                                 sx, axis_y_screen + tick_len, TICK_COL);
+                        char buf[32];
+                        double f_label = f + wf_opt.center_hz;
+                        wf_fmt_freq(f_label, buf, sizeof buf);
+                        int tw = measure_text(buf, lpt_axis);
+                        draw_text(buf, sx - tw / 2,
+                                  axis_y_screen + tick_len + 2,
+                                  lpt_axis, AXIS_COL);
+                    }
+                }
+            }
+
+            // Left + right time axes, mirroring gen_waterfall's
+            // three-tier hierarchy:
+            //   1 s  ultra-minor  — short white pip (only when there's
+            //                       at least ~3 px per second to keep
+            //                       adjacent ticks from merging).
+            //   20 s minor        — medium gray tick with a ":SS"
+            //                       sub-label (e.g. ":20", ":40").
+            //   major             — long gray tick with full HH:MM:SS,
+            //                       interval chosen by wf_pick_time_step.
+            // When wf_opt.start_utc is set, the 20 s + major sequences
+            // align to wall-clock boundaries (so labels read ":00 / :20
+            // / :40 / 12:11:00" instead of arbitrary capture-relative
+            // offsets).
+            {
+                int TICK_1S  = (int)(3.0f  * zoom + 0.5f);
+                int TICK_20S = (int)(6.0f  * zoom + 0.5f);
+                int TICK_MAJ = (int)(10.0f * zoom + 0.5f);
+                if (TICK_1S  < 1) TICK_1S  = 1;
+                if (TICK_20S < 2) TICK_20S = 2;
+                if (TICK_MAJ < 3) TICK_MAJ = 3;
+                const int SS_PT     = lpt_sub;
+                const int AXIS_PT   = lpt_axis;
+                const Color FINE_COL = (Color){255, 255, 255, 255};
+
+                int axis_x_img_left  = WF_LM - 1;
+                int axis_x_img_right = WF_LM + spec_w + 1;
+                int axis_x_screen_left =
+                    (int)(((double) axis_x_img_left
+                           - (double) view_x) * zoom);
+                int axis_x_screen_right =
+                    (int)(((double) axis_x_img_right
+                           - (double) view_x) * zoom);
+                int draw_left  = (axis_x_screen_left  > 30
+                               && axis_x_screen_left  < sw);
+                int draw_right = (axis_x_screen_right > 0
+                               && axis_x_screen_right < sw - 50);
+
+                double t_step = wf_pick_time_step(duration_s, 10);
+                double major_offset   = 0.0;
+                double minor20_offset = 0.0;
+                if (wf_opt.start_utc != 0) {
+                    long step_maj = (long)(t_step + 0.5);
+                    if (step_maj > 0) {
+                        long mod = ((long) wf_opt.start_utc) % step_maj;
+                        if (mod < 0) mod += step_maj;
+                        major_offset =
+                            (double)((step_maj - mod) % step_maj);
+                    }
+                    long mod20 = ((long) wf_opt.start_utc) % 20L;
+                    if (mod20 < 0) mod20 += 20L;
+                    minor20_offset = (double)((20L - mod20) % 20L);
+                }
+
+                double px_per_s = (duration_s > 0.0)
+                                  ? (double) spec_h / duration_s : 0.0;
+                int draw_1s = (px_per_s * zoom >= 3.0);
+
+                if (draw_left || draw_right) {
+                    // 1 s pips first so the longer minor / major ticks
+                    // overpaint them at coincident positions.
+                    if (draw_1s) {
+                        for (double t = 0.0;
+                             t <= duration_s + 0.5; t += 1.0)
+                        {
+                            float y_img = WF_TM
+                                + (float)((1.0 - t / duration_s) * spec_h);
+                            int sy = (int)(((double) y_img
+                                            - (double) view_y) * zoom);
+                            if (sy < 0 || sy >= sh) continue;
+                            if (draw_left) {
+                                DrawLine(axis_x_screen_left - TICK_1S, sy,
+                                         axis_x_screen_left,            sy,
+                                         FINE_COL);
+                            }
+                            if (draw_right) {
+                                DrawLine(axis_x_screen_right,            sy,
+                                         axis_x_screen_right + TICK_1S,  sy,
+                                         FINE_COL);
+                            }
+                        }
+                    }
+
+                    // 20 s minor ticks with ":SS" labels. Skipped where
+                    // they'd land on a major tick (the major loop draws
+                    // a longer tick + full label at that spot).
+                    for (double t = minor20_offset;
+                         t <= duration_s + 0.5; t += 20.0)
+                    {
+                        double mod = fmod(t - major_offset, t_step);
+                        if (fabs(mod) < 1.0 || fabs(mod - t_step) < 1.0) {
+                            continue;
+                        }
+                        float y_img = WF_TM
+                            + (float)((1.0 - t / duration_s) * spec_h);
+                        int sy = (int)(((double) y_img
+                                        - (double) view_y) * zoom);
+                        if (sy < 0 || sy >= sh) continue;
+                        char ssbuf[8];
+                        if (wf_opt.start_utc != 0) {
+                            long sec = (((long) wf_opt.start_utc
+                                         + (long)(t + 0.5)) % 60L + 60L)
+                                       % 60L;
+                            snprintf(ssbuf, sizeof ssbuf, ":%02ld", sec);
+                        } else {
+                            snprintf(ssbuf, sizeof ssbuf, ":%02d",
+                                     (int)(t + 0.5) % 60);
+                        }
+                        int ssw = measure_text(ssbuf, SS_PT);
+                        if (draw_left) {
+                            DrawLine(axis_x_screen_left - TICK_20S, sy,
+                                     axis_x_screen_left,            sy,
+                                     TICK_COL);
+                            draw_text(ssbuf,
+                                      axis_x_screen_left - TICK_MAJ - 2
+                                          - ssw,
+                                      sy - SS_PT / 2,
+                                      SS_PT, AXIS_COL);
+                        }
+                        if (draw_right) {
+                            DrawLine(axis_x_screen_right,             sy,
+                                     axis_x_screen_right + TICK_20S,  sy,
+                                     TICK_COL);
+                            draw_text(ssbuf,
+                                      axis_x_screen_right + TICK_MAJ + 3,
+                                      sy - SS_PT / 2,
+                                      SS_PT, AXIS_COL);
+                        }
+                    }
+
+                    // Majors with full HH:MM:SS labels.
+                    for (double t = major_offset;
+                         t <= duration_s + 0.5 * t_step; t += t_step)
+                    {
+                        float y_img = WF_TM
+                            + (float)((1.0 - t / duration_s) * spec_h);
+                        int sy = (int)(((double) y_img
+                                        - (double) view_y) * zoom);
+                        if (sy < 0 || sy >= sh) continue;
+                        char buf[32];
+                        wf_fmt_time(wf_opt.start_utc, t, buf, sizeof buf);
+                        int tw = measure_text(buf, AXIS_PT);
+                        if (draw_left) {
+                            DrawLine(axis_x_screen_left - TICK_MAJ, sy,
+                                     axis_x_screen_left,            sy,
+                                     TICK_COL);
+                            draw_text(buf,
+                                      axis_x_screen_left - TICK_MAJ - 2
+                                          - tw,
+                                      sy - AXIS_PT / 2,
+                                      AXIS_PT, AXIS_COL);
+                        }
+                        if (draw_right) {
+                            DrawLine(axis_x_screen_right,             sy,
+                                     axis_x_screen_right + TICK_MAJ,  sy,
+                                     TICK_COL);
+                            draw_text(buf,
+                                      axis_x_screen_right + TICK_MAJ + 3,
+                                      sy - AXIS_PT / 2,
+                                      AXIS_PT, AXIS_COL);
+                        }
+                    }
+                }
+            }
+
+            // Right colorbar + dB tick labels. The colorbar sits in the
+            // outer half of the right margin (60 px past the spec edge,
+            // mirroring gen_waterfall's PNG layout) so the right time
+            // axis has its own gutter. The 1×256 RGBA8 strip is
+            // stretched to spec_h; dB labels are derived live from
+            // dbmin_abs / dbmax_abs so they update the instant the
+            // operator nudges the colormap.
+            {
+                int cb_w_img  = 16;
+                int cb_x_img  = WF_LM + spec_w + 60;
+                int cb_y_img  = WF_TM;
+                int cb_h_img  = spec_h;
+                double sx_d = ((double) cb_x_img - (double) view_x) * zoom;
+                double sy_d = ((double) cb_y_img - (double) view_y) * zoom;
+                double sw_d = (double) cb_w_img * zoom;
+                double sh_d = (double) cb_h_img * zoom;
+                int    tick_len = (int)(4.0f * zoom + 0.5f);
+                int    label_gap = (int)(6.0f * zoom + 0.5f);
+                if (tick_len  < 2) tick_len  = 2;
+                if (label_gap < 3) label_gap = 3;
+                if (sx_d < sw && sx_d + sw_d > 0 &&
+                    sy_d < sh && sy_d + sh_d > 0) {
+                    Rectangle src = { 0, 0, 1, 256 };
+                    Rectangle dst = { (float) sx_d, (float) sy_d,
+                                      (float) sw_d, (float) sh_d };
+                    DrawTexturePro(cb_texture, src, dst,
+                                   (Vector2){0, 0}, 0.0f, WHITE);
+
+                    double db_range = (double) dbmax_abs - (double) dbmin_abs;
+                    if (db_range > 0.0) {
+                        double db_step  = wf_pick_tick_step(db_range, 6);
+                        double db_first = ceil((double) dbmin_abs / db_step)
+                                          * db_step;
+                        int cb_right_screen = (int)(sx_d + sw_d);
+                        for (double db = db_first; db <= dbmax_abs + 1e-6;
+                             db += db_step)
+                        {
+                            double f = (db - (double) dbmin_abs) / db_range;
+                            float y_img = WF_TM
+                                + (float)((1.0 - f) * spec_h);
+                            int sy = (int)(((double) y_img
+                                            - (double) view_y) * zoom);
+                            if (sy < 0 || sy >= sh) continue;
+                            DrawLine(cb_right_screen,            sy,
+                                     cb_right_screen + tick_len, sy,
+                                     TICK_COL);
+                            char buf[32];
+                            snprintf(buf, sizeof buf, "%.0f", db);
+                            draw_text(buf,
+                                      cb_right_screen + label_gap,
+                                      sy - lpt_axis / 2,
+                                      lpt_axis, AXIS_COL);
+                        }
+                    }
+                    // Unit label above the colorbar.
+                    int unit_y_screen = (int)(((double)(WF_TM - 1)
+                                               - (double) view_y) * zoom)
+                                       - lpt_axis - 2;
+                    if (unit_y_screen < 0) unit_y_screen = 0;
+                    draw_text(wf_opt.power_unit,
+                              (int) sx_d, unit_y_screen,
+                              lpt_axis, AXIS_COL);
+                }
+            }
         }
 
         // Boxes: (t, f) → image px → screen px = (img_px - view_xy) * zoom.
@@ -2292,6 +2882,9 @@ int main(int argc, char **argv)
         if (tiles[t].id != 0) UnloadTexture(tiles[t]);
     }
     free(tiles);
+    UnloadTexture(cb_texture);
+    UnloadShader(wf_shader);
+    free(spec_db);
     iq_buf_free(&iqb);
     free(decode_text);
     if (g_ui_font_loaded) UnloadFont(g_ui_font);
