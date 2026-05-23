@@ -39,6 +39,7 @@
 
 #include "b210_rx_tx_core.h"
 #include "frontiersat.h"
+#include "pdf_writer.h"
 #include "sso_paths.h"
 
 #include <errno.h>
@@ -50,6 +51,25 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+#define MAX_GAIN_STEPS 256
+
+typedef struct {
+    double gain_db;
+    double mean_sq;
+    double mean_dbfs;
+    int    peak_env;
+    size_t n_samples;
+} sweep_point_t;
+
+// Pretty single-page summary: gain (x) vs mean(I²+Q²) in dBFS (y),
+// connected polyline, faint slope-1 reference anchored at the lowest
+// gain so the knee where the line peels off is obvious by eye.
+static int write_knee_pdf(const char *path,
+                          const sweep_point_t *pts, size_t n,
+                          double freq_hz, double rate_hz,
+                          unsigned decim, double dwell_s,
+                          const char *antenna);
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int sig) { (void)sig; g_stop = 1; }
@@ -195,6 +215,15 @@ int main(int argc, char *argv[])
     signal(SIGINT,  on_sigint);
     signal(SIGTERM, on_sigint);
 
+    // libuhd's default console log level is INFO, which means the
+    // "[INFO] [B200] Detecting internal GPSDO..." stanza scrolls past
+    // every time we open the device — fifteen-plus times during a
+    // full sweep.  Set the threshold to error before the first
+    // uhd_usrp_make so only real failures break into the operator's
+    // terminal.  setenv with overwrite=0 leaves a pre-existing value
+    // alone so the operator can still crank it back up to debug.
+    setenv("UHD_LOG_CONSOLE_LEVEL", "error", 0);
+
     FILE *csv = NULL;
     if (csv_path != NULL) {
         csv = fopen(csv_path, "w");
@@ -215,6 +244,9 @@ int main(int argc, char *argv[])
            rx_antenna);
     printf("# dwell=%.1f s   settle=%.1f s\n", dwell_s, settle_s);
     printf("gain_dB   mean_dBFS  peak_env  n_samples\n");
+
+    sweep_point_t pts[MAX_GAIN_STEPS];
+    size_t        n_pts = 0u;
 
     int rc = 0;
     for (double g = gain_start; g <= gain_end + 1e-9 && !g_stop; g += gain_step) {
@@ -324,9 +356,211 @@ int main(int argc, char *argv[])
                     g, n_samps, mean_sq, dbfs, (int) peak);
             fflush(csv);
         }
+        if (n_pts < MAX_GAIN_STEPS) {
+            pts[n_pts].gain_db   = g;
+            pts[n_pts].mean_sq   = mean_sq;
+            pts[n_pts].mean_dbfs = dbfs;
+            pts[n_pts].peak_env  = (int) peak;
+            pts[n_pts].n_samples = n_samps;
+            ++n_pts;
+        }
     }
 
     if (csv != NULL) fclose(csv);
+
+    // PDF knee plot — emit under --testing automatically.  We don't
+    // expose a --pdf flag yet because the only consumer right now is
+    // the bench-mode summary; if a future caller wants the PDF
+    // without a Testing folder we can add it without touching the
+    // shared writer.
+    if (testing_mode && n_pts >= 2u && !g_stop) {
+        char pdf_path[640];
+        snprintf(pdf_path, sizeof pdf_path,
+                 "%s/knee_plot.pdf", testing_folder);
+        if (write_knee_pdf(pdf_path, pts, n_pts,
+                           freq_hz, rate_hz, decim, dwell_s,
+                           rx_antenna) == 0) {
+            fprintf(stderr, "b210_gain_sweep: wrote %s\n", pdf_path);
+        } else {
+            fprintf(stderr, "b210_gain_sweep: pdf write failed (%s)\n",
+                    pdf_path);
+        }
+    }
+
     if (g_stop) fprintf(stderr, "interrupted\n");
     return rc;
+}
+
+static int write_knee_pdf(const char *path,
+                          const sweep_point_t *pts, size_t n,
+                          double freq_hz, double rate_hz,
+                          unsigned decim, double dwell_s,
+                          const char *antenna)
+{
+    if (path == NULL || pts == NULL || n < 2u) return -1;
+
+    // Landscape letter, generous margins so the page reads nicely as
+    // a one-page bench report.
+    const float page_w = 792.0f;
+    const float page_h = 612.0f;
+    pdfw_t *w = pdfw_begin(path, page_w, page_h);
+    if (w == NULL) return -1;
+
+    const float MARGIN   = 48.0f;
+    const float HEADER_H = 70.0f;
+    const float FOOTER_H = 24.0f;
+
+    pdfw_set_fill(w, (pdfw_rgb_t){250, 250, 252, 255});
+    pdfw_rect_fill(w, MARGIN, MARGIN, page_w - 2.0f*MARGIN, HEADER_H);
+    pdfw_set_stroke(w, PDFW_DGREY);
+    pdfw_lw(w, 0.7f);
+    pdfw_rect_stroke(w, MARGIN, MARGIN, page_w - 2.0f*MARGIN, HEADER_H);
+
+    pdfw_set_fill(w, PDFW_BLACK);
+    pdfw_text(w, MARGIN + 10, MARGIN + 6,
+              "b210_gain_sweep -- noise floor vs RX gain", 14.0f, 0);
+
+    char line1[256];
+    snprintf(line1, sizeof line1,
+             "freq=%.0f Hz   rate=%.0f Hz   decim=%u  ->  %.0f Hz post-decim   "
+             "antenna=%s   dwell=%.1f s",
+             freq_hz, rate_hz, decim,
+             rate_hz / (decim == 0u ? 1.0 : (double) decim),
+             antenna, dwell_s);
+    pdfw_text(w, MARGIN + 10, MARGIN + 28, line1, 9.0f, 1);
+
+    time_t now = time(NULL);
+    struct tm tm_local;
+    localtime_r(&now, &tm_local);
+    char ts[64];
+    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S %Z", &tm_local);
+    char line2[160];
+    snprintf(line2, sizeof line2, "captured %s   %zu gain steps", ts, n);
+    pdfw_text(w, MARGIN + 10, MARGIN + 44, line2, 9.0f, 1);
+
+    // Plot area.
+    const float pL = MARGIN + 60.0f;
+    const float pR = page_w - MARGIN - 16.0f;
+    const float pT = MARGIN + HEADER_H + 28.0f;
+    const float pB = page_h - MARGIN - FOOTER_H - 30.0f;
+    const float plot_w = pR - pL;
+    const float plot_h = pB - pT;
+
+    pdfw_set_stroke(w, (pdfw_rgb_t){100, 100, 110, 255});
+    pdfw_lw(w, 0.8f);
+    pdfw_rect_stroke(w, pL, pT, plot_w, plot_h);
+
+    // Axis ranges.  X = gain (snap to 10 dB grid).  Y = dBFS, expand
+    // to the nearest 5 dB on each side and pad by 5 dB so the slope-1
+    // reference line has room.
+    double x_min = pts[0].gain_db;
+    double x_max = pts[n - 1u].gain_db;
+    double y_min = pts[0].mean_dbfs;
+    double y_max = pts[0].mean_dbfs;
+    for (size_t i = 0u; i < n; ++i) {
+        if (pts[i].mean_dbfs < y_min) y_min = pts[i].mean_dbfs;
+        if (pts[i].mean_dbfs > y_max) y_max = pts[i].mean_dbfs;
+    }
+    x_min = floor(x_min / 10.0) * 10.0;
+    x_max = ceil (x_max / 10.0) * 10.0;
+    y_min = floor((y_min - 2.0) / 5.0) * 5.0;
+    y_max = ceil ((y_max + 2.0) / 5.0) * 5.0;
+    if (x_max <= x_min) x_max = x_min + 10.0;
+    if (y_max <= y_min) y_max = y_min + 5.0;
+
+    const double x_span = x_max - x_min;
+    const double y_span = y_max - y_min;
+    #define XPIX(GX) ((float)(pL + ((GX) - x_min) / x_span * plot_w))
+    #define YPIX(GY) ((float)(pB - ((GY) - y_min) / y_span * plot_h))
+
+    // X-axis grid + ticks every 10 dB.
+    pdfw_lw(w, 0.3f);
+    for (double gx = x_min; gx <= x_max + 1e-9; gx += 10.0) {
+        float x = XPIX(gx);
+        pdfw_set_stroke(w, PDFW_LGREY);
+        pdfw_line(w, x, pT, x, pB);
+        pdfw_set_stroke(w, PDFW_DGREY);
+        pdfw_line(w, x, pB, x, pB + 4);
+        char buf[16];
+        snprintf(buf, sizeof buf, "%g", gx);
+        float tw = pdfw_str_width(buf, 9.0f, 1);
+        pdfw_set_fill(w, PDFW_BLACK);
+        pdfw_text(w, x - 0.5f*tw, pB + 6, buf, 9.0f, 1);
+    }
+    // Y-axis grid + ticks every 5 dB.
+    for (double gy = y_min; gy <= y_max + 1e-9; gy += 5.0) {
+        float y = YPIX(gy);
+        pdfw_set_stroke(w, PDFW_LGREY);
+        pdfw_line(w, pL, y, pR, y);
+        pdfw_set_stroke(w, PDFW_DGREY);
+        pdfw_line(w, pL - 4, y, pL, y);
+        char buf[16];
+        snprintf(buf, sizeof buf, "%g", gy);
+        float tw = pdfw_str_width(buf, 9.0f, 1);
+        pdfw_set_fill(w, PDFW_BLACK);
+        pdfw_text(w, pL - 6 - tw, y - 4, buf, 9.0f, 1);
+    }
+
+    // Slope-1 reference: a 1 dB/dB line anchored at the lowest gain
+    // point.  Below the knee the data should sit right on top of it.
+    pdfw_set_stroke(w, (pdfw_rgb_t){180, 180, 200, 255});
+    pdfw_lw(w, 0.7f);
+    {
+        double ref_x0 = pts[0].gain_db;
+        double ref_y0 = pts[0].mean_dbfs;
+        double ref_x1 = x_max;
+        double ref_y1 = ref_y0 + (ref_x1 - ref_x0);
+        if (ref_y1 > y_max) {
+            ref_x1 = ref_x0 + (y_max - ref_y0);
+            ref_y1 = y_max;
+        }
+        pdfw_line(w, XPIX(ref_x0), YPIX(ref_y0),
+                     XPIX(ref_x1), YPIX(ref_y1));
+    }
+
+    // Data polyline.
+    pdfw_set_stroke(w, (pdfw_rgb_t){30, 120, 200, 255});
+    pdfw_lw(w, 1.4f);
+    for (size_t i = 1u; i < n; ++i) {
+        pdfw_line(w,
+            XPIX(pts[i - 1u].gain_db), YPIX(pts[i - 1u].mean_dbfs),
+            XPIX(pts[i].gain_db),      YPIX(pts[i].mean_dbfs));
+    }
+    // Markers.
+    pdfw_set_fill(w, (pdfw_rgb_t){30, 120, 200, 255});
+    for (size_t i = 0u; i < n; ++i) {
+        float x = XPIX(pts[i].gain_db);
+        float y = YPIX(pts[i].mean_dbfs);
+        pdfw_rect_fill(w, x - 2.0f, y - 2.0f, 4.0f, 4.0f);
+    }
+
+    // Axis labels.
+    pdfw_set_fill(w, PDFW_BLACK);
+    pdfw_text(w, 0.5f*(pL + pR) - pdfw_str_width("RX gain (dB)", 10.0f, 0)*0.5f,
+              pB + 22, "RX gain (dB)", 10.0f, 0);
+    // Y-axis label — drawn horizontally at the top-left of the plot
+    // because the simple writer doesn't do rotated text.
+    pdfw_text(w, MARGIN + 10, pT - 18,
+              "mean(I^2 + Q^2)  [dBFS]", 10.0f, 0);
+
+    // Legend.
+    pdfw_set_stroke(w, (pdfw_rgb_t){180, 180, 200, 255});
+    pdfw_lw(w, 0.7f);
+    pdfw_line(w, pR - 200.0f, pT + 10.0f, pR - 180.0f, pT + 10.0f);
+    pdfw_set_fill(w, PDFW_GREY);
+    pdfw_text(w, pR - 175.0f, pT + 4.0f, "slope-1 reference", 8.5f, 0);
+    pdfw_set_stroke(w, (pdfw_rgb_t){30, 120, 200, 255});
+    pdfw_lw(w, 1.4f);
+    pdfw_line(w, pR - 200.0f, pT + 26.0f, pR - 180.0f, pT + 26.0f);
+    pdfw_set_fill(w, PDFW_BLACK);
+    pdfw_text(w, pR - 175.0f, pT + 20.0f, "measured", 8.5f, 0);
+
+    // Footer.
+    pdfw_set_fill(w, PDFW_GREY);
+    pdfw_text(w, MARGIN, page_h - MARGIN - 12,
+              "Knee = lowest gain at which the curve peels off the "
+              "slope-1 reference. Operate ~5 dB above it.",
+              9.0f, 0);
+
+    return pdfw_end(w);
 }
