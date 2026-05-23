@@ -26,6 +26,9 @@
         T                    Cycle label of the selected box
         S                    Save both CSVs
         L                    Load <iq>.boxes.csv
+        , / .                Decrease / increase color-scale floor (db-min)
+        < / >                Decrease / increase color-scale ceiling (db-max)
+        R                    Reset color scale to gen_waterfall auto
         ↑/↓, PgUp/PgDn,      Scroll
         Home/End, wheel
         Q                    Quit
@@ -297,7 +300,40 @@ static int is_passthru(const char *arg)
     return 0;
 }
 
-// Build and run: gen_waterfall <iq> <rate> <png> <passthru flags...>
+// Build and run: gen_waterfall <iq> <rate> <png> <passthru flags...>.
+// db_min / db_max are passed in separately from the static passthru
+// list so the operator can adjust them mid-session without touching
+// the rest of the flag set; pass *_set = 0 to omit the corresponding
+// flag entirely and let gen_waterfall fall back to its percentile-
+// derived defaults.
+static int run_gen_waterfall(const char *iq_path, int samp_rate,
+                             const char *png_path,
+                             const char **passthru, int n_passthru);
+static int render_waterfall(const char *iq_path, int samp_rate,
+                            const char *png_path,
+                            const char **passthru, int n_passthru,
+                            double db_min, int db_min_set,
+                            double db_max, int db_max_set)
+{
+    char db_min_buf[32];
+    char db_max_buf[32];
+    const char *combined[64];
+    int n = 0;
+    int cap = (int)(sizeof combined / sizeof combined[0]);
+    for (int i = 0; i < n_passthru && n < cap; ++i) {
+        combined[n++] = passthru[i];
+    }
+    if (db_min_set && n < cap) {
+        snprintf(db_min_buf, sizeof db_min_buf, "--db-min=%g", db_min);
+        combined[n++] = db_min_buf;
+    }
+    if (db_max_set && n < cap) {
+        snprintf(db_max_buf, sizeof db_max_buf, "--db-max=%g", db_max);
+        combined[n++] = db_max_buf;
+    }
+    return run_gen_waterfall(iq_path, samp_rate, png_path, combined, n);
+}
+
 static int run_gen_waterfall(const char *iq_path, int samp_rate,
                              const char *png_path,
                              const char **passthru, int n_passthru)
@@ -852,10 +888,36 @@ int main(int argc, char **argv)
         snprintf(png_path, sizeof png_path,
                  "/tmp/iq_annotator_%d.png", (int) getpid());
     }
+
+    // Pull --db-min / --db-max out of passthru into mutable locals so
+    // the operator can adjust them at runtime ( ',' / '.' / '<' / '>' /
+    // 'R' keys). They get re-added on every render via render_waterfall.
+    double wf_db_min     = 0.0;
+    double wf_db_max     = 0.0;
+    int    wf_db_min_set = 0;
+    int    wf_db_max_set = 0;
+    {
+        int dst = 0;
+        for (int i = 0; i < n_passthru; ++i) {
+            if (strncmp(passthru[i], "--db-min=", 9) == 0) {
+                wf_db_min     = atof(passthru[i] + 9);
+                wf_db_min_set = 1;
+            } else if (strncmp(passthru[i], "--db-max=", 9) == 0) {
+                wf_db_max     = atof(passthru[i] + 9);
+                wf_db_max_set = 1;
+            } else {
+                passthru[dst++] = passthru[i];
+            }
+        }
+        n_passthru = dst;
+    }
+
     fprintf(stderr, "iq_annotator: rendering with gen_waterfall → %s\n",
             png_path);
-    if (run_gen_waterfall(iq_path, samp_rate, png_path,
-                          passthru, n_passthru) != 0) {
+    if (render_waterfall(iq_path, samp_rate, png_path,
+                         passthru, n_passthru,
+                         wf_db_min, wf_db_min_set,
+                         wf_db_max, wf_db_max_set) != 0) {
         return 1;
     }
 
@@ -984,6 +1046,43 @@ int main(int argc, char **argv)
     fprintf(stderr,
         "iq_annotator: PNG %dx%d, spec %dx%d, BW %.1f kHz\n",
         img_w, img_h, spec_w, spec_h, display_bw_hz / 1e3);
+
+    // Reload the tile textures from a freshly rendered PNG.  Uses a
+    // do/while so a `break` falls through to the standard return
+    // value; tile slot is left at id=0 on failure so the draw code
+    // skips it (rather than crashing on a stale handle).
+    #define RELOAD_TILES_FROM_PNG()                                        \
+    do {                                                                   \
+        for (int t = 0; t < n_tiles; ++t) {                                \
+            if (tiles[t].id != 0) {                                        \
+                UnloadTexture(tiles[t]);                                   \
+                tiles[t].id = 0;                                           \
+            }                                                              \
+        }                                                                  \
+        Image _rimg = LoadImage(png_path);                                 \
+        if (_rimg.data == NULL) {                                          \
+            fprintf(stderr,                                                \
+                "iq_annotator: reload LoadImage failed: %s\n", png_path);  \
+        } else if (_rimg.width != img_w || _rimg.height != img_h) {        \
+            fprintf(stderr,                                                \
+                "iq_annotator: regen size changed (%dx%d -> %dx%d), "      \
+                "ignoring\n", img_w, img_h, _rimg.width, _rimg.height);    \
+            UnloadImage(_rimg);                                            \
+        } else {                                                           \
+            for (int t = 0; t < n_tiles; ++t) {                            \
+                int _y0 = t * TILE_H;                                      \
+                int _h  = (_y0 + TILE_H <= img_h) ? TILE_H : (img_h - _y0); \
+                Image _sub = ImageFromImage(_rimg,                         \
+                    (Rectangle){0, (float) _y0,                            \
+                                (float) img_w, (float) _h});               \
+                tiles[t] = LoadTextureFromImage(_sub);                     \
+                UnloadImage(_sub);                                         \
+                if (tiles[t].id != 0)                                      \
+                    SetTextureFilter(tiles[t], TEXTURE_FILTER_POINT);      \
+            }                                                              \
+            UnloadImage(_rimg);                                            \
+        }                                                                  \
+    } while (0)
 
     // Boxes.
     box_list_t boxes = {0};
@@ -1226,6 +1325,53 @@ int main(int argc, char **argv)
               : (iq_show_mode == 1) ? "I only" : "Q only";
             snprintf(status, sizeof status,
                 "waveform channels: %s", mode_label);
+        }
+        // Color-scale controls — comma/period adjust db-min (floor),
+        // shifted (',' / '.' with shift = '<' / '>') adjust db-max
+        // (ceiling), 'R' resets both to auto.  Each step is 3 dB.
+        // We re-run gen_waterfall synchronously and reload textures.
+        {
+            int shift_down = IsKeyDown(KEY_LEFT_SHIFT)
+                          || IsKeyDown(KEY_RIGHT_SHIFT);
+            int regen      = 0;
+            const double STEP_DB = 3.0;
+            if (IsKeyPressed(KEY_COMMA)) {
+                if (!wf_db_min_set) wf_db_min = -100.0;
+                if (!wf_db_max_set) wf_db_max =    0.0;
+                if (shift_down) { wf_db_max -= STEP_DB; wf_db_max_set = 1; }
+                else            { wf_db_min -= STEP_DB; wf_db_min_set = 1; }
+                regen = 1;
+            } else if (IsKeyPressed(KEY_PERIOD)) {
+                if (!wf_db_min_set) wf_db_min = -100.0;
+                if (!wf_db_max_set) wf_db_max =    0.0;
+                if (shift_down) { wf_db_max += STEP_DB; wf_db_max_set = 1; }
+                else            { wf_db_min += STEP_DB; wf_db_min_set = 1; }
+                regen = 1;
+            } else if (IsKeyPressed(KEY_R)) {
+                wf_db_min_set = 0;
+                wf_db_max_set = 0;
+                regen = 1;
+            }
+            if (regen) {
+                snprintf(status, sizeof status,
+                    "rendering waterfall (db-min=%s%g db-max=%s%g)...",
+                    wf_db_min_set ? "" : "auto:", wf_db_min,
+                    wf_db_max_set ? "" : "auto:", wf_db_max);
+                // Best-effort: even if the regen errors, the previous
+                // textures stay onscreen and the operator can keep
+                // working.  An aborted render is reported via the
+                // existing stderr path inside run_gen_waterfall.
+                if (render_waterfall(iq_path, samp_rate, png_path,
+                                     (const char **) passthru, n_passthru,
+                                     wf_db_min, wf_db_min_set,
+                                     wf_db_max, wf_db_max_set) == 0) {
+                    RELOAD_TILES_FROM_PNG();
+                }
+                snprintf(status, sizeof status,
+                    "color: db-min=%s%g db-max=%s%g  (',/.': floor  '<>': ceiling  'R': reset)",
+                    wf_db_min_set ? "" : "auto:", wf_db_min,
+                    wf_db_max_set ? "" : "auto:", wf_db_max);
+            }
         }
         // ']' → advance to the START of the next box (in time).
         // '[' → step back to the START of the previous box.
@@ -1833,12 +1979,12 @@ int main(int argc, char **argv)
         char info[512];
         if (in_spec) {
             snprintf(info, sizeof info,
-                "cursor t=%.3fs  f=%+.0f Hz  zoom=%.2fx  boxes=%d  hover=%d sel=%d  | drag=new pinch=zoom +/-=5x@cursor-anchor scroll=pan W=wave I=ch P=pdf T=label S=save L=load 0=reset Del=del-hover Q=quit",
+                "cursor t=%.3fs  f=%+.0f Hz  zoom=%.2fx  boxes=%d  hover=%d sel=%d  | drag=new pinch=zoom +/-=5x@cursor-anchor scroll=pan W=wave I=ch P=pdf T=label S=save L=load ,./<>=color R=auto-color 0=reset Del=del-hover Q=quit",
                 cursor_t, cursor_f, (double) zoom,
                 boxes.n, hovered, boxes.selected);
         } else {
             snprintf(info, sizeof info,
-                "zoom=%.2fx  boxes=%d  | drag=new pinch=zoom +/-=5x@cursor-anchor scroll=pan W=wave I=ch P=pdf T=label S=save L=load 0=reset Del=del-hover Q=quit",
+                "zoom=%.2fx  boxes=%d  | drag=new pinch=zoom +/-=5x@cursor-anchor scroll=pan W=wave I=ch P=pdf T=label S=save L=load ,./<>=color R=auto-color 0=reset Del=del-hover Q=quit",
                 (double) zoom, boxes.n);
         }
         draw_text(info, 6, sh - bar_h + STATUS_PT + 8, STATUS_PT, LIGHTGRAY);
