@@ -41,6 +41,7 @@
 #include <raylib.h>
 #include <rlgl.h>
 
+#include "golay24.h"
 #include "modem.h"
 #include "modem_fsk.h"
 #include "pdf_writer.h"
@@ -2108,7 +2109,7 @@ int main(int argc, char **argv)
     // visible in the spectrogram (no fixed-window slice). Recompute
     // fires after a short debounce on zoom/pan so a fast scroll
     // doesn't trigger one per frame.
-    #define DECMODE_N_STAGES 7
+    #define DECMODE_N_STAGES 8
     static const char *DECMODE_STAGE_NAMES[DECMODE_N_STAGES] = {
         "raw IQ",
         "IQ LPF",
@@ -2117,6 +2118,7 @@ int main(int argc, char **argv)
         "Gardner / eye",
         "slicer bits",
         "ASM correlation",
+        "Golay length",
     };
     int    decmode_open      = 0;
     int    decmode_stage     = 0;
@@ -2136,6 +2138,16 @@ int main(int argc, char **argv)
     uint8_t   *decmode_out_scratch = NULL;
     size_t     decmode_out_scratch_cap = 0;
     int        decmode_input_sps     = 0;
+
+    // Stage 7 (Golay length header) — computed after each recompute
+    // when ASM was found. decmode_golay_rc:
+    //   -2 = no ASM lock or not enough bits past ASM
+    //   -1 = Golay uncorrectable (>3 bit errors)
+    //    0 = decoded ok; data12 + errors valid
+    uint32_t   decmode_golay_word24 = 0;
+    uint16_t   decmode_golay_data12 = 0;
+    int        decmode_golay_errors = -1;
+    int        decmode_golay_rc     = -2;
 
     while (!WindowShouldClose()) {
         int sw = GetScreenWidth();
@@ -3401,6 +3413,31 @@ int main(int argc, char **argv)
                             decmode_out_scratch_cap);
                         decmode_input_sps   = sps;
                         decmode_have_result = 1;
+                        // Stage 7: Golay(24,12) over the 24 bits right
+                        // after the ASM. Pack MSB-first to match the
+                        // way ax100.c lifts those 3 bytes off the wire.
+                        decmode_golay_word24 = 0;
+                        decmode_golay_data12 = 0;
+                        decmode_golay_errors = -1;
+                        decmode_golay_rc     = -2;
+                        if (decmode_diag.asm_offset != (size_t) -1
+                            && decmode_diag.bits != NULL
+                            && decmode_diag.n_strobes
+                                 >= decmode_diag.asm_offset + 32 + 24) {
+                            uint32_t g = 0;
+                            size_t base = decmode_diag.asm_offset + 32;
+                            for (int k = 0; k < 24; ++k) {
+                                g = (g << 1)
+                                  | (decmode_diag.bits[base + k] & 1u);
+                            }
+                            decmode_golay_word24 = g;
+                            uint16_t d12 = 0;
+                            int errs = 0;
+                            int rc = golay24_decode(g, &d12, &errs);
+                            decmode_golay_rc     = rc;
+                            decmode_golay_data12 = d12;
+                            decmode_golay_errors = errs;
+                        }
                     }
                 }
             }
@@ -4372,12 +4409,118 @@ int main(int argc, char **argv)
                     }
                 }
 
+                // ------ Stage 7: Golay(24,12) length header ------
+                else if (decmode_stage == 7) {
+                    // Layout: 24 cells across the upper third of the
+                    // body (parity | data), result text in the middle,
+                    // raw-word bit pattern in the lower third.
+                    int margin_x = 24;
+                    int cells_y0 = body_y0 + 30;
+                    int cells_h  = 56;
+                    int avail_w  = body_w - 2 * margin_x;
+                    int gap_mid  = 18;
+                    int half_w   = (avail_w - gap_mid) / 2;
+                    int cell_w   = half_w / 12;
+                    int parity_x0 = body_x0 + margin_x;
+                    int data_x0   = parity_x0 + 12 * cell_w + gap_mid;
+
+                    // Captions
+                    draw_text("parity (12 bits)",
+                              parity_x0, cells_y0 - 18,
+                              T_PT, (Color){170, 180, 220, 220});
+                    draw_text("data (12 bits)",
+                              data_x0, cells_y0 - 18,
+                              T_PT, (Color){200, 200, 150, 230});
+
+                    // Draw the 24 cells. Golay convention from
+                    // ax100.c: word = (parity << 12) | data. So bits
+                    // 23..12 of word24 are parity (drawn left),
+                    // bits 11..0 are data (drawn right).
+                    if (decmode_golay_rc != -2) {
+                        Color cell_on_parity = {180, 190, 240, 255};
+                        Color cell_on_data   = {230, 220, 130, 255};
+                        Color cell_off       = {60, 60, 80, 255};
+                        Color cell_edge      = {30, 30, 40, 255};
+                        for (int i = 0; i < 24; ++i) {
+                            int bit = (decmode_golay_word24
+                                       >> (23 - i)) & 1u;
+                            int is_parity = (i < 12);
+                            int xi = is_parity
+                                ? (parity_x0 + i * cell_w)
+                                : (data_x0   + (i - 12) * cell_w);
+                            Color c = bit
+                                ? (is_parity ? cell_on_parity
+                                             : cell_on_data)
+                                : cell_off;
+                            DrawRectangle(xi + 1, cells_y0,
+                                          cell_w - 2, cells_h, c);
+                            DrawRectangleLines(xi + 1, cells_y0,
+                                               cell_w - 2, cells_h,
+                                               cell_edge);
+                            char b[4];
+                            snprintf(b, sizeof b, "%d", bit);
+                            int bw = measure_text(b, AMP_PT);
+                            Color tcol = bit
+                                ? (Color){20, 20, 30, 255}
+                                : (Color){170, 170, 190, 255};
+                            draw_text(b, xi + 1 + (cell_w - 2 - bw)/2,
+                                      cells_y0 + (cells_h - AMP_PT)/2,
+                                      AMP_PT, tcol);
+                        }
+                    }
+
+                    // Result text below the cells.
+                    int txt_y = cells_y0 + cells_h + 24;
+                    char buf[128];
+                    if (decmode_golay_rc == -2) {
+                        draw_text("no ASM lock — Golay decode skipped",
+                                  body_x0 + margin_x, txt_y,
+                                  AMP_PT, LIGHTGRAY);
+                    } else {
+                        snprintf(buf, sizeof buf,
+                            "raw word    0x%06X",
+                            decmode_golay_word24 & 0xFFFFFFu);
+                        draw_text(buf, body_x0 + margin_x, txt_y,
+                                  AMP_PT,
+                                  (Color){220, 220, 230, 255});
+
+                        snprintf(buf, sizeof buf,
+                            "data 12b    0x%03X  ( = %u bytes )",
+                            decmode_golay_data12 & 0xFFFu,
+                            (unsigned) decmode_golay_data12);
+                        draw_text(buf, body_x0 + margin_x,
+                                  txt_y + AMP_PT + 6, AMP_PT,
+                                  (Color){230, 220, 140, 255});
+
+                        if (decmode_golay_rc == 0) {
+                            snprintf(buf, sizeof buf,
+                                "decode ok   %d bit error%s corrected",
+                                decmode_golay_errors,
+                                decmode_golay_errors == 1 ? "" : "s");
+                            Color col = (decmode_golay_errors <= 1)
+                                ? (Color){140, 220, 140, 255}
+                                : (decmode_golay_errors == 2)
+                                ? (Color){220, 220, 140, 255}
+                                : (Color){240, 180, 120, 255};
+                            draw_text(buf, body_x0 + margin_x,
+                                      txt_y + 2*(AMP_PT + 6),
+                                      AMP_PT, col);
+                        } else {
+                            draw_text(
+                                "decode FAIL  (>3 bit errors — uncorrectable)",
+                                body_x0 + margin_x,
+                                txt_y + 2*(AMP_PT + 6),
+                                AMP_PT, (Color){240, 110, 110, 255});
+                        }
+                    }
+                }
+
                 DrawRectangleLines(body_x0, body_y0,
                                    body_w, body_h, DARKGRAY);
 
                 // Time-axis ticks — same renderer the W panel uses,
-                // shared by all stages.
-                {
+                // shared by the time-domain stages (0-6).
+                if (decmode_stage != 7) {
                     double raw_step = span_s / 6.0;
                     double mag = pow(10.0, floor(log10(raw_step)));
                     double mul = raw_step / mag;
