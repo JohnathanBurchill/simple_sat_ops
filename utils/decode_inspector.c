@@ -3368,6 +3368,17 @@ int main(int argc, char **argv)
                 if (i_lo < 0) i_lo = 0;
                 if (i_hi > (int64_t) iqb.n_pairs)
                     i_hi = (int64_t) iqb.n_pairs;
+                // Hand the decoder at least 0.3 s of IQ starting at the
+                // visible window's left edge — the matched filter,
+                // Gardner loop, and ASM correlator all need room to
+                // work even when the operator has zoomed in tight. The
+                // render side still clips to [wf_t_lo, wf_t_hi] so the
+                // K-panel time axis matches the W panel.
+                int64_t min_dec_n = (int64_t)(0.3 * iqb.samp_rate);
+                if (i_hi - i_lo < min_dec_n)
+                    i_hi = i_lo + min_dec_n;
+                if (i_hi > (int64_t) iqb.n_pairs)
+                    i_hi = (int64_t) iqb.n_pairs;
                 size_t slice_n = (i_hi > i_lo)
                     ? (size_t)(i_hi - i_lo) : 0;
                 const int bit_rate = 9600;
@@ -3975,6 +3986,12 @@ int main(int argc, char **argv)
                         }
                     } else if (decmode_stage == 1) {
                         size_t n = decmode_diag.n_pairs_lpf;
+                        // Auto-scale off the visible portion only.
+                        {
+                            int64_t n_vis = (int64_t)(span_s * samp_rate_d);
+                            if (n_vis < 0) n_vis = 0;
+                            if ((int64_t) n > n_vis) n = (size_t) n_vis;
+                        }
                         size_t step = (n > 4096) ? n / 2048 : 1;
                         for (size_t k = 0; k < n; k += step) {
                             double a = fabs((double) decmode_diag.i_lpf[k]);
@@ -3987,6 +4004,12 @@ int main(int argc, char **argv)
                             ? decmode_diag.fm : decmode_diag.mf;
                         size_t n = (decmode_stage == 2)
                             ? decmode_diag.n_fm : decmode_diag.n_mf;
+                        // Auto-scale off the visible portion only.
+                        {
+                            int64_t n_vis = (int64_t)(span_s * samp_rate_d);
+                            if (n_vis < 0) n_vis = 0;
+                            if ((int64_t) n > n_vis) n = (size_t) n_vis;
+                        }
                         size_t step = (n > 4096) ? n / 2048 : 1;
                         for (size_t k = 0; k < n; k += step) {
                             double a = fabs((double) src[k]);
@@ -4040,7 +4063,14 @@ int main(int argc, char **argv)
                             src_q = decmode_diag.q_lpf;
                             n_pairs_total = decmode_diag.n_pairs_lpf;
                             i_lo_idx = 0;
-                            i_hi_idx = (int64_t) n_pairs_total;
+                            // Clip to visible time so the dense binning
+                            // doesn't compress the >=0.3 s decoder
+                            // extension into the K panel.
+                            int64_t n_vis = (int64_t)(span_s * samp_rate_data);
+                            if (n_vis < 0) n_vis = 0;
+                            if (n_vis > (int64_t) n_pairs_total)
+                                n_vis = (int64_t) n_pairs_total;
+                            i_hi_idx = n_vis;
                         }
                         int64_t nvis = i_hi_idx - i_lo_idx;
                         if (nvis > 0) {
@@ -4099,6 +4129,14 @@ int main(int argc, char **argv)
                             ? decmode_diag.fm : decmode_diag.mf;
                         size_t n = (decmode_stage == 2)
                             ? decmode_diag.n_fm : decmode_diag.n_mf;
+                        // Clip the buffer to the visible time span so
+                        // the dense renderer doesn't squash the >=0.3 s
+                        // decoder extension into the K panel.
+                        {
+                            int64_t n_vis = (int64_t)(span_s * samp_rate_d);
+                            if (n_vis < 0) n_vis = 0;
+                            if ((int64_t) n > n_vis) n = (size_t) n_vis;
+                        }
                         Color col = (decmode_stage == 2)
                             ? (Color){180, 220, 130, 255}
                             : (Color){255, 200, 80, 255};
