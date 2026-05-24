@@ -2329,11 +2329,13 @@ int main(int argc, char **argv)
                                       - scr_y_eff / (double) zoom);
                 }
                 if (wheel_v.y != 0.0f || wheel_v.x != 0.0f) {
-                    // Wheel.y pans time; wheel.x pans freq (so
-                    // a horizontal scroll over the panel still
-                    // works the same as over the spec).
-                    view_y -= wheel_v.y * 12.0f / zoom;
-                    view_x -= wheel_v.x * 12.0f / zoom;
+                    // Both axes pan time on the panel — the panel's
+                    // time axis is left-to-right so wheel.x is the
+                    // natural pan, and wheel.y carries on working
+                    // for users with vertical-only mice. Freq does
+                    // not get a pan from the panel; the panel has
+                    // no freq axis to pan along.
+                    view_y -= (wheel_v.x + wheel_v.y) * 12.0f / zoom;
                 }
             }
         }
@@ -4816,6 +4818,53 @@ int main(int argc, char **argv)
                     ? "computing decode chain (zoom the spectrogram to refresh)..."
                     : "no data — pick an IQ region in the spectrogram above";
                 draw_text(msg, plot_x0, plot_y0 + 20, 16, LIGHTGRAY);
+            }
+            // Cursor indicator: yellow vertical guide showing where
+            // the spectrogram cursor's time falls on the K-panel
+            // x-axis, with top + bottom arrowheads (same as the W
+            // panel). When the mouse is in the K panel itself, draw
+            // a small crosshair at the mouse position. Skipped on
+            // stage 4 (eye, symbol-relative) and stage 7 (Golay, no
+            // time axis).
+            if (decmode_stage != 4 && decmode_stage != 7
+                && wf_t_hi > wf_t_lo
+                && plot_w > 16 && plot_h > 16) {
+                double span = wf_t_hi - wf_t_lo;
+                if (in_spec
+                    && cursor_t >= wf_t_lo - 1e-12
+                    && cursor_t <= wf_t_hi + 1e-12) {
+                    int cx = plot_x0
+                           + (int)((cursor_t - wf_t_lo) / span * plot_w);
+                    if (cx >= plot_x0 && cx <= plot_x1) {
+                        DrawLine(cx - 1, plot_y0, cx - 1, plot_y1 + 1, BLACK);
+                        DrawLine(cx + 1, plot_y0, cx + 1, plot_y1 + 1, BLACK);
+                        DrawLine(cx,     plot_y0, cx,     plot_y1 + 1, YELLOW);
+                        Vector2 ba = {(float) cx, (float)(plot_y1 - 1)};
+                        Vector2 bl = {(float)(cx - 7), (float)(plot_y1 + 11)};
+                        Vector2 br = {(float)(cx + 7), (float)(plot_y1 + 11)};
+                        DrawTriangle(ba, br, bl, YELLOW);
+                        DrawTriangleLines(ba, br, bl, BLACK);
+                        Vector2 ta = {(float) cx, (float)(plot_y0 + 1)};
+                        Vector2 tl = {(float)(cx - 7), (float)(plot_y0 - 11)};
+                        Vector2 tr = {(float)(cx + 7), (float)(plot_y0 - 11)};
+                        DrawTriangle(ta, tl, tr, YELLOW);
+                        DrawTriangleLines(ta, tl, tr, BLACK);
+                    }
+                }
+                int in_k_panel_now =
+                    decmode_open
+                    && (int) m.y >= sh - decmode_panel_h
+                    && (int) m.y <  sh
+                    && (int) m.x >= 0
+                    && (int) m.x <  dm_right;
+                if (in_k_panel_now
+                    && (int) m.x >= plot_x0 && (int) m.x <= plot_x1
+                    && (int) m.y >= plot_y0 && (int) m.y <= plot_y1) {
+                    int cx = (int) m.x;
+                    int cy = (int) m.y;
+                    DrawLine(cx - 6, cy, cx + 6, cy, YELLOW);
+                    DrawLine(cx, cy - 6, cx, cy + 6, YELLOW);
+                }
             }
         }
 
