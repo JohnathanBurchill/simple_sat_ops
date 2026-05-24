@@ -2236,7 +2236,14 @@ int main(int argc, char **argv)
     // independent zoom / pan — pinch / scroll on the spectrogram move
     // both the waterfall and the time-series in lockstep.
     int   wf_open       = 0;
-    int   wf_panel_h    = 240;
+    // W and K panels share the same height so the operator can
+    // toggle between them without the time range jumping. Whichever
+    // is open replaces the bottom slice of the waterfall; the time
+    // range shown is exactly what is visible above the panel, so
+    // scrolling the spec all the way to t=0 lands the first sample
+    // at the left edge of the panel (i.e., "adjacent to the top of
+    // the panel" = the spec/panel boundary).
+    int   wf_panel_h    = 420;
 
     // Decode side panel: D presses spawn rx_replay over the IQ slice
     // covering the currently-visible time range and capture its stderr
@@ -2440,14 +2447,11 @@ int main(int argc, char **argv)
             int spec_screen_w_in = decode_open
                 ? (sw - decode_panel_w) : sw;
             if (spec_screen_w_in < 64) spec_screen_w_in = 64;
-            // Time math must match the renderer's spec_bot_y_screen:
-            // both W and K derive their time range from the W-panel
-            // slot (sh - wf_panel_h) so panels stay synchronised.
-            // The K panel happens to be taller and overlaps the
-            // bottom of the spec visually; using decmode_panel_h
-            // here would give a different visible time range than
-            // the renderer and the zoom-to-cursor anchor would
-            // drift accordingly.
+            // Time math must match the renderer's spec_bot_y_screen.
+            // W and K are the same height now, so whichever is open
+            // replaces the same chunk of the waterfall and the time
+            // range is whatever remains visible above. Using
+            // sh - wf_panel_h here matches the renderer's wf_y0.
             int bar_h_in = 2 * (STATUS_PT + 6);
             int spec_bot_y_in = bottom_panel_h_now > 0
                 ? (sh - wf_panel_h)
@@ -3697,15 +3701,14 @@ int main(int argc, char **argv)
         // using the FRACTION of the spec height (not a discrete row
         // index) to avoid an off-by-one row-width gap at each end.
         int bar_h_for_wf = 2 * (STATUS_PT + 6);
-        // Time-range derivation uses the W-panel's slot whether W or
-        // K is open, so the time series and decode panels always
-        // cover the same time range — operators can switch between
-        // them and compare features by time without the bottom of
-        // the range shifting. (The K panel is physically taller so
-        // its top edge sits inside the W-slot region; the time math
-        // pretends the spec extends down to the W bottom either way.)
-        // When neither bottom panel is open, the spec stretches down
-        // to the status bar and we use that.
+        // Time-range derivation: whichever bottom panel is open
+        // replaces the bottom slice of the waterfall, and the time
+        // range shown by that panel is whatever waterfall remains
+        // visible above it. W and K are now the same height so
+        // wf_y0 = top edge of either panel; scrolling the spec to
+        // the start of the capture lands the first sample at that
+        // boundary (== left edge of the panel). When neither panel
+        // is open the spec stretches down to the status bar.
         int spec_bot_y_screen =
             (wf_open || decmode_open)
                 ? wf_y0
