@@ -2304,8 +2304,19 @@ int main(int argc, char **argv)
             }
             double span_in = t_hi_in - t_lo_in;
             if (span_in > 1e-12) {
-                double frac_x = (double) m.x
-                                / (double) spec_screen_w_in;
+                // K and W panels both leave a 96 px left margin for
+                // y-axis labels and an 8 px right margin. Map the
+                // cursor's screen x to the actual *plot* area so a
+                // cursor sitting on the left edge of the trace
+                // corresponds to frac_x = 0 (not ~0.07).
+                const int pL_panel = 96;
+                const int pR_panel = 8;
+                int plot_x0_in = pL_panel;
+                int plot_x1_in = spec_screen_w_in - pR_panel;
+                int plot_w_in  = plot_x1_in - plot_x0_in;
+                if (plot_w_in < 16) plot_w_in = 16;
+                double frac_x = ((double) m.x - (double) plot_x0_in)
+                                / (double) plot_w_in;
                 if (frac_x < 0.0) frac_x = 0.0;
                 if (frac_x > 1.0) frac_x = 1.0;
                 double t_cursor = t_lo_in + frac_x * span_in;
