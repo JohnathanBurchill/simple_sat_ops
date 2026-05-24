@@ -45,6 +45,7 @@
 #include "modem.h"
 #include "modem_fsk.h"
 #include "pdf_writer.h"
+#include "rs.h"
 #include "sw_nco.h"
 #include "waterfall_core.h"
 
@@ -2241,7 +2242,7 @@ int main(int argc, char **argv)
     // visible in the spectrogram (no fixed-window slice). Recompute
     // fires after a short debounce on zoom/pan so a fast scroll
     // doesn't trigger one per frame.
-    #define DECMODE_N_STAGES 9
+    #define DECMODE_N_STAGES 10
     static const char *DECMODE_STAGE_NAMES[DECMODE_N_STAGES] = {
         "raw IQ",
         "IQ LPF",
@@ -2252,6 +2253,7 @@ int main(int argc, char **argv)
         "ASM correlation",
         "Golay length",
         "CCSDS descrambler",
+        "Reed-Solomon (255,223)",
     };
     int    decmode_open      = 0;
     int    decmode_stage     = 0;
@@ -2304,6 +2306,21 @@ int main(int argc, char **argv)
     // adjusts this; wheel scroll is independent.
     float      decmode_descr_cell_w     = 30.0f;
 
+    // Stage 9 (Reed-Solomon 255,223): the descrambled bytes get
+    // zero-padded on the left to RS_N=255, then rs_decode runs in
+    // place. decmode_rs_in is the codeword as RS saw it (pre-
+    // correction); decmode_rs_out is what RS produced. _errors is
+    // the number of corrected bytes (0..16), -1 if uncorrectable,
+    // -2 if RS could not run (no Golay lock, no descrambled bytes,
+    // or input too short).
+    uint8_t    decmode_rs_in[RS_N];
+    uint8_t    decmode_rs_out[RS_N];
+    int        decmode_rs_locs[RS_NROOTS];
+    int        decmode_rs_errors        = -2;
+    size_t     decmode_rs_pad_len       = 0;
+    int        decmode_rs_view_off      = 0;
+    float      decmode_rs_cell_w        = 30.0f;
+
     while (!WindowShouldClose()) {
         int sw = GetScreenWidth();
         int sh = GetScreenHeight();
@@ -2339,31 +2356,42 @@ int main(int argc, char **argv)
         // The spectrogram's view_y/zoom are the single source of
         // truth for the visible time window, so the panel handlers
         // just modify those.
-        // Stage 8 (CCSDS descrambler) byte-grid: wheel.x / wheel.y
-        // scroll the byte offset shown at the left edge of the
-        // grid, instead of panning time. Pinch resizes the byte
-        // cells instead of zooming time. Lets the operator scan
-        // across the full payload (up to DECMODE_DESCR_CAP bytes)
-        // and pick a readable cell size without time-axis
-        // interference.
+        // Byte-grid stages (8 = CCSDS descrambler, 9 = Reed-Solomon)
+        // consume wheel + pinch for their own scroll/zoom instead
+        // of panning time. Wheel scrolls the byte offset shown at
+        // the left edge of the grid; pinch resizes the byte cells.
+        // Each stage has its own offset/cell-width state so the
+        // operator's view position carries across when they cycle
+        // between the two.
         int stage_eats_panel_input = in_panel_for_input
-            && decmode_open && decmode_stage == 8;
+            && decmode_open
+            && (decmode_stage == 8 || decmode_stage == 9);
         if (stage_eats_panel_input && (wheel_v.x != 0.0f
                                        || wheel_v.y != 0.0f)) {
-            decmode_descr_view_off +=
-                (int)((wheel_v.x + wheel_v.y) * 2.0f);
-            if (decmode_descr_view_off < 0)
-                decmode_descr_view_off = 0;
-            int max_off = (int) decmode_descr_n - 1;
-            if (max_off < 0) max_off = 0;
-            if (decmode_descr_view_off > max_off)
-                decmode_descr_view_off = max_off;
+            int delta = (int)((wheel_v.x + wheel_v.y) * 2.0f);
+            if (decmode_stage == 8) {
+                decmode_descr_view_off += delta;
+                if (decmode_descr_view_off < 0)
+                    decmode_descr_view_off = 0;
+                int max_off = (int) decmode_descr_n - 1;
+                if (max_off < 0) max_off = 0;
+                if (decmode_descr_view_off > max_off)
+                    decmode_descr_view_off = max_off;
+            } else {
+                decmode_rs_view_off += delta;
+                if (decmode_rs_view_off < 0)
+                    decmode_rs_view_off = 0;
+                if (decmode_rs_view_off > RS_N - 1)
+                    decmode_rs_view_off = RS_N - 1;
+            }
         }
         if (stage_eats_panel_input && pinch != 0.0f) {
-            float new_cw = decmode_descr_cell_w * expf(pinch);
+            float *cw = (decmode_stage == 8)
+                ? &decmode_descr_cell_w : &decmode_rs_cell_w;
+            float new_cw = *cw * expf(pinch);
             if (new_cw < 12.0f)  new_cw = 12.0f;
             if (new_cw > 100.0f) new_cw = 100.0f;
-            decmode_descr_cell_w = new_cw;
+            *cw = new_cw;
         }
         if (in_panel_for_input && !stage_eats_panel_input
             && (pinch != 0.0f
@@ -3776,6 +3804,29 @@ int main(int argc, char **argv)
                                 decmode_descr_n = i + 1;
                             }
                         }
+                        // Stage 9: Reed-Solomon. Mirror ax100.c's
+                        // pycsp path — left-zero-pad to RS_N, run
+                        // rs_decode in place, keep both the
+                        // pre-correction codeword and the
+                        // post-correction codeword so the K panel
+                        // can show which positions RS moved.
+                        decmode_rs_errors = -2;
+                        decmode_rs_pad_len = 0;
+                        if (decmode_descr_n > (size_t) RS_NROOTS) {
+                            size_t use_n = (decmode_descr_n > (size_t) RS_N)
+                                ? (size_t) RS_N : decmode_descr_n;
+                            size_t pad = (size_t) RS_N - use_n;
+                            memset(decmode_rs_in, 0, pad);
+                            memcpy(decmode_rs_in + pad,
+                                   decmode_descr_descrambled,
+                                   use_n);
+                            memcpy(decmode_rs_out, decmode_rs_in,
+                                   RS_N);
+                            decmode_rs_pad_len = pad;
+                            int rc_rs = rs_decode(decmode_rs_out,
+                                                  decmode_rs_locs);
+                            decmode_rs_errors = rc_rs;
+                        }
                     }
                 }
             }
@@ -5065,12 +5116,204 @@ int main(int argc, char **argv)
                     }
                 }
 
+                // ------ Stage 9: Reed-Solomon (255,223) ------
+                else if (decmode_stage == 9) {
+                    // Two rows of byte cells across the 255-byte
+                    // codeword: the input (pre-correction) and the
+                    // output (post-correction). Cells whose value
+                    // changed are tinted yellow on the output row so
+                    // the operator can spot every correction at a
+                    // glance. A red vertical separator marks the
+                    // data/parity boundary at byte 223. Scroll +
+                    // pinch reuse the descrambler-stage state so
+                    // the operator's view position carries across.
+                    int margin_x = 24;
+                    int avail_w  = body_w - 2 * margin_x;
+                    int cell_h   = 26;
+                    int gap_y    = 4;
+                    int cell_w   = (int) decmode_rs_cell_w;
+                    if (cell_w < 12) cell_w = 12;
+                    int max_cells = (avail_w > 0)
+                        ? (avail_w / cell_w) : 0;
+                    if (max_cells > RS_N) max_cells = RS_N;
+                    int off_v = decmode_rs_view_off;
+                    int max_off_v = RS_N - max_cells;
+                    if (max_off_v < 0) max_off_v = 0;
+                    if (off_v > max_off_v) {
+                        off_v = max_off_v;
+                        decmode_rs_view_off = off_v;
+                    }
+                    if (off_v < 0) {
+                        off_v = 0;
+                        decmode_rs_view_off = 0;
+                    }
+                    int n_show = RS_N - off_v;
+                    if (n_show > max_cells) n_show = max_cells;
+                    if (n_show < 0) n_show = 0;
+
+                    int row_x0 = body_x0 + margin_x;
+                    int row1_y = body_y0 + 40;
+                    int row2_y = row1_y + cell_h + gap_y;
+                    int ascii_y = row2_y + cell_h + gap_y + 4;
+
+                    draw_text("input",
+                              body_x0 + margin_x - 4 - 50,
+                              row1_y + (cell_h - AMP_PT)/2,
+                              AMP_PT, (Color){200, 200, 220, 220});
+                    draw_text("corrected",
+                              body_x0 + margin_x - 4 - 80,
+                              row2_y + (cell_h - AMP_PT)/2,
+                              AMP_PT, (Color){200, 220, 200, 220});
+
+                    if (decmode_rs_errors == -2) {
+                        draw_text(
+                            "no descrambled payload — need at least 33 "
+                            "bytes (RS parity + 1) before RS can run",
+                            body_x0 + margin_x, body_y0 + 80,
+                            AMP_PT, LIGHTGRAY);
+                    } else {
+                        Color edge       = {30, 30, 40, 255};
+                        Color row1_bg    = {60, 60, 70, 255};
+                        Color row2_bg    = {55, 80, 70, 255};
+                        Color corrected_bg = {200, 170, 60, 255};
+                        Color row1_tx    = {220, 220, 230, 255};
+                        Color row2_tx    = {220, 240, 200, 255};
+                        Color corr_tx    = {30, 25, 10, 255};
+
+                        // Quick lookup for corrected positions.
+                        int corr_lo[RS_N] = {0};
+                        if (decmode_rs_errors > 0) {
+                            for (int j = 0; j < decmode_rs_errors
+                                            && j < RS_NROOTS; ++j) {
+                                int p = decmode_rs_locs[j];
+                                if (p >= 0 && p < RS_N) corr_lo[p] = 1;
+                            }
+                        }
+
+                        for (int i = 0; i < n_show; ++i) {
+                            int src = off_v + i;
+                            int x = row_x0 + i * cell_w;
+                            DrawRectangle(x, row1_y,
+                                          cell_w - 2, cell_h, row1_bg);
+                            DrawRectangleLines(x, row1_y,
+                                          cell_w - 2, cell_h, edge);
+                            Color bg2 = corr_lo[src]
+                                ? corrected_bg : row2_bg;
+                            DrawRectangle(x, row2_y,
+                                          cell_w - 2, cell_h, bg2);
+                            DrawRectangleLines(x, row2_y,
+                                          cell_w - 2, cell_h, edge);
+
+                            int tp = AMP_PT - 2;
+                            char b[4];
+                            snprintf(b, sizeof b, "%02X",
+                                     decmode_rs_in[src]);
+                            int bw = measure_text(b, tp);
+                            draw_text(b, x + (cell_w - 2 - bw)/2,
+                                      row1_y + (cell_h - tp)/2,
+                                      tp, row1_tx);
+                            snprintf(b, sizeof b, "%02X",
+                                     decmode_rs_out[src]);
+                            bw = measure_text(b, tp);
+                            Color tx2 = corr_lo[src]
+                                ? corr_tx : row2_tx;
+                            draw_text(b, x + (cell_w - 2 - bw)/2,
+                                      row2_y + (cell_h - tp)/2,
+                                      tp, tx2);
+                        }
+
+                        // Byte-index ribbon above row 1.
+                        for (int i = 0; i < n_show; ++i) {
+                            int src = off_v + i;
+                            int x = row_x0 + i * cell_w;
+                            if ((src & 3) == 0) {
+                                DrawLine(x + (cell_w - 2)/2,
+                                         row1_y - 6,
+                                         x + (cell_w - 2)/2,
+                                         row1_y - 2,
+                                         (Color){120, 130, 150, 220});
+                            }
+                            if ((src & 7) == 0) {
+                                char nb[16];
+                                snprintf(nb, sizeof nb, "%d", src);
+                                int nw = measure_text(nb, AMP_PT - 4);
+                                draw_text(nb,
+                                          x + (cell_w - 2 - nw)/2,
+                                          row1_y - AMP_PT - 2,
+                                          AMP_PT - 4,
+                                          (Color){170, 180, 210, 220});
+                            }
+                        }
+
+                        // Data / parity boundary at byte 223 (= start
+                        // of the 32-byte RS parity tail).
+                        const int parity_start = RS_K;
+                        if (parity_start >= off_v
+                            && parity_start < off_v + n_show) {
+                            int x_sep = row_x0
+                                + (parity_start - off_v) * cell_w - 1;
+                            DrawLine(x_sep, row1_y - 14,
+                                     x_sep, row2_y + cell_h + 2,
+                                     (Color){220, 120, 80, 255});
+                            draw_text("parity →",
+                                      x_sep + 6, row1_y - 14,
+                                      AMP_PT - 4,
+                                      (Color){220, 150, 100, 230});
+                        }
+
+                        // ASCII strip from the corrected codeword.
+                        char ascii_buf[RS_N + 1] = {0};
+                        for (int i = 0; i < n_show; ++i) {
+                            uint8_t c = decmode_rs_out[off_v + i];
+                            ascii_buf[i] =
+                                (c >= 0x20 && c < 0x7F) ? (char) c : '.';
+                        }
+                        ascii_buf[n_show] = '\0';
+                        draw_text("ASCII:",
+                                  body_x0 + margin_x - 4 - 56,
+                                  ascii_y + 2,
+                                  AMP_PT - 2,
+                                  (Color){170, 200, 200, 220});
+                        draw_text(ascii_buf,
+                                  row_x0, ascii_y,
+                                  AMP_PT,
+                                  (Color){180, 220, 220, 230});
+
+                        // Footer: status + correction count.
+                        char status_buf[224];
+                        int last = off_v + n_show;
+                        if (decmode_rs_errors >= 0) {
+                            snprintf(status_buf, sizeof status_buf,
+                                "showing codeword bytes [%d, %d) of 255  "
+                                "—  %d correction%s applied "
+                                "(pad %u, data 0..222, parity 223..254)",
+                                off_v, last,
+                                decmode_rs_errors,
+                                decmode_rs_errors == 1 ? "" : "s",
+                                (unsigned) decmode_rs_pad_len);
+                        } else {
+                            snprintf(status_buf, sizeof status_buf,
+                                "showing codeword bytes [%d, %d) of 255  "
+                                "—  RS uncorrectable (>16 byte errors)",
+                                off_v, last);
+                        }
+                        draw_text(status_buf,
+                                  row_x0,
+                                  ascii_y + AMP_PT + 12,
+                                  AMP_PT - 2,
+                                  decmode_rs_errors >= 0
+                                      ? (Color){180, 180, 200, 220}
+                                      : (Color){240, 110, 110, 255});
+                    }
+                }
+
                 DrawRectangleLines(body_x0, body_y0,
                                    body_w, body_h, DARKGRAY);
 
                 // Time-axis ticks — same renderer the W panel uses,
                 // shared by the time-domain stages (0-6).
-                if (decmode_stage != 7 && decmode_stage != 8) {
+                if (decmode_stage != 7 && decmode_stage != 8
+                    && decmode_stage != 9) {
                     double raw_step = span_s / 6.0;
                     double mag = pow(10.0, floor(log10(raw_step)));
                     double mul = raw_step / mag;
@@ -5156,7 +5399,7 @@ int main(int argc, char **argv)
             // stage 4 (eye, symbol-relative) and stage 7 (Golay, no
             // time axis).
             if (decmode_stage != 4 && decmode_stage != 7
-                && decmode_stage != 8
+                && decmode_stage != 8 && decmode_stage != 9
                 && wf_t_hi > wf_t_lo
                 && plot_w > 16 && plot_h > 16) {
                 double span = wf_t_hi - wf_t_lo;
