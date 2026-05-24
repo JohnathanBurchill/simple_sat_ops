@@ -1461,6 +1461,35 @@ static int safe_init_window(int w, int h, const char *title)
     return ok ? 0 : -1;
 }
 
+// Hardware GL failed. If we haven't already tried software rendering,
+// set LIBGL_ALWAYS_SOFTWARE=1 (mesa will switch to the llvmpipe
+// software pipeline, which DOES advertise the GLX_ARB_create_context_
+// profile that raylib's 3.3 core context request needs) and re-exec
+// ourselves with the same argv. A guard env var stops a re-exec loop
+// if the software path also fails. Returns 1 if exec was attempted
+// (caller should not reach here), 0 if we've already tried.
+static int retry_with_software_renderer(char **argv, const char *prog)
+{
+    if (getenv("SSO_FORCE_SW_RENDER") != NULL) return 0;
+    fprintf(stderr,
+        "%s: hardware OpenGL unavailable; retrying with the mesa\n"
+        "software renderer (LIBGL_ALWAYS_SOFTWARE=1)...\n", prog);
+    setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+    setenv("SSO_FORCE_SW_RENDER", "1", 1);
+    // Prefer the kernel-canonical path so a relative argv[0]
+    // doesn't depend on $PATH/cwd after exec.
+    char self_path[4096];
+    ssize_t n = readlink("/proc/self/exe", self_path, sizeof self_path - 1);
+    if (n > 0) {
+        self_path[n] = '\0';
+        execv(self_path, argv);
+    }
+    execvp(argv[0], argv);
+    // exec returned → failure.
+    fprintf(stderr, "%s: execvp failed: %s\n", prog, strerror(errno));
+    return 1;
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1596,20 +1625,25 @@ int main(int argc, char **argv)
     // ----- raylib window + IQ load + in-process spectrogram -----
     SetTraceLogLevel(LOG_WARNING);
     if (safe_init_window(win_w, win_h, "decode_inspector") != 0) {
-        // No display, or the display can't give us the OpenGL 3.3
-        // core context raylib wants. Common causes: SSH without `-X`
-        // (no DISPLAY); SSH with `-X` but a forwarded X server that
-        // only speaks OpenGL 2.x (the GLX errors above name this);
-        // a truly headless host.
+        // Hardware OpenGL failed (no display, or no 3.3 core
+        // profile). Try the mesa software renderer before giving up
+        // — re-execs ourselves with LIBGL_ALWAYS_SOFTWARE=1 so the
+        // GLFW state starts clean.
+        retry_with_software_renderer(argv, "decode_inspector");
+        // Either we already retried (SSO_FORCE_SW_RENDER set) or
+        // exec failed. Either way print the final hint and exit.
         fprintf(stderr,
-            "decode_inspector: failed to open a window. This tool is a\n"
-            "graphical viewer and needs a display capable of OpenGL 3.3\n"
-            "core profile. Common causes: SSH without `-X` (no DISPLAY)\n"
-            "or SSH with `-X` to an X server that only speaks OpenGL 2.x\n"
-            "(the GLX errors above name this). Run on a host with a\n"
-            "local desktop, or copy the .iq file off the remote and run\n"
-            "decode_inspector there.\n");
+            "decode_inspector: failed to open a window. Needed a display\n"
+            "capable of OpenGL 3.3 core profile (hardware or llvmpipe\n"
+            "software). Common causes: no DISPLAY (SSH without `-X`);\n"
+            "DISPLAY set but no working X server; mesa drivers missing\n"
+            "(`apt install libgl1-mesa-dri` on Debian/Ubuntu hosts).\n");
         return 1;
+    }
+    if (getenv("SSO_FORCE_SW_RENDER") != NULL) {
+        fprintf(stderr,
+            "decode_inspector: running on the software renderer "
+            "(LIBGL_ALWAYS_SOFTWARE=1). Frame rate will be lower.\n");
     }
     SetTargetFPS(60);
     SetExitKey(0);

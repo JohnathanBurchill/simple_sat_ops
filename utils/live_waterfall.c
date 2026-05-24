@@ -528,6 +528,27 @@ static int safe_init_window(int w, int h, const char *title)
     return ok ? 0 : -1;
 }
 
+// See decode_inspector.c for the rationale — re-exec with
+// LIBGL_ALWAYS_SOFTWARE=1 so mesa falls back to llvmpipe.
+static int retry_with_software_renderer(char **argv, const char *prog)
+{
+    if (getenv("SSO_FORCE_SW_RENDER") != NULL) return 0;
+    fprintf(stderr,
+        "%s: hardware OpenGL unavailable; retrying with the mesa\n"
+        "software renderer (LIBGL_ALWAYS_SOFTWARE=1)...\n", prog);
+    setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+    setenv("SSO_FORCE_SW_RENDER", "1", 1);
+    char self_path[4096];
+    ssize_t n = readlink("/proc/self/exe", self_path, sizeof self_path - 1);
+    if (n > 0) {
+        self_path[n] = '\0';
+        execv(self_path, argv);
+    }
+    execvp(argv[0], argv);
+    fprintf(stderr, "%s: execvp failed: %s\n", prog, strerror(errno));
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) { usage(); return 2; }
@@ -565,17 +586,21 @@ int main(int argc, char **argv)
 
     SetTraceLogLevel(LOG_WARNING);
     if (safe_init_window(64, 64, "live_waterfall") != 0) {
-        // No display, or the display can't give us OpenGL 3.3 core.
-        // Common causes: SSH without `-X`, SSH with `-X` to an X
-        // server that only speaks OpenGL 2.x, headless host.
+        // Hardware GL failed. Try the mesa software renderer before
+        // giving up.
+        retry_with_software_renderer(argv, "live_waterfall");
         fprintf(stderr,
-            "live_waterfall: failed to open a window. This tool is a\n"
-            "graphical viewer and needs a display capable of OpenGL 3.3\n"
-            "core profile. Common causes: SSH without `-X` (no DISPLAY)\n"
-            "or SSH with `-X` to an X server that only speaks OpenGL 2.x\n"
-            "(the GLX errors above name this). Run on a host with a\n"
-            "local desktop.\n");
+            "live_waterfall: failed to open a window. Needed a display\n"
+            "capable of OpenGL 3.3 core profile (hardware or llvmpipe\n"
+            "software). Common causes: no DISPLAY (SSH without `-X`);\n"
+            "DISPLAY set but no working X server; mesa drivers missing\n"
+            "(`apt install libgl1-mesa-dri` on Debian/Ubuntu hosts).\n");
         return 1;
+    }
+    if (getenv("SSO_FORCE_SW_RENDER") != NULL) {
+        fprintf(stderr,
+            "live_waterfall: running on the software renderer "
+            "(LIBGL_ALWAYS_SOFTWARE=1). Frame rate will be lower.\n");
     }
     int monitor = GetCurrentMonitor();
     int mon_w = GetMonitorWidth(monitor);
