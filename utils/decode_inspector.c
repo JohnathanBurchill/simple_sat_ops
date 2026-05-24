@@ -1,6 +1,6 @@
 /*
 
-    Simple Satellite Operations  utils/iq_annotator.c
+    Simple Satellite Operations  utils/decode_inspector.c
 
     Interactive raylib viewer that lets the operator mouse-draw
     time × frequency boxes around bursts in an .iq capture, then save
@@ -48,11 +48,11 @@
 
 #ifdef __APPLE__
 // Trackpad pinch is delivered as NSEventTypeMagnify, which raylib/GLFW
-// don't forward. utils/iq_annotator_macos.m installs an NSEvent local
+// don't forward. utils/decode_inspector_macos.m installs an NSEvent local
 // monitor that accumulates magnification deltas into this global; we
 // read & reset it each frame.
-extern float g_iq_annotator_pinch_delta;
-extern void  iq_annotator_install_pinch_monitor(void);
+extern float g_decode_inspector_pinch_delta;
+extern void  decode_inspector_install_pinch_monitor(void);
 #endif
 
 #include <ctype.h>
@@ -197,7 +197,7 @@ static int boxes_save(const box_list_t *bl, const char *iq_path)
     snprintf(path, sizeof path, "%.1000s.boxes.csv", iq_path);
     FILE *f = fopen(path, "w");
     if (f == NULL) {
-        fprintf(stderr, "iq_annotator: save failed: %s: %s\n",
+        fprintf(stderr, "decode_inspector: save failed: %s: %s\n",
                 path, strerror(errno));
         return -1;
     }
@@ -213,7 +213,7 @@ static int boxes_save(const box_list_t *bl, const char *iq_path)
     snprintf(anc_path, sizeof anc_path, "%.1000s.box_anchors.csv", iq_path);
     f = fopen(anc_path, "w");
     if (f == NULL) {
-        fprintf(stderr, "iq_annotator: save failed: %s: %s\n",
+        fprintf(stderr, "decode_inspector: save failed: %s: %s\n",
                 anc_path, strerror(errno));
         return -1;
     }
@@ -232,7 +232,7 @@ static int boxes_save(const box_list_t *bl, const char *iq_path)
     }
     fclose(f);
     fprintf(stderr,
-        "iq_annotator: saved %d box(es) to %s\n             anchors  to %s\n",
+        "decode_inspector: saved %d box(es) to %s\n             anchors  to %s\n",
         bl->n, path, anc_path);
     return 0;
 }
@@ -243,7 +243,7 @@ static int boxes_load(box_list_t *bl, const char *iq_path)
     snprintf(path, sizeof path, "%.1000s.boxes.csv", iq_path);
     FILE *f = fopen(path, "r");
     if (f == NULL) {
-        fprintf(stderr, "iq_annotator: load: %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "decode_inspector: load: %s: %s\n", path, strerror(errno));
         return -1;
     }
     bl->n = 0;
@@ -267,13 +267,13 @@ static int boxes_load(box_list_t *bl, const char *iq_path)
     if (bl->n > 1) {
         qsort(bl->items, (size_t) bl->n, sizeof bl->items[0], box_cmp_t0);
     }
-    fprintf(stderr, "iq_annotator: loaded %d box(es) from %s\n",
+    fprintf(stderr, "decode_inspector: loaded %d box(es) from %s\n",
             bl->n, path);
     return 0;
 }
 
 // ---------------------------------------------------------------------------
-// Operator-flag passthru — same names gen_waterfall accepts; iq_annotator
+// Operator-flag passthru — same names gen_waterfall accepts; decode_inspector
 // now consumes them directly into a wf_opts_t and runs the spectrogram
 // in-process via waterfall_core.
 // ---------------------------------------------------------------------------
@@ -382,7 +382,7 @@ static int parse_wf_opts_from_passthru(const char **passthru, int n_passthru,
                 }
             }
         }
-        // --elapsed-time is iq_annotator's render_opts concern, not wf_opts_t's.
+        // --elapsed-time is decode_inspector's render_opts concern, not wf_opts_t's.
     }
     // Resolve out_rows from the duration + time-bin hint. Clamp to a
     // sane range so a 14-second capture with time-bin=0.5 doesn't end
@@ -511,13 +511,13 @@ static int load_ttf_from_known_paths(void)
                 SetTextureFilter(g_ui_font.texture,
                                  TEXTURE_FILTER_BILINEAR);
                 fprintf(stderr,
-                    "iq_annotator: loaded font %s\n", candidates[i]);
+                    "decode_inspector: loaded font %s\n", candidates[i]);
                 return 1;
             }
         }
     }
     fprintf(stderr,
-        "iq_annotator: TTF font not found; using raylib default\n");
+        "decode_inspector: TTF font not found; using raylib default\n");
     return 0;
 }
 
@@ -620,7 +620,7 @@ static int iq_buf_load_progress(iq_buf_t *b, const char *path, int samp_rate,
 {
     FILE *fp = fopen(path, "rb");
     if (fp == NULL) {
-        fprintf(stderr, "iq_annotator: open %s: %s\n",
+        fprintf(stderr, "decode_inspector: open %s: %s\n",
                 path, strerror(errno));
         return -1;
     }
@@ -1038,7 +1038,7 @@ static int pdf_write_waveform(const char *path,
     const float page_h = 468.0f;
     pdfw_t *w = pdfw_begin(path, page_w, page_h);
     if (w == NULL) {
-        fprintf(stderr, "iq_annotator: pdf open %s: %s\n",
+        fprintf(stderr, "decode_inspector: pdf open %s: %s\n",
                 path, strerror(errno));
         return -1;
     }
@@ -1053,7 +1053,7 @@ static int pdf_write_waveform(const char *path,
     pdfw_rect_stroke(w, MARGIN, MARGIN, page_w - 2*MARGIN, HEADER_H);
     pdfw_set_fill(w, PDFW_BLACK);
     pdfw_text(w, MARGIN + 8, MARGIN + 6,
-              "iq_annotator -- waveform export", 14.0f, 0);
+              "decode_inspector -- waveform export", 14.0f, 0);
     pdfw_text(w, MARGIN + 8, MARGIN + 26,
               iq_path ? iq_path : "", 9.0f, 1);
 
@@ -1304,7 +1304,7 @@ static int pdf_write_waveform(const char *path,
     struct tm utc;
     gmtime_r(&now, &utc);
     snprintf(foot, sizeof foot,
-        "generated %04d-%02d-%02dT%02d:%02d:%02dZ  by iq_annotator",
+        "generated %04d-%02d-%02dT%02d:%02d:%02dZ  by decode_inspector",
         utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
         utc.tm_hour, utc.tm_min, utc.tm_sec);
     pdfw_set_fill(w, PDFW_GREY);
@@ -1403,7 +1403,7 @@ static int decmode_recompute_window(const iq_buf_t *iqb,
 static void usage(void)
 {
     fprintf(stderr,
-        "usage: iq_annotator <iq_path> [options]\n"
+        "usage: decode_inspector <iq_path> [options]\n"
         "  All gen_waterfall options are accepted and forwarded\n"
         "  (--fft-time-bin-s, --zoom-khz, --detrend, --detrend-tau-s, --center-hz,\n"
         "   --dc-notch, --dc-notch-bins, --db-min, --db-max,\n"
@@ -1466,13 +1466,13 @@ int main(int argc, char **argv)
         } else if (is_passthru(a)) {
             if (n_passthru >= MAX_PASSTHRU) {
                 fprintf(stderr,
-                    "iq_annotator: too many gen_waterfall flags (>%d)\n",
+                    "decode_inspector: too many gen_waterfall flags (>%d)\n",
                     MAX_PASSTHRU);
                 return 2;
             }
             passthru[n_passthru++] = a;
         } else {
-            fprintf(stderr, "iq_annotator: unknown option '%s'\n", a);
+            fprintf(stderr, "decode_inspector: unknown option '%s'\n", a);
             usage();
             return 2;
         }
@@ -1489,12 +1489,12 @@ int main(int argc, char **argv)
         }
         if (samp_rate <= 0) samp_rate = 96000;
     }
-    fprintf(stderr, "iq_annotator: rate=%d Hz\n", samp_rate);
+    fprintf(stderr, "decode_inspector: rate=%d Hz\n", samp_rate);
 
     // Compute duration from file size.
     struct stat st;
     if (stat(iq_path, &st) != 0) {
-        fprintf(stderr, "iq_annotator: stat %s: %s\n",
+        fprintf(stderr, "decode_inspector: stat %s: %s\n",
                 iq_path, strerror(errno));
         return 1;
     }
@@ -1503,7 +1503,7 @@ int main(int argc, char **argv)
     {
         char pb[32];
         fmt_thousands(pb, sizeof pb, (uint64_t) n_pairs);
-        fprintf(stderr, "iq_annotator: duration=%.3fs (%s pairs)\n",
+        fprintf(stderr, "decode_inspector: duration=%.3fs (%s pairs)\n",
                 duration_s, pb);
     }
 
@@ -1555,11 +1555,11 @@ int main(int argc, char **argv)
 
     // ----- raylib window + IQ load + in-process spectrogram -----
     SetTraceLogLevel(LOG_WARNING);
-    InitWindow(win_w, win_h, "iq_annotator");
+    InitWindow(win_w, win_h, "decode_inspector");
     SetTargetFPS(60);
     SetExitKey(0);
 #ifdef __APPLE__
-    iq_annotator_install_pinch_monitor();
+    decode_inspector_install_pinch_monitor();
 #endif
     g_ui_font_loaded = load_ttf_from_known_paths();
 
@@ -1569,7 +1569,7 @@ int main(int argc, char **argv)
     // responsive (and showing progress) for the few seconds a long-pass
     // FFT can take.
     fprintf(stderr,
-        "iq_annotator: computing spectrogram (fft=%d, rows=%d, "
+        "decode_inspector: computing spectrogram (fft=%d, rows=%d, "
         "zoom=%.1f kHz, detrend=%d)...\n",
         wf_opt.fft_size, wf_opt.out_rows,
         wf_opt.zoom_hz / 1e3, wf_opt.detrend_mode);
@@ -1584,7 +1584,7 @@ int main(int argc, char **argv)
     pthread_t loader_thread;
     if (pthread_create(&loader_thread, NULL,
                        loader_thread_fn, &lctx) != 0) {
-        fprintf(stderr, "iq_annotator: pthread_create: %s\n",
+        fprintf(stderr, "decode_inspector: pthread_create: %s\n",
                 strerror(errno));
         pthread_mutex_destroy(&lctx.lock);
         CloseWindow(); return 1;
@@ -1674,7 +1674,7 @@ int main(int argc, char **argv)
         pthread_mutex_destroy(&lctx.lock);
         if (lctx.error || quit_pressed) {
             if (lctx.error) {
-                fprintf(stderr, "iq_annotator: %s\n", lctx.status_msg);
+                fprintf(stderr, "decode_inspector: %s\n", lctx.status_msg);
             }
             if (lctx.spec_db) free(lctx.spec_db);
             iq_buf_free(&lctx.iqb);
@@ -1691,18 +1691,18 @@ int main(int argc, char **argv)
         char pb[32];
         fmt_thousands(pb, sizeof pb, (uint64_t) iqb.n_pairs);
         fprintf(stderr,
-            "iq_annotator: IQ buffer loaded (%s pairs)\n", pb);
+            "decode_inspector: IQ buffer loaded (%s pairs)\n", pb);
     }
     if (spec_w < 16 || spec_h < 16) {
         fprintf(stderr,
-            "iq_annotator: spectrogram too small (%dx%d)\n",
+            "decode_inspector: spectrogram too small (%dx%d)\n",
             spec_w, spec_h);
         free(spec_db); iq_buf_free(&iqb); CloseWindow(); return 1;
     }
     // wf_compute returns row 0 = earliest sample. gen_waterfall's
     // render_with_axes then flips that so its PNG reads "newest at
     // top of spec, earliest at bottom" — the convention every other
-    // bit of iq_annotator already assumes (box→pixel math and the
+    // bit of decode_inspector already assumes (box→pixel math and the
     // waveform-panel time mapping both use 1 - t/duration). Flip the
     // float grid here, once, so the GPU texture is in the same
     // orientation gen_waterfall's PNG was.
@@ -1747,7 +1747,7 @@ int main(int argc, char **argv)
     Texture2D *tiles = (Texture2D *) calloc((size_t) n_tiles,
                                             sizeof(Texture2D));
     if (tiles == NULL) {
-        fprintf(stderr, "iq_annotator: oom on tile array\n");
+        fprintf(stderr, "decode_inspector: oom on tile array\n");
         free(spec_db); iq_buf_free(&iqb); CloseWindow(); return 1;
     }
     for (int t = 0; t < n_tiles; ++t) {
@@ -1763,14 +1763,14 @@ int main(int argc, char **argv)
         tiles[t] = LoadTextureFromImage(im);
         if (tiles[t].id == 0) {
             fprintf(stderr,
-                "iq_annotator: tile %d upload failed (%dx%d)\n",
+                "decode_inspector: tile %d upload failed (%dx%d)\n",
                 t, spec_w, h);
         } else {
             SetTextureFilter(tiles[t], TEXTURE_FILTER_POINT);
         }
     }
     fprintf(stderr,
-        "iq_annotator: spec %dx%d, %d tile(s) of up to %d rows, "
+        "decode_inspector: spec %dx%d, %d tile(s) of up to %d rows, "
         "BW %.1f kHz, floor=%.1f dBFS\n",
         spec_w, spec_h, n_tiles, TILE_H, display_bw_hz / 1e3,
         wf_opt.display_db_floor + wf_opt.power_offset_db);
@@ -1996,8 +1996,8 @@ int main(int argc, char **argv)
         // to whichever panel the cursor is over.
         float pinch = 0.0f;
 #ifdef __APPLE__
-        pinch = g_iq_annotator_pinch_delta;
-        g_iq_annotator_pinch_delta = 0.0f;
+        pinch = g_decode_inspector_pinch_delta;
+        g_decode_inspector_pinch_delta = 0.0f;
 #endif
         Vector2 wheel_v = GetMouseWheelMoveV();
         // Bottom slot: wf and decmode are mutually exclusive; whichever
@@ -2270,7 +2270,7 @@ int main(int argc, char **argv)
                     snprintf(status, sizeof status,
                         "wrote /tmp/%s", short_base);
                     fprintf(stderr,
-                        "iq_annotator: filtered IQ -> %s\n", fn);
+                        "decode_inspector: filtered IQ -> %s\n", fn);
                 } else {
                     snprintf(status, sizeof status,
                         "filter write failed: %s", strerror(errno));

@@ -49,7 +49,7 @@ typedef struct wf_opts {
 } wf_opts_t;
 
 // 256-entry viridis colormap (R,G,B in 0..255). Used by gen_waterfall to
-// bake pixels into a PNG and by iq_annotator to build a GPU lookup
+// bake pixels into a PNG and by decode_inspector to build a GPU lookup
 // texture for live recolouring.
 extern const uint8_t WF_VIRIDIS[256][3];
 
@@ -70,13 +70,13 @@ int wf_compute(const int16_t *iq, size_t n_pairs,
                float **out_db, int *out_w, int *out_h);
 
 // Recompute auto-detected dB range (5th and 99th percentiles) from a
-// previously-computed grid. Used by iq_annotator when the operator
+// previously-computed grid. Used by decode_inspector when the operator
 // presses "R" to reset — no need to redo the FFT.
 void wf_auto_db_range(const float *db, int w, int h,
                       float *out_lo, float *out_hi);
 
 // Axis tick / label helpers, shared by gen_waterfall (which bakes them
-// into a PNG) and iq_annotator (which draws them live via raylib).
+// into a PNG) and decode_inspector (which draws them live via raylib).
 double wf_pick_tick_step(double range, int target_ticks);
 double wf_pick_time_step(double range_s, int target_ticks);
 int    wf_fmt_freq(double hz, char *out, size_t out_cap);

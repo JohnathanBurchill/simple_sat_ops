@@ -1954,7 +1954,7 @@ int main(int argc, char **argv)
                     out_png, strerror(errno));
             return 1;
         }
-        // Sidecar metadata so downstream readers (iq_annotator) can
+        // Sidecar metadata so downstream readers (decode_inspector) can
         // map PNG pixel columns to absolute frequency without having
         // to replicate gen_waterfall's bin-rounding rules. The PNG's
         // displayed bandwidth is opt.display_bw_hz (set inside

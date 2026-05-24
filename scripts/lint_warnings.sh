@@ -87,7 +87,7 @@ cd "$BUILD_DIR"
 
 # Run the build, tee the full output to build.log; show ONLY diagnostic
 # lines from project .c/.h files. gcc-15 can't parse Objective-C, so
-# compiling iq_annotator_macos.m emits hundreds of irrelevant errors
+# compiling decode_inspector_macos.m emits hundreds of irrelevant errors
 # from the AppKit / Foundation headers — we drop those entirely.
 make -j4 2>&1 | tee build.log | \
     grep -E "warning:|error:" | \

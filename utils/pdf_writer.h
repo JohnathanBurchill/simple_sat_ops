@@ -7,7 +7,7 @@
    ASCII-only text.  Coordinates are pixel-style (Y down, origin
    top-left); the writer flips internally to PDF page space.
 
-   Originally inlined in utils/iq_annotator.c; pulled out so the
+   Originally inlined in utils/decode_inspector.c; pulled out so the
    bench tools (b210_gain_sweep, …) can share the same code path
    and produce visually consistent reports.
 

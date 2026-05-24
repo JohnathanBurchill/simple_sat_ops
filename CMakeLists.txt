@@ -174,7 +174,7 @@ list(APPEND SSO_TARGETS beacon_detect)
 
 # Shared FFT / dB / detrend / notch / zoom pipeline. Used by both the
 # CLI waterfall renderer (gen_waterfall) and the interactive annotator
-# (iq_annotator, which uses it to compute the spectrogram in-process
+# (decode_inspector, which uses it to compute the spectrogram in-process
 # and re-colour on the GPU rather than regenerating a PNG every time
 # the operator nudges the dB range).
 add_library(waterfall_core STATIC utils/waterfall_core.c)
@@ -213,23 +213,23 @@ if (RAYLIB_FOUND)
     endif()
     list(APPEND SSO_TARGETS live_waterfall)
 
-    # iq_annotator — raylib-backed interactive viewer for offline .iq
+    # decode_inspector — raylib-backed interactive viewer for offline .iq
     # captures. Lets the operator mouse-draw time × freq boxes around
     # bursts they want to feed back into rx_replay --anchor-csv.
-    set(IQ_ANNOTATOR_SRCS utils/iq_annotator.c utils/pdf_writer.c
+    set(DECODE_INSPECTOR_SRCS utils/decode_inspector.c utils/pdf_writer.c
                           src/dsp/modem.c src/dsp/modem_fsk.c)
     if (APPLE)
         # raylib/GLFW drop NSEventTypeMagnify (trackpad pinch); this
         # ObjC shim installs a global NSEvent monitor and accumulates
         # magnification into a global the C side reads each frame.
-        list(APPEND IQ_ANNOTATOR_SRCS utils/iq_annotator_macos.m)
+        list(APPEND DECODE_INSPECTOR_SRCS utils/decode_inspector_macos.m)
     endif()
-    add_executable(iq_annotator ${IQ_ANNOTATOR_SRCS})
-    target_include_directories(iq_annotator PRIVATE ${RAYLIB_INCLUDE_DIRS})
-    target_link_directories(iq_annotator PRIVATE ${RAYLIB_LIBRARY_DIRS})
-    target_link_libraries(iq_annotator PRIVATE ${RAYLIB_LIBRARIES} waterfall_core m)
+    add_executable(decode_inspector ${DECODE_INSPECTOR_SRCS})
+    target_include_directories(decode_inspector PRIVATE ${RAYLIB_INCLUDE_DIRS})
+    target_link_directories(decode_inspector PRIVATE ${RAYLIB_LIBRARY_DIRS})
+    target_link_libraries(decode_inspector PRIVATE ${RAYLIB_LIBRARIES} waterfall_core m)
     if (APPLE)
-        target_link_libraries(iq_annotator PRIVATE
+        target_link_libraries(decode_inspector PRIVATE
             "-framework Cocoa"
             "-framework AppKit"
             "-framework OpenGL"
@@ -237,9 +237,9 @@ if (RAYLIB_FOUND)
             "-framework CoreVideo"
             "-framework Foundation")
     endif()
-    list(APPEND SSO_TARGETS iq_annotator)
+    list(APPEND SSO_TARGETS decode_inspector)
 else()
-    message(STATUS "raylib not found via pkg-config; live_waterfall + iq_annotator skipped.")
+    message(STATUS "raylib not found via pkg-config; live_waterfall + decode_inspector skipped.")
 endif()
 
 # Selftest for the IQ-domain demods (modem_iq.c, modem_viterbi.c).

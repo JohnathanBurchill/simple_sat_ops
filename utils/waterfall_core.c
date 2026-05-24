@@ -1,7 +1,7 @@
 // utils/waterfall_core.c — shared FFT / dB / detrend / notch / zoom
 // pipeline, viridis colormap, and axis-tick helpers.
 //
-// Pulled out of utils/gen_waterfall.c so iq_annotator can compute the
+// Pulled out of utils/gen_waterfall.c so decode_inspector can compute the
 // spectrogram in-process (no subprocess, no /tmp PNG) and re-colour it
 // on the GPU. gen_waterfall keeps doing its bitmap-axes + PNG/PDF
 // rendering on top of wf_compute's float output.
@@ -436,7 +436,7 @@ int wf_compute(const int16_t *iq, size_t n_pairs,
 
 // --------------------------------------------------------------------
 // Axis helpers (shared between gen_waterfall's PNG axes and
-// iq_annotator's live raylib axes).
+// decode_inspector's live raylib axes).
 // --------------------------------------------------------------------
 
 double wf_pick_tick_step(double range, int target_ticks)
