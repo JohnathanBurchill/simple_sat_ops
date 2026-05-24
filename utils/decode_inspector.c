@@ -596,6 +596,94 @@ static int measure_text(const char *s, int size)
     return MeasureText(s, size);
 }
 
+// Map a byte value to a short display string for the ASCII tooltip
+// on the byte-grid stages (descrambler / RS / CSP). Printable bytes
+// come back as "'X'"; the 32 C0 control codes plus DEL come back as
+// their three-letter mnemonics; the high half (0x80..0xFF) is left
+// to the caller as "(0xNN)" since these byte values aren't strictly
+// ASCII at all.
+static void ascii_byte_label(uint8_t c, char *out, size_t out_cap)
+{
+    static const char *CTRL[32] = {
+        "NUL", "SOH", "STX", "ETX", "EOT", "ENQ", "ACK", "BEL",
+        "BS",  "HT",  "LF",  "VT",  "FF",  "CR",  "SO",  "SI",
+        "DLE", "DC1", "DC2", "DC3", "DC4", "NAK", "SYN", "ETB",
+        "CAN", "EM",  "SUB", "ESC", "FS",  "GS",  "RS",  "US",
+    };
+    if (c == 0x20) {
+        snprintf(out, out_cap, "SP");
+    } else if (c >= 0x21 && c < 0x7F) {
+        snprintf(out, out_cap, "'%c'", (char) c);
+    } else if (c < 0x20) {
+        snprintf(out, out_cap, "%s", CTRL[c]);
+    } else if (c == 0x7F) {
+        snprintf(out, out_cap, "DEL");
+    } else {
+        snprintf(out, out_cap, "(0x%02X)", (unsigned) c);
+    }
+}
+
+// Format a byte as a "0100 1000" string for the bit-sequence line of
+// the tooltip. MSB on the left, low-nibble half separated by a
+// single space so the operator can quickly count nibbles.
+static void byte_to_bit_string(uint8_t c, char *out, size_t out_cap)
+{
+    if (out_cap < 10) { if (out_cap > 0) out[0] = '\0'; return; }
+    for (int i = 0; i < 4; ++i) out[i]     = (c & (0x80u >> i)) ? '1' : '0';
+    out[4] = ' ';
+    for (int i = 0; i < 4; ++i) out[5 + i] = (c & (0x08u >> i)) ? '1' : '0';
+    out[9] = '\0';
+}
+
+// Tooltip for a byte hovered in one of the byte-grid stages. Drawn
+// as a small dark box near the cursor, with the byte's ASCII /
+// integer / bit-sequence representations stacked. Position is
+// clipped to [clip_x0, clip_x1] x [clip_y0, clip_y1] so the box
+// doesn't fall off the panel.
+static void draw_byte_tooltip(int mouse_x, int mouse_y,
+                              uint8_t value, int byte_index,
+                              int clip_x0, int clip_x1,
+                              int clip_y0, int clip_y1,
+                              int text_pt)
+{
+    char ascii_label[16];
+    ascii_byte_label(value, ascii_label, sizeof ascii_label);
+    char bits[16];
+    byte_to_bit_string(value, bits, sizeof bits);
+    char l1[48], l2[48], l3[48], l4[48];
+    snprintf(l1, sizeof l1, "byte  %d", byte_index);
+    snprintf(l2, sizeof l2, "ASCII %s", ascii_label);
+    snprintf(l3, sizeof l3, "int   %u  (0x%02X)",
+             (unsigned) value, (unsigned) value);
+    snprintf(l4, sizeof l4, "bits  %s", bits);
+    int pad = 6;
+    int line_h = text_pt + 4;
+    int w1 = measure_text(l1, text_pt);
+    int w2 = measure_text(l2, text_pt);
+    int w3 = measure_text(l3, text_pt);
+    int w4 = measure_text(l4, text_pt);
+    int w = w1;
+    if (w2 > w) w = w2;
+    if (w3 > w) w = w3;
+    if (w4 > w) w = w4;
+    int box_w = w + 2 * pad;
+    int box_h = 4 * line_h + 2 * pad;
+    int x = mouse_x + 14;
+    int y = mouse_y + 14;
+    if (x + box_w > clip_x1) x = mouse_x - 14 - box_w;
+    if (x < clip_x0) x = clip_x0;
+    if (y + box_h > clip_y1) y = mouse_y - 14 - box_h;
+    if (y < clip_y0) y = clip_y0;
+    DrawRectangle(x, y, box_w, box_h, (Color){10, 10, 18, 230});
+    DrawRectangleLines(x, y, box_w, box_h, (Color){90, 110, 140, 255});
+    Color tx_main = {220, 220, 235, 255};
+    Color tx_dim  = {170, 180, 200, 255};
+    draw_text(l1, x + pad, y + pad + 0 * line_h, text_pt, tx_dim);
+    draw_text(l2, x + pad, y + pad + 1 * line_h, text_pt, tx_main);
+    draw_text(l3, x + pad, y + pad + 2 * line_h, text_pt, tx_main);
+    draw_text(l4, x + pad, y + pad + 3 * line_h, text_pt, tx_main);
+}
+
 // Draw the 2-row ASM bit-comparison strip at `y_top`:
 //   row 0 (expected): 16 preamble cells (gray) + 32 ASM cells (white)
 //   row 1 (actual):   green where bits match expected, red where not
@@ -5427,24 +5515,61 @@ int main(int argc, char **argv)
                                           (Color){170, 180, 210, 220});
                             }
                         }
-                        // ASCII strip — replace non-printable with '.'.
-                        char ascii_buf[DECMODE_DESCR_CAP + 1] = {0};
-                        for (int i = 0; i < n_show; ++i) {
-                            uint8_t c =
-                                decmode_descr_descrambled[off_v + i];
-                            ascii_buf[i] =
-                                (c >= 0x20 && c < 0x7F) ? (char) c : '.';
-                        }
-                        ascii_buf[n_show] = '\0';
+                        // ASCII strip — replace non-printable with
+                        // '.'. Drawn cell-by-cell so each char
+                        // lines up with the byte column above and
+                        // mouse hover can locate the byte for the
+                        // tooltip.
                         draw_text("ASCII:",
                                   body_x0 + margin_x - 4 - 56,
                                   ascii_y + 2,
                                   AMP_PT - 2,
                                   (Color){170, 200, 200, 220});
-                        draw_text(ascii_buf,
-                                  row_x0, ascii_y,
-                                  AMP_PT,
-                                  (Color){180, 220, 220, 230});
+                        int ascii_hover_idx = -1;
+                        Color ascii_tx = {180, 220, 220, 230};
+                        for (int i = 0; i < n_show; ++i) {
+                            int x = row_x0 + i * cell_w;
+                            uint8_t c =
+                                decmode_descr_descrambled[off_v + i];
+                            char ch[2];
+                            ch[0] = (c >= 0x20 && c < 0x7F)
+                                ? (char) c : '.';
+                            ch[1] = '\0';
+                            int cw = measure_text(ch, AMP_PT);
+                            draw_text(ch,
+                                      x + (cell_w - 2 - cw) / 2,
+                                      ascii_y, AMP_PT, ascii_tx);
+                        }
+                        if ((int) m.y >= ascii_y - 2
+                            && (int) m.y <  ascii_y + AMP_PT + 4
+                            && (int) m.x >= row_x0
+                            && (int) m.x <  row_x0 + n_show * cell_w) {
+                            ascii_hover_idx =
+                                ((int) m.x - row_x0) / cell_w;
+                            if (ascii_hover_idx < 0
+                                || ascii_hover_idx >= n_show)
+                                ascii_hover_idx = -1;
+                        }
+                        if (ascii_hover_idx >= 0) {
+                            int x = row_x0 + ascii_hover_idx * cell_w;
+                            Color outline = {255, 220, 100, 255};
+                            DrawRectangleLines(x - 1, row1_y - 1,
+                                cell_w, cell_h + 2, outline);
+                            DrawRectangleLines(x - 1, row2_y - 1,
+                                cell_w, cell_h + 2, outline);
+                            DrawRectangleLines(x - 1, row3_y - 1,
+                                cell_w, cell_h + 2, outline);
+                            DrawRectangleLines(x - 1, ascii_y - 2,
+                                cell_w, AMP_PT + 4, outline);
+                            int byte_idx = off_v + ascii_hover_idx;
+                            draw_byte_tooltip(
+                                (int) m.x, (int) m.y,
+                                decmode_descr_descrambled[byte_idx],
+                                byte_idx,
+                                body_x0 + 4, body_x1 - 4,
+                                body_y0 + 4, body_y1 - 4,
+                                AMP_PT - 2);
+                        }
 
                         // Footer: show the byte range currently on
                         // screen, plus the Golay-decoded total.
@@ -5618,23 +5743,56 @@ int main(int argc, char **argv)
                                       (Color){220, 150, 100, 230});
                         }
 
-                        // ASCII strip from the corrected codeword.
-                        char ascii_buf[RS_N + 1] = {0};
-                        for (int i = 0; i < n_show; ++i) {
-                            uint8_t c = decmode_rs_out[off_v + i];
-                            ascii_buf[i] =
-                                (c >= 0x20 && c < 0x7F) ? (char) c : '.';
-                        }
-                        ascii_buf[n_show] = '\0';
+                        // ASCII strip — per-cell so each char lines
+                        // up with the byte column above; hover
+                        // brings up the byte-value tooltip + a
+                        // yellow highlight on the column.
                         draw_text("ASCII:",
                                   body_x0 + margin_x - 4 - 56,
                                   ascii_y + 2,
                                   AMP_PT - 2,
                                   (Color){170, 200, 200, 220});
-                        draw_text(ascii_buf,
-                                  row_x0, ascii_y,
-                                  AMP_PT,
-                                  (Color){180, 220, 220, 230});
+                        int ascii_hover_idx = -1;
+                        Color ascii_tx = {180, 220, 220, 230};
+                        for (int i = 0; i < n_show; ++i) {
+                            int x = row_x0 + i * cell_w;
+                            uint8_t c = decmode_rs_out[off_v + i];
+                            char ch[2];
+                            ch[0] = (c >= 0x20 && c < 0x7F)
+                                ? (char) c : '.';
+                            ch[1] = '\0';
+                            int cw = measure_text(ch, AMP_PT);
+                            draw_text(ch,
+                                      x + (cell_w - 2 - cw) / 2,
+                                      ascii_y, AMP_PT, ascii_tx);
+                        }
+                        if ((int) m.y >= ascii_y - 2
+                            && (int) m.y <  ascii_y + AMP_PT + 4
+                            && (int) m.x >= row_x0
+                            && (int) m.x <  row_x0 + n_show * cell_w) {
+                            ascii_hover_idx =
+                                ((int) m.x - row_x0) / cell_w;
+                            if (ascii_hover_idx < 0
+                                || ascii_hover_idx >= n_show)
+                                ascii_hover_idx = -1;
+                        }
+                        if (ascii_hover_idx >= 0) {
+                            int x = row_x0 + ascii_hover_idx * cell_w;
+                            Color outline = {255, 220, 100, 255};
+                            DrawRectangleLines(x - 1, row1_y - 1,
+                                cell_w, cell_h + 2, outline);
+                            DrawRectangleLines(x - 1, row2_y - 1,
+                                cell_w, cell_h + 2, outline);
+                            DrawRectangleLines(x - 1, ascii_y - 2,
+                                cell_w, AMP_PT + 4, outline);
+                            int byte_idx = off_v + ascii_hover_idx;
+                            draw_byte_tooltip(
+                                (int) m.x, (int) m.y,
+                                decmode_rs_out[byte_idx], byte_idx,
+                                body_x0 + 4, body_x1 - 4,
+                                body_y0 + 4, body_y1 - 4,
+                                AMP_PT - 2);
+                        }
 
                         // Footer: status + correction count.
                         char status_buf[224];
@@ -5843,24 +6001,58 @@ int main(int argc, char **argv)
                                               (Color){170, 180, 210, 220});
                                 }
                             }
-                            // ASCII strip from the payload.
-                            char ascii_buf[RS_N + 1] = {0};
-                            for (int i = 0; i < n_show; ++i) {
-                                uint8_t c = payload[off_v + i];
-                                ascii_buf[i] =
-                                    (c >= 0x20 && c < 0x7F)
-                                        ? (char) c : '.';
-                            }
-                            ascii_buf[n_show] = '\0';
+                            // ASCII strip — per-cell so each char
+                            // lines up with the byte column above;
+                            // hover brings up the byte-value
+                            // tooltip + a yellow highlight on the
+                            // column.
                             draw_text("ASCII:",
                                       label_x - 4 - 56,
                                       ascii_y + 2,
                                       AMP_PT - 2,
                                       (Color){170, 200, 200, 220});
-                            draw_text(ascii_buf,
-                                      label_x, ascii_y,
-                                      AMP_PT,
-                                      (Color){180, 220, 220, 230});
+                            int ascii_hover_idx = -1;
+                            Color ascii_tx = {180, 220, 220, 230};
+                            for (int i = 0; i < n_show; ++i) {
+                                int x = label_x + i * cell_w;
+                                uint8_t c = payload[off_v + i];
+                                char ch[2];
+                                ch[0] = (c >= 0x20 && c < 0x7F)
+                                    ? (char) c : '.';
+                                ch[1] = '\0';
+                                int cw = measure_text(ch, AMP_PT);
+                                draw_text(ch,
+                                    x + (cell_w - 2 - cw) / 2,
+                                    ascii_y, AMP_PT, ascii_tx);
+                            }
+                            if ((int) m.y >= ascii_y - 2
+                                && (int) m.y < ascii_y + AMP_PT + 4
+                                && (int) m.x >= label_x
+                                && (int) m.x
+                                    < label_x + n_show * cell_w) {
+                                ascii_hover_idx =
+                                    ((int) m.x - label_x) / cell_w;
+                                if (ascii_hover_idx < 0
+                                    || ascii_hover_idx >= n_show)
+                                    ascii_hover_idx = -1;
+                            }
+                            if (ascii_hover_idx >= 0) {
+                                int x = label_x
+                                    + ascii_hover_idx * cell_w;
+                                Color outline = {255, 220, 100, 255};
+                                DrawRectangleLines(x - 1, row_y - 1,
+                                    cell_w, cell_h + 2, outline);
+                                DrawRectangleLines(x - 1,
+                                    ascii_y - 2,
+                                    cell_w, AMP_PT + 4, outline);
+                                int byte_idx = off_v + ascii_hover_idx;
+                                draw_byte_tooltip(
+                                    (int) m.x, (int) m.y,
+                                    payload[byte_idx], byte_idx,
+                                    body_x0 + 4, body_x1 - 4,
+                                    body_y0 + 4, body_y1 - 4,
+                                    AMP_PT - 2);
+                            }
 
                             char status_buf[224];
                             int last = off_v + n_show;
