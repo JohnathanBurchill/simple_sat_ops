@@ -3602,17 +3602,19 @@ int main(int argc, char **argv)
                                       : 0.0;
                         if (decmode_diag.asm_offset != (size_t) -1
                             && decmode_diag.strobe_t != NULL) {
-                            // Group delay through LPF (30) + discrim
-                            // (1) + MF (sps - 1) shifts MF-sample
-                            // index ↔ IQ-sample index. Re-applying
-                            // it here keeps the marker on the actual
-                            // ASM in the IQ time series, which
-                            // matters at high zoom.
-                            double t_off_iq =
-                                decmode_diag.strobe_t[decmode_diag.asm_offset]
-                                + 30.0 + 1.0 + (double)(sps - 1);
+                            // Stay in the same coordinate system the
+                            // trace renderer uses: strobe_t is in
+                            // MF-sample units, and the trace draws
+                            // strobe k at wf_t_lo + st[k]/sr. The
+                            // marker (and the bit strip cells, which
+                            // step in symbol periods from this time)
+                            // must land on the trace's dip, so we
+                            // ignore the LPF+discrim+MF group delay
+                            // here — adding it would offset the
+                            // marker by ~4 bits at 9600 baud / 96 kSPS.
                             decmode_asm_abs_time_s =
-                                ((double) i_lo + t_off_iq)
+                                ((double) i_lo
+                                 + decmode_diag.strobe_t[decmode_diag.asm_offset])
                                 / (double) iqb.samp_rate;
                         }
                         if (decmode_diag.asm_offset != (size_t) -1
