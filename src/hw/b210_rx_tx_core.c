@@ -95,6 +95,7 @@ struct b210_rx_tx_core {
     int                     fm_lo_nco_active;
     double                  fm_lo_compensation_hz; // operator's rx_lo_offset
     double                  tune_residual_hz;      // target − actual, per retune
+    double                  carrier_trim_hz;       // per-host TCXO calibration
 
     // Broadband-burst detector — FFTs the post-NCO IQ and counts how
     // many bins simultaneously exceed their per-bin running floor.
@@ -132,17 +133,21 @@ static void refresh_actual_freq(b210_rx_tx_core_t *c)
 }
 
 // Recompute the fm_lo_nco rotation from the current operator offset
-// + the UHD tune residual so the satellite carrier lands at DC.
+// + the UHD tune residual + the per-host carrier trim, so the
+// satellite carrier lands at DC.
 //
 // After UHD tunes to target_freq the actual LO is at actual_freq;
 // a signal at the nominal RF (target − rx_lo_offset_hz) lands at
 // baseband = nominal − actual_freq = −rx_lo_offset_hz + (target − actual)
 //          = −fm_lo_compensation_hz + tune_residual_hz.
-// sw_nco_set_freq(f) shifts signals DOWN by f, so set f to that
-// baseband location and the carrier ends up at exactly 0.
+// carrier_trim_hz absorbs whatever's left (TCXO error, etc) — it's
+// added directly so a "−700" in the trim file becomes "−700" in the
+// NCO frequency, shifting the carrier UP by 700 Hz. sw_nco_set_freq(f)
+// shifts signals DOWN by f, so set f to the carrier's current baseband
+// location and it ends up at exactly 0.
 static void refresh_fm_lo_nco(b210_rx_tx_core_t *c)
 {
-    double f = -c->fm_lo_compensation_hz + c->tune_residual_hz;
+    double f = -c->fm_lo_compensation_hz + c->tune_residual_hz + c->carrier_trim_hz;
     sw_nco_set_freq(&c->fm_lo_nco, f);
     c->fm_lo_nco_active = (f != 0.0);
 }
@@ -201,6 +206,7 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
     sw_nco_init(&c->fm_lo_nco, c->actual_rate);
     c->fm_lo_compensation_hz = p->fm_lo_compensation_hz;
     c->tune_residual_hz      = 0.0;
+    c->carrier_trim_hz       = p->carrier_trim_hz;
 
     // Broadband-burst detector at the post-decim rate. N=512 → ~187 Hz
     // bin width at 96 kS/s. 10 dB threshold + 2 s floor τ is the same

@@ -33,6 +33,7 @@
 
 #ifdef WITH_USRP_B210
 #include "b210_rx_tx_core.h"
+#include "carrier_trim.h"
 #include "rx_session.h"
 #include "tx_burst.h"
 #endif
@@ -5307,13 +5308,14 @@ int main(int argc, char **argv)
             .decim_cutoff_hz = 18000.0,
             .decim_taps      = 96u,
             // FM-path LO compensation: the core's second NCO cancels
-            // both the operator's lo_offset AND the UHD-reported tune
-            // residual (target − actual, from the AD9361 PLL step) so
-            // the carrier lands at exactly DC for every downstream
-            // consumer (.iq sidecar, live waterfall, shadow IQ
-            // decoder, FM discriminator). Pass the operator offset
-            // through; the residual is read back inside set_freq.
+            // the operator's lo_offset, the UHD-reported tune residual
+            // (target − actual, from the AD9361 PLL step), AND the
+            // persistent per-host carrier trim (TCXO calibration). The
+            // carrier lands at exactly DC for every downstream consumer
+            // (.iq sidecar, live waterfall, shadow IQ decoder, FM
+            // discriminator).
             .fm_lo_compensation_hz = state.rx_lo_offset_hz,
+            .carrier_trim_hz       = carrier_trim_load_hz(),
         };
         b210_rx_tx_core_t *core = NULL;
         if (b210_rx_tx_core_open(&cp, &core) != 0) {

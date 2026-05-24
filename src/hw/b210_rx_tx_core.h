@@ -87,6 +87,15 @@ typedef struct b210_rx_tx_core_params {
     // 0 lo_offset with 0 residual → NCO disabled. Otherwise it stays
     // active to cancel whatever residual is left.
     double      fm_lo_compensation_hz;
+
+    // Persistent per-host carrier-trim calibration. Absorbs whatever's
+    // left after the UHD-reported tune residual is cancelled — in
+    // practice this is the B210 TCXO error (a few ppm × tuned RF =
+    // hundreds of Hz at 70 cm). Loaded once at program startup from
+    // ~/.local/share/simple_sat_ops/carrier-trim-hz (see carrier_trim.h);
+    // pass 0 if you don't want a trim. Added on top of the operator
+    // offset and the UHD residual inside the second NCO.
+    double      carrier_trim_hz;
 } b210_rx_tx_core_params_t;
 
 typedef struct b210_rx_tx_core b210_rx_tx_core_t;

@@ -38,6 +38,7 @@
 */
 
 #include "b210_rx_tx_core.h"
+#include "carrier_trim.h"
 #include "frontiersat.h"
 #include "pdf_writer.h"
 #include "sso_paths.h"
@@ -248,6 +249,10 @@ int main(int argc, char *argv[])
     sweep_point_t pts[MAX_GAIN_STEPS];
     size_t        n_pts = 0u;
 
+    // Loaded once — creates the trim file with 0 if it doesn't yet
+    // exist, so every B210-using program agrees on the calibration.
+    double trim_hz = carrier_trim_load_hz();
+
     int rc = 0;
     for (double g = gain_start; g <= gain_end + 1e-9 && !g_stop; g += gain_step) {
 
@@ -263,6 +268,7 @@ int main(int argc, char *argv[])
             .decim_cutoff_hz        = decim_cutoff,
             .decim_taps             = 0u,
             .fm_lo_compensation_hz  = 0.0,
+            .carrier_trim_hz        = trim_hz,
         };
         b210_rx_tx_core_t *core = NULL;
         if (b210_rx_tx_core_open(&p, &core) != 0) {

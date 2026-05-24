@@ -47,6 +47,8 @@
 
 #include "modem.h"   // pcm16_write_wav
 #include "frontiersat.h"   // FRONTIERSAT_CARRIER_HZ
+#include "carrier_trim.h"
+#include "sw_nco.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -337,6 +339,27 @@ int main(int argc, char **argv)
             actual_freq / 1e6, freq_hz / 1e6, actual_rate, gain_db, bw_hz,
             actual_antenna, duration_s, n_request);
 
+    // Pre-write NCO: pulls the carrier to DC by cancelling the UHD
+    // tune residual + the persistent per-host carrier trim. Applied
+    // to each recv chunk before the WAV write / ALSA monitor / IQ
+    // file write, so all three see the centered signal.
+    //
+    // sw_nco_set_freq(f) shifts signals DOWN by f. The carrier sits
+    // at baseband = (target − actual) + trim_hz, so set the NCO
+    // frequency to that sum to drop it onto DC.
+    double trim_hz = carrier_trim_load_hz();
+    double tune_residual_hz = freq_hz - actual_freq;
+    double centering_freq_hz = tune_residual_hz + trim_hz;
+    sw_nco_t centering_nco;
+    sw_nco_init(&centering_nco, actual_rate);
+    sw_nco_set_freq(&centering_nco, centering_freq_hz);
+    if (fabs(centering_freq_hz) >= 1.0) {
+        fprintf(stderr,
+                "b210_rx_capture: centering NCO = %.3f Hz "
+                "(tune residual %.3f + carrier trim %.3f)\n",
+                centering_freq_hz, tune_residual_hz, trim_hz);
+    }
+
     uhd_rx_streamer_handle stream = NULL;
     if (uhd_check(uhd_rx_streamer_make(&stream), "rx_streamer_make")) { rc = 1; goto done; }
     {
@@ -501,6 +524,12 @@ int main(int argc, char **argv)
             (void)uhd_rx_metadata_strerror(md, errbuf, sizeof errbuf);
             fprintf(stderr, "b210_rx_capture: RX metadata error %d: %s\n",
                     (int)mderr, errbuf[0] ? errbuf : "(no detail)");
+        }
+        // Centre the carrier on DC before any downstream consumer
+        // (monitor, demod, IQ write) touches the chunk. NCO phase is
+        // preserved across calls so chunk boundaries don't pop.
+        if (n_recv > 0 && centering_freq_hz != 0.0) {
+            sw_nco_apply(&centering_nco, iq + got * 2, n_recv);
         }
         got += n_recv;
 
