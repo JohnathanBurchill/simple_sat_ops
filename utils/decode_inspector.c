@@ -125,9 +125,9 @@ static const uint8_t DECMODE_CCSDS_TABLE[255] = {
     (sizeof DECMODE_CCSDS_TABLE / sizeof DECMODE_CCSDS_TABLE[0])
 
 // Cap on how many post-Golay bytes the descrambler stage previews.
-// Plenty to recognise the payload's character without filling the
-// panel with redundant rows.
-#define DECMODE_DESCR_CAP 96
+// 255 = the AX100 / RS(255,223) codeword length — enough to scroll
+// across the entire on-wire payload when RS is in play.
+#define DECMODE_DESCR_CAP 255
 
 // ---------------------------------------------------------------------------
 // CLI flags + companion helpers
@@ -2295,6 +2295,10 @@ int main(int argc, char **argv)
     uint8_t    decmode_descr_scrambled[DECMODE_DESCR_CAP];
     uint8_t    decmode_descr_descrambled[DECMODE_DESCR_CAP];
     size_t     decmode_descr_n          = 0;
+    // Byte offset shown at the left edge of the descrambler grid.
+    // Driven by wheel input while stage 8 is open; clamped to
+    // [0, decmode_descr_n - 1] each frame.
+    int        decmode_descr_view_off   = 0;
 
     while (!WindowShouldClose()) {
         int sw = GetScreenWidth();
@@ -2331,9 +2335,28 @@ int main(int argc, char **argv)
         // The spectrogram's view_y/zoom are the single source of
         // truth for the visible time window, so the panel handlers
         // just modify those.
-        if (in_panel_for_input && (pinch != 0.0f
-                                   || wheel_v.y != 0.0f
-                                   || wheel_v.x != 0.0f)) {
+        // Stage 8 (CCSDS descrambler) byte-grid: wheel.x / wheel.y
+        // scroll the byte offset shown at the left edge of the
+        // grid, instead of panning time. Lets the operator scan
+        // across the full payload (up to DECMODE_DESCR_CAP bytes)
+        // even when only ~50 cells fit on screen.
+        int stage_eats_wheel = in_panel_for_input
+            && decmode_open && decmode_stage == 8;
+        if (stage_eats_wheel && (wheel_v.x != 0.0f
+                                 || wheel_v.y != 0.0f)) {
+            decmode_descr_view_off +=
+                (int)((wheel_v.x + wheel_v.y) * 2.0f);
+            if (decmode_descr_view_off < 0)
+                decmode_descr_view_off = 0;
+            int max_off = (int) decmode_descr_n - 1;
+            if (max_off < 0) max_off = 0;
+            if (decmode_descr_view_off > max_off)
+                decmode_descr_view_off = max_off;
+        }
+        if (in_panel_for_input && !stage_eats_wheel
+            && (pinch != 0.0f
+                || wheel_v.y != 0.0f
+                || wheel_v.x != 0.0f)) {
             int spec_screen_w_in = decode_open
                 ? (sw - decode_panel_w) : sw;
             if (spec_screen_w_in < 64) spec_screen_w_in = 64;
@@ -3707,6 +3730,7 @@ int main(int argc, char **argv)
                         // Golay length came back smaller than the
                         // cap, only descramble that many.
                         decmode_descr_n = 0;
+                        decmode_descr_view_off = 0;
                         if (decmode_diag.asm_offset != (size_t) -1
                             && decmode_diag.bits != NULL) {
                             size_t bbase =
@@ -4868,8 +4892,23 @@ int main(int argc, char **argv)
                         ? (avail_w / cell_w) : 0;
                     if (max_cells > DECMODE_DESCR_CAP)
                         max_cells = DECMODE_DESCR_CAP;
-                    int n_show = (int) decmode_descr_n;
+                    // Clamp the scroll offset each frame so a
+                    // shrunk window or shorter Golay length can't
+                    // leave us scrolled past the end.
+                    int off_v = decmode_descr_view_off;
+                    int max_off_v = (int) decmode_descr_n - max_cells;
+                    if (max_off_v < 0) max_off_v = 0;
+                    if (off_v > max_off_v) {
+                        off_v = max_off_v;
+                        decmode_descr_view_off = off_v;
+                    }
+                    if (off_v < 0) {
+                        off_v = 0;
+                        decmode_descr_view_off = 0;
+                    }
+                    int n_show = (int) decmode_descr_n - off_v;
                     if (n_show > max_cells) n_show = max_cells;
+                    if (n_show < 0) n_show = 0;
                     int row_x0 = body_x0 + margin_x;
                     int row1_y = body_y0 + 32;
                     int row2_y = row1_y + cell_h + gap_y;
@@ -4906,6 +4945,7 @@ int main(int argc, char **argv)
                         Color row3_tx    = {220, 240, 200, 255};
 
                         for (int i = 0; i < n_show; ++i) {
+                            int src = off_v + i;
                             int x = row_x0 + i * cell_w;
                             DrawRectangle(x, row1_y, cell_w - 2, cell_h, row1_bg);
                             DrawRectangleLines(x, row1_y, cell_w - 2, cell_h, edge);
@@ -4917,29 +4957,55 @@ int main(int argc, char **argv)
                             char b[4];
                             int tp = AMP_PT - 2;
                             snprintf(b, sizeof b, "%02X",
-                                     decmode_descr_scrambled[i]);
+                                     decmode_descr_scrambled[src]);
                             int bw = measure_text(b, tp);
                             draw_text(b, x + (cell_w - 2 - bw)/2,
                                       row1_y + (cell_h - tp)/2,
                                       tp, row1_tx);
                             snprintf(b, sizeof b, "%02X",
                                      DECMODE_CCSDS_TABLE[
-                                         (size_t) i % DECMODE_CCSDS_TABLE_N]);
+                                         (size_t) src % DECMODE_CCSDS_TABLE_N]);
                             bw = measure_text(b, tp);
                             draw_text(b, x + (cell_w - 2 - bw)/2,
                                       row2_y + (cell_h - tp)/2,
                                       tp, row2_tx);
                             snprintf(b, sizeof b, "%02X",
-                                     decmode_descr_descrambled[i]);
+                                     decmode_descr_descrambled[src]);
                             bw = measure_text(b, tp);
                             draw_text(b, x + (cell_w - 2 - bw)/2,
                                       row3_y + (cell_h - tp)/2,
                                       tp, row3_tx);
                         }
+                        // Byte-index ribbon above row 1 — light tick
+                        // every 4 cells, with the byte number written
+                        // every 8 so the operator can tell at a
+                        // glance "I'm at byte 64", "byte 128", etc.
+                        for (int i = 0; i < n_show; ++i) {
+                            int src = off_v + i;
+                            int x = row_x0 + i * cell_w;
+                            if ((src & 3) == 0) {
+                                DrawLine(x + (cell_w - 2)/2,
+                                         row1_y - 6,
+                                         x + (cell_w - 2)/2,
+                                         row1_y - 2,
+                                         (Color){120, 130, 150, 220});
+                            }
+                            if ((src & 7) == 0) {
+                                char nb[16];
+                                snprintf(nb, sizeof nb, "%d", src);
+                                int nw = measure_text(nb, AMP_PT - 4);
+                                draw_text(nb,
+                                          x + (cell_w - 2 - nw)/2,
+                                          row1_y - AMP_PT - 2,
+                                          AMP_PT - 4,
+                                          (Color){170, 180, 210, 220});
+                            }
+                        }
                         // ASCII strip — replace non-printable with '.'.
                         char ascii_buf[DECMODE_DESCR_CAP + 1] = {0};
                         for (int i = 0; i < n_show; ++i) {
-                            uint8_t c = decmode_descr_descrambled[i];
+                            uint8_t c =
+                                decmode_descr_descrambled[off_v + i];
                             ascii_buf[i] =
                                 (c >= 0x20 && c < 0x7F) ? (char) c : '.';
                         }
@@ -4954,21 +5020,24 @@ int main(int argc, char **argv)
                                   AMP_PT,
                                   (Color){180, 220, 220, 230});
 
-                        // Footer: show the on-wire length the Golay
-                        // header claimed (or a "no lock" notice).
-                        char status_buf[160];
+                        // Footer: show the byte range currently on
+                        // screen, plus the Golay-decoded total.
+                        char status_buf[192];
+                        int last = off_v + n_show;
                         if (decmode_golay_rc == 0) {
                             snprintf(status_buf, sizeof status_buf,
-                                "Golay said %u byte%s on the wire; "
-                                "showing the first %d.",
-                                (unsigned) decmode_golay_data12,
-                                decmode_golay_data12 == 1 ? "" : "s",
-                                n_show);
+                                "showing bytes [%d, %d) of %u "
+                                "(Golay said %u on the wire)  —  "
+                                "scroll the panel to scan further",
+                                off_v, last,
+                                (unsigned) decmode_descr_n,
+                                (unsigned) decmode_golay_data12);
                         } else {
                             snprintf(status_buf, sizeof status_buf,
-                                "Golay uncorrectable — descrambling "
-                                "the first %d bytes anyway.",
-                                n_show);
+                                "showing bytes [%d, %d) of %u  —  "
+                                "Golay uncorrectable, length unknown",
+                                off_v, last,
+                                (unsigned) decmode_descr_n);
                         }
                         draw_text(status_buf,
                                   row_x0,
