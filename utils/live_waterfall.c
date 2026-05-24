@@ -32,6 +32,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -497,6 +499,35 @@ static void usage(void)
         "  --height=<px>      Window height override (default = 95%% of monitor)\n");
 }
 
+// Trap signals (SIGSEGV / SIGABRT) raised inside InitWindow so a
+// hostile X server / GLX setup doesn't core-dump the process before
+// we can print a useful hint. Same pattern as decode_inspector.
+static sigjmp_buf g_init_window_jmp;
+static void init_window_crash_handler(int sig)
+{
+    (void) sig;
+    siglongjmp(g_init_window_jmp, 1);
+}
+
+static int safe_init_window(int w, int h, const char *title)
+{
+    struct sigaction old_segv, old_abrt;
+    struct sigaction trap = {0};
+    trap.sa_handler = init_window_crash_handler;
+    sigemptyset(&trap.sa_mask);
+    sigaction(SIGSEGV, &trap, &old_segv);
+    sigaction(SIGABRT, &trap, &old_abrt);
+
+    int ok = 0;
+    if (sigsetjmp(g_init_window_jmp, 1) == 0) {
+        InitWindow(w, h, title);
+        ok = IsWindowReady();
+    }
+    sigaction(SIGSEGV, &old_segv, NULL);
+    sigaction(SIGABRT, &old_abrt, NULL);
+    return ok ? 0 : -1;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) { usage(); return 2; }
@@ -533,16 +564,17 @@ int main(int argc, char **argv)
     }
 
     SetTraceLogLevel(LOG_WARNING);
-    InitWindow(64, 64, "live_waterfall");
-    if (!IsWindowReady()) {
-        // GLFW couldn't open a window — typically SSH without X11
-        // forwarding or a headless host. Exit cleanly with a hint
-        // rather than segfaulting on the next raylib call.
+    if (safe_init_window(64, 64, "live_waterfall") != 0) {
+        // No display, or the display can't give us OpenGL 3.3 core.
+        // Common causes: SSH without `-X`, SSH with `-X` to an X
+        // server that only speaks OpenGL 2.x, headless host.
         fprintf(stderr,
             "live_waterfall: failed to open a window. This tool is a\n"
-            "graphical viewer and needs a display ($DISPLAY, Wayland\n"
-            "compositor, or local macOS/Windows session). Over SSH use\n"
-            "`ssh -X` / `ssh -Y` to forward X11, or run locally.\n");
+            "graphical viewer and needs a display capable of OpenGL 3.3\n"
+            "core profile. Common causes: SSH without `-X` (no DISPLAY)\n"
+            "or SSH with `-X` to an X server that only speaks OpenGL 2.x\n"
+            "(the GLX errors above name this). Run on a host with a\n"
+            "local desktop.\n");
         return 1;
     }
     int monitor = GetCurrentMonitor();

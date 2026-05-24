@@ -61,6 +61,8 @@ extern void  decode_inspector_install_pinch_monitor(void);
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1421,6 +1423,44 @@ static void usage(void)
         "                       (default 6000 Hz)\n");
 }
 
+// Trap signals (SIGSEGV / SIGABRT) raised inside InitWindow so a
+// hostile X server / GLX setup doesn't core-dump the process before
+// we can print a useful hint. raylib forwards GLFW errors to its
+// TraceLog as LOG_WARNING and on some builds glfwCreateWindow can
+// hand back a half-valid handle that segfaults on the next deref;
+// catching the signal lets us bail cleanly instead.
+static sigjmp_buf g_init_window_jmp;
+static void init_window_crash_handler(int sig)
+{
+    (void) sig;
+    siglongjmp(g_init_window_jmp, 1);
+}
+
+// Wraps InitWindow with the trap above + an IsWindowReady() check.
+// Returns 0 on success, non-zero on any failure (signal caught,
+// glfwCreateWindow returned NULL, etc.). On failure the caller
+// should print its own message and exit; this helper just unwinds
+// the signal handlers cleanly.
+static int safe_init_window(int w, int h, const char *title)
+{
+    struct sigaction old_segv, old_abrt;
+    struct sigaction trap = {0};
+    trap.sa_handler = init_window_crash_handler;
+    sigemptyset(&trap.sa_mask);
+    sigaction(SIGSEGV, &trap, &old_segv);
+    sigaction(SIGABRT, &trap, &old_abrt);
+
+    int ok = 0;
+    if (sigsetjmp(g_init_window_jmp, 1) == 0) {
+        InitWindow(w, h, title);
+        ok = IsWindowReady();
+    }
+
+    sigaction(SIGSEGV, &old_segv, NULL);
+    sigaction(SIGABRT, &old_abrt, NULL);
+    return ok ? 0 : -1;
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1555,19 +1595,20 @@ int main(int argc, char **argv)
 
     // ----- raylib window + IQ load + in-process spectrogram -----
     SetTraceLogLevel(LOG_WARNING);
-    InitWindow(win_w, win_h, "decode_inspector");
-    if (!IsWindowReady()) {
-        // GLFW couldn't open a window — most commonly an SSH session
-        // without X11 forwarding ($DISPLAY missing) or a headless
-        // host. Exit cleanly with a useful hint instead of letting
-        // SetTargetFPS / LoadTexture deref the unready handle and
-        // segfault.
+    if (safe_init_window(win_w, win_h, "decode_inspector") != 0) {
+        // No display, or the display can't give us the OpenGL 3.3
+        // core context raylib wants. Common causes: SSH without `-X`
+        // (no DISPLAY); SSH with `-X` but a forwarded X server that
+        // only speaks OpenGL 2.x (the GLX errors above name this);
+        // a truly headless host.
         fprintf(stderr,
             "decode_inspector: failed to open a window. This tool is a\n"
-            "graphical viewer and needs a display ($DISPLAY, Wayland\n"
-            "compositor, or local macOS/Windows session). Over SSH use\n"
-            "`ssh -X` / `ssh -Y` to forward X11, or copy the .iq off the\n"
-            "remote and run decode_inspector locally.\n");
+            "graphical viewer and needs a display capable of OpenGL 3.3\n"
+            "core profile. Common causes: SSH without `-X` (no DISPLAY)\n"
+            "or SSH with `-X` to an X server that only speaks OpenGL 2.x\n"
+            "(the GLX errors above name this). Run on a host with a\n"
+            "local desktop, or copy the .iq file off the remote and run\n"
+            "decode_inspector there.\n");
         return 1;
     }
     SetTargetFPS(60);
