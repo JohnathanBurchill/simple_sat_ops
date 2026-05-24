@@ -252,6 +252,16 @@ target_include_directories(modem_iq_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(modem_iq_selftest PRIVATE m)
 list(APPEND SSO_TARGETS modem_iq_selftest)
 
+# FSK demod self-test: pins the modem_fsk refactor (per-stage helpers +
+# the new modem_fsk_iq_to_bits_diag entry point) on a synthetic MSK
+# frame. Same .c links as modem_iq_selftest since modem_fsk depends on
+# modem.h.
+add_executable(modem_fsk_selftest unit_tests/modem_fsk_selftest.c
+               src/dsp/modem.c src/dsp/modem_fsk.c)
+target_include_directories(modem_fsk_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(modem_fsk_selftest PRIVATE m)
+list(APPEND SSO_TARGETS modem_fsk_selftest)
+
 # Software-Doppler NCO selftest. Runs without UHD — the NCO is the
 # DSP core, extracted so it can be exercised on synthesised IQ.
 add_executable(sw_nco_selftest unit_tests/sw_nco_selftest.c

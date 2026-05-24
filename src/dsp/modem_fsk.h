@@ -52,6 +52,59 @@ int modem_fsk_iq_to_bits(const int16_t *iq_pairs, size_t n_pairs,
                          size_t *sync_bit_offset,
                          int *polarity_used);
 
+// Diagnostic entry: same input + decode contract as
+// modem_fsk_iq_to_bits, plus optional per-stage buffer copies. Any
+// pointer field in `diag` may be NULL to skip that stage's copy; the
+// matching count field is filled regardless so the caller can size
+// later allocations. `diag` itself may be NULL — in which case this
+// degenerates exactly to modem_fsk_iq_to_bits semantics.
+//
+// Buffer sizing (caller-allocated):
+//   i_lpf, q_lpf       :  n_pairs - 30
+//   fm                 :  n_pairs - 31  (post HPF + AGC)
+//   mf                 :  n_pairs - 31 - (sps - 1)
+//   strobes, strobe_t,
+//   bits               :  use modem_fsk_diag_max_strobes() to size
+//   asm_hamming        :  n_strobes - 31 (post-compute)
+//
+// modem_fsk_iq_to_bits() is now a thin wrapper around this entry with
+// diag=NULL; bit-for-bit identical output is guaranteed (and pinned by
+// unit_tests/modem_fsk_selftest.c).
+typedef struct fsk_diag {
+    float    *i_lpf;
+    float    *q_lpf;
+    float    *fm;
+    float    *mf;
+    float    *strobes;
+    double   *strobe_t;
+    uint8_t  *bits;
+    uint8_t  *asm_hamming;
+
+    // Filled by modem_fsk_iq_to_bits_diag regardless of which buffers
+    // were requested. asm_offset == (size_t)-1 iff no sync was found.
+    size_t   n_pairs_lpf;
+    size_t   n_fm;
+    size_t   n_mf;
+    size_t   n_strobes;
+    size_t   asm_offset;
+    int      asm_dist;
+    int      polarity_used;
+} fsk_diag_t;
+
+// Conservative upper bound on the strobe count for a given input —
+// caller uses this to size diag.strobes / strobe_t / bits.
+size_t modem_fsk_diag_max_strobes(size_t n_pairs, int sps);
+
+int modem_fsk_iq_to_bits_diag(const int16_t *iq_pairs, size_t n_pairs,
+                              const modem_params_t *p,
+                              int invert_polarity,
+                              int sync_max_ham,
+                              size_t min_bit_offset,
+                              uint8_t *out_bits, size_t *n_bits_out,
+                              size_t *sync_bit_offset,
+                              int *polarity_used,
+                              fsk_diag_t *diag);
+
 #ifdef __cplusplus
 }
 #endif
