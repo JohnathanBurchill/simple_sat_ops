@@ -485,9 +485,25 @@ static int load_ttf_from_known_paths(void)
              "assets/SourceCodePro-Regular.ttf");
     snprintf(candidates[n++], sizeof candidates[0],
              "../assets/SourceCodePro-Regular.ttf");
+    // Build the codepoint list: printable ASCII (0x20..0x7E) plus the
+    // handful of Latin-1 / math symbols the UI actually uses. LoadFontEx
+    // with codepoints=NULL/count=0 falls back to ASCII-only, which is
+    // why µ etc. were rendering as the "?" glyph.
+    int codepoints[128];
+    int n_cp = 0;
+    for (int c = 0x20; c <= 0x7E; ++c) codepoints[n_cp++] = c;
+    codepoints[n_cp++] = 0x00B5; // µ (micro sign)
+    codepoints[n_cp++] = 0x00B0; // ° (degree)
+    codepoints[n_cp++] = 0x00B1; // ± (plus-minus)
+    codepoints[n_cp++] = 0x00B2; // ² (superscript two)
+    codepoints[n_cp++] = 0x00B3; // ³ (superscript three)
+    codepoints[n_cp++] = 0x2013; // – (en dash)
+    codepoints[n_cp++] = 0x2014; // — (em dash)
+
     for (int i = 0; i < n; ++i) {
         if (FileExists(candidates[i])) {
-            g_ui_font = LoadFontEx(candidates[i], 48, NULL, 0);
+            g_ui_font = LoadFontEx(candidates[i], 48,
+                                   codepoints, n_cp);
             if (g_ui_font.texture.id != 0) {
                 SetTextureFilter(g_ui_font.texture,
                                  TEXTURE_FILTER_BILINEAR);
@@ -642,6 +658,27 @@ static int iq_buf_load(iq_buf_t *b, const char *path, int samp_rate)
     return iq_buf_load_progress(b, path, samp_rate, NULL);
 }
 
+// Pretty-print a duration in seconds using whichever unit (minutes,
+// s, ms, µs, ns) lands the leading digit between 1 and 60. Three
+// decimals of precision so a 1234 µs span still reads as "1234.000 µs"
+// rather than "1.234 ms" — the operator picks the breakpoint when they
+// drag.
+static int fmt_duration_auto(double dur_s, char *out, size_t cap)
+{
+    double abs_d = fabs(dur_s);
+    if (abs_d >= 60.0) {
+        return snprintf(out, cap, "%.3f min", dur_s / 60.0);
+    } else if (abs_d >= 1.0) {
+        return snprintf(out, cap, "%.3f s", dur_s);
+    } else if (abs_d >= 1.0e-3) {
+        return snprintf(out, cap, "%.3f ms", dur_s * 1.0e3);
+    } else if (abs_d >= 1.0e-6) {
+        return snprintf(out, cap, "%.3f µs", dur_s * 1.0e6);
+    } else {
+        return snprintf(out, cap, "%.3f ns", dur_s * 1.0e9);
+    }
+}
+
 // Format an unsigned 64-bit value with thousand separators (US-style
 // commas — locale-independent so it doesn't depend on a setlocale()
 // call at startup).  Returns the number of bytes written (excluding
@@ -754,6 +791,232 @@ static void *loader_thread_fn(void *arg)
     pthread_mutex_lock(&ctx->lock);
     ctx->done = 1;
     pthread_mutex_unlock(&ctx->lock);
+    return NULL;
+}
+
+// ---------------------------------------------------------------------------
+// Band-pass filter view: shift center_hz to DC, real LPF with bw_hz/2
+// cutoff, leave the result at DC. Used by the waveform panel's 'F'
+// toggle to view an IQ stream with the beacon's band kept and other
+// energy (e.g. broadband 50 Hz line-coupled spikes) reduced. Runs on
+// a worker thread so the UI stays responsive; output goes into a
+// caller-allocated int16 buffer matched to the input length.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    const int16_t *iq_in;
+    size_t         n_pairs;
+    int            samp_rate;
+    double         center_hz;       // shift target for the LPF stage
+    double         lower_hz;        // HPF cutoff (original frame); 0 = disabled
+    double         upper_hz;        // LPF cutoff (shifted frame)
+    int16_t       *iq_out;          // pre-allocated, n_pairs * 2 int16s
+    volatile float progress_pct;    // 0..1, updated as the worker runs
+    volatile int   done;
+    int            error;
+} filter_ctx_t;
+
+// Build a length-N (odd) Hamming-windowed sinc low-pass with the given
+// normalised cutoff (in units of fs). Returns a freshly-malloc'd array
+// of N floats; caller frees.
+static float *build_lpf_taps(int N, double cutoff_norm)
+{
+    if (N < 3 || (N & 1) == 0) return NULL;
+    float *h = (float *) malloc((size_t) N * sizeof(float));
+    if (h == NULL) return NULL;
+    int M = N - 1;
+    double sum = 0.0;
+    for (int n = 0; n <= M; ++n) {
+        double t = (double) n - (double) M / 2.0;
+        double v = (fabs(t) < 1e-9)
+            ? 2.0 * cutoff_norm
+            : sin(2.0 * M_PI * cutoff_norm * t) / (M_PI * t);
+        v *= 0.54 - 0.46 * cos(2.0 * M_PI * (double) n / (double) M);
+        h[n] = (float) v;
+        sum += v;
+    }
+    if (sum > 0.0) {
+        for (int n = 0; n < N; ++n) h[n] /= (float) sum;
+    }
+    return h;
+}
+
+// Run a symmetric Hamming-windowed sinc FIR over an interleaved
+// complex (I,Q) input. `taps[N]` is the real-valued kernel; the same
+// kernel is applied to I and Q independently. If `mode_hpf` is set,
+// the output is (delayed_input - LPF), giving a high-pass response
+// with the same transition band. Output is group-delay-compensated:
+// the last (N-1)/2 samples of the input are not written to. Reads
+// from `in_iq` (complex floats) and writes to `out_iq` (complex
+// floats); both are interleaved I,Q.
+static void apply_fir_complex(const float *in_iq, size_t n_pairs,
+                              const float *taps, int N, int mode_hpf,
+                              float *out_iq,
+                              volatile float *progress_pct_out,
+                              float progress_lo, float progress_hi)
+{
+    int Mhalf = N / 2;
+    float *dl_i = (float *) calloc((size_t) N, sizeof(float));
+    float *dl_q = (float *) calloc((size_t) N, sizeof(float));
+    if (dl_i == NULL || dl_q == NULL) {
+        free(dl_i); free(dl_q);
+        return;
+    }
+    int dl_pos = 0;
+    size_t progress_step = (n_pairs >= 100) ? n_pairs / 100 : 1;
+    for (size_t n = 0; n < n_pairs; ++n) {
+        dl_i[dl_pos] = in_iq[n * 2 + 0];
+        dl_q[dl_pos] = in_iq[n * 2 + 1];
+        int newest = dl_pos;
+        dl_pos = (dl_pos + 1) % N;
+
+        double y_i = 0.0, y_q = 0.0;
+        int idx = newest;
+        for (int k = 0; k < N; ++k) {
+            y_i += (double) taps[k] * dl_i[idx];
+            y_q += (double) taps[k] * dl_q[idx];
+            idx = (idx == 0) ? (N - 1) : (idx - 1);
+        }
+
+        ssize_t out_idx = (ssize_t) n - Mhalf;
+        if (out_idx >= 0) {
+            if (mode_hpf) {
+                // High-pass: subtract the LPF from the delayed input.
+                // dl[(newest - Mhalf) mod N] is the sample at out_idx.
+                int o_idx = (newest - Mhalf + N) % N;
+                out_iq[out_idx * 2 + 0] = dl_i[o_idx] - (float) y_i;
+                out_iq[out_idx * 2 + 1] = dl_q[o_idx] - (float) y_q;
+            } else {
+                out_iq[out_idx * 2 + 0] = (float) y_i;
+                out_iq[out_idx * 2 + 1] = (float) y_q;
+            }
+        }
+        if (progress_pct_out != NULL && (n % progress_step) == 0) {
+            float frac = (float)((double)(n + 1) / (double) n_pairs);
+            *progress_pct_out = progress_lo
+                + (progress_hi - progress_lo) * frac;
+        }
+    }
+    // Zero the group-delay tail.
+    for (size_t i = n_pairs - (size_t) Mhalf; i < n_pairs; ++i) {
+        out_iq[i * 2 + 0] = 0.0f;
+        out_iq[i * 2 + 1] = 0.0f;
+    }
+    free(dl_i); free(dl_q);
+}
+
+static void *filter_thread_fn(void *arg)
+{
+    filter_ctx_t *c = (filter_ctx_t *) arg;
+    const int N_hpf = 257;
+    const int N_lpf = 257;
+
+    // Build LPF kernels for both stages. The HPF stage uses the same
+    // sinc kernel internally; apply_fir_complex does the
+    // (delayed_in - LPF) subtraction to turn it into a high-pass.
+    float *h_hpf = NULL, *h_lpf = NULL;
+    if (c->lower_hz > 0.0) {
+        double cutoff_n = c->lower_hz / (double) c->samp_rate;
+        if (cutoff_n <= 0.0 || cutoff_n >= 0.5) {
+            c->error = 1; c->done = 1; return NULL;
+        }
+        h_hpf = build_lpf_taps(N_hpf, cutoff_n);
+    }
+    {
+        double cutoff_n = c->upper_hz / (double) c->samp_rate;
+        if (cutoff_n <= 0.0 || cutoff_n >= 0.5) {
+            free(h_hpf);
+            c->error = 1; c->done = 1; return NULL;
+        }
+        h_lpf = build_lpf_taps(N_lpf, cutoff_n);
+    }
+    if (h_lpf == NULL) {
+        free(h_hpf);
+        c->error = 1; c->done = 1; return NULL;
+    }
+
+    // Float intermediate buffer for the HPF stage (and the shift). One
+    // float pair per IQ sample → 8 bytes × n_pairs. For a 9-minute
+    // 96 kHz pass that's ~430 MB; comfortable on any modern Mac.
+    float *iq_mid = (float *) malloc(c->n_pairs * 2 * sizeof(float));
+    if (iq_mid == NULL) {
+        free(h_hpf); free(h_lpf);
+        c->error = 1; c->done = 1; return NULL;
+    }
+
+    // Stage 1: HPF in the ORIGINAL frame. With lower_hz == 0, the
+    // stage is a no-op (just copy input → intermediate as floats).
+    if (h_hpf != NULL) {
+        // Copy input to a temporary float scratch so apply_fir_complex
+        // can read uniform-format complex floats. Skip the copy by
+        // adapting the inner loop; for now keep the code simple.
+        float *scratch_in = (float *) malloc(c->n_pairs * 2 * sizeof(float));
+        if (scratch_in == NULL) {
+            free(iq_mid); free(h_hpf); free(h_lpf);
+            c->error = 1; c->done = 1; return NULL;
+        }
+        for (size_t n = 0; n < c->n_pairs; ++n) {
+            scratch_in[n * 2 + 0] = (float) c->iq_in[n * 2 + 0];
+            scratch_in[n * 2 + 1] = (float) c->iq_in[n * 2 + 1];
+        }
+        apply_fir_complex(scratch_in, c->n_pairs,
+                          h_hpf, N_hpf, /*mode_hpf=*/1,
+                          iq_mid,
+                          &c->progress_pct, 0.0f, 0.45f);
+        free(scratch_in);
+    } else {
+        for (size_t n = 0; n < c->n_pairs; ++n) {
+            iq_mid[n * 2 + 0] = (float) c->iq_in[n * 2 + 0];
+            iq_mid[n * 2 + 1] = (float) c->iq_in[n * 2 + 1];
+        }
+        c->progress_pct = 0.45f;
+    }
+
+    // Stage 2: shift center_hz to DC, then LPF. Done in place into
+    // iq_mid as we sweep through, with the result written into iq_out
+    // (int16, clipped). The shift is a complex multiplication by
+    // exp(-j*2π*center_hz*n/fs) — a recursive phasor update is cheap
+    // and accurate enough for the few-million-sample range.
+    double delta = -2.0 * M_PI * c->center_hz / (double) c->samp_rate;
+    double cos_d = cos(delta), sin_d = sin(delta);
+    double p_re = 1.0, p_im = 0.0;
+    for (size_t n = 0; n < c->n_pairs; ++n) {
+        double I = (double) iq_mid[n * 2 + 0];
+        double Q = (double) iq_mid[n * 2 + 1];
+        iq_mid[n * 2 + 0] = (float)(I * p_re - Q * p_im);
+        iq_mid[n * 2 + 1] = (float)(I * p_im + Q * p_re);
+        double np_re = p_re * cos_d - p_im * sin_d;
+        double np_im = p_re * sin_d + p_im * cos_d;
+        p_re = np_re; p_im = np_im;
+    }
+    // Final LPF stage. Write directly into iq_out via a small
+    // wrapper that does the float → int16 clip after the convolution.
+    float *iq_lpf_out = (float *) malloc(c->n_pairs * 2 * sizeof(float));
+    if (iq_lpf_out == NULL) {
+        free(iq_mid); free(h_hpf); free(h_lpf);
+        c->error = 1; c->done = 1; return NULL;
+    }
+    apply_fir_complex(iq_mid, c->n_pairs,
+                      h_lpf, N_lpf, /*mode_hpf=*/0,
+                      iq_lpf_out,
+                      &c->progress_pct, 0.50f, 0.99f);
+    free(iq_mid);
+    // Clip + write final output as int16.
+    for (size_t n = 0; n < c->n_pairs; ++n) {
+        int qi = (int) lrintf(iq_lpf_out[n * 2 + 0]);
+        int qq = (int) lrintf(iq_lpf_out[n * 2 + 1]);
+        if (qi >  32767) qi =  32767;
+        if (qi < -32768) qi = -32768;
+        if (qq >  32767) qq =  32767;
+        if (qq < -32768) qq = -32768;
+        c->iq_out[n * 2 + 0] = (int16_t) qi;
+        c->iq_out[n * 2 + 1] = (int16_t) qq;
+    }
+    free(iq_lpf_out);
+
+    free(h_hpf); free(h_lpf);
+    c->progress_pct = 1.0f;
+    c->done = 1;
     return NULL;
 }
 
@@ -963,7 +1226,13 @@ static void usage(void)
         "Annotator-specific:\n"
         "  --rate=<Hz>          IQ rate (default = auto from companion .wav)\n"
         "  --width=<px>         Window width  (default 1280)\n"
-        "  --height=<px>        Window height (default 900)\n");
+        "  --height=<px>        Window height (default 900)\n"
+        "  --filter-center-hz=F LPF shift target for the F-key view\n"
+        "                       (default -770 Hz)\n"
+        "  --filter-lower-hz=F  HPF cutoff in the original IQ frame\n"
+        "                       (default 500 Hz; 0 disables HPF stage)\n"
+        "  --filter-upper-hz=F  LPF cutoff around the shifted DC\n"
+        "                       (default 6000 Hz)\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -984,6 +1253,13 @@ int main(int argc, char **argv)
     int    win_w     = 1280;
     int    win_h     = 900;
 
+    // Filter knobs (overridable per-launch; the F-key handler reads
+    // these). Defaults are tuned for the FrontierSat downlink at
+    // -770 Hz on a 96 kHz IQ.
+    double filter_center_hz_cli = -770.0;
+    double filter_lower_hz_cli  = 500.0;
+    double filter_upper_hz_cli  = 6000.0;
+
     const char *passthru[MAX_PASSTHRU];
     int n_passthru = 0;
 
@@ -995,6 +1271,12 @@ int main(int argc, char **argv)
             win_w = atoi(a + 8);
         } else if (strncmp(a, "--height=", 9) == 0) {
             win_h = atoi(a + 9);
+        } else if (strncmp(a, "--filter-center-hz=", 19) == 0) {
+            filter_center_hz_cli = atof(a + 19);
+        } else if (strncmp(a, "--filter-lower-hz=", 18) == 0) {
+            filter_lower_hz_cli = atof(a + 18);
+        } else if (strncmp(a, "--filter-upper-hz=", 18) == 0) {
+            filter_upper_hz_cli = atof(a + 18);
         } else if (is_passthru(a)) {
             if (n_passthru >= MAX_PASSTHRU) {
                 fprintf(stderr,
@@ -1424,6 +1706,26 @@ int main(int argc, char **argv)
     float anim_anchor_ix = 0.0f, anim_anchor_iy = 0.0f;
     int   dragging = 0;       // 1 = drawing a new box
     Vector2 drag_start = {0, 0};
+    // Waveform-panel measurement drag — anchored in TIME so the
+    // rectangle still reads the right duration even if the operator
+    // pinches/scrolls mid-drag. Cleared on mouse-up.
+    int    wf_drag           = 0;
+    double wf_drag_t_anchor  = 0.0;
+
+    // Band-pass-filter view (F key). Two stages: HPF in the original
+    // frame (cuts everything below filter_lower_hz around DC, i.e.
+    // LO leakage / very-low-freq drift), then shift filter_center_hz
+    // to DC + LPF (cuts everything above filter_upper_hz around the
+    // new DC, i.e. outside the beacon band).
+    int       filter_show         = 0;
+    int       filter_built        = 0;
+    int       filter_building     = 0;
+    int16_t  *filtered_iq         = NULL;
+    pthread_t filter_thread       = (pthread_t) 0;
+    filter_ctx_t fctx             = {0};
+    double    filter_center_hz    = filter_center_hz_cli;
+    double    filter_lower_hz     = filter_lower_hz_cli;
+    double    filter_upper_hz     = filter_upper_hz_cli;
     char  status[256] = "";
     int   label_cycle_idx = 0;
 
@@ -1627,6 +1929,83 @@ int main(int argc, char **argv)
             snprintf(status, sizeof status,
                 "waveform channels: %s", mode_label);
         }
+        // F: band-pass-filter view. First press kicks off the filter
+        // worker (mixes filter_center_hz to DC, real LPF with bw/2
+        // cutoff); subsequent presses toggle the waveform-panel
+        // between raw and filtered IQ. The live state (building %,
+        // raw / FILTERED) lives in its own bar above the main status
+        // bar (see render below); status[] is only used here for
+        // one-time error / file-write announcements.
+        if (IsKeyPressed(KEY_F) && iqb.samples != NULL) {
+            if (!filter_built && !filter_building) {
+                filtered_iq = (int16_t *) malloc(
+                    iqb.n_pairs * 2 * sizeof(int16_t));
+                if (filtered_iq != NULL) {
+                    memset(&fctx, 0, sizeof fctx);
+                    fctx.iq_in     = iqb.samples;
+                    fctx.n_pairs   = iqb.n_pairs;
+                    fctx.samp_rate = samp_rate;
+                    fctx.center_hz = filter_center_hz;
+                    fctx.lower_hz  = filter_lower_hz;
+                    fctx.upper_hz  = filter_upper_hz;
+                    fctx.iq_out    = filtered_iq;
+                    if (pthread_create(&filter_thread, NULL,
+                                       filter_thread_fn, &fctx) == 0) {
+                        filter_building = 1;
+                    } else {
+                        free(filtered_iq); filtered_iq = NULL;
+                        snprintf(status, sizeof status,
+                            "filter: pthread_create failed");
+                    }
+                } else {
+                    snprintf(status, sizeof status,
+                        "filter: out of memory");
+                }
+            } else if (filter_built) {
+                filter_show = !filter_show;
+            }
+            // While filter_building, F is a no-op (the dedicated bar
+            // already shows progress).
+        }
+        // Reap the filter thread if it's finished. Done once per
+        // frame so the toggle is available the instant the worker
+        // returns.
+        if (filter_building && fctx.done) {
+            pthread_join(filter_thread, NULL);
+            filter_building = 0;
+            if (fctx.error) {
+                free(filtered_iq); filtered_iq = NULL;
+                snprintf(status, sizeof status, "filter: failed");
+            } else {
+                filter_built = 1;
+                filter_show  = 1;
+                // Write the cleaned IQ to /tmp so rx_replay can take
+                // it. Path is logged to stderr; status[] gets just the
+                // basename so it doesn't smear across the help line.
+                char fn[1200];
+                const char *base = strrchr(iq_path, '/');
+                base = (base != NULL) ? base + 1 : iq_path;
+                snprintf(fn, sizeof fn,
+                    "/tmp/%.480s.filt%+0.0fHz_hp%.0f_lp%.0f.iq",
+                    base, filter_center_hz,
+                    filter_lower_hz, filter_upper_hz);
+                FILE *fp = fopen(fn, "wb");
+                if (fp != NULL) {
+                    fwrite(filtered_iq, sizeof(int16_t) * 2,
+                           iqb.n_pairs, fp);
+                    fclose(fp);
+                    const char *short_base = strrchr(fn, '/');
+                    short_base = short_base ? short_base + 1 : fn;
+                    snprintf(status, sizeof status,
+                        "wrote /tmp/%s", short_base);
+                    fprintf(stderr,
+                        "iq_annotator: filtered IQ -> %s\n", fn);
+                } else {
+                    snprintf(status, sizeof status,
+                        "filter write failed: %s", strerror(errno));
+                }
+            }
+        }
         // Color-scale controls — instantaneous now: the keystroke just
         // nudges dbmin_abs / dbmax_abs and pushes the new uniforms; the
         // GPU re-colours on the next frame. 'R' drops back to the
@@ -1798,8 +2177,15 @@ int main(int argc, char **argv)
                         "decode: open %s: %s",
                         tmp_iq, strerror(errno));
                 } else {
+                    // Source: filtered IQ when F-toggle is on AND the
+                    // filter worker has finished; raw IQ otherwise.
+                    const int16_t *src_iq =
+                        (filter_show && filter_built && filtered_iq != NULL)
+                        ? filtered_iq : iqb.samples;
+                    const char *src_label =
+                        (src_iq == filtered_iq) ? "filtered" : "raw";
                     size_t want_pairs = (size_t) n_pairs_dec;
-                    fwrite(iqb.samples + i_lo * 2,
+                    fwrite(src_iq + i_lo * 2,
                            sizeof(int16_t),
                            want_pairs * 2, fo);
                     fclose(fo);
@@ -1834,10 +2220,12 @@ int main(int argc, char **argv)
                     if (rc == 0) {
                         snprintf(status, sizeof status,
                             "decode: rx_replay over %.2fs window "
-                            "(t=%.2fs..%.2fs)", t1 - t0, t0, t1);
+                            "(t=%.2fs..%.2fs, %s IQ)",
+                            t1 - t0, t0, t1, src_label);
                     } else {
                         snprintf(status, sizeof status,
-                            "decode: rx_replay rc=%d (is it on PATH?)", rc);
+                            "decode: rx_replay rc=%d (is it on PATH?, %s IQ)",
+                            rc, src_label);
                     }
                 }
             }
@@ -2217,8 +2605,13 @@ int main(int argc, char **argv)
                 if (TICK_1S  < 1) TICK_1S  = 1;
                 if (TICK_20S < 2) TICK_20S = 2;
                 if (TICK_MAJ < 3) TICK_MAJ = 3;
-                const int SS_PT     = lpt_sub;
-                const int AXIS_PT   = lpt_axis;
+                // Time-axis labels run 25 % smaller than the freq +
+                // colorbar labels so the HH:MM:SS columns don't crowd
+                // the spec edges at high zoom.
+                int SS_PT   = (int)((float) lpt_sub  * 0.75f + 0.5f);
+                int AXIS_PT = (int)((float) lpt_axis * 0.75f + 0.5f);
+                if (SS_PT   < 2) SS_PT   = 2;
+                if (AXIS_PT < 2) AXIS_PT = 2;
                 const Color FINE_COL = (Color){255, 255, 255, 255};
 
                 int axis_x_img_left  = WF_LM - 1;
@@ -2558,6 +2951,41 @@ int main(int argc, char **argv)
         // Status bar — two lines now: top = box info, bottom = cursor
         // / keys / status messages.
         int bar_h = 2 * (STATUS_PT + 6);
+
+        // Filter-state strip — sits just above the main status bar
+        // when the filter is building or built, so its live readout
+        // doesn't fight with the keys-help line below.
+        int filter_strip_h = 0;
+        if (filter_building || filter_built) {
+            char fmsg[160];
+            Color fcol;
+            if (filter_building) {
+                snprintf(fmsg, sizeof fmsg,
+                    "filtering... %.0f %%  "
+                    "(center=%.0f Hz, HPF=%.0f Hz, LPF=%.0f Hz)",
+                    fctx.progress_pct * 100.0f,
+                    filter_center_hz,
+                    filter_lower_hz, filter_upper_hz);
+                fcol = (Color){200, 200, 130, 255};
+            } else {
+                snprintf(fmsg, sizeof fmsg,
+                    "waveform: %s  "
+                    "(center=%.0f Hz, HPF=%.0f Hz, LPF=%.0f Hz)",
+                    filter_show ? "FILTERED" : "raw",
+                    filter_center_hz,
+                    filter_lower_hz, filter_upper_hz);
+                fcol = filter_show
+                    ? (Color){170, 220, 255, 255}
+                    : (Color){180, 180, 190, 255};
+            }
+            filter_strip_h = STATUS_PT + 8;
+            DrawRectangle(0, sh - bar_h - filter_strip_h,
+                          spec_screen_w, filter_strip_h,
+                          (Color){0, 0, 0, 210});
+            draw_text(fmsg, 6, sh - bar_h - filter_strip_h + 4,
+                      STATUS_PT, fcol);
+        }
+
         // Status bar runs only as wide as the spec area so it doesn't
         // sit under the decode side panel.
         DrawRectangle(0, sh - bar_h, spec_screen_w, bar_h, (Color){0, 0, 0, 210});
@@ -2569,12 +2997,12 @@ int main(int argc, char **argv)
         char info[512];
         if (in_spec) {
             snprintf(info, sizeof info,
-                "cursor t=%.3fs  f=%+.0f Hz  zoom=%.2fx  boxes=%d  hover=%d sel=%d  | drag=new pinch=zoom +/-=5x@cursor-anchor scroll=pan W=wave I=ch P=pdf T=label S=save L=load ,./<>=color R=auto-color 0=reset Del=del-hover Q=quit",
+                "cursor t=%.3fs  f=%+.0f Hz  zoom=%.2fx  boxes=%d  hover=%d sel=%d  | drag=new pinch=zoom +/-=5x@cursor-anchor scroll=pan W=wave I=ch F=filter P=pdf T=label S=save L=load ,./<>=color R=auto-color 0=reset Del=del-hover Q=quit",
                 cursor_t, cursor_f, (double) zoom,
                 boxes.n, hovered, boxes.selected);
         } else {
             snprintf(info, sizeof info,
-                "zoom=%.2fx  boxes=%d  | drag=new pinch=zoom +/-=5x@cursor-anchor scroll=pan W=wave I=ch P=pdf T=label S=save L=load ,./<>=color R=auto-color 0=reset Del=del-hover Q=quit",
+                "zoom=%.2fx  boxes=%d  | drag=new pinch=zoom +/-=5x@cursor-anchor scroll=pan W=wave I=ch F=filter P=pdf T=label S=save L=load ,./<>=color R=auto-color 0=reset Del=del-hover Q=quit",
                 (double) zoom, boxes.n);
         }
         draw_text(info, 6, sh - bar_h + STATUS_PT + 8, STATUS_PT, LIGHTGRAY);
@@ -2606,6 +3034,60 @@ int main(int argc, char **argv)
             int plot_w  = plot_x1 - plot_x0;
             int plot_h  = plot_y1 - plot_y0;
             if (plot_w > 16 && plot_h > 16 && wf_t_hi > wf_t_lo) {
+                // Measurement-drag input + render. LMB press inside the
+                // plot rect anchors a TIME (not a screen-x), so a
+                // pinch-zoom or pan mid-drag still reads the right
+                // duration. The rectangle paints behind everything else
+                // in the panel — drawn first, then the traces sit on
+                // top. Mouse-up clears the drag.
+                int in_wf_plot = (int) m.x >= plot_x0
+                              && (int) m.x <  plot_x1
+                              && (int) m.y >= plot_y0
+                              && (int) m.y <  plot_y1;
+                if (in_wf_plot && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+                    double frac = ((double) m.x - plot_x0) / (double) plot_w;
+                    wf_drag_t_anchor = wf_t_lo
+                        + frac * (wf_t_hi - wf_t_lo);
+                    wf_drag = 1;
+                }
+                if (wf_drag && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
+                    wf_drag = 0;
+                }
+                if (wf_drag) {
+                    double frac_now = ((double) m.x - plot_x0)
+                                    / (double) plot_w;
+                    if (frac_now < 0.0) frac_now = 0.0;
+                    if (frac_now > 1.0) frac_now = 1.0;
+                    double t_now = wf_t_lo
+                        + frac_now * (wf_t_hi - wf_t_lo);
+                    double frac_anchor = (wf_drag_t_anchor - wf_t_lo)
+                        / (wf_t_hi - wf_t_lo);
+                    if (frac_anchor < 0.0) frac_anchor = 0.0;
+                    if (frac_anchor > 1.0) frac_anchor = 1.0;
+                    int x_anchor = plot_x0
+                        + (int)(frac_anchor * plot_w + 0.5);
+                    int x_now    = plot_x0
+                        + (int)(frac_now    * plot_w + 0.5);
+                    int x_lo = (x_anchor < x_now) ? x_anchor : x_now;
+                    int x_hi = (x_anchor < x_now) ? x_now : x_anchor;
+                    DrawRectangle(x_lo, plot_y0,
+                                  x_hi - x_lo, plot_h,
+                                  (Color){90, 110, 150, 70});
+                    char dbuf[64];
+                    fmt_duration_auto(t_now - wf_drag_t_anchor,
+                                      dbuf, sizeof dbuf);
+                    int dpt = 18;
+                    int dw  = measure_text(dbuf, dpt);
+                    int tx  = (x_lo + x_hi) / 2 - dw / 2;
+                    int ty  = plot_y0 + 6;
+                    if (tx < plot_x0)            tx = plot_x0;
+                    if (tx + dw > plot_x1)       tx = plot_x1 - dw;
+                    DrawRectangle(tx - 4, ty - 2, dw + 8, dpt + 4,
+                                  (Color){0, 0, 0, 180});
+                    draw_text(dbuf, tx, ty, dpt,
+                              (Color){240, 240, 250, 255});
+                }
+
                 // Sample bounds.
                 int64_t i_lo = (int64_t)(wf_t_lo * iqb.samp_rate);
                 int64_t i_hi = (int64_t)(wf_t_hi * iqb.samp_rate);
@@ -2613,14 +3095,22 @@ int main(int argc, char **argv)
                 if (i_hi > (int64_t) iqb.n_pairs) i_hi = iqb.n_pairs;
                 int64_t n_pairs_vis = i_hi - i_lo;
 
+                // When the F-toggle is on and the worker has finished,
+                // read from the filtered IQ buffer; otherwise use the
+                // raw one. The two buffers are identical-length so the
+                // index math stays the same.
+                const int16_t *display_iq =
+                    (filter_show && filter_built && filtered_iq != NULL)
+                    ? filtered_iq : iqb.samples;
+
                 // Find the magnitude scale (auto). Take the max |I|,|Q|.
                 int amp_max = 1;
                 if (n_pairs_vis > 0) {
                     int64_t step = (n_pairs_vis > 4096)
                         ? n_pairs_vis / 2048 : 1;
                     for (int64_t k = i_lo; k < i_hi; k += step) {
-                        int I = iqb.samples[k * 2 + 0];
-                        int Q = iqb.samples[k * 2 + 1];
+                        int I = display_iq[k * 2 + 0];
+                        int Q = display_iq[k * 2 + 1];
                         if (abs(I) > amp_max) amp_max = abs(I);
                         if (abs(Q) > amp_max) amp_max = abs(Q);
                     }
@@ -2685,8 +3175,8 @@ int main(int argc, char **argv)
                             int x = plot_x0
                                   + (int)((t - wf_t_lo) / span * plot_w);
                             if (x < plot_x0 || x > plot_x1) continue;
-                            int yI = mid_y - (int)(iqb.samples[k*2+0] * y_scale);
-                            int yQ = mid_y - (int)(iqb.samples[k*2+1] * y_scale);
+                            int yI = mid_y - (int)(display_iq[k*2+0] * y_scale);
+                            int yQ = mid_y - (int)(display_iq[k*2+1] * y_scale);
                             // Underlay Q in violet first, I in cyan on top.
                             if (show_q && prev_xq >= 0)
                                 DrawLine(prev_xq, prev_yq, x, yQ, (Color){200,90,220,200});
@@ -2705,8 +3195,8 @@ int main(int argc, char **argv)
                             int iMin =  INT_MAX, iMax = INT_MIN;
                             int qMin =  INT_MAX, qMax = INT_MIN;
                             for (int64_t k = s0; k < s1; ++k) {
-                                int I = iqb.samples[k*2+0];
-                                int Q = iqb.samples[k*2+1];
+                                int I = display_iq[k*2+0];
+                                int Q = display_iq[k*2+1];
                                 if (I < iMin) iMin = I;
                                 if (I > iMax) iMax = I;
                                 if (Q < qMin) qMin = Q;
@@ -2877,6 +3367,14 @@ int main(int argc, char **argv)
 
         EndDrawing();
     }
+
+    // Make sure the band-pass-filter worker finishes before we let
+    // iqb.samples drop out from under it.
+    if (filter_building) {
+        pthread_join(filter_thread, NULL);
+        filter_building = 0;
+    }
+    if (filtered_iq != NULL) free(filtered_iq);
 
     for (int t = 0; t < n_tiles; ++t) {
         if (tiles[t].id != 0) UnloadTexture(tiles[t]);
