@@ -2281,11 +2281,20 @@ int main(int argc, char **argv)
             int spec_screen_w_in = decode_open
                 ? (sw - decode_panel_w) : sw;
             if (spec_screen_w_in < 64) spec_screen_w_in = 64;
+            // Time math must match the renderer's spec_bot_y_screen:
+            // both W and K derive their time range from the W-panel
+            // slot (sh - wf_panel_h) so panels stay synchronised.
+            // The K panel happens to be taller and overlaps the
+            // bottom of the spec visually; using decmode_panel_h
+            // here would give a different visible time range than
+            // the renderer and the zoom-to-cursor anchor would
+            // drift accordingly.
             int bar_h_in = 2 * (STATUS_PT + 6);
-            int spec_screen_h_in = bottom_panel_h_now > 0
-                ? (sh - bottom_panel_h_now)
+            int spec_bot_y_in = bottom_panel_h_now > 0
+                ? (sh - wf_panel_h)
                 : (sh - bar_h_in);
-            if (spec_screen_h_in < 32) spec_screen_h_in = 32;
+            if (spec_bot_y_in < 32) spec_bot_y_in = 32;
+            int spec_screen_h_in = spec_bot_y_in;
             double vis_h_in = (double) spec_screen_h_in
                               / (double) zoom;
             double vt_top = (double) view_y;
