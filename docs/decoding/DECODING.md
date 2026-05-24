@@ -13,32 +13,32 @@ encoder that traded raw data rate for robustness.
 
 ```
 RF wave at ~436 MHz
-  │  antenna + analog frontend + ADC + I/Q mixer
-  ▼
+  |  antenna + analog frontend + ADC + I/Q mixer
+  v
 complex baseband samples (96 kHz)
-  │  FM discriminator
-  ▼
+  |  FM discriminator
+  v
 real-valued "instantaneous frequency" stream
-  │  matched filter
-  ▼
+  |  matched filter
+  v
 soft symbol estimates
-  │  timing recovery + slicer
-  ▼
+  |  timing recovery + slicer
+  v
 raw bits
-  │  sync word (ASM) search
-  ▼
+  |  sync word (ASM) search
+  v
 framed bits
-  │  Golay(24,12) length decode
-  ▼
+  |  Golay(24,12) length decode
+  v
 known-length bytes
-  │  CCSDS descrambler
-  ▼
+  |  CCSDS descrambler
+  v
 plaintext bytes
-  │  Reed-Solomon(255,223) decoder
-  ▼
+  |  Reed-Solomon(255,223) decoder
+  v
 error-corrected payload
-  │  CSP packet parser
-  ▼
+  |  CSP packet parser
+  v
 header fields + application string ("Hello from CalgaryToSpace FrontierSat")
 ```
 
