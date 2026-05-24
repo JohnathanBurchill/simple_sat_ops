@@ -3166,13 +3166,19 @@ int main(int argc, char **argv)
         // using the FRACTION of the spec height (not a discrete row
         // index) to avoid an off-by-one row-width gap at each end.
         int bar_h_for_wf = 2 * (STATUS_PT + 6);
-        // Either bottom panel (W or K) shifts the spec lower edge up
-        // by its height; otherwise it's bar_h above the bottom of the
-        // window. wf_y0 already accounts for wf_panel_h.
+        // Time-range derivation uses the W-panel's slot whether W or
+        // K is open, so the time series and decode panels always
+        // cover the same time range — operators can switch between
+        // them and compare features by time without the bottom of
+        // the range shifting. (The K panel is physically taller so
+        // its top edge sits inside the W-slot region; the time math
+        // pretends the spec extends down to the W bottom either way.)
+        // When neither bottom panel is open, the spec stretches down
+        // to the status bar and we use that.
         int spec_bot_y_screen =
-            wf_open ? wf_y0
-          : decmode_open ? (sh - decmode_panel_h)
-                         : (sh - bar_h_for_wf);
+            (wf_open || decmode_open)
+                ? wf_y0
+                : (sh - bar_h_for_wf);
         double vis_top_img = (double) view_y;
         double vis_bot_img = (double) view_y
                            + (double) spec_bot_y_screen / (double) zoom;
@@ -3779,10 +3785,9 @@ int main(int argc, char **argv)
                 const int T_PT   = 17;
                 int sps   = decmode_input_sps;
                 double samp_rate_d = (double) iqb.samp_rate;
-                // Time-domain stages (0..5) all share the same x-axis
-                // (visible spectrogram window). Stage 6's x-axis is
-                // the bit-offset of the sliding ASM window.
-                int is_bit_axis = (decmode_stage == 6);
+                // All stages share the same time x-axis (the
+                // visible spectrogram window). Stage 6 additionally
+                // gets a bit-number axis below the time labels.
                 double span_s = wf_t_hi - wf_t_lo;
 
                 // Stage 4 (eye) wants a 1:1 plot rect — collapse the
@@ -4094,14 +4099,26 @@ int main(int argc, char **argv)
                     draw_text("accept (≤4)", body_x1 - 100,
                               y_thr + 4, AMP_PT,
                               (Color){220, 80, 80, 220});
-                    // Trace
-                    if (n_h > 0) {
+                    // Trace — x is the TIME of each Hamming-trace
+                    // strobe, so the ASM dip sits at the same time
+                    // coordinate as the matching IQ feature in
+                    // stages 0..5. strobe_t is in MF-sample units;
+                    // the +30 (LPF) + 1 (discrim) + sps-1 (MF) offset
+                    // shifts MF-index ↔ IQ-index, but for visual
+                    // alignment with the spectrogram a sub-millisecond
+                    // shift is invisible so we drop it.
+                    if (n_h > 0 && decmode_diag.strobe_t != NULL) {
                         const uint8_t *h = decmode_diag.asm_hamming;
-                        if ((int64_t) n_h <= (int64_t) body_w) {
+                        const double *st = decmode_diag.strobe_t;
+                        double sr = samp_rate_d;
+                        // Sparse: line-to-line plot.
+                        if ((int64_t) n_h <= (int64_t) body_w * 2) {
                             int prev_x = -1, prev_y = 0;
                             for (size_t k = 0; k < n_h; ++k) {
                                 int x = body_x0
-                                      + (int)((double) k / (double) n_h * body_w);
+                                      + (int)(st[k] / (sr * span_s) * body_w);
+                                if (x < body_x0) { prev_x = -1; continue; }
+                                if (x > body_x1) break;
                                 int y = y_bot
                                       - (int)((double) h[k] / 32.0 * h_axis);
                                 if (prev_x >= 0)
@@ -4110,35 +4127,49 @@ int main(int argc, char **argv)
                                 prev_x = x; prev_y = y;
                             }
                         } else {
-                            for (int x = 0; x < body_w; ++x) {
-                                int64_t s0 = (int64_t) x * (int64_t) n_h / body_w;
-                                int64_t s1 = (int64_t)(x+1) * (int64_t) n_h / body_w;
-                                if (s1 <= s0) s1 = s0 + 1;
-                                if (s1 > (int64_t) n_h) s1 = n_h;
-                                int mn = 33;
-                                for (int64_t k = s0; k < s1; ++k)
-                                    if (h[k] < mn) mn = h[k];
-                                int xpx = body_x0 + x;
-                                int y = y_bot
-                                      - (int)((double) mn / 32.0 * h_axis);
-                                DrawLine(xpx, y_bot, xpx, y,
-                                    (Color){120, 180, 220, 180});
+                            // Dense: per-pixel min/max binning.
+                            int *col_min = malloc((size_t) body_w * sizeof(int));
+                            int *col_max = malloc((size_t) body_w * sizeof(int));
+                            if (col_min != NULL && col_max != NULL) {
+                                for (int x = 0; x < body_w; ++x) {
+                                    col_min[x] = 33;
+                                    col_max[x] = -1;
+                                }
+                                for (size_t k = 0; k < n_h; ++k) {
+                                    int x = (int)(st[k] / (sr * span_s) * body_w);
+                                    if (x < 0 || x >= body_w) continue;
+                                    if (h[k] < col_min[x]) col_min[x] = h[k];
+                                    if (h[k] > col_max[x]) col_max[x] = h[k];
+                                }
+                                for (int x = 0; x < body_w; ++x) {
+                                    if (col_min[x] > 32) continue;
+                                    int y_mn = y_bot
+                                        - (int)((double) col_min[x] / 32.0 * h_axis);
+                                    int y_mx = y_bot
+                                        - (int)((double) col_max[x] / 32.0 * h_axis);
+                                    DrawLine(body_x0 + x, y_mn,
+                                             body_x0 + x, y_mx,
+                                             (Color){120, 180, 220, 180});
+                                }
                             }
+                            free(col_min); free(col_max);
                         }
                         // Marker at the found ASM offset
                         if (decmode_diag.asm_offset != (size_t) -1
                             && decmode_diag.asm_offset < n_h) {
                             int x = body_x0
-                                  + (int)((double) decmode_diag.asm_offset
-                                          / (double) n_h * body_w);
-                            DrawLine(x, body_y0, x, body_y1, YELLOW);
-                            char buf[64];
-                            snprintf(buf, sizeof buf,
-                                "ASM @ bit %zu  (Δ=%d)",
-                                decmode_diag.asm_offset,
-                                decmode_diag.asm_dist);
-                            draw_text(buf, x + 6, body_y0 + 4,
-                                      AMP_PT, YELLOW);
+                                  + (int)(st[decmode_diag.asm_offset]
+                                          / (sr * span_s) * body_w);
+                            if (x >= body_x0 && x <= body_x1) {
+                                DrawLine(x, body_y0, x, body_y1, YELLOW);
+                                char buf[64];
+                                snprintf(buf, sizeof buf,
+                                    "ASM @ bit %zu  (Δ=%d)",
+                                    decmode_diag.asm_offset,
+                                    decmode_diag.asm_dist);
+                                draw_text(buf, x + 6, body_y0 + 4,
+                                          AMP_PT, YELLOW);
+                            }
                         }
                     }
                 }
@@ -4146,9 +4177,9 @@ int main(int argc, char **argv)
                 DrawRectangleLines(body_x0, body_y0,
                                    body_w, body_h, DARKGRAY);
 
-                // Time-axis ticks (stages 0..5) — same renderer the W
-                // panel uses, anchored at the body width / position.
-                if (!is_bit_axis) {
+                // Time-axis ticks — same renderer the W panel uses,
+                // shared by all stages.
+                {
                     double raw_step = span_s / 6.0;
                     double mag = pow(10.0, floor(log10(raw_step)));
                     double mul = raw_step / mag;
@@ -4171,17 +4202,53 @@ int main(int argc, char **argv)
                         draw_text(buf, x - tw/2, body_y1 + 8,
                                   T_PT, GRAY);
                     }
-                } else {
-                    // Stage 6 — x-axis is bit offset. Label endpoints.
-                    char buf[24];
-                    snprintf(buf, sizeof buf, "bit 0");
-                    draw_text(buf, body_x0, body_y1 + 8, T_PT, GRAY);
-                    snprintf(buf, sizeof buf, "bit %zu",
-                        decmode_diag.n_strobes
-                        ? decmode_diag.n_strobes - 32 : 0);
-                    int tw = measure_text(buf, T_PT);
-                    draw_text(buf, body_x1 - tw, body_y1 + 8,
-                              T_PT, GRAY);
+                }
+
+                // Stage 6 also gets a secondary bit-number axis below
+                // the time labels. Tick step is the largest power-of-2
+                // multiple of 1 such that 5..20 ticks fit; 8 is the
+                // default when it fits, but at very wide zoom we
+                // coarsen to 16/32/64/... and at very narrow zoom we
+                // refine to 4/2/1.
+                if (decmode_stage == 6
+                    && decmode_diag.n_strobes >= 32
+                    && decmode_diag.strobe_t != NULL) {
+                    size_t n_h = decmode_diag.n_strobes - 31;
+                    const double *st = decmode_diag.strobe_t;
+                    double sr = samp_rate_d;
+                    static const int cands[] = {
+                        2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1
+                    };
+                    int n_cands = (int)(sizeof cands / sizeof cands[0]);
+                    int step_bits = 8;
+                    for (int i = 0; i < n_cands; ++i) {
+                        int t = (int)(n_h / (size_t) cands[i]);
+                        if (t >= 5 && t <= 20) {
+                            step_bits = cands[i];
+                            break;
+                        }
+                    }
+                    int bit_y_line = body_y1 + 26;
+                    DrawLine(body_x0, bit_y_line, body_x1, bit_y_line,
+                             (Color){60, 80, 110, 200});
+                    for (size_t b = 0; b < n_h; b += (size_t) step_bits) {
+                        int x = body_x0
+                              + (int)(st[b] / (sr * span_s) * body_w);
+                        if (x < body_x0 || x > body_x1) continue;
+                        DrawLine(x, bit_y_line - 4, x, bit_y_line,
+                                 (Color){120, 160, 200, 220});
+                        char buf[32];
+                        snprintf(buf, sizeof buf, "%zu", b);
+                        int tw = measure_text(buf, T_PT - 2);
+                        draw_text(buf, x - tw/2, bit_y_line + 2,
+                                  T_PT - 2, (Color){170, 200, 220, 220});
+                    }
+                    // Axis caption to the left.
+                    const char *cap = "bit";
+                    int capw = measure_text(cap, T_PT - 2);
+                    draw_text(cap, body_x0 - 6 - capw,
+                              bit_y_line + 2, T_PT - 2,
+                              (Color){170, 200, 220, 220});
                 }
             } else {
                 // Either no data yet, or the window is too small.
