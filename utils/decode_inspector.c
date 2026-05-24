@@ -4406,6 +4406,106 @@ int main(int argc, char **argv)
                                           AMP_PT, YELLOW);
                             }
                         }
+                        // Bit-by-bit comparison strip near the ASM
+                        // marker. Top row shows the expected pattern
+                        // (preamble bits in gray, ASM bits in white);
+                        // bottom row shows the actual decoded bits,
+                        // green where they match expected and red
+                        // where they don't. Cells follow the strobe
+                        // x projection so they align with the trace.
+                        if (decmode_diag.asm_offset != (size_t) -1
+                            && decmode_diag.bits != NULL) {
+                            const size_t off = decmode_diag.asm_offset;
+                            const uint8_t *bs = decmode_diag.bits;
+                            const int n_pre = 16;
+                            const int n_asm = 32;
+                            const uint32_t ASM_EXPECTED = 0x930B51DEu;
+                            int cell_h = 14;
+                            int act_y = y_bot - cell_h - 2;
+                            int exp_y = act_y - cell_h - 2;
+                            Color exp_pre_bg = {110, 110, 120, 255};
+                            Color exp_asm_bg = {235, 235, 240, 255};
+                            Color edge       = {30,  30,  40,  255};
+                            Color match_bg   = {70,  190, 110, 255};
+                            Color miss_bg    = {220, 90,  100, 255};
+                            for (int i = 0; i < n_pre + n_asm; ++i) {
+                                int is_asm = (i >= n_pre);
+                                int bit_idx = is_asm
+                                    ? (int) off + (i - n_pre)
+                                    : (int) off - n_pre + i;
+                                if (bit_idx < 0) continue;
+                                if (bit_idx
+                                    >= (int) decmode_diag.n_strobes)
+                                    continue;
+                                double t = st[bit_idx];
+                                int xc = body_x0
+                                       + (int)(t / (sr * span_s)
+                                               * body_w);
+                                if (xc < body_x0 - 2
+                                    || xc > body_x1 + 2) continue;
+                                // Cell width from strobe spacing,
+                                // clamped so a wide zoom doesn't
+                                // make the strip unreadable.
+                                int cell_w = 8;
+                                if (bit_idx + 1
+                                    < (int) decmode_diag.n_strobes) {
+                                    double t2 = st[bit_idx + 1];
+                                    int x2 = body_x0
+                                           + (int)(t2 / (sr * span_s)
+                                                   * body_w);
+                                    cell_w = x2 - xc;
+                                    if (cell_w < 4)  cell_w = 4;
+                                    if (cell_w > 22) cell_w = 22;
+                                }
+                                int xl = xc - cell_w / 2;
+                                int expected;
+                                if (is_asm) {
+                                    expected = (ASM_EXPECTED
+                                        >> (31 - (i - n_pre))) & 1u;
+                                } else {
+                                    // off is byte-aligned and the
+                                    // last preamble byte is 0xAA.
+                                    // Distance back: 1=LSB of 0xAA=0,
+                                    // 2=1, 3=0, ... → odd dist=0,
+                                    // even dist=1.
+                                    int dist_back = (int) off - bit_idx;
+                                    expected = (dist_back & 1) ? 0 : 1;
+                                }
+                                uint8_t actual = bs[bit_idx] & 1u;
+                                Color exp_bg = is_asm
+                                    ? exp_asm_bg : exp_pre_bg;
+                                Color exp_tx = is_asm
+                                    ? (Color){20, 20, 30, 255}
+                                    : (Color){225, 225, 235, 255};
+                                DrawRectangle(xl, exp_y,
+                                              cell_w, cell_h, exp_bg);
+                                DrawRectangleLines(xl, exp_y,
+                                              cell_w, cell_h, edge);
+                                Color act_bg = (actual == expected)
+                                    ? match_bg : miss_bg;
+                                DrawRectangle(xl, act_y,
+                                              cell_w, cell_h, act_bg);
+                                DrawRectangleLines(xl, act_y,
+                                              cell_w, cell_h, edge);
+                                if (cell_w >= 9) {
+                                    int tp = AMP_PT - 4;
+                                    char b[4];
+                                    snprintf(b, sizeof b, "%d",
+                                             expected);
+                                    int bw = measure_text(b, tp);
+                                    draw_text(b, xc - bw / 2,
+                                              exp_y + (cell_h - tp)/2,
+                                              tp, exp_tx);
+                                    snprintf(b, sizeof b, "%d",
+                                             actual);
+                                    bw = measure_text(b, tp);
+                                    draw_text(b, xc - bw / 2,
+                                              act_y + (cell_h - tp)/2,
+                                              tp,
+                                              (Color){20, 20, 30, 255});
+                                }
+                            }
+                        }
                     }
                 }
 
