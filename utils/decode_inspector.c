@@ -2184,9 +2184,13 @@ int main(int argc, char **argv)
     Vector2 drag_start = {0, 0};
     // Waveform-panel measurement drag — anchored in TIME so the
     // rectangle still reads the right duration even if the operator
-    // pinches/scrolls mid-drag. Cleared on mouse-up.
+    // pinches/scrolls mid-drag. Cleared on mouse-up. Shared by the
+    // W panel and the K panel's time-domain stages (0/1/2/3/5/6).
+    // wf_drag_shift = 1 when the drag started with Shift held; on
+    // mouse-up the spectrogram zooms to the selected time range.
     int    wf_drag           = 0;
     double wf_drag_t_anchor  = 0.0;
+    int    wf_drag_shift     = 0;
 
     // Band-pass-filter view (F key). Two stages: HPF in the original
     // frame (cuts everything below filter_lower_hz around DC, i.e.
@@ -2382,7 +2386,11 @@ int main(int argc, char **argv)
                 || decmode_stage == 10);
         if (stage_eats_panel_input && (wheel_v.x != 0.0f
                                        || wheel_v.y != 0.0f)) {
-            int delta = (int)((wheel_v.x + wheel_v.y) * 2.0f);
+            // Trackpad swipe-right shows EARLIER bytes (smaller
+            // offset); swipe-left shows later ones. Matches the
+            // "drag the page" convention rather than "drag the
+            // viewport".
+            int delta = -(int)((wheel_v.x + wheel_v.y) * 2.0f);
             if (decmode_stage == 8) {
                 decmode_descr_view_off += delta;
                 if (decmode_descr_view_off < 0)
@@ -2496,10 +2504,12 @@ int main(int argc, char **argv)
                     // Both axes pan time on the panel — the panel's
                     // time axis is left-to-right so wheel.x is the
                     // natural pan, and wheel.y carries on working
-                    // for users with vertical-only mice. Freq does
-                    // not get a pan from the panel; the panel has
-                    // no freq axis to pan along.
-                    view_y -= (wheel_v.x + wheel_v.y) * 12.0f / zoom;
+                    // for users with vertical-only mice. Sign
+                    // matches the "drag the page" convention:
+                    // swipe-right reveals earlier time (panel view
+                    // moves left → see content that was to the
+                    // left). Freq does not pan from the panel.
+                    view_y += (wheel_v.x + wheel_v.y) * 12.0f / zoom;
                 }
             }
         }
@@ -4024,9 +4034,40 @@ int main(int argc, char **argv)
                     wf_drag_t_anchor = wf_t_lo
                         + frac * (wf_t_hi - wf_t_lo);
                     wf_drag = 1;
+                    wf_drag_shift = (IsKeyDown(KEY_LEFT_SHIFT)
+                                  || IsKeyDown(KEY_RIGHT_SHIFT));
                 }
                 if (wf_drag && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
+                    if (wf_drag_shift) {
+                        double frac_end = ((double) m.x - plot_x0)
+                                          / (double) plot_w;
+                        if (frac_end < 0.0) frac_end = 0.0;
+                        if (frac_end > 1.0) frac_end = 1.0;
+                        double t_end = wf_t_lo
+                            + frac_end * (wf_t_hi - wf_t_lo);
+                        double t_lo_z = (wf_drag_t_anchor < t_end)
+                            ? wf_drag_t_anchor : t_end;
+                        double t_hi_z = (wf_drag_t_anchor < t_end)
+                            ? t_end : wf_drag_t_anchor;
+                        if (t_hi_z - t_lo_z > 1e-6) {
+                            double new_vis_h = (t_hi_z - t_lo_z)
+                                * (double) spec_h / duration_s;
+                            int sb_y = (wf_open || decmode_open)
+                                ? (sh - wf_panel_h)
+                                : (sh - 2 * (STATUS_PT + 6));
+                            if (sb_y < 32) sb_y = 32;
+                            float new_zoom = (float)
+                                ((double) sb_y / new_vis_h);
+                            if (new_zoom < 0.1f)        new_zoom = 0.1f;
+                            if (new_zoom > 1.0e6f)      new_zoom = 1.0e6f;
+                            zoom = new_zoom;
+                            view_y = (float)(WF_TM
+                                + (1.0 - t_hi_z / duration_s)
+                                  * (double) spec_h);
+                        }
+                    }
                     wf_drag = 0;
+                    wf_drag_shift = 0;
                 }
                 if (wf_drag) {
                     double frac_now = ((double) m.x - plot_x0)
@@ -4045,12 +4086,22 @@ int main(int argc, char **argv)
                         + (int)(frac_now    * plot_w + 0.5);
                     int x_lo = (x_anchor < x_now) ? x_anchor : x_now;
                     int x_hi = (x_anchor < x_now) ? x_now : x_anchor;
+                    Color rect_col = wf_drag_shift
+                        ? (Color){180, 140, 90, 90}
+                        : (Color){90, 110, 150, 70};
                     DrawRectangle(x_lo, plot_y0,
-                                  x_hi - x_lo, plot_h,
-                                  (Color){90, 110, 150, 70});
-                    char dbuf[64];
-                    fmt_duration_auto(t_now - wf_drag_t_anchor,
-                                      dbuf, sizeof dbuf);
+                                  x_hi - x_lo, plot_h, rect_col);
+                    char dbuf[128];
+                    if (wf_drag_shift) {
+                        char dtxt[64];
+                        fmt_duration_auto(t_now - wf_drag_t_anchor,
+                                          dtxt, sizeof dtxt);
+                        snprintf(dbuf, sizeof dbuf,
+                                 "%s   ↳ zoom on release", dtxt);
+                    } else {
+                        fmt_duration_auto(t_now - wf_drag_t_anchor,
+                                          dbuf, sizeof dbuf);
+                    }
                     int dpt = 18;
                     int dw  = measure_text(dbuf, dpt);
                     int tx  = (x_lo + x_hi) / 2 - dw / 2;
@@ -4417,6 +4468,124 @@ int main(int argc, char **argv)
                 const int T_PT   = 17;
                 int sps   = decmode_input_sps;
                 double samp_rate_d = (double) iqb.samp_rate;
+                // Measurement-drag input + render — only on the
+                // time-domain stages (0/1/2/3/5/6). Same semantics
+                // as the W panel: anchor in TIME, render a
+                // translucent rectangle behind the traces with a
+                // duration label across the top. Shift-drag zooms
+                // the spectrogram to the selected time range on
+                // mouse-up.
+                int stage_has_time_axis =
+                    (decmode_stage == 0 || decmode_stage == 1
+                     || decmode_stage == 2 || decmode_stage == 3
+                     || decmode_stage == 5 || decmode_stage == 6);
+                if (stage_has_time_axis) {
+                    int in_k_plot = (int) m.x >= plot_x0
+                                 && (int) m.x <  plot_x1
+                                 && (int) m.y >= plot_y0
+                                 && (int) m.y <  plot_y1;
+                    if (in_k_plot
+                        && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+                        double frac = ((double) m.x - plot_x0)
+                                      / (double) plot_w;
+                        wf_drag_t_anchor = wf_t_lo
+                            + frac * (wf_t_hi - wf_t_lo);
+                        wf_drag = 1;
+                        wf_drag_shift =
+                            (IsKeyDown(KEY_LEFT_SHIFT)
+                             || IsKeyDown(KEY_RIGHT_SHIFT));
+                    }
+                    if (wf_drag
+                        && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
+                        if (wf_drag_shift) {
+                            double frac_end =
+                                ((double) m.x - plot_x0)
+                                / (double) plot_w;
+                            if (frac_end < 0.0) frac_end = 0.0;
+                            if (frac_end > 1.0) frac_end = 1.0;
+                            double t_end = wf_t_lo
+                                + frac_end * (wf_t_hi - wf_t_lo);
+                            double t_lo_z =
+                                (wf_drag_t_anchor < t_end)
+                                ? wf_drag_t_anchor : t_end;
+                            double t_hi_z =
+                                (wf_drag_t_anchor < t_end)
+                                ? t_end : wf_drag_t_anchor;
+                            if (t_hi_z - t_lo_z > 1e-6) {
+                                double new_vis_h =
+                                    (t_hi_z - t_lo_z)
+                                    * (double) spec_h / duration_s;
+                                int sb_y =
+                                    (wf_open || decmode_open)
+                                    ? (sh - wf_panel_h)
+                                    : (sh - 2 * (STATUS_PT + 6));
+                                if (sb_y < 32) sb_y = 32;
+                                float new_zoom = (float)
+                                    ((double) sb_y / new_vis_h);
+                                if (new_zoom < 0.1f)
+                                    new_zoom = 0.1f;
+                                if (new_zoom > 1.0e6f)
+                                    new_zoom = 1.0e6f;
+                                zoom = new_zoom;
+                                view_y = (float)(WF_TM
+                                    + (1.0 - t_hi_z / duration_s)
+                                      * (double) spec_h);
+                            }
+                        }
+                        wf_drag = 0;
+                        wf_drag_shift = 0;
+                    }
+                    if (wf_drag) {
+                        double frac_now =
+                            ((double) m.x - plot_x0)
+                            / (double) plot_w;
+                        if (frac_now < 0.0) frac_now = 0.0;
+                        if (frac_now > 1.0) frac_now = 1.0;
+                        double t_now = wf_t_lo
+                            + frac_now * (wf_t_hi - wf_t_lo);
+                        double frac_anchor =
+                            (wf_drag_t_anchor - wf_t_lo)
+                            / (wf_t_hi - wf_t_lo);
+                        if (frac_anchor < 0.0) frac_anchor = 0.0;
+                        if (frac_anchor > 1.0) frac_anchor = 1.0;
+                        int x_anchor = plot_x0
+                            + (int)(frac_anchor * plot_w + 0.5);
+                        int x_now    = plot_x0
+                            + (int)(frac_now    * plot_w + 0.5);
+                        int x_lo = (x_anchor < x_now)
+                            ? x_anchor : x_now;
+                        int x_hi = (x_anchor < x_now)
+                            ? x_now : x_anchor;
+                        Color rect_col = wf_drag_shift
+                            ? (Color){180, 140, 90, 90}
+                            : (Color){90, 110, 150, 70};
+                        DrawRectangle(x_lo, plot_y0,
+                                      x_hi - x_lo, plot_h,
+                                      rect_col);
+                        char dbuf[128];
+                        if (wf_drag_shift) {
+                            char dtxt[64];
+                            fmt_duration_auto(t_now - wf_drag_t_anchor,
+                                              dtxt, sizeof dtxt);
+                            snprintf(dbuf, sizeof dbuf,
+                                     "%s   ↳ zoom on release", dtxt);
+                        } else {
+                            fmt_duration_auto(t_now - wf_drag_t_anchor,
+                                              dbuf, sizeof dbuf);
+                        }
+                        int dpt = 18;
+                        int dw  = measure_text(dbuf, dpt);
+                        int tx  = (x_lo + x_hi) / 2 - dw / 2;
+                        int ty  = plot_y0 + 6;
+                        if (tx < plot_x0)       tx = plot_x0;
+                        if (tx + dw > plot_x1)  tx = plot_x1 - dw;
+                        DrawRectangle(tx - 4, ty - 2,
+                                      dw + 8, dpt + 4,
+                                      (Color){0, 0, 0, 180});
+                        draw_text(dbuf, tx, ty, dpt,
+                                  (Color){240, 240, 250, 255});
+                    }
+                }
                 // All stages share the same time x-axis (the
                 // visible spectrogram window). Stage 6 additionally
                 // gets a bit-number axis below the time labels.
