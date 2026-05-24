@@ -2166,24 +2166,29 @@ int main(int argc, char **argv)
                 snprintf(status, sizeof status,
                     "decode: window too small (%.3fs)", t1 - t0);
             } else {
-                char tmp_iq[128], tmp_txt[128];
+                // Source: filtered IQ when F-toggle is on AND the
+                // filter worker has finished; raw IQ otherwise.
+                // The temp filename includes the source tag so it's
+                // visible from the rx_replay command line and any
+                // outside inspection of /tmp.
+                const int16_t *src_iq =
+                    (filter_show && filter_built && filtered_iq != NULL)
+                    ? filtered_iq : iqb.samples;
+                const char *src_label =
+                    (src_iq == filtered_iq) ? "filt" : "raw";
+                char tmp_iq[160], tmp_txt[160];
                 snprintf(tmp_iq, sizeof tmp_iq,
-                    "/tmp/iqa_decode_%d.iq", (int) getpid());
+                    "/tmp/iqa_decode_%d_%s.iq",
+                    (int) getpid(), src_label);
                 snprintf(tmp_txt, sizeof tmp_txt,
-                    "/tmp/iqa_decode_%d.txt", (int) getpid());
+                    "/tmp/iqa_decode_%d_%s.txt",
+                    (int) getpid(), src_label);
                 FILE *fo = fopen(tmp_iq, "wb");
                 if (fo == NULL) {
                     snprintf(status, sizeof status,
                         "decode: open %s: %s",
                         tmp_iq, strerror(errno));
                 } else {
-                    // Source: filtered IQ when F-toggle is on AND the
-                    // filter worker has finished; raw IQ otherwise.
-                    const int16_t *src_iq =
-                        (filter_show && filter_built && filtered_iq != NULL)
-                        ? filtered_iq : iqb.samples;
-                    const char *src_label =
-                        (src_iq == filtered_iq) ? "filtered" : "raw";
                     size_t want_pairs = (size_t) n_pairs_dec;
                     fwrite(src_iq + i_lo * 2,
                            sizeof(int16_t),
