@@ -2297,8 +2297,12 @@ int main(int argc, char **argv)
     size_t     decmode_descr_n          = 0;
     // Byte offset shown at the left edge of the descrambler grid.
     // Driven by wheel input while stage 8 is open; clamped to
-    // [0, decmode_descr_n - 1] each frame.
+    // [0, decmode_descr_n - max_cells] each frame. Persists across
+    // waterfall pan/zoom recomputes so scrolling doesn't snap back.
     int        decmode_descr_view_off   = 0;
+    // Byte-cell width in pixels. Pinch over the descrambler stage
+    // adjusts this; wheel scroll is independent.
+    float      decmode_descr_cell_w     = 30.0f;
 
     while (!WindowShouldClose()) {
         int sw = GetScreenWidth();
@@ -2337,13 +2341,15 @@ int main(int argc, char **argv)
         // just modify those.
         // Stage 8 (CCSDS descrambler) byte-grid: wheel.x / wheel.y
         // scroll the byte offset shown at the left edge of the
-        // grid, instead of panning time. Lets the operator scan
+        // grid, instead of panning time. Pinch resizes the byte
+        // cells instead of zooming time. Lets the operator scan
         // across the full payload (up to DECMODE_DESCR_CAP bytes)
-        // even when only ~50 cells fit on screen.
-        int stage_eats_wheel = in_panel_for_input
+        // and pick a readable cell size without time-axis
+        // interference.
+        int stage_eats_panel_input = in_panel_for_input
             && decmode_open && decmode_stage == 8;
-        if (stage_eats_wheel && (wheel_v.x != 0.0f
-                                 || wheel_v.y != 0.0f)) {
+        if (stage_eats_panel_input && (wheel_v.x != 0.0f
+                                       || wheel_v.y != 0.0f)) {
             decmode_descr_view_off +=
                 (int)((wheel_v.x + wheel_v.y) * 2.0f);
             if (decmode_descr_view_off < 0)
@@ -2353,7 +2359,13 @@ int main(int argc, char **argv)
             if (decmode_descr_view_off > max_off)
                 decmode_descr_view_off = max_off;
         }
-        if (in_panel_for_input && !stage_eats_wheel
+        if (stage_eats_panel_input && pinch != 0.0f) {
+            float new_cw = decmode_descr_cell_w * expf(pinch);
+            if (new_cw < 12.0f)  new_cw = 12.0f;
+            if (new_cw > 100.0f) new_cw = 100.0f;
+            decmode_descr_cell_w = new_cw;
+        }
+        if (in_panel_for_input && !stage_eats_panel_input
             && (pinch != 0.0f
                 || wheel_v.y != 0.0f
                 || wheel_v.x != 0.0f)) {
@@ -3730,7 +3742,12 @@ int main(int argc, char **argv)
                         // Golay length came back smaller than the
                         // cap, only descramble that many.
                         decmode_descr_n = 0;
-                        decmode_descr_view_off = 0;
+                        // decmode_descr_view_off intentionally
+                        // persists — operator-driven byte scroll
+                        // shouldn't snap back when the waterfall
+                        // recomputes from a pan/zoom event. The
+                        // renderer clamps it each frame against the
+                        // new buffer length.
                         if (decmode_diag.asm_offset != (size_t) -1
                             && decmode_diag.bits != NULL) {
                             size_t bbase =
@@ -4887,7 +4904,8 @@ int main(int argc, char **argv)
                     int avail_w  = body_w - 2 * margin_x;
                     int cell_h   = 26;
                     int gap_y    = 4;
-                    int cell_w   = 30;   // room for "FF"
+                    int cell_w   = (int) decmode_descr_cell_w;
+                    if (cell_w < 12) cell_w = 12;
                     int max_cells = (avail_w > 0)
                         ? (avail_w / cell_w) : 0;
                     if (max_cells > DECMODE_DESCR_CAP)
