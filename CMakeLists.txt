@@ -185,7 +185,7 @@ target_link_libraries(waterfall_core PUBLIC m)
 # Self-contained — no libpng or libz dependency (stored-DEFLATE PNG +
 # inlined radix-2 FFT). simple_sat_ops invokes it for `:spectrum N` and
 # end-of-pass renders when an IQ sidecar is available.
-add_executable(gen_waterfall utils/gen_waterfall.c)
+add_executable(gen_waterfall utils/gen_waterfall.c src/dsp/sw_nco.c)
 target_link_libraries(gen_waterfall PRIVATE waterfall_core m)
 list(APPEND SSO_TARGETS gen_waterfall)
 
@@ -217,7 +217,8 @@ if (RAYLIB_FOUND)
     # captures. Lets the operator mouse-draw time × freq boxes around
     # bursts they want to feed back into rx_replay --anchor-csv.
     set(DECODE_INSPECTOR_SRCS utils/decode_inspector.c utils/pdf_writer.c
-                          src/dsp/modem.c src/dsp/modem_fsk.c)
+                          src/dsp/modem.c src/dsp/modem_fsk.c
+                          src/dsp/sw_nco.c)
     if (APPLE)
         # raylib/GLFW drop NSEventTypeMagnify (trackpad pinch); this
         # ObjC shim installs a global NSEvent monitor and accumulates

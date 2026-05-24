@@ -44,6 +44,7 @@
 #include "modem.h"
 #include "modem_fsk.h"
 #include "pdf_writer.h"
+#include "sw_nco.h"
 #include "waterfall_core.h"
 
 #ifdef __APPLE__
@@ -730,6 +731,9 @@ static void iq_buf_free(iq_buf_t *b)
 typedef struct {
     const char     *iq_path;
     int             samp_rate;
+    double          lo_shift_hz;    // sw NCO shift applied in-place to
+                                    // iqb.samples between load and FFT;
+                                    // 0 = pass-through
     wf_opts_t      *opt;
     // Outputs (set by the worker; readable by main once `done` is non-zero).
     iq_buf_t        iqb;
@@ -773,6 +777,23 @@ static void *loader_thread_fn(void *arg)
         pthread_mutex_unlock(&ctx->lock);
         return NULL;
     }
+    // Optional NCO-shift the loaded IQ so an off-DC carrier (e.g. an
+    // old RAO capture recorded before carrier-trim-hz was populated)
+    // lands at baseband. Spectrogram + K-panel decode both see the
+    // shifted buffer.
+    if (ctx->lo_shift_hz != 0.0 && ctx->iqb.samples != NULL
+        && ctx->iqb.n_pairs > 0) {
+        char pb[32];
+        fmt_thousands(pb, sizeof pb, (uint64_t) ctx->iqb.n_pairs);
+        loader_set_status(ctx, 0,
+            "NCO-shifting IQ by %.3f kHz (%s pairs)...",
+            ctx->lo_shift_hz / 1000.0, pb);
+        sw_nco_t nco;
+        sw_nco_init(&nco, (double) ctx->samp_rate);
+        sw_nco_set_freq(&nco, ctx->lo_shift_hz);
+        sw_nco_apply(&nco, ctx->iqb.samples, ctx->iqb.n_pairs);
+    }
+
     char pair_buf[32];
     fmt_thousands(pair_buf, sizeof pair_buf,
                   (uint64_t) ctx->iqb.n_pairs);
@@ -1422,7 +1443,13 @@ static void usage(void)
         "  --filter-lower-hz=F  HPF cutoff in the original IQ frame\n"
         "                       (default 500 Hz; 0 disables HPF stage)\n"
         "  --filter-upper-hz=F  LPF cutoff around the shifted DC\n"
-        "                       (default 6000 Hz)\n");
+        "                       (default 6000 Hz)\n"
+        "  --lo-shift-khz=N     NCO-shift the loaded IQ by -N kHz before\n"
+        "                       spectrogram and decode. Positive N moves\n"
+        "                       a signal at +N kHz baseband to DC. Use to\n"
+        "                       bring an off-DC carrier on an old capture\n"
+        "                       to baseband (e.g. -0.77 for the legacy\n"
+        "                       RAO -770 Hz LO offset). Default 0.\n");
 }
 
 // Trap signals (SIGSEGV / SIGABRT) raised inside InitWindow so a
@@ -1497,6 +1524,14 @@ int main(int argc, char **argv)
     double filter_lower_hz_cli  = 500.0;
     double filter_upper_hz_cli  = 6000.0;
 
+    // Optional global IQ NCO shift applied once at load, before the
+    // spectrogram and before the K-panel decode see the buffer. Lets
+    // the operator bring an off-DC carrier on an old capture to
+    // baseband without re-running the RX chain. Sign matches rx_replay
+    // --lo-shift-khz: positive value moves a signal at +N kHz down to
+    // DC.
+    double lo_shift_hz_cli = 0.0;
+
     const char *passthru[MAX_PASSTHRU];
     int n_passthru = 0;
 
@@ -1514,6 +1549,8 @@ int main(int argc, char **argv)
             filter_lower_hz_cli = atof(a + 18);
         } else if (strncmp(a, "--filter-upper-hz=", 18) == 0) {
             filter_upper_hz_cli = atof(a + 18);
+        } else if (strncmp(a, "--lo-shift-khz=", 15) == 0) {
+            lo_shift_hz_cli = atof(a + 15) * 1000.0;
         } else if (is_passthru(a)) {
             if (n_passthru >= MAX_PASSTHRU) {
                 fprintf(stderr,
@@ -1658,9 +1695,10 @@ int main(int argc, char **argv)
         wf_opt.zoom_hz / 1e3, wf_opt.detrend_mode);
 
     loader_ctx_t lctx = {0};
-    lctx.iq_path   = iq_path;
-    lctx.samp_rate = samp_rate;
-    lctx.opt       = &wf_opt;
+    lctx.iq_path     = iq_path;
+    lctx.samp_rate   = samp_rate;
+    lctx.lo_shift_hz = lo_shift_hz_cli;
+    lctx.opt         = &wf_opt;
     snprintf(lctx.status_msg, sizeof lctx.status_msg, "Loading IQ samples...");
     pthread_mutex_init(&lctx.lock, NULL);
 

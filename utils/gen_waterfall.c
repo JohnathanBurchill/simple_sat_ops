@@ -39,6 +39,7 @@
 
 #define _GNU_SOURCE
 
+#include "sw_nco.h"
 #include "waterfall_core.h"
 
 #include <ctype.h>
@@ -1618,6 +1619,7 @@ static void usage(void)
         "                     [--pdf=<out_pdf>]\n"
         "                     [--fft=N] [--rows=N] [--db-min=X]\n"
         "                     [--db-max=X] [--center-hz=F]\n"
+        "                     [--lo-shift-khz=N]\n"
         "                     [--zoom-khz=W] [--full-width]\n"
         "                     [--dc-notch] [--dc-notch-bins=N]\n"
         "                     [--power-offset=X] [--power-unit=U]\n"
@@ -1643,6 +1645,15 @@ static void usage(void)
         "    --zoom-khz=W         Visible bandwidth around DC, in kHz.\n"
         "                         Default 30 (±15 kHz). --full-width to\n"
         "                         disable.\n"
+        "    --center-hz=F        Label-only frequency offset added to the\n"
+        "                         displayed axis ticks; the IQ itself is\n"
+        "                         not shifted. Useful for reading absolute\n"
+        "                         RF instead of baseband. Default 0.\n"
+        "    --lo-shift-khz=N     NCO-shift the loaded IQ by -N kHz before\n"
+        "                         FFT. Positive N brings a signal at +N kHz\n"
+        "                         baseband to DC. Use to centre a carrier\n"
+        "                         that landed off-DC due to LO error.\n"
+        "                         Default 0.\n"
         "    --dc-notch           Notch out DC and ±dc-notch-bins. Off by\n"
         "                         default — the B210 in this stack has a\n"
         "                         working DC blocker so DC sits BELOW the\n"
@@ -1761,6 +1772,11 @@ int main(int argc, char **argv)
         first_opt = 4;
     }
 
+    // Optional NCO shift applied to the loaded IQ before FFT. Positive
+    // N moves a signal at +N kHz baseband to DC. Sign matches
+    // rx_replay --lo-shift-khz.
+    double lo_shift_hz = 0.0;
+
     wf_opts_t opt;
     opt.fft_size      = 1024;
     opt.hop           = 0;            // 0 = N/2 default
@@ -1839,6 +1855,9 @@ int main(int argc, char **argv)
         } else if ((rc = parse_double_opt(argv[i], "--center-hz=", &d)) != 0) {
             if (rc < 0) { usage(); return 2; }
             opt.center_hz = d;
+        } else if ((rc = parse_double_opt(argv[i], "--lo-shift-khz=", &d)) != 0) {
+            if (rc < 0) { usage(); return 2; }
+            lo_shift_hz = d * 1000.0;
         } else if ((rc = parse_double_opt(argv[i], "--zoom-khz=", &d)) != 0) {
             if (rc < 0) { usage(); return 2; }
             opt.zoom_hz = d * 1000.0;
@@ -1923,6 +1942,16 @@ int main(int argc, char **argv)
         free(iq); fclose(f); return 1;
     }
     fclose(f);
+
+    if (lo_shift_hz != 0.0) {
+        sw_nco_t nco;
+        sw_nco_init(&nco, (double) sample_rate);
+        sw_nco_set_freq(&nco, lo_shift_hz);
+        sw_nco_apply(&nco, iq, n_pairs);
+        fprintf(stderr,
+            "gen_waterfall: applied --lo-shift-khz=%g (sw NCO over %zu IQ pairs)\n",
+            lo_shift_hz / 1000.0, n_pairs);
+    }
 
     uint8_t *spec_rgb = NULL;
     int spec_w = 0, spec_h = 0;
