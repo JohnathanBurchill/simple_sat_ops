@@ -2267,8 +2267,11 @@ int main(int argc, char **argv)
                     fclose(fp);
                     const char *short_base = strrchr(fn, '/');
                     short_base = short_base ? short_base + 1 : fn;
+                    // Width-bound short_base so gcc's truncation
+                    // checker is happy — short_base can be up to ~1200
+                    // bytes (size of fn[]), status is 256.
                     snprintf(status, sizeof status,
-                        "wrote /tmp/%s", short_base);
+                        "wrote /tmp/%.200s", short_base);
                     fprintf(stderr,
                         "decode_inspector: filtered IQ -> %s\n", fn);
                 } else {
