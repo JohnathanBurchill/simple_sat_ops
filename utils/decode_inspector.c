@@ -504,6 +504,8 @@ static int load_ttf_from_known_paths(void)
     codepoints[n_cp++] = 0x2013; // – (en dash)
     codepoints[n_cp++] = 0x2014; // — (em dash)
     codepoints[n_cp++] = 0x03C0; // π (lowercase pi)
+    codepoints[n_cp++] = 0x0394; // Δ (uppercase delta)
+    codepoints[n_cp++] = 0x2264; // ≤ (less-than-or-equal)
 
     for (int i = 0; i < n; ++i) {
         if (FileExists(candidates[i])) {
@@ -4275,7 +4277,7 @@ int main(int argc, char **argv)
                                 DrawLine(x, body_y0, x, body_y1, YELLOW);
                                 char buf[64];
                                 snprintf(buf, sizeof buf,
-                                    "ASM @ bit %zu  (Δ=%d)",
+                                    "ASM @ bit %zu  (min=%d)",
                                     decmode_diag.asm_offset,
                                     decmode_diag.asm_dist);
                                 draw_text(buf, x + 6, body_y0 + 4,
