@@ -41,6 +41,8 @@
 #include <raylib.h>
 #include <rlgl.h>
 
+#include "modem.h"
+#include "modem_fsk.h"
 #include "pdf_writer.h"
 #include "waterfall_core.h"
 
@@ -1311,6 +1313,93 @@ static int pdf_write_waveform(const char *path,
     return pdfw_end(w);
 }
 
+// ---------------------------------------------------------------------------
+// Decode-mode (K panel) helpers
+// ---------------------------------------------------------------------------
+
+// Free every malloc'd buffer pointed to by `d` and zero the struct.
+static void decmode_diag_free(fsk_diag_t *d)
+{
+    free(d->i_lpf); free(d->q_lpf);
+    free(d->fm);    free(d->mf);
+    free(d->strobes); free(d->strobe_t);
+    free(d->bits); free(d->asm_hamming);
+    memset(d, 0, sizeof *d);
+}
+
+// Grow the diag buffers (and the caller-owned out-bits scratch) so
+// they can hold a recompute over a window of `lpf_cap` LPF samples
+// and `strob_cap` strobes. Grow-only — zooming out reallocs, zooming
+// back in reuses without churn. Returns 0 on success, -1 on alloc
+// failure (in which case the partially-realloc'd buffers stay
+// allocated; we don't try to roll back).
+static int decmode_diag_grow(fsk_diag_t *d,
+                             size_t lpf_cap, size_t strob_cap,
+                             size_t *cap_lpf_io,
+                             size_t *cap_strob_io,
+                             uint8_t **out_scratch_io,
+                             size_t *out_scratch_cap_io)
+{
+    if (lpf_cap > *cap_lpf_io) {
+        float *ni  = realloc(d->i_lpf, lpf_cap * sizeof(float));
+        float *nq  = realloc(d->q_lpf, lpf_cap * sizeof(float));
+        float *nfm = realloc(d->fm,    lpf_cap * sizeof(float));
+        float *nmf = realloc(d->mf,    lpf_cap * sizeof(float));
+        if (!ni || !nq || !nfm || !nmf) {
+            d->i_lpf = ni ? ni : d->i_lpf;
+            d->q_lpf = nq ? nq : d->q_lpf;
+            d->fm    = nfm ? nfm : d->fm;
+            d->mf    = nmf ? nmf : d->mf;
+            return -1;
+        }
+        d->i_lpf = ni; d->q_lpf = nq; d->fm = nfm; d->mf = nmf;
+        *cap_lpf_io = lpf_cap;
+    }
+    if (strob_cap > *cap_strob_io) {
+        float   *ns  = realloc(d->strobes,     strob_cap * sizeof(float));
+        double  *nt  = realloc(d->strobe_t,    strob_cap * sizeof(double));
+        uint8_t *nb  = realloc(d->bits,        strob_cap);
+        uint8_t *nh  = realloc(d->asm_hamming, strob_cap);
+        uint8_t *no  = realloc(*out_scratch_io, strob_cap);
+        if (!ns || !nt || !nb || !nh || !no) return -1;
+        d->strobes = ns; d->strobe_t = nt;
+        d->bits = nb;   d->asm_hamming = nh;
+        *out_scratch_io = no;
+        *cap_strob_io = strob_cap;
+        *out_scratch_cap_io = strob_cap;
+    }
+    return 0;
+}
+
+// Run the FSK diag chain over iqb[i_lo..i_hi]. Returns the rc from
+// modem_fsk_iq_to_bits_diag (0 on sync, -1 on no sync — both leave
+// the diag bundle populated with whatever it managed to compute).
+static int decmode_recompute_window(const iq_buf_t *iqb,
+                                    int64_t i_lo, int64_t i_hi,
+                                    int sps, fsk_diag_t *d,
+                                    uint8_t *out_scratch,
+                                    size_t out_scratch_cap)
+{
+    if (iqb == NULL || iqb->samples == NULL) return -1;
+    if (i_lo < 0) i_lo = 0;
+    if (i_hi > (int64_t) iqb->n_pairs) i_hi = (int64_t) iqb->n_pairs;
+    if (i_hi <= i_lo) return -1;
+    size_t slice_n = (size_t)(i_hi - i_lo);
+    modem_params_t p = {
+        .samp_rate           = iqb->samp_rate,
+        .bit_rate            = (int)(iqb->samp_rate / sps),
+        .gain_db             = 0.0,
+        .rx_disable_dc_block = 0,
+    };
+    size_t n_out = 0, sync_off = (size_t)-1;
+    int polarity = -1;
+    (void) out_scratch_cap;
+    return modem_fsk_iq_to_bits_diag(
+        iqb->samples + i_lo * 2, slice_n, &p,
+        /*invert*/0, /*sync_max_ham*/4, /*min_bit_offset*/0,
+        out_scratch, &n_out, &sync_off, &polarity, d);
+}
+
 static void usage(void)
 {
     fprintf(stderr,
@@ -1861,6 +1950,42 @@ int main(int argc, char **argv)
     int    decode_panel_w   = 520;
     int    decode_scroll    = 0;   // first visible line (panel scroll pos)
 
+    // Decode-mode panel state: toggle with K. Mutually exclusive with
+    // the W (waveform) panel — they share the bottom slot. Walks the
+    // decode chain from docs/decoding/DECODING.md stage-by-stage;
+    // [ / ] cycle stages. The decoder runs on the FULL time range
+    // visible in the spectrogram (no fixed-window slice). Recompute
+    // fires after a short debounce on zoom/pan so a fast scroll
+    // doesn't trigger one per frame.
+    #define DECMODE_N_STAGES 7
+    static const char *DECMODE_STAGE_NAMES[DECMODE_N_STAGES] = {
+        "raw IQ",
+        "IQ LPF",
+        "FM discriminator",
+        "matched filter",
+        "Gardner / eye",
+        "slicer bits",
+        "ASM correlation",
+    };
+    int    decmode_open      = 0;
+    int    decmode_stage     = 0;
+    int    decmode_panel_h   = 420;       // taller than wf so eye plot
+                                          // fits as a 1:1 square
+    double decmode_recompute_after = -1.0;
+    double decmode_last_t_lo = -1.0;
+    double decmode_last_t_hi = -1.0;
+    int    decmode_have_result = 0;
+
+    // Diagnostic bundle + scratch buffers. Grow monotonically as the
+    // visible window expands; never shrink. The fsk_diag_t struct holds
+    // pointers into these.
+    fsk_diag_t decmode_diag      = {0};
+    size_t     decmode_cap_lpf   = 0;     // i_lpf/q_lpf/fm/mf capacity
+    size_t     decmode_cap_strob = 0;     // strobes/strobe_t/bits/asm_h capacity
+    uint8_t   *decmode_out_scratch = NULL;
+    size_t     decmode_out_scratch_cap = 0;
+    int        decmode_input_sps     = 0;
+
     while (!WindowShouldClose()) {
         int sw = GetScreenWidth();
         int sh = GetScreenHeight();
@@ -1875,8 +2000,13 @@ int main(int argc, char **argv)
         g_iq_annotator_pinch_delta = 0.0f;
 #endif
         Vector2 wheel_v = GetMouseWheelMoveV();
+        // Bottom slot: wf and decmode are mutually exclusive; whichever
+        // one is open captures pinch/wheel input over its area.
+        int bottom_panel_h_now = wf_open ? wf_panel_h
+                               : decmode_open ? decmode_panel_h : 0;
         int in_panel_for_input =
-            wf_open && (int) m.y >= sh - wf_panel_h && (int) m.y < sh;
+            bottom_panel_h_now > 0
+            && (int) m.y >= sh - bottom_panel_h_now && (int) m.y < sh;
         // Decode side panel occupies the right strip when open.
         int in_decode_panel_input =
             decode_open && (int) m.x >= sw - decode_panel_w && (int) m.x < sw;
@@ -1971,8 +2101,14 @@ int main(int argc, char **argv)
         // Likewise spec_screen_w shrinks when the decode side panel
         // is open so the spec doesn't render behind that strip.
         int   bar_h_clamp = 2 * (STATUS_PT + 6);
-        int   spec_screen_h = wf_open
-            ? (sh - wf_panel_h) : (sh - bar_h_clamp);
+        // wf and decmode share the bottom slot — exactly one can be
+        // open at a time (the K and W handlers enforce that). Pick
+        // whichever panel height is non-zero, falling back to the
+        // status bar at the foot when neither is open.
+        int   bottom_panel_h = wf_open ? wf_panel_h
+                             : decmode_open ? decmode_panel_h : 0;
+        int   spec_screen_h = bottom_panel_h
+            ? (sh - bottom_panel_h) : (sh - bar_h_clamp);
         if (spec_screen_h < 32) spec_screen_h = 32;
         int   spec_screen_w = decode_open ? (sw - decode_panel_w) : sw;
         if (spec_screen_w < 64) spec_screen_w = 64;
@@ -2018,9 +2154,40 @@ int main(int argc, char **argv)
         }
         if (IsKeyPressed(KEY_W)) {
             wf_open = !wf_open;
+            if (wf_open) decmode_open = 0; // share the bottom slot
             snprintf(status, sizeof status,
                 "waveform panel %s (follows spectrogram time range)",
                 wf_open ? "ON" : "OFF");
+        }
+        // K: toggle decode-mode panel. Mutually exclusive with W. When
+        // turning on, force a recompute on the next frame (debounce
+        // target = now). Brackets cycle stages whenever the panel is
+        // open (overriding the box-advance binding further down).
+        if (IsKeyPressed(KEY_K)) {
+            decmode_open = !decmode_open;
+            if (decmode_open) {
+                wf_open = 0;
+                decmode_recompute_after = GetTime();
+                decmode_last_t_lo = -1.0;
+                decmode_last_t_hi = -1.0;
+            }
+            snprintf(status, sizeof status,
+                "decode mode %s — stage %d/%d  %s",
+                decmode_open ? "ON" : "OFF",
+                decmode_stage + 1, DECMODE_N_STAGES,
+                decmode_open ? DECMODE_STAGE_NAMES[decmode_stage] : "");
+        }
+        if (decmode_open
+            && (IsKeyPressed(KEY_RIGHT_BRACKET)
+                || IsKeyPressed(KEY_LEFT_BRACKET))) {
+            int dir = IsKeyPressed(KEY_RIGHT_BRACKET) ? 1
+                    : -1;
+            decmode_stage = (decmode_stage + DECMODE_N_STAGES + dir)
+                            % DECMODE_N_STAGES;
+            snprintf(status, sizeof status,
+                "decode stage %d/%d — %s",
+                decmode_stage + 1, DECMODE_N_STAGES,
+                DECMODE_STAGE_NAMES[decmode_stage]);
         }
         if (IsKeyPressed(KEY_I)) {
             iq_show_mode = (iq_show_mode + 1) % 5;
@@ -2170,8 +2337,11 @@ int main(int argc, char **argv)
         // whole pass fits in the window, which used to lock the anchor
         // at duration/2 forever. With no selection we fall back to a
         // t0-based search anchored on the time at the centre of the view.
-        int walk_fwd  = IsKeyPressed(KEY_RIGHT_BRACKET);
-        int walk_back = IsKeyPressed(KEY_LEFT_BRACKET);
+        // The [ and ] keys advance / rewind through boxes, but when
+        // the decode-mode panel is open they're stage navigation
+        // (handled higher up); skip the box-walk in that case.
+        int walk_fwd  = !decmode_open && IsKeyPressed(KEY_RIGHT_BRACKET);
+        int walk_back = !decmode_open && IsKeyPressed(KEY_LEFT_BRACKET);
         if ((walk_fwd || walk_back) && boxes.n > 0) {
             int target = -1;
             if (boxes.selected >= 0 && boxes.selected < boxes.n) {
@@ -2348,8 +2518,10 @@ int main(int argc, char **argv)
         // When the waveform panel is open, exclude its area from
         // "in_spec" so clicks/drags in the panel don't also drive
         // box drawing / selection / resize on the spectrogram above.
+        // Same applies to the decode-mode panel — it shares the slot.
         int   in_panel_now =
-            wf_open && (int) m.y >= sh - wf_panel_h && (int) m.y < sh;
+            (wf_open && (int) m.y >= sh - wf_panel_h && (int) m.y < sh)
+         || (decmode_open && (int) m.y >= sh - decmode_panel_h && (int) m.y < sh);
         int   in_decode_now =
             decode_open && (int) m.x >= spec_screen_w;
         // Spec is drawn from screen (0,0) to (spec_screen_w, spec_screen_h);
@@ -2991,8 +3163,13 @@ int main(int argc, char **argv)
         // using the FRACTION of the spec height (not a discrete row
         // index) to avoid an off-by-one row-width gap at each end.
         int bar_h_for_wf = 2 * (STATUS_PT + 6);
+        // Either bottom panel (W or K) shifts the spec lower edge up
+        // by its height; otherwise it's bar_h above the bottom of the
+        // window. wf_y0 already accounts for wf_panel_h.
         int spec_bot_y_screen =
-            (wf_open ? wf_y0 : (sh - bar_h_for_wf));
+            wf_open ? wf_y0
+          : decmode_open ? (sh - decmode_panel_h)
+                         : (sh - bar_h_for_wf);
         double vis_top_img = (double) view_y;
         double vis_bot_img = (double) view_y
                            + (double) spec_bot_y_screen / (double) zoom;
@@ -3008,6 +3185,54 @@ int main(int argc, char **argv)
         double wf_t_lo = (1.0 - frac_bot) * duration_s;
         if (wf_t_hi < wf_t_lo) {
             double tmp = wf_t_lo; wf_t_lo = wf_t_hi; wf_t_hi = tmp;
+        }
+
+        // Decode-mode debounced recompute. When the visible time range
+        // changes (scroll, zoom, pan), arm the timer; when it fires,
+        // slice iqb to [wf_t_lo, wf_t_hi] and rerun the FSK chain.
+        // The fixed 9600 baud assumption matches rx_replay's default
+        // and the FrontierSat link.
+        if (decmode_open && iqb.samples != NULL) {
+            if (fabs(wf_t_lo - decmode_last_t_lo) > 1e-9
+             || fabs(wf_t_hi - decmode_last_t_hi) > 1e-9) {
+                decmode_recompute_after = GetTime() + 0.25;
+                decmode_last_t_lo = wf_t_lo;
+                decmode_last_t_hi = wf_t_hi;
+            }
+            if (decmode_recompute_after > 0.0
+                && GetTime() >= decmode_recompute_after
+                && wf_t_hi > wf_t_lo) {
+                decmode_recompute_after = -1.0;
+                int64_t i_lo = (int64_t)(wf_t_lo * iqb.samp_rate);
+                int64_t i_hi = (int64_t)(wf_t_hi * iqb.samp_rate);
+                if (i_lo < 0) i_lo = 0;
+                if (i_hi > (int64_t) iqb.n_pairs)
+                    i_hi = (int64_t) iqb.n_pairs;
+                size_t slice_n = (i_hi > i_lo)
+                    ? (size_t)(i_hi - i_lo) : 0;
+                const int bit_rate = 9600;
+                int sps = (iqb.samp_rate > 0
+                           && (iqb.samp_rate % bit_rate) == 0)
+                          ? iqb.samp_rate / bit_rate : 0;
+                if (sps >= 2 && slice_n > 32u * (size_t) sps) {
+                    size_t lpf_cap = (slice_n > 30u)
+                        ? (slice_n - 30u) : 0;
+                    size_t strob_cap =
+                        modem_fsk_diag_max_strobes(slice_n, sps);
+                    if (decmode_diag_grow(
+                            &decmode_diag, lpf_cap, strob_cap,
+                            &decmode_cap_lpf, &decmode_cap_strob,
+                            &decmode_out_scratch,
+                            &decmode_out_scratch_cap) == 0) {
+                        (void) decmode_recompute_window(
+                            &iqb, i_lo, i_hi, sps, &decmode_diag,
+                            decmode_out_scratch,
+                            decmode_out_scratch_cap);
+                        decmode_input_sps   = sps;
+                        decmode_have_result = 1;
+                    }
+                }
+            }
         }
         // Box-info status line content.
         char box_info[256] = "";
@@ -3512,6 +3737,458 @@ int main(int argc, char **argv)
             }
         }
 
+        // ----- decode-mode panel rendering (K, mutually exclusive
+        // with the waveform panel; same bottom slot but taller) -----
+        if (decmode_open) {
+            int dm_y0    = sh - decmode_panel_h;
+            int dm_right = spec_screen_w;
+            DrawRectangle(0, dm_y0, dm_right, decmode_panel_h,
+                          (Color){15, 15, 20, 230});
+            DrawLine(0, dm_y0, dm_right, dm_y0, GRAY);
+
+            // Title strip — stage label + nav hint.
+            int title_h = 30;
+            char title_str[256];
+            snprintf(title_str, sizeof title_str,
+                "[stage %d/%d]  %s   ( [ / ] navigate )",
+                decmode_stage + 1, DECMODE_N_STAGES,
+                DECMODE_STAGE_NAMES[decmode_stage]);
+            draw_text(title_str, 12, dm_y0 + 6, 18,
+                      (Color){210, 210, 230, 255});
+            DrawLine(0, dm_y0 + title_h, dm_right, dm_y0 + title_h,
+                     (Color){40, 40, 50, 255});
+
+            // Inner plot rect — pT below the title bar, leaving room
+            // at the bottom for tick labels above the status bar.
+            int pL = 96, pR = 8, pT = title_h + 8, pB = 52;
+            int plot_x0 = pL;
+            int plot_x1 = dm_right - pR;
+            int plot_y0 = dm_y0 + pT;
+            int plot_y1 = sh - bar_h - pB;
+            int plot_w  = plot_x1 - plot_x0;
+            int plot_h  = plot_y1 - plot_y0;
+
+            int has_data = decmode_have_result
+                        && decmode_diag.n_fm > 0
+                        && wf_t_hi > wf_t_lo;
+            if (plot_w > 16 && plot_h > 16 && has_data) {
+                const int AMP_PT = 17;
+                const int T_PT   = 17;
+                int sps   = decmode_input_sps;
+                double samp_rate_d = (double) iqb.samp_rate;
+                // Time-domain stages (0..5) all share the same x-axis
+                // (visible spectrogram window). Stage 6's x-axis is
+                // the bit-offset of the sliding ASM window.
+                int is_bit_axis = (decmode_stage == 6);
+                double span_s = wf_t_hi - wf_t_lo;
+
+                // Stage 4 (eye) wants a 1:1 plot rect — collapse the
+                // body to a square subrect on the left of the body
+                // area. Other stages use the full body width.
+                int body_x0 = plot_x0, body_x1 = plot_x1;
+                int body_y0 = plot_y0, body_y1 = plot_y1;
+                int body_w  = plot_w,  body_h  = plot_h;
+                if (decmode_stage == 4) {
+                    int side = (body_h < body_w) ? body_h : body_w;
+                    body_w = side; body_h = side;
+                    body_x0 = plot_x0;
+                    body_x1 = body_x0 + body_w;
+                    body_y0 = plot_y0;
+                    body_y1 = body_y0 + body_h;
+                }
+
+                // ------ Stages 0..3, 5: y-axis (amp) + time x-axis ------
+                if (decmode_stage <= 3 || decmode_stage == 5) {
+                    // Auto-scale amplitude from the stage's buffer.
+                    double amax = 1.0;
+                    if (decmode_stage == 0) {
+                        int64_t i_lo = (int64_t)(wf_t_lo * iqb.samp_rate);
+                        int64_t i_hi = (int64_t)(wf_t_hi * iqb.samp_rate);
+                        if (i_lo < 0) i_lo = 0;
+                        if (i_hi > (int64_t) iqb.n_pairs) i_hi = iqb.n_pairs;
+                        int64_t step = ((i_hi - i_lo) > 4096)
+                            ? (i_hi - i_lo) / 2048 : 1;
+                        for (int64_t k = i_lo; k < i_hi; k += step) {
+                            double a = fabs((double) iqb.samples[k*2+0]);
+                            double b = fabs((double) iqb.samples[k*2+1]);
+                            if (a > amax) amax = a;
+                            if (b > amax) amax = b;
+                        }
+                    } else if (decmode_stage == 1) {
+                        size_t n = decmode_diag.n_pairs_lpf;
+                        size_t step = (n > 4096) ? n / 2048 : 1;
+                        for (size_t k = 0; k < n; k += step) {
+                            double a = fabs((double) decmode_diag.i_lpf[k]);
+                            double b = fabs((double) decmode_diag.q_lpf[k]);
+                            if (a > amax) amax = a;
+                            if (b > amax) amax = b;
+                        }
+                    } else {
+                        const float *src = (decmode_stage == 2)
+                            ? decmode_diag.fm : decmode_diag.mf;
+                        size_t n = (decmode_stage == 2)
+                            ? decmode_diag.n_fm : decmode_diag.n_mf;
+                        size_t step = (n > 4096) ? n / 2048 : 1;
+                        for (size_t k = 0; k < n; k += step) {
+                            double a = fabs((double) src[k]);
+                            if (a > amax) amax = a;
+                        }
+                        if (decmode_stage == 5) amax = 2.0; // ±π/20 rails fit
+                    }
+                    if (amax < 1e-6) amax = 1e-6;
+
+                    int mid_y = body_y0 + body_h / 2;
+                    float y_scale = (float)(body_h * 0.5 / amax);
+                    DrawLine(body_x0, mid_y, body_x1, mid_y,
+                             (Color){50, 50, 60, 255});
+                    for (int k = -2; k <= 2; ++k) {
+                        int y = mid_y - (k * body_h / 4);
+                        DrawLine(body_x0 - 4, y, body_x0, y, GRAY);
+                        char buf[24];
+                        if (decmode_stage <= 1) {
+                            snprintf(buf, sizeof buf, "%+d",
+                                (int)(k * amax / 2));
+                        } else {
+                            snprintf(buf, sizeof buf, "%+.2f",
+                                (double)(k * amax / 2.0));
+                        }
+                        int tw = measure_text(buf, AMP_PT);
+                        draw_text(buf, body_x0 - 6 - tw, y - AMP_PT/2,
+                                  AMP_PT, GRAY);
+                    }
+
+                    // Plot the data. For dense data fall back to
+                    // per-column min/max; for sparse, line-to-line.
+                    if (decmode_stage == 0 || decmode_stage == 1) {
+                        // Two-trace (I + Q)
+                        Color colI = {80, 200, 220, 255};
+                        Color colQ = {200, 90, 220, 200};
+                        const int16_t *src_iq16 = NULL;
+                        const float *src_i = NULL, *src_q = NULL;
+                        size_t n_pairs_total = 0;
+                        int64_t i_lo_idx = 0, i_hi_idx = 0;
+                        double samp_rate_data = samp_rate_d;
+                        if (decmode_stage == 0) {
+                            src_iq16 = iqb.samples;
+                            n_pairs_total = iqb.n_pairs;
+                            i_lo_idx = (int64_t)(wf_t_lo * iqb.samp_rate);
+                            i_hi_idx = (int64_t)(wf_t_hi * iqb.samp_rate);
+                            if (i_lo_idx < 0) i_lo_idx = 0;
+                            if (i_hi_idx > (int64_t) n_pairs_total)
+                                i_hi_idx = n_pairs_total;
+                        } else {
+                            src_i = decmode_diag.i_lpf;
+                            src_q = decmode_diag.q_lpf;
+                            n_pairs_total = decmode_diag.n_pairs_lpf;
+                            i_lo_idx = 0;
+                            i_hi_idx = (int64_t) n_pairs_total;
+                        }
+                        int64_t nvis = i_hi_idx - i_lo_idx;
+                        if (nvis > 0) {
+                            if (nvis <= (int64_t) body_w * 2) {
+                                int prev_x = -1, prev_yI = 0, prev_yQ = 0;
+                                for (int64_t k = i_lo_idx; k < i_hi_idx; ++k) {
+                                    double t = (double) k / samp_rate_data;
+                                    double t_show = (decmode_stage == 0)
+                                        ? t : (wf_t_lo + (double)(k - i_lo_idx) / samp_rate_data);
+                                    int x = body_x0
+                                          + (int)((t_show - wf_t_lo) / span_s * body_w);
+                                    if (x < body_x0 || x > body_x1) continue;
+                                    double I = (decmode_stage == 0)
+                                        ? src_iq16[k*2+0] : src_i[k];
+                                    double Q = (decmode_stage == 0)
+                                        ? src_iq16[k*2+1] : src_q[k];
+                                    int yI = mid_y - (int)(I * y_scale);
+                                    int yQ = mid_y - (int)(Q * y_scale);
+                                    if (prev_x >= 0) {
+                                        DrawLine(prev_x, prev_yQ, x, yQ, colQ);
+                                        DrawLine(prev_x, prev_yI, x, yI, colI);
+                                    }
+                                    prev_x = x; prev_yI = yI; prev_yQ = yQ;
+                                }
+                            } else {
+                                for (int x = 0; x < body_w; ++x) {
+                                    int64_t s0 = i_lo_idx + (int64_t) x * nvis / body_w;
+                                    int64_t s1 = i_lo_idx + (int64_t)(x+1) * nvis / body_w;
+                                    if (s1 <= s0) s1 = s0 + 1;
+                                    if (s1 > i_hi_idx) s1 = i_hi_idx;
+                                    double iMin =  1e30, iMax = -1e30;
+                                    double qMin =  1e30, qMax = -1e30;
+                                    for (int64_t k = s0; k < s1; ++k) {
+                                        double I = (decmode_stage == 0)
+                                            ? src_iq16[k*2+0] : src_i[k];
+                                        double Q = (decmode_stage == 0)
+                                            ? src_iq16[k*2+1] : src_q[k];
+                                        if (I < iMin) iMin = I;
+                                        if (I > iMax) iMax = I;
+                                        if (Q < qMin) qMin = Q;
+                                        if (Q > qMax) qMax = Q;
+                                    }
+                                    int xpx = body_x0 + x;
+                                    DrawLine(xpx, mid_y - (int)(qMax * y_scale),
+                                             xpx, mid_y - (int)(qMin * y_scale),
+                                             (Color){200,90,220,160});
+                                    DrawLine(xpx, mid_y - (int)(iMax * y_scale),
+                                             xpx, mid_y - (int)(iMin * y_scale),
+                                             (Color){80,200,220,220});
+                                }
+                            }
+                        }
+                    } else {
+                        // Single-trace (FM disc, MF, or slicer underlay)
+                        const float *src = (decmode_stage == 2)
+                            ? decmode_diag.fm : decmode_diag.mf;
+                        size_t n = (decmode_stage == 2)
+                            ? decmode_diag.n_fm : decmode_diag.n_mf;
+                        Color col = (decmode_stage == 2)
+                            ? (Color){180, 220, 130, 255}
+                            : (Color){255, 200, 80, 255};
+                        // Stage 5 overlays bit cells on the MF.
+                        if (n > 0) {
+                            if ((int64_t) n <= (int64_t) body_w * 2) {
+                                int prev_x = -1, prev_y = 0;
+                                for (size_t k = 0; k < n; ++k) {
+                                    double t = wf_t_lo
+                                        + (double) k / samp_rate_d;
+                                    int x = body_x0
+                                          + (int)((t - wf_t_lo) / span_s * body_w);
+                                    if (x < body_x0 || x > body_x1) continue;
+                                    int y = mid_y - (int)(src[k] * y_scale);
+                                    if (prev_x >= 0)
+                                        DrawLine(prev_x, prev_y, x, y, col);
+                                    prev_x = x; prev_y = y;
+                                }
+                            } else {
+                                for (int x = 0; x < body_w; ++x) {
+                                    int64_t s0 = (int64_t) x * (int64_t) n / body_w;
+                                    int64_t s1 = (int64_t)(x+1) * (int64_t) n / body_w;
+                                    if (s1 <= s0) s1 = s0 + 1;
+                                    if (s1 > (int64_t) n) s1 = n;
+                                    double mn = 1e30, mx = -1e30;
+                                    for (int64_t k = s0; k < s1; ++k) {
+                                        double v = src[k];
+                                        if (v < mn) mn = v;
+                                        if (v > mx) mx = v;
+                                    }
+                                    int xpx = body_x0 + x;
+                                    DrawLine(xpx, mid_y - (int)(mx * y_scale),
+                                             xpx, mid_y - (int)(mn * y_scale),
+                                             col);
+                                }
+                            }
+                        }
+                        // Stage 5: overlay bit cells at the strobe
+                        // positions, color-coded.
+                        if (decmode_stage == 5
+                            && decmode_diag.bits != NULL) {
+                            size_t ns = decmode_diag.n_strobes;
+                            double samp_per_sym = (double) sps;
+                            for (size_t k = 0; k < ns; ++k) {
+                                double mf_idx = decmode_diag.strobe_t[k];
+                                double t = wf_t_lo
+                                    + mf_idx / samp_rate_d;
+                                int x = body_x0
+                                      + (int)((t - wf_t_lo) / span_s * body_w);
+                                if (x < body_x0 || x > body_x1) continue;
+                                int up = decmode_diag.bits[k] ? 1 : 0;
+                                int y_rail = up
+                                    ? (mid_y - (int)(0.157f * 2.0 * y_scale))
+                                    : (mid_y + (int)(0.157f * 2.0 * y_scale));
+                                DrawCircle(x, y_rail, 2,
+                                    up ? (Color){120, 220, 120, 220}
+                                       : (Color){220, 120, 120, 220});
+                            }
+                            (void) samp_per_sym;
+                        }
+                    }
+                }
+
+                // ------ Stage 4: eye diagram ------
+                else if (decmode_stage == 4) {
+                    // Centre line + ±1 reference rails
+                    int mid_y = body_y0 + body_h / 2;
+                    float y_scale = (float)(body_h * 0.45);
+                    DrawLine(body_x0, mid_y, body_x1, mid_y,
+                             (Color){50, 50, 60, 255});
+                    DrawLine(body_x0, mid_y - (int)(y_scale * 0.157f * 2),
+                             body_x1, mid_y - (int)(y_scale * 0.157f * 2),
+                             (Color){80, 80, 100, 180});
+                    DrawLine(body_x0, mid_y + (int)(y_scale * 0.157f * 2),
+                             body_x1, mid_y + (int)(y_scale * 0.157f * 2),
+                             (Color){80, 80, 100, 180});
+
+                    // Each strobe defines a symbol centre; draw a
+                    // polyline from t_centre - sps to t_centre + sps
+                    // (a 2-symbol window). Alpha-blend so high-density
+                    // areas (the eye opening) brighten visibly.
+                    const Color eye_col = {255, 180, 80, 64};
+                    size_t ns = decmode_diag.n_strobes;
+                    const float *mf = decmode_diag.mf;
+                    size_t mf_n = decmode_diag.n_mf;
+                    double sps_d = (double) sps;
+                    if (ns > 0 && mf_n > 0) {
+                        for (size_t k = 0; k < ns; ++k) {
+                            double centre = decmode_diag.strobe_t[k];
+                            double i0d = centre - sps_d;
+                            double i1d = centre + sps_d;
+                            if (i0d < 0.0) i0d = 0.0;
+                            if (i1d >= (double) mf_n) i1d = (double) mf_n - 1.0;
+                            int i0 = (int) i0d;
+                            int i1 = (int) i1d;
+                            if (i1 <= i0) continue;
+                            int prev_x = -1, prev_y = 0;
+                            for (int j = i0; j <= i1; ++j) {
+                                double rel = ((double) j - centre) / sps_d;
+                                // rel in [-1, +1] maps to body_x0..body_x1
+                                int x = body_x0
+                                      + (int)(((rel + 1.0) * 0.5) * body_w);
+                                int y = mid_y - (int)(mf[j] * y_scale * 0.5);
+                                if (prev_x >= 0)
+                                    DrawLine(prev_x, prev_y, x, y, eye_col);
+                                prev_x = x; prev_y = y;
+                            }
+                        }
+                    }
+                    // Y-axis labels at ±1 and 0
+                    char buf[16];
+                    snprintf(buf, sizeof buf, "+1");
+                    draw_text(buf, body_x0 - 22,
+                              mid_y - (int)(y_scale * 0.5) - AMP_PT/2,
+                              AMP_PT, GRAY);
+                    snprintf(buf, sizeof buf, "0");
+                    draw_text(buf, body_x0 - 12, mid_y - AMP_PT/2,
+                              AMP_PT, GRAY);
+                    snprintf(buf, sizeof buf, "-1");
+                    draw_text(buf, body_x0 - 22,
+                              mid_y + (int)(y_scale * 0.5) - AMP_PT/2,
+                              AMP_PT, GRAY);
+                }
+
+                // ------ Stage 6: ASM Hamming-distance trace ------
+                else if (decmode_stage == 6) {
+                    size_t n_bits = decmode_diag.n_strobes;
+                    size_t n_h = (n_bits >= 32) ? (n_bits - 31) : 0;
+                    int y_top = body_y0 + 6;
+                    int y_bot = body_y1 - 6;
+                    int h_axis = y_bot - y_top;
+                    // Y axis: Hamming distance 0..32, with the accept
+                    // threshold (4) drawn as a red line.
+                    for (int k = 0; k <= 4; ++k) {
+                        int hd = k * 8;  // ticks at 0, 8, 16, 24, 32
+                        int y = y_bot
+                              - (int)((double) hd / 32.0 * (double) h_axis);
+                        DrawLine(body_x0 - 4, y, body_x0, y, GRAY);
+                        char buf[16];
+                        snprintf(buf, sizeof buf, "%d", hd);
+                        int tw = measure_text(buf, AMP_PT);
+                        draw_text(buf, body_x0 - 6 - tw, y - AMP_PT/2,
+                                  AMP_PT, GRAY);
+                    }
+                    int y_thr = y_bot
+                              - (int)((double) 4 / 32.0 * (double) h_axis);
+                    DrawLine(body_x0, y_thr, body_x1, y_thr,
+                             (Color){220, 80, 80, 200});
+                    draw_text("accept (≤4)", body_x1 - 100,
+                              y_thr + 4, AMP_PT,
+                              (Color){220, 80, 80, 220});
+                    // Trace
+                    if (n_h > 0) {
+                        const uint8_t *h = decmode_diag.asm_hamming;
+                        if ((int64_t) n_h <= (int64_t) body_w) {
+                            int prev_x = -1, prev_y = 0;
+                            for (size_t k = 0; k < n_h; ++k) {
+                                int x = body_x0
+                                      + (int)((double) k / (double) n_h * body_w);
+                                int y = y_bot
+                                      - (int)((double) h[k] / 32.0 * h_axis);
+                                if (prev_x >= 0)
+                                    DrawLine(prev_x, prev_y, x, y,
+                                        (Color){180, 220, 250, 230});
+                                prev_x = x; prev_y = y;
+                            }
+                        } else {
+                            for (int x = 0; x < body_w; ++x) {
+                                int64_t s0 = (int64_t) x * (int64_t) n_h / body_w;
+                                int64_t s1 = (int64_t)(x+1) * (int64_t) n_h / body_w;
+                                if (s1 <= s0) s1 = s0 + 1;
+                                if (s1 > (int64_t) n_h) s1 = n_h;
+                                int mn = 33;
+                                for (int64_t k = s0; k < s1; ++k)
+                                    if (h[k] < mn) mn = h[k];
+                                int xpx = body_x0 + x;
+                                int y = y_bot
+                                      - (int)((double) mn / 32.0 * h_axis);
+                                DrawLine(xpx, y_bot, xpx, y,
+                                    (Color){120, 180, 220, 180});
+                            }
+                        }
+                        // Marker at the found ASM offset
+                        if (decmode_diag.asm_offset != (size_t) -1
+                            && decmode_diag.asm_offset < n_h) {
+                            int x = body_x0
+                                  + (int)((double) decmode_diag.asm_offset
+                                          / (double) n_h * body_w);
+                            DrawLine(x, body_y0, x, body_y1, YELLOW);
+                            char buf[64];
+                            snprintf(buf, sizeof buf,
+                                "ASM @ bit %zu  (Δ=%d)",
+                                decmode_diag.asm_offset,
+                                decmode_diag.asm_dist);
+                            draw_text(buf, x + 6, body_y0 + 4,
+                                      AMP_PT, YELLOW);
+                        }
+                    }
+                }
+
+                DrawRectangleLines(body_x0, body_y0,
+                                   body_w, body_h, DARKGRAY);
+
+                // Time-axis ticks (stages 0..5) — same renderer the W
+                // panel uses, anchored at the body width / position.
+                if (!is_bit_axis) {
+                    double raw_step = span_s / 6.0;
+                    double mag = pow(10.0, floor(log10(raw_step)));
+                    double mul = raw_step / mag;
+                    if      (mul < 1.5) mul = 1.0;
+                    else if (mul < 3.5) mul = 2.0;
+                    else if (mul < 7.5) mul = 5.0;
+                    else                mul = 10.0;
+                    double step = mul * mag;
+                    double t0_aligned = ceil(wf_t_lo / step) * step;
+                    int t_nd = decimals_for_step(step);
+                    for (double t = t0_aligned;
+                         t <= wf_t_hi + 0.5 * step; t += step) {
+                        int x = body_x0
+                              + (int)((t - wf_t_lo) / span_s * body_w);
+                        if (x < body_x0 || x > body_x1) continue;
+                        DrawLine(x, body_y1, x, body_y1 + 6, GRAY);
+                        char buf[40];
+                        fmt_mmss_ndec(t, t_nd, buf, sizeof buf);
+                        int tw = measure_text(buf, T_PT);
+                        draw_text(buf, x - tw/2, body_y1 + 8,
+                                  T_PT, GRAY);
+                    }
+                } else {
+                    // Stage 6 — x-axis is bit offset. Label endpoints.
+                    char buf[24];
+                    snprintf(buf, sizeof buf, "bit 0");
+                    draw_text(buf, body_x0, body_y1 + 8, T_PT, GRAY);
+                    snprintf(buf, sizeof buf, "bit %zu",
+                        decmode_diag.n_strobes
+                        ? decmode_diag.n_strobes - 32 : 0);
+                    int tw = measure_text(buf, T_PT);
+                    draw_text(buf, body_x1 - tw, body_y1 + 8,
+                              T_PT, GRAY);
+                }
+            } else {
+                // Either no data yet, or the window is too small.
+                const char *msg = (!decmode_have_result)
+                    ? "computing decode chain (zoom the spectrogram to refresh)..."
+                    : "no data — pick an IQ region in the spectrogram above";
+                draw_text(msg, plot_x0, plot_y0 + 20, 16, LIGHTGRAY);
+            }
+        }
+
         // ----- decode side panel (D to (re)decode, Esc to close) -----
         if (decode_open) {
             int dpx = spec_screen_w;
@@ -3601,6 +4278,8 @@ int main(int argc, char **argv)
     free(spec_db);
     iq_buf_free(&iqb);
     free(decode_text);
+    decmode_diag_free(&decmode_diag);
+    free(decmode_out_scratch);
     if (g_ui_font_loaded) UnloadFont(g_ui_font);
     CloseWindow();
     return 0;

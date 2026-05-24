@@ -216,7 +216,8 @@ if (RAYLIB_FOUND)
     # iq_annotator — raylib-backed interactive viewer for offline .iq
     # captures. Lets the operator mouse-draw time × freq boxes around
     # bursts they want to feed back into rx_replay --anchor-csv.
-    set(IQ_ANNOTATOR_SRCS utils/iq_annotator.c utils/pdf_writer.c)
+    set(IQ_ANNOTATOR_SRCS utils/iq_annotator.c utils/pdf_writer.c
+                          src/dsp/modem.c src/dsp/modem_fsk.c)
     if (APPLE)
         # raylib/GLFW drop NSEventTypeMagnify (trackpad pinch); this
         # ObjC shim installs a global NSEvent monitor and accumulates
