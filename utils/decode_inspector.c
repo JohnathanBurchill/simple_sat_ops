@@ -1887,7 +1887,25 @@ int main(int argc, char **argv)
     // matplotlib's viridis within ~1% per channel and avoids the
     // sampler-completeness pitfalls that a separate LUT texture runs
     // into on Apple's OpenGL 4.1 stack).
-    static const char *FRAG_SRC =
+    //
+    // Two source variants so the same binary works on both raylib
+    // builds: GLSL 330 for the default 3.3-core build (Apple/Mac
+    // dev hosts) and GLSL 120 for the 2.1 build that's needed when
+    // SSH X11 forwarding can't carry the 3.3 core profile (see
+    // README.md for the raylib rebuild command). rlGetVersion()
+    // picks at runtime.
+    static const char *VIRIDIS_BODY =
+        "vec3 viridis(float t) {\n"
+        "    vec3 c0 = vec3( 0.2777273272234177,  0.005407344544966578,  0.3340998053353061);\n"
+        "    vec3 c1 = vec3( 0.1050930431667207,  1.4046135298985746,    1.3845901625946856);\n"
+        "    vec3 c2 = vec3(-0.3308618287255563,  0.2148475594682130,    0.0950951630282366);\n"
+        "    vec3 c3 = vec3(-4.6342304989834860, -5.7991009733515850,  -19.3324409562798700);\n"
+        "    vec3 c4 = vec3( 6.2282699363470810, 14.1799333668050900,   56.6905526006810500);\n"
+        "    vec3 c5 = vec3( 4.7763849976702880,-13.7451453777460100,  -65.3530326333723400);\n"
+        "    vec3 c6 = vec3(-5.4354558559346310,  4.6458526121785350,   26.3124352495832000);\n"
+        "    return c0 + t*(c1 + t*(c2 + t*(c3 + t*(c4 + t*(c5 + t*c6)))));\n"
+        "}\n";
+    static const char *FRAG_HEAD_330 =
         "#version 330\n"
         "in vec2 fragTexCoord;\n"
         "in vec4 fragColor;\n"
@@ -1899,24 +1917,36 @@ int main(int argc, char **argv)
         // medians — we re-push db_min / db_max accordingly.
         "uniform float db_min;\n"
         "uniform float db_max;\n"
-        "out vec4 finalColor;\n"
-        "vec3 viridis(float t) {\n"
-        "    const vec3 c0 = vec3( 0.2777273272234177,  0.005407344544966578,  0.3340998053353061);\n"
-        "    const vec3 c1 = vec3( 0.1050930431667207,  1.4046135298985746,    1.3845901625946856);\n"
-        "    const vec3 c2 = vec3(-0.3308618287255563,  0.2148475594682130,    0.0950951630282366);\n"
-        "    const vec3 c3 = vec3(-4.6342304989834860, -5.7991009733515850,  -19.3324409562798700);\n"
-        "    const vec3 c4 = vec3( 6.2282699363470810, 14.1799333668050900,   56.6905526006810500);\n"
-        "    const vec3 c5 = vec3( 4.7763849976702880,-13.7451453777460100,  -65.3530326333723400);\n"
-        "    const vec3 c6 = vec3(-5.4354558559346310,  4.6458526121785350,   26.3124352495832000);\n"
-        "    return c0 + t*(c1 + t*(c2 + t*(c3 + t*(c4 + t*(c5 + t*c6)))));\n"
-        "}\n"
+        "out vec4 finalColor;\n";
+    static const char *FRAG_MAIN_330 =
         "void main() {\n"
         "    float v = texture(texture0, fragTexCoord).r;\n"
         "    float t = (v - db_min) / max(db_max - db_min, 1e-6);\n"
         "    t = clamp(t, 0.0, 1.0);\n"
         "    finalColor = vec4(viridis(t), 1.0) * fragColor;\n"
         "}\n";
-    Shader wf_shader = LoadShaderFromMemory(NULL, FRAG_SRC);
+    static const char *FRAG_HEAD_120 =
+        "#version 120\n"
+        "varying vec2 fragTexCoord;\n"
+        "varying vec4 fragColor;\n"
+        "uniform sampler2D texture0;\n"
+        "uniform float db_min;\n"
+        "uniform float db_max;\n";
+    static const char *FRAG_MAIN_120 =
+        "void main() {\n"
+        "    float v = texture2D(texture0, fragTexCoord).r;\n"
+        "    float t = (v - db_min) / max(db_max - db_min, 1e-6);\n"
+        "    t = clamp(t, 0.0, 1.0);\n"
+        "    gl_FragColor = vec4(viridis(t), 1.0) * fragColor;\n"
+        "}\n";
+    int gl_version = rlGetVersion();
+    int use_120 = (gl_version == RL_OPENGL_21);
+    char frag_src[4096];
+    snprintf(frag_src, sizeof frag_src, "%s%s%s",
+             use_120 ? FRAG_HEAD_120 : FRAG_HEAD_330,
+             VIRIDIS_BODY,
+             use_120 ? FRAG_MAIN_120 : FRAG_MAIN_330);
+    Shader wf_shader = LoadShaderFromMemory(NULL, frag_src);
     int loc_dbmin    = GetShaderLocation(wf_shader, "db_min");
     int loc_dbmax    = GetShaderLocation(wf_shader, "db_max");
 
