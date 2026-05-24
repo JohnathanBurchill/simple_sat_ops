@@ -82,6 +82,53 @@ extern void  decode_inspector_install_pinch_monitor(void);
 #define WF_TM 12
 #define WF_BM 28
 
+// CCSDS RX scrambler XOR table — same constants ax100.c uses for
+// descrambling on the receive side. Polynomial h(x) = x^8 + x^7 +
+// x^5 + x^3 + 1, fbmask = 0xA9, initreg = 0xFF. Duplicated here so
+// the decode inspector can run the descramble stage without pulling
+// the full ax100 translation unit (and its OpenSSL transitives).
+static const uint8_t DECMODE_CCSDS_TABLE[255] = {
+    0xFF, 0x48, 0x0E, 0xC0, 0x9A, 0x0D, 0x70, 0xBC,
+    0x8E, 0x2C, 0x93, 0xAD, 0xA7, 0xB7, 0x46, 0xCE,
+    0x5A, 0x97, 0x7D, 0xCC, 0x32, 0xA2, 0xBF, 0x3E,
+    0x0A, 0x10, 0xF1, 0x88, 0x94, 0xCD, 0xEA, 0xB1,
+    0xFE, 0x90, 0x1D, 0x81, 0x34, 0x1A, 0xE1, 0x79,
+    0x1C, 0x59, 0x27, 0x5B, 0x4F, 0x6E, 0x8D, 0x9C,
+    0xB5, 0x2E, 0xFB, 0x98, 0x65, 0x45, 0x7E, 0x7C,
+    0x14, 0x21, 0xE3, 0x11, 0x29, 0x9B, 0xD5, 0x63,
+    0xFD, 0x20, 0x3B, 0x02, 0x68, 0x35, 0xC2, 0xF2,
+    0x38, 0xB2, 0x4E, 0xB6, 0x9E, 0xDD, 0x1B, 0x39,
+    0x6A, 0x5D, 0xF7, 0x30, 0xCA, 0x8A, 0xFC, 0xF8,
+    0x28, 0x43, 0xC6, 0x22, 0x53, 0x37, 0xAA, 0xC7,
+    0xFA, 0x40, 0x76, 0x04, 0xD0, 0x6B, 0x85, 0xE4,
+    0x71, 0x64, 0x9D, 0x6D, 0x3D, 0xBA, 0x36, 0x72,
+    0xD4, 0xBB, 0xEE, 0x61, 0x95, 0x15, 0xF9, 0xF0,
+    0x50, 0x87, 0x8C, 0x44, 0xA6, 0x6F, 0x55, 0x8F,
+    0xF4, 0x80, 0xEC, 0x09, 0xA0, 0xD7, 0x0B, 0xC8,
+    0xE2, 0xC9, 0x3A, 0xDA, 0x7B, 0x74, 0x6C, 0xE5,
+    0xA9, 0x77, 0xDC, 0xC3, 0x2A, 0x2B, 0xF3, 0xE0,
+    0xA1, 0x0F, 0x18, 0x89, 0x4C, 0xDE, 0xAB, 0x1F,
+    0xE9, 0x01, 0xD8, 0x13, 0x41, 0xAE, 0x17, 0x91,
+    0xC5, 0x92, 0x75, 0xB4, 0xF6, 0xE8, 0xD9, 0xCB,
+    0x52, 0xEF, 0xB9, 0x86, 0x54, 0x57, 0xE7, 0xC1,
+    0x42, 0x1E, 0x31, 0x12, 0x99, 0xBD, 0x56, 0x3F,
+    0xD2, 0x03, 0xB0, 0x26, 0x83, 0x5C, 0x2F, 0x23,
+    0x8B, 0x24, 0xEB, 0x69, 0xED, 0xD1, 0xB3, 0x96,
+    0xA5, 0xDF, 0x73, 0x0C, 0xA8, 0xAF, 0xCF, 0x82,
+    0x84, 0x3C, 0x62, 0x25, 0x33, 0x7A, 0xAC, 0x7F,
+    0xA4, 0x07, 0x60, 0x4D, 0x06, 0xB8, 0x5E, 0x47,
+    0x16, 0x49, 0xD6, 0xD3, 0xDB, 0xA3, 0x67, 0x2D,
+    0x4B, 0xBE, 0xE6, 0x19, 0x51, 0x5F, 0x9F, 0x05,
+    0x08, 0x78, 0xC4, 0x4A, 0x66, 0xF5, 0x58,
+};
+#define DECMODE_CCSDS_TABLE_N \
+    (sizeof DECMODE_CCSDS_TABLE / sizeof DECMODE_CCSDS_TABLE[0])
+
+// Cap on how many post-Golay bytes the descrambler stage previews.
+// Plenty to recognise the payload's character without filling the
+// panel with redundant rows.
+#define DECMODE_DESCR_CAP 96
+
 // ---------------------------------------------------------------------------
 // CLI flags + companion helpers
 // ---------------------------------------------------------------------------
@@ -2194,7 +2241,7 @@ int main(int argc, char **argv)
     // visible in the spectrogram (no fixed-window slice). Recompute
     // fires after a short debounce on zoom/pan so a fast scroll
     // doesn't trigger one per frame.
-    #define DECMODE_N_STAGES 8
+    #define DECMODE_N_STAGES 9
     static const char *DECMODE_STAGE_NAMES[DECMODE_N_STAGES] = {
         "raw IQ",
         "IQ LPF",
@@ -2204,6 +2251,7 @@ int main(int argc, char **argv)
         "slicer bits",
         "ASM correlation",
         "Golay length",
+        "CCSDS descrambler",
     };
     int    decmode_open      = 0;
     int    decmode_stage     = 0;
@@ -2239,6 +2287,14 @@ int main(int argc, char **argv)
     // spectrogram between debounced recomputes. -1.0 = no lock.
     double     decmode_asm_abs_time_s = -1.0;
     double     decmode_bit_period_s   = 0.0;
+
+    // Stage 8 (CCSDS descrambler) — first DECMODE_DESCR_CAP bytes
+    // immediately after the Golay header, packed MSB-first, plus
+    // their CCSDS-descrambled values. decmode_descr_n = 0 → not
+    // computed (no Golay lock, or not enough bits past Golay).
+    uint8_t    decmode_descr_scrambled[DECMODE_DESCR_CAP];
+    uint8_t    decmode_descr_descrambled[DECMODE_DESCR_CAP];
+    size_t     decmode_descr_n          = 0;
 
     while (!WindowShouldClose()) {
         int sw = GetScreenWidth();
@@ -3644,6 +3700,41 @@ int main(int argc, char **argv)
                             decmode_golay_data12 = d12;
                             decmode_golay_errors = errs;
                         }
+                        // Stage 8: CCSDS descrambler. Pack the
+                        // first DECMODE_DESCR_CAP bytes after the
+                        // Golay header (MSB-first within each byte),
+                        // then XOR with the CCSDS table. If the
+                        // Golay length came back smaller than the
+                        // cap, only descramble that many.
+                        decmode_descr_n = 0;
+                        if (decmode_diag.asm_offset != (size_t) -1
+                            && decmode_diag.bits != NULL) {
+                            size_t bbase =
+                                decmode_diag.asm_offset + 32 + 24;
+                            size_t want = DECMODE_DESCR_CAP;
+                            if (decmode_golay_rc == 0
+                                && decmode_golay_data12 > 0
+                                && (size_t) decmode_golay_data12
+                                   < want) {
+                                want = (size_t) decmode_golay_data12;
+                            }
+                            for (size_t i = 0; i < want; ++i) {
+                                if (bbase + (i + 1) * 8
+                                    > decmode_diag.n_strobes) break;
+                                uint8_t b = 0;
+                                for (int k = 0; k < 8; ++k) {
+                                    b = (uint8_t)((b << 1)
+                                        | (decmode_diag.bits[
+                                              bbase + i * 8 + k] & 1u));
+                                }
+                                decmode_descr_scrambled[i] = b;
+                                decmode_descr_descrambled[i] =
+                                    (uint8_t)(b
+                                              ^ DECMODE_CCSDS_TABLE[
+                                                  i % DECMODE_CCSDS_TABLE_N]);
+                                decmode_descr_n = i + 1;
+                            }
+                        }
                     }
                 }
             }
@@ -4758,12 +4849,141 @@ int main(int argc, char **argv)
                     }
                 }
 
+                // ------ Stage 8: CCSDS descrambler ------
+                else if (decmode_stage == 8) {
+                    // Three rows of byte cells:
+                    //   1) scrambled (on-wire) bytes
+                    //   2) CCSDS XOR table bytes
+                    //   3) descrambled bytes (row 1 XOR row 2)
+                    // Plus an ASCII strip on the bottom showing
+                    // printable descrambled bytes — gives the
+                    // operator a quick "is this a beacon string?"
+                    // sanity check.
+                    int margin_x = 24;
+                    int avail_w  = body_w - 2 * margin_x;
+                    int cell_h   = 26;
+                    int gap_y    = 4;
+                    int cell_w   = 30;   // room for "FF"
+                    int max_cells = (avail_w > 0)
+                        ? (avail_w / cell_w) : 0;
+                    if (max_cells > DECMODE_DESCR_CAP)
+                        max_cells = DECMODE_DESCR_CAP;
+                    int n_show = (int) decmode_descr_n;
+                    if (n_show > max_cells) n_show = max_cells;
+                    int row_x0 = body_x0 + margin_x;
+                    int row1_y = body_y0 + 32;
+                    int row2_y = row1_y + cell_h + gap_y;
+                    int row3_y = row2_y + cell_h + gap_y;
+                    int ascii_y = row3_y + cell_h + gap_y + 4;
+
+                    // Row captions on the left.
+                    draw_text("scrambled",
+                              body_x0 + margin_x - 4 - 70,
+                              row1_y + (cell_h - AMP_PT)/2,
+                              AMP_PT, (Color){200, 200, 220, 220});
+                    draw_text("CCSDS XOR",
+                              body_x0 + margin_x - 4 - 70,
+                              row2_y + (cell_h - AMP_PT)/2,
+                              AMP_PT, (Color){170, 170, 200, 220});
+                    draw_text("descrambled",
+                              body_x0 + margin_x - 4 - 88,
+                              row3_y + (cell_h - AMP_PT)/2,
+                              AMP_PT, (Color){200, 220, 200, 220});
+
+                    if (decmode_descr_n == 0) {
+                        draw_text(
+                            "no Golay lock — descrambler input is "
+                            "not byte-aligned yet",
+                            body_x0 + margin_x, body_y0 + 80,
+                            AMP_PT, LIGHTGRAY);
+                    } else {
+                        Color edge       = {30, 30, 40, 255};
+                        Color row1_bg    = {60, 60, 70, 255};
+                        Color row2_bg    = {45, 45, 60, 255};
+                        Color row3_bg    = {55, 80, 70, 255};
+                        Color row1_tx    = {220, 220, 230, 255};
+                        Color row2_tx    = {170, 180, 210, 255};
+                        Color row3_tx    = {220, 240, 200, 255};
+
+                        for (int i = 0; i < n_show; ++i) {
+                            int x = row_x0 + i * cell_w;
+                            DrawRectangle(x, row1_y, cell_w - 2, cell_h, row1_bg);
+                            DrawRectangleLines(x, row1_y, cell_w - 2, cell_h, edge);
+                            DrawRectangle(x, row2_y, cell_w - 2, cell_h, row2_bg);
+                            DrawRectangleLines(x, row2_y, cell_w - 2, cell_h, edge);
+                            DrawRectangle(x, row3_y, cell_w - 2, cell_h, row3_bg);
+                            DrawRectangleLines(x, row3_y, cell_w - 2, cell_h, edge);
+
+                            char b[4];
+                            int tp = AMP_PT - 2;
+                            snprintf(b, sizeof b, "%02X",
+                                     decmode_descr_scrambled[i]);
+                            int bw = measure_text(b, tp);
+                            draw_text(b, x + (cell_w - 2 - bw)/2,
+                                      row1_y + (cell_h - tp)/2,
+                                      tp, row1_tx);
+                            snprintf(b, sizeof b, "%02X",
+                                     DECMODE_CCSDS_TABLE[
+                                         (size_t) i % DECMODE_CCSDS_TABLE_N]);
+                            bw = measure_text(b, tp);
+                            draw_text(b, x + (cell_w - 2 - bw)/2,
+                                      row2_y + (cell_h - tp)/2,
+                                      tp, row2_tx);
+                            snprintf(b, sizeof b, "%02X",
+                                     decmode_descr_descrambled[i]);
+                            bw = measure_text(b, tp);
+                            draw_text(b, x + (cell_w - 2 - bw)/2,
+                                      row3_y + (cell_h - tp)/2,
+                                      tp, row3_tx);
+                        }
+                        // ASCII strip — replace non-printable with '.'.
+                        char ascii_buf[DECMODE_DESCR_CAP + 1] = {0};
+                        for (int i = 0; i < n_show; ++i) {
+                            uint8_t c = decmode_descr_descrambled[i];
+                            ascii_buf[i] =
+                                (c >= 0x20 && c < 0x7F) ? (char) c : '.';
+                        }
+                        ascii_buf[n_show] = '\0';
+                        draw_text("ASCII:",
+                                  body_x0 + margin_x - 4 - 56,
+                                  ascii_y + 2,
+                                  AMP_PT - 2,
+                                  (Color){170, 200, 200, 220});
+                        draw_text(ascii_buf,
+                                  row_x0, ascii_y,
+                                  AMP_PT,
+                                  (Color){180, 220, 220, 230});
+
+                        // Footer: show the on-wire length the Golay
+                        // header claimed (or a "no lock" notice).
+                        char status_buf[160];
+                        if (decmode_golay_rc == 0) {
+                            snprintf(status_buf, sizeof status_buf,
+                                "Golay said %u byte%s on the wire; "
+                                "showing the first %d.",
+                                (unsigned) decmode_golay_data12,
+                                decmode_golay_data12 == 1 ? "" : "s",
+                                n_show);
+                        } else {
+                            snprintf(status_buf, sizeof status_buf,
+                                "Golay uncorrectable — descrambling "
+                                "the first %d bytes anyway.",
+                                n_show);
+                        }
+                        draw_text(status_buf,
+                                  row_x0,
+                                  ascii_y + AMP_PT + 12,
+                                  AMP_PT - 2,
+                                  (Color){180, 180, 200, 220});
+                    }
+                }
+
                 DrawRectangleLines(body_x0, body_y0,
                                    body_w, body_h, DARKGRAY);
 
                 // Time-axis ticks — same renderer the W panel uses,
                 // shared by the time-domain stages (0-6).
-                if (decmode_stage != 7) {
+                if (decmode_stage != 7 && decmode_stage != 8) {
                     double raw_step = span_s / 6.0;
                     double mag = pow(10.0, floor(log10(raw_step)));
                     double mul = raw_step / mag;
@@ -4849,6 +5069,7 @@ int main(int argc, char **argv)
             // stage 4 (eye, symbol-relative) and stage 7 (Golay, no
             // time axis).
             if (decmode_stage != 4 && decmode_stage != 7
+                && decmode_stage != 8
                 && wf_t_hi > wf_t_lo
                 && plot_w > 16 && plot_h > 16) {
                 double span = wf_t_hi - wf_t_lo;
