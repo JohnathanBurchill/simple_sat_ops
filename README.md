@@ -121,3 +121,48 @@ gcc -o lifetime lifetime.c prediction.c -lsgp4sdp4
 
 The ```sgp4sdp4``` library needs to be compiled separately and installed in a
 suitable location.
+
+## Graphical tools over SSH (raylib OpenGL 2.1 rebuild)
+
+`decode_inspector` and `live_waterfall` are raylib apps. raylib's default
+build asks GLFW for an OpenGL 3.3 core context. Vanilla SSH X11 forwarding
+(`ssh -X` / `ssh -Y`) only carries GLX 1.x and can't transport that context
+request — you get `GLX: An OpenGL profile requested but
+GLX_ARB_create_context_profile is unavailable` and the window won't open.
+
+The fix is to rebuild raylib for OpenGL 2.1, which fits inside GLX 1.x:
+
+```bash
+# In the raylib source tree (apt-installed sources, a git clone, etc.):
+mkdir -p build && cd build
+cmake -DOPENGL_VERSION=2.1 \
+      -DBUILD_EXAMPLES=OFF \
+      -DBUILD_SHARED_LIBS=ON \
+      -DCMAKE_BUILD_TYPE=Release \
+      ..
+make -j
+sudo make install            # /usr/local by default
+sudo ldconfig
+
+# Sanity check — should report the /usr/local copy first:
+pkg-config --variable=prefix raylib
+```
+
+Then re-cmake the simple_sat_ops build so it picks the new raylib up:
+
+```bash
+cd /path/to/simple_sat_ops/build
+rm -f CMakeCache.txt
+cmake ..
+make -j decode_inspector live_waterfall
+```
+
+`decode_inspector` picks GLSL 120 vs 330 for its colour-map shader at runtime
+via `rlGetVersion()`, so the same source tree builds and runs against either
+raylib variant.
+
+If you want to keep the apt-installed raylib alongside the 2.1 one, give
+the 2.1 build a custom prefix (`-DCMAKE_INSTALL_PREFIX=/opt/raylib-21`) and
+prefix the simple_sat_ops cmake with
+`PKG_CONFIG_PATH=/opt/raylib-21/lib/pkgconfig:$PKG_CONFIG_PATH`; at runtime
+set `LD_LIBRARY_PATH=/opt/raylib-21/lib`.

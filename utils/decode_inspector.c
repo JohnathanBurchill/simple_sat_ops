@@ -1461,34 +1461,14 @@ static int safe_init_window(int w, int h, const char *title)
     return ok ? 0 : -1;
 }
 
-// Hardware GL failed. If we haven't already tried software rendering,
-// set LIBGL_ALWAYS_SOFTWARE=1 (mesa will switch to the llvmpipe
-// software pipeline, which DOES advertise the GLX_ARB_create_context_
-// profile that raylib's 3.3 core context request needs) and re-exec
-// ourselves with the same argv. A guard env var stops a re-exec loop
-// if the software path also fails. Returns 1 if exec was attempted
-// (caller should not reach here), 0 if we've already tried.
-static int retry_with_software_renderer(char **argv, const char *prog)
-{
-    if (getenv("SSO_FORCE_SW_RENDER") != NULL) return 0;
-    fprintf(stderr,
-        "%s: hardware OpenGL unavailable; retrying with the mesa\n"
-        "software renderer (LIBGL_ALWAYS_SOFTWARE=1)...\n", prog);
-    setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
-    setenv("SSO_FORCE_SW_RENDER", "1", 1);
-    // Prefer the kernel-canonical path so a relative argv[0]
-    // doesn't depend on $PATH/cwd after exec.
-    char self_path[4096];
-    ssize_t n = readlink("/proc/self/exe", self_path, sizeof self_path - 1);
-    if (n > 0) {
-        self_path[n] = '\0';
-        execv(self_path, argv);
-    }
-    execvp(argv[0], argv);
-    // exec returned → failure.
-    fprintf(stderr, "%s: execvp failed: %s\n", prog, strerror(errno));
-    return 1;
-}
+// (No software-renderer fallback. `LIBGL_ALWAYS_SOFTWARE=1` just runs
+// the OpenGL pipeline on the CPU via mesa/llvmpipe; it doesn't get us
+// out of OpenGL. In particular the GLX wire protocol round-trip to
+// the X server still happens, so the SSH-X11 case isn't helped at
+// all. A true no-OpenGL path would need OSMesa + XPutImage or a
+// different renderer entirely, and raylib doesn't expose that. If
+// you're hitting this on a headless host with no GPU driver, set
+// LIBGL_ALWAYS_SOFTWARE=1 in your environment by hand.)
 
 // ---------------------------------------------------------------------------
 // Main
@@ -1625,42 +1605,37 @@ int main(int argc, char **argv)
     // ----- raylib window + IQ load + in-process spectrogram -----
     SetTraceLogLevel(LOG_WARNING);
     if (safe_init_window(win_w, win_h, "decode_inspector") != 0) {
-        // Hardware OpenGL failed. Try mesa's software renderer
-        // (LIBGL_ALWAYS_SOFTWARE=1) by re-execing ourselves with a
-        // clean GLFW state. Helps on headless hosts with no GPU
-        // driver. Does NOT help when the bottleneck is the X
-        // protocol over SSH — see the message below.
-        retry_with_software_renderer(argv, "decode_inspector");
+        // Couldn't get an OpenGL context. raylib is OpenGL-only, so
+        // there isn't a software fallback we can take inside the
+        // process — `LIBGL_ALWAYS_SOFTWARE=1` just selects mesa's CPU
+        // OpenGL implementation, which still has to traverse GLX to
+        // the X server (no help when SSH forwarding is the bottleneck).
         fprintf(stderr,
             "decode_inspector: cannot open a window.\n"
             "\n"
             "If you're connected over SSH with `-X` / `-Y`:\n"
             "  vanilla X11 forwarding only carries the GLX 1.x wire\n"
-            "  protocol and the OpenGL 3.3 core profile context that\n"
-            "  raylib needs can't be created remotely (the\n"
+            "  protocol; the OpenGL 3.3 core context raylib normally\n"
+            "  requests can't be created remotely (the\n"
             "  GLX_ARB_create_context_profile errors above are this).\n"
-            "  LIBGL_ALWAYS_SOFTWARE=1 doesn't help — that picks the\n"
-            "  software pipeline on the local mesa side, but the GLX\n"
-            "  request still has to round-trip your X server.\n"
+            "  LIBGL_ALWAYS_SOFTWARE=1 doesn't help — it switches mesa\n"
+            "  to the CPU pipeline locally, but the GLX request still\n"
+            "  round-trips your X server.\n"
             "\n"
-            "Workarounds, in order of effort:\n"
+            "  The fix is to rebuild raylib with OpenGL 2.1 (the older\n"
+            "  profile travels fine over GLX 1.x) and relink. See\n"
+            "  README.md for the exact command.\n"
+            "\n"
+            "Alternatives if you don't want to rebuild raylib:\n"
             "  - Copy the .iq off the remote and run decode_inspector\n"
             "    on your local desktop (lowest friction).\n"
             "  - Use Xpra (`xpra start :100 --start-child=decode_inspector`)\n"
-            "    or VirtualGL + VNC — both render server-side and ship\n"
-            "    framebuffer pixels rather than GL calls.\n"
-            "  - Rebuild raylib locally with `-DGRAPHICS=GRAPHICS_API_\n"
-            "    OPENGL_21` and relink decode_inspector against it; the\n"
-            "    older profile traverses SSH X11 forwarding.\n"
+            "    or VirtualGL + VNC — both render on the server side\n"
+            "    and ship framebuffer pixels rather than GL calls.\n"
             "\n"
-            "If you're truly headless (no DISPLAY, no SSH `-X`): there's\n"
-            "no way to put a window on the screen. Run locally instead.\n");
+            "If you're truly headless (no DISPLAY, no SSH `-X`): there\n"
+            "is no way to put a window on the screen. Run locally.\n");
         return 1;
-    }
-    if (getenv("SSO_FORCE_SW_RENDER") != NULL) {
-        fprintf(stderr,
-            "decode_inspector: running on the software renderer "
-            "(LIBGL_ALWAYS_SOFTWARE=1). Frame rate will be lower.\n");
     }
     SetTargetFPS(60);
     SetExitKey(0);
