@@ -5306,12 +5306,13 @@ int main(int argc, char **argv)
             .decim_factor    = 5u,
             .decim_cutoff_hz = 18000.0,
             .decim_taps      = 96u,
-            // FM-path LO compensation: the IQ tap stays at the LO-
-            // offset baseband (so .iq + waterfall stay readable), but
-            // the FM discriminator needs the carrier at DC or its
-            // ±25 kHz scale clips the FSK upper level. Pass the LO
-            // offset through; the core's second NCO subtracts it for
-            // the demod path only.
+            // FM-path LO compensation: the core's second NCO cancels
+            // both the operator's lo_offset AND the UHD-reported tune
+            // residual (target − actual, from the AD9361 PLL step) so
+            // the carrier lands at exactly DC for every downstream
+            // consumer (.iq sidecar, live waterfall, shadow IQ
+            // decoder, FM discriminator). Pass the operator offset
+            // through; the residual is read back inside set_freq.
             .fm_lo_compensation_hz = state.rx_lo_offset_hz,
         };
         b210_rx_tx_core_t *core = NULL;

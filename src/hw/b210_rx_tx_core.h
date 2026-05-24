@@ -69,19 +69,23 @@ typedef struct b210_rx_tx_core_params {
     // waveform that won't bit-slice cleanly.
     //
     // The pump applies a SECOND NCO to the post-decim/post-Doppler
-    // stream IN PLACE, rotating by -fm_lo_compensation_hz so the
-    // carrier lands at DC. The rotation happens BEFORE the IQ tap
-    // so every downstream consumer (.iq sidecar, live waterfall,
-    // shadow IQ decoder, FM discriminator) sees the centered signal.
-    // The spectrum is periodic in fs so the rotation wraps the far
-    // edge — for a single-carrier sat that's invisible; for a noisy
-    // neighbour at original +/-(fs/2 - lo_offset) baseband it'll show
-    // up mirrored on the opposite edge.
+    // stream IN PLACE that cancels both this lo_offset AND the UHD-
+    // reported tune residual (target_freq − actual_freq, from the
+    // AD9361's PLL step), so the carrier lands at exactly DC. The
+    // rotation happens BEFORE the IQ tap so every downstream consumer
+    // (.iq sidecar, live waterfall, shadow IQ decoder, FM
+    // discriminator) sees the centered signal. The spectrum is
+    // periodic in fs so the rotation wraps the far edge — for a
+    // single-carrier sat that's invisible; for a noisy neighbour at
+    // original +/-(fs/2 - lo_offset) baseband it'll show up mirrored
+    // on the opposite edge.
     //
-    // Pass the operator's lo_offset_hz here (i.e. nominal − actual_LO)
-    // so the demod path sees an at-DC signal.
+    // Pass the operator's lo_offset_hz here (i.e. nominal − actual_LO).
+    // The tune residual is read back from UHD on every set_freq and
+    // folded in automatically.
     //
-    // 0 disables — the FM demod runs on the post-Doppler IQ as-is.
+    // 0 lo_offset with 0 residual → NCO disabled. Otherwise it stays
+    // active to cancel whatever residual is left.
     double      fm_lo_compensation_hz;
 } b210_rx_tx_core_params_t;
 
@@ -145,8 +149,10 @@ double b210_rx_tx_core_get_doppler_offset(const b210_rx_tx_core_t *core);
 // same value plumbed via fm_lo_compensation_hz at open). Used by the
 // :lo_offset colon command to chase a noisier baseband band — pair
 // with a hardware retune via b210_rx_tx_core_set_freq so the SDR LO
-// and the demod-path compensation stay consistent. 0 disables the
-// second NCO entirely.
+// and the demod-path compensation stay consistent. The UHD tune
+// residual is refreshed automatically inside set_freq and stays
+// folded into the NCO across this call. 0 lo_offset + 0 residual →
+// the NCO goes dormant; non-zero residual keeps it running.
 void b210_rx_tx_core_set_fm_lo_compensation(b210_rx_tx_core_t *core,
                                             double lo_offset_hz);
 

@@ -80,9 +80,11 @@ struct b210_rx_tx_core {
     // Lives in src/dsp/sw_nco for unit-testability.
     sw_nco_t                sw_nco;
     // Second NCO that runs ONLY on the FM-discriminator path. Cancels
-    // the constant lo_offset so the FSK signal lands at DC for the
-    // discriminator (which is calibrated for ±fm_fullscale_hz around
-    // DC; a non-zero baseband offset clips the FSK upper level).
+    // the constant lo_offset AND the UHD-reported tune residual
+    // (target_freq − actual_freq, from the AD9361's PLL step) so the
+    // FSK signal lands at exactly DC for the discriminator (which is
+    // calibrated for ±fm_fullscale_hz around DC; a non-zero baseband
+    // offset clips the FSK upper level).
     // Applied IN PLACE on the post-decim/post-Doppler stream BEFORE
     // the IQ tap, so the .iq sidecar + live waterfall + shadow IQ
     // decoder all see the signal centered at DC. The spectrum is
@@ -91,6 +93,8 @@ struct b210_rx_tx_core {
     // (faithful but visually unfamiliar for wideband neighbours).
     sw_nco_t                fm_lo_nco;
     int                     fm_lo_nco_active;
+    double                  fm_lo_compensation_hz; // operator's rx_lo_offset
+    double                  tune_residual_hz;      // target − actual, per retune
 
     // Broadband-burst detector — FFTs the post-NCO IQ and counts how
     // many bins simultaneously exceed their per-bin running floor.
@@ -125,6 +129,22 @@ static void refresh_actual_freq(b210_rx_tx_core_t *c)
     if (uhd_usrp_get_rx_freq(c->dev, 0, &f) == UHD_ERROR_NONE) {
         c->actual_freq = f;
     }
+}
+
+// Recompute the fm_lo_nco rotation from the current operator offset
+// + the UHD tune residual so the satellite carrier lands at DC.
+//
+// After UHD tunes to target_freq the actual LO is at actual_freq;
+// a signal at the nominal RF (target − rx_lo_offset_hz) lands at
+// baseband = nominal − actual_freq = −rx_lo_offset_hz + (target − actual)
+//          = −fm_lo_compensation_hz + tune_residual_hz.
+// sw_nco_set_freq(f) shifts signals DOWN by f, so set f to that
+// baseband location and the carrier ends up at exactly 0.
+static void refresh_fm_lo_nco(b210_rx_tx_core_t *c)
+{
+    double f = -c->fm_lo_compensation_hz + c->tune_residual_hz;
+    sw_nco_set_freq(&c->fm_lo_nco, f);
+    c->fm_lo_nco_active = (f != 0.0);
 }
 
 int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **out)
@@ -171,21 +191,16 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
     sw_nco_init(&c->sw_nco, c->actual_rate);
 
     // FM-path LO-compensation NCO: shifts the post-Doppler IQ to DC
-    // for the discriminator. fm_lo_compensation_hz is the SIGNED
-    // offset of the hardware LO from nominal — the NCO subtracts it
-    // (rotates by exp(-j 2π · (-comp) · n/fs) = exp(+j 2π · comp · n/fs))
-    // to put the carrier back at 0 Hz baseband. 0 → disable, FM path
-    // runs straight off the post-Doppler buffer.
+    // for the discriminator. Combines the operator's rx_lo_offset_hz
+    // with the UHD-reported tune residual (target − actual) so the
+    // signal lands at exactly DC, not just within a PLL-step of it.
+    // 0 total → NCO disabled, FM path runs straight off the post-
+    // Doppler buffer. tune_residual_hz is filled in below, once
+    // set_rx_freq has run and refresh_actual_freq has read back the
+    // achieved LO.
     sw_nco_init(&c->fm_lo_nco, c->actual_rate);
-    if (p->fm_lo_compensation_hz != 0.0) {
-        // sw_nco_apply rotates by exp(-j 2π · f · n/fs). To shift a
-        // tone at +offset to DC we set f = +offset. The operator's
-        // lo_offset_hz is "LO minus nominal", so the signal lives at
-        // -lo_offset_hz baseband. Setting f = -lo_offset_hz brings
-        // it to DC.
-        sw_nco_set_freq(&c->fm_lo_nco, -p->fm_lo_compensation_hz);
-        c->fm_lo_nco_active = 1;
-    }
+    c->fm_lo_compensation_hz = p->fm_lo_compensation_hz;
+    c->tune_residual_hz      = 0.0;
 
     // Broadband-burst detector at the post-decim rate. N=512 → ~187 Hz
     // bin width at 96 kS/s. 10 dB threshold + 2 s floor τ is the same
@@ -221,6 +236,14 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
     }
     c->actual_freq = p->freq_hz;
     refresh_actual_freq(c);
+    c->tune_residual_hz = p->freq_hz - c->actual_freq;
+    refresh_fm_lo_nco(c);
+    if (fabs(c->tune_residual_hz) >= 1.0) {
+        fprintf(stderr,
+                "b210_rx_tx_core: tune residual %.1f Hz (target %.6f MHz, "
+                "actual %.6f MHz) — folded into fm_lo_nco\n",
+                c->tune_residual_hz, p->freq_hz / 1e6, c->actual_freq / 1e6);
+    }
 
     if (log_uhd(uhd_rx_streamer_make(&c->stream), "rx_streamer_make")) goto fail;
     {
@@ -488,6 +511,8 @@ int b210_rx_tx_core_set_freq(b210_rx_tx_core_t *c, double freq_hz)
         return -1;
     }
     refresh_actual_freq(c);
+    c->tune_residual_hz = freq_hz - c->actual_freq;
+    refresh_fm_lo_nco(c);
     return 0;
 }
 
@@ -522,15 +547,11 @@ void b210_rx_tx_core_set_fm_lo_compensation(b210_rx_tx_core_t *c,
                                             double lo_offset_hz)
 {
     if (c == NULL) return;
-    if (lo_offset_hz == 0.0) {
-        c->fm_lo_nco_active = 0;
-        sw_nco_set_freq(&c->fm_lo_nco, 0.0);
-    } else {
-        // Frequency-only update — preserve phase so a small adjustment
-        // doesn't pop the discriminator output.
-        sw_nco_set_freq(&c->fm_lo_nco, -lo_offset_hz);
-        c->fm_lo_nco_active = 1;
-    }
+    // Update operator offset; recompute the NCO including the latest
+    // UHD tune residual. Phase is preserved by sw_nco_set_freq so a
+    // small adjustment doesn't pop the discriminator output.
+    c->fm_lo_compensation_hz = lo_offset_hz;
+    refresh_fm_lo_nco(c);
 }
 
 int b210_rx_tx_core_iq_levels(const b210_rx_tx_core_t *c,
