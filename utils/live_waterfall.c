@@ -534,6 +534,17 @@ int main(int argc, char **argv)
 
     SetTraceLogLevel(LOG_WARNING);
     InitWindow(64, 64, "live_waterfall");
+    if (!IsWindowReady()) {
+        // GLFW couldn't open a window — typically SSH without X11
+        // forwarding or a headless host. Exit cleanly with a hint
+        // rather than segfaulting on the next raylib call.
+        fprintf(stderr,
+            "live_waterfall: failed to open a window. This tool is a\n"
+            "graphical viewer and needs a display ($DISPLAY, Wayland\n"
+            "compositor, or local macOS/Windows session). Over SSH use\n"
+            "`ssh -X` / `ssh -Y` to forward X11, or run locally.\n");
+        return 1;
+    }
     int monitor = GetCurrentMonitor();
     int mon_w = GetMonitorWidth(monitor);
     int mon_h = GetMonitorHeight(monitor);
