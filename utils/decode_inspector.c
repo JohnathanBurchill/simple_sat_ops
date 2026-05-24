@@ -41,6 +41,7 @@
 #include <raylib.h>
 #include <rlgl.h>
 
+#include "csp.h"
 #include "golay24.h"
 #include "modem.h"
 #include "modem_fsk.h"
@@ -2242,7 +2243,7 @@ int main(int argc, char **argv)
     // visible in the spectrogram (no fixed-window slice). Recompute
     // fires after a short debounce on zoom/pan so a fast scroll
     // doesn't trigger one per frame.
-    #define DECMODE_N_STAGES 10
+    #define DECMODE_N_STAGES 11
     static const char *DECMODE_STAGE_NAMES[DECMODE_N_STAGES] = {
         "raw IQ",
         "IQ LPF",
@@ -2254,6 +2255,7 @@ int main(int argc, char **argv)
         "Golay length",
         "CCSDS descrambler",
         "Reed-Solomon (255,223)",
+        "CSP v1 packet",
     };
     int    decmode_open      = 0;
     int    decmode_stage     = 0;
@@ -2321,6 +2323,17 @@ int main(int argc, char **argv)
     int        decmode_rs_view_off      = 0;
     float      decmode_rs_cell_w        = 30.0f;
 
+    // Stage 10 (CSP v1 packet parse). After RS, the "inner" buffer
+    // is decmode_rs_out + pad_len, of length (decmode_descr_n - 32).
+    // The first 4 bytes are the CSP v1 header; the rest is payload
+    // (with an optional HMAC or CRC trailer that we don't strip
+    // here — the panel is for inspection, not validation).
+    csp_v1_header_t decmode_csp_hdr     = {0};
+    int             decmode_csp_have_hdr = 0;
+    size_t          decmode_csp_inner_n  = 0;
+    int             decmode_csp_view_off = 0;
+    float           decmode_csp_cell_w   = 30.0f;
+
     while (!WindowShouldClose()) {
         int sw = GetScreenWidth();
         int sh = GetScreenHeight();
@@ -2356,16 +2369,17 @@ int main(int argc, char **argv)
         // The spectrogram's view_y/zoom are the single source of
         // truth for the visible time window, so the panel handlers
         // just modify those.
-        // Byte-grid stages (8 = CCSDS descrambler, 9 = Reed-Solomon)
-        // consume wheel + pinch for their own scroll/zoom instead
-        // of panning time. Wheel scrolls the byte offset shown at
-        // the left edge of the grid; pinch resizes the byte cells.
-        // Each stage has its own offset/cell-width state so the
-        // operator's view position carries across when they cycle
-        // between the two.
+        // Byte-grid stages (8 = CCSDS descrambler, 9 = Reed-Solomon,
+        // 10 = CSP packet) consume wheel + pinch for their own
+        // scroll/zoom instead of panning time. Wheel scrolls the
+        // byte offset shown at the left edge of the grid; pinch
+        // resizes the byte cells. Each stage owns its own state so
+        // the operator's view position carries across when they
+        // cycle between them.
         int stage_eats_panel_input = in_panel_for_input
             && decmode_open
-            && (decmode_stage == 8 || decmode_stage == 9);
+            && (decmode_stage == 8 || decmode_stage == 9
+                || decmode_stage == 10);
         if (stage_eats_panel_input && (wheel_v.x != 0.0f
                                        || wheel_v.y != 0.0f)) {
             int delta = (int)((wheel_v.x + wheel_v.y) * 2.0f);
@@ -2377,17 +2391,28 @@ int main(int argc, char **argv)
                 if (max_off < 0) max_off = 0;
                 if (decmode_descr_view_off > max_off)
                     decmode_descr_view_off = max_off;
-            } else {
+            } else if (decmode_stage == 9) {
                 decmode_rs_view_off += delta;
                 if (decmode_rs_view_off < 0)
                     decmode_rs_view_off = 0;
                 if (decmode_rs_view_off > RS_N - 1)
                     decmode_rs_view_off = RS_N - 1;
+            } else {
+                decmode_csp_view_off += delta;
+                if (decmode_csp_view_off < 0)
+                    decmode_csp_view_off = 0;
+                int max_off = (int) decmode_csp_inner_n - 1;
+                if (max_off < 0) max_off = 0;
+                if (decmode_csp_view_off > max_off)
+                    decmode_csp_view_off = max_off;
             }
         }
         if (stage_eats_panel_input && pinch != 0.0f) {
             float *cw = (decmode_stage == 8)
-                ? &decmode_descr_cell_w : &decmode_rs_cell_w;
+                ? &decmode_descr_cell_w
+                : (decmode_stage == 9)
+                    ? &decmode_rs_cell_w
+                    : &decmode_csp_cell_w;
             float new_cw = *cw * expf(pinch);
             if (new_cw < 12.0f)  new_cw = 12.0f;
             if (new_cw > 100.0f) new_cw = 100.0f;
@@ -3826,6 +3851,25 @@ int main(int argc, char **argv)
                             int rc_rs = rs_decode(decmode_rs_out,
                                                   decmode_rs_locs);
                             decmode_rs_errors = rc_rs;
+                        }
+                        // Stage 10: CSP v1 header parse. Try to
+                        // decode even if RS failed — the four bytes
+                        // are what they are, and showing the
+                        // attempted parse is more useful than
+                        // silently doing nothing.
+                        decmode_csp_have_hdr = 0;
+                        decmode_csp_inner_n = 0;
+                        if (decmode_descr_n
+                            > (size_t) (RS_NROOTS + 4)) {
+                            const uint8_t *inner =
+                                decmode_rs_out + decmode_rs_pad_len;
+                            if (csp_v1_decode(inner,
+                                              &decmode_csp_hdr) == 0) {
+                                decmode_csp_have_hdr = 1;
+                                decmode_csp_inner_n =
+                                    decmode_descr_n
+                                    - (size_t) RS_NROOTS;
+                            }
                         }
                     }
                 }
@@ -5307,13 +5351,226 @@ int main(int argc, char **argv)
                     }
                 }
 
+                // ------ Stage 10: CSP v1 packet parse ------
+                else if (decmode_stage == 10) {
+                    // Top: parsed header fields as labeled text.
+                    // Bottom: payload byte grid (same scroll/zoom
+                    // semantics as stages 8/9) and an ASCII strip.
+                    int margin_x = 24;
+                    if (!decmode_csp_have_hdr) {
+                        draw_text(
+                            "no RS-corrected codeword yet — need at "
+                            "least 36 descrambled bytes (4-byte CSP "
+                            "header + 32-byte RS parity tail) "
+                            "before this stage can parse",
+                            body_x0 + margin_x, body_y0 + 60,
+                            AMP_PT, LIGHTGRAY);
+                    } else {
+                        const uint8_t *inner =
+                            decmode_rs_out + decmode_rs_pad_len;
+                        const uint8_t *payload = inner + 4;
+                        size_t payload_n = (decmode_csp_inner_n > 4)
+                            ? (decmode_csp_inner_n - 4) : 0;
+
+                        // ---- Header summary text ----
+                        int label_x = body_x0 + margin_x;
+                        int label_y = body_y0 + 30;
+                        int line_h  = AMP_PT + 6;
+
+                        const char *prio_name = "?";
+                        switch (decmode_csp_hdr.prio) {
+                            case 0: prio_name = "CRITICAL"; break;
+                            case 1: prio_name = "HIGH";     break;
+                            case 2: prio_name = "NORMAL";   break;
+                            case 3: prio_name = "LOW";      break;
+                        }
+                        char flag_str[64] = "";
+                        if (decmode_csp_hdr.flags & CSP_FLAG_HMAC)
+                            strncat(flag_str, "HMAC|",
+                                    sizeof flag_str - strlen(flag_str) - 1);
+                        if (decmode_csp_hdr.flags & CSP_FLAG_XTEA)
+                            strncat(flag_str, "XTEA|",
+                                    sizeof flag_str - strlen(flag_str) - 1);
+                        if (decmode_csp_hdr.flags & CSP_FLAG_RDP)
+                            strncat(flag_str, "RDP|",
+                                    sizeof flag_str - strlen(flag_str) - 1);
+                        if (decmode_csp_hdr.flags & CSP_FLAG_CRC)
+                            strncat(flag_str, "CRC|",
+                                    sizeof flag_str - strlen(flag_str) - 1);
+                        size_t fl = strlen(flag_str);
+                        if (fl > 0 && flag_str[fl - 1] == '|')
+                            flag_str[fl - 1] = '\0';
+                        if (flag_str[0] == '\0')
+                            snprintf(flag_str, sizeof flag_str,
+                                     "(none)");
+
+                        char hdr_hex[16];
+                        snprintf(hdr_hex, sizeof hdr_hex,
+                                 "%02X %02X %02X %02X",
+                                 inner[0], inner[1], inner[2], inner[3]);
+                        char buf[160];
+
+                        snprintf(buf, sizeof buf,
+                                 "raw header: %s", hdr_hex);
+                        draw_text(buf, label_x, label_y,
+                                  AMP_PT,
+                                  (Color){220, 220, 230, 255});
+
+                        snprintf(buf, sizeof buf,
+                                 "prio   : %s  (%u)",
+                                 prio_name,
+                                 (unsigned) decmode_csp_hdr.prio);
+                        draw_text(buf, label_x, label_y + line_h,
+                                  AMP_PT,
+                                  (Color){200, 220, 200, 230});
+
+                        snprintf(buf, sizeof buf,
+                                 "src    : %3u    →    dst    : %3u",
+                                 (unsigned) decmode_csp_hdr.src,
+                                 (unsigned) decmode_csp_hdr.dst);
+                        draw_text(buf, label_x, label_y + 2*line_h,
+                                  AMP_PT,
+                                  (Color){200, 220, 200, 230});
+
+                        snprintf(buf, sizeof buf,
+                                 "sport  : %3u    →    dport  : %3u",
+                                 (unsigned) decmode_csp_hdr.sport,
+                                 (unsigned) decmode_csp_hdr.dport);
+                        draw_text(buf, label_x, label_y + 3*line_h,
+                                  AMP_PT,
+                                  (Color){200, 220, 200, 230});
+
+                        snprintf(buf, sizeof buf,
+                                 "flags  : %s  (0x%02X)",
+                                 flag_str,
+                                 (unsigned) decmode_csp_hdr.flags);
+                        draw_text(buf, label_x, label_y + 4*line_h,
+                                  AMP_PT,
+                                  (Color){230, 210, 170, 230});
+
+                        // ---- Payload byte grid ----
+                        int grid_y0 = label_y + 6 * line_h;
+                        draw_text("payload:",
+                                  label_x, grid_y0 - line_h,
+                                  AMP_PT,
+                                  (Color){200, 220, 240, 230});
+
+                        int avail_w = body_w - 2 * margin_x;
+                        int cell_h  = 26;
+                        int gap_y   = 4;
+                        int cell_w  = (int) decmode_csp_cell_w;
+                        if (cell_w < 12) cell_w = 12;
+                        int max_cells = (avail_w > 0)
+                            ? (avail_w / cell_w) : 0;
+                        if (max_cells > (int) payload_n)
+                            max_cells = (int) payload_n;
+                        if (max_cells < 0) max_cells = 0;
+                        int off_v = decmode_csp_view_off;
+                        int max_off_v = (int) payload_n - max_cells;
+                        if (max_off_v < 0) max_off_v = 0;
+                        if (off_v > max_off_v) {
+                            off_v = max_off_v;
+                            decmode_csp_view_off = off_v;
+                        }
+                        if (off_v < 0) {
+                            off_v = 0;
+                            decmode_csp_view_off = 0;
+                        }
+                        int n_show = (int) payload_n - off_v;
+                        if (n_show > max_cells) n_show = max_cells;
+                        if (n_show < 0) n_show = 0;
+
+                        int row_y = grid_y0;
+                        int ascii_y = row_y + cell_h + gap_y + 4;
+
+                        if (payload_n == 0) {
+                            draw_text("(empty payload)",
+                                      label_x, row_y,
+                                      AMP_PT, LIGHTGRAY);
+                        } else {
+                            Color edge   = {30, 30, 40, 255};
+                            Color bg     = {55, 80, 70, 255};
+                            Color tx     = {220, 240, 200, 255};
+                            for (int i = 0; i < n_show; ++i) {
+                                int src = off_v + i;
+                                int x = label_x + i * cell_w;
+                                DrawRectangle(x, row_y,
+                                              cell_w - 2, cell_h, bg);
+                                DrawRectangleLines(x, row_y,
+                                              cell_w - 2, cell_h, edge);
+                                char b[4];
+                                int tp = AMP_PT - 2;
+                                snprintf(b, sizeof b, "%02X",
+                                         payload[src]);
+                                int bw = measure_text(b, tp);
+                                draw_text(b,
+                                          x + (cell_w - 2 - bw)/2,
+                                          row_y + (cell_h - tp)/2,
+                                          tp, tx);
+                            }
+                            // Byte-index ribbon.
+                            for (int i = 0; i < n_show; ++i) {
+                                int src = off_v + i;
+                                int x = label_x + i * cell_w;
+                                if ((src & 3) == 0) {
+                                    DrawLine(x + (cell_w - 2)/2,
+                                             row_y - 6,
+                                             x + (cell_w - 2)/2,
+                                             row_y - 2,
+                                             (Color){120, 130, 150, 220});
+                                }
+                                if ((src & 7) == 0) {
+                                    char nb[16];
+                                    snprintf(nb, sizeof nb, "%d", src);
+                                    int nw = measure_text(nb, AMP_PT - 4);
+                                    draw_text(nb,
+                                              x + (cell_w - 2 - nw)/2,
+                                              row_y - AMP_PT - 2,
+                                              AMP_PT - 4,
+                                              (Color){170, 180, 210, 220});
+                                }
+                            }
+                            // ASCII strip from the payload.
+                            char ascii_buf[RS_N + 1] = {0};
+                            for (int i = 0; i < n_show; ++i) {
+                                uint8_t c = payload[off_v + i];
+                                ascii_buf[i] =
+                                    (c >= 0x20 && c < 0x7F)
+                                        ? (char) c : '.';
+                            }
+                            ascii_buf[n_show] = '\0';
+                            draw_text("ASCII:",
+                                      label_x - 4 - 56,
+                                      ascii_y + 2,
+                                      AMP_PT - 2,
+                                      (Color){170, 200, 200, 220});
+                            draw_text(ascii_buf,
+                                      label_x, ascii_y,
+                                      AMP_PT,
+                                      (Color){180, 220, 220, 230});
+
+                            char status_buf[224];
+                            int last = off_v + n_show;
+                            snprintf(status_buf, sizeof status_buf,
+                                "payload [%d, %d) of %zu  —  "
+                                "scroll the panel to scan further",
+                                off_v, last, payload_n);
+                            draw_text(status_buf,
+                                      label_x,
+                                      ascii_y + AMP_PT + 12,
+                                      AMP_PT - 2,
+                                      (Color){180, 180, 200, 220});
+                        }
+                    }
+                }
+
                 DrawRectangleLines(body_x0, body_y0,
                                    body_w, body_h, DARKGRAY);
 
                 // Time-axis ticks — same renderer the W panel uses,
                 // shared by the time-domain stages (0-6).
                 if (decmode_stage != 7 && decmode_stage != 8
-                    && decmode_stage != 9) {
+                    && decmode_stage != 9 && decmode_stage != 10) {
                     double raw_step = span_s / 6.0;
                     double mag = pow(10.0, floor(log10(raw_step)));
                     double mul = raw_step / mag;
@@ -5400,6 +5657,7 @@ int main(int argc, char **argv)
             // time axis).
             if (decmode_stage != 4 && decmode_stage != 7
                 && decmode_stage != 8 && decmode_stage != 9
+                && decmode_stage != 10
                 && wf_t_hi > wf_t_lo
                 && plot_w > 16 && plot_h > 16) {
                 double span = wf_t_hi - wf_t_lo;

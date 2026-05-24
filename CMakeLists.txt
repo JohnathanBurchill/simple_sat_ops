@@ -219,7 +219,7 @@ if (RAYLIB_FOUND)
     set(DECODE_INSPECTOR_SRCS utils/decode_inspector.c utils/pdf_writer.c
                           src/dsp/modem.c src/dsp/modem_fsk.c
                           src/dsp/sw_nco.c src/proto/golay24.c
-                          src/proto/rs.c)
+                          src/proto/rs.c src/proto/csp.c)
     if (APPLE)
         # raylib/GLFW drop NSEventTypeMagnify (trackpad pinch); this
         # ObjC shim installs a global NSEvent monitor and accumulates
