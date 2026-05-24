@@ -499,6 +499,7 @@ static int load_ttf_from_known_paths(void)
     codepoints[n_cp++] = 0x00B3; // ³ (superscript three)
     codepoints[n_cp++] = 0x2013; // – (en dash)
     codepoints[n_cp++] = 0x2014; // — (em dash)
+    codepoints[n_cp++] = 0x03C0; // π (lowercase pi)
 
     for (int i = 0; i < n; ++i) {
         if (FileExists(candidates[i])) {
@@ -1021,7 +1022,7 @@ static void *filter_thread_fn(void *arg)
 }
 
 // Render the current waveform-panel view to a one-page PDF.
-// iq_show_mode: 0=both, 1=I only, 2=Q only.
+// iq_show_mode: 0=I+Q, 1=I only, 2=Q only, 3=phase only, 4=split.
 static int pdf_write_waveform(const char *path,
                               const iq_buf_t *iqb,
                               double wf_t_lo, double wf_t_hi,
@@ -1084,8 +1085,31 @@ static int pdf_write_waveform(const char *path,
     pdfw_lw(w, 0.8f);
     pdfw_rect_stroke(w, pL, pT, plot_w, plot_h);
 
+    // Mode flags + sub-rect layout (same logic as the on-screen panel).
+    int show_iq    = (iq_show_mode != 3);
+    int show_i     = show_iq && (iq_show_mode != 2);
+    int show_q     = show_iq && (iq_show_mode != 1);
+    int show_phase = (iq_show_mode == 3 || iq_show_mode == 4);
+    int split      = (iq_show_mode == 4);
+    float iq_y0_sub    = pT,  iq_y1_sub    = pB;
+    float phase_y0_sub = pT,  phase_y1_sub = pB;
+    if (split) {
+        float gap = 8.0f;
+        float mid = pT + plot_h * 0.5f;
+        phase_y0_sub = pT;
+        phase_y1_sub = mid - gap * 0.5f;
+        iq_y0_sub    = mid + gap * 0.5f;
+        iq_y1_sub    = pB;
+    } else if (show_phase) {
+        iq_y0_sub = iq_y1_sub = pT;
+    } else {
+        phase_y0_sub = phase_y1_sub = pT;
+    }
+    float iq_h_sub    = iq_y1_sub    - iq_y0_sub;
+    float phase_h_sub = phase_y1_sub - phase_y0_sub;
+
     int amp_max = 1;
-    if (n_pairs_vis > 0) {
+    if (show_iq && n_pairs_vis > 0) {
         int64_t step_s = (n_pairs_vis > 4096) ? n_pairs_vis / 2048 : 1;
         for (int64_t k = i_lo; k < i_hi; k += step_s) {
             int I = iqb->samples[k * 2 + 0];
@@ -1096,21 +1120,47 @@ static int pdf_write_waveform(const char *path,
     }
     if (amp_max < 32) amp_max = 32;
 
-    float mid_y = pT + plot_h * 0.5f;
-    pdfw_set_stroke(w, PDFW_LGREY);
-    pdfw_lw(w, 0.3f);
-    pdfw_line(w, pL, mid_y, pR, mid_y);
-
-    pdfw_set_stroke(w, PDFW_DGREY);
-    pdfw_lw(w, 0.5f);
+    // IQ axis (centre line + ±amp/2, ±amp ticks).
     pdfw_set_fill(w, PDFW_BLACK);
-    for (int k = -2; k <= 2; ++k) {
-        float y = mid_y - (float)(k * plot_h / 4);
-        pdfw_line(w, pL - 4, y, pL, y);
-        char buf[24];
-        snprintf(buf, sizeof buf, "%+d", (int)(k * amp_max / 2));
-        float tw = pdfw_str_width(buf, 9.0f, 1);
-        pdfw_text(w, pL - 6 - tw, y - 4, buf, 9.0f, 1);
+    if (show_iq && iq_h_sub > 4.0f) {
+        float iq_mid_y = iq_y0_sub + iq_h_sub * 0.5f;
+        pdfw_set_stroke(w, PDFW_LGREY);
+        pdfw_lw(w, 0.3f);
+        pdfw_line(w, pL, iq_mid_y, pR, iq_mid_y);
+        pdfw_set_stroke(w, PDFW_DGREY);
+        pdfw_lw(w, 0.5f);
+        for (int k = -2; k <= 2; ++k) {
+            float y = iq_mid_y - (float)(k * iq_h_sub / 4.0f);
+            pdfw_line(w, pL - 4, y, pL, y);
+            char buf[24];
+            snprintf(buf, sizeof buf, "%+d", (int)(k * amp_max / 2));
+            float tw = pdfw_str_width(buf, 9.0f, 1);
+            pdfw_text(w, pL - 6 - tw, y - 4, buf, 9.0f, 1);
+        }
+    }
+    // Phase axis (centre line + -π, -π/2, 0, +π/2, +π ticks).
+    if (show_phase && phase_h_sub > 4.0f) {
+        float ph_mid_y = phase_y0_sub + phase_h_sub * 0.5f;
+        pdfw_set_stroke(w, PDFW_LGREY);
+        pdfw_lw(w, 0.3f);
+        pdfw_line(w, pL, ph_mid_y, pR, ph_mid_y);
+        pdfw_set_stroke(w, PDFW_DGREY);
+        pdfw_lw(w, 0.5f);
+        const char *plabels[5] = {"-pi", "-pi/2", "0", "+pi/2", "+pi"};
+        for (int k = -2; k <= 2; ++k) {
+            float y = ph_mid_y - (float)(k * phase_h_sub / 4.0f);
+            pdfw_line(w, pL - 4, y, pL, y);
+            float tw = pdfw_str_width(plabels[k + 2], 9.0f, 1);
+            pdfw_text(w, pL - 6 - tw, y - 4, plabels[k + 2], 9.0f, 1);
+        }
+    }
+    // Separator between the two sub-areas in split mode.
+    if (split) {
+        float sep_y = phase_y1_sub
+                    + (iq_y0_sub - phase_y1_sub) * 0.5f;
+        pdfw_set_stroke(w, PDFW_DGREY);
+        pdfw_lw(w, 0.4f);
+        pdfw_line(w, pL, sep_y, pR, sep_y);
     }
 
     double span = wf_t_hi - wf_t_lo;
@@ -1124,6 +1174,8 @@ static int pdf_write_waveform(const char *path,
     double t_step = mul * mag;
     int    t_nd   = decimals_for_step(t_step);
     double t0_aligned = ceil(wf_t_lo / t_step) * t_step;
+    pdfw_set_stroke(w, PDFW_DGREY);
+    pdfw_lw(w, 0.5f);
     for (double t = t0_aligned; t <= wf_t_hi + 0.5 * t_step; t += t_step) {
         float x = pL + (float)((t - wf_t_lo) / span * plot_w);
         if (x < pL || x > pR) continue;
@@ -1136,37 +1188,67 @@ static int pdf_write_waveform(const char *path,
     pdfw_text(w, (pL + pR) * 0.5f - pdfw_str_width("time", 9, 0) * 0.5f,
               pB + 22, "time", 9.0f, 0);
 
-    int show_i = (iq_show_mode != 2);
-    int show_q = (iq_show_mode != 1);
-    pdfw_text(w, MARGIN + 4, pT - 14,
-              "amplitude (int16)", 9.0f, 0);
-    if (show_i) pdfw_text(w, MARGIN + 4, pT + 4,  "I = cyan",    9.0f, 0);
-    if (show_q) pdfw_text(w, MARGIN + 4, pT + 16, "Q = magenta", 9.0f, 0);
+    // Y-axis labels in the left margin.
+    if (show_iq && iq_h_sub > 4.0f) {
+        pdfw_text(w, MARGIN + 4, iq_y0_sub - 12,
+                  "amplitude (int16)", 9.0f, 0);
+        float legy = iq_y0_sub + 4;
+        if (show_i) { pdfw_text(w, MARGIN + 4, legy, "I = cyan",    9.0f, 0); legy += 12; }
+        if (show_q) { pdfw_text(w, MARGIN + 4, legy, "Q = magenta", 9.0f, 0); }
+    }
+    if (show_phase && phase_h_sub > 4.0f) {
+        pdfw_text(w, MARGIN + 4, phase_y0_sub - 12,
+                  "phase (rad)", 9.0f, 0);
+        pdfw_text(w, MARGIN + 4, phase_y0_sub + 4,
+                  "phi = orange", 9.0f, 0);
+    }
 
     if (n_pairs_vis > 0 && plot_w > 8.0f) {
-        float y_scale = (plot_h * 0.5f) / (float) amp_max;
-        pdfw_rgb_t I_col = (pdfw_rgb_t){0, 170, 200, 255};
-        pdfw_rgb_t Q_col = (pdfw_rgb_t){190, 60, 180, 255};
+        float y_scale = (iq_h_sub > 0.0f)
+            ? (iq_h_sub * 0.5f) / (float) amp_max : 0.0f;
+        float ph_scale = (phase_h_sub > 0.0f)
+            ? (phase_h_sub * 0.5f) / (float) M_PI : 0.0f;
+        float iq_mid_y = iq_y0_sub + iq_h_sub * 0.5f;
+        float ph_mid_y = phase_y0_sub + phase_h_sub * 0.5f;
+        pdfw_rgb_t I_col  = (pdfw_rgb_t){0,   170, 200, 255};
+        pdfw_rgb_t Q_col  = (pdfw_rgb_t){190, 60,  180, 255};
+        pdfw_rgb_t Ph_col = (pdfw_rgb_t){230, 130, 40,  255};
         int plot_w_px = (int) plot_w;
         if (n_pairs_vis <= (int64_t) plot_w_px * 2) {
             pdfw_lw(w, 0.5f);
             float prev_xi = -1, prev_yi = 0, prev_xq = -1, prev_yq = 0;
+            float prev_xph = -1, prev_yph = 0;
+            double prev_phi = 0.0;
             for (int64_t k = i_lo; k < i_hi; ++k) {
                 double t = (double) k / iqb->samp_rate;
                 float x = pL + (float)((t - wf_t_lo) / span * plot_w);
                 if (x < pL || x > pR) continue;
-                float yI = mid_y - iqb->samples[k*2+0] * y_scale;
-                float yQ = mid_y - iqb->samples[k*2+1] * y_scale;
-                if (show_q && prev_xq > 0) {
-                    pdfw_set_stroke(w, Q_col);
-                    pdfw_line(w, prev_xq, prev_yq, x, yQ);
+                int I = iqb->samples[k * 2 + 0];
+                int Q = iqb->samples[k * 2 + 1];
+                if (show_iq) {
+                    float yI = iq_mid_y - I * y_scale;
+                    float yQ = iq_mid_y - Q * y_scale;
+                    if (show_q && prev_xq > 0) {
+                        pdfw_set_stroke(w, Q_col);
+                        pdfw_line(w, prev_xq, prev_yq, x, yQ);
+                    }
+                    if (show_i && prev_xi > 0) {
+                        pdfw_set_stroke(w, I_col);
+                        pdfw_line(w, prev_xi, prev_yi, x, yI);
+                    }
+                    prev_xi = x; prev_yi = yI;
+                    prev_xq = x; prev_yq = yQ;
                 }
-                if (show_i && prev_xi > 0) {
-                    pdfw_set_stroke(w, I_col);
-                    pdfw_line(w, prev_xi, prev_yi, x, yI);
+                if (show_phase) {
+                    double phi = atan2((double) Q, (double) I);
+                    float yPh = ph_mid_y - (float)(phi * ph_scale);
+                    if (prev_xph > 0
+                        && fabs(phi - prev_phi) <= M_PI) {
+                        pdfw_set_stroke(w, Ph_col);
+                        pdfw_line(w, prev_xph, prev_yph, x, yPh);
+                    }
+                    prev_xph = x; prev_yph = yPh; prev_phi = phi;
                 }
-                prev_xi = x; prev_yi = yI;
-                prev_xq = x; prev_yq = yQ;
             }
         } else {
             pdfw_lw(w, 0.5f);
@@ -1177,24 +1259,39 @@ static int pdf_write_waveform(const char *path,
                 if (s1 > i_hi) s1 = i_hi;
                 int iMin =  INT_MAX, iMax = INT_MIN;
                 int qMin =  INT_MAX, qMax = INT_MIN;
+                double phMin =  1e9, phMax = -1e9;
                 for (int64_t k = s0; k < s1; ++k) {
-                    int I = iqb->samples[k*2+0];
-                    int Q = iqb->samples[k*2+1];
-                    if (I < iMin) iMin = I;
-                    if (I > iMax) iMax = I;
-                    if (Q < qMin) qMin = Q;
-                    if (Q > qMax) qMax = Q;
+                    int I = iqb->samples[k * 2 + 0];
+                    int Q = iqb->samples[k * 2 + 1];
+                    if (show_iq) {
+                        if (I < iMin) iMin = I;
+                        if (I > iMax) iMax = I;
+                        if (Q < qMin) qMin = Q;
+                        if (Q > qMax) qMax = Q;
+                    }
+                    if (show_phase) {
+                        double phi = atan2((double) Q, (double) I);
+                        if (phi < phMin) phMin = phi;
+                        if (phi > phMax) phMax = phi;
+                    }
                 }
                 float xpx = pL + (float) x;
-                if (show_q) {
-                    pdfw_set_stroke(w, Q_col);
-                    pdfw_line(w, xpx, mid_y - qMax * y_scale,
-                                 xpx, mid_y - qMin * y_scale);
+                if (show_iq && iq_h_sub > 0.0f) {
+                    if (show_q) {
+                        pdfw_set_stroke(w, Q_col);
+                        pdfw_line(w, xpx, iq_mid_y - qMax * y_scale,
+                                     xpx, iq_mid_y - qMin * y_scale);
+                    }
+                    if (show_i) {
+                        pdfw_set_stroke(w, I_col);
+                        pdfw_line(w, xpx, iq_mid_y - iMax * y_scale,
+                                     xpx, iq_mid_y - iMin * y_scale);
+                    }
                 }
-                if (show_i) {
-                    pdfw_set_stroke(w, I_col);
-                    pdfw_line(w, xpx, mid_y - iMax * y_scale,
-                                 xpx, mid_y - iMin * y_scale);
+                if (show_phase && phase_h_sub > 0.0f && phMin <= phMax) {
+                    pdfw_set_stroke(w, Ph_col);
+                    pdfw_line(w, xpx, ph_mid_y - (float)(phMax * ph_scale),
+                                 xpx, ph_mid_y - (float)(phMin * ph_scale));
                 }
             }
         }
@@ -1685,9 +1782,13 @@ int main(int argc, char **argv)
     float view_x  = 0.0f;     // image pixel at screen x=0
     float view_y  = 0.0f;     // image pixel at screen y=0
     int   first_frame = 1;    // set initial fit-to-window view on frame 1
-    // Which channels to show in the waveform panel + PDF.
-    // 0 = both (default), 1 = I only, 2 = Q only.  Cycle with the
-    // `i` key: both → I → Q → both → ...
+    // Which signal to show in the waveform panel + PDF.
+    //   0 = I+Q (default)
+    //   1 = I only
+    //   2 = Q only
+    //   3 = phase only (atan2(Q,I), -π..+π)
+    //   4 = split: phase on top, I+Q on bottom
+    // Cycle with the `i` key.
     int iq_show_mode = 0;
     // Smooth +/- zoom animation. When the user presses + (or =) the
     // target is set to 2× the current zoom centred on the cursor;
@@ -1922,10 +2023,13 @@ int main(int argc, char **argv)
                 wf_open ? "ON" : "OFF");
         }
         if (IsKeyPressed(KEY_I)) {
-            iq_show_mode = (iq_show_mode + 1) % 3;
+            iq_show_mode = (iq_show_mode + 1) % 5;
             const char *mode_label =
                 (iq_show_mode == 0) ? "I + Q"
-              : (iq_show_mode == 1) ? "I only" : "Q only";
+              : (iq_show_mode == 1) ? "I only"
+              : (iq_show_mode == 2) ? "Q only"
+              : (iq_show_mode == 3) ? "phase"
+              :                       "phase + I/Q";
             snprintf(status, sizeof status,
                 "waveform channels: %s", mode_label);
         }
@@ -3108,12 +3212,43 @@ int main(int argc, char **argv)
                     (filter_show && filter_built && filtered_iq != NULL)
                     ? filtered_iq : iqb.samples;
 
+                // Mode flags + sub-rect layout. iq_h/phase_h = 0 means
+                // that channel isn't shown this frame. Split mode puts
+                // phase on top, I/Q on bottom with a small visual gap.
+                int show_iq    = (iq_show_mode != 3);
+                int show_i     = show_iq && (iq_show_mode != 2);
+                int show_q     = show_iq && (iq_show_mode != 1);
+                int show_phase = (iq_show_mode == 3 || iq_show_mode == 4);
+                int split      = (iq_show_mode == 4);
+                int iq_y0_sub    = plot_y0;
+                int iq_y1_sub    = plot_y1;
+                int phase_y0_sub = plot_y0;
+                int phase_y1_sub = plot_y1;
+                if (split) {
+                    int gap = 6;
+                    int mid = plot_y0 + plot_h / 2;
+                    phase_y0_sub = plot_y0;
+                    phase_y1_sub = mid - gap / 2;
+                    iq_y0_sub    = mid + gap / 2;
+                    iq_y1_sub    = plot_y1;
+                } else if (show_phase) {
+                    // phase-only: phase takes the whole plot, iq area
+                    // is zero-height so the iq render block skips.
+                    iq_y0_sub = iq_y1_sub = plot_y0;
+                } else {
+                    phase_y0_sub = phase_y1_sub = plot_y0;
+                }
+                int iq_h_sub    = iq_y1_sub    - iq_y0_sub;
+                int phase_h_sub = phase_y1_sub - phase_y0_sub;
+
                 // Find the magnitude scale (auto). Take the max |I|,|Q|.
+                // Skip the scan when IQ isn't shown — saves work in
+                // phase-only mode.
                 int amp_max = 1;
-                if (n_pairs_vis > 0) {
-                    int64_t step = (n_pairs_vis > 4096)
+                if (show_iq && n_pairs_vis > 0) {
+                    int64_t step_s = (n_pairs_vis > 4096)
                         ? n_pairs_vis / 2048 : 1;
-                    for (int64_t k = i_lo; k < i_hi; k += step) {
+                    for (int64_t k = i_lo; k < i_hi; k += step_s) {
                         int I = display_iq[k * 2 + 0];
                         int Q = display_iq[k * 2 + 1];
                         if (abs(I) > amp_max) amp_max = abs(I);
@@ -3122,23 +3257,40 @@ int main(int argc, char **argv)
                 }
                 if (amp_max < 32) amp_max = 32;
 
-                // Centre amp axis on 0; one tick per integer 1/4 of scale.
-                DrawLine(plot_x0, plot_y0 + plot_h/2,
-                         plot_x1, plot_y0 + plot_h/2,
-                         (Color){50, 50, 60, 255});
-                for (int k = -2; k <= 2; ++k) {
-                    int y = plot_y0 + plot_h/2 - (k * plot_h / 4);
-                    DrawLine(plot_x0 - 4, y, plot_x0, y, GRAY);
-                    char buf[24];
-                    snprintf(buf, sizeof buf, "%+d",
-                             (int)(k * amp_max / 2));
-                    const int AMP_PT = 19;
-                    int tw = measure_text(buf, AMP_PT);
-                    draw_text(buf, plot_x0 - 6 - tw, y - AMP_PT/2,
-                              AMP_PT, GRAY);
+                const int AMP_PT = 19;
+                // IQ y-axis (centred on 0; ticks at ±amp_max/2 and ±amp_max).
+                if (show_iq && iq_h_sub > 8) {
+                    int iq_mid_y = iq_y0_sub + iq_h_sub / 2;
+                    DrawLine(plot_x0, iq_mid_y, plot_x1, iq_mid_y,
+                             (Color){50, 50, 60, 255});
+                    for (int k = -2; k <= 2; ++k) {
+                        int y = iq_mid_y - (k * iq_h_sub / 4);
+                        DrawLine(plot_x0 - 4, y, plot_x0, y, GRAY);
+                        char buf[24];
+                        snprintf(buf, sizeof buf, "%+d",
+                                 (int)(k * amp_max / 2));
+                        int tw = measure_text(buf, AMP_PT);
+                        draw_text(buf, plot_x0 - 6 - tw, y - AMP_PT/2,
+                                  AMP_PT, GRAY);
+                    }
+                }
+                // Phase y-axis (centred on 0; ticks at -π, -π/2, 0, +π/2, +π).
+                if (show_phase && phase_h_sub > 8) {
+                    int ph_mid_y = phase_y0_sub + phase_h_sub / 2;
+                    DrawLine(plot_x0, ph_mid_y, plot_x1, ph_mid_y,
+                             (Color){50, 50, 60, 255});
+                    const char *plabels[5] = {"-π", "-π/2", "0", "+π/2", "+π"};
+                    for (int k = -2; k <= 2; ++k) {
+                        int y = ph_mid_y - (k * phase_h_sub / 4);
+                        DrawLine(plot_x0 - 4, y, plot_x0, y, GRAY);
+                        int tw = measure_text(plabels[k + 2], AMP_PT);
+                        draw_text(plabels[k + 2],
+                                  plot_x0 - 6 - tw, y - AMP_PT/2,
+                                  AMP_PT, GRAY);
+                    }
                 }
 
-                // Time-axis ticks.
+                // Time-axis ticks (drawn at the bottom of the panel).
                 double span = wf_t_hi - wf_t_lo;
                 double raw_step = span / 6.0;
                 double mag = pow(10.0, floor(log10(raw_step)));
@@ -3166,63 +3318,120 @@ int main(int argc, char **argv)
 
                 // Draw the waveforms. Decimate when n_pairs_vis > plot_w
                 // by taking per-column min/max (so individual bit
-                // transitions stay visible).
-                if (n_pairs_vis > 0) {
-                    int mid_y = plot_y0 + plot_h / 2;
-                    float y_scale = (float) plot_h / 2.0f / (float) amp_max;
-                    int show_i = (iq_show_mode != 2);  // 0 both, 1 I only
-                    int show_q = (iq_show_mode != 1);  // 0 both, 2 Q only
-                    if (n_pairs_vis <= (int64_t) plot_w * 2) {
-                        // Point/line plot for sparse data.
-                        int prev_xi = -1, prev_yi = 0, prev_xq = -1, prev_yq = 0;
-                        for (int64_t k = i_lo; k < i_hi; ++k) {
-                            double t = (double) k / iqb.samp_rate;
-                            int x = plot_x0
-                                  + (int)((t - wf_t_lo) / span * plot_w);
-                            if (x < plot_x0 || x > plot_x1) continue;
-                            int yI = mid_y - (int)(display_iq[k*2+0] * y_scale);
-                            int yQ = mid_y - (int)(display_iq[k*2+1] * y_scale);
-                            // Underlay Q in violet first, I in cyan on top.
+                // transitions stay visible). Phase rendering uses
+                // atan2(Q,I) into [-π,+π]; at the wrap (±π) the sparse
+                // line plot lifts the pen and the dense min/max paints
+                // a column-tall bar (visually = "phase wrapped here").
+                const Color COLOR_I     = {80, 200, 220, 255};
+                const Color COLOR_Q     = {200, 90, 220, 200};
+                const Color COLOR_I_D   = {80, 200, 220, 220};
+                const Color COLOR_Q_D   = {200, 90, 220, 160};
+                const Color COLOR_PHASE = {255, 180, 80, 255};
+                const Color COLOR_PHASE_D = {255, 180, 80, 200};
+                if (n_pairs_vis > 0
+                    && (n_pairs_vis <= (int64_t) plot_w * 2)) {
+                    // Sparse: line-to-line plot.
+                    int prev_xi = -1, prev_yi = 0, prev_xq = -1, prev_yq = 0;
+                    int prev_xph = -1, prev_yph = 0;
+                    double prev_phi = 0.0;
+                    int iq_mid_y    = iq_y0_sub + iq_h_sub / 2;
+                    int ph_mid_y    = phase_y0_sub + phase_h_sub / 2;
+                    float y_scale = (iq_h_sub > 0)
+                        ? (float) iq_h_sub / 2.0f / (float) amp_max
+                        : 0.0f;
+                    float ph_scale = (phase_h_sub > 0)
+                        ? (float) phase_h_sub / 2.0f / (float) M_PI
+                        : 0.0f;
+                    for (int64_t k = i_lo; k < i_hi; ++k) {
+                        double t = (double) k / iqb.samp_rate;
+                        int x = plot_x0
+                              + (int)((t - wf_t_lo) / span * plot_w);
+                        if (x < plot_x0 || x > plot_x1) continue;
+                        int I = display_iq[k * 2 + 0];
+                        int Q = display_iq[k * 2 + 1];
+                        if (show_iq) {
+                            int yI = iq_mid_y - (int)(I * y_scale);
+                            int yQ = iq_mid_y - (int)(Q * y_scale);
                             if (show_q && prev_xq >= 0)
-                                DrawLine(prev_xq, prev_yq, x, yQ, (Color){200,90,220,200});
+                                DrawLine(prev_xq, prev_yq, x, yQ, COLOR_Q);
                             if (show_i && prev_xi >= 0)
-                                DrawLine(prev_xi, prev_yi, x, yI, (Color){80,200,220,255});
+                                DrawLine(prev_xi, prev_yi, x, yI, COLOR_I);
                             prev_xi = x; prev_yi = yI;
                             prev_xq = x; prev_yq = yQ;
                         }
-                    } else {
-                        // Per-column min/max for dense data.
-                        for (int x = 0; x < plot_w; ++x) {
-                            int64_t s0 = i_lo + (int64_t) x * n_pairs_vis / plot_w;
-                            int64_t s1 = i_lo + (int64_t)(x+1) * n_pairs_vis / plot_w;
-                            if (s1 <= s0) s1 = s0 + 1;
-                            if (s1 > i_hi) s1 = i_hi;
-                            int iMin =  INT_MAX, iMax = INT_MIN;
-                            int qMin =  INT_MAX, qMax = INT_MIN;
-                            for (int64_t k = s0; k < s1; ++k) {
-                                int I = display_iq[k*2+0];
-                                int Q = display_iq[k*2+1];
+                        if (show_phase) {
+                            double phi = atan2((double) Q, (double) I);
+                            int yPh = ph_mid_y - (int)(phi * ph_scale);
+                            if (prev_xph >= 0
+                                && fabs(phi - prev_phi) <= M_PI)
+                                DrawLine(prev_xph, prev_yph,
+                                         x, yPh, COLOR_PHASE);
+                            prev_xph = x; prev_yph = yPh; prev_phi = phi;
+                        }
+                    }
+                } else if (n_pairs_vis > 0) {
+                    // Dense: per-column min/max.
+                    int iq_mid_y    = iq_y0_sub + iq_h_sub / 2;
+                    int ph_mid_y    = phase_y0_sub + phase_h_sub / 2;
+                    float y_scale = (iq_h_sub > 0)
+                        ? (float) iq_h_sub / 2.0f / (float) amp_max
+                        : 0.0f;
+                    float ph_scale = (phase_h_sub > 0)
+                        ? (float) phase_h_sub / 2.0f / (float) M_PI
+                        : 0.0f;
+                    for (int x = 0; x < plot_w; ++x) {
+                        int64_t s0 = i_lo + (int64_t) x * n_pairs_vis / plot_w;
+                        int64_t s1 = i_lo + (int64_t)(x+1) * n_pairs_vis / plot_w;
+                        if (s1 <= s0) s1 = s0 + 1;
+                        if (s1 > i_hi) s1 = i_hi;
+                        int iMin =  INT_MAX, iMax = INT_MIN;
+                        int qMin =  INT_MAX, qMax = INT_MIN;
+                        double phMin =  1e9, phMax = -1e9;
+                        for (int64_t k = s0; k < s1; ++k) {
+                            int I = display_iq[k * 2 + 0];
+                            int Q = display_iq[k * 2 + 1];
+                            if (show_iq) {
                                 if (I < iMin) iMin = I;
                                 if (I > iMax) iMax = I;
                                 if (Q < qMin) qMin = Q;
                                 if (Q > qMax) qMax = Q;
                             }
-                            int xpx = plot_x0 + x;
+                            if (show_phase) {
+                                double phi = atan2((double) Q, (double) I);
+                                if (phi < phMin) phMin = phi;
+                                if (phi > phMax) phMax = phi;
+                            }
+                        }
+                        int xpx = plot_x0 + x;
+                        if (show_iq && iq_h_sub > 0) {
                             if (show_q)
-                                DrawLine(xpx, mid_y - (int)(qMax * y_scale),
-                                         xpx, mid_y - (int)(qMin * y_scale),
-                                         (Color){200,90,220,160});
+                                DrawLine(xpx, iq_mid_y - (int)(qMax * y_scale),
+                                         xpx, iq_mid_y - (int)(qMin * y_scale),
+                                         COLOR_Q_D);
                             if (show_i)
-                                DrawLine(xpx, mid_y - (int)(iMax * y_scale),
-                                         xpx, mid_y - (int)(iMin * y_scale),
-                                         (Color){80,200,220,220});
+                                DrawLine(xpx, iq_mid_y - (int)(iMax * y_scale),
+                                         xpx, iq_mid_y - (int)(iMin * y_scale),
+                                         COLOR_I_D);
+                        }
+                        if (show_phase && phase_h_sub > 0 && phMin <= phMax) {
+                            DrawLine(xpx, ph_mid_y - (int)(phMax * ph_scale),
+                                     xpx, ph_mid_y - (int)(phMin * ph_scale),
+                                     COLOR_PHASE_D);
                         }
                     }
                 }
 
-                // Border around plot.
+                // Border around plot (+ a separator line between the
+                // two sub-areas in split mode so the eye doesn't try to
+                // continue a phase trace into the I/Q area).
                 DrawRectangleLines(plot_x0, plot_y0,
                                    plot_w, plot_h, DARKGRAY);
+                if (split) {
+                    int sep_y = phase_y1_sub
+                              + (iq_y0_sub - phase_y1_sub) / 2;
+                    DrawLine(plot_x0, sep_y, plot_x1, sep_y,
+                             (Color){70, 70, 80, 255});
+                }
 
                 // Cursor indicator: bright full-height line through
                 // the plot, with arrowheads at top and bottom, marking
@@ -3291,10 +3500,12 @@ int main(int argc, char **argv)
                 const char *chans =
                     (iq_show_mode == 0) ? "I cyan  Q violet"
                   : (iq_show_mode == 1) ? "I only (cyan)"
-                  : "Q only (violet)";
+                  : (iq_show_mode == 2) ? "Q only (violet)"
+                  : (iq_show_mode == 3) ? "phase (orange, ±π)"
+                  :                       "phase top / I+Q bottom";
                 char title[256];
                 snprintf(title, sizeof title,
-                    "I/Q  span=%.3f s  (%lld samples)   %s   [i=cycle]",
+                    "waveform  span=%.3f s  (%lld samples)   %s   [i=cycle]",
                     span, (long long) n_pairs_vis, chans);
                 draw_text(title, plot_x0 + 6, plot_y0 + 2, TITLE_PT,
                           (Color){200, 200, 220, 255});
