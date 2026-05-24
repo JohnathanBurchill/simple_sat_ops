@@ -1987,7 +1987,7 @@ typedef struct {
 // previous typed string. First open seeds it with "CTS1+" — the OBC's
 // CTS1 telecommand prefix.
 static char g_tx_last_payload[160] = "CTS1+";
-static char g_tx_last_power[12]    = "70.0";
+static char g_tx_last_power[12]    = "80.0";
 // Same idea for the --allow-tx checkbox: operators commonly send a
 // series of commands during a pass and would rather not re-arm the
 // safety gate between every one. Survives Esc + commit; cleared by
@@ -3072,7 +3072,7 @@ static void auto_tcmd_open(void) {
     snprintf(g_auto_tcmd.file_path, sizeof g_auto_tcmd.file_path,
              "%.*s", (int)(sizeof g_auto_tcmd.file_path - 1),
              g_auto_tcmd_file_path);
-    snprintf(g_auto_tcmd.power,   sizeof g_auto_tcmd.power,   "70.0");
+    snprintf(g_auto_tcmd.power,   sizeof g_auto_tcmd.power,   "80.0");
     snprintf(g_auto_tcmd.repeats, sizeof g_auto_tcmd.repeats, "3");
     snprintf(g_auto_tcmd.delay_s, sizeof g_auto_tcmd.delay_s, "2.0");
     g_auto_tcmd.allow_tx = 0;
@@ -3996,7 +3996,7 @@ void usage(FILE *dest, const char *name, int full)
         "                               samples per ring scale with cos(el) so\n"
         "                               cells stay approximately equal area.\n"
         "  --rx-gain=<dB>               AD9361 RX gain at session open, dB.\n"
-        "                               Default 50; range [0, 76]. Pick from a\n"
+        "                               Default 30; range [0, 76]. Pick from a\n"
         "                               b210_gain_sweep run — operate ~5 dB above\n"
         "                               the knee where the noise floor stops\n"
         "                               tracking gain 1:1. Adjustable mid-pass\n"
@@ -6241,7 +6241,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     // 5 kHz to clear DC, and at most ~35 kHz so the ±10 kHz Doppler
     // swing stays inside the 48 kHz post-decim half-band.
     state->rx_lo_offset_hz = -25000.0;
-    state->rx_gain_db      = 50.0;
+    state->rx_gain_db      = 30.0;
 
     state->run_with_antenna_rotator = 1;
     state->antenna_rotator.device_filename = "/dev/ttyUSB0";
