@@ -1625,19 +1625,36 @@ int main(int argc, char **argv)
     // ----- raylib window + IQ load + in-process spectrogram -----
     SetTraceLogLevel(LOG_WARNING);
     if (safe_init_window(win_w, win_h, "decode_inspector") != 0) {
-        // Hardware OpenGL failed (no display, or no 3.3 core
-        // profile). Try the mesa software renderer before giving up
-        // — re-execs ourselves with LIBGL_ALWAYS_SOFTWARE=1 so the
-        // GLFW state starts clean.
+        // Hardware OpenGL failed. Try mesa's software renderer
+        // (LIBGL_ALWAYS_SOFTWARE=1) by re-execing ourselves with a
+        // clean GLFW state. Helps on headless hosts with no GPU
+        // driver. Does NOT help when the bottleneck is the X
+        // protocol over SSH — see the message below.
         retry_with_software_renderer(argv, "decode_inspector");
-        // Either we already retried (SSO_FORCE_SW_RENDER set) or
-        // exec failed. Either way print the final hint and exit.
         fprintf(stderr,
-            "decode_inspector: failed to open a window. Needed a display\n"
-            "capable of OpenGL 3.3 core profile (hardware or llvmpipe\n"
-            "software). Common causes: no DISPLAY (SSH without `-X`);\n"
-            "DISPLAY set but no working X server; mesa drivers missing\n"
-            "(`apt install libgl1-mesa-dri` on Debian/Ubuntu hosts).\n");
+            "decode_inspector: cannot open a window.\n"
+            "\n"
+            "If you're connected over SSH with `-X` / `-Y`:\n"
+            "  vanilla X11 forwarding only carries the GLX 1.x wire\n"
+            "  protocol and the OpenGL 3.3 core profile context that\n"
+            "  raylib needs can't be created remotely (the\n"
+            "  GLX_ARB_create_context_profile errors above are this).\n"
+            "  LIBGL_ALWAYS_SOFTWARE=1 doesn't help — that picks the\n"
+            "  software pipeline on the local mesa side, but the GLX\n"
+            "  request still has to round-trip your X server.\n"
+            "\n"
+            "Workarounds, in order of effort:\n"
+            "  - Copy the .iq off the remote and run decode_inspector\n"
+            "    on your local desktop (lowest friction).\n"
+            "  - Use Xpra (`xpra start :100 --start-child=decode_inspector`)\n"
+            "    or VirtualGL + VNC — both render server-side and ship\n"
+            "    framebuffer pixels rather than GL calls.\n"
+            "  - Rebuild raylib locally with `-DGRAPHICS=GRAPHICS_API_\n"
+            "    OPENGL_21` and relink decode_inspector against it; the\n"
+            "    older profile traverses SSH X11 forwarding.\n"
+            "\n"
+            "If you're truly headless (no DISPLAY, no SSH `-X`): there's\n"
+            "no way to put a window on the screen. Run locally instead.\n");
         return 1;
     }
     if (getenv("SSO_FORCE_SW_RENDER") != NULL) {

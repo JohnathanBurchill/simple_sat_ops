@@ -586,15 +586,25 @@ int main(int argc, char **argv)
 
     SetTraceLogLevel(LOG_WARNING);
     if (safe_init_window(64, 64, "live_waterfall") != 0) {
-        // Hardware GL failed. Try the mesa software renderer before
-        // giving up.
+        // Hardware GL failed. Try mesa software renderer; doesn't
+        // help with SSH X11 forwarding (the protocol is the
+        // bottleneck) but does help on headless boxes with no GPU
+        // driver. See decode_inspector for the long explanation.
         retry_with_software_renderer(argv, "live_waterfall");
         fprintf(stderr,
-            "live_waterfall: failed to open a window. Needed a display\n"
-            "capable of OpenGL 3.3 core profile (hardware or llvmpipe\n"
-            "software). Common causes: no DISPLAY (SSH without `-X`);\n"
-            "DISPLAY set but no working X server; mesa drivers missing\n"
-            "(`apt install libgl1-mesa-dri` on Debian/Ubuntu hosts).\n");
+            "live_waterfall: cannot open a window.\n"
+            "\n"
+            "If you're connected over SSH with `-X` / `-Y`:\n"
+            "  vanilla X11 forwarding only carries GLX 1.x and the\n"
+            "  OpenGL 3.3 core profile raylib needs can't traverse it\n"
+            "  (the GLX_ARB_create_context_profile errors above name\n"
+            "  this). LIBGL_ALWAYS_SOFTWARE=1 doesn't help — that\n"
+            "  switches the local mesa pipeline but the GLX request\n"
+            "  still has to round-trip your X server.\n"
+            "\n"
+            "Workarounds: run locally; use Xpra or VirtualGL + VNC;\n"
+            "or rebuild raylib with `-DGRAPHICS=GRAPHICS_API_OPENGL_21`\n"
+            "and relink live_waterfall against it.\n");
         return 1;
     }
     if (getenv("SSO_FORCE_SW_RENDER") != NULL) {
