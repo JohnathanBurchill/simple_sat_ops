@@ -546,6 +546,91 @@ static int measure_text(const char *s, int size)
     return MeasureText(s, size);
 }
 
+// Draw the 2-row ASM bit-comparison strip at `y_top`:
+//   row 0 (expected): 16 preamble cells (gray) + 32 ASM cells (white)
+//   row 1 (actual):   green where bits match expected, red where not
+// Cell x positions are computed from each bit's *absolute time* so
+// they survive pan/zoom without waiting for the next debounced
+// recompute. Callers pass the captured ASM absolute time + bit
+// period so the strip can land on the same physical bits regardless
+// of which K-panel stage is showing.
+static void draw_asm_bit_strip(
+    int body_x0, int body_x1, int body_w,
+    double wf_t_lo, double span_s,
+    int y_top,
+    const uint8_t *bits, size_t n_bits_total,
+    size_t asm_offset,
+    double asm_abs_time_s,
+    double bit_period_s,
+    int text_pt)
+{
+    if (bits == NULL || asm_abs_time_s < 0.0
+        || bit_period_s <= 0.0 || span_s <= 0.0) return;
+    const int n_pre = 16;
+    const int n_asm = 32;
+    const uint32_t ASM_EXPECTED = 0x930B51DEu;
+    const int cell_h = 14;
+    const int gap_y  = 2;
+    int exp_y = y_top;
+    int act_y = exp_y + cell_h + gap_y;
+    Color exp_pre_bg = {110, 110, 120, 255};
+    Color exp_asm_bg = {235, 235, 240, 255};
+    Color edge       = {30,  30,  40,  255};
+    Color match_bg   = {70,  190, 110, 255};
+    Color miss_bg    = {220, 90,  100, 255};
+    // Default cell width = one bit period's worth of screen pixels,
+    // clamped so very wide zoom doesn't turn the strip into pixel-
+    // wide bars and very high zoom doesn't fill the panel.
+    int cell_w = (int)(bit_period_s / span_s * (double) body_w);
+    if (cell_w < 4)  cell_w = 4;
+    if (cell_w > 22) cell_w = 22;
+
+    for (int i = 0; i < n_pre + n_asm; ++i) {
+        int is_asm = (i >= n_pre);
+        int bit_offset = i - n_pre;  // -16..+31
+        int bit_idx = (int) asm_offset + bit_offset;
+        if (bit_idx < 0 || bit_idx >= (int) n_bits_total) continue;
+        double t_abs = asm_abs_time_s + (double) bit_offset * bit_period_s;
+        int xc = body_x0 + (int)((t_abs - wf_t_lo) / span_s * (double) body_w);
+        if (xc < body_x0 - 2 || xc > body_x1 + 2) continue;
+        int xl = xc - cell_w / 2;
+
+        int expected;
+        if (is_asm) {
+            expected = (ASM_EXPECTED >> (31 - (i - n_pre))) & 1u;
+        } else {
+            // asm_offset is byte-aligned; the last preamble byte is
+            // 0xAA = 10101010 sent MSB-first, so distance-1 back is
+            // bit 7 (=0), distance-2 is bit 6 (=1), etc.
+            int dist_back = -bit_offset;  // 1..16
+            expected = (dist_back & 1) ? 0 : 1;
+        }
+        uint8_t actual = bits[bit_idx] & 1u;
+
+        Color exp_bg = is_asm ? exp_asm_bg : exp_pre_bg;
+        Color exp_tx = is_asm ? (Color){20, 20, 30, 255}
+                              : (Color){225, 225, 235, 255};
+        DrawRectangle(xl, exp_y, cell_w, cell_h, exp_bg);
+        DrawRectangleLines(xl, exp_y, cell_w, cell_h, edge);
+        Color act_bg = (actual == expected) ? match_bg : miss_bg;
+        DrawRectangle(xl, act_y, cell_w, cell_h, act_bg);
+        DrawRectangleLines(xl, act_y, cell_w, cell_h, edge);
+        if (cell_w >= 9 && text_pt > 0) {
+            char b[4];
+            snprintf(b, sizeof b, "%d", expected);
+            int bw = measure_text(b, text_pt);
+            draw_text(b, xc - bw / 2,
+                      exp_y + (cell_h - text_pt) / 2,
+                      text_pt, exp_tx);
+            snprintf(b, sizeof b, "%d", actual);
+            bw = measure_text(b, text_pt);
+            draw_text(b, xc - bw / 2,
+                      act_y + (cell_h - text_pt) / 2,
+                      text_pt, (Color){20, 20, 30, 255});
+        }
+    }
+}
+
 // Pick how many decimals to show on a seconds label given the
 // tick step (or the resolution of interest). Range: 0 (whole-second
 // ticks) up to 7 (~100 ns precision — well below the 96 kSPS sample
@@ -2149,6 +2234,12 @@ int main(int argc, char **argv)
     int        decmode_golay_errors = -1;
     int        decmode_golay_rc     = -2;
 
+    // ASM lock in absolute time, captured at recompute time so the
+    // marker + bit-comparison strip can pan/zoom smoothly with the
+    // spectrogram between debounced recomputes. -1.0 = no lock.
+    double     decmode_asm_abs_time_s = -1.0;
+    double     decmode_bit_period_s   = 0.0;
+
     while (!WindowShouldClose()) {
         int sw = GetScreenWidth();
         int sh = GetScreenHeight();
@@ -2176,6 +2267,75 @@ int main(int argc, char **argv)
         if (in_decode_panel_input && wheel_v.y != 0.0f) {
             decode_scroll -= (int)(wheel_v.y * 3.0f);
             if (decode_scroll < 0) decode_scroll = 0;
+        }
+
+        // Panel-driven zoom: when the cursor is over the W or K
+        // panel (the time-series view), pinch and wheel act on the
+        // *time* axis, anchored on the cursor's panel-x mapping.
+        // The spectrogram's view_y/zoom are the single source of
+        // truth for the visible time window, so the panel handlers
+        // just modify those.
+        if (in_panel_for_input && (pinch != 0.0f
+                                   || wheel_v.y != 0.0f
+                                   || wheel_v.x != 0.0f)) {
+            int spec_screen_w_in = decode_open
+                ? (sw - decode_panel_w) : sw;
+            if (spec_screen_w_in < 64) spec_screen_w_in = 64;
+            int bar_h_in = 2 * (STATUS_PT + 6);
+            int spec_screen_h_in = bottom_panel_h_now > 0
+                ? (sh - bottom_panel_h_now)
+                : (sh - bar_h_in);
+            if (spec_screen_h_in < 32) spec_screen_h_in = 32;
+            double vis_h_in = (double) spec_screen_h_in
+                              / (double) zoom;
+            double vt_top = (double) view_y;
+            double vt_bot = vt_top + vis_h_in;
+            if (vt_top < WF_TM) vt_top = WF_TM;
+            if (vt_bot > WF_TM + spec_h) vt_bot = WF_TM + spec_h;
+            if (vt_bot < vt_top) vt_bot = vt_top;
+            double ft_top = (vt_top - WF_TM) / (double) spec_h;
+            double ft_bot = (vt_bot - WF_TM) / (double) spec_h;
+            double t_hi_in = (1.0 - ft_top) * duration_s;
+            double t_lo_in = (1.0 - ft_bot) * duration_s;
+            if (t_hi_in < t_lo_in) {
+                double tmp = t_lo_in;
+                t_lo_in = t_hi_in;
+                t_hi_in = tmp;
+            }
+            double span_in = t_hi_in - t_lo_in;
+            if (span_in > 1e-12) {
+                double frac_x = (double) m.x
+                                / (double) spec_screen_w_in;
+                if (frac_x < 0.0) frac_x = 0.0;
+                if (frac_x > 1.0) frac_x = 1.0;
+                double t_cursor = t_lo_in + frac_x * span_in;
+                // Spec image-y where t_cursor lives — this is the
+                // pivot we want to keep at the cursor's panel x
+                // position through the zoom.
+                double img_y_t = WF_TM
+                    + (1.0 - t_cursor / duration_s)
+                      * (double) spec_h;
+                // Effective spec screen-y of that pivot.
+                double scr_y_eff = (img_y_t - (double) view_y)
+                                   * (double) zoom;
+                if (pinch != 0.0f) {
+                    float img_x_under = view_x + m.x / zoom;
+                    float new_zoom = zoom * expf(pinch);
+                    if (new_zoom < 0.1f)        new_zoom = 0.1f;
+                    if (new_zoom > 1.0e6f)      new_zoom = 1.0e6f;
+                    zoom = new_zoom;
+                    view_x = img_x_under - m.x / zoom;
+                    view_y = (float) (img_y_t
+                                      - scr_y_eff / (double) zoom);
+                }
+                if (wheel_v.y != 0.0f || wheel_v.x != 0.0f) {
+                    // Wheel.y pans time; wheel.x pans freq (so
+                    // a horizontal scroll over the panel still
+                    // works the same as over the spec).
+                    view_y -= wheel_v.y * 12.0f / zoom;
+                    view_x -= wheel_v.x * 12.0f / zoom;
+                }
+            }
         }
 
         // Spectrogram-view pinch/scroll (only when cursor is NOT
@@ -3420,6 +3580,28 @@ int main(int argc, char **argv)
                         decmode_golay_data12 = 0;
                         decmode_golay_errors = -1;
                         decmode_golay_rc     = -2;
+                        // Capture the ASM lock in absolute time so the
+                        // marker + bit-strip can survive zoom/pan
+                        // without waiting for the next recompute.
+                        decmode_asm_abs_time_s = -1.0;
+                        decmode_bit_period_s   =
+                            (sps > 0) ? ((double) sps / (double) iqb.samp_rate)
+                                      : 0.0;
+                        if (decmode_diag.asm_offset != (size_t) -1
+                            && decmode_diag.strobe_t != NULL) {
+                            // Group delay through LPF (30) + discrim
+                            // (1) + MF (sps - 1) shifts MF-sample
+                            // index ↔ IQ-sample index. Re-applying
+                            // it here keeps the marker on the actual
+                            // ASM in the IQ time series, which
+                            // matters at high zoom.
+                            double t_off_iq =
+                                decmode_diag.strobe_t[decmode_diag.asm_offset]
+                                + 30.0 + 1.0 + (double)(sps - 1);
+                            decmode_asm_abs_time_s =
+                                ((double) i_lo + t_off_iq)
+                                / (double) iqb.samp_rate;
+                        }
                         if (decmode_diag.asm_offset != (size_t) -1
                             && decmode_diag.bits != NULL
                             && decmode_diag.n_strobes
@@ -4235,6 +4417,24 @@ int main(int argc, char **argv)
                             (void) samp_per_sym;
                         }
                     }
+                    // Bit-by-bit ASM comparison strip for the
+                    // phase / post-discriminator stages where
+                    // individual bits manifest visually (FM disc,
+                    // matched filter, slicer). Stages 0/1 (raw IQ)
+                    // skip this — they show amplitude, not phase.
+                    if (decmode_stage == 2 || decmode_stage == 3
+                        || decmode_stage == 5) {
+                        int strip_top = body_y1 - 2 * 14 - 2 - 4;
+                        draw_asm_bit_strip(
+                            body_x0, body_x1, body_w,
+                            wf_t_lo, span_s, strip_top,
+                            decmode_diag.bits,
+                            decmode_diag.n_strobes,
+                            decmode_diag.asm_offset,
+                            decmode_asm_abs_time_s,
+                            decmode_bit_period_s,
+                            AMP_PT - 4);
+                    }
                 }
 
                 // ------ Stage 4: eye diagram ------
@@ -4389,12 +4589,15 @@ int main(int argc, char **argv)
                             }
                             free(col_min); free(col_max);
                         }
-                        // Marker at the found ASM offset
-                        if (decmode_diag.asm_offset != (size_t) -1
-                            && decmode_diag.asm_offset < n_h) {
+                        // Marker at the ASM lock — positioned from
+                        // the captured absolute time so it tracks
+                        // the actual ASM through pan/zoom even before
+                        // the next debounced recompute fires.
+                        if (decmode_asm_abs_time_s >= 0.0) {
                             int x = body_x0
-                                  + (int)(st[decmode_diag.asm_offset]
-                                          / (sr * span_s) * body_w);
+                                  + (int)((decmode_asm_abs_time_s
+                                           - wf_t_lo)
+                                          / span_s * (double) body_w);
                             if (x >= body_x0 && x <= body_x1) {
                                 DrawLine(x, body_y0, x, body_y1, YELLOW);
                                 char buf[64];
@@ -4406,105 +4609,21 @@ int main(int argc, char **argv)
                                           AMP_PT, YELLOW);
                             }
                         }
-                        // Bit-by-bit comparison strip near the ASM
-                        // marker. Top row shows the expected pattern
-                        // (preamble bits in gray, ASM bits in white);
-                        // bottom row shows the actual decoded bits,
-                        // green where they match expected and red
-                        // where they don't. Cells follow the strobe
-                        // x projection so they align with the trace.
-                        if (decmode_diag.asm_offset != (size_t) -1
-                            && decmode_diag.bits != NULL) {
-                            const size_t off = decmode_diag.asm_offset;
-                            const uint8_t *bs = decmode_diag.bits;
-                            const int n_pre = 16;
-                            const int n_asm = 32;
-                            const uint32_t ASM_EXPECTED = 0x930B51DEu;
-                            int cell_h = 14;
-                            int act_y = y_bot - cell_h - 2;
-                            int exp_y = act_y - cell_h - 2;
-                            Color exp_pre_bg = {110, 110, 120, 255};
-                            Color exp_asm_bg = {235, 235, 240, 255};
-                            Color edge       = {30,  30,  40,  255};
-                            Color match_bg   = {70,  190, 110, 255};
-                            Color miss_bg    = {220, 90,  100, 255};
-                            for (int i = 0; i < n_pre + n_asm; ++i) {
-                                int is_asm = (i >= n_pre);
-                                int bit_idx = is_asm
-                                    ? (int) off + (i - n_pre)
-                                    : (int) off - n_pre + i;
-                                if (bit_idx < 0) continue;
-                                if (bit_idx
-                                    >= (int) decmode_diag.n_strobes)
-                                    continue;
-                                double t = st[bit_idx];
-                                int xc = body_x0
-                                       + (int)(t / (sr * span_s)
-                                               * body_w);
-                                if (xc < body_x0 - 2
-                                    || xc > body_x1 + 2) continue;
-                                // Cell width from strobe spacing,
-                                // clamped so a wide zoom doesn't
-                                // make the strip unreadable.
-                                int cell_w = 8;
-                                if (bit_idx + 1
-                                    < (int) decmode_diag.n_strobes) {
-                                    double t2 = st[bit_idx + 1];
-                                    int x2 = body_x0
-                                           + (int)(t2 / (sr * span_s)
-                                                   * body_w);
-                                    cell_w = x2 - xc;
-                                    if (cell_w < 4)  cell_w = 4;
-                                    if (cell_w > 22) cell_w = 22;
-                                }
-                                int xl = xc - cell_w / 2;
-                                int expected;
-                                if (is_asm) {
-                                    expected = (ASM_EXPECTED
-                                        >> (31 - (i - n_pre))) & 1u;
-                                } else {
-                                    // off is byte-aligned and the
-                                    // last preamble byte is 0xAA.
-                                    // Distance back: 1=LSB of 0xAA=0,
-                                    // 2=1, 3=0, ... → odd dist=0,
-                                    // even dist=1.
-                                    int dist_back = (int) off - bit_idx;
-                                    expected = (dist_back & 1) ? 0 : 1;
-                                }
-                                uint8_t actual = bs[bit_idx] & 1u;
-                                Color exp_bg = is_asm
-                                    ? exp_asm_bg : exp_pre_bg;
-                                Color exp_tx = is_asm
-                                    ? (Color){20, 20, 30, 255}
-                                    : (Color){225, 225, 235, 255};
-                                DrawRectangle(xl, exp_y,
-                                              cell_w, cell_h, exp_bg);
-                                DrawRectangleLines(xl, exp_y,
-                                              cell_w, cell_h, edge);
-                                Color act_bg = (actual == expected)
-                                    ? match_bg : miss_bg;
-                                DrawRectangle(xl, act_y,
-                                              cell_w, cell_h, act_bg);
-                                DrawRectangleLines(xl, act_y,
-                                              cell_w, cell_h, edge);
-                                if (cell_w >= 9) {
-                                    int tp = AMP_PT - 4;
-                                    char b[4];
-                                    snprintf(b, sizeof b, "%d",
-                                             expected);
-                                    int bw = measure_text(b, tp);
-                                    draw_text(b, xc - bw / 2,
-                                              exp_y + (cell_h - tp)/2,
-                                              tp, exp_tx);
-                                    snprintf(b, sizeof b, "%d",
-                                             actual);
-                                    bw = measure_text(b, tp);
-                                    draw_text(b, xc - bw / 2,
-                                              act_y + (cell_h - tp)/2,
-                                              tp,
-                                              (Color){20, 20, 30, 255});
-                                }
-                            }
+                        // Expected-vs-actual bit comparison strip.
+                        // Shared helper so the same strip lands on
+                        // stages 2, 3, 5, 6 — anywhere the phase /
+                        // post-discriminator signal is shown.
+                        {
+                            int strip_top = y_bot - 2 * 14 - 2 - 2;
+                            draw_asm_bit_strip(
+                                body_x0, body_x1, body_w,
+                                wf_t_lo, span_s, strip_top,
+                                decmode_diag.bits,
+                                decmode_diag.n_strobes,
+                                decmode_diag.asm_offset,
+                                decmode_asm_abs_time_s,
+                                decmode_bit_period_s,
+                                AMP_PT - 4);
                         }
                     }
                 }
