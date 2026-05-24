@@ -45,6 +45,7 @@
 #include "golay24.h"
 #include "modem.h"
 #include "modem_fsk.h"
+#include "modem_viterbi.h"
 #include "pdf_writer.h"
 #include "rs.h"
 #include "sw_nco.h"
@@ -2294,6 +2295,18 @@ int main(int argc, char **argv)
     size_t     decmode_out_scratch_cap = 0;
     int        decmode_input_sps     = 0;
 
+    // Viterbi (MSK-MLSE) slicer toggle. When on, the K panel still
+    // runs the FSK chain end-to-end for the pre-slicer intermediates
+    // (LPF / FM disc / matched filter / Gardner), but the bit
+    // decisions + ASM sync + Hamming trace get overwritten with the
+    // Viterbi demod's output. Everything downstream (Golay,
+    // descrambler, RS, CSP) reads from decmode_diag the same way,
+    // so the substitution is invisible to those stages. The scratch
+    // buffer grows on demand alongside the FSK strobe capacity.
+    int        decmode_use_viterbi   = 0;
+    uint8_t   *decmode_viterbi_buf   = NULL;
+    size_t     decmode_viterbi_cap   = 0;
+
     // Stage 7 (Golay length header) — computed after each recompute
     // when ASM was found. decmode_golay_rc:
     //   -2 = no ASM lock or not enough bits past ASM
@@ -2712,7 +2725,27 @@ int main(int argc, char **argv)
                 decmode_stage + 1, DECMODE_N_STAGES,
                 decmode_open ? DECMODE_STAGE_NAMES[decmode_stage] : "");
         }
-        if (decmode_open
+        // V toggles the Viterbi (MSK-MLSE) slicer in the K panel.
+        // Forces a recompute so the new slicer's output replaces
+        // the FSK slicer's bits + ASM sync + Hamming trace in the
+        // diag struct on the next tick.
+        if (decmode_open && IsKeyPressed(KEY_V)) {
+            decmode_use_viterbi = !decmode_use_viterbi;
+            decmode_recompute_after = GetTime();
+            decmode_last_t_lo = -1.0;
+            decmode_last_t_hi = -1.0;
+            snprintf(status, sizeof status,
+                "K slicer: %s",
+                decmode_use_viterbi ? "Viterbi (MSK-MLSE)"
+                                    : "hard slicer (FSK chain)");
+        }
+        // [ / ] route by cursor: when the K panel is open AND the
+        // cursor is over the panel, brackets cycle stages; when the
+        // cursor is over the waterfall (with K open or closed),
+        // brackets walk through boxes. Lets the operator keep K
+        // open and still scrub between annotated bursts.
+        int bracket_for_stage = decmode_open && in_panel_for_input;
+        if (bracket_for_stage
             && (IsKeyPressed(KEY_RIGHT_BRACKET)
                 || IsKeyPressed(KEY_LEFT_BRACKET))) {
             int dir = IsKeyPressed(KEY_RIGHT_BRACKET) ? 1
@@ -2875,11 +2908,13 @@ int main(int argc, char **argv)
         // whole pass fits in the window, which used to lock the anchor
         // at duration/2 forever. With no selection we fall back to a
         // t0-based search anchored on the time at the centre of the view.
-        // The [ and ] keys advance / rewind through boxes, but when
-        // the decode-mode panel is open they're stage navigation
-        // (handled higher up); skip the box-walk in that case.
-        int walk_fwd  = !decmode_open && IsKeyPressed(KEY_RIGHT_BRACKET);
-        int walk_back = !decmode_open && IsKeyPressed(KEY_LEFT_BRACKET);
+        // The [ and ] keys advance / rewind through boxes EXCEPT when
+        // the cursor is over an open K panel (then they're stage
+        // navigation — handled higher up via bracket_for_stage).
+        int walk_fwd  = !bracket_for_stage
+                     && IsKeyPressed(KEY_RIGHT_BRACKET);
+        int walk_back = !bracket_for_stage
+                     && IsKeyPressed(KEY_LEFT_BRACKET);
         if ((walk_fwd || walk_back) && boxes.n > 0) {
             int target = -1;
             if (boxes.selected >= 0 && boxes.selected < boxes.n) {
@@ -3784,6 +3819,76 @@ int main(int argc, char **argv)
                             decmode_out_scratch_cap);
                         decmode_input_sps   = sps;
                         decmode_have_result = 1;
+                        // Viterbi slicer: run MSK-MLSE on the same IQ
+                        // slice and substitute its bit decisions +
+                        // ASM sync + Hamming trace into decmode_diag.
+                        // Downstream stages keep reading from the
+                        // diag struct exactly as before.
+                        if (decmode_use_viterbi) {
+                            if (strob_cap > decmode_viterbi_cap) {
+                                uint8_t *nb = (uint8_t *) realloc(
+                                    decmode_viterbi_buf, strob_cap);
+                                if (nb != NULL) {
+                                    decmode_viterbi_buf = nb;
+                                    decmode_viterbi_cap = strob_cap;
+                                }
+                            }
+                            if (decmode_viterbi_buf != NULL
+                                && decmode_viterbi_cap >= strob_cap) {
+                                modem_params_t pv = {
+                                    .samp_rate           = iqb.samp_rate,
+                                    .bit_rate            = bit_rate,
+                                    .gain_db             = 0.0,
+                                    .rx_disable_dc_block = 0,
+                                };
+                                size_t v_n = 0;
+                                size_t v_off = (size_t) -1;
+                                int    v_pol = -1;
+                                (void) modem_iq_viterbi_to_bits(
+                                    iqb.samples + i_lo * 2, slice_n,
+                                    &pv, /*invert*/0,
+                                    /*sync_max_ham*/4,
+                                    /*min_bit_offset*/0,
+                                    decmode_viterbi_buf, &v_n,
+                                    &v_off, &v_pol);
+                                if (v_n > strob_cap) v_n = strob_cap;
+                                if (decmode_diag.bits != NULL && v_n > 0) {
+                                    memcpy(decmode_diag.bits,
+                                           decmode_viterbi_buf, v_n);
+                                    decmode_diag.n_strobes = v_n;
+                                    decmode_diag.asm_offset = v_off;
+                                    decmode_diag.polarity_used = v_pol;
+                                    if (v_n >= 32
+                                        && decmode_diag.asm_hamming
+                                           != NULL) {
+                                        size_t hn = v_n - 31;
+                                        const uint32_t ASM_W =
+                                            0x930B51DEu;
+                                        for (size_t k = 0; k < hn; ++k) {
+                                            uint32_t w = 0;
+                                            for (int b = 0; b < 32; ++b) {
+                                                w = (w << 1)
+                                                  | (decmode_diag.bits[k + b]
+                                                     & 1u);
+                                            }
+                                            int dist =
+                                                __builtin_popcount(
+                                                    w ^ ASM_W);
+                                            decmode_diag.asm_hamming[k] =
+                                                (uint8_t) dist;
+                                        }
+                                        if (v_off != (size_t) -1
+                                            && v_off < hn) {
+                                            decmode_diag.asm_dist =
+                                                decmode_diag.asm_hamming[
+                                                    v_off];
+                                        } else {
+                                            decmode_diag.asm_dist = 32;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // Stage 7: Golay(24,12) over the 24 bits right
                         // after the ASM. Pack MSB-first to match the
                         // way ax100.c lifts those 3 bytes off the wire.
@@ -4473,15 +4578,19 @@ int main(int argc, char **argv)
                           (Color){15, 15, 20, 230});
             DrawLine(0, dm_y0, dm_right, dm_y0, GRAY);
 
-            // Title strip — stage label + nav hint.
+            // Title strip — stage label + nav hint + slicer mode.
             int title_h = 30;
             char title_str[256];
             snprintf(title_str, sizeof title_str,
-                "[stage %d/%d]  %s   ( [ / ] navigate )",
+                "[stage %d/%d]  %s   ( [ / ] navigate )   "
+                "slicer: %s (V to toggle)",
                 decmode_stage + 1, DECMODE_N_STAGES,
-                DECMODE_STAGE_NAMES[decmode_stage]);
+                DECMODE_STAGE_NAMES[decmode_stage],
+                decmode_use_viterbi ? "Viterbi" : "hard");
             draw_text(title_str, 12, dm_y0 + 6, 18,
-                      (Color){210, 210, 230, 255});
+                      decmode_use_viterbi
+                          ? (Color){220, 200, 150, 255}
+                          : (Color){210, 210, 230, 255});
             DrawLine(0, dm_y0 + title_h, dm_right, dm_y0 + title_h,
                      (Color){40, 40, 50, 255});
 
