@@ -1556,6 +1556,20 @@ int main(int argc, char **argv)
     // ----- raylib window + IQ load + in-process spectrogram -----
     SetTraceLogLevel(LOG_WARNING);
     InitWindow(win_w, win_h, "decode_inspector");
+    if (!IsWindowReady()) {
+        // GLFW couldn't open a window — most commonly an SSH session
+        // without X11 forwarding ($DISPLAY missing) or a headless
+        // host. Exit cleanly with a useful hint instead of letting
+        // SetTargetFPS / LoadTexture deref the unready handle and
+        // segfault.
+        fprintf(stderr,
+            "decode_inspector: failed to open a window. This tool is a\n"
+            "graphical viewer and needs a display ($DISPLAY, Wayland\n"
+            "compositor, or local macOS/Windows session). Over SSH use\n"
+            "`ssh -X` / `ssh -Y` to forward X11, or copy the .iq off the\n"
+            "remote and run decode_inspector locally.\n");
+        return 1;
+    }
     SetTargetFPS(60);
     SetExitKey(0);
 #ifdef __APPLE__
