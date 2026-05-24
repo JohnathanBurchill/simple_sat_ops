@@ -4300,6 +4300,15 @@ int main(int argc, char **argv)
                         const uint8_t *h = decmode_diag.asm_hamming;
                         const double *st = decmode_diag.strobe_t;
                         double sr = samp_rate_d;
+                        // Clip n_h to strobes that fall inside the
+                        // visible time span. strobe_t is monotonic, so
+                        // a linear scan from the right gives the count.
+                        // Without this, the >=0.3 s decoder extension
+                        // would push the trace into the dense path even
+                        // when only a few strobes are visible, leaving
+                        // the panel almost empty at high zoom.
+                        double t_lim = sr * span_s;
+                        while (n_h > 0 && st[n_h - 1] > t_lim) --n_h;
                         // Sparse: line-to-line plot.
                         if ((int64_t) n_h <= (int64_t) body_w * 2) {
                             int prev_x = -1, prev_y = 0;
