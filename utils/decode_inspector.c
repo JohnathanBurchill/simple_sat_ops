@@ -2191,6 +2191,13 @@ int main(int argc, char **argv)
     int    wf_drag           = 0;
     double wf_drag_t_anchor  = 0.0;
     int    wf_drag_shift     = 0;
+    // K-panel arrow stepping. When the cursor hovers over the K
+    // panel, up/down arrows pan the spec view by IQ samples (not
+    // pan_step pixels). The held-frame counters drive an
+    // acceleration ramp so a long press doesn't take forever to
+    // traverse the pass.
+    int    k_pan_up_held     = 0;
+    int    k_pan_down_held   = 0;
 
     // Band-pass-filter view (F key). Two stages: HPF in the original
     // frame (cuts everything below filter_lower_hz around DC, i.e.
@@ -2546,9 +2553,34 @@ int main(int argc, char **argv)
             view_y -= d.y / zoom;
         }
         // Arrow keys = pan; PgUp/PgDn = big vertical step; Home/End = endpoints.
+        // K-panel hover overrides up/down to step by IQ samples
+        // with a hold-to-accelerate ramp; left/right and all the
+        // other arrow paths fall through to the spec-pixel pan.
+        int k_pan_hover = decmode_open && in_panel_for_input
+                       && iqb.samp_rate > 0 && duration_s > 0.0;
+        int k_up_now    = k_pan_hover && IsKeyDown(KEY_UP);
+        int k_down_now  = k_pan_hover && IsKeyDown(KEY_DOWN);
+        if (k_up_now)   ++k_pan_up_held;   else k_pan_up_held   = 0;
+        if (k_down_now) ++k_pan_down_held; else k_pan_down_held = 0;
+        if (k_up_now || k_down_now) {
+            int held = k_up_now ? k_pan_up_held : k_pan_down_held;
+            int mult;
+            if      (held <=   8) mult =    1;
+            else if (held <=  30) mult =    4;
+            else if (held <=  60) mult =   16;
+            else if (held <= 120) mult =   64;
+            else                  mult =  256;
+            double img_per_sample =
+                ((double) mult / (double) iqb.samp_rate / duration_s)
+                * (double) spec_h;
+            if (k_up_now)   view_y -= (float) img_per_sample;
+            if (k_down_now) view_y += (float) img_per_sample;
+        }
         float pan_step = 8.0f / zoom;
-        if (IsKeyDown(KEY_UP))    view_y -= pan_step;
-        if (IsKeyDown(KEY_DOWN))  view_y += pan_step;
+        if (!k_pan_hover) {
+            if (IsKeyDown(KEY_UP))    view_y -= pan_step;
+            if (IsKeyDown(KEY_DOWN))  view_y += pan_step;
+        }
         if (IsKeyDown(KEY_LEFT))  view_x -= pan_step;
         if (IsKeyDown(KEY_RIGHT)) view_x += pan_step;
         float page_step = (sh / zoom) * 0.8f;
