@@ -3908,11 +3908,20 @@ int main(int argc, char **argv)
                         decmode_input_sps   = sps;
                         decmode_have_result = 1;
                         // Viterbi slicer: run MSK-MLSE on the same IQ
-                        // slice and substitute its bit decisions +
-                        // ASM sync + Hamming trace into decmode_diag.
-                        // Downstream stages keep reading from the
-                        // diag struct exactly as before.
+                        // slice and splice its bit decisions into
+                        // decmode_diag. The Viterbi entry strips
+                        // pre-ASM bits from its out_bits stream
+                        // (same convention as modem_iq_to_bits), so
+                        // we keep the FSK chain's pre-ASM bits
+                        // (preamble) in [0, fsk_asm_offset) and put
+                        // Viterbi's bits in [fsk_asm_offset, ...).
+                        // ASM offset stays at fsk_asm_offset; the
+                        // Hamming trace is recomputed over the
+                        // spliced stream so the dip lands at the
+                        // marker again.
                         if (decmode_use_viterbi) {
+                            size_t fsk_asm_off = decmode_diag.asm_offset;
+                            size_t fsk_n_strob = decmode_diag.n_strobes;
                             if (strob_cap > decmode_viterbi_cap) {
                                 uint8_t *nb = (uint8_t *) realloc(
                                     decmode_viterbi_buf, strob_cap);
@@ -3939,17 +3948,31 @@ int main(int argc, char **argv)
                                     /*min_bit_offset*/0,
                                     decmode_viterbi_buf, &v_n,
                                     &v_off, &v_pol);
-                                if (v_n > strob_cap) v_n = strob_cap;
-                                if (decmode_diag.bits != NULL && v_n > 0) {
-                                    memcpy(decmode_diag.bits,
+                                if (decmode_diag.bits != NULL
+                                    && v_n > 0
+                                    && v_off != (size_t) -1) {
+                                    // pre_len = where ASM lands. If
+                                    // FSK didn't lock, place ASM at 0
+                                    // so the rest of the panel still
+                                    // has something to show.
+                                    size_t pre_len =
+                                        (fsk_asm_off == (size_t) -1)
+                                        ? 0 : fsk_asm_off;
+                                    if (pre_len > strob_cap)
+                                        pre_len = strob_cap;
+                                    size_t room = strob_cap - pre_len;
+                                    if (v_n > room) v_n = room;
+                                    memcpy(decmode_diag.bits + pre_len,
                                            decmode_viterbi_buf, v_n);
-                                    decmode_diag.n_strobes = v_n;
-                                    decmode_diag.asm_offset = v_off;
+                                    decmode_diag.n_strobes =
+                                        pre_len + v_n;
+                                    decmode_diag.asm_offset = pre_len;
                                     decmode_diag.polarity_used = v_pol;
-                                    if (v_n >= 32
+                                    if (decmode_diag.n_strobes >= 32
                                         && decmode_diag.asm_hamming
                                            != NULL) {
-                                        size_t hn = v_n - 31;
+                                        size_t hn =
+                                            decmode_diag.n_strobes - 31;
                                         const uint32_t ASM_W =
                                             0x930B51DEu;
                                         for (size_t k = 0; k < hn; ++k) {
@@ -3965,15 +3988,23 @@ int main(int argc, char **argv)
                                             decmode_diag.asm_hamming[k] =
                                                 (uint8_t) dist;
                                         }
-                                        if (v_off != (size_t) -1
-                                            && v_off < hn) {
-                                            decmode_diag.asm_dist =
-                                                decmode_diag.asm_hamming[
-                                                    v_off];
-                                        } else {
-                                            decmode_diag.asm_dist = 32;
-                                        }
+                                        decmode_diag.asm_dist =
+                                            (pre_len < hn)
+                                            ? decmode_diag.asm_hamming[
+                                                pre_len]
+                                            : 32;
                                     }
+                                } else if (v_off == (size_t) -1) {
+                                    // Viterbi found no ASM. Keep
+                                    // FSK's diag intact so the
+                                    // operator can see "Viterbi
+                                    // didn't lock" by comparing the
+                                    // ASM marker / Hamming trace
+                                    // against the FSK baseline.
+                                    decmode_diag.asm_offset =
+                                        fsk_asm_off;
+                                    decmode_diag.n_strobes =
+                                        fsk_n_strob;
                                 }
                             }
                         }
