@@ -1927,6 +1927,19 @@ int main(int argc, char **argv)
                                 duration_s, &wf_opt);
     if (wf_db_min_set) { wf_opt.db_min = (float) wf_db_min; wf_opt.db_min_user_set = 1; }
     if (wf_db_max_set) { wf_opt.db_max = (float) wf_db_max; wf_opt.db_max_user_set = 1; }
+    // --live forces detrend=none for *both* the initial load and every
+    // refresh chunk. Mixing detrend modes (e.g. initial=median,
+    // refresh=none) leaves the two halves of spec_db in different
+    // coordinate systems — the colormap is calibrated for one and the
+    // appended rows render as the colormap's darkest pixel ("zeros"
+    // in the waterfall). Median per-chunk would also flicker every
+    // refresh as the median jumps with each new chunk.
+    if (live_mode_cli && wf_opt.detrend_mode != 2) {
+        fprintf(stderr,
+            "decode_inspector: --live: forcing detrend=none for the "
+            "initial load too (was %d)\n", wf_opt.detrend_mode);
+        wf_opt.detrend_mode = 2;
+    }
     // Bridge ropts → wf_opt: parse_render_opts also picks up
     // UT=YYYYMMDDTHHMMSS from the file path, which is how every
     // sso-captured .iq carries its start time. Threading that into
@@ -2191,12 +2204,9 @@ int main(int argc, char **argv)
     size_t live_last_iq_size  = (size_t) iqb.n_pairs * 4u;
     double live_last_check_time = GetTime();
     if (live_mode) {
-        if (wf_opt.detrend_mode != 2) {
-            fprintf(stderr,
-                "decode_inspector: --live: forcing detrend=none "
-                "(median/HPF jump every refresh otherwise)\n");
-            wf_opt.detrend_mode = 2;
-        }
+        // detrend was already forced to none before the initial
+        // load (see above) so the rolling-window spec_db stays in
+        // one coordinate system.
         fprintf(stderr,
             "decode_inspector: --live: window %.1f s, interval %.1f s, "
             "row %.3f s/bin\n",
