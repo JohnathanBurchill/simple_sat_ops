@@ -5304,9 +5304,21 @@ int main(int argc, char **argv)
             .fm_fullscale_hz = 25000.0,
             .device_args     = "type=b200",
             .rx_antenna      = "RX2",
+            // fir_decim budget:
+            //   - operator LO offset clamped ±45 kHz (apps/main.c
+            //     KEY_LO_OFFSET clamp);
+            //   - Doppler swing ±10 kHz for a typical LEO pass;
+            //   - FM envelope ±5 kHz around the carrier;
+            //   - Nyquist after decim by 5 = ±48 kHz.
+            // Cutoff 42 kHz with 256 taps gives ~6 kHz transition
+            // before Nyquist and lets the carrier sit anywhere
+            // inside the clamp without the LPF rolling off half the
+            // beacon. The carrier-at-DC convention moved to the
+            // decode-only buffer (see b210_rx_tx_core.c); the IQ
+            // tap now carries the carrier at +lo_offset baseband.
             .decim_factor    = 5u,
-            .decim_cutoff_hz = 18000.0,
-            .decim_taps      = 96u,
+            .decim_cutoff_hz = 42000.0,
+            .decim_taps      = 256u,
             // FM-path LO compensation: the core's second NCO cancels
             // the operator's lo_offset, the UHD-reported tune residual
             // (target − actual, from the AD9361 PLL step), AND the

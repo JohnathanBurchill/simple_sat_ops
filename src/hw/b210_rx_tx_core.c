@@ -49,6 +49,13 @@ struct b210_rx_tx_core {
     // sample rate equals actual_rate.
     fir_decim_iq_t         *decim;
     int16_t                *iq_decim;        // sc16 interleaved, max_iq_out pairs
+                                              // post-Doppler, PRE-fm_lo_nco
+                                              // (carrier at +lo_offset baseband)
+    int16_t                *iq_for_decode;   // sc16 interleaved, max_iq_out pairs
+                                              // post-Doppler, POST-fm_lo_nco
+                                              // (carrier at DC). NULL when
+                                              // fm_lo_nco_active is always
+                                              // false — see refresh_fm_lo_nco.
     size_t                  max_iq_out;      // ceil(max_iq_in / M) + 1
 
     double                  input_rate;      // UHD's coerced sample rate
@@ -79,18 +86,21 @@ struct b210_rx_tx_core {
     // set_freq() so a smooth Doppler trajectory stays phase-coherent.
     // Lives in src/dsp/sw_nco for unit-testability.
     sw_nco_t                sw_nco;
-    // Second NCO that runs ONLY on the FM-discriminator path. Cancels
+    // Second NCO that runs ONLY on the decode-path buffer. Cancels
     // the constant lo_offset AND the UHD-reported tune residual
     // (target_freq − actual_freq, from the AD9361's PLL step) so the
     // FSK signal lands at exactly DC for the discriminator (which is
     // calibrated for ±fm_fullscale_hz around DC; a non-zero baseband
     // offset clips the FSK upper level).
-    // Applied IN PLACE on the post-decim/post-Doppler stream BEFORE
-    // the IQ tap, so the .iq sidecar + live waterfall + shadow IQ
-    // decoder all see the signal centered at DC. The spectrum is
-    // periodic in fs so the rotation wraps the [-fs/2, -lo_offset]
-    // chunk around to the right edge of the post-rotation baseband
-    // (faithful but visually unfamiliar for wideband neighbours).
+    //
+    // The pump first copies iq_decim → iq_for_decode and then applies
+    // this NCO to iq_for_decode only. The IQ tap (iq_raw_out) sees the
+    // unrotated iq_decim, so the operator's chosen lo_offset is
+    // visible in the .iq sidecar / live waterfall (beacon parked
+    // wherever they pushed it, away from the DC null + spurs).
+    // Downstream consumers that need carrier-at-DC (FM discriminator,
+    // shadow IQ decoder, IQ-burst detector, IQ level meter) read from
+    // iq_for_decode via iq_decode_out / iq_demod.
     sw_nco_t                fm_lo_nco;
     int                     fm_lo_nco_active;
     double                  fm_lo_compensation_hz; // operator's rx_lo_offset
@@ -298,6 +308,17 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
     } else {
         c->max_iq_out = c->max_iq_in;
     }
+    // Parallel buffer for the decode path (post-fm_lo_nco). Sized
+    // to the same upper bound as iq_decim. Allocated unconditionally
+    // — fm_lo_nco_active toggles per pump, but the buffer is cheap
+    // and aliasing iq_for_decode = iq_decim when inactive avoids a
+    // per-pump branch elsewhere.
+    c->iq_for_decode = (int16_t *)malloc(c->max_iq_out * 2 * sizeof(int16_t));
+    if (c->iq_for_decode == NULL) {
+        fprintf(stderr,
+            "b210_rx_tx_core: out of memory for decode IQ buf\n");
+        goto fail;
+    }
 
     if (log_uhd(uhd_rx_metadata_make(&c->md), "rx_metadata_make")) goto fail;
 
@@ -341,14 +362,18 @@ void b210_rx_tx_core_close(b210_rx_tx_core_t *c)
     if (c->iq_burst_det != NULL) iq_burst_free(c->iq_burst_det);
     free(c->iq_chunk);
     free(c->iq_decim);
+    free(c->iq_for_decode);
     free(c);
 }
 
 ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *c, int16_t *pcm_out, size_t pcm_cap,
-                             int16_t *iq_out, size_t iq_cap,
-                             size_t *out_iq_pairs)
+                             int16_t *iq_raw_out,    size_t iq_raw_cap,
+                             size_t  *out_iq_raw_pairs,
+                             int16_t *iq_decode_out, size_t iq_decode_cap,
+                             size_t  *out_iq_decode_pairs)
 {
-    if (out_iq_pairs) *out_iq_pairs = 0;
+    if (out_iq_raw_pairs)    *out_iq_raw_pairs    = 0;
+    if (out_iq_decode_pairs) *out_iq_decode_pairs = 0;
     if (c == NULL || pcm_out == NULL || pcm_cap == 0) return -1;
 
     // Decide how much IQ to ask UHD for. With decimation by M, each
@@ -404,24 +429,34 @@ ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *c, int16_t *pcm_out, size_t pcm_
         if (n_demod == 0) return 0;
     }
     // Software Doppler correction — applied in place on the post-decim
-    // buffer so every downstream consumer (.iq writer, FM discriminator,
-    // shadow IQ decoder, IQ tap) sees the same Doppler-corrected stream.
+    // buffer so both the IQ tap and the decode path see the same
+    // Doppler-tracked stream. The carrier is parked at the operator's
+    // +lo_offset baseband in iq_demod_buf after this step.
     sw_nco_apply(&c->sw_nco, iq_demod_buf, n_demod);
-    const int16_t *iq_demod = iq_demod_buf;
 
-    // Broadband-burst detector: feed the post-NCO IQ in and snapshot
-    // the latest count. Internally it accumulates into 512-sample
-    // FFT frames so one push usually triggers 0-2 frame completions
-    // at typical UHD chunk sizes.
+    // Decode-path buffer: rotated to DC for FM discriminator + shadow
+    // IQ decoder + IQ-burst detector + level meter. When fm_lo_nco is
+    // inactive (lo_offset, tune residual, and trim are all zero), alias
+    // iq_for_decode to iq_demod_buf to skip the redundant copy.
+    int16_t *iq_decode = iq_demod_buf;
+    if (c->fm_lo_nco_active) {
+        memcpy(c->iq_for_decode, iq_demod_buf,
+               n_demod * 2 * sizeof(int16_t));
+        sw_nco_apply(&c->fm_lo_nco, c->iq_for_decode, n_demod);
+        iq_decode = c->iq_for_decode;
+    }
+    const int16_t *iq_demod = iq_decode;
+
+    // Broadband-burst detector: reads the decode-path buffer so the
+    // FFT bins line up with carrier-at-DC.
     if (c->iq_burst_det != NULL) {
         iq_burst_push(c->iq_burst_det, iq_demod, n_demod);
         c->last_burst_bright_bins    = iq_burst_bright_bins(c->iq_burst_det);
         c->last_burst_peak_excess_db = iq_burst_peak_excess_db(c->iq_burst_det);
     }
 
-    // IQ level meter. Run before the discriminator so the reading
-    // reflects RF input (rises on incoming signal) rather than demod
-    // output (whose noise floor *drops* on FM capture).
+    // IQ level meter. Run on the decode-path buffer so the reading
+    // reflects the in-passband signal around the carrier-at-DC.
     {
         double env = c->iq_peak_env;
         double rms = c->iq_rms_sq;
@@ -444,31 +479,23 @@ ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *c, int16_t *pcm_out, size_t pcm_
         c->iq_rms_sq   = rms;
     }
 
-    // FM-path LO compensation, applied IN PLACE before the IQ tap so
-    // every downstream consumer (.iq sidecar, live waterfall, shadow
-    // IQ decoder, FM discriminator) sees the signal at DC. Earlier
-    // design kept the LO offset in the IQ tap so the waterfall would
-    // show the raw baseband (DC null + fixed-pattern spurs at known
-    // positions). Operator preference is now "centered carrier" —
-    // the spectrum [-fs/2, +fs/2] wraps circularly as a result, so
-    // the rightmost ~lo_offset_hz of the post-rotation waterfall is
-    // the original spectrum from just below the LO, aliased around.
-    // For a single-carrier sat that's invisible; for wideband
-    // neighbours it'd show up as a mirror image on the far edge.
-    if (c->fm_lo_nco_active) {
-        sw_nco_apply(&c->fm_lo_nco, iq_demod_buf, n_demod);
-    }
-
-    // IQ tap: copy the post-rotation IQ stream to the caller's
-    // buffer. Same sample timing as the PCM output (one IQ pair per
-    // PCM sample) so a downstream recorder can pair them. Caller
-    // decides the cap; the count we actually delivered lands in
-    // *out_iq_pairs.
-    if (iq_out != NULL && iq_cap >= 2) {
+    // Raw IQ tap (carrier at +lo_offset baseband). Goes to the .iq
+    // sidecar and the live waterfall — operator sees the beacon
+    // wherever they parked it, no rotation wraparound at the spectrum
+    // edges.
+    if (iq_raw_out != NULL && iq_raw_cap >= 2) {
         size_t pairs = n_demod;
-        if (pairs * 2 > iq_cap) pairs = iq_cap / 2;
-        memcpy(iq_out, iq_demod, pairs * 2 * sizeof(int16_t));
-        if (out_iq_pairs) *out_iq_pairs = pairs;
+        if (pairs * 2 > iq_raw_cap) pairs = iq_raw_cap / 2;
+        memcpy(iq_raw_out, iq_demod_buf, pairs * 2 * sizeof(int16_t));
+        if (out_iq_raw_pairs) *out_iq_raw_pairs = pairs;
+    }
+    // Decode-path IQ tap (carrier at DC). Goes to the shadow IQ
+    // decoder. Same stream the FM discriminator reads below.
+    if (iq_decode_out != NULL && iq_decode_cap >= 2) {
+        size_t pairs = n_demod;
+        if (pairs * 2 > iq_decode_cap) pairs = iq_decode_cap / 2;
+        memcpy(iq_decode_out, iq_demod, pairs * 2 * sizeof(int16_t));
+        if (out_iq_decode_pairs) *out_iq_decode_pairs = pairs;
     }
 
     // FM discriminator: pcm[k] = arg(z[k] * conj(z[k-1])) * k_scale,

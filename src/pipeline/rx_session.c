@@ -183,7 +183,13 @@ struct rx_session {
     // Allocated scratch.
     int16_t *pcm_chunk;
     size_t   max_chunk;
+    // Raw IQ tap from the pump (carrier at +lo_offset baseband). This
+    // is what gets written to the .iq sidecar.
     int16_t *iq_chunk;   // 2 * max_chunk int16: interleaved I,Q pairs
+    // Decode-path IQ tap from the pump (carrier at DC). Fills the
+    // sliding window the shadow IQ + Viterbi decoders consume so they
+    // see the same shape the FM discriminator does.
+    int16_t *iq_decode_chunk;
     int16_t *window;
     size_t   window_filled;
     // Shadow IQ window: interleaved I,Q pairs, same length (in pairs)
@@ -406,16 +412,17 @@ int rx_session_open(rx_session_t **out, const rx_session_params_t *p,
 
     rxs->max_chunk = b210_rx_tx_core_max_chunk(core);
     if (rxs->max_chunk == 0) rxs->max_chunk = 2040;
-    rxs->pcm_chunk     = malloc(rxs->max_chunk * sizeof(int16_t));
-    rxs->iq_chunk      = malloc(rxs->max_chunk * 2 * sizeof(int16_t));
-    rxs->window        = malloc(rxs->window_samples * sizeof(int16_t));
-    rxs->iq_window     = malloc(rxs->window_samples * 2 * sizeof(int16_t));
-    rxs->bits_cap      = rxs->window_samples + 8;
-    rxs->bits_scratch  = malloc(rxs->bits_cap);
-    rxs->bytes_cap     = rxs->bits_cap / 8 + 1;
-    rxs->bytes_scratch = malloc(rxs->bytes_cap);
-    if (!rxs->pcm_chunk || !rxs->iq_chunk || !rxs->window
-        || !rxs->iq_window
+    rxs->pcm_chunk        = malloc(rxs->max_chunk * sizeof(int16_t));
+    rxs->iq_chunk         = malloc(rxs->max_chunk * 2 * sizeof(int16_t));
+    rxs->iq_decode_chunk  = malloc(rxs->max_chunk * 2 * sizeof(int16_t));
+    rxs->window           = malloc(rxs->window_samples * sizeof(int16_t));
+    rxs->iq_window        = malloc(rxs->window_samples * 2 * sizeof(int16_t));
+    rxs->bits_cap         = rxs->window_samples + 8;
+    rxs->bits_scratch     = malloc(rxs->bits_cap);
+    rxs->bytes_cap        = rxs->bits_cap / 8 + 1;
+    rxs->bytes_scratch    = malloc(rxs->bytes_cap);
+    if (!rxs->pcm_chunk || !rxs->iq_chunk || !rxs->iq_decode_chunk
+        || !rxs->window || !rxs->iq_window
         || !rxs->bits_scratch || !rxs->bytes_scratch) {
         rx_session_close(rxs);
         return -1;
@@ -855,6 +862,7 @@ void rx_session_close(rx_session_t *rxs)
     if (rxs->db)     packet_db_close(rxs->db);
     free(rxs->pcm_chunk);
     free(rxs->iq_chunk);
+    free(rxs->iq_decode_chunk);
     free(rxs->window);
     free(rxs->iq_window);
     free(rxs->bits_scratch);
@@ -1099,16 +1107,22 @@ static void try_decode_viterbi_at_window(rx_session_t *rxs)
 
 static int worker_pump_once(rx_session_t *rxs)
 {
-    // Pass the IQ tap buffer through so the core copies post-decim IQ
-    // alongside the FM-demoded PCM. iq_pairs may be less than n on the
-    // very first pump (the discriminator emits a leading zero for the
-    // missing prev-sample) — that's fine; we write only what the core
-    // actually delivered.
+    // Two IQ taps from the core: iq_chunk is raw post-Doppler IQ with
+    // the carrier at +lo_offset baseband (gets written to the .iq
+    // sidecar), iq_decode_chunk is the same stream after fm_lo_nco
+    // brings the carrier to DC (feeds the shadow IQ + Viterbi decoders
+    // below). iq_pairs may be less than n on the very first pump (the
+    // discriminator emits a leading zero for the missing prev-sample) —
+    // that's fine; we write only what the core actually delivered.
     size_t iq_pairs = 0;
+    size_t iq_decode_pairs = 0;
     ssize_t n = b210_rx_tx_core_pump(rxs->core, rxs->pcm_chunk,
                                      rxs->max_chunk,
-                                     rxs->iq_chunk, rxs->max_chunk * 2,
-                                     &iq_pairs);
+                                     rxs->iq_chunk,
+                                     rxs->max_chunk * 2, &iq_pairs,
+                                     rxs->iq_decode_chunk,
+                                     rxs->max_chunk * 2,
+                                     &iq_decode_pairs);
     if (n < 0) return -1;
     if (n == 0) return 0;
     if (rxs->wav.fp) wav_w_append(&rxs->wav, rxs->pcm_chunk, (size_t) n);
@@ -1138,16 +1152,19 @@ static int worker_pump_once(rx_session_t *rxs)
         }
     }
 
-    size_t pairs_to_use = iq_pairs;
+    // iq_window feeds the shadow IQ + Viterbi decoders, both of which
+    // are calibrated for carrier-at-DC. Source bytes come from the
+    // decode-path tap (post-fm_lo_nco), not the raw .iq tap.
+    size_t pairs_to_use = iq_decode_pairs;
     if (pairs_to_use > (size_t) n) pairs_to_use = (size_t) n;
     for (ssize_t i = 0; i < n; i++) {
         rxs->window[rxs->window_filled++] = rxs->pcm_chunk[i];
         if ((size_t) i < pairs_to_use
             && rxs->iq_window_filled < rxs->window_samples) {
             rxs->iq_window[rxs->iq_window_filled * 2 + 0] =
-                rxs->iq_chunk[i * 2 + 0];
+                rxs->iq_decode_chunk[i * 2 + 0];
             rxs->iq_window[rxs->iq_window_filled * 2 + 1] =
-                rxs->iq_chunk[i * 2 + 1];
+                rxs->iq_decode_chunk[i * 2 + 1];
             rxs->iq_window_filled++;
         }
         rxs->total_window_samples++;

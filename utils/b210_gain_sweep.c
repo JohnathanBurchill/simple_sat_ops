@@ -316,10 +316,14 @@ int main(int argc, char *argv[])
             if (t >= t_stop) break;
 
             size_t out_iq_pairs = 0u;
+            // Use the raw IQ tap (carrier at +lo_offset baseband). The
+            // sweep only cares about RX level, not carrier centering;
+            // the decode-path tap would be redundant here.
             ssize_t r = b210_rx_tx_core_pump(core,
                                              pcm, max_chunk,
                                              iq,  max_chunk * 2u,
-                                             &out_iq_pairs);
+                                             &out_iq_pairs,
+                                             NULL, 0u, NULL);
             if (r < 0) { fprintf(stderr, "gain=%.1f dB: pump fatal\n", g); break; }
             if (r == 0) continue;
             if (out_iq_pairs == 0u) continue;

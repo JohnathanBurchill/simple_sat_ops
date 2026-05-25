@@ -114,12 +114,23 @@ void b210_rx_tx_core_close(b210_rx_tx_core_t *core);
 // the prev-IQ phase reference across calls. pcm_cap should be at least
 // b210_rx_tx_core_max_chunk(core) — short caps just truncate the chunk.
 //
-// iq_out is an optional tap on the post-decimation IQ stream — the same
-// samples the FM discriminator runs on. When non-NULL, the call copies
-// up to (iq_cap / 2) IQ pairs (interleaved I,Q int16) into the buffer,
-// returning the IQ count in *out_iq_pairs. Pass NULL for both iq_out
-// and out_iq_pairs to keep the existing PCM-only behaviour. Use this
-// to write a sidecar IQ recording without re-running the FIR.
+// Two optional IQ taps on the post-decimation stream:
+//
+//   * iq_raw_out: post-Doppler, PRE-fm_lo_nco. The carrier sits at
+//     +lo_offset_hz baseband (i.e. wherever the operator's LO offset
+//     placed it). This is what gets written to the .iq sidecar so the
+//     waterfall shows the beacon away from DC and the operator's
+//     offset choice survives offline replay.
+//
+//   * iq_decode_out: post-Doppler, POST-fm_lo_nco. The carrier sits at
+//     DC, which is what the FM discriminator's calibration and the
+//     shadow IQ decoder both expect. This is the same shape the old
+//     single-tap output had, just plumbed out separately.
+//
+// Each tap copies up to (cap / 2) IQ pairs (interleaved I,Q int16) and
+// reports the pair count in *out_*_pairs. Either tap may be NULL with
+// the corresponding cap = 0; pass nulls for both to keep the existing
+// PCM-only behaviour.
 //
 // Return:
 //   > 0  number of PCM samples written
@@ -127,8 +138,10 @@ void b210_rx_tx_core_close(b210_rx_tx_core_t *core);
 //   < 0  fatal UHD error — bail
 ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *core,
                           int16_t *pcm_out, size_t pcm_cap,
-                          int16_t *iq_out, size_t iq_cap,
-                          size_t *out_iq_pairs);
+                          int16_t *iq_raw_out,    size_t iq_raw_cap,
+                          size_t  *out_iq_raw_pairs,
+                          int16_t *iq_decode_out, size_t iq_decode_cap,
+                          size_t  *out_iq_decode_pairs);
 
 // Issue a tune request on RX channel 0. The streamer keeps running.
 // Return: 0 on success, -1 on UHD error.
