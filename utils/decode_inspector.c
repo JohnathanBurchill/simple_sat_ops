@@ -3035,7 +3035,18 @@ int main(int argc, char **argv)
                 double best_t = boxes.items[target].t0_s;
                 double target_img_y =
                     WF_TM + (1.0 - best_t / duration_s) * (double) spec_h;
-                view_y = (float)(target_img_y - (double) visible_h * 0.5);
+                // When K is open, place the box's earliest time
+                // (t0_s = bottom of the box on the spec, since time
+                // increases upward) at the BOTTOM of the visible
+                // spec area — which is the top of the K panel — so
+                // the box's first sample is the first thing the K
+                // panel shows. Otherwise centre the box vertically
+                // in the visible spec the way the W panel and
+                // standalone waterfall do.
+                double anchor_img =
+                    decmode_open ? (double) visible_h
+                                 : (double) visible_h * 0.5;
+                view_y = (float)(target_img_y - anchor_img);
                 boxes.selected = target;
                 snprintf(status, sizeof status,
                     "%s box %d/%d (%s, t0=%.3fs)",
