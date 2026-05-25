@@ -896,7 +896,14 @@ typedef struct {
 // chunk so a UI thread can render a progress bar — the file is read in
 // 8 MB chunks rather than one big fread() to make the granularity
 // useful on multi-hundred-MB passes.
+// tail_bytes > 0: only load the last tail_bytes (rounded down to an
+// IQ-pair multiple) from the file. Use this to start --live mode
+// already on the most-recent window instead of loading the whole
+// pass and then sliding it down to the window — the user sees only
+// the window from frame 0. tail_bytes == 0 loads the entire file
+// (legacy behaviour).
 static int iq_buf_load_progress(iq_buf_t *b, const char *path, int samp_rate,
+                                size_t tail_bytes,
                                 volatile float *progress_pct_out)
 {
     FILE *fp = fopen(path, "rb");
@@ -907,13 +914,22 @@ static int iq_buf_load_progress(iq_buf_t *b, const char *path, int samp_rate,
     }
     fseek(fp, 0, SEEK_END);
     long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
     if (sz <= 0) { fclose(fp); return -1; }
-    b->samples = (int16_t *) malloc((size_t) sz);
+    size_t total = (size_t) sz;
+    size_t offset = 0;
+    if (tail_bytes > 0 && total > tail_bytes) {
+        // Round the offset DOWN to a 4-byte IQ-pair boundary so we
+        // never split an int16 I/Q pair.
+        offset = (total - tail_bytes) & ~(size_t)3;
+        total = (size_t) sz - offset;
+    }
+    if (fseek(fp, (long) offset, SEEK_SET) != 0) {
+        fclose(fp); return -1;
+    }
+    b->samples = (int16_t *) malloc(total);
     if (b->samples == NULL) { fclose(fp); return -1; }
 
     const size_t chunk = 8u * 1024u * 1024u;
-    size_t total      = (size_t) sz;
     size_t read_total = 0;
     char  *dst        = (char *) b->samples;
     while (read_total < total) {
@@ -939,7 +955,7 @@ static int iq_buf_load_progress(iq_buf_t *b, const char *path, int samp_rate,
 
 static int iq_buf_load(iq_buf_t *b, const char *path, int samp_rate)
 {
-    return iq_buf_load_progress(b, path, samp_rate, NULL);
+    return iq_buf_load_progress(b, path, samp_rate, 0, NULL);
 }
 
 // Pretty-print a duration in seconds using whichever unit (minutes,
@@ -1010,6 +1026,12 @@ typedef struct {
     double          lo_shift_hz;    // sw NCO shift applied in-place to
                                     // iqb.samples between load and FFT;
                                     // 0 = pass-through
+    size_t          tail_bytes;     // > 0: only load the last
+                                    // tail_bytes from the file (rounded
+                                    // down to an IQ-pair boundary). 0:
+                                    // load the entire file. Used by
+                                    // --live so the initial render
+                                    // already shows the rolling window.
     wf_opts_t      *opt;
     // Outputs (set by the worker; readable by main once `done` is non-zero).
     iq_buf_t        iqb;
@@ -1044,6 +1066,7 @@ static void *loader_thread_fn(void *arg)
     loader_set_status(ctx, 0, "Loading IQ samples...");
     ctx->phase_progress = 0.0f;
     if (iq_buf_load_progress(&ctx->iqb, ctx->iq_path, ctx->samp_rate,
+                             ctx->tail_bytes,
                              &ctx->phase_progress) != 0) {
         pthread_mutex_lock(&ctx->lock);
         ctx->error = 1;
@@ -2014,6 +2037,15 @@ int main(int argc, char **argv)
     lctx.iq_path     = iq_path;
     lctx.samp_rate   = samp_rate;
     lctx.lo_shift_hz = lo_shift_hz_cli;
+    // --live: only load the most-recent live_window_s seconds from
+    // the file. Without this, a long .iq would render its whole pass
+    // for ~2 s and then suddenly shrink to the rolling window on the
+    // first refresh — confusing. tail_bytes is rounded inside the
+    // loader to a 4-byte IQ-pair boundary.
+    if (live_mode_cli) {
+        lctx.tail_bytes = (size_t)(live_window_s_cli
+                                   * (double) samp_rate) * 4u;
+    }
     lctx.opt         = &wf_opt;
     snprintf(lctx.status_msg, sizeof lctx.status_msg, "Loading IQ samples...");
     pthread_mutex_init(&lctx.lock, NULL);
@@ -2207,7 +2239,18 @@ int main(int argc, char **argv)
             ((double) iqb.n_pairs / (double) iqb.samp_rate)
             / (double) wf_opt.out_rows;
     }
-    size_t live_last_iq_size  = (size_t) iqb.n_pairs * 4u;
+    // For tail-loaded captures (--live on a file already bigger
+    // than the window), live_last_iq_size is the FULL file size at
+    // load time — not iqb.n_pairs*4. Otherwise the first refresh
+    // would see "file grew by everything we skipped" and re-read
+    // megabytes of bytes that are already represented in iqb.
+    size_t live_last_iq_size = (size_t) iqb.n_pairs * 4u;
+    if (live_mode_cli) {
+        struct stat lst;
+        if (stat(iq_path, &lst) == 0 && lst.st_size > 0) {
+            live_last_iq_size = (size_t) lst.st_size;
+        }
+    }
     double live_last_check_time = GetTime();
     if (live_mode) {
         // detrend was already forced to none before the initial
