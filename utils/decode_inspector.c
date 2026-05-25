@@ -674,7 +674,7 @@ static void draw_byte_tooltip(int mouse_x, int mouse_y,
     if (x < clip_x0) x = clip_x0;
     if (y + box_h > clip_y1) y = mouse_y - 14 - box_h;
     if (y < clip_y0) y = clip_y0;
-    DrawRectangle(x, y, box_w, box_h, (Color){10, 10, 18, 230});
+    DrawRectangle(x, y, box_w, box_h, (Color){6, 6, 10, 250});
     DrawRectangleLines(x, y, box_w, box_h, (Color){90, 110, 140, 255});
     Color tx_main = {220, 220, 235, 255};
     Color tx_dim  = {170, 180, 200, 255};
