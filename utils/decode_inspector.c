@@ -684,6 +684,52 @@ static void draw_byte_tooltip(int mouse_x, int mouse_y,
     draw_text(l4, x + pad, y + pad + 3 * line_h, text_pt, tx_main);
 }
 
+// Slice the dB grid into row tiles and upload each as an R32F
+// Texture2D. Out_tiles and out_n_tiles are caller-allocated pointers
+// to receive the newly-allocated array + its length. Returns 0 on
+// success, -1 on out-of-memory.
+static int build_spec_tiles(const float *spec_db,
+                            int spec_w, int spec_h,
+                            int tile_h,
+                            Texture2D **out_tiles, int *out_n_tiles)
+{
+    if (out_tiles == NULL || out_n_tiles == NULL) return -1;
+    *out_tiles = NULL;
+    *out_n_tiles = 0;
+    if (spec_w <= 0 || spec_h <= 0 || tile_h <= 0) return 0;
+    int n_tiles = (spec_h + tile_h - 1) / tile_h;
+    if (n_tiles < 1) n_tiles = 1;
+    Texture2D *tiles = (Texture2D *) calloc((size_t) n_tiles,
+                                            sizeof(Texture2D));
+    if (tiles == NULL) return -1;
+    for (int t = 0; t < n_tiles; ++t) {
+        int y0 = t * tile_h;
+        int h  = (y0 + tile_h <= spec_h) ? tile_h : (spec_h - y0);
+        Image im = {
+            .data    = (void *)(spec_db
+                                + (size_t) y0 * (size_t) spec_w),
+            .width   = spec_w,
+            .height  = h,
+            .mipmaps = 1,
+            .format  = PIXELFORMAT_UNCOMPRESSED_R32,
+        };
+        tiles[t] = LoadTextureFromImage(im);
+        if (tiles[t].id != 0)
+            SetTextureFilter(tiles[t], TEXTURE_FILTER_POINT);
+    }
+    *out_tiles   = tiles;
+    *out_n_tiles = n_tiles;
+    return 0;
+}
+
+static void free_spec_tiles(Texture2D *tiles, int n_tiles)
+{
+    if (tiles == NULL) return;
+    for (int t = 0; t < n_tiles; ++t)
+        if (tiles[t].id != 0) UnloadTexture(tiles[t]);
+    free(tiles);
+}
+
 // Draw the 2-row ASM bit-comparison strip at `y_top`:
 //   row 0 (expected): 16 preamble cells (gray) + 32 ASM cells (white)
 //   row 1 (actual):   green where bits match expected, red where not
@@ -1673,7 +1719,16 @@ static void usage(void)
         "                       a signal at +N kHz baseband to DC. Use to\n"
         "                       bring an off-DC carrier on an old capture\n"
         "                       to baseband (e.g. -0.77 for the legacy\n"
-        "                       RAO -770 Hz LO offset). Default 0.\n");
+        "                       RAO -770 Hz LO offset). Default 0.\n"
+        "  --live               Follow the .iq as it grows on disk. The\n"
+        "                       inspector keeps a rolling window of the\n"
+        "                       most-recent --live-window-s seconds and\n"
+        "                       FFTs only the appended chunk on each\n"
+        "                       refresh. Detrend mode is forced to none in\n"
+        "                       this mode (rolling-window median would jump\n"
+        "                       on every refresh).\n"
+        "  --live-interval-s=N  Seconds between refresh ticks (default 2).\n"
+        "  --live-window-s=N    Rolling window length in seconds (default 30).\n");
 }
 
 // Trap signals (SIGSEGV / SIGABRT) raised inside InitWindow so a
@@ -1756,6 +1811,14 @@ int main(int argc, char **argv)
     // DC.
     double lo_shift_hz_cli = 0.0;
 
+    // Live mode: follow the .iq as it grows on disk. Keeps a rolling
+    // window of the most-recent live_window_s seconds; on each refresh
+    // appends the new bytes, drops the oldest, FFTs only the new
+    // chunk, and re-tiles the GPU texture.
+    int    live_mode_cli       = 0;
+    double live_interval_s_cli = 2.0;
+    double live_window_s_cli   = 30.0;
+
     const char *passthru[MAX_PASSTHRU];
     int n_passthru = 0;
 
@@ -1775,6 +1838,16 @@ int main(int argc, char **argv)
             filter_upper_hz_cli = atof(a + 18);
         } else if (strncmp(a, "--lo-shift-khz=", 15) == 0) {
             lo_shift_hz_cli = atof(a + 15) * 1000.0;
+        } else if (strcmp(a, "--live") == 0) {
+            live_mode_cli = 1;
+        } else if (strncmp(a, "--live-interval-s=", 18) == 0) {
+            live_interval_s_cli = atof(a + 18);
+            if (live_interval_s_cli < 0.1)
+                live_interval_s_cli = 0.1;
+        } else if (strncmp(a, "--live-window-s=", 16) == 0) {
+            live_window_s_cli = atof(a + 16);
+            if (live_window_s_cli < 1.0)
+                live_window_s_cli = 1.0;
         } else if (is_passthru(a)) {
             if (n_passthru >= MAX_PASSTHRU) {
                 fprintf(stderr,
@@ -2088,37 +2161,47 @@ int main(int argc, char **argv)
     // tile is an R32F texture; the fragment shader samples it and
     // looks up the colour in a 256×1 viridis LUT.
     const int TILE_H = 4096;
-    int n_tiles = (spec_h + TILE_H - 1) / TILE_H;
-    Texture2D *tiles = (Texture2D *) calloc((size_t) n_tiles,
-                                            sizeof(Texture2D));
-    if (tiles == NULL) {
+    Texture2D *tiles = NULL;
+    int n_tiles = 0;
+    if (build_spec_tiles(spec_db, spec_w, spec_h, TILE_H,
+                         &tiles, &n_tiles) != 0) {
         fprintf(stderr, "decode_inspector: oom on tile array\n");
         free(spec_db); iq_buf_free(&iqb); CloseWindow(); return 1;
-    }
-    for (int t = 0; t < n_tiles; ++t) {
-        int y0 = t * TILE_H;
-        int h  = (y0 + TILE_H <= spec_h) ? TILE_H : (spec_h - y0);
-        Image im = {
-            .data    = spec_db + (size_t) y0 * (size_t) spec_w,
-            .width   = spec_w,
-            .height  = h,
-            .mipmaps = 1,
-            .format  = PIXELFORMAT_UNCOMPRESSED_R32,
-        };
-        tiles[t] = LoadTextureFromImage(im);
-        if (tiles[t].id == 0) {
-            fprintf(stderr,
-                "decode_inspector: tile %d upload failed (%dx%d)\n",
-                t, spec_w, h);
-        } else {
-            SetTextureFilter(tiles[t], TEXTURE_FILTER_POINT);
-        }
     }
     fprintf(stderr,
         "decode_inspector: spec %dx%d, %d tile(s) of up to %d rows, "
         "BW %.1f kHz, floor=%.1f dBFS\n",
         spec_w, spec_h, n_tiles, TILE_H, display_bw_hz / 1e3,
         wf_opt.display_db_floor + wf_opt.power_offset_db);
+
+    // Live-mode state. Time bin = how many seconds of IQ each spec
+    // row covers; captured from the initial load so refresh chunks
+    // produce rows on the same cadence. detrend is forced to none
+    // when --live is on — median/HPF would shift with every refresh
+    // and the rolling-window display would flicker.
+    int    live_mode      = live_mode_cli;
+    double live_interval_s = live_interval_s_cli;
+    double live_window_s   = live_window_s_cli;
+    double live_time_bin_s = 0.5;
+    if (iqb.n_pairs > 0 && wf_opt.out_rows > 0 && iqb.samp_rate > 0) {
+        live_time_bin_s =
+            ((double) iqb.n_pairs / (double) iqb.samp_rate)
+            / (double) wf_opt.out_rows;
+    }
+    size_t live_last_iq_size  = (size_t) iqb.n_pairs * 4u;
+    double live_last_check_time = GetTime();
+    if (live_mode) {
+        if (wf_opt.detrend_mode != 2) {
+            fprintf(stderr,
+                "decode_inspector: --live: forcing detrend=none "
+                "(median/HPF jump every refresh otherwise)\n");
+            wf_opt.detrend_mode = 2;
+        }
+        fprintf(stderr,
+            "decode_inspector: --live: window %.1f s, interval %.1f s, "
+            "row %.3f s/bin\n",
+            live_window_s, live_interval_s, live_time_bin_s);
+    }
 
     // Fragment shader: take the R32F sample (dB), normalise against the
     // operator's current [db_min, db_max] range, and evaluate viridis
@@ -2457,6 +2540,145 @@ int main(int argc, char **argv)
         int sw = GetScreenWidth();
         int sh = GetScreenHeight();
         Vector2 m = GetMousePosition();
+
+        // ----- live refresh -----
+        // If --live, every live_interval_s seconds stat the .iq.
+        // When it grows by at least ~0.25 s of new IQ, append the
+        // new bytes to iqb.samples (sliding out the oldest to keep
+        // the rolling window at live_window_s), FFT only the new
+        // chunk via wf_compute, and append the new rows to spec_db
+        // (again sliding the oldest out). Rebuild the GPU tiles
+        // from the rolling spec_db. duration_s and img_h get
+        // updated so the time math and view clamping stay correct.
+        if (live_mode && iqb.samples != NULL
+            && (GetTime() - live_last_check_time) >= live_interval_s) {
+            live_last_check_time = GetTime();
+            struct stat lst;
+            if (stat(iq_path, &lst) == 0
+                && lst.st_size > 0
+                && (size_t) lst.st_size > live_last_iq_size) {
+                size_t new_size = (size_t) lst.st_size;
+                size_t new_bytes = new_size - live_last_iq_size;
+                size_t new_pairs = new_bytes / 4u;
+                size_t min_new_pairs =
+                    (size_t) (0.25 * (double) iqb.samp_rate);
+                if (new_pairs >= min_new_pairs) {
+                    FILE *fp = fopen(iq_path, "rb");
+                    int16_t *tmp = (int16_t *) malloc(new_bytes);
+                    if (fp != NULL && tmp != NULL
+                        && fseek(fp, (long) live_last_iq_size,
+                                 SEEK_SET) == 0
+                        && fread(tmp, 1, new_bytes, fp)
+                           == new_bytes) {
+                        // Apply the same LO shift the initial load
+                        // applied so the live data stays aligned
+                        // with the existing spec rows.
+                        if (lo_shift_hz_cli != 0.0) {
+                            sw_nco_t nco;
+                            sw_nco_init(&nco,
+                                        (double) iqb.samp_rate);
+                            sw_nco_set_freq(&nco, lo_shift_hz_cli);
+                            sw_nco_apply(&nco, tmp, new_pairs);
+                        }
+                        // Slide IQ rolling window.
+                        size_t max_pairs =
+                            (size_t)(live_window_s
+                                     * (double) iqb.samp_rate);
+                        size_t total = iqb.n_pairs + new_pairs;
+                        size_t drop_pairs = (total > max_pairs)
+                            ? (total - max_pairs) : 0;
+                        if (drop_pairs > iqb.n_pairs)
+                            drop_pairs = iqb.n_pairs;
+                        if (drop_pairs > 0) {
+                            memmove(iqb.samples,
+                                    iqb.samples + 2u * drop_pairs,
+                                    (iqb.n_pairs - drop_pairs)
+                                        * 4u);
+                            iqb.n_pairs -= drop_pairs;
+                        }
+                        int16_t *grew = (int16_t *) realloc(
+                            iqb.samples,
+                            (iqb.n_pairs + new_pairs) * 4u);
+                        if (grew != NULL) {
+                            iqb.samples = grew;
+                            memcpy(iqb.samples
+                                       + 2u * iqb.n_pairs,
+                                   tmp, new_bytes);
+                            iqb.n_pairs += new_pairs;
+                            duration_s =
+                                (double) iqb.n_pairs
+                                / (double) iqb.samp_rate;
+                            // FFT just the new chunk.
+                            wf_opts_t pv = wf_opt;
+                            pv.detrend_mode = 2;
+                            pv.progress_pct_out = NULL;
+                            int new_rows = (int)(
+                                ((double) new_pairs
+                                 / (double) iqb.samp_rate)
+                                / live_time_bin_s + 0.5);
+                            if (new_rows < 1) new_rows = 1;
+                            pv.out_rows = new_rows;
+                            float *chunk_db = NULL;
+                            int chunk_w = 0, chunk_h = 0;
+                            int rc = wf_compute(tmp, new_pairs, &pv,
+                                                &chunk_db,
+                                                &chunk_w, &chunk_h);
+                            if (rc == 0 && chunk_db != NULL
+                                && chunk_w == spec_w
+                                && chunk_h > 0) {
+                                int max_rows = (int)(
+                                    live_window_s
+                                    / live_time_bin_s + 0.5);
+                                int total_rows = spec_h + chunk_h;
+                                int drop_rows = (total_rows
+                                                 > max_rows)
+                                    ? (total_rows - max_rows) : 0;
+                                if (drop_rows > spec_h)
+                                    drop_rows = spec_h;
+                                if (drop_rows > 0) {
+                                    memmove(spec_db,
+                                        spec_db
+                                            + (size_t) drop_rows
+                                              * (size_t) spec_w,
+                                        (size_t)(spec_h
+                                                 - drop_rows)
+                                            * (size_t) spec_w
+                                            * sizeof(float));
+                                    spec_h -= drop_rows;
+                                }
+                                float *db_grew = (float *) realloc(
+                                    spec_db,
+                                    (size_t)(spec_h + chunk_h)
+                                        * (size_t) spec_w
+                                        * sizeof(float));
+                                if (db_grew != NULL) {
+                                    spec_db = db_grew;
+                                    memcpy(spec_db
+                                            + (size_t) spec_h
+                                              * (size_t) spec_w,
+                                           chunk_db,
+                                           (size_t) chunk_h
+                                              * (size_t) spec_w
+                                              * sizeof(float));
+                                    spec_h += chunk_h;
+                                    img_h = WF_TM + spec_h + WF_BM;
+                                    free_spec_tiles(tiles, n_tiles);
+                                    tiles = NULL;
+                                    n_tiles = 0;
+                                    (void) build_spec_tiles(
+                                        spec_db, spec_w, spec_h,
+                                        TILE_H, &tiles, &n_tiles);
+                                }
+                            }
+                            free(chunk_db);
+                        }
+                        live_last_iq_size = new_size;
+                    }
+                    free(tmp);
+                    if (fp != NULL) fclose(fp);
+                }
+            }
+        }
 
         // ----- input -----
         // Capture pinch + wheel ONCE per frame so we can route them
