@@ -29,7 +29,7 @@ case "${1:-}" in -h|--help)
     ;;
 esac
 
-HOST="${HOST:-va6raogndstn}"
+HOST="${HOST:-rao}"
 REMOTE_ROOT="${REMOTE_ROOT:-/FrontierSat/Operations}"
 LOCAL_PATH="${1:-live.iq}"
 

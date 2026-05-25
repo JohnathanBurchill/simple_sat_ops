@@ -2626,41 +2626,65 @@ int main(int argc, char **argv)
                             if (rc == 0 && chunk_db != NULL
                                 && chunk_w == spec_w
                                 && chunk_h > 0) {
+                                // The initial loader flips spec_db
+                                // so row 0 = LATEST sample (top of
+                                // display = newest). Match it: flip
+                                // the new chunk in place, then
+                                // prepend (push older rows down).
+                                // Oldest rows fall off the END of
+                                // the buffer when the window is
+                                // full.
+                                size_t row_bytes =
+                                    (size_t) spec_w * sizeof(float);
+                                if (chunk_h > 1) {
+                                    float *tmp_row =
+                                        (float *) malloc(row_bytes);
+                                    if (tmp_row != NULL) {
+                                        for (int r = 0;
+                                             r < chunk_h / 2; ++r) {
+                                            int r2 = chunk_h - 1 - r;
+                                            memcpy(tmp_row,
+                                                chunk_db + (size_t) r
+                                                    * (size_t) spec_w,
+                                                row_bytes);
+                                            memcpy(chunk_db
+                                                + (size_t) r
+                                                    * (size_t) spec_w,
+                                                chunk_db + (size_t) r2
+                                                    * (size_t) spec_w,
+                                                row_bytes);
+                                            memcpy(chunk_db
+                                                + (size_t) r2
+                                                    * (size_t) spec_w,
+                                                tmp_row,
+                                                row_bytes);
+                                        }
+                                        free(tmp_row);
+                                    }
+                                }
                                 int max_rows = (int)(
                                     live_window_s
                                     / live_time_bin_s + 0.5);
-                                int total_rows = spec_h + chunk_h;
-                                int drop_rows = (total_rows
-                                                 > max_rows)
-                                    ? (total_rows - max_rows) : 0;
-                                if (drop_rows > spec_h)
-                                    drop_rows = spec_h;
-                                if (drop_rows > 0) {
-                                    memmove(spec_db,
-                                        spec_db
-                                            + (size_t) drop_rows
-                                              * (size_t) spec_w,
-                                        (size_t)(spec_h
-                                                 - drop_rows)
-                                            * (size_t) spec_w
-                                            * sizeof(float));
-                                    spec_h -= drop_rows;
-                                }
                                 float *db_grew = (float *) realloc(
                                     spec_db,
                                     (size_t)(spec_h + chunk_h)
-                                        * (size_t) spec_w
-                                        * sizeof(float));
+                                        * row_bytes);
                                 if (db_grew != NULL) {
                                     spec_db = db_grew;
-                                    memcpy(spec_db
-                                            + (size_t) spec_h
-                                              * (size_t) spec_w,
-                                           chunk_db,
-                                           (size_t) chunk_h
-                                              * (size_t) spec_w
-                                              * sizeof(float));
+                                    // Push existing rows down by
+                                    // chunk_h, then drop the
+                                    // bottom (= oldest) tail to
+                                    // honour the rolling window.
+                                    memmove(spec_db
+                                        + (size_t) chunk_h
+                                            * (size_t) spec_w,
+                                        spec_db,
+                                        (size_t) spec_h * row_bytes);
+                                    memcpy(spec_db, chunk_db,
+                                        (size_t) chunk_h * row_bytes);
                                     spec_h += chunk_h;
+                                    if (spec_h > max_rows)
+                                        spec_h = max_rows;
                                     img_h = WF_TM + spec_h + WF_BM;
                                     free_spec_tiles(tiles, n_tiles);
                                     tiles = NULL;
