@@ -369,7 +369,13 @@ static int parse_wf_opts_from_passthru(const char **passthru, int n_passthru,
     double time_bin_s   = 0.5;
     opt->db_min         = -3.0f;
     opt->db_max         = 20.0f;
-    opt->detrend_mode   = 0;
+    // detrend=none by default. median across the whole pass is
+    // useful when reading a static PNG, but in decode_inspector it
+    // re-quantises the colour map every time the file grows under
+    // --live and changes the noise floor's apparent dB value out
+    // from under the operator. Operators who want median can still
+    // ask for it explicitly.
+    opt->detrend_mode   = 2;
     opt->detrend_tau_s  = 0.0;
     opt->sample_rate    = samp_rate;
     opt->center_hz      = 0.0;
