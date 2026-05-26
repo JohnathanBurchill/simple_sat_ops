@@ -4005,14 +4005,18 @@ void usage(FILE *dest, const char *name, int full)
         "                               carrier (signed, default -25). Adjustable\n"
         "                               mid-pass via ':lo_offset <signed_kHz>'.\n"
         "  --ad9361-dc-track=on|off     AD9361 background DC-offset tracking.\n"
-        "                               UHD default is on; we default to OFF\n"
-        "                               because the periodic register kicks\n"
-        "                               leak as a ~51 Hz comb of spikes into\n"
-        "                               the captured IQ at mid-range gain.\n"
-        "                               Flip back on for A/B comparison.\n"
+        "                               Default ON (UHD default). The slow IIR\n"
+        "                               notch suppresses the AD9361's static\n"
+        "                               ADC DC bias; turning it off and\n"
+        "                               letting fm_lo_nco rotate the raw bias\n"
+        "                               leaks a large +lo_offset_hz sinusoid\n"
+        "                               into the decode-path IQ.\n"
         "  --ad9361-iq-track=on|off     AD9361 background IQ-balance tracking.\n"
-        "                               Same comb-of-spikes story; same\n"
-        "                               default OFF and same A/B knob.\n"
+        "                               Default OFF — the loop kicks discrete\n"
+        "                               phase-rotation steps into the IQ at\n"
+        "                               ~51 Hz, visible as a comb of spikes\n"
+        "                               in the waterfall at mid-range gain.\n"
+        "                               Flip back on for A/B comparison.\n"
         "  --tx-dry-run                 Synthesize an immediate 'ok' ack for\n"
         "                               every TX burst instead of routing it\n"
         "                               through the SDR. Exercises the auto-\n"
@@ -6265,13 +6269,16 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     // swing stays inside the 48 kHz post-decim half-band.
     state->rx_lo_offset_hz = -25000.0;
     state->rx_gain_db      = 30.0;
-    // AD9361 background tracking — off by default. Reason: at
-    // mid-range gain (~5..55 dB) the AD9361's BBDC + IQ-balance
-    // tracking loops update at ~51 Hz and leak as a comb of
-    // impulsive spikes across the captured IQ. Operator can flip
-    // either back on with --ad9361-dc-track=on / --ad9361-iq-track=on
-    // for A/B comparison.
-    state->rx_dc_offset_track  = 0;
+    // AD9361 background tracking. The visible ~51 Hz comb of impulsive
+    // spikes at mid-range gain is from the IQ-balance loop (discrete
+    // phase-rotation steps applied to the captured IQ); the DC-offset
+    // loop is a slow continuous IIR notch that DOESN'T produce
+    // spikes but DOES suppress the AD9361's static ADC DC bias.
+    // Turn IQ tracking off by default (kills the spikes), leave DC
+    // tracking on (otherwise the static DC bias rotates into a strong
+    // +lo_offset_hz sinusoid via fm_lo_nco on the decode path, which
+    // dominates the IQ time series).
+    state->rx_dc_offset_track  = 1;
     state->rx_iq_balance_track = 0;
 
     state->run_with_antenna_rotator = 1;
