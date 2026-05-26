@@ -1540,6 +1540,10 @@ static int pdf_write_waveform(const char *path,
         pdfw_rgb_t Q_col  = (pdfw_rgb_t){190, 60,  180, 255};
         pdfw_rgb_t Ph_col = (pdfw_rgb_t){230, 130, 40,  255};
         int plot_w_px = (int) plot_w;
+        // Confine the traces to the plot rect so any sample whose
+        // value exceeds the auto-scaled amp_max can't bleed onto the
+        // header / time-axis labels.
+        pdfw_clip_begin(w, pL, pT, plot_w, plot_h);
         if (n_pairs_vis <= (int64_t) plot_w_px * 2) {
             pdfw_lw(w, 0.5f);
             float prev_xi = -1, prev_yi = 0, prev_xq = -1, prev_yq = 0;
@@ -1621,6 +1625,7 @@ static int pdf_write_waveform(const char *path,
                 }
             }
         }
+        pdfw_clip_end(w);
     }
 
     char foot[256];
@@ -4814,6 +4819,10 @@ int main(int argc, char **argv)
                 // atan2(Q,I) into [-π,+π]; at the wrap (±π) the sparse
                 // line plot lifts the pen and the dense min/max paints
                 // a column-tall bar (visually = "phase wrapped here").
+                // Confine the traces to the plot rect so any sample
+                // exceeding the auto-scaled amp_max can't bleed out
+                // past the time-axis labels or the panel border.
+                BeginScissorMode(plot_x0, plot_y0, plot_w, plot_h);
                 const Color COLOR_I     = {80, 200, 220, 255};
                 const Color COLOR_Q     = {200, 90, 220, 200};
                 const Color COLOR_I_D   = {80, 200, 220, 220};
@@ -4912,6 +4921,7 @@ int main(int argc, char **argv)
                         }
                     }
                 }
+                EndScissorMode();
 
                 // Border around plot (+ a separator line between the
                 // two sub-areas in split mode so the eye doesn't try to
@@ -5259,6 +5269,9 @@ int main(int argc, char **argv)
 
                     // Plot the data. For dense data fall back to
                     // per-column min/max; for sparse, line-to-line.
+                    // Scissor to the body rect so a sample exceeding
+                    // amax can't paint into the time-axis labels.
+                    BeginScissorMode(body_x0, body_y0, body_w, body_h);
                     if (decmode_stage == 0 || decmode_stage == 1) {
                         // Two-trace (I + Q)
                         Color colI = {80, 200, 220, 255};
@@ -5416,6 +5429,7 @@ int main(int argc, char **argv)
                             (void) samp_per_sym;
                         }
                     }
+                    EndScissorMode();
                     // Bit-by-bit ASM comparison strip for the
                     // phase / post-discriminator stages where
                     // individual bits manifest visually (FM disc,
@@ -5454,12 +5468,15 @@ int main(int argc, char **argv)
                     // polyline from t_centre - sps to t_centre + sps
                     // (a 2-symbol window). Alpha-blend so high-density
                     // areas (the eye opening) brighten visibly.
+                    // Scissor to the body rect so symbol traces with
+                    // mf[j] > 2.0 can't bleed past the rails.
                     const Color eye_col = {255, 180, 80, 64};
                     size_t ns = decmode_diag.n_strobes;
                     const float *mf = decmode_diag.mf;
                     size_t mf_n = decmode_diag.n_mf;
                     double sps_d = (double) sps;
                     if (ns > 0 && mf_n > 0) {
+                        BeginScissorMode(body_x0, body_y0, body_w, body_h);
                         for (size_t k = 0; k < ns; ++k) {
                             double centre = decmode_diag.strobe_t[k];
                             double i0d = centre - sps_d;
@@ -5481,6 +5498,7 @@ int main(int argc, char **argv)
                                 prev_x = x; prev_y = y;
                             }
                         }
+                        EndScissorMode();
                     }
                     // Y-axis labels at ±1 and 0
                     char buf[16];

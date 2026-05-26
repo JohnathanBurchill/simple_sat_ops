@@ -67,6 +67,13 @@ void pdfw_line       (pdfw_t *w, float x1, float y1, float x2, float y2);
 void pdfw_rect_stroke(pdfw_t *w, float x,  float y,  float ww, float hh);
 void pdfw_rect_fill  (pdfw_t *w, float x,  float y,  float ww, float hh);
 
+// Clipping.  Save the current graphics state and intersect the clip
+// path with the given pixel-space rectangle; subsequent draws are
+// confined to that rect until pdfw_clip_end restores the state.
+// Pairs must nest.
+void pdfw_clip_begin(pdfw_t *w, float x, float y, float ww, float hh);
+void pdfw_clip_end  (pdfw_t *w);
+
 // Text.  y_top = y coordinate of the cap line.  mono != 0 selects
 // Courier; otherwise Helvetica.  Characters outside printable ASCII
 // are replaced with '?'.

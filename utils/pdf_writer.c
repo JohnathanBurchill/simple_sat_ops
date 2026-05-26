@@ -124,6 +124,15 @@ void pdfw_rect_fill(pdfw_t *w, float x, float y, float ww, float hh)
     pdfw_csf(w, "%.4f %.4f %.4f %.4f re f\n",
              x, PDFY(w, y + hh), ww, hh);
 }
+void pdfw_clip_begin(pdfw_t *w, float x, float y, float ww, float hh)
+{
+    pdfw_csf(w, "q\n%.4f %.4f %.4f %.4f re W n\n",
+             x, PDFY(w, y + hh), ww, hh);
+}
+void pdfw_clip_end(pdfw_t *w)
+{
+    pdfw_csf(w, "Q\n");
+}
 void pdfw_text(pdfw_t *w, float x, float y_top,
                const char *s, float fsz, int mono)
 {
