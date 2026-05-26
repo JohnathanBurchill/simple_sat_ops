@@ -26,7 +26,10 @@
 #include "radio_device_store.h"
 #include "state.h"
 #include "prediction.h"
+#include "tr_switch.h"
 
+#include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,6 +64,15 @@ void stop_tracking(state_t *state);
 void enable_wildrose_mode(state_t *state);
 int point_to_stationary_target(state_t *state, double azimuth, double elevation);
 void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, double downlink_freq);
+
+// Wall-clock-independent seconds, for cadence gates and freshness
+// timestamps on subsystems like the T/R switch heartbeat parser.
+static double monotonic_seconds(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
 
 static speed_t speed_from_bps(int bps)
 {
@@ -128,6 +140,12 @@ void usage(FILE *dest, const char *name, int full)
         "Rotator overrides:\n"
         "  --rotator-target-azimuth=<deg>    Park on a fixed azimuth\n"
         "  --rotator-target-elevation=<deg>  Park on a fixed elevation\n"
+        "\n"
+        "T/R switch (UHF antenna RX/TX switch, USB-CDC):\n"
+        "  --tr-switch-device=<path>    Serial device. Default /dev/ttyACM0.\n"
+        "                               Auto-probed on start; absence is\n"
+        "                               warned-and-continued.\n"
+        "  --without-tr-switch          Skip the probe entirely.\n"
         "\n"
         "Observer location (default RAO Priddis):\n"
         "  --lat=<deg>                  Geodetic latitude\n"
@@ -381,6 +399,53 @@ void report_status(state_t *state, int *print_row, int print_col)
         clrtoeol();
     }
 
+    row++;
+    if (state->have_tr_switch) {
+        const tr_switch_t *trs = &state->tr_switch;
+        const double t_now = monotonic_seconds();
+        int stale = tr_switch_is_stale(trs, t_now);
+        const char *rfs  = (trs->state_str[0] != '\0') ? trs->state_str : "?";
+        const char *mode = (trs->mode_str [0] != '\0') ? trs->mode_str  : "?";
+
+        mvprintw(row++, col, "%15s   connected (%s)",
+                 "T/R switch",
+                 trs->device_filename ? trs->device_filename : "?");
+        clrtoeol();
+
+        // RF state. Highlight in red if we appear to be transmitting
+        // outside of a controlled burst, or if the link has gone stale
+        // (the displayed state may be from many seconds ago).
+        int rfs_warn = (strcmp(rfs, "TX") == 0) || stale;
+        if (rfs_warn) attron(COLOR_PAIR(1));
+        mvprintw(row++, col, "%15s   %s%s",
+                 "RF state", rfs, stale ? "  (stale)" : "");
+        if (rfs_warn) attroff(COLOR_PAIR(1));
+        clrtoeol();
+
+        // Mode. Anything other than AUTO is yellow so the operator
+        // notices the slide switch / serial override mismatch.
+        int mode_warn = (strcmp(mode, "AUTO") != 0);
+        if (mode_warn) attron(COLOR_PAIR(2));
+        mvprintw(row++, col, "%15s   %s", "mode", mode);
+        if (mode_warn) attroff(COLOR_PAIR(2));
+        clrtoeol();
+
+        // last_tx_ago_s: NAN = field absent (firmware pre-extension)
+        // or unparseable, +inf = firmware-reported "never". Both render
+        // as the placeholder so the operator can tell the firmware
+        // never saw a TX from the current value alone.
+        if (isnan(trs->last_tx_ago_s) || isinf(trs->last_tx_ago_s)) {
+            mvprintw(row++, col, "%15s   --", "last TX");
+        } else {
+            mvprintw(row++, col, "%15s   %.1f s ago",
+                     "last TX", trs->last_tx_ago_s);
+        }
+        clrtoeol();
+    } else {
+        mvprintw(row++, col, "%15s   %s", "T/R switch", "* not connected *");
+        clrtoeol();
+    }
+
     *print_row = row;
 }
 
@@ -514,6 +579,21 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
         state.have_antenna_rotator = 1;
+    }
+
+    // T/R antenna switch — auto-probe. Absent / inaccessible device
+    // is a one-line warning, not an error; the UI panel will render
+    // "not connected" until the switch shows up on a subsequent run.
+    if (state.run_with_tr_switch) {
+        if (tr_switch_init(&state.tr_switch) == 0) {
+            state.have_tr_switch = 1;
+        } else {
+            fprintf(stderr,
+                    "T/R switch: could not open %s (skipping; "
+                    "pass --without-tr-switch to silence)\n",
+                    state.tr_switch.device_filename
+                        ? state.tr_switch.device_filename : "?");
+        }
         // Check that we can control the antenna position
         // antenna_rotator_result = antenna_rotator_command(&state.antenna_rotator, ANTENNA_ROTATOR_STATUS, NULL, NULL);
         // if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
@@ -578,6 +658,14 @@ int main(int argc, char **argv)
         UTC_Calendar_Now(&utc, &tv);
         jul_utc = Julian_Date(&utc, &tv);
         update_satellite_position(&state.prediction, jul_utc);
+
+        // Drain whatever the T/R switch has emitted since the last
+        // tick. Non-blocking; the firmware emits one heartbeat per
+        // ~2.5 s, so 5 ticks pass between updates at the 500 ms loop
+        // cadence and most ticks read zero bytes.
+        if (state.have_tr_switch) {
+            tr_switch_pump(&state.tr_switch, monotonic_seconds());
+        }
 
         /* Calculate Doppler shift */
         if (state.radio.doppler_correction_enabled) {
@@ -828,6 +916,10 @@ int main(int argc, char **argv)
         // rot_cleanup(state.rot);
     }
 
+    if (state.have_tr_switch) {
+        tr_switch_disconnect(&state.tr_switch);
+    }
+
     return 0;
 }
 
@@ -875,6 +967,13 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->antenna_rotator.serial_speed = B600;
     state->antenna_rotator.fixed_target = 0;
 
+    // T/R antenna switch defaults. Auto-probe is on by default;
+    // failure is a one-line stderr warning, not an error.
+    state->run_with_tr_switch = 1;
+    state->have_tr_switch     = 0;
+    state->tr_switch.device_filename = "/dev/ttyACM0";
+    state->tr_switch.serial_speed    = B115200;
+
     // Default to recording audio
     state->audio.audio_record = 1;
     state->audio.audio_output_file_basename = "session/session_pcm_audio";
@@ -899,6 +998,16 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             state->n_options++;
             state->run_with_radio = 1;
             state->run_with_antenna_rotator = 1;
+        } else if (strcmp("--without-tr-switch", argv[i]) == 0) {
+            state->n_options++;
+            state->run_with_tr_switch = 0;
+        } else if (strncmp("--tr-switch-device=", argv[i], 19) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 20) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state->tr_switch.device_filename = argv[i] + 19;
         } else if (strncmp("--tle=", argv[i], 6) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 7) {
