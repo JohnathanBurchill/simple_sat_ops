@@ -231,6 +231,22 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
     c->last_burst_peak_excess_db = 0.0;
 
     if (log_uhd(uhd_usrp_set_rx_gain(c->dev, p->gain_db, 0, ""), "set_rx_gain")) goto fail;
+    // AD9361 background tracking loops — see params_t for why we
+    // default to off. log_uhd reports but doesn't abort because not
+    // every UHD build wires these calls all the way down to the
+    // device on every revision.
+    log_uhd(uhd_usrp_set_rx_dc_offset_enabled(c->dev,
+                                              p->rx_dc_offset_track ? true : false,
+                                              0),
+            "set_rx_dc_offset_enabled");
+    log_uhd(uhd_usrp_set_rx_iq_balance_enabled(c->dev,
+                                               p->rx_iq_balance_track ? true : false,
+                                               0),
+            "set_rx_iq_balance_enabled");
+    fprintf(stderr,
+        "b210_rx_tx_core: AD9361 tracking: dc_offset=%s, iq_balance=%s\n",
+        p->rx_dc_offset_track  ? "on" : "off",
+        p->rx_iq_balance_track ? "on" : "off");
     if (log_uhd(uhd_usrp_set_rx_bandwidth(c->dev, bw_hz, 0), "set_rx_bandwidth")) goto fail;
     if (log_uhd(uhd_usrp_set_rx_antenna(c->dev, rx_antenna, 0), "set_rx_antenna")) goto fail;
 

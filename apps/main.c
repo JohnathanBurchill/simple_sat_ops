@@ -4004,6 +4004,15 @@ void usage(FILE *dest, const char *name, int full)
         "  --lo-offset=<kHz>            Park the SDR LO this far off the nominal\n"
         "                               carrier (signed, default -25). Adjustable\n"
         "                               mid-pass via ':lo_offset <signed_kHz>'.\n"
+        "  --ad9361-dc-track=on|off     AD9361 background DC-offset tracking.\n"
+        "                               UHD default is on; we default to OFF\n"
+        "                               because the periodic register kicks\n"
+        "                               leak as a ~51 Hz comb of spikes into\n"
+        "                               the captured IQ at mid-range gain.\n"
+        "                               Flip back on for A/B comparison.\n"
+        "  --ad9361-iq-track=on|off     AD9361 background IQ-balance tracking.\n"
+        "                               Same comb-of-spikes story; same\n"
+        "                               default OFF and same A/B knob.\n"
         "  --tx-dry-run                 Synthesize an immediate 'ok' ack for\n"
         "                               every TX burst instead of routing it\n"
         "                               through the SDR. Exercises the auto-\n"
@@ -5326,6 +5335,8 @@ int main(int argc, char **argv)
             // carrier lands at exactly DC for every downstream consumer
             // (.iq sidecar, live waterfall, shadow IQ decoder, FM
             // discriminator).
+            .rx_dc_offset_track  = state.rx_dc_offset_track,
+            .rx_iq_balance_track = state.rx_iq_balance_track,
             .fm_lo_compensation_hz = state.rx_lo_offset_hz,
             .carrier_trim_hz       = carrier_trim_load_hz(),
         };
@@ -6254,6 +6265,14 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     // swing stays inside the 48 kHz post-decim half-band.
     state->rx_lo_offset_hz = -25000.0;
     state->rx_gain_db      = 30.0;
+    // AD9361 background tracking — off by default. Reason: at
+    // mid-range gain (~5..55 dB) the AD9361's BBDC + IQ-balance
+    // tracking loops update at ~51 Hz and leak as a comb of
+    // impulsive spikes across the captured IQ. Operator can flip
+    // either back on with --ad9361-dc-track=on / --ad9361-iq-track=on
+    // for A/B comparison.
+    state->rx_dc_offset_track  = 0;
+    state->rx_iq_balance_track = 0;
 
     state->run_with_antenna_rotator = 1;
     state->antenna_rotator.device_filename = "/dev/ttyUSB0";
@@ -6404,6 +6423,21 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             if (g < 0.0)       g = 0.0;
             else if (g > 76.0) g = 76.0;
             state->rx_gain_db = g;
+        } else if (strncmp("--ad9361-dc-track=", argv[i], 18) == 0) {
+            // on|off|true|false|1|0
+            const char *v = argv[i] + 18;
+            state->n_options++;
+            state->rx_dc_offset_track =
+                (strcmp(v, "on")   == 0
+                 || strcmp(v, "true") == 0
+                 || strcmp(v, "1")  == 0) ? 1 : 0;
+        } else if (strncmp("--ad9361-iq-track=", argv[i], 18) == 0) {
+            const char *v = argv[i] + 18;
+            state->n_options++;
+            state->rx_iq_balance_track =
+                (strcmp(v, "on")   == 0
+                 || strcmp(v, "true") == 0
+                 || strcmp(v, "1")  == 0) ? 1 : 0;
         } else if (strncmp("--rotator-target-elevation=", argv[i], 27) == 0) {
             state->n_options++;
             if (strlen(argv[i]) < 28) {

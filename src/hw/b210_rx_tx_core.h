@@ -88,6 +88,24 @@ typedef struct b210_rx_tx_core_params {
     // active to cancel whatever residual is left.
     double      fm_lo_compensation_hz;
 
+    // AD9361 automatic DC-offset tracking + IQ-balance tracking. Both
+    // run as periodic background loops inside the AD9361 driver: each
+    // tick steps an IIR notch / a correction register, which kicks an
+    // impulsive transient into the IQ stream. At ~51 Hz update rate
+    // those transients look like a comb of vertical spikes in the
+    // waterfall — visible at moderate gain, suppressed at gain=0 (no
+    // input to chase) and at very high gain (loop saturates and the
+    // driver bails on convergence). FM signals near DC fall inside
+    // the tracking bandwidth and make the artifact worse.
+    //
+    // Pass false to disable. Tradeoff: a small static DC bias and
+    // residual IQ imbalance remain in the captured IQ, both of which
+    // the rest of the chain tolerates (carrier parked off-DC at
+    // +lo_offset_hz, FM disc is per-sample, decoder is differential
+    // phase). UHD's default is true on B210.
+    int         rx_dc_offset_track;
+    int         rx_iq_balance_track;
+
     // Persistent per-host carrier-trim calibration. Absorbs whatever's
     // left after the UHD-reported tune residual is cancelled — in
     // practice this is the B210 TCXO error (a few ppm × tuned RF =

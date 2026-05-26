@@ -73,6 +73,14 @@ typedef struct state
     // :gain colon command in the operator UI.
     double rx_gain_db;
 
+    // AD9361 background tracking loops. Default off — these add a
+    // ~51 Hz comb of impulsive spikes to the captured IQ at mid gain
+    // settings (see b210_rx_tx_core.h). Configurable via
+    // --ad9361-dc-track=on|off and --ad9361-iq-track=on|off so the
+    // operator can A/B against the default-on UHD baseline.
+    int rx_dc_offset_track;
+    int rx_iq_balance_track;
+
     // Antenna rotator
     antenna_rotator_t antenna_rotator;
     int run_with_antenna_rotator;
