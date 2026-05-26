@@ -117,6 +117,17 @@ static void usage(const char *argv0)
         "                       and default --csv / --iq-prefix into it\n"
         "                       unless you also passed them explicitly.\n"
         "\n"
+        "  --ad9361-dc-track=on|off   AD9361 background DC-offset tracking.\n"
+        "                             Default ON, mirroring simple_sat_ops, so\n"
+        "                             the noise-floor knee found here matches\n"
+        "                             what the operator UI will see at the\n"
+        "                             same gain. Pass off to characterise the\n"
+        "                             raw ADC floor (the BBDC IIR otherwise\n"
+        "                             notches a few bins around DC).\n"
+        "  --ad9361-iq-track=on|off   AD9361 background IQ-balance tracking.\n"
+        "                             Default OFF (the spike-comb culprit).\n"
+        "                             Pass on for A/B comparison.\n"
+        "\n"
         "Output: one row per gain on stdout — column \"mean_dBFS\" is\n"
         "10*log10(mean(I^2+Q^2) / 32767^2). Plot dBFS vs gain; the knee\n"
         "is the gain above which the line stops being slope ~1.\n",
@@ -142,6 +153,11 @@ int main(int argc, char *argv[])
     const char *iq_prefix     = NULL;
     int         testing_mode  = 0;
 
+    // Defaults mirror simple_sat_ops so a sweep finds the operator-
+    // visible noise-floor knee directly. CLI flags below override.
+    int         dc_track      = 1;
+    int         iq_track      = 0;
+
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
         if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
@@ -160,6 +176,18 @@ int main(int argc, char *argv[])
         else if (starts_with(a, "--csv="))            csv_path     = a + 6;
         else if (starts_with(a, "--iq-prefix="))      iq_prefix    = a + 12;
         else if (strcmp(a, "--testing") == 0)         testing_mode = 1;
+        else if (starts_with(a, "--ad9361-dc-track=")) {
+            const char *v = a + 18;
+            dc_track = (strcmp(v, "on") == 0
+                        || strcmp(v, "true") == 0
+                        || strcmp(v, "1") == 0) ? 1 : 0;
+        }
+        else if (starts_with(a, "--ad9361-iq-track=")) {
+            const char *v = a + 18;
+            iq_track = (strcmp(v, "on") == 0
+                        || strcmp(v, "true") == 0
+                        || strcmp(v, "1") == 0) ? 1 : 0;
+        }
         else {
             fprintf(stderr, "unknown option: %s\n", a);
             usage(argv[0]); return 2;
@@ -267,14 +295,12 @@ int main(int argc, char *argv[])
             .decim_factor           = decim,
             .decim_cutoff_hz        = decim_cutoff,
             .decim_taps             = 0u,
-            // Gain sweep characterises the noise floor vs gain. The
-            // AD9361's BBDC tracking IIR is a slow notch around DC
-            // that would suppress (some of) the noise floor it's
-            // trying to measure, so leave it OFF for this tool.
-            // IQ tracking off too — its periodic correction steps
-            // would inject spikes that bias the level meter.
-            .rx_dc_offset_track     = 0,
-            .rx_iq_balance_track    = 0,
+            // Default to the same AD9361 tracking config the
+            // operator UI uses (dc on, iq off), so the knee we find
+            // here is the knee they'll see. --ad9361-dc-track=off /
+            // --ad9361-iq-track=on override for characterisation.
+            .rx_dc_offset_track     = dc_track,
+            .rx_iq_balance_track    = iq_track,
             .fm_lo_compensation_hz  = 0.0,
             .carrier_trim_hz        = trim_hz,
         };
