@@ -267,6 +267,14 @@ int main(int argc, char *argv[])
             .decim_factor           = decim,
             .decim_cutoff_hz        = decim_cutoff,
             .decim_taps             = 0u,
+            // Gain sweep characterises the noise floor vs gain. The
+            // AD9361's BBDC tracking IIR is a slow notch around DC
+            // that would suppress (some of) the noise floor it's
+            // trying to measure, so leave it OFF for this tool.
+            // IQ tracking off too — its periodic correction steps
+            // would inject spikes that bias the level meter.
+            .rx_dc_offset_track     = 0,
+            .rx_iq_balance_track    = 0,
             .fm_lo_compensation_hz  = 0.0,
             .carrier_trim_hz        = trim_hz,
         };
