@@ -1193,6 +1193,13 @@ static long               g_tx_freq_hz_doppler =
 // rehearse / get advice from viewers without keying the PA.
 static int g_no_tx = 0;
 
+// Modulated 0xAA carrier prepended in front of every TX burst, ms.
+// Stamped into g_tx_request.preroll_ms at slot-build time and read by
+// auto_tcmd_burst_seconds for the on-air progress estimate. Default
+// matches the tx_burst_run fallback (200 ms). Override with
+// --tx-preroll-ms=<n>.
+static int g_tx_preroll_ms = 200;
+
 // TX log ring buffer — last few PREVIEW/SENT/ACK events for display.
 // Shared by operator and viewer renderers. ascii is sized to fit the
 // full upstream payload buffer (sso_event_t.ascii = 160) so the panel
@@ -2091,14 +2098,14 @@ static char         g_auto_tcmd_file_path[512]   = "";
 //                 + tailfill(1)
 //               = 80 + payload
 //
-//   on_air_s    = preroll(0.100) + frame_bytes * 8 / bit_rate
+//   on_air_s    = g_tx_preroll_ms/1000 + frame_bytes * 8 / bit_rate
 //                 + postroll(0.050)
 //
 // auto-tcmd always sets repeat=1, gap=200ms (line 3164 region) — the
 // gap and any repeat>1 multiplier are folded in by the caller, not
 // here, so this helper stays a pure per-burst quantum.
 static double auto_tcmd_burst_seconds(size_t payload_len) {
-    const double preroll_s  = 0.100;
+    const double preroll_s  = (double) g_tx_preroll_ms * 1e-3;
     const double postroll_s = 0.050;
     const double bit_rate   = 9600.0;
     size_t frame_bytes = 80 + payload_len;
@@ -2616,6 +2623,7 @@ static int tx_compose_commit(const tx_compose_t *c, char *err, size_t err_size) 
     g_tx_request.tx_gain_db       = atof(c->power);
     g_tx_request.repeat           = 1;
     g_tx_request.gap_ms           = 200;
+    g_tx_request.preroll_ms       = g_tx_preroll_ms;
     g_tx_request.allow_high_power = 0;
     g_tx_request.allow_hf_tx      = 0;
     tx_compose_summary(c, g_tx_request.summary, sizeof g_tx_request.summary);
@@ -3312,6 +3320,7 @@ static void auto_tcmd_tick(state_t *state) {
     g_tx_request.tx_gain_db       = atof(a->power);
     g_tx_request.repeat           = 1;
     g_tx_request.gap_ms           = 200;
+    g_tx_request.preroll_ms       = g_tx_preroll_ms;
     // No g_tx_request.allow_tx field — the TX-inhibit gate is enforced
     // at auto_tcmd_start time (refuses to enter RUNNING unless allow_tx
     // is ticked), same way tx_compose_validate handles it before commit.
@@ -4026,6 +4035,14 @@ void usage(FILE *dest, const char *name, int full)
         "                               safety checkbox still has to be\n"
         "                               ticked — dry-run is about hardware\n"
         "                               presence, not operator intent.\n"
+        "  --tx-preroll-ms=<n>          Modulated 0xAA carrier prepended in\n"
+        "                               front of every TX burst (default 200,\n"
+        "                               clamped to [0, 5000]). Gives the\n"
+        "                               receiver a longer symbol-clock train\n"
+        "                               and lets the B210 TX FIFO buffer the\n"
+        "                               whole burst before the real preamble\n"
+        "                               so a one-time host stall doesn't eat\n"
+        "                               the AX100 ASM.\n"
         "  --tc-file <path>             Load a file of ASCII telecommands\n"
         "                               (CTS1+...; one per line; '#' lines\n"
         "                               and blank lines ignored). Press 'A'\n"
@@ -6331,6 +6348,12 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strcmp("--tx-dry-run", argv[i]) == 0) {
             state->n_options++;
             g_tx_dry_run = 1;
+        } else if (strncmp("--tx-preroll-ms=", argv[i], 16) == 0) {
+            state->n_options++;
+            int v = atoi(argv[i] + 16);
+            if (v < 0)    v = 0;
+            if (v > 5000) v = 5000;
+            g_tx_preroll_ms = v;
         // Filename args use the space form (--foo <path>) so bash
         // tab-completion works. The old --foo=<path> form is rejected
         // with a one-line hint pointing at the new spelling.

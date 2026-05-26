@@ -30,6 +30,11 @@ typedef struct {
     double   tx_gain_db;
     int      repeat;
     int      gap_ms;
+    // Modulated 0xAA carrier prepended in front of the AX100 frame, ms.
+    // Acts as receiver bit-clock training and lets the B210 TX FIFO
+    // buffer the burst before the real preamble. 0 or negative selects
+    // the tx_burst_run default.
+    int      preroll_ms;
     int      allow_high_power;
     int      allow_hf_tx;
     char     summary[160];

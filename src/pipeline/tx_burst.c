@@ -233,7 +233,7 @@ tx_burst_result_t tx_burst_run(b210_rx_tx_core_t *core,
     double deviation = (double) bit_rate / 4.0;
     int repeat       = req->repeat > 0 ? req->repeat : 1;
     int gap_ms       = req->gap_ms > 0 ? req->gap_ms : 200;
-    int preroll_ms   = 100;
+    int preroll_ms   = req->preroll_ms > 0 ? req->preroll_ms : 200;
     int postroll_ms  = 50;
     double ramp_ms   = 1.0;
     double start_delay_s = 0.5;
