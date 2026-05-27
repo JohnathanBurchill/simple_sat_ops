@@ -21,6 +21,7 @@
 #define _GNU_SOURCE
 
 #include "antenna_rotator.h"
+#include "tr_switch.h"
 #include "state.h"
 #include "prediction.h"
 #include "sso_audit.h"
@@ -3960,6 +3961,10 @@ void usage(FILE *dest, const char *name, int full)
         "  --without-b210               Skip the USRP B210 (dev hosts that\n"
         "                               have UHD but no device, or any time\n"
         "                               you just want the UI + rotator).\n"
+        "  --tr-switch-device=<path>    UHF T/R antenna switch (USB-CDC).\n"
+        "                               Default /dev/ttyACM0, auto-probed on\n"
+        "                               start; absence is warned-and-continued.\n"
+        "  --without-tr-switch          Skip the T/R switch probe entirely.\n"
         "  --no-tx                      Open the B210 for RX, but block the\n"
         "                               TX compose modal from actually keying\n"
         "                               the PA. Typing + preview broadcast to\n"
@@ -4312,6 +4317,15 @@ typedef struct {
     const char           *hmac_path;
     hmac_display_status_t hmac_status;
     ssize_t               hmac_bytes;
+    // T/R antenna switch. Operator-only: the viewer leaves tr_show = 0
+    // so the block is skipped (the switch status isn't broadcast).
+    int         tr_show;
+    int         tr_connected;
+    int         tr_stale;
+    const char *tr_device;
+    const char *tr_state;        // "RX" / "TX" / "?"
+    const char *tr_mode;         // "AUTO" / "FORCE_TX" / ...
+    double      tr_last_tx_ago_s; // NAN or +inf -> placeholder
 } status_panel_t;
 
 static void render_status_panel(const status_panel_t *p,
@@ -4374,6 +4388,48 @@ static void render_status_panel(const status_panel_t *p,
         mvprintw(row++, col, "%15s   %s",
                  "antenna rotator", "* not initialized *");
         clrtoeol();
+    }
+
+    // T/R antenna switch block (operator-only).
+    if (p->tr_show) {
+        row++;
+        if (p->tr_connected) {
+            const char *rfs  = (p->tr_state && p->tr_state[0]) ? p->tr_state : "?";
+            const char *mode = (p->tr_mode  && p->tr_mode[0])  ? p->tr_mode  : "?";
+            mvprintw(row++, col, "%15s   connected (%s)",
+                     "T/R switch", p->tr_device ? p->tr_device : "?");
+            clrtoeol();
+
+            // RF state in red while transmitting or if the link's gone
+            // stale (the shown state may be many seconds old).
+            int rfs_warn = (strcmp(rfs, "TX") == 0) || p->tr_stale;
+            if (rfs_warn) attron(COLOR_PAIR(1));
+            mvprintw(row++, col, "%15s   %s%s",
+                     "RF state", rfs, p->tr_stale ? "  (stale)" : "");
+            if (rfs_warn) attroff(COLOR_PAIR(1));
+            clrtoeol();
+
+            // Mode in yellow when it isn't AUTO.
+            int mode_warn = (strcmp(mode, "AUTO") != 0);
+            if (mode_warn) attron(COLOR_PAIR(2));
+            mvprintw(row++, col, "%15s   %s", "mode", mode);
+            if (mode_warn) attroff(COLOR_PAIR(2));
+            clrtoeol();
+
+            // NAN (field absent / unparseable) and +inf ("never") both
+            // render as the placeholder.
+            if (isnan(p->tr_last_tx_ago_s) || isinf(p->tr_last_tx_ago_s)) {
+                mvprintw(row++, col, "%15s   --", "last TX");
+            } else {
+                mvprintw(row++, col, "%15s   %.1f s ago",
+                         "last TX", p->tr_last_tx_ago_s);
+            }
+            clrtoeol();
+        } else {
+            mvprintw(row++, col, "%15s   %s",
+                     "T/R switch", "* not connected *");
+            clrtoeol();
+        }
     }
 
     *print_row = row;
@@ -4452,6 +4508,19 @@ void report_status(state_t *state, int *print_row, int print_col)
         p.target_az  = state->antenna_rotator.target_azimuth;
         p.target_el  = state->antenna_rotator.target_elevation;
         p.flip       = state->antenna_rotator.flip_mode_pass;
+    }
+
+    // T/R switch block — operator-only (this process owns the serial
+    // link). The viewer never sets tr_show, so its panel skips it.
+    p.tr_show = 1;
+    p.tr_connected = state->have_tr_switch;
+    if (state->have_tr_switch) {
+        p.tr_device        = state->tr_switch.device_filename;
+        p.tr_state         = state->tr_switch.state_str;
+        p.tr_mode          = state->tr_switch.mode_str;
+        p.tr_last_tx_ago_s = state->tr_switch.last_tx_ago_s;
+        p.tr_stale         = tr_switch_is_stale(&state->tr_switch,
+                                                monotonic_seconds());
     }
 
     render_status_panel(&p, print_row, print_col);
@@ -5300,6 +5369,22 @@ int main(int argc, char **argv)
         }
     }
 
+    // T/R antenna switch — auto-probe before ncurses takes the screen,
+    // so a "not connected" warning lands on the terminal. Absent or
+    // inaccessible hardware is non-fatal; the UI panel reads "not
+    // connected" and the program runs normally.
+    if (state.run_with_tr_switch) {
+        if (tr_switch_init(&state.tr_switch) == 0) {
+            state.have_tr_switch = 1;
+        } else {
+            fprintf(stderr,
+                    "T/R switch: could not open %s (skipping; "
+                    "pass --without-tr-switch to silence)\n",
+                    state.tr_switch.device_filename
+                        ? state.tr_switch.device_filename : "?");
+        }
+    }
+
 #ifdef WITH_USRP_B210
     // Open the B210 once, here, before ncurses init — soft-fail on any
     // UHD error so a dev host without a device can still run the UI.
@@ -5509,6 +5594,13 @@ int main(int argc, char **argv)
         UTC_Calendar_Now(&utc, &tv);
         jul_utc = Julian_Date(&utc, &tv);
         update_satellite_position(&state.prediction, jul_utc);
+
+        // Drain whatever the T/R switch emitted since the last tick.
+        // Non-blocking; the firmware beats every ~2.5 s so most ticks
+        // read zero bytes.
+        if (state.have_tr_switch) {
+            tr_switch_pump(&state.tr_switch, t_now);
+        }
 
         /* Calculate Doppler shift for the display + IPC publishing */
         if (state.doppler_correction_enabled) {
@@ -6151,6 +6243,10 @@ int main(int argc, char **argv)
     }
 
     endwin();
+    if (state.have_tr_switch) {
+        tr_switch_disconnect(&state.tr_switch);
+        state.have_tr_switch = 0;
+    }
     if (g_ipc) {
         sso_ipc_server_close(g_ipc);
         g_ipc = NULL;
@@ -6303,6 +6399,13 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     state->antenna_rotator.serial_speed = B600;
     state->antenna_rotator.fixed_target = 0;
 
+    // T/R antenna switch: auto-probe /dev/ttyACM0. Failure is a
+    // one-line warning, not an error.
+    state->run_with_tr_switch = 1;
+    state->have_tr_switch     = 0;
+    state->tr_switch.device_filename = "/dev/ttyACM0";
+    state->tr_switch.serial_speed    = B115200;
+
     for (int i = 0; i < argc; i++) {
         if (strncmp("--verbose=", argv[i], 10) == 0) {
             state->n_options++;
@@ -6322,6 +6425,16 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 || strcmp("--without-hardware", argv[i]) == 0) {
             state->n_options++;
             state->run_with_antenna_rotator = 0;
+        } else if (strcmp("--without-tr-switch", argv[i]) == 0) {
+            state->n_options++;
+            state->run_with_tr_switch = 0;
+        } else if (strncmp("--tr-switch-device=", argv[i], 19) == 0) {
+            state->n_options++;
+            if (strlen(argv[i]) < 20) {
+                fprintf(stderr, "Unable to parse %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            state->tr_switch.device_filename = argv[i] + 19;
         } else if (strcmp("--without-b210", argv[i]) == 0) {
             state->n_options++;
             g_without_b210 = 1;

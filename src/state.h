@@ -24,6 +24,7 @@
 #include "antenna_rotator.h"
 #include "prediction.h"
 #include "telemetry.h"
+#include "tr_switch.h"
 
 #include <stdint.h>
 #include <termios.h>
@@ -85,6 +86,13 @@ typedef struct state
     antenna_rotator_t antenna_rotator;
     int run_with_antenna_rotator;
     int have_antenna_rotator;
+
+    // T/R antenna switch (USB-CDC, default /dev/ttyACM0).
+    // run_with_tr_switch defaults to 1: auto-probe the device on start.
+    // Absent hardware is a one-line warning, not an error.
+    tr_switch_t tr_switch;
+    int run_with_tr_switch;
+    int have_tr_switch;
 
     // Telemetry overlay (still rendered alongside the prediction).
     telemetry_t telemetry;
