@@ -655,6 +655,27 @@ static int rx_pause_for_tx(b210_rx_tx_core_t *c)
     return 0;
 }
 
+// Release the TX streamer at the end of every burst. The B210 keeps
+// its TX frontend (LO + driver) powered while a TX streamer is
+// allocated; caching the streamer across bursts therefore leaves the
+// TX LO sitting on the shared TX/RX port as a steady carrier from the
+// moment the first burst of a session ends — the external T/R switch
+// can't fully isolate it, so the receiver sees a bright narrow tone
+// until the device is re-initialized (which is why a restart cleared
+// it). Freeing the streamer returns the device to RX-only so UHD's
+// automatic TX/RX switching idles the TX driver and the carrier stops.
+// The next burst rebuilds via tx_streamer_lazy_build (a few ms, hidden
+// under the start delay); reset the cached rate/gain so it does.
+static void tx_teardown_after_burst(b210_rx_tx_core_t *c)
+{
+    if (c == NULL || c->tx_stream == NULL) return;
+    uhd_tx_streamer_free(&c->tx_stream);
+    c->tx_stream       = NULL;
+    c->tx_max_per_buff = 0;
+    c->tx_rate_cached  = 0.0;
+    c->tx_gain_cached  = -1.0;
+}
+
 static int rx_resume_after_tx(b210_rx_tx_core_t *c, double rx_freq_hz)
 {
     if (c == NULL || c->stream == NULL) return -1;
@@ -796,6 +817,12 @@ int b210_rx_tx_core_burst(b210_rx_tx_core_t *c,
     rc = 0;
 
 resume:
+    // Release the TX streamer so the B210 returns to RX-only and idles
+    // its TX driver — otherwise the cached streamer leaves the TX LO on
+    // the air as a steady carrier after the first burst of the session.
+    // Done even if the TX leg failed: the chain may have been powered
+    // partway through.
+    tx_teardown_after_burst(c);
     // Always try to put RX back into service, even if the TX leg failed.
     if (rx_resume_after_tx(c, p->rx_resume_freq_hz) != 0) {
         fprintf(stderr,
