@@ -23,6 +23,7 @@
 
 #include <uhd.h>
 #include <uhd/usrp/usrp.h>
+#include <uhd/usrp/subdev_spec.h>
 #include <uhd/types/tune_request.h>
 #include <uhd/types/metadata.h>
 #include <uhd/error.h>
@@ -38,6 +39,7 @@ struct b210_rx_tx_core {
     size_t                  tx_max_per_buff;
     double                  tx_rate_cached;
     double                  tx_gain_cached;
+    int                     tx_powered;       // TX subdev mapped ("A:A") vs unmapped ("")
 
     // UHD streamer side
     int16_t                *iq_chunk;        // sc16 interleaved, max_iq_in pairs
@@ -182,6 +184,10 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
     c->fm_fullscale_hz = fm_fullscale;
 
     if (log_uhd(uhd_usrp_make(&c->dev, device_args), "uhd_usrp_make")) goto fail;
+
+    // The B200 maps TX channel 0 ("A:A") by default. Track that so the
+    // burst path can unmap it after a burst to power the TX LO down.
+    c->tx_powered = 1;
 
     if (log_uhd(uhd_usrp_set_rx_rate(c->dev, p->rate_hz, 0), "set_rx_rate")) goto fail;
     c->input_rate = p->rate_hz;
@@ -655,25 +661,64 @@ static int rx_pause_for_tx(b210_rx_tx_core_t *c)
     return 0;
 }
 
-// Release the TX streamer at the end of every burst. The B210 keeps
-// its TX frontend (LO + driver) powered while a TX streamer is
-// allocated; caching the streamer across bursts therefore leaves the
-// TX LO sitting on the shared TX/RX port as a steady carrier from the
-// moment the first burst of a session ends — the external T/R switch
-// can't fully isolate it, so the receiver sees a bright narrow tone
-// until the device is re-initialized (which is why a restart cleared
-// it). Freeing the streamer returns the device to RX-only so UHD's
-// automatic TX/RX switching idles the TX driver and the carrier stops.
-// The next burst rebuilds via tx_streamer_lazy_build (a few ms, hidden
-// under the start delay); reset the cached rate/gain so it does.
-static void tx_teardown_after_burst(b210_rx_tx_core_t *c)
+// Map (power up) or unmap (power down) the AD9361 TX chain by setting
+// the TX subdev spec. "A:A" maps TX channel 0; "" leaves zero TX
+// channels mapped. Returns 0 on success, -1 on UHD error (logged).
+static int tx_set_subdev(b210_rx_tx_core_t *c, const char *markup)
 {
-    if (c == NULL || c->tx_stream == NULL) return;
-    uhd_tx_streamer_free(&c->tx_stream);
+    uhd_subdev_spec_handle sp = NULL;
+    if (log_uhd(uhd_subdev_spec_make(&sp, markup), "subdev_spec_make")) return -1;
+    int rc = log_uhd(uhd_usrp_set_tx_subdev_spec(c->dev, sp, 0),
+                     "set_tx_subdev_spec") ? -1 : 0;
+    uhd_subdev_spec_free(&sp);
+    return rc;
+}
+
+// Power the AD9361 TX chain down at the end of a burst. Freeing the TX
+// streamer alone leaves the transmit synthesiser locked, so its LO
+// keeps feeding through to the TX/RX port as a steady carrier (the
+// receiver saw a bright narrow tone until the device was reopened).
+// Unmapping the TX frontend (empty TX subdev spec) makes the B200
+// driver drop the whole TX chain, so the carrier stops being generated
+// rather than merely attenuated or relocated — the hard requirement is
+// nothing on the antenna while in RX. RX is stopped when this runs (the
+// burst resume path), so the reconfigure can't glitch a live RX stream.
+// Re-armed by tx_power_up before the next burst.
+static void tx_power_down(b210_rx_tx_core_t *c)
+{
+    if (c == NULL || !c->tx_powered) return;
+    if (c->tx_stream != NULL) uhd_tx_streamer_free(&c->tx_stream);
     c->tx_stream       = NULL;
     c->tx_max_per_buff = 0;
     c->tx_rate_cached  = 0.0;
     c->tx_gain_cached  = -1.0;
+    if (tx_set_subdev(c, "") != 0) {
+        // Empty TX subdev rejected by this UHD/device — the chain stays
+        // powered and the carrier persists. Non-fatal (RX still resumes);
+        // the hardware ATR gate is the fallback if this can't kill it.
+        fprintf(stderr, "b210_rx_tx_core: TX power-down via empty subdev "
+                        "spec failed; transmit carrier may persist in RX\n");
+        return;
+    }
+    c->tx_powered = 0;
+}
+
+// Re-map the TX chain before a burst. The power-down reconfigured the
+// frontend, so any cached streamer is stale — clear it and the
+// rate/gain cache to force tx_streamer_lazy_build to rebuild on the
+// fresh chain. No-op when TX is already mapped (first burst of a
+// session, before any power-down). Returns 0 on success, -1 on error.
+static int tx_power_up(b210_rx_tx_core_t *c)
+{
+    if (c == NULL) return -1;
+    if (c->tx_powered) return 0;
+    if (tx_set_subdev(c, "A:A") != 0) return -1;
+    c->tx_powered      = 1;
+    c->tx_stream       = NULL;
+    c->tx_max_per_buff = 0;
+    c->tx_rate_cached  = 0.0;
+    c->tx_gain_cached  = -1.0;
+    return 0;
 }
 
 static int rx_resume_after_tx(b210_rx_tx_core_t *c, double rx_freq_hz)
@@ -741,6 +786,7 @@ int b210_rx_tx_core_burst(b210_rx_tx_core_t *c,
 
     int rc = -1;
     if (rx_pause_for_tx(c) != 0) goto resume;
+    if (tx_power_up(c) != 0) goto resume;
     if (tx_streamer_lazy_build(c, p->tx_rate_hz) != 0) goto resume;
 
     if (fabs(c->tx_gain_cached - p->tx_gain_db) > 0.05) {
@@ -817,12 +863,12 @@ int b210_rx_tx_core_burst(b210_rx_tx_core_t *c,
     rc = 0;
 
 resume:
-    // Release the TX streamer so the B210 returns to RX-only and idles
-    // its TX driver — otherwise the cached streamer leaves the TX LO on
-    // the air as a steady carrier after the first burst of the session.
-    // Done even if the TX leg failed: the chain may have been powered
-    // partway through.
-    tx_teardown_after_burst(c);
+    // Power the TX chain down (empty TX subdev) so the transmit LO stops
+    // feeding through to the TX/RX port — nothing on the antenna while in
+    // RX. Done even if the TX leg failed: the chain may have been powered
+    // partway through. RX is restarted right after, so the reconfigure
+    // lands while RX is stopped.
+    tx_power_down(c);
     // Always try to put RX back into service, even if the TX leg failed.
     if (rx_resume_after_tx(c, p->rx_resume_freq_hz) != 0) {
         fprintf(stderr,
