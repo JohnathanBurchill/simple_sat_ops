@@ -842,6 +842,56 @@ rx_burst_result_t rx_session_request_burst_sync(
     return res;
 }
 
+int rx_session_submit_burst(
+    rx_session_t *rxs,
+    const tx_request_slot_t *req,
+    const uint8_t *hmac_key, size_t hmac_key_len)
+{
+    if (rxs == NULL || req == NULL) return -1;
+    pthread_mutex_lock(&rxs->mu);
+    // Refuse to overwrite a still-pending submission. burst_req_pending
+    // is cleared by the worker when it picks up the request; burst_complete
+    // by the operator's poll. While either is set, there's an in-flight or
+    // unconsumed result the caller must reap first.
+    if (rxs->burst_req_pending || rxs->burst_complete) {
+        pthread_mutex_unlock(&rxs->mu);
+        return -1;
+    }
+    rxs->burst_req            = *req;
+    rxs->burst_hmac_key_len   = (hmac_key && hmac_key_len > 0
+                                  && hmac_key_len <= sizeof rxs->burst_hmac_key)
+                                  ? hmac_key_len : 0;
+    if (rxs->burst_hmac_key_len > 0) {
+        memcpy(rxs->burst_hmac_key, hmac_key, rxs->burst_hmac_key_len);
+    }
+    rxs->burst_complete    = 0;
+    rxs->burst_req_pending = 1;
+    pthread_cond_broadcast(&rxs->cv);
+    pthread_mutex_unlock(&rxs->mu);
+    return 0;
+}
+
+int rx_session_poll_burst(
+    rx_session_t *rxs,
+    rx_burst_result_t *out_result,
+    char *out_summary, size_t summary_n)
+{
+    if (out_summary && summary_n) out_summary[0] = '\0';
+    if (rxs == NULL || out_result == NULL) return -1;
+    pthread_mutex_lock(&rxs->mu);
+    if (!rxs->burst_complete) {
+        pthread_mutex_unlock(&rxs->mu);
+        return 0;
+    }
+    *out_result = rxs->burst_result;
+    if (out_summary && summary_n) {
+        snprintf(out_summary, summary_n, "%s", rxs->burst_summary);
+    }
+    rxs->burst_complete = 0;   // consume; slot ready for next submission
+    pthread_mutex_unlock(&rxs->mu);
+    return 1;
+}
+
 void rx_session_close(rx_session_t *rxs)
 {
     if (rxs == NULL) return;

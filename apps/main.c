@@ -1179,6 +1179,11 @@ static int  g_without_b210 = 0;
 // over.
 static rx_session_t      *g_rx_session  = NULL;
 static tx_request_slot_t  g_tx_request  = {0};
+// Set when a burst has been submitted to the rx_session worker but not
+// yet polled to completion. Gates submit-vs-poll in the main loop so the
+// loop stays responsive (rotator / redraw / IPC / auto-tcmd ticks) while
+// the worker pauses RX, transmits, and resumes RX.
+static int                g_tx_inflight = 0;
 // Doppler-corrected uplink carrier (Hz). Refreshed every main-loop
 // tick from range_rate_km_s. The compose-preview, modal commit, and
 // auto-tcmd staging all snapshot this so the burst is keyed at the
@@ -6124,15 +6129,20 @@ int main(int argc, char **argv)
                 doppler_offset);
         }
 
-        // Synchronously service any pending TX request. Three paths:
+        // Service a pending TX request. Three paths:
         //
         //   1. --tx-dry-run:    synthesize "ok" without touching the
         //                       SDR. Auto-tcmd + compose still exercise
         //                       all their UI state on dev hosts.
-        //   2. g_rx_session up: real burst — B210 worker pauses RX,
-        //                       transmits, resumes RX, then unblocks
-        //                       us. Blocks ~1 s; intentional, the
-        //                       operator just hit Enter.
+        //   2. g_rx_session up: real burst — submitted async to the
+        //                       worker, which pauses RX, transmits and
+        //                       resumes RX (~1 s). The main loop keeps
+        //                       running between submit and poll so the
+        //                       rotator, redraw, IPC and the next auto-
+        //                       tcmd tick aren't frozen by the burst.
+        //                       g_tx_request.pending stays set across
+        //                       the in-flight window, so auto-tcmd will
+        //                       not queue a second burst on top.
         //   3. neither:         reject so auto-tcmd can move on. The
         //                       operator must have started simple_sat_ops
         //                       --without-b210 without also passing
@@ -6142,11 +6152,13 @@ int main(int argc, char **argv)
             char summary[160];
             const char *ack = NULL;
             int  cmd_sent = 0;
+            int  finished = 0;        // emit ack + clear pending this tick
             if (g_tx_dry_run) {
                 snprintf(summary, sizeof summary, "%s",
                          g_tx_request.summary);
                 ack = "dry-run";
                 cmd_sent = 1;
+                finished = 1;
             } else if (g_hmac_key_len == 0) {
                 // CTS1 expects HMAC on every uplink. Without a valid
                 // key the burst would go out unsigned and the satellite
@@ -6155,38 +6167,61 @@ int main(int argc, char **argv)
                 snprintf(summary, sizeof summary, "%s",
                          g_tx_request.summary);
                 ack = "rejected: no HMAC key (see banner)";
+                finished = 1;
             } else if (g_rx_session != NULL) {
-                rx_burst_result_t br = rx_session_request_burst_sync(
-                    g_rx_session, &g_tx_request,
-                    g_hmac_key, g_hmac_key_len,
-                    summary, sizeof summary);
-                switch (br) {
-                    case RX_BURST_OK:                 ack = "ok"; cmd_sent = 1; break;
-                    case RX_BURST_NO_CORE:            ack = "rejected: no B210"; break;
-                    case RX_BURST_FRAME_BUILD_FAILED: ack = "rejected: frame build"; break;
-                    case RX_BURST_UHD_ERROR:          ack = "uhd-err"; break;
+                if (!g_tx_inflight) {
+                    if (rx_session_submit_burst(g_rx_session, &g_tx_request,
+                                                 g_hmac_key, g_hmac_key_len) == 0) {
+                        g_tx_inflight = 1;
+                        // Stay pending; we'll poll on subsequent ticks.
+                    } else {
+                        // Worker refused (slot already busy or rxs error).
+                        snprintf(summary, sizeof summary, "%s",
+                                 g_tx_request.summary);
+                        ack = "rejected: rx_session busy";
+                        finished = 1;
+                    }
+                } else {
+                    rx_burst_result_t br;
+                    int done = rx_session_poll_burst(g_rx_session, &br,
+                                                      summary, sizeof summary);
+                    if (done == 1) {
+                        switch (br) {
+                            case RX_BURST_OK:                 ack = "ok"; cmd_sent = 1; break;
+                            case RX_BURST_NO_CORE:            ack = "rejected: no B210"; break;
+                            case RX_BURST_FRAME_BUILD_FAILED: ack = "rejected: frame build"; break;
+                            case RX_BURST_UHD_ERROR:          ack = "uhd-err"; break;
+                        }
+                        g_tx_inflight = 0;
+                        finished = 1;
+                    }
+                    // else: still in flight; fall through and let the
+                    // rest of the main loop run.
                 }
             } else {
                 snprintf(summary, sizeof summary, "%s",
                          g_tx_request.summary);
                 ack = "rejected: no B210";
+                finished = 1;
             }
-            emit_tx_event_local(SSO_EVT_TX_ACK, summary, ack);
-            if (cmd_sent) {
-                emit_tx_event_local(SSO_EVT_TX_COMMAND_SENT, summary, NULL);
+            if (finished) {
+                emit_tx_event_local(SSO_EVT_TX_ACK, summary, ack);
+                if (cmd_sent) {
+                    emit_tx_event_local(SSO_EVT_TX_COMMAND_SENT, summary, NULL);
+                }
+                // Audit: the result of the just-queued TX burst, so post-
+                // incident review can correlate every tx-commit with its
+                // ack (ok / uhd-err / rejected reason). cmd_sent=1 means
+                // the burst actually left the radio.
+                {
+                    char det[512];
+                    snprintf(det, sizeof det,
+                             "ack=\"%.80s\" sent=%d summary=\"%.300s\"",
+                             ack ? ack : "?", cmd_sent, summary);
+                    sso_audit_event("tx-ack", det);
+                }
+                g_tx_request.pending = 0;
             }
-            // Audit: the result of the just-queued TX burst, so post-
-            // incident review can correlate every tx-commit with its
-            // ack (ok / uhd-err / rejected reason). cmd_sent=1 means
-            // the burst actually left the radio.
-            {
-                char det[512];
-                snprintf(det, sizeof det,
-                         "ack=\"%.80s\" sent=%d summary=\"%.300s\"",
-                         ack ? ack : "?", cmd_sent, summary);
-                sso_audit_event("tx-ack", det);
-            }
-            g_tx_request.pending = 0;
         }
 #endif
 

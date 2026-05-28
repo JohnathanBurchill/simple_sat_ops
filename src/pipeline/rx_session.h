@@ -162,6 +162,22 @@ rx_burst_result_t rx_session_request_burst_sync(
     const uint8_t *hmac_key, size_t hmac_key_len,
     char *out_summary, size_t summary_n);
 
+// Async split of the sync API. submit hands the request to the worker
+// and returns immediately; poll is non-blocking and returns 1 when the
+// burst has finished (filling out_result / out_summary), 0 while still
+// in flight, -1 on argument error. submit returns 0 on accept, -1 if a
+// prior submission is still pending. Lets the main loop keep servicing
+// rotator / redraw / IPC / auto-tcmd while the worker runs the burst.
+int rx_session_submit_burst(
+    rx_session_t *rxs,
+    const tx_request_slot_t *req,
+    const uint8_t *hmac_key, size_t hmac_key_len);
+
+int rx_session_poll_burst(
+    rx_session_t *rxs,
+    rx_burst_result_t *out_result,
+    char *out_summary, size_t summary_n);
+
 // Snapshot for the UI. Any out-pointer may be NULL.
 // out_actual_freq_hz returns the EFFECTIVE downlink frequency, i.e.
 // the SDR LO plus the current software-Doppler offset — the carrier
