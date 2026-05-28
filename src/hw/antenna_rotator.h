@@ -111,6 +111,7 @@ typedef struct antenna_rotator
 
 int antenna_rotator_init(antenna_rotator_t *antenna_rotator);
 void antenna_rotator_connect(antenna_rotator_t *antenna_rotator);
+void antenna_rotator_disconnect(antenna_rotator_t *antenna_rotator);
 int antenna_rotator_command(antenna_rotator_t *antenna_rotator, antenna_rotator_command_t cmd, double *azimuth, double *elevation);
 int antenna_rotator_increase_azimuth(antenna_rotator_t *antenna_rotator, double angle);
 int antenna_rotator_point_to_target(antenna_rotator_t *antenna_rotator, double azimuth, double elevation);

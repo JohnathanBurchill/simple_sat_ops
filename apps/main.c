@@ -21,6 +21,7 @@
 #define _GNU_SOURCE
 
 #include "antenna_rotator.h"
+#include "antenna_rotator_async.h"
 #include "tr_switch.h"
 #include "state.h"
 #include "prediction.h"
@@ -1173,6 +1174,11 @@ static double monotonic_seconds(void)
 // that opens the SDR. --without-b210 (or a non-WITH_USRP_B210 build)
 // leaves g_rx_session NULL and the loop falls through cleanly.
 static int  g_without_b210 = 0;
+// Async wrapper around antenna_rotator's serial I/O. NULL if no rotator
+// (--without-rotator, or antenna_rotator_init failed). Spawned right
+// after antenna_rotator_init succeeds; joined on shutdown. While set, no
+// other thread touches state.antenna_rotator's serial FD.
+static antenna_rotator_async_t *g_rot_async = NULL;
 #ifdef WITH_USRP_B210
 // rx_session owns the b210 core + the worker thread. main.c only
 // keeps a local handle long enough to open the device and hand it
@@ -4467,6 +4473,63 @@ static void operator_viewers_list(char *out, size_t out_size)
     }
 }
 
+// Range-check, write target_* bookkeeping, and submit the wire-level SET
+// to the rotator worker. Replaces the previous direct
+// antenna_rotator_set_unwrapped() call; the target / wrap bookkeeping
+// stays on the main thread, only the serial I/O moves to the worker.
+static int main_rotator_submit_set(state_t *state,
+                                    double az_unwrapped, double elevation)
+{
+    if (az_unwrapped < ANTENNA_ROTATOR_MINIMUM_AZIMUTH
+        || az_unwrapped > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
+        return ANTENNA_ROTATOR_AZIMUTH_LIMIT;
+    }
+    if (elevation < ANTENNA_ROTATOR_MINIMUM_ELEVATION
+        || elevation > ANTENNA_ROTATOR_MAXIMUM_ELEVATION) {
+        return ANTENNA_ROTATOR_ELEVATION_LIMIT;
+    }
+    state->antenna_rotator.target_azimuth_unwrapped = az_unwrapped;
+    state->antenna_rotator.target_azimuth           = az_unwrapped;
+    state->antenna_rotator.target_elevation         = elevation;
+    state->antenna_rotator.unwrapped_target_valid   = 1;
+    if (g_rot_async != NULL) {
+        antenna_rotator_async_submit_set(g_rot_async, az_unwrapped, elevation);
+    }
+    return ANTENNA_ROTATOR_OK;
+}
+
+// Mirror of antenna_rotator_increase_azimuth() but routed through the
+// async worker via main_rotator_submit_set(). Used by the `[` and `]`
+// hotkeys.
+static int main_rotator_increase_azimuth(state_t *state, double delta)
+{
+    double base = state->antenna_rotator.unwrapped_target_valid
+        ? state->antenna_rotator.target_azimuth_unwrapped
+        : state->antenna_rotator.target_azimuth;
+    return main_rotator_submit_set(state, base + delta,
+                                    state->antenna_rotator.target_elevation);
+}
+
+// Pull az/el from the async snapshot and write them through to az/el AND
+// target_* on state. Used after a STOP / on tracking start when targets
+// should reflect the physical position. Returns 0 on success, -1 if no
+// good status has landed yet (or it's gone stale).
+static int main_rotator_refresh_targets_from_snapshot(state_t *state)
+{
+    if (g_rot_async == NULL) return -1;
+    double az = 0.0, el = 0.0;
+    int    ok = 0, stale_ms = 0;
+    antenna_rotator_async_snapshot(g_rot_async, &az, &el, &ok, &stale_ms, NULL);
+    if (!ok || stale_ms > 1500) return -1;
+    state->antenna_rotator.azimuth                  = az;
+    state->antenna_rotator.elevation                = el;
+    state->antenna_rotator.target_azimuth           = az;
+    state->antenna_rotator.target_elevation         = el;
+    state->antenna_rotator.target_azimuth_unwrapped = az;
+    state->antenna_rotator.unwrapped_target_valid   = 1;
+    return 0;
+}
+
 void report_status(state_t *state, int *print_row, int print_col)
 {
     if (print_row == NULL) return;
@@ -4490,23 +4553,23 @@ void report_status(state_t *state, int *print_row, int print_col)
 
     p.have_rotator = state->have_antenna_rotator;
     if (state->have_antenna_rotator) {
+        // The serial roundtrip moved to a worker thread (see
+        // src/hw/antenna_rotator_async.c); we just read the latest
+        // snapshot here. No more 5-10 ms per redraw on the main loop,
+        // and no 500 ms VTIME hang if the cable is unplugged.
         double azimuth = state->antenna_rotator.azimuth;
         double elevation = state->antenna_rotator.elevation;
-        // The rotator STATUS command does a blocking read() on the
-        // serial port (antenna_rotator.c:142) that can take hundreds of
-        // milliseconds. Skip the live poll while the operator is typing
-        // in the ":" prompt or the TX compose modal — the cached az/el
-        // from the last poll is good enough for display, and the loop
-        // needs to keep ticking at 50 Hz so each keystroke echoes
-        // promptly. Rotator SET commands (the tracking output) are
-        // unaffected; only the read-back blocks.
-        if (!g_cmd_active && !g_tx_compose_active && !g_auto_tcmd_active) {
-            if (antenna_rotator_command(&state->antenna_rotator,
-                                        ANTENNA_ROTATOR_STATUS,
-                                        &azimuth, &elevation) == ANTENNA_ROTATOR_OK) {
-                state->antenna_rotator.azimuth   = azimuth;
-                state->antenna_rotator.elevation = elevation;
-            }
+        int    rot_ok = 0;
+        int    rot_stale_ms = 0;
+        if (g_rot_async != NULL) {
+            antenna_rotator_async_snapshot(g_rot_async,
+                                            &azimuth, &elevation,
+                                            &rot_ok, &rot_stale_ms, NULL);
+            // Cache the snapshot back into state so other code (the
+            // antenna_is_moving heuristic, IPC broadcast, etc.) reads a
+            // single consistent value across the tick.
+            state->antenna_rotator.azimuth   = azimuth;
+            state->antenna_rotator.elevation = elevation;
         }
         p.current_az = azimuth;
         p.current_el = elevation;
@@ -5348,13 +5411,23 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
         state.have_antenna_rotator = 1;
+        // Spawn the async worker. From here on, every serial roundtrip
+        // happens on the worker thread; the main loop only reads the
+        // snapshot via main_rotator_refresh_targets_from_snapshot() and
+        // posts SETs via main_rotator_submit_set().
+        if (antenna_rotator_async_open(&g_rot_async,
+                                        &state.antenna_rotator, 0.5) != 0) {
+            fprintf(stderr, "Error spawning antenna rotator worker\n");
+            return EXIT_FAILURE;
+        }
         // Adopt whatever extended position the SPID is already at so the
-        // unwrapped accumulator starts grounded in reality.
+        // unwrapped accumulator starts grounded in reality. We wait
+        // briefly for the worker's first STATUS read; the timeout is
+        // bounded so a missing controller doesn't hang startup.
         //
-        // BUT: seed_from_status also overwrites target_azimuth /
-        // target_elevation / target_azimuth_unwrapped with the rotator's
-        // current physical position — fine when nobody asked for a
-        // specific park position, but a problem when the operator passed
+        // The seed snapshot also overwrites target_* with the current
+        // physical position — fine when nobody asked for a specific park
+        // position, but a problem when the operator passed
         // --rotator-target-azimuth / --rotator-target-elevation: those
         // user-specified targets would be silently clobbered before T
         // ever fired. Snapshot them and restore after seeding.
@@ -5362,7 +5435,8 @@ int main(int argc, char **argv)
         double sav_el    = state.antenna_rotator.target_elevation;
         double sav_az_uw = state.antenna_rotator.target_azimuth_unwrapped;
         int    sav_uw_ok = state.antenna_rotator.unwrapped_target_valid;
-        if (antenna_rotator_seed_from_status(&state.antenna_rotator) != ANTENNA_ROTATOR_OK) {
+        if (antenna_rotator_async_wait_first_status(g_rot_async, 1500) != 0
+            || main_rotator_refresh_targets_from_snapshot(&state) != 0) {
             fprintf(stderr, "Warning: could not read SPID position; "
                             "check that the Rot2ProG is in 'A' mode\n");
         }
@@ -5697,8 +5771,7 @@ int main(int argc, char **argv)
             && !state.antenna_rotator.antenna_is_moving
             && state.have_antenna_rotator) {
             double final_az = state.antenna_rotator.home_pending_final_az;
-            int rc = antenna_rotator_set_unwrapped(&state.antenna_rotator,
-                                                    final_az, 0.0);
+            int rc = main_rotator_submit_set(&state, final_az, 0.0);
             if (rc == ANTENNA_ROTATOR_OK) {
                 state.antenna_rotator.antenna_is_moving = 1;
             }
@@ -5754,8 +5827,8 @@ int main(int argc, char **argv)
             if (state.antenna_rotator.tracking
                 && state.antenna_rotator.antenna_is_under_control) {
                 if (!state.antenna_rotator.unwrapped_target_valid) {
-                    if (antenna_rotator_seed_from_status(&state.antenna_rotator)
-                        != ANTENNA_ROTATOR_OK) {
+                    if (main_rotator_refresh_targets_from_snapshot(&state)
+                        != 0) {
                         state.antenna_rotator.tracking = 0;
                     }
                 } else if (!state.antenna_rotator.antenna_is_moving) {
@@ -5815,8 +5888,8 @@ int main(int argc, char **argv)
                             || next_az > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
                             state.antenna_rotator.tracking = 0;
                         } else {
-                            int rc = antenna_rotator_set_unwrapped(
-                                &state.antenna_rotator, next_az, next_el);
+                            int rc = main_rotator_submit_set(
+                                &state, next_az, next_el);
                             if (rc != ANTENNA_ROTATOR_OK) {
                                 fprintf(stderr,
                                         "Error setting antenna rotator position\n");
@@ -5935,8 +6008,8 @@ int main(int argc, char **argv)
                 case '[':
                     state.satellite_tracking = 0;
                     state.antenna_rotator.antenna_is_under_control = 0;
-                    antenna_rotator_result = antenna_rotator_increase_azimuth(
-                        &state.antenna_rotator, -5.0);
+                    antenna_rotator_result = main_rotator_increase_azimuth(
+                        &state, -5.0);
                     if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
                         state.antenna_rotator.antenna_is_moving = 1;
                     }
@@ -5945,8 +6018,8 @@ int main(int argc, char **argv)
                 case ']':
                     state.satellite_tracking = 0;
                     state.antenna_rotator.antenna_is_under_control = 0;
-                    antenna_rotator_result = antenna_rotator_increase_azimuth(
-                        &state.antenna_rotator, 5.0);
+                    antenna_rotator_result = main_rotator_increase_azimuth(
+                        &state, 5.0);
                     if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
                         state.antenna_rotator.antenna_is_moving = 1;
                     }
@@ -6281,6 +6354,16 @@ int main(int argc, char **argv)
     if (state.have_tr_switch) {
         tr_switch_disconnect(&state.tr_switch);
         state.have_tr_switch = 0;
+    }
+    // Join the rotator worker before closing the serial FD — otherwise a
+    // mid-read in the worker would see EBADF and corrupt the snapshot.
+    if (g_rot_async != NULL) {
+        antenna_rotator_async_close(g_rot_async);
+        g_rot_async = NULL;
+    }
+    if (state.have_antenna_rotator) {
+        antenna_rotator_disconnect(&state.antenna_rotator);
+        state.have_antenna_rotator = 0;
     }
     if (g_ipc) {
         sso_ipc_server_close(g_ipc);
@@ -6866,8 +6949,7 @@ void start_tracking(state_t *state)
     state->antenna_rotator.flip_decision_made = 0;
     state->antenna_rotator.flip_half = 0;
     if (state->antenna_rotator.fixed_target) {
-        antenna_rotator_result = antenna_rotator_set_unwrapped(
-            &state->antenna_rotator,
+        antenna_rotator_result = main_rotator_submit_set(state,
             state->antenna_rotator.target_azimuth_unwrapped,
             state->antenna_rotator.target_elevation);
         if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
@@ -6880,22 +6962,18 @@ void start_tracking(state_t *state)
 
 void stop_tracking(state_t *state)
 {
-    int antenna_rotator_result = 0;
-    double azimuth = 0.0;
-    double elevation = 0.0;
-
     state->satellite_tracking = 0;
     state->doppler_correction_enabled = 1;
     state->antenna_rotator.antenna_is_under_control = 0;
-    if (state->run_with_antenna_rotator) {
-        antenna_rotator_result = antenna_rotator_command(
-            &state->antenna_rotator, ANTENNA_ROTATOR_STOP, &azimuth, &elevation);
-        if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
-            fprintf(stderr, "Error stopping the antenna rotator\n");
-        }
-        if (antenna_rotator_seed_from_status(&state->antenna_rotator)
-            != ANTENNA_ROTATOR_OK) {
-            // leave unwrapped_target_valid as it was
+    if (state->run_with_antenna_rotator && g_rot_async != NULL) {
+        antenna_rotator_async_submit_stop(g_rot_async);
+        antenna_rotator_async_kick_status(g_rot_async);
+        // Wait briefly for the next OK STATUS so target_* reflect the
+        // position the antenna actually stopped at (not where the
+        // satellite was). Bounded — the operator's 's' / 'r' keystroke
+        // shouldn't hang if the controller is unresponsive.
+        if (antenna_rotator_async_wait_next_good_status(g_rot_async, 750) == 0) {
+            (void) main_rotator_refresh_targets_from_snapshot(state);
         }
     }
     state->antenna_rotator.antenna_is_moving = 0;
@@ -6915,8 +6993,7 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
     state->antenna_rotator.flip_half = 0;
 
     if (!state->antenna_rotator.unwrapped_target_valid) {
-        if (antenna_rotator_seed_from_status(&state->antenna_rotator)
-            != ANTENNA_ROTATOR_OK) {
+        if (main_rotator_refresh_targets_from_snapshot(state) != 0) {
             return ANTENNA_ROTATOR_BAD_RESPONSE;
         }
     }
@@ -6936,8 +7013,7 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
             mid = ANTENNA_ROTATOR_MAXIMUM_AZIMUTH;
         state->antenna_rotator.home_pending_final_az = final_az;
         state->antenna_rotator.homing_in_progress = 1;
-        int rc = antenna_rotator_set_unwrapped(&state->antenna_rotator,
-                                                mid, elevation);
+        int rc = main_rotator_submit_set(state, mid, elevation);
         if (rc == ANTENNA_ROTATOR_OK) {
             state->antenna_rotator.antenna_is_moving = 1;
         }
@@ -6946,8 +7022,7 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
 
     state->antenna_rotator.homing_in_progress = 0;
     state->antenna_rotator.home_pending_final_az = 0.0;
-    int rc = antenna_rotator_set_unwrapped(&state->antenna_rotator,
-                                            final_az, elevation);
+    int rc = main_rotator_submit_set(state, final_az, elevation);
     if (rc == ANTENNA_ROTATOR_OK) {
         state->antenna_rotator.antenna_is_moving = 1;
     }

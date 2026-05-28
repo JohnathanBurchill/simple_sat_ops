@@ -587,6 +587,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
     add_executable(simple_sat_ops apps/main.c
                    src/orbit/prediction.c src/orbit/oem.c
                    src/hw/antenna_rotator.c
+                   src/hw/antenna_rotator_async.c
                    src/hw/tr_switch.c
                    src/beacon/telemetry.c
                    src/pipeline/decode_loop.c
