@@ -1190,9 +1190,28 @@ static int g_confirm_rotator_calibrate = 0;
 // Rotator slew rates loaded from disk at startup (deg/s). Either both
 // > 0 (calibration present, pursuit planner can run) or both 0
 // (calibration absent, the track loop falls back to today's "aim
-// where sat is now" behavior). Phase 2 plumbs these into the planner.
+// where sat is now" behavior).
 static double g_pursuit_az_dps = 0.0;
 static double g_pursuit_el_dps = 0.0;
+// --without-rotator-pursuit disables the planner without removing the
+// calibration files. Useful for A/B comparisons on the bench.
+static int    g_without_rotator_pursuit = 0;
+
+// Pre-sampled mech-frame satellite trajectory backing the planner's
+// sat_sample_fn_t callback. Sampled once at plan-build time so the
+// planner's iterations see a consistent, order-independent function
+// without us ever mutating state.prediction.satellite_ephem on the
+// side. Owned alongside g_pursuit_plan; both live for the duration of
+// the current tracking session and are freed together at LOS / 's' /
+// shutdown.
+typedef struct {
+    double *t_jul;
+    double *az_unwrapped;
+    double *el;
+    size_t  n;
+} pursuit_track_t;
+static pursuit_plan_t  g_pursuit_plan  = {0};
+static pursuit_track_t g_pursuit_track = {0};
 #ifdef WITH_USRP_B210
 // rx_session owns the b210 core + the worker thread. main.c only
 // keeps a local handle long enough to open the device and hand it
@@ -3992,6 +4011,11 @@ void usage(FILE *dest, const char *name, int full)
         "                               (the antenna physically moves; the\n"
         "                               operator must clear the mast first).\n"
         "  --confirm-rotator-calibrate  Safety interlock for --calibrate-rotator.\n"
+        "  --without-rotator-pursuit    Disable the pursuit / lead-aim planner\n"
+        "                               even if calibration is on disk. The\n"
+        "                               track loop falls back to today's\n"
+        "                               aim-where-sat-is-now behavior. Useful\n"
+        "                               for A/B comparison on the bench.\n"
         "  --without-b210               Skip the USRP B210 (dev hosts that\n"
         "                               have UHD but no device, or any time\n"
         "                               you just want the UI + rotator).\n"
@@ -4545,6 +4569,204 @@ static int main_rotator_increase_elevation(state_t *state, double delta)
         : state->antenna_rotator.target_azimuth;
     double new_el = state->antenna_rotator.target_elevation + delta;
     return main_rotator_submit_set(state, az, new_el);
+}
+
+// --- Pursuit planner integration ----------------------------------
+//
+// At AOS we pre-sample the satellite trajectory in unwrapped mech
+// coords into g_pursuit_track, then ask the planner (src/orbit/
+// pursuit.c) for a rate-feasible whole-pass antenna trajectory. Each
+// track-loop tick the loop reads the next waypoint via
+// pursuit_aim_at() and submits it through the existing
+// main_rotator_submit_set() path — the playback is just "aim at the
+// next waypoint", and the worker's constant-rate slew interpolates
+// the segment for us. The planner runs once per pass; mid-pass the
+// only work is the O(log N) waypoint lookup.
+
+// Free the pre-sampled trajectory arrays. Idempotent.
+static void pursuit_track_free(pursuit_track_t *trk)
+{
+    if (trk == NULL) return;
+    free(trk->t_jul);
+    free(trk->az_unwrapped);
+    free(trk->el);
+    trk->t_jul        = NULL;
+    trk->az_unwrapped = NULL;
+    trk->el           = NULL;
+    trk->n            = 0;
+}
+
+// pursuit_sat_sample_fn_t backing the planner. Linear-interpolates the
+// pre-sampled track at `jul`. Saturates at the endpoints so iterations
+// that wander a fraction of a second beyond AOS / LOS still produce a
+// sensible answer.
+static int pursuit_track_lookup(double jul, double *az, double *el, void *ctx)
+{
+    const pursuit_track_t *trk = (const pursuit_track_t *) ctx;
+    if (trk == NULL || trk->n == 0) return -1;
+    if (jul <= trk->t_jul[0]) {
+        if (az) *az = trk->az_unwrapped[0];
+        if (el) *el = trk->el[0];
+        return 0;
+    }
+    if (jul >= trk->t_jul[trk->n - 1]) {
+        if (az) *az = trk->az_unwrapped[trk->n - 1];
+        if (el) *el = trk->el[trk->n - 1];
+        return 0;
+    }
+    size_t lo = 0, hi = trk->n - 1;
+    while (hi - lo > 1) {
+        size_t mid = (lo + hi) / 2;
+        if (trk->t_jul[mid] <= jul) lo = mid;
+        else hi = mid;
+    }
+    double frac = (jul - trk->t_jul[lo])
+                / (trk->t_jul[hi] - trk->t_jul[lo]);
+    if (az) *az = trk->az_unwrapped[lo]
+                + (trk->az_unwrapped[hi] - trk->az_unwrapped[lo]) * frac;
+    if (el) *el = trk->el[lo]
+                + (trk->el[hi] - trk->el[lo]) * frac;
+    return 0;
+}
+
+// Sample the live prediction's satellite at 1 s intervals across the
+// pass window, run it through the existing flip mech-coord mapping (so
+// flip-mode passes get back-hemisphere mech_el up to 180), accumulate
+// unwrapped azimuth in time order. We work on a memcpy of
+// state->prediction so the live satellite_ephem.azimuth/elevation
+// displayed in the UI is not perturbed. Returns 0 on success.
+static int pursuit_track_build(const state_t *state,
+                                double jul_aos, double jul_los,
+                                int flip,
+                                double aos_az, double los_az,
+                                double aos_jul, double los_jul,
+                                double a0_unwrapped,
+                                pursuit_track_t *out)
+{
+    if (out == NULL) return -1;
+    pursuit_track_free(out);
+    double dt_days = 1.0 / 86400.0;     // 1 s sampling
+    if (jul_los <= jul_aos) return -1;
+    size_t n = (size_t) floor((jul_los - jul_aos) / dt_days) + 1;
+    if (n < 2)    n = 2;
+    if (n > 4096) n = 4096;             // sanity cap; ~68 min pass
+    out->t_jul        = calloc(n, sizeof *out->t_jul);
+    out->az_unwrapped = calloc(n, sizeof *out->az_unwrapped);
+    out->el           = calloc(n, sizeof *out->el);
+    if (out->t_jul == NULL || out->az_unwrapped == NULL
+        || out->el == NULL) {
+        pursuit_track_free(out);
+        return -1;
+    }
+    out->n = n;
+
+    prediction_t scratch;
+    memcpy(&scratch, &state->prediction, sizeof scratch);
+
+    double prev = a0_unwrapped;
+    double span = jul_los - jul_aos;
+    for (size_t i = 0; i < n; ++i) {
+        double frac = (n == 1) ? 0.0 : (double) i / (double) (n - 1);
+        double t = jul_aos + frac * span;
+        out->t_jul[i] = t;
+        update_satellite_position(&scratch, t);
+        double sat_az = scratch.satellite_ephem.azimuth;
+        double sat_el = scratch.satellite_ephem.elevation;
+        double mech_az = sat_az;
+        double mech_el = sat_el;
+        if (flip) {
+            double progress = 0.0;
+            double pass_jul = los_jul - aos_jul;
+            if (pass_jul > 0.0) progress = (t - aos_jul) / pass_jul;
+            int half = 0;
+            antenna_rotator_to_mech_coords(1, aos_az, los_az, progress,
+                                            sat_az, sat_el,
+                                            &mech_az, &mech_el, &half);
+        }
+        prev = antenna_rotator_accumulate_unwrapped(prev, mech_az);
+        out->az_unwrapped[i] = prev;
+        out->el[i] = mech_el;
+    }
+    return 0;
+}
+
+// Free the current plan + its sampled trajectory. Idempotent.
+static void main_pursuit_clear_plan(void)
+{
+    pursuit_plan_free(&g_pursuit_plan);
+    pursuit_track_free(&g_pursuit_track);
+}
+
+// Build (or rebuild) the whole-pass plan from the current prediction.
+// `jul_now` is used to clamp the plan start to the current time if
+// we're already past AOS (mid-pass re-enter). Quietly does nothing
+// when pursuit is disabled or prerequisites are missing — the caller
+// just keeps the existing aim-where-sat-is-now logic.
+static void main_pursuit_build_plan(state_t *state, double jul_now)
+{
+    main_pursuit_clear_plan();
+    if (g_without_rotator_pursuit)              return;
+    if (g_pursuit_az_dps <= 0.0)                return;
+    if (g_pursuit_el_dps <= 0.0)                return;
+    if (!state->have_antenna_rotator)           return;
+    if (!state->antenna_rotator.unwrapped_target_valid) return;
+
+    double aos = state->prediction.predicted_ascension_jul_utc;
+    double los = state->prediction.predicted_descent_jul_utc;
+    if (aos <= 0.0 || los <= aos)               return;
+    if (jul_now > aos) aos = jul_now;
+    if (los - aos < 5.0 / 86400.0)              return;  // <5 s left
+
+    int    flip    = state->antenna_rotator.flip_mode_pass;
+    double aos_az  = state->antenna_rotator.flip_aos_az;
+    double los_az  = state->antenna_rotator.flip_los_az;
+    double aos_jul = state->antenna_rotator.flip_aos_jul;
+    double los_jul = state->antenna_rotator.flip_los_jul;
+    double a0      = state->antenna_rotator.target_azimuth_unwrapped;
+    double e0      = state->antenna_rotator.target_elevation;
+
+    if (pursuit_track_build(state, aos, los,
+                             flip, aos_az, los_az, aos_jul, los_jul,
+                             a0, &g_pursuit_track) != 0) {
+        fprintf(stderr, "pursuit: track sampling failed; "
+                        "falling back to aim-where-sat-is-now\n");
+        main_pursuit_clear_plan();
+        return;
+    }
+
+    pursuit_config_t cfg;
+    pursuit_config_defaults(&cfg);
+    cfg.jul_aos      = aos;
+    cfg.jul_los      = los;
+    cfg.r_az_dps     = g_pursuit_az_dps;
+    cfg.r_el_dps     = g_pursuit_el_dps;
+    cfg.a0_unwrapped = a0;
+    cfg.e0           = e0;
+
+    if (pursuit_plan_build(&cfg, pursuit_track_lookup, &g_pursuit_track,
+                            &g_pursuit_plan) != 0) {
+        fprintf(stderr, "pursuit: plan build failed; "
+                        "falling back to aim-where-sat-is-now\n");
+        main_pursuit_clear_plan();
+        return;
+    }
+    // Sanity bound: a plan with > 30 deg max error is suspect; the
+    // calibration may be wildly off. Discard and let the track loop
+    // fall back rather than driving the antenna to bogus targets.
+    if (g_pursuit_plan.max_error_deg > 30.0) {
+        fprintf(stderr,
+                "pursuit: plan max_err=%.1f deg > 30; disabled, "
+                "falling back to aim-where-sat-is-now\n",
+                g_pursuit_plan.max_error_deg);
+        main_pursuit_clear_plan();
+        return;
+    }
+    fprintf(stderr,
+            "pursuit: plan built %zu waypoints, "
+            "max_err=%.2f mean_err=%.2f deg, %d iter\n",
+            g_pursuit_plan.n_waypoints,
+            g_pursuit_plan.max_error_deg, g_pursuit_plan.mean_error_deg,
+            g_pursuit_plan.iterations_used);
 }
 
 // Pull az/el from the async snapshot and write them through to az/el AND
@@ -5920,6 +6142,13 @@ int main(int argc, char **argv)
                     }
                     state.antenna_rotator.flip_decision_made = 1;
                     state.antenna_rotator.tracking = 1;
+                    // Pre-sample the trajectory and ask the planner
+                    // for a rate-feasible whole-pass aim sequence. On
+                    // any failure (no calibration, planner unhappy,
+                    // --without-rotator-pursuit) the helper leaves
+                    // g_pursuit_plan zero and the track loop below
+                    // falls back to today's aim-where-sat-is-now path.
+                    main_pursuit_build_plan(&state, jul_utc);
                 }
             }
 
@@ -5929,51 +6158,69 @@ int main(int argc, char **argv)
                     if (main_rotator_refresh_targets_from_snapshot(&state)
                         != 0) {
                         state.antenna_rotator.tracking = 0;
+                        main_pursuit_clear_plan();
                     }
                 } else if (!state.antenna_rotator.antenna_is_moving) {
-                    double pred_az = state.prediction.satellite_ephem.azimuth;
-                    double pred_el = state.prediction.satellite_ephem.elevation;
-                    double mech_az = pred_az;
-                    double mech_el = pred_el;
-                    int half = 0;
-                    // AOS->LOS progress: drives the boom-meridian lerp
-                    // in flip mode. Clamped to [0, 1] inside the
-                    // function. For non-flip passes (and any tick
-                    // where the AOS/LOS times weren't captured) the
-                    // value is ignored.
-                    double progress = 0.0;
-                    double pass_jul =
-                        state.antenna_rotator.flip_los_jul
-                        - state.antenna_rotator.flip_aos_jul;
-                    if (pass_jul > 0.0) {
-                        progress = (jul_utc
-                                    - state.antenna_rotator.flip_aos_jul)
-                                   / pass_jul;
-                    }
-                    antenna_rotator_to_mech_coords(
-                        state.antenna_rotator.flip_mode_pass,
-                        state.antenna_rotator.flip_aos_az,
-                        state.antenna_rotator.flip_los_az,
-                        progress,
-                        pred_az, pred_el,
-                        &mech_az, &mech_el, &half);
-                    if (state.antenna_rotator.flip_mode_pass
-                        && half != state.antenna_rotator.flip_half) {
-                        state.antenna_rotator.target_azimuth_unwrapped = mech_az;
-                        state.antenna_rotator.flip_half = half;
-                    }
+                    double next_az = 0.0, next_el = 0.0;
                     double prev_unwrapped =
                         state.antenna_rotator.target_azimuth_unwrapped;
-                    double next_az = antenna_rotator_accumulate_unwrapped(
-                        prev_unwrapped, mech_az);
-                    double next_el = mech_el;
+                    int    used_pursuit = 0;
+                    if (g_pursuit_plan.waypoints != NULL
+                        && pursuit_aim_at(&g_pursuit_plan, jul_utc,
+                                          &next_az, &next_el) == 0) {
+                        used_pursuit = 1;
+                    }
+                    if (!used_pursuit) {
+                        double pred_az =
+                            state.prediction.satellite_ephem.azimuth;
+                        double pred_el =
+                            state.prediction.satellite_ephem.elevation;
+                        double mech_az = pred_az;
+                        double mech_el = pred_el;
+                        int half = 0;
+                        // AOS->LOS progress: drives the boom-meridian
+                        // lerp in flip mode. Clamped to [0, 1] inside
+                        // the function. Ignored for non-flip passes.
+                        double progress = 0.0;
+                        double pass_jul =
+                            state.antenna_rotator.flip_los_jul
+                            - state.antenna_rotator.flip_aos_jul;
+                        if (pass_jul > 0.0) {
+                            progress = (jul_utc
+                                        - state.antenna_rotator.flip_aos_jul)
+                                       / pass_jul;
+                        }
+                        antenna_rotator_to_mech_coords(
+                            state.antenna_rotator.flip_mode_pass,
+                            state.antenna_rotator.flip_aos_az,
+                            state.antenna_rotator.flip_los_az,
+                            progress,
+                            pred_az, pred_el,
+                            &mech_az, &mech_el, &half);
+                        if (state.antenna_rotator.flip_mode_pass
+                            && half != state.antenna_rotator.flip_half) {
+                            state.antenna_rotator.target_azimuth_unwrapped =
+                                mech_az;
+                            state.antenna_rotator.flip_half = half;
+                            prev_unwrapped =
+                                state.antenna_rotator.target_azimuth_unwrapped;
+                        }
+                        next_az = antenna_rotator_accumulate_unwrapped(
+                            prev_unwrapped, mech_az);
+                        next_el = mech_el;
+                    }
                     if (next_el < ANTENNA_ROTATOR_MINIMUM_ELEVATION) {
                         next_el = ANTENNA_ROTATOR_MINIMUM_ELEVATION;
                     } else if (next_el > ANTENNA_ROTATOR_MAXIMUM_ELEVATION) {
                         next_el = ANTENNA_ROTATOR_MAXIMUM_ELEVATION;
                     }
                     delta_az = next_az - prev_unwrapped;
-                    if (state.antenna_rotator.flip_mode_pass
+                    // With a plan in play the elevation is part of the
+                    // trajectory; respect it even below the horizon.
+                    // The pre-pursuit fallback keeps the existing
+                    // "only chase el while the sat is visible" rule.
+                    if (used_pursuit
+                        || state.antenna_rotator.flip_mode_pass
                         || state.prediction.satellite_ephem.elevation >= 0) {
                         delta_el = next_el
                                    - state.antenna_rotator.target_elevation;
@@ -5986,6 +6233,7 @@ int main(int argc, char **argv)
                         if (next_az < ANTENNA_ROTATOR_MINIMUM_AZIMUTH
                             || next_az > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
                             state.antenna_rotator.tracking = 0;
+                            main_pursuit_clear_plan();
                         } else {
                             int rc = main_rotator_submit_set(
                                 &state, next_az, next_el);
@@ -6011,6 +6259,10 @@ int main(int argc, char **argv)
                 state.antenna_rotator.flip_mode_pass = 0;
                 state.antenna_rotator.flip_decision_made = 0;
                 state.antenna_rotator.flip_half = 0;
+                // Released the pass; tear down the planner so the
+                // memory comes back and so the next pass / mid-pass
+                // 'T' rebuilds against fresh state.
+                main_pursuit_clear_plan();
             }
         }
         (void) jul_idle_start;  // reserved for any future idle-window behavior
@@ -6524,6 +6776,9 @@ int main(int argc, char **argv)
         antenna_rotator_disconnect(&state.antenna_rotator);
         state.have_antenna_rotator = 0;
     }
+    // Free any plan that survived (mid-pass exit / crash on a key
+    // before the LOS branch had a chance to clear it).
+    main_pursuit_clear_plan();
     if (g_ipc) {
         sso_ipc_server_close(g_ipc);
         g_ipc = NULL;
@@ -6708,6 +6963,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strcmp("--confirm-rotator-calibrate", argv[i]) == 0) {
             state->n_options++;
             g_confirm_rotator_calibrate = 1;
+        } else if (strcmp("--without-rotator-pursuit", argv[i]) == 0) {
+            state->n_options++;
+            g_without_rotator_pursuit = 1;
         } else if (strcmp("--without-tr-switch", argv[i]) == 0) {
             state->n_options++;
             state->run_with_tr_switch = 0;
