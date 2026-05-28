@@ -20,10 +20,14 @@
     verbatim.
 
     Usage:
-        agenda_check [--local-time] [--no-dup-check] [<file>]
+        agenda_check [--local-time] [--no-dup-check] [--tle <file>] [<file>]
 
     --local-time     human times in the host's local TZ (default UTC)
     --no-dup-check   skip the duplicate-line audit (substitute only)
+    --tle <file>     (sgp4sdp4 builds only) propagate the first satellite
+                     in <file> and prepend the sub-satellite latitude (deg),
+                     longitude (deg) and altitude (km) to each command,
+                     evaluated at @tsexec= (else @tssent=, else now)
     No <file>        read from stdin
 
     Duplicate lines are flagged inline with a "DUP(N)>" prefix
@@ -52,13 +56,24 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef WITH_SGP4SDP4
+// prediction.h pulls in ephemeres.h -> sgp4sdp4.h (ClearFlag,
+// select_ephemeris, the propagators). We reuse next_in_queue's proven
+// load_tle + update_satellite_position path rather than driving SGP4 by
+// hand, which is easy to get subtly wrong.
+#include "prediction.h"
+#endif
+
 static void usage(FILE *out, const char *progname)
 {
     fprintf(out,
-        "Usage: %s [--local-time] [--no-dup-check] [<file>]\n"
+        "Usage: %s [--local-time] [--no-dup-check] [--tle <file>] [<file>]\n"
         "  Replaces @tssent=<unix_ms> and @tsexec=<unix_ms> values with\n"
         "  human-readable timestamps. UTC by default; --local-time uses\n"
         "  the host's local timezone. Flags verbatim-duplicate TC lines.\n"
+        "  With --tle <file> (sgp4sdp4 builds), prepends the sub-satellite\n"
+        "  lat/lon (deg) and altitude (km) per command at its exec time\n"
+        "  (@tsexec=, else @tssent=, else now).\n"
         "  No <file> reads from stdin.\n",
         progname);
 }
@@ -198,16 +213,90 @@ static void dup_table_free(dup_table_t *t)
     t->lines = NULL; t->line_no = NULL; t->n = t->cap = 0;
 }
 
+#ifdef WITH_SGP4SDP4
+// Single-satellite propagation context, loaded once from the --tle file
+// and reused for every command line.
+static prediction_t g_pred;
+
+// Find the first @<key>=<digits> in `line` and return its integer value.
+// A leading +/- is accepted (matching humanize_directives' tolerance).
+// Returns 1 on success, 0 if the key is absent or not followed by digits.
+static int find_directive_ms(const char *line, const char *key, long long *out)
+{
+    size_t klen = strlen(key);
+    for (const char *p = line; *p != '\0'; ++p) {
+        if (strncmp(p, key, klen) != 0) continue;
+        const char *digits = p + klen;
+        const char *d = digits;
+        if (*d == '+' || *d == '-') ++d;
+        const char *digit_start = d;
+        while (isdigit((unsigned char) *d)) ++d;
+        if (d == digit_start) continue;
+        char numbuf[32];
+        size_t n = (size_t)(d - digits);
+        if (n >= sizeof numbuf) continue;
+        memcpy(numbuf, digits, n);
+        numbuf[n] = '\0';
+        *out = strtoll(numbuf, NULL, 10);
+        return 1;
+    }
+    return 0;
+}
+
+// Load the first satellite from `path` and prime the SGP4/SDP4 selector.
+// Mirrors next_in_queue's setup (load_tle + select_ephemeris). The empty
+// satellite name makes load_tle's zero-length prefix match the first TLE
+// record in the file. Returns 0 on success, -1 on failure (load_tle has
+// already printed the reason).
+static int tle_setup(const char *path)
+{
+    static char empty_name[] = "";
+    g_pred.tles_filename = (char *) path;
+    g_pred.satellite_ephem.name = empty_name;
+    g_pred.observer_ephem.position_geodetic.lat = RAO_LATITUDE  * M_PI / 180.0;
+    g_pred.observer_ephem.position_geodetic.lon = RAO_LONGITUDE * M_PI / 180.0;
+    g_pred.observer_ephem.position_geodetic.alt = RAO_ALTITUDE  / 1000.0;
+    if (load_tle(&g_pred) != 0) {
+        return -1;
+    }
+    ClearFlag(ALL_FLAGS);
+    select_ephemeris(&g_pred.satellite_ephem.tle);
+    return 0;
+}
+
+// Sub-satellite geodetic point at a unix-millisecond instant. Longitude is
+// normalised from the propagator's [0,360) east to [-180,180).
+static void sat_subpoint(long long unix_ms,
+                         double *lat_deg, double *lon_deg, double *alt_km)
+{
+    // The Unix epoch (1970-01-01T00:00:00Z) is Julian Date 2440587.5.
+    double jul_utc = 2440587.5 + (double) unix_ms / 86400000.0;
+    update_satellite_position(&g_pred, jul_utc);
+    double lon = g_pred.satellite_ephem.longitude;
+    if (lon > 180.0) lon -= 360.0;
+    *lat_deg = g_pred.satellite_ephem.latitude;
+    *lon_deg = lon;
+    *alt_km  = g_pred.satellite_ephem.altitude_km;
+}
+#endif // WITH_SGP4SDP4
+
 int main(int argc, char **argv)
 {
     int local = 0;
     int dup_check = 1;
     const char *path = NULL;
+    const char *tle_path = NULL;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--local-time") == 0) {
             local = 1;
         } else if (strcmp(argv[i], "--no-dup-check") == 0) {
             dup_check = 0;
+        } else if (strcmp(argv[i], "--tle") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: --tle requires a file path\n", argv[0]);
+                return 2;
+            }
+            tle_path = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0
                 || strcmp(argv[i], "-h") == 0) {
             usage(stdout, argv[0]);
@@ -223,6 +312,24 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+
+#ifdef WITH_SGP4SDP4
+    int annotate = 0;
+    long long now_ms = (long long) time(NULL) * 1000;
+    if (tle_path != NULL) {
+        if (tle_setup(tle_path) != 0) {
+            return 1;
+        }
+        annotate = 1;
+    }
+#else
+    if (tle_path != NULL) {
+        fprintf(stderr,
+                "%s: --tle needs a build with sgp4sdp4; this binary lacks it\n",
+                argv[0]);
+        return 2;
+    }
+#endif
 
     FILE *in = stdin;
     if (path != NULL) {
@@ -269,23 +376,47 @@ int main(int argc, char **argv)
             if (first_seen) ++n_dups;
         }
 
+        // Sub-satellite point at this command's execution time, prepended
+        // to the line. Empty unless a --tle was loaded. The exec instant
+        // is @tsexec=, else @tssent=, else the wall-clock time captured at
+        // startup.
+        char annot[96];
+        annot[0] = '\0';
+#ifdef WITH_SGP4SDP4
+        if (annotate) {
+            long long exec_ms;
+            if (!find_directive_ms(buf, "@tsexec=", &exec_ms)
+                && !find_directive_ms(buf, "@tssent=", &exec_ms)) {
+                exec_ms = now_ms;
+            }
+            double lat, lon, alt;
+            sat_subpoint(exec_ms, &lat, &lon, &alt);
+            // Fixed-width lat/lon (-90.0 / -180.0 worst case) so the
+            // prepended columns line up down the page.
+            snprintf(annot, sizeof annot,
+                     "lat=%5.1f lon=%6.1f alt=%.1f  ", lat, lon, alt);
+        }
+#endif
+
         if (humanize_directives(buf, local, out, sizeof out) != 0) {
             fprintf(stderr,
                 "agenda_check: line %d too long to humanize; passing through\n",
                 lineno);
+            strip_eol(buf);
             if (first_seen) {
-                fprintf(stdout, "%sDUP(line %d)>%s %s",
-                        dup_red, first_seen, dup_reset, buf);
+                fprintf(stdout, "%s%sDUP(line %d)>%s %s\n",
+                        annot, dup_red, first_seen, dup_reset, buf);
             } else {
-                fputs(buf, stdout);
+                fprintf(stdout, "%s%s\n", annot, buf);
             }
             continue;
         }
+        strip_eol(out);
         if (first_seen) {
-            fprintf(stdout, "%sDUP(line %d)>%s %s",
-                    dup_red, first_seen, dup_reset, out);
+            fprintf(stdout, "%s%sDUP(line %d)>%s %s\n",
+                    annot, dup_red, first_seen, dup_reset, out);
         } else {
-            fputs(out, stdout);
+            fprintf(stdout, "%s%s\n", annot, out);
         }
     }
 

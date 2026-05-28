@@ -162,8 +162,16 @@ list(APPEND SSO_TARGETS fm_preview)
 
 # agenda_check: TC-file reviewer. Humanizes @tssent=/@tsexec= unix-ms
 # values into ISO timestamps (UTC or --local-time) and flags verbatim-
-# duplicate command lines. Pure POSIX; no external libs.
+# duplicate command lines. Pure POSIX core. When sgp4sdp4 is present it
+# also accepts --tle <file>, propagating the first satellite (via the
+# same prediction.c path next_in_queue uses) to append the sub-satellite
+# lat/lon/alt at each command's execution time.
 add_executable(agenda_check utils/agenda_check.c)
+if (SGP4SDP4_LIB)
+    target_compile_definitions(agenda_check PRIVATE WITH_SGP4SDP4)
+    target_sources(agenda_check PRIVATE src/orbit/prediction.c src/orbit/oem.c)
+    target_link_libraries(agenda_check PRIVATE ${SGP4SDP4_LIB} m)
+endif()
 list(APPEND SSO_TARGETS agenda_check)
 
 # Beacon-cadence detector for post-pass triage of FM-demoded WAVs.
