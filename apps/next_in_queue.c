@@ -36,7 +36,7 @@ void usage(FILE *dest, const char *name, int full)
     fprintf(dest,
         "usage:\n"
         "  %s <min_alt_km> <max_alt_km> [<satellite_name>] [options]\n"
-        "  %s --tle=<path> [<satellite_name>] [options]\n"
+        "  %s --tle <path> [<satellite_name>] [options]\n"
         "  %s --trajectory-id=<id> [options]\n"
         "\n"
         "Scan a TLE file (or a propagated SSM trajectory) for upcoming passes\n"
@@ -54,7 +54,9 @@ void usage(FILE *dest, const char *name, int full)
         "                               matching use --regex= instead.\n"
         "\n"
         "Trajectory source (pick one; default = implicit TLE catalog):\n"
-        "  --tle=<path>                 Path to a TLE file (2 or 3-line format).\n"
+        "  --tle <path>                 Path to a TLE file (2 or 3-line format).\n"
+        "                               Space form is tab-completable; the\n"
+        "                               older --tle=<path> form still works.\n"
         "                               Default: $HOME/.local/state/simple_sat_ops/active.tle\n"
         "                               With this flag, positional alt limits\n"
         "                               become optional — use --min-altitude-km=\n"
@@ -272,6 +274,14 @@ int main(int argc, char **argv)
         } else if (strcmp("--show-radio-info", argv[i]) == 0) {
             state.n_options++;
             show_radio_info = 1;
+        } else if (strcmp("--tle", argv[i]) == 0) {
+            state.n_options++;
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: --tle requires a file path\n", argv[0]);
+                return EXIT_FAILURE;
+            }
+            state.prediction.tles_filename = tle_path_resolve(argv[++i]);
+            tle_explicit = 1;
         } else if (strncmp("--tle=", argv[i], 6) == 0) {
             state.n_options++;
             if (strlen(argv[i]) < 7) {
@@ -326,7 +336,12 @@ int main(int argc, char **argv)
     int positional_argv[8];
     int n_positional = 0;
     for (int i = 1; i < argc; i++) {
-        if (strncmp("--", argv[i], 2) == 0) continue;
+        if (strncmp("--", argv[i], 2) == 0) {
+            // Space-form options consume the next argv as their value;
+            // don't mistake that value for a positional.
+            if (strcmp(argv[i], "--tle") == 0) ++i;
+            continue;
+        }
         if (n_positional >= (int)(sizeof positional_argv / sizeof positional_argv[0])) {
             fprintf(stderr, "too many positional arguments\n");
             return EXIT_FAILURE;
