@@ -58,6 +58,10 @@ pkg_check_modules(OPENSSL libcrypto)
 pkg_check_modules(SQLITE3 sqlite3)
 pkg_check_modules(RAYLIB raylib)
 find_library(SGP4SDP4_LIB sgp4sdp4)
+# pthread for the sso_audit writer thread + the rx_session worker.
+# Used by target_link_sso_core() and the simple_sat_ops link line.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
 
 # packet_db is a shared dependency of every receiver: rx_decode,
 # rx_replay, b210_rx_tx all tap emit_frame and write each decoded
@@ -102,6 +106,10 @@ set(SSO_CORE_SOURCES
     src/ipc/sso_operator.c)
 function(target_link_sso_core target)
     target_sources(${target} PRIVATE ${SSO_CORE_SOURCES})
+    # sso_audit.c spawns a writer pthread to keep the producer side
+    # non-blocking. Apple libSystem provides pthread implicitly; Linux
+    # needs -lpthread. CMake's Threads::Threads handles both.
+    target_link_libraries(${target} PRIVATE Threads::Threads)
 endfunction()
 
 # Built-target accumulator. Every successfully-added target is appended
