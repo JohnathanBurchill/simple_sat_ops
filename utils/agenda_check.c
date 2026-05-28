@@ -20,14 +20,19 @@
     verbatim.
 
     Usage:
-        agenda_check [--local-time] [--no-dup-check] [--tle <file>] [<file>]
+        agenda_check [--local-time] [--no-dup-check] [--prune-dups]
+                     [--tle <file>] [<file>]
 
     --local-time     human times in the host's local TZ (default UTC)
     --no-dup-check   skip the duplicate-line audit (substitute only)
+    --prune-dups     drop verbatim-duplicate command lines (keep the first
+                     occurrence) and print a count of how many were pruned
     --tle <file>     (sgp4sdp4 builds only) propagate the first satellite
-                     in <file> and prepend the sub-satellite latitude (deg),
-                     longitude (deg) and altitude (km) to each command,
-                     evaluated at @tsexec= (else @tssent=, else now)
+                     in <file> and prepend the execution date-time
+                     (humanized, local/UTC per --local-time) plus the
+                     sub-satellite latitude (deg), longitude (deg) and
+                     altitude (km), leaving the command itself intact. The
+                     instant is @tsexec= (else @tssent=, else now)
     No <file>        read from stdin
 
     Duplicate lines are flagged inline with a "DUP(N)>" prefix
@@ -67,13 +72,14 @@
 static void usage(FILE *out, const char *progname)
 {
     fprintf(out,
-        "Usage: %s [--local-time] [--no-dup-check] [--tle <file>] [<file>]\n"
+        "Usage: %s [--local-time] [--no-dup-check] [--prune-dups] [--tle <file>] [<file>]\n"
         "  Replaces @tssent=<unix_ms> and @tsexec=<unix_ms> values with\n"
         "  human-readable timestamps. UTC by default; --local-time uses\n"
-        "  the host's local timezone. Flags verbatim-duplicate TC lines.\n"
-        "  With --tle <file> (sgp4sdp4 builds), prepends the sub-satellite\n"
-        "  lat/lon (deg) and altitude (km) per command at its exec time\n"
-        "  (@tsexec=, else @tssent=, else now).\n"
+        "  the host's local timezone. Flags verbatim-duplicate TC lines;\n"
+        "  --prune-dups drops them instead and reports how many were pruned.\n"
+        "  With --tle <file> (sgp4sdp4 builds), prepends the execution\n"
+        "  date-time plus the sub-satellite lat/lon (deg) and altitude (km),\n"
+        "  leaving the command intact (@tsexec=, else @tssent=, else now).\n"
         "  No <file> reads from stdin.\n",
         progname);
 }
@@ -284,6 +290,7 @@ int main(int argc, char **argv)
 {
     int local = 0;
     int dup_check = 1;
+    int prune_dups = 0;
     const char *path = NULL;
     const char *tle_path = NULL;
     for (int i = 1; i < argc; ++i) {
@@ -291,6 +298,8 @@ int main(int argc, char **argv)
             local = 1;
         } else if (strcmp(argv[i], "--no-dup-check") == 0) {
             dup_check = 0;
+        } else if (strcmp(argv[i], "--prune-dups") == 0) {
+            prune_dups = 1;
         } else if (strcmp(argv[i], "--tle") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "%s: --tle requires a file path\n", argv[0]);
@@ -365,7 +374,7 @@ int main(int argc, char **argv)
         // identical embedded unix times count as duplicates. EOL is
         // stripped so trailing CRLF differences don't matter.
         int first_seen = 0;
-        if (dup_check) {
+        if (dup_check || prune_dups) {
             char dupbuf[4096];
             snprintf(dupbuf, sizeof dupbuf, "%s", buf);
             strip_eol(dupbuf);
@@ -375,15 +384,21 @@ int main(int argc, char **argv)
             }
             if (first_seen) ++n_dups;
         }
+        // --prune-dups: drop the duplicate entirely, keeping the first.
+        if (prune_dups && first_seen) {
+            continue;
+        }
 
-        // Sub-satellite point at this command's execution time, prepended
-        // to the line. Empty unless a --tle was loaded. The exec instant
-        // is @tsexec=, else @tssent=, else the wall-clock time captured at
-        // startup.
-        char annot[96];
-        annot[0] = '\0';
+        // With a --tle loaded, prepend the execution date-time (humanized,
+        // local or UTC per --local-time) and the sub-satellite point, and
+        // leave the command itself untouched. The exec instant is
+        // @tsexec=, else @tssent=, else the startup wall-clock time.
+        char prefix[96];
+        prefix[0] = '\0';
+        int keep_intact = 0;
 #ifdef WITH_SGP4SDP4
         if (annotate) {
+            keep_intact = 1;
             long long exec_ms;
             if (!find_directive_ms(buf, "@tsexec=", &exec_ms)
                 && !find_directive_ms(buf, "@tssent=", &exec_ms)) {
@@ -391,32 +406,37 @@ int main(int argc, char **argv)
             }
             double lat, lon, alt;
             sat_subpoint(exec_ms, &lat, &lon, &alt);
+            char ts[48];
+            format_ts(exec_ms, local, ts, sizeof ts);
             // Fixed-width lat/lon (-90.0 / -180.0 worst case) so the
             // prepended columns line up down the page.
-            snprintf(annot, sizeof annot,
-                     "lat=%5.1f lon=%6.1f alt=%.1f  ", lat, lon, alt);
+            snprintf(prefix, sizeof prefix,
+                     "%s  lat=%5.1f lon=%6.1f alt=%.1f  ", ts, lat, lon, alt);
         }
 #endif
 
-        if (humanize_directives(buf, local, out, sizeof out) != 0) {
+        // Body: keep the command verbatim when annotating; otherwise
+        // humanize the inline @tssent=/@tsexec= values in place.
+        const char *body;
+        if (keep_intact) {
+            strip_eol(buf);
+            body = buf;
+        } else if (humanize_directives(buf, local, out, sizeof out) != 0) {
             fprintf(stderr,
                 "agenda_check: line %d too long to humanize; passing through\n",
                 lineno);
             strip_eol(buf);
-            if (first_seen) {
-                fprintf(stdout, "%s%sDUP(line %d)>%s %s\n",
-                        annot, dup_red, first_seen, dup_reset, buf);
-            } else {
-                fprintf(stdout, "%s%s\n", annot, buf);
-            }
-            continue;
+            body = buf;
+        } else {
+            strip_eol(out);
+            body = out;
         }
-        strip_eol(out);
+
         if (first_seen) {
             fprintf(stdout, "%s%sDUP(line %d)>%s %s\n",
-                    annot, dup_red, first_seen, dup_reset, out);
+                    prefix, dup_red, first_seen, dup_reset, body);
         } else {
-            fprintf(stdout, "%s%s\n", annot, out);
+            fprintf(stdout, "%s%s\n", prefix, body);
         }
     }
 
@@ -424,6 +444,11 @@ int main(int argc, char **argv)
     dup_table_free(&dups);
 
     if (n_dups > 0) {
+        if (prune_dups) {
+            fprintf(stderr, "agenda_check: pruned %d duplicate line%s\n",
+                    n_dups, n_dups == 1 ? "" : "s");
+            return 0;
+        }
         fprintf(stderr,
             "agenda_check: %d duplicate line%s detected (see DUP> rows)\n",
             n_dups, n_dups == 1 ? "" : "s");
