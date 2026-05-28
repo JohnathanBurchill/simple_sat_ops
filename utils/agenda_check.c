@@ -80,6 +80,8 @@ static void usage(FILE *out, const char *progname)
         "  With --tle <file> (sgp4sdp4 builds), prepends the execution\n"
         "  date-time plus the sub-satellite lat/lon (deg) and altitude (km),\n"
         "  leaving the command intact (@tsexec=, else @tssent=, else now).\n"
+        "  Prints a stderr summary: total commands, non-duplicate commands,\n"
+        "  and unique timed commands (same command at different times = 1).\n"
         "  No <file> reads from stdin.\n",
         progname);
 }
@@ -170,6 +172,36 @@ static void strip_eol(char *buf)
     while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) {
         buf[--n] = '\0';
     }
+}
+
+// Build a command-identity key: the line with the @tssent=<digits> and
+// @tsexec=<digits> directives removed, so the same command scheduled at
+// different times maps to one key. Other directives (e.g. @resp_fname=)
+// are preserved. Used only to count distinct timed commands — the output
+// itself keeps every timed command, times and all.
+static void make_dedup_key(const char *in, char *out, size_t cap)
+{
+    static const char *const keys[] = {"@tssent=", "@tsexec="};
+    size_t op = 0;
+    const char *p = in;
+    while (*p != '\0' && op + 1 < cap) {
+        int matched = 0;
+        for (int k = 0; k < 2; ++k) {
+            size_t klen = strlen(keys[k]);
+            if (strncmp(p, keys[k], klen) != 0) continue;
+            const char *d = p + klen;
+            if (*d == '+' || *d == '-') ++d;
+            const char *digit_start = d;
+            while (isdigit((unsigned char) *d)) ++d;
+            if (d == digit_start) break;   // not a numeric value; copy as-is
+            p = d;                          // skip the whole @key=<digits>
+            matched = 1;
+            break;
+        }
+        if (matched) continue;
+        out[op++] = *p++;
+    }
+    out[op] = '\0';
 }
 
 // Linear-scan dedup. Telecommand schedules are short (dozens of
@@ -354,11 +386,13 @@ int main(int argc, char **argv)
     const char *dup_red    = tty ? "\x1b[1;31m" : "";
     const char *dup_reset  = tty ? "\x1b[0m"    : "";
 
-    dup_table_t dups = {0};
+    dup_table_t dups = {0};        // distinct verbatim command lines
+    dup_table_t timed_uniq = {0};  // distinct timed commands, times ignored
     char buf[4096];
     char out[8192];
     int lineno = 0;
     int n_dups = 0;
+    int total_commands = 0;
     while (fgets(buf, sizeof buf, in) != NULL) {
         ++lineno;
         // Pass through comments and blank lines verbatim — they're
@@ -368,23 +402,39 @@ int main(int argc, char **argv)
             fputs(buf, stdout);
             continue;
         }
+        ++total_commands;
 
-        // Duplicate check operates on the RAW line (before
-        // humanizing) so two lines with identical commands AND
-        // identical embedded unix times count as duplicates. EOL is
-        // stripped so trailing CRLF differences don't matter.
+        // Verbatim duplicate detection, always run (drives both the
+        // summary counts and the flag/prune feature). Two lines with
+        // identical commands AND identical embedded unix times are
+        // duplicates; the table is scanned in full, so duplicates anywhere
+        // in the file are caught, not just adjacent ones. dups.n ends up
+        // as the distinct (non-duplicate) command count.
+        char dupbuf[4096];
+        snprintf(dupbuf, sizeof dupbuf, "%s", buf);
+        strip_eol(dupbuf);
         int first_seen = 0;
-        if (dup_check || prune_dups) {
-            char dupbuf[4096];
-            snprintf(dupbuf, sizeof dupbuf, "%s", buf);
-            strip_eol(dupbuf);
-            if (dup_table_push(&dups, dupbuf, lineno, &first_seen) != 0) {
+        if (dup_table_push(&dups, dupbuf, lineno, &first_seen) != 0) {
+            fprintf(stderr, "agenda_check: out of memory\n");
+            return 1;
+        }
+        if (first_seen) ++n_dups;
+
+        // Distinct timed commands: lines carrying @tsexec= / @tssent=,
+        // keyed with those time values stripped so the same command at
+        // different times counts once. timed_uniq.n is that count.
+        if (strstr(buf, "@tsexec=") != NULL || strstr(buf, "@tssent=") != NULL) {
+            char key[4096];
+            make_dedup_key(buf, key, sizeof key);
+            strip_eol(key);
+            int timed_seen = 0;
+            if (dup_table_push(&timed_uniq, key, lineno, &timed_seen) != 0) {
                 fprintf(stderr, "agenda_check: out of memory\n");
                 return 1;
             }
-            if (first_seen) ++n_dups;
         }
-        // --prune-dups: drop the duplicate entirely, keeping the first.
+
+        // --prune-dups: drop the verbatim duplicate, keeping the first.
         if (prune_dups && first_seen) {
             continue;
         }
@@ -432,7 +482,10 @@ int main(int argc, char **argv)
             body = out;
         }
 
-        if (first_seen) {
+        // Flag duplicates inline only in the default audit mode. With
+        // --no-dup-check the markers are off (counts still computed);
+        // with --prune-dups the duplicate was already dropped above.
+        if (first_seen && dup_check && !prune_dups) {
             fprintf(stdout, "%s%sDUP(line %d)>%s %s\n",
                     prefix, dup_red, first_seen, dup_reset, body);
         } else {
@@ -441,18 +494,25 @@ int main(int argc, char **argv)
     }
 
     if (in != stdin) fclose(in);
-    dup_table_free(&dups);
 
-    if (n_dups > 0) {
-        if (prune_dups) {
+    fprintf(stderr,
+        "agenda_check: %d command%s total, %zu non-duplicate, %zu unique timed\n",
+        total_commands, total_commands == 1 ? "" : "s",
+        dups.n, timed_uniq.n);
+
+    int rc = 0;
+    if (prune_dups) {
+        if (n_dups > 0) {
             fprintf(stderr, "agenda_check: pruned %d duplicate line%s\n",
                     n_dups, n_dups == 1 ? "" : "s");
-            return 0;
         }
+    } else if (dup_check && n_dups > 0) {
         fprintf(stderr,
             "agenda_check: %d duplicate line%s detected (see DUP> rows)\n",
             n_dups, n_dups == 1 ? "" : "s");
-        return 3;
+        rc = 3;
     }
-    return 0;
+    dup_table_free(&dups);
+    dup_table_free(&timed_uniq);
+    return rc;
 }
