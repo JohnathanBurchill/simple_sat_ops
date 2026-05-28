@@ -22,6 +22,8 @@
 
 #include "antenna_rotator.h"
 #include "antenna_rotator_async.h"
+#include "rotator_calibrate.h"
+#include "pursuit.h"
 #include "tr_switch.h"
 #include "state.h"
 #include "prediction.h"
@@ -1179,6 +1181,18 @@ static int  g_without_b210 = 0;
 // after antenna_rotator_init succeeds; joined on shutdown. While set, no
 // other thread touches state.antenna_rotator's serial FD.
 static antenna_rotator_async_t *g_rot_async = NULL;
+// --calibrate-rotator: when 1, simple_sat_ops runs the calibration
+// routine after opening the rotator and exits without entering the
+// ncurses UI. --confirm-rotator-calibrate is the safety interlock so
+// the physical motion is always deliberate.
+static int g_calibrate_rotator = 0;
+static int g_confirm_rotator_calibrate = 0;
+// Rotator slew rates loaded from disk at startup (deg/s). Either both
+// > 0 (calibration present, pursuit planner can run) or both 0
+// (calibration absent, the track loop falls back to today's "aim
+// where sat is now" behavior). Phase 2 plumbs these into the planner.
+static double g_pursuit_az_dps = 0.0;
+static double g_pursuit_el_dps = 0.0;
 #ifdef WITH_USRP_B210
 // rx_session owns the b210 core + the worker thread. main.c only
 // keeps a local handle long enough to open the device and hand it
@@ -3969,6 +3983,15 @@ void usage(FILE *dest, const char *name, int full)
         "                               the tracker initialises and commands\n"
         "                               the rotator unless this flag is given.\n"
         "  --without-hardware           Synonym for --without-rotator\n"
+        "  --calibrate-rotator          Drive the antenna across known arcs to\n"
+        "                               measure the rotator's deg/s slew rate\n"
+        "                               on each axis. Writes the rates to\n"
+        "                               $HOME/.local/share/simple_sat_ops/\n"
+        "                               rotator_{az,el}_rate_dps then exits.\n"
+        "                               Requires --confirm-rotator-calibrate\n"
+        "                               (the antenna physically moves; the\n"
+        "                               operator must clear the mast first).\n"
+        "  --confirm-rotator-calibrate  Safety interlock for --calibrate-rotator.\n"
         "  --without-b210               Skip the USRP B210 (dev hosts that\n"
         "                               have UHD but no device, or any time\n"
         "                               you just want the UI + rotator).\n"
@@ -5462,6 +5485,64 @@ int main(int argc, char **argv)
         }
     }
 
+    // --calibrate-rotator: drive the antenna across known arcs to
+    // measure deg/s on each axis, save the result to disk, and exit
+    // without entering the operator UI. Requires the safety interlock
+    // so a stray flag in a script can't move hardware.
+    if (g_calibrate_rotator) {
+        if (!state.have_antenna_rotator) {
+            fprintf(stderr, "--calibrate-rotator: no rotator open "
+                            "(was --without-rotator passed?)\n");
+            return EXIT_FAILURE;
+        }
+        if (!g_confirm_rotator_calibrate) {
+            fprintf(stderr,
+                    "--calibrate-rotator will physically move the antenna.\n"
+                    "Confirm the mast area is clear, then re-run with\n"
+                    "  --calibrate-rotator --confirm-rotator-calibrate\n");
+            return EXIT_FAILURE;
+        }
+        double az_dps = 0.0, el_dps = 0.0;
+        rotator_calibrate_result_t cres = rotator_calibrate_run(
+            g_rot_async, &az_dps, &el_dps, stderr);
+        fprintf(stderr, "calibrate: result = %s\n",
+                rotator_calibrate_result_name(cres));
+        if (cres == ROTATOR_CALIBRATE_OK) {
+            fprintf(stderr,
+                    "calibrate: saved rates az=%.3f deg/s el=%.3f deg/s\n",
+                    az_dps, el_dps);
+        }
+        // Shutdown cleanly — the operator UI never started, but the
+        // rotator FD and worker are open.
+        if (g_rot_async != NULL) {
+            antenna_rotator_async_close(g_rot_async);
+            g_rot_async = NULL;
+        }
+        if (state.have_antenna_rotator) {
+            antenna_rotator_disconnect(&state.antenna_rotator);
+            state.have_antenna_rotator = 0;
+        }
+        return (cres == ROTATOR_CALIBRATE_OK) ? 0 : 1;
+    }
+
+    // Normal startup: load saved rotator rates from the calibration
+    // file. Missing or malformed file -> pursuit planner stays
+    // disabled (Phase 2 hooks this in front of the track loop; Phase
+    // 1 just loads + warns so the bench can see the values).
+    if (state.have_antenna_rotator) {
+        if (pursuit_load_rotator_rates(&g_pursuit_az_dps,
+                                        &g_pursuit_el_dps) == 0) {
+            fprintf(stderr,
+                    "pursuit: loaded slew rates az=%.3f deg/s el=%.3f deg/s\n",
+                    g_pursuit_az_dps, g_pursuit_el_dps);
+        } else {
+            fprintf(stderr,
+                    "pursuit: no calibration on disk; run "
+                    "`simple_sat_ops --calibrate-rotator "
+                    "--confirm-rotator-calibrate` to enable lead-aim\n");
+        }
+    }
+
     // T/R antenna switch — auto-probe before ncurses takes the screen,
     // so a "not connected" warning lands on the terminal. Absent or
     // inaccessible hardware is non-fatal; the UI panel reads "not
@@ -6621,6 +6702,12 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 || strcmp("--without-hardware", argv[i]) == 0) {
             state->n_options++;
             state->run_with_antenna_rotator = 0;
+        } else if (strcmp("--calibrate-rotator", argv[i]) == 0) {
+            state->n_options++;
+            g_calibrate_rotator = 1;
+        } else if (strcmp("--confirm-rotator-calibrate", argv[i]) == 0) {
+            state->n_options++;
+            g_confirm_rotator_calibrate = 1;
         } else if (strcmp("--without-tr-switch", argv[i]) == 0) {
             state->n_options++;
             state->run_with_tr_switch = 0;

@@ -140,6 +140,15 @@ target_include_directories(antenna_rotator_selftest PRIVATE ${UNIT_TESTS_INCLUDE
 target_link_libraries(antenna_rotator_selftest PRIVATE m)
 list(APPEND SSO_TARGETS antenna_rotator_selftest)
 
+# Pursuit-tracking self-test: closed-form mock sat tracks exercising
+# the whole-pass planner in src/orbit/pursuit.c (no SGP4 / rotator
+# dependency). See ~/.claude/plans/let-s-implement-a-decode-dynamic-newt.md.
+add_executable(pursuit_selftest
+               unit_tests/pursuit_selftest.c src/orbit/pursuit.c)
+target_include_directories(pursuit_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(pursuit_selftest PRIVATE m)
+list(APPEND SSO_TARGETS pursuit_selftest)
+
 # TLE CSV self-test: round-trips Celestrak OMM CSV through
 # tle_path_resolve and audits the resulting 3-line TLE. Pure POSIX,
 # no external library deps.
@@ -594,8 +603,10 @@ endif()
 if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
     add_executable(simple_sat_ops apps/main.c
                    src/orbit/prediction.c src/orbit/oem.c
+                   src/orbit/pursuit.c
                    src/hw/antenna_rotator.c
                    src/hw/antenna_rotator_async.c
+                   src/hw/rotator_calibrate.c
                    src/hw/tr_switch.c
                    src/beacon/telemetry.c
                    src/pipeline/decode_loop.c
