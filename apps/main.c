@@ -4130,8 +4130,10 @@ void usage(FILE *dest, const char *name, int full)
         "  T         Start tracking the current satellite\n"
         "  s         Stop tracking\n"
         "  r         Reset rotator to az=0, el=0\n"
-        "  [         Nudge antenna azimuth -5 deg\n"
-        "  ]         Nudge antenna azimuth +5 deg\n"
+        "  [ / ]     Nudge antenna azimuth -5 / +5 deg\n"
+        "  { / }     Nudge antenna azimuth -1 / +1 deg (fine)\n"
+        "  , / .     Nudge antenna elevation -5 / +5 deg\n"
+        "  < / >     Nudge antenna elevation -1 / +1 deg (fine)\n"
         "  q         Quit\n"
         "\n"
         "EXAMPLES\n"
@@ -4499,8 +4501,8 @@ static int main_rotator_submit_set(state_t *state,
 }
 
 // Mirror of antenna_rotator_increase_azimuth() but routed through the
-// async worker via main_rotator_submit_set(). Used by the `[` and `]`
-// hotkeys.
+// async worker via main_rotator_submit_set(). Used by the `[` / `]`
+// (5 deg) and `{` / `}` (1 deg, shifted) hotkeys.
 static int main_rotator_increase_azimuth(state_t *state, double delta)
 {
     double base = state->antenna_rotator.unwrapped_target_valid
@@ -4508,6 +4510,18 @@ static int main_rotator_increase_azimuth(state_t *state, double delta)
         : state->antenna_rotator.target_azimuth;
     return main_rotator_submit_set(state, base + delta,
                                     state->antenna_rotator.target_elevation);
+}
+
+// Same idea but stepping elevation. Used by the `,` / `.` (5 deg) and
+// `<` / `>` (1 deg, shifted) hotkeys. The azimuth target is held — only
+// the wire-level SET goes out, on the worker.
+static int main_rotator_increase_elevation(state_t *state, double delta)
+{
+    double az = state->antenna_rotator.unwrapped_target_valid
+        ? state->antenna_rotator.target_azimuth_unwrapped
+        : state->antenna_rotator.target_azimuth;
+    double new_el = state->antenna_rotator.target_elevation + delta;
+    return main_rotator_submit_set(state, az, new_el);
 }
 
 // Pull az/el from the async snapshot and write them through to az/el AND
@@ -5626,9 +5640,13 @@ int main(int argc, char **argv)
     clrtoeol();
     mvprintw(keyboard_info_row++, 3, "%s", "r  - Reset to az=0 el=0");
     clrtoeol();
-    mvprintw(keyboard_info_row++, 3, "%s", "[  - Jog azimuth -5 deg");
+    mvprintw(keyboard_info_row++, 3, "%s", "[/]- Jog azimuth -5/+5 deg");
     clrtoeol();
-    mvprintw(keyboard_info_row++, 3, "%s", "]  - Jog azimuth +5 deg");
+    mvprintw(keyboard_info_row++, 3, "%s", "{/}- Jog azimuth -1/+1 deg");
+    clrtoeol();
+    mvprintw(keyboard_info_row++, 3, "%s", ",/.- Jog elevation -5/+5 deg");
+    clrtoeol();
+    mvprintw(keyboard_info_row++, 3, "%s", "</>- Jog elevation -1/+1 deg");
     clrtoeol();
     mvprintw(keyboard_info_row++, 3, "%s", "t  - Compose TX command");
     clrtoeol();
@@ -6020,6 +6038,66 @@ int main(int argc, char **argv)
                     state.antenna_rotator.antenna_is_under_control = 0;
                     antenna_rotator_result = main_rotator_increase_azimuth(
                         &state, 5.0);
+                    if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
+                        state.antenna_rotator.antenna_is_moving = 1;
+                    }
+                    flushinp();
+                    break;
+                case '{':
+                    state.satellite_tracking = 0;
+                    state.antenna_rotator.antenna_is_under_control = 0;
+                    antenna_rotator_result = main_rotator_increase_azimuth(
+                        &state, -1.0);
+                    if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
+                        state.antenna_rotator.antenna_is_moving = 1;
+                    }
+                    flushinp();
+                    break;
+                case '}':
+                    state.satellite_tracking = 0;
+                    state.antenna_rotator.antenna_is_under_control = 0;
+                    antenna_rotator_result = main_rotator_increase_azimuth(
+                        &state, 1.0);
+                    if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
+                        state.antenna_rotator.antenna_is_moving = 1;
+                    }
+                    flushinp();
+                    break;
+                case ',':
+                    state.satellite_tracking = 0;
+                    state.antenna_rotator.antenna_is_under_control = 0;
+                    antenna_rotator_result = main_rotator_increase_elevation(
+                        &state, -5.0);
+                    if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
+                        state.antenna_rotator.antenna_is_moving = 1;
+                    }
+                    flushinp();
+                    break;
+                case '.':
+                    state.satellite_tracking = 0;
+                    state.antenna_rotator.antenna_is_under_control = 0;
+                    antenna_rotator_result = main_rotator_increase_elevation(
+                        &state, 5.0);
+                    if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
+                        state.antenna_rotator.antenna_is_moving = 1;
+                    }
+                    flushinp();
+                    break;
+                case '<':
+                    state.satellite_tracking = 0;
+                    state.antenna_rotator.antenna_is_under_control = 0;
+                    antenna_rotator_result = main_rotator_increase_elevation(
+                        &state, -1.0);
+                    if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
+                        state.antenna_rotator.antenna_is_moving = 1;
+                    }
+                    flushinp();
+                    break;
+                case '>':
+                    state.satellite_tracking = 0;
+                    state.antenna_rotator.antenna_is_under_control = 0;
+                    antenna_rotator_result = main_rotator_increase_elevation(
+                        &state, 1.0);
                     if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
                         state.antenna_rotator.antenna_is_moving = 1;
                     }
