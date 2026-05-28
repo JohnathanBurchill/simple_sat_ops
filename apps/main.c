@@ -29,6 +29,7 @@
 #include "prediction.h"
 #include "sso_audit.h"
 #include "sso_ipc.h"
+#include "sso_operator.h"
 #include "sso_ipc_paths.h"
 #include "sso_paths.h"
 #include "tle_csv.h"
@@ -5620,23 +5621,65 @@ int main(int argc, char **argv)
         sso_audit_event("argv", argv_buf);
     }
     if (g_control_mode) {
+        // Refuse if another simple_sat_ops --control is already
+        // bound — two operators driving the same SDR / rotator is
+        // exactly the failure mode the IPC server existed to avoid.
+        // The probe connects as a transient viewer, reads the
+        // operator's identity off the welcome reply, and disconnects.
+        char existing_user[64]    = {0};
+        char existing_folder[256] = {0};
+        int op_status = sso_operator_verify("viewer",
+                                             existing_folder,
+                                             sizeof existing_folder,
+                                             existing_user,
+                                             sizeof existing_user);
+        if (op_status == SSO_OP_OK || op_status == SSO_OP_MISMATCH) {
+            pid_t op_pid = 0;
+            const char *who = existing_user[0] ? existing_user : "?";
+            if (read_operator_pid(&op_pid) == 0) {
+                fprintf(stderr,
+                    "simple_sat_ops: --control refused — operator already "
+                    "running as user=%s pid=%d.\n"
+                    "  To take over, run a viewer (no --control) and press\n"
+                    "  'c' then 'y' to force-claim; the running operator\n"
+                    "  will yield and your viewer will re-exec into --control.\n",
+                    who, (int) op_pid);
+            } else {
+                fprintf(stderr,
+                    "simple_sat_ops: --control refused — operator already "
+                    "running as user=%s.\n", who);
+            }
+            char det[96];
+            snprintf(det, sizeof det,
+                     "existing_user=%s existing_pid=%d",
+                     who, (int) op_pid);
+            sso_audit_event("control-refused", det);
+            return EXIT_FAILURE;
+        }
+
         g_ipc = sso_ipc_server_open("simple_sat_ops");
         if (g_ipc == NULL) {
-            fprintf(stderr, "simple_sat_ops: --control requested but socket "
-                            "bind failed (already running? check "
-                            "/run/sso/simple_sat_ops.{sock,pid}). "
-                            "Continuing without IPC.\n");
+            // Probe said "no operator" yet bind still failed — most
+            // likely a stale socket / pid file from a crashed
+            // previous operator (or a vanishingly-rare race with
+            // another --control starting at the same instant).
+            // Either way, refuse so we don't quietly drive hardware
+            // alongside something else.
+            fprintf(stderr,
+                "simple_sat_ops: --control: socket bind failed. If this is "
+                "from a crashed previous operator, remove "
+                "/run/sso/simple_sat_ops.{sock,pid} and retry.\n");
             sso_audit_event("ipc-bind-failed", "");
-        } else {
-            sso_ipc_server_on_event(g_ipc, ipc_on_event, NULL);
-            struct sigaction sa;
-            memset(&sa, 0, sizeof(sa));
-            sa.sa_handler = on_sigusr1;
-            sigemptyset(&sa.sa_mask);
-            sigaction(SIGUSR1, &sa, NULL);
-            fprintf(stderr, "simple_sat_ops: operator=%s ipc=on\n",
-                    g_operator_user);
+            return EXIT_FAILURE;
         }
+        sso_ipc_server_on_event(g_ipc, ipc_on_event, NULL);
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_sigusr1;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR1, &sa, NULL);
+        fprintf(stderr, "simple_sat_ops: operator=%s ipc=on\n",
+                g_operator_user);
     }
 
     /* Parse TLE data */
