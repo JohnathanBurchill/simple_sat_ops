@@ -1658,11 +1658,11 @@ git checkout iq-inspector
 
 ### The active line
 
-The branch you want grew as one long, rebased, *linear* chain: no
-merge commits, each topic branch rebased forward onto the last. Read
-end to end it is the development history of the SDR ground station, in
-four eras. The ranges below are `git log` arguments you can paste
-directly.
+The branch you want grew commit by commit into one long, *linear*
+chain: no merge commits and very little rebasing, just one small
+change after another. Read end to end it is the development history of
+the SDR ground station, in four eras. The ranges below are `git log`
+arguments you can paste directly.
 
 | Era (branch) | Commit range | Dates | What it introduced |
 |--------------|--------------|-------|--------------------|
