@@ -126,6 +126,7 @@ typedef struct b210_rx_tx_core_params {
     sdr_backend_type_t backend_type;
     const char        *uhd_args_override;
     const char        *fpga_image_path;
+    int                device_index;   // RTL-SDR dongle index (0 = first)
 } b210_rx_tx_core_params_t;
 
 typedef struct b210_rx_tx_core b210_rx_tx_core_t;

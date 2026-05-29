@@ -72,6 +72,13 @@ if pkg-config --exists uhd 2>/dev/null; then
     USRP_FLAG="-DWITH_USRP_B210=ON"
 fi
 
+# Same for the RTL-SDR backend: cover sdr_rtlsdr.c with gcc-15 when
+# librtlsdr is discoverable.
+RTL_FLAG="-DWITH_RTL_SDR=OFF"
+if pkg-config --exists librtlsdr 2>/dev/null; then
+    RTL_FLAG="-DWITH_RTL_SDR=ON"
+fi
+
 if [[ "$mode" == "full" || ! -d "$BUILD_DIR" ]]; then
     rm -rf "$BUILD_DIR"
     mkdir -p "$BUILD_DIR"
@@ -79,7 +86,7 @@ if [[ "$mode" == "full" || ! -d "$BUILD_DIR" ]]; then
     cmake "$ROOT" \
         -DCMAKE_C_COMPILER="$GCC" \
         -DCMAKE_C_FLAGS="${WFLAGS[*]} ${SGP4SDP4_INC}" \
-        "$USRP_FLAG" \
+        "$USRP_FLAG" "$RTL_FLAG" \
         >cmake.log 2>&1 || { cat cmake.log; exit 1; }
 fi
 

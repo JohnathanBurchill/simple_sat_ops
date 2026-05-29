@@ -61,6 +61,11 @@ typedef struct sdr_caps {
 typedef struct sdr_open_params {
     double      freq_hz;            // initial RX center freq
     double      rate_hz;            // requested native sample rate (coerced)
+    double      target_post_decim_hz; // desired rate after the chain's decimator;
+                                    // a backend with a fixed/quantized native
+                                    // rate (RTL-SDR) picks a valid native that
+                                    // is an integer multiple of this so the
+                                    // chain hits the target. 0 => use rate_hz.
     double      gain_db;            // RX gain
     double      bw_hz;              // analog filter bw; <=0 => use rate_hz
     const char *rx_antenna;         // NULL => backend default
@@ -69,6 +74,7 @@ typedef struct sdr_open_params {
     int         rx_iq_balance_track;
     const char *uhd_args_override;  // UHD: raw device-args passthrough (NULL => none)
     const char *fpga_image_path;    // UHD: force fpga=<path> (NULL => none)
+    int         device_index;       // RTL-SDR: dongle index (0 = first)
 } sdr_open_params_t;
 
 // One TX burst, half-duplex: the backend pauses its own RX, transmits,

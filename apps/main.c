@@ -36,7 +36,7 @@
 #include "frontiersat.h"
 #include "hmac_keyfile.h"
 
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
 #include "b210_rx_tx_core.h"
 #include "carrier_trim.h"
 #include "rx_session.h"
@@ -892,7 +892,7 @@ static void scan_sky_tick(state_t *state, double t_now);
 // sits with the rest of the B210 globals further down. Forward-declare
 // it so the compiler doesn't reject the references; the symbol resolves
 // at link time to the static definition below.
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
 static rx_session_t *g_rx_session;
 #endif
 // Forward-decl the auto-tcmd file path for the same reason — its
@@ -1020,7 +1020,7 @@ static void cmd_dispatch(state_t *state)
         if (arg1 == NULL) {
             cmd_set_status("freq: missing argument (MHz)");
         } else {
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
             double v = atof(arg1);
             double hz = (v < 1e6) ? v * 1e6 : v;   // accept MHz or Hz
             if (hz < 1e6 || hz > 6e9) {
@@ -1046,7 +1046,7 @@ static void cmd_dispatch(state_t *state)
                            arg1);
         }
     } else if (strcmp(cmd, "spectrum") == 0 || strcmp(cmd, "spec") == 0) {
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
         if (arg1 == NULL) {
             cmd_set_status("spectrum: usage `spectrum <seconds>` (1..600)");
         } else if (g_rx_session == NULL) {
@@ -1160,7 +1160,7 @@ static void cmd_dispatch(state_t *state)
             cmd_set_status("lo_offset: usage `lo_offset <signed_kHz>` "
                            "(comfort range ±5..±40)");
         } else {
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
             double khz = atof(arg1);
             if (khz < -45.0 || khz > 45.0) {
                 cmd_set_status("lo_offset: %g kHz out of [-45, +45]", khz);
@@ -1216,7 +1216,7 @@ static void cmd_dispatch(state_t *state)
             cmd_set_status("gain: usage `gain <dB>` (range 0-76; current %.1f)",
                            state->rx_gain_db);
         } else {
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
             double g = atof(arg1);
             if (g < 0.0 || g > 76.0) {
                 cmd_set_status("gain: %g dB out of [0, 76]", g);
@@ -1509,7 +1509,7 @@ static double monotonic_seconds(void)
 // that opens the SDR. --without-b210 (or a non-WITH_USRP_B210 build)
 // leaves g_rx_session NULL and the loop falls through cleanly.
 static int  g_without_b210 = 0;
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
 // SDR backend selection. g_sdr_type defaults to AUTO (probe UHD, then
 // RTL-SDR). g_sdr_device is a backend-specific selector (RTL index;
 // for UHD prefer --uhd-args). g_uhd_args is a verbatim UHD device-args
@@ -1555,7 +1555,7 @@ typedef struct {
 } pursuit_track_t;
 static pursuit_plan_t  g_pursuit_plan  = {0};
 static pursuit_track_t g_pursuit_track = {0};
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
 // rx_session owns the b210 core + the worker thread. main.c only
 // keeps a local handle long enough to open the device and hand it
 // over.
@@ -1789,7 +1789,7 @@ static double g_last_state_rrate_kms   = 0.0;
 // On builds without B210 we still want the viewer to draw the panel
 // from broadcast data, so define a fallback so the struct compiles
 // everywhere.
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
 #define RX_PANEL_PT_COUNT RX_PT_COUNT
 #define RX_PANEL_PAYLOAD_MAX RX_LAST_PAYLOAD_MAX
 #define RX_PANEL_SUMMARY_MAX RX_LAST_SUMMARY_MAX
@@ -1852,7 +1852,7 @@ typedef struct {
 static void rx_panel_collect_local(rx_panel_data_t *d)
 {
     memset(d, 0, sizeof *d);
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
     d->have_session = (g_rx_session != NULL);
     if (!d->have_session) return;
     d->rec_active = rx_session_wav_active(g_rx_session);
@@ -2615,7 +2615,7 @@ static void tx_compose_fill_event(const tx_compose_t *c, sso_event_t *evt) {
     evt->tx_csp_dport = 7;
     evt->tx_csp_sport = 16;
     evt->tx_csp_prio  = 2;
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
     evt->tx_freq_hz   = g_tx_freq_hz_doppler;
 #else
     evt->tx_freq_hz   = (long) FRONTIERSAT_CARRIER_HZ;
@@ -2894,7 +2894,7 @@ static void tx_compose_draw(WINDOW *w, const tx_compose_t *c) {
     mvwprintw(w, 0, 2, " TX compose (operator: %s)%s ",
               g_operator_user ? g_operator_user : "?",
               g_no_tx ? "  [--no-tx]" : "");
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
     mvwprintw(w, 1, 2,
               "B210: %s",
               g_rx_session ? "in-process (this binary)" : "(offline)");
@@ -2985,7 +2985,7 @@ static void tx_compose_broadcast_preview(const tx_compose_t *c) {
 }
 
 static int tx_compose_commit(const tx_compose_t *c, char *err, size_t err_size) {
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
     if (g_no_tx) {
         snprintf(err, err_size,
                  "TX disabled by --no-tx (preview still goes to viewers)");
@@ -3044,7 +3044,7 @@ static int tx_compose_commit(const tx_compose_t *c, char *err, size_t err_size) 
 #endif
 }
 
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
 // Emit a TX event locally: push into the operator's own TX log and
 // broadcast to viewers via the IPC server.
 static void emit_tx_event_local(sso_event_type_t type,
@@ -3696,7 +3696,7 @@ static void auto_tcmd_tick(state_t *state) {
         return;
     }
 
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
     long now = ts_now_ns();
     if (now < a->next_send_ns) return;
     if (g_tx_request.pending)  return;  // prior burst still inflight
@@ -3742,7 +3742,7 @@ static void auto_tcmd_tick(state_t *state) {
     (void) state;
     a->state = AUTO_STATE_STOPPED;
     snprintf(a->status_msg, sizeof a->status_msg,
-             "stopped: this build has no B210 (WITH_USRP_B210=OFF)");
+             "stopped: this build has no SDR support");
     auto_tcmd_draw();
 #endif
 }
@@ -5937,12 +5937,25 @@ static void self_test_report(const state_t *state, FILE *out, int argc, char **a
                                        : "standalone";
     fprintf(out, "mode: %s\n", mode);
 
-#ifdef WITH_USRP_B210
-    int b210_compiled = 1;
+#ifdef SSO_WITH_SDR
+    int sdr_compiled = 1;
 #else
-    int b210_compiled = 0;
+    int sdr_compiled = 0;
 #endif
-    fprintf(out, "build: WITH_USRP_B210=%s\n", b210_compiled ? "on" : "off");
+#ifdef WITH_USRP_B210
+    int uhd_compiled = 1;
+#else
+    int uhd_compiled = 0;
+#endif
+#ifdef WITH_RTL_SDR
+    int rtl_compiled = 1;
+#else
+    int rtl_compiled = 0;
+#endif
+    fprintf(out, "build: sdr=%s (uhd=%s, rtl-sdr=%s)\n",
+            sdr_compiled ? "on" : "off",
+            uhd_compiled ? "on" : "off",
+            rtl_compiled ? "on" : "off");
 
     fprintf(out, "tle: %s\n",
             state->prediction.tles_filename
@@ -5974,9 +5987,9 @@ static void self_test_report(const state_t *state, FILE *out, int argc, char **a
                                               : "DISABLED (--no-doppler-correction)");
     fprintf(out, "doppler-rx: %s (software sw_nco on post-decim IQ; hardware LO fixed)\n",
             state->doppler_correction_enabled ? "enabled" : "disabled");
-    fprintf(out, "doppler-tx: %s (hardware B210 LO retune per burst, f=carrier/(1-rr/c))\n",
-            (!b210_compiled || g_without_b210)
-                ? "n/a (no B210)"
+    fprintf(out, "doppler-tx: %s (hardware SDR LO retune per burst, f=carrier/(1-rr/c))\n",
+            (!sdr_compiled || g_without_b210)
+                ? "n/a (no SDR)"
                 : (state->doppler_correction_enabled ? "enabled" : "disabled"));
     fprintf(out, "uplink-nominal-mhz: %.6f\n",
             state->nominal_uplink_frequency_hz / 1e6);
@@ -5998,8 +6011,8 @@ static void self_test_report(const state_t *state, FILE *out, int argc, char **a
                                             : "disabled (--without-rotator)",
             state->antenna_rotator.device_filename,
             baud_str(state->antenna_rotator.serial_speed));
-    fprintf(out, "b210: %s\n",
-            (!b210_compiled || g_without_b210)
+    fprintf(out, "sdr: %s\n",
+            (!sdr_compiled || g_without_b210)
                 ? "disabled (--without-b210 or build-time)"
                 : "enabled");
 
@@ -6317,7 +6330,7 @@ int main(int argc, char **argv)
         }
     }
 
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
     // Open the B210 once, here, before ncurses init — soft-fail on any
     // UHD error so a dev host without a device can still run the UI.
     // rx_session takes ownership of the core; we drop our local handle
@@ -6384,6 +6397,8 @@ int main(int argc, char **argv)
             .device_args         = g_sdr_device[0] ? g_sdr_device : "type=b200",
             .uhd_args_override   = g_uhd_args[0] ? g_uhd_args : NULL,
             .fpga_image_path     = g_sdr_fpga[0] ? g_sdr_fpga : NULL,
+            // RTL-SDR dongle index (UHD ignores it; for UHD use --uhd-args).
+            .device_index        = g_sdr_device[0] ? atoi(g_sdr_device) : 0,
         };
         b210_rx_tx_core_t *core = NULL;
         if (b210_rx_tx_core_open(&cp, &core) != 0) {
@@ -6560,7 +6575,7 @@ int main(int argc, char **argv)
             current_downlink_frequency = state.doppler_downlink_frequency_hz;
         }
 
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
         // TX-side Doppler: transmit at the frequency that places the
         // nominal carrier at the satellite. Sign: range_rate_km_s > 0
         // when the satellite is receding (LOS end of a pass), so the
@@ -6577,7 +6592,7 @@ int main(int argc, char **argv)
             state.doppler_correction_enabled);
 #endif
 
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
         // Auto-record per pass: open the WAV 1 min before AOS (or as
         // soon as we're above the horizon, in case simple_sat_ops
         // started mid-pass), keep it open while the satellite is up,
@@ -7043,7 +7058,7 @@ int main(int argc, char **argv)
             curs_set(show_hw_cursor ? 1 : 0);
         }
 
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
         // Signal ribbon sampler: push one peak-dBFS reading per second
         // so the ribbon in the RX panel rolls left in real time. Also
         // grab the iq_burst bright-bin count so the renderer can pick
@@ -7364,7 +7379,7 @@ int main(int argc, char **argv)
             g_live_waterfall_stdin_fd = -1;
         }
     }
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
     char final_wav_path[512] = "";
     char final_iq_path[512]  = "";
     int  final_iq_rate       = 0;
@@ -7536,7 +7551,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strcmp("--without-b210", argv[i]) == 0) {
             state->n_options++;
             g_without_b210 = 1;
-#ifdef WITH_USRP_B210
+#ifdef SSO_WITH_SDR
         } else if (strncmp("--sdr-type=", argv[i], 11) == 0) {
             state->n_options++;
             if (sdr_backend_type_from_string(argv[i] + 11, &g_sdr_type) != 0) {

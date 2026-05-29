@@ -106,8 +106,17 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
     *out = NULL;
 
     double fm_fullscale = p->fm_fullscale_hz > 0.0 ? p->fm_fullscale_hz : 25000.0;
-    unsigned decim_M    = (p->decim_factor >= 1u) ? p->decim_factor : 1u;
-    unsigned decim_taps = p->decim_taps  > 0u   ? p->decim_taps    : 96u;
+    unsigned req_decim_M = (p->decim_factor >= 1u) ? p->decim_factor : 1u;
+    unsigned decim_taps  = p->decim_taps  > 0u   ? p->decim_taps    : 96u;
+    // The post-decim rate the caller is asking for (rate_hz / decim).
+    // A backend with a fixed/quantized native rate (RTL-SDR) coerces to
+    // a valid native that is an integer multiple of this; the actual
+    // decimation factor is then derived from the backend's native rate
+    // after open, so the chain lands on the same post-decim rate
+    // regardless of which SDR opened.
+    double target_rate = (req_decim_M >= 1u)
+                       ? p->rate_hz / (double)req_decim_M
+                       : p->rate_hz;
 
     b210_rx_tx_core_t *c = (b210_rx_tx_core_t *)calloc(1, sizeof(*c));
     if (c == NULL) {
@@ -122,6 +131,7 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
     sdr_open_params_t sp = {
         .freq_hz             = p->freq_hz,
         .rate_hz             = p->rate_hz,
+        .target_post_decim_hz = target_rate,
         .gain_db             = p->gain_db,
         .bw_hz               = p->bw_hz,
         .rx_antenna          = p->rx_antenna,
@@ -130,6 +140,7 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
         .rx_iq_balance_track = p->rx_iq_balance_track,
         .uhd_args_override   = p->uhd_args_override,
         .fpga_image_path     = p->fpga_image_path,
+        .device_index        = p->device_index,
     };
     if (sdr_backend_open(p->backend_type, &sp, &c->backend) != 0) goto fail;
 
@@ -137,6 +148,16 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
     c->input_rate = caps->native_rate_hz;
     c->max_iq_in  = caps->max_rx_pairs;
     if (c->max_iq_in == 0) c->max_iq_in = 2040;
+
+    // Derive the decimation factor from the backend's ACTUAL native rate
+    // so the post-decim rate matches target_rate whichever SDR opened
+    // (UHD 480k/5, RTL-SDR 1.92M/20 -> both 96 kHz).
+    unsigned decim_M = req_decim_M;
+    if (target_rate > 0.0 && c->input_rate > 0.0) {
+        long m = lround(c->input_rate / target_rate);
+        if (m < 1) m = 1;
+        decim_M = (unsigned)m;
+    }
 
     // actual_rate (post-decimation) is what the FM demod runs at, so it
     // sets k_scale. dphi-per-sample for a given Hz of deviation is

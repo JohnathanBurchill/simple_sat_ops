@@ -94,6 +94,20 @@ if (WITH_USRP_B210)
     endif()
 endif()
 
+# RTL-SDR (RX-only) backend. Off by default; turn on with
+# `cmake .. -DWITH_RTL_SDR=ON` on a host with librtlsdr. simple_sat_ops
+# can be built with UHD, RTL-SDR, or both; at runtime --sdr-type / auto
+# picks the device. An RTL-SDR cannot transmit, so TX is disabled.
+option(WITH_RTL_SDR "Build the RTL-SDR RX-only backend (requires librtlsdr)" OFF)
+if (WITH_RTL_SDR)
+    pkg_check_modules(RTLSDR librtlsdr)
+    if (NOT RTLSDR_FOUND)
+        message(FATAL_ERROR "WITH_RTL_SDR=ON but librtlsdr not found via "
+                            "pkg-config. Install librtlsdr and retry, or rerun "
+                            "with -DWITH_RTL_SDR=OFF.")
+    endif()
+endif()
+
 # sso_core: small set of helpers used by every operator/viewer-aware
 # tool plus the audit log. Pure POSIX; builds on every host. Pulled
 # in via target_link_sso_core() rather than a SHARED lib so the build
@@ -538,6 +552,9 @@ if (OPENSSL_FOUND)
                        src/dsp/fir_decim.c src/dsp/sw_nco.c
                        src/dsp/iq_burst.c
                        src/dsp/modem.c)
+        # WITH_USRP_B210 must be defined for this target too: sdr_backend.c's
+        # ops_for() only returns the UHD ops under this macro.
+        target_compile_definitions(b210_gain_sweep PRIVATE WITH_USRP_B210)
         target_include_directories(b210_gain_sweep PRIVATE
             ${UHD_INCLUDE_DIRS})
         target_link_directories(b210_gain_sweep PRIVATE
@@ -636,18 +653,33 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
         ${NCURSES_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(simple_sat_ops PRIVATE
         ${SGP4SDP4_LIB} ${NCURSES_LIBRARIES} ${OPENSSL_LIBRARIES} m pthread)
-    if (WITH_USRP_B210)
-        target_compile_definitions(simple_sat_ops PRIVATE WITH_USRP_B210)
+    # Shared SDR RX/TX chain + the dispatcher, compiled whenever at least
+    # one backend is enabled. SSO_WITH_SDR gates the SDR-general code in
+    # apps/main.c (which is now device-agnostic). Per-device backends
+    # (sdr_uhd.c / sdr_rtlsdr.c) are added under their own option below.
+    if (WITH_USRP_B210 OR WITH_RTL_SDR)
+        target_compile_definitions(simple_sat_ops PRIVATE SSO_WITH_SDR)
         target_sources(simple_sat_ops PRIVATE
                        src/hw/b210_rx_tx_core.c
-                       src/hw/sdr_backend.c src/hw/sdr_uhd.c
+                       src/hw/sdr_backend.c
                        src/hw/carrier_trim.c
                        src/dsp/fir_decim.c src/dsp/sw_nco.c
                        src/dsp/iq_burst.c
                        src/pipeline/rx_session.c src/pipeline/tx_burst.c)
+    endif()
+    if (WITH_USRP_B210)
+        target_compile_definitions(simple_sat_ops PRIVATE WITH_USRP_B210)
+        target_sources(simple_sat_ops PRIVATE src/hw/sdr_uhd.c)
         target_include_directories(simple_sat_ops PRIVATE ${UHD_INCLUDE_DIRS})
         target_link_directories(simple_sat_ops PRIVATE ${UHD_LIBRARY_DIRS})
         target_link_libraries(simple_sat_ops PRIVATE ${UHD_LIBRARIES})
+    endif()
+    if (WITH_RTL_SDR)
+        target_compile_definitions(simple_sat_ops PRIVATE WITH_RTL_SDR)
+        target_sources(simple_sat_ops PRIVATE src/hw/sdr_rtlsdr.c)
+        target_include_directories(simple_sat_ops PRIVATE ${RTLSDR_INCLUDE_DIRS})
+        target_link_directories(simple_sat_ops PRIVATE ${RTLSDR_LIBRARY_DIRS})
+        target_link_libraries(simple_sat_ops PRIVATE ${RTLSDR_LIBRARIES})
     endif()
     target_link_packet_db(simple_sat_ops)
     target_link_sso_core(simple_sat_ops)
