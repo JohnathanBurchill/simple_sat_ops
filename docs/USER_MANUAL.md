@@ -924,16 +924,20 @@ Once the pass ends, it stops sending commands.
 ### Finding telecommands and their arguments
 
 `simple_sat_ops` only carries telecommands to the satellite - it does
-not define them. The authoritative list of commands, their arguments,
-and the responses to expect lives with the flight firmware in the
-CalgaryToSpace repository:
+not define them. The authoritative documentation lives with the flight
+firmware in the CalgaryToSpace repository:
 
-- <https://github.com/CalgaryToSpace/CTS-SAT-1-OBC-Firmware/blob/main/docs/Mission_Operations/Telecommands_and_Config_Variables.md>
+- Mission operations ICD (start here - the directory of operations
+  documents):
+  <https://github.com/CalgaryToSpace/CTS-SAT-1-OBC-Firmware/tree/main/docs/Mission_Operations>
+- The command list itself - commands, their arguments, and the
+  responses to expect:
+  <https://github.com/CalgaryToSpace/CTS-SAT-1-OBC-Firmware/blob/main/docs/Mission_Operations/Telecommands_and_Config_Variables.md>
 
-Use that page to look up the exact function name, its argument order
-and types, and the form of the reply on the downlink. The command you
-type into the `t` compose modal (or list in a `--tc-file`) is the same
-`CTS1+function_name(...)!` string documented there.
+Use the command list to look up the exact function name, its argument
+order and types, and the form of the reply on the downlink. The command
+you type into the `t` compose modal (or list in a `--tc-file`) is the
+same `CTS1+function_name(...)!` string documented there.
 
 > Note: the manual link points at `main`. The image you are actually
 > flying may be a tagged release rather than `main`; when in doubt,
