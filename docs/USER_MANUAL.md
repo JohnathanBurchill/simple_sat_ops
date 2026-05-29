@@ -805,32 +805,48 @@ at a specific device when more than one is present.
 receives, so all operator functions are available.
 
 If you run a **B210-ish clone whose FPGA differs from the stock image**,
-that bitstream has to be uploaded for the board to come up. A clone is
+that bitstream has to be loaded for the board to come up. A clone is
 indistinguishable from a genuine board on the USB bus *except by its
-serial number*, so detection is by serial:
+serial number*, so the image is selected per-serial.
 
-1. Find the serial: run `sdr_probe`. It prints e.g. `USB serial: 30AA038`
-   and which FPGA image will load.
-2. Map it: add a line to `~/.local/share/simple_sat_ops/sdr_fpga_map`:
+The bitstream is **not** in the repository (a large binary derived from
+vendor IP, so it is git-ignored and never published). It lives on the
+RAO ground-station computer under `/FrontierSat/sdr/`. One-time setup on
+your machine:
+
+1. Copy the image into your FrontierSat tree, at the same path used on
+   RAO:
+
    ```
-   30AA038 /path/to/your/usrp_b210_fpga.bin
+   mkdir -p /FrontierSat/sdr
+   scp <user>@va6raogndstn:/FrontierSat/sdr/usrp_b210_fpga.bin /FrontierSat/sdr/
    ```
-   (The file is created with a template, and your detected serial
-   commented in, the first time `simple_sat_ops` opens the device.)
+
+   If your FrontierSat root is elsewhere, use it - the tools resolve
+   `$FRONTIERSAT_ROOT`, then `/FrontierSat`, then `~/FrontierSat`.
+
+2. Find the device serial: run `sdr_probe`. It prints e.g.
+   `USB serial: 30AA038`.
+
+3. Map the serial to the image - add a line to
+   `~/.local/share/simple_sat_ops/sdr_fpga_map`:
+
+   ```
+   30AA038 /FrontierSat/sdr/usrp_b210_fpga.bin
+   ```
+
+   (That file is created with a template, and your serial commented in,
+   the first time `simple_sat_ops` opens the device.)
+
+4. Confirm: re-run `sdr_probe`. It should report the clone image and the
+   board should open (RX2 / TX-RX).
 
 From then on the clone's image loads automatically whenever that serial
-is seen - a genuine board with a different serial still gets the stock
-image. To override the map, pass `--sdr-fpga=/path/to.bin`, or fold it
-into `--uhd-args="type=b200,serial=...,fpga=/path/to.bin"` (which wins
+is seen; a genuine board with a different serial still gets the stock
+image. To override the map for a one-off, pass `--sdr-fpga=<path>`, or
+fold it into `--uhd-args="type=b200,serial=...,fpga=<path>"` (which wins
 over everything). The serial is read via libusb; UHD's own
 device-enumeration call segfaults on macOS, so it is not used.
-
-The bitstream itself is **not** in the repository: it is a large binary
-derived from vendor IP, so it is git-ignored and distributed within the
-team out of band (a shared drive, not a public release). Put your copy
-wherever you like - the UHD images directory
-(`~/.local/share/uhd/images/`) or the repo's git-ignored `sdr/` folder
-are both fine - and give the map its absolute path.
 
 **RTL-SDR - receive only.** An RTL-SDR dongle (`--sdr-type=rtlsdr`, or
 auto with no USRP present) runs the full receive chain: tracking,
