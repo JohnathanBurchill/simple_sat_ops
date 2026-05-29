@@ -276,4 +276,8 @@ int b210_rx_tx_core_burst(b210_rx_tx_core_t *core,
 // is NULL). The TX UI and the burst path gate on this.
 int b210_rx_tx_core_can_tx(const b210_rx_tx_core_t *core);
 
+// Friendly name of the active SDR (e.g. "USRP B210", "RTL-SDR ...").
+// Returns "" if core is NULL. For the operator banner / audit.
+const char *b210_rx_tx_core_sdr_name(const b210_rx_tx_core_t *core);
+
 #endif // B210_RX_TX_CORE_H

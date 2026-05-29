@@ -115,6 +115,10 @@ double rx_session_get_bandwidth_hz(const rx_session_t *rxs);
 // capability set at open, so it is safe without the worker lock.
 int rx_session_can_tx(const rx_session_t *rxs);
 
+// Friendly name of the active SDR ("USRP B210", "RTL-SDR ...") for the
+// operator banner. Returns "" with no session. Static at open.
+const char *rx_session_sdr_name(const rx_session_t *rxs);
+
 // Async: ask the worker to start recording the post-FIR PCM to a
 // fresh auto-named WAV under the configured pass folder. No-op if
 // already recording.

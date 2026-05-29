@@ -458,3 +458,9 @@ int b210_rx_tx_core_can_tx(const b210_rx_tx_core_t *c)
 {
     return c ? sdr_backend_can_tx(c->backend) : 0;
 }
+
+const char *b210_rx_tx_core_sdr_name(const b210_rx_tx_core_t *c)
+{
+    const sdr_caps_t *caps = c ? sdr_backend_caps(c->backend) : NULL;
+    return caps ? caps->name : "";
+}

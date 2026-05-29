@@ -1815,6 +1815,8 @@ static const char *rx_panel_pt_label(int slot)
 typedef struct {
     int        have_session;
     int        rec_active;
+    char       sdr_name[32];       // active SDR (operator-side; "" for viewers)
+    int        can_tx;             // 0 => RX-only backend (operator-side)
     double     rx_freq_hz;         // effective Doppler-shifted carrier
     double     rx_lo_hz;           // hardware SDR LO (without the
                                    // intentional LO offset added back)
@@ -1856,6 +1858,9 @@ static void rx_panel_collect_local(rx_panel_data_t *d)
     d->have_session = (g_rx_session != NULL);
     if (!d->have_session) return;
     d->rec_active = rx_session_wav_active(g_rx_session);
+    snprintf(d->sdr_name, sizeof d->sdr_name, "%.31s",
+             rx_session_sdr_name(g_rx_session));
+    d->can_tx = rx_session_can_tx(g_rx_session);
     char last[sizeof d->last_frame_summary] = "";
     rx_session_snapshot(g_rx_session,
                         &d->frames_total,
@@ -1932,9 +1937,17 @@ static void render_rx_panel(const rx_panel_data_t *d,
     if (print_row == NULL || d == NULL) return;
     int row = *print_row;
     int col = print_col;
-    mvprintw(row++, col, "%15s   %s%s", "B210",
-             d->have_session ? "active" : "(offline)",
-             d->rec_active ? "  [REC]" : "");
+    if (d->sdr_name[0]) {
+        // Operator side: show the detected SDR + RX-only flag.
+        mvprintw(row++, col, "%15s   %s%s%s", "SDR",
+                 d->sdr_name,
+                 d->can_tx ? "" : "  (RX-only)",
+                 d->rec_active ? "  [REC]" : "");
+    } else {
+        mvprintw(row++, col, "%15s   %s%s", "SDR",
+                 d->have_session ? "active" : "(offline)",
+                 d->rec_active ? "  [REC]" : "");
+    }
     clrtoeol();
     if (d->warning[0]) {
         // Red attribute pair 1 was initialised in init_window; fall
@@ -3094,6 +3107,14 @@ static void tx_compose_open(void) {
     keypad(g_tx_compose_win, TRUE);
     nodelay(g_tx_compose_win, TRUE);
     tx_compose_init(&g_tx_compose_state);
+#ifdef SSO_WITH_SDR
+    // RX-only SDR (e.g. RTL-SDR): the burst can never reach the air, so
+    // keep the allow-tx gate forced off. Compose + preview still work
+    // (commit refuses with a clear message).
+    if (g_rx_session != NULL && !rx_session_can_tx(g_rx_session)) {
+        g_tx_compose_state.allow_tx = 0;
+    }
+#endif
     tx_compose_draw(g_tx_compose_win, &g_tx_compose_state);
     g_tx_compose_last_edit_ns = ts_now_ns();
     g_tx_compose_active = 1;

@@ -811,6 +811,12 @@ int rx_session_can_tx(const rx_session_t *rxs)
     return b210_rx_tx_core_can_tx(rxs->core);
 }
 
+const char *rx_session_sdr_name(const rx_session_t *rxs)
+{
+    if (rxs == NULL || rxs->core == NULL) return "";
+    return b210_rx_tx_core_sdr_name(rxs->core);
+}
+
 double rx_session_get_bandwidth_hz(const rx_session_t *rxs)
 {
     if (rxs == NULL || rxs->core == NULL) return 0.0;
