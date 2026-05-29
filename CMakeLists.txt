@@ -94,17 +94,20 @@ if (WITH_USRP_B210)
     endif()
 endif()
 
-# RTL-SDR (RX-only) backend. Off by default; turn on with
-# `cmake .. -DWITH_RTL_SDR=ON` on a host with librtlsdr. simple_sat_ops
-# can be built with UHD, RTL-SDR, or both; at runtime --sdr-type / auto
-# picks the device. An RTL-SDR cannot transmit, so TX is disabled.
-option(WITH_RTL_SDR "Build the RTL-SDR RX-only backend (requires librtlsdr)" OFF)
+# RTL-SDR (RX-only) backend. On by default, but SOFT: unlike UHD it
+# auto-disables when librtlsdr is absent rather than failing the build,
+# so hosts without the library (or without any SDR at all) still
+# configure. simple_sat_ops can be built with UHD, RTL-SDR, or both; at
+# runtime --sdr-type / auto picks the device. An RTL-SDR cannot
+# transmit, so TX is disabled when one is in use.
+option(WITH_RTL_SDR "Build the RTL-SDR RX-only backend (needs librtlsdr)" ON)
 if (WITH_RTL_SDR)
     pkg_check_modules(RTLSDR librtlsdr)
     if (NOT RTLSDR_FOUND)
-        message(FATAL_ERROR "WITH_RTL_SDR=ON but librtlsdr not found via "
-                            "pkg-config. Install librtlsdr and retry, or rerun "
-                            "with -DWITH_RTL_SDR=OFF.")
+        message(STATUS "librtlsdr not found; RTL-SDR backend disabled. "
+                       "Install librtlsdr to enable it, or pass "
+                       "-DWITH_RTL_SDR=OFF to silence this note.")
+        set(WITH_RTL_SDR OFF)
     endif()
 endif()
 

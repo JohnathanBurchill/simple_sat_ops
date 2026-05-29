@@ -816,8 +816,9 @@ transmit**: the TX compose (`t`) and auto-telecommand (`A`) modals open
 for composing and preview but the allow-tx gate is forced off, and a
 commit is refused with "TX not supported by this SDR (RX-only backend)".
 Pick the dongle with `--sdr-device=<index>` if you have more than one.
-The RTL backend must be compiled in (`-DWITH_RTL_SDR=ON`, needs
-`librtlsdr`).
+The RTL backend is compiled in by default when `librtlsdr` is present
+(it auto-disables if the library is missing; `-DWITH_RTL_SDR=OFF` forces
+it off).
 
 ### Keyboard controls
 
