@@ -679,11 +679,10 @@ Until the whole list is true for you, sit in viewer mode (no
 
 ## A map of the cat: the tools
 
-Everything from here to the appendices is the tool reference. Per the
-Feynman lesson at the front of this manual, it is meant to be
-consulted, not held in your head: learn that these tools exist and
-roughly what each is for, then look up the details when you need them.
-This table is the outline you name the parts off.
+Everything from here to the appendices is the tool reference. It is
+meant to be consulted, not held in your head: learn that these tools
+exist and roughly what each is for, then look up the details when you
+need them. This table is the outline you name the parts off.
 
 One binary touches the hardware during a pass; the rest plan it,
 review it, or take apart what it recorded.
@@ -819,8 +818,14 @@ Screen layout (ncurses, redrawn at ~10 Hz):
 * **RX panel** (when the B210 is open). Live IQ peak and RMS dBFS,
   frame counter from the live AX100 decode loop, shadow decoder
   frame counts, signal-quality estimate.
-* **TX log panel** (bottom). Rolling N-line history of TX events
-  (`draft>`, `sent>`, `ack>`). Viewers see the same lines via IPC.
+* **TX log panel** (bottom). Rolling N-line history of TX events:
+  `draft>` as you compose, `sent>` once a command goes on the air,
+  and a `notsent>` line *only* when a command did **not** reach the air,
+  carrying the reason. A clean send leaves just the `sent>`
+  record - the ground station does not acknowledge its own transmit,
+  and the satellite's reply, if any, arrives on the downlink (the RX
+  panel and packet database), not here. Viewers see the same lines
+  via IPC.
 
 ### Colon-command prompt
 
@@ -853,8 +858,10 @@ gap between repeats, preroll, and three safety-gate checkboxes
 Each field edit is debounced (~200 ms) and broadcast to viewers as
 a `tx-preview` event, so observers see the draft before commit.
 Enter sends a `tx-request`. The main loop's next tick passes RX
-over to TX, transmits the burst, resumes RX, and emits `tx-ack` and
-`tx-command-sent` events that show up in the TX log. Esc cancels.
+over to TX, transmits the burst, resumes RX, and records a
+`tx-command-sent` event in the TX log. If the burst never reaches the
+air - no B210, frame-build failure, UHD error, or `--tx-dry-run` - a
+`tx-not-sent` event carries the reason instead. Esc cancels.
 
 ### Auto-telecommand modal (`A`)
 
