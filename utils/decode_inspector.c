@@ -379,7 +379,9 @@ static int parse_wf_opts_from_passthru(const char **passthru, int n_passthru,
     opt->detrend_tau_s  = 0.0;
     opt->sample_rate    = samp_rate;
     opt->center_hz      = 0.0;
-    opt->zoom_hz        = 30000.0;
+    // Full capture width by default (0 = no zoom); --zoom-khz=<n> narrows
+    // it. --full-width is kept as an explicit no-op for the same.
+    opt->zoom_hz        = 0.0;
     opt->dc_notch       = 0;
     opt->dc_notch_bins  = 2;
     snprintf(opt->power_unit, sizeof opt->power_unit, "dBFS");
