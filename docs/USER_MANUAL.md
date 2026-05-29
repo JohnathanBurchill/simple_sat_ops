@@ -1686,8 +1686,10 @@ you ask? No grand reason - it happened to be Burchill's work laptop,
 and it had Claude Code installed, so that is where the code got
 written. It builds the non-hardware tools (no ALSA, no SGP4SDP4, no
 UHD by default); the actual radio, rotator, and antenna live on the
-RAO ground station. So the loop was: write on the Mac, push, pull on
-RAO, test against hardware, observe, commit the fix. The commits are
+RAO ground station. So the loop was: write and commit on the Mac,
+push, pull on RAO, test against the hardware, and watch for errors,
+limitations, or features worth adding - then back to the Mac to do it
+again. The commits are
 therefore deliberately small, one observable change each, so that a
 regression can be cornered with `git bisect` and a behavior can be
 explained with `git log -p`. A run of forty near-identical
