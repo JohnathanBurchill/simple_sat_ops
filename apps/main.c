@@ -1509,6 +1509,16 @@ static double monotonic_seconds(void)
 // that opens the SDR. --without-b210 (or a non-WITH_USRP_B210 build)
 // leaves g_rx_session NULL and the loop falls through cleanly.
 static int  g_without_b210 = 0;
+#ifdef WITH_USRP_B210
+// SDR backend selection. g_sdr_type defaults to AUTO (probe UHD, then
+// RTL-SDR). g_sdr_device is a backend-specific selector (RTL index;
+// for UHD prefer --uhd-args). g_uhd_args is a verbatim UHD device-args
+// passthrough; g_sdr_fpga forces an FPGA image for a B2xx clone.
+static sdr_backend_type_t g_sdr_type   = SDR_TYPE_AUTO;
+static char g_sdr_device[128] = "";
+static char g_uhd_args[256]   = "";
+static char g_sdr_fpga[512]   = "";
+#endif
 // Async wrapper around antenna_rotator's serial I/O. NULL if no rotator
 // (--without-rotator, or antenna_rotator_init failed). Spawned right
 // after antenna_rotator_init succeeds; joined on shutdown. While set, no
@@ -2981,6 +2991,11 @@ static int tx_compose_commit(const tx_compose_t *c, char *err, size_t err_size) 
                  "TX disabled by --no-tx (preview still goes to viewers)");
         return -1;
     }
+    if (g_rx_session != NULL && !rx_session_can_tx(g_rx_session)) {
+        snprintf(err, err_size,
+                 "TX not supported by this SDR (RX-only backend)");
+        return -1;
+    }
     if (g_tx_request.pending) {
         snprintf(err, err_size, "previous burst still in flight");
         return -1;
@@ -4353,6 +4368,14 @@ void usage(FILE *dest, const char *name, int full)
         "  --without-b210               Skip the USRP B210 (dev hosts that\n"
         "                               have UHD but no device, or any time\n"
         "                               you just want the UI + rotator).\n"
+        "  --sdr-type=uhd|rtlsdr|auto   SDR backend (default auto: probe UHD,\n"
+        "                               then RTL-SDR). RTL-SDR is RX-only.\n"
+        "  --sdr-device=<sel>           Backend-specific device selector\n"
+        "                               (RTL-SDR index; for UHD use --uhd-args).\n"
+        "  --uhd-args=<args>            UHD device-args verbatim (e.g.\n"
+        "                               \"type=b200,serial=...\"). Overrides detect.\n"
+        "  --sdr-fpga=<path>            Force a UHD FPGA image (B2xx clone whose\n"
+        "                               bitstream differs from the stock image).\n"
         "  --tr-switch-device=<path>    UHF T/R antenna switch (USB-CDC).\n"
         "                               Default /dev/ttyACM0, auto-probed on\n"
         "                               start; absence is warned-and-continued.\n"
@@ -6326,7 +6349,6 @@ int main(int argc, char **argv)
             .gain_db         = state.rx_gain_db,
             .bw_hz           = -1.0,
             .fm_fullscale_hz = 25000.0,
-            .device_args     = "type=b200",
             .rx_antenna      = "RX2",
             // fir_decim budget:
             //   - operator LO offset clamped ±45 kHz (apps/main.c
@@ -6354,6 +6376,14 @@ int main(int argc, char **argv)
             .rx_iq_balance_track = state.rx_iq_balance_track,
             .fm_lo_compensation_hz = state.rx_lo_offset_hz,
             .carrier_trim_hz       = carrier_trim_load_hz(),
+            // SDR backend selection: type (default auto), and the UHD
+            // clone overrides. --sdr-device routes to the UHD device
+            // args when given (e.g. "serial=..."); --uhd-args takes
+            // precedence and is passed verbatim.
+            .backend_type        = g_sdr_type,
+            .device_args         = g_sdr_device[0] ? g_sdr_device : "type=b200",
+            .uhd_args_override   = g_uhd_args[0] ? g_uhd_args : NULL,
+            .fpga_image_path     = g_sdr_fpga[0] ? g_sdr_fpga : NULL,
         };
         b210_rx_tx_core_t *core = NULL;
         if (b210_rx_tx_core_open(&cp, &core) != 0) {
@@ -6363,9 +6393,11 @@ int main(int argc, char **argv)
             sso_audit_event("b210-open-failed", "");
         } else {
             fprintf(stderr,
-                "simple_sat_ops: B210 open at %.6f MHz (post-decim rate %.0f)\n",
+                "simple_sat_ops: SDR open at %.6f MHz (post-decim rate %.0f, "
+                "tx=%s)\n",
                 b210_rx_tx_core_actual_freq(core) / 1e6,
-                b210_rx_tx_core_actual_rate(core));
+                b210_rx_tx_core_actual_rate(core),
+                b210_rx_tx_core_can_tx(core) ? "yes" : "no (RX-only)");
             {
                 char det[256];
                 snprintf(det, sizeof det,
@@ -7164,6 +7196,13 @@ int main(int argc, char **argv)
                          g_tx_request.summary);
                 outcome = "rejected: no HMAC key (see banner)";
                 finished = 1;
+            } else if (g_rx_session != NULL && !rx_session_can_tx(g_rx_session)) {
+                // RX-only backend (e.g. RTL-SDR): never reaches the air.
+                // Backstop for a stale queued burst that slipped past the
+                // compose / auto-tcmd gates.
+                snprintf(summary, sizeof summary, "%s", g_tx_request.summary);
+                outcome = "rejected: RX-only SDR";
+                finished = 1;
             } else if (g_rx_session != NULL) {
                 if (!g_tx_inflight) {
                     if (rx_session_submit_burst(g_rx_session, &g_tx_request,
@@ -7497,6 +7536,24 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         } else if (strcmp("--without-b210", argv[i]) == 0) {
             state->n_options++;
             g_without_b210 = 1;
+#ifdef WITH_USRP_B210
+        } else if (strncmp("--sdr-type=", argv[i], 11) == 0) {
+            state->n_options++;
+            if (sdr_backend_type_from_string(argv[i] + 11, &g_sdr_type) != 0) {
+                fprintf(stderr, "--sdr-type: unknown '%s' "
+                        "(want uhd | rtlsdr | auto)\n", argv[i] + 11);
+                return EXIT_FAILURE;
+            }
+        } else if (strncmp("--sdr-device=", argv[i], 13) == 0) {
+            state->n_options++;
+            snprintf(g_sdr_device, sizeof g_sdr_device, "%s", argv[i] + 13);
+        } else if (strncmp("--uhd-args=", argv[i], 11) == 0) {
+            state->n_options++;
+            snprintf(g_uhd_args, sizeof g_uhd_args, "%s", argv[i] + 11);
+        } else if (strncmp("--sdr-fpga=", argv[i], 11) == 0) {
+            state->n_options++;
+            snprintf(g_sdr_fpga, sizeof g_sdr_fpga, "%s", argv[i] + 11);
+#endif
         } else if (strcmp("--no-tx", argv[i]) == 0) {
             state->n_options++;
             g_no_tx = 1;

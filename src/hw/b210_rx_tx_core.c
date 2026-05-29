@@ -116,8 +116,9 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
     }
     c->fm_fullscale_hz = fm_fullscale;
 
-    // Open the device backend. (Phase 1: UHD only. Phase 2 will let the
-    // caller pick the type / pass UHD device-args + FPGA overrides.)
+    // Open the device backend. backend_type selects UHD / RTL-SDR / auto;
+    // the UHD overrides let the caller force device args or an FPGA image
+    // for a B2xx clone.
     sdr_open_params_t sp = {
         .freq_hz             = p->freq_hz,
         .rate_hz             = p->rate_hz,
@@ -127,10 +128,10 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
         .device_args         = p->device_args,
         .rx_dc_offset_track  = p->rx_dc_offset_track,
         .rx_iq_balance_track = p->rx_iq_balance_track,
-        .uhd_args_override   = NULL,
-        .fpga_image_path     = NULL,
+        .uhd_args_override   = p->uhd_args_override,
+        .fpga_image_path     = p->fpga_image_path,
     };
-    if (sdr_backend_open(SDR_TYPE_UHD, &sp, &c->backend) != 0) goto fail;
+    if (sdr_backend_open(p->backend_type, &sp, &c->backend) != 0) goto fail;
 
     const sdr_caps_t *caps = sdr_backend_caps(c->backend);
     c->input_rate = caps->native_rate_hz;

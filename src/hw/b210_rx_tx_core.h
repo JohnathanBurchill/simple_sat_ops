@@ -37,6 +37,8 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+#include "sdr_backend.h"
+
 typedef struct b210_rx_tx_core_params {
     double      freq_hz;          // initial center freq
     double      rate_hz;          // requested sample rate (UHD will coerce)
@@ -114,6 +116,16 @@ typedef struct b210_rx_tx_core_params {
     // pass 0 if you don't want a trim. Added on top of the operator
     // offset and the UHD residual inside the second NCO.
     double      carrier_trim_hz;
+
+    // SDR backend selection. SDR_TYPE_AUTO (0) probes the compiled-in
+    // backends in order (UHD, then RTL-SDR). uhd_args_override, when
+    // non-NULL, is passed to UHD verbatim as the device args (escape
+    // hatch); fpga_image_path, when non-NULL, forces fpga=<path> so UHD
+    // uploads that bitstream — for a B2xx clone whose FPGA differs from
+    // the stock image. Both ignored by non-UHD backends.
+    sdr_backend_type_t backend_type;
+    const char        *uhd_args_override;
+    const char        *fpga_image_path;
 } b210_rx_tx_core_params_t;
 
 typedef struct b210_rx_tx_core b210_rx_tx_core_t;

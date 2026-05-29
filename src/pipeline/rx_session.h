@@ -109,6 +109,12 @@ double rx_session_get_lo_freq_hz(const rx_session_t *rxs);
 // Post-decimation sample rate (Hz) = captured bandwidth.
 double rx_session_get_bandwidth_hz(const rx_session_t *rxs);
 
+// 1 if the underlying SDR backend can transmit, 0 if it is RX-only
+// (e.g. an RTL-SDR) or there is no session. The operator UI gates the
+// TX compose / auto-telecommand paths on this. Reads a static
+// capability set at open, so it is safe without the worker lock.
+int rx_session_can_tx(const rx_session_t *rxs);
+
 // Async: ask the worker to start recording the post-FIR PCM to a
 // fresh auto-named WAV under the configured pass folder. No-op if
 // already recording.
