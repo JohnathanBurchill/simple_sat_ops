@@ -97,9 +97,10 @@ typedef struct {
     int    dtsec_valid;
 
     // Multi-day drift of the orbit-mean along-track offset: a linear fit
-    // over the trend window. trend_now_s is the fitted offset now,
-    // trend_end_s at the end of the window, trend_rate_s_per_day the slope.
-    double trend_now_s, trend_end_s, trend_rate_s_per_day;
+    // over a window centred on now (-trend_days .. +trend_days). _start
+    // is the fitted offset trend_days ago, _now at present, _end
+    // trend_days ahead, _rate the slope (s/day).
+    double trend_start_s, trend_now_s, trend_end_s, trend_rate_s_per_day;
     int    trend_valid;
 } obj_t;
 
@@ -420,8 +421,9 @@ static double orbit_mean_dtsec(obj_t *a, obj_t *b, double jul, double period_day
 }
 
 // For each subsequent object, linear-fit the orbit-mean along-track
-// offset vs object 0 over the next `days`, so we can see whether it is
-// drifting apart or closing on average. Fills trend_now/end/rate.
+// offset vs object 0 over a window centred on now (-days .. +days), so
+// we can see whether it has been and is drifting apart or closing on
+// average. Fills trend_start/now/end/rate.
 static void compute_alongtrack_trend(obj_t *objs, int n, double jul_now, double days)
 {
     for (int i = 1; i < n; ++i) objs[i].trend_valid = 0;
@@ -430,33 +432,32 @@ static void compute_alongtrack_trend(obj_t *objs, int n, double jul_now, double 
     if (!(xno > 0.0)) return;
     double period_days = (2.0 * M_PI / xno) / 1440.0;
 
-    int M = (int) (days * 2.0) + 1;                 // ~12-hourly samples
-    if (M < 3) M = 3;
-    if (M > 64) M = 64;
+    // Sample the actual orbit-mean offset at -days, now, and +days rather
+    // than least-squares fitting: for a fast-drifting object the offset is
+    // not linear over the window, and a fit intercept would disagree with
+    // the instantaneous value. The endpoints give an honest average rate.
     for (int i = 1; i < n; ++i) {
         if (!objs[i].loaded) continue;
-        double sx = 0, sy = 0, sxx = 0, sxy = 0;
-        for (int j = 0; j < M; ++j) {
-            double x = days * (double) j / (double) (M - 1);   // days from now
-            double y = orbit_mean_dtsec(&objs[0], &objs[i], jul_now + x, period_days);
-            sx += x; sy += y; sxx += x * x; sxy += x * y;
-        }
-        double mm = (double) M;
-        double denom = mm * sxx - sx * sx;
-        double b = (denom != 0.0) ? (mm * sxy - sx * sy) / denom : 0.0;
-        double a = (sy - b * sx) / mm;
-        objs[i].trend_now_s          = a;
-        objs[i].trend_rate_s_per_day = b;
-        objs[i].trend_end_s          = a + b * days;
+        double ys = orbit_mean_dtsec(&objs[0], &objs[i], jul_now - days, period_days);
+        double yn = orbit_mean_dtsec(&objs[0], &objs[i], jul_now,        period_days);
+        double ye = orbit_mean_dtsec(&objs[0], &objs[i], jul_now + days, period_days);
+        objs[i].trend_start_s        = ys;
+        objs[i].trend_now_s          = yn;
+        objs[i].trend_end_s          = ye;
+        objs[i].trend_rate_s_per_day = (ye - ys) / (2.0 * days);
         objs[i].trend_valid          = 1;
     }
 }
 
-// "separating" / "closing" / "stable" by comparing the magnitude of the
-// along-track offset now vs at the end of the trend window.
-static const char *trend_word(double now_s, double end_s)
+// Verdict over the trend window from its endpoints. A sign flip means the
+// objects pass through coincidence inside the window ("crossing");
+// otherwise compare the magnitude of the offset at the two ends.
+static const char *trend_word(double start_s, double end_s)
 {
-    double d = fabs(end_s) - fabs(now_s);
+    if ((start_s > 0.0) != (end_s > 0.0)
+        && fabs(start_s) > 1.0 && fabs(end_s) > 1.0)
+        return "crossing";
+    double d = fabs(end_s) - fabs(start_s);
     if (d >  1.0) return "separating";
     if (d < -1.0) return "closing";
     return "stable";
@@ -621,21 +622,23 @@ static void draw(obj_t *objs, int n, double jul_now, double freq_hz,
         }
         row++;
 
-        // --- DRIFT: along-track offset trend over the next few days ---
-        char dtitle[40];
-        snprintf(dtitle, sizeof dtitle, "DRIFT vs 1 (%.1fd)", g_trend_days);
-        mvprintw(row++, 0, "%-17s%9s %10s %9s %s",
-                 dtitle, "now s", "rate s/d", "end s", "trend");
+        // --- DRIFT: along-track offset trend centred on now (+/- days) ---
+        char dtitle[40], hstart[24], hend[24];
+        snprintf(dtitle, sizeof dtitle, "DRIFT vs 1 (%.1fd)", 2.0 * g_trend_days);
+        snprintf(hstart, sizeof hstart, "-%gd s", g_trend_days);
+        snprintf(hend,   sizeof hend,   "+%gd s", g_trend_days);
+        mvprintw(row++, 0, "%-17s%8s %8s %9s %8s %s",
+                 dtitle, hstart, "now s", "rate s/d", hend, "trend");
         for (int i = 1; i < n; ++i) {
             obj_t *b = &objs[i];
             if (!b->loaded) { row++; continue; }
             if (b->trend_valid)
-                mvprintw(row++, 0, "%d %-*.*s %9.1f %10.2f %9.1f %s",
+                mvprintw(row++, 0, "%d %-*.*s %8.1f %8.1f %9.2f %8.1f %s",
                          i + 1, NAME_COL, NAME_COL, b->name,
-                         b->trend_now_s, b->trend_rate_s_per_day, b->trend_end_s,
-                         trend_word(b->trend_now_s, b->trend_end_s));
+                         b->trend_start_s, b->trend_now_s, b->trend_rate_s_per_day,
+                         b->trend_end_s, trend_word(b->trend_start_s, b->trend_end_s));
             else
-                mvprintw(row++, 0, "%d %-*.*s %9s",
+                mvprintw(row++, 0, "%d %-*.*s %8s",
                          i + 1, NAME_COL, NAME_COL, b->name, "--");
         }
         row++;
@@ -745,19 +748,22 @@ static void print_text(obj_t *objs, int n, double jul_now, double freq_hz,
                 printf("%d %-*.*s %12s %12s\n",
                        i + 1, NAME_COL, NAME_COL, b->name, "--", "--");
         }
-        char dtitle[40];
-        snprintf(dtitle, sizeof dtitle, "DRIFT vs 1 (%.1fd)", g_trend_days);
-        printf("\n%-17s%9s %10s %9s %s\n", dtitle, "now s", "rate s/d", "end s", "trend");
+        char dtitle[40], hstart[24], hend[24];
+        snprintf(dtitle, sizeof dtitle, "DRIFT vs 1 (%.1fd)", 2.0 * g_trend_days);
+        snprintf(hstart, sizeof hstart, "-%gd s", g_trend_days);
+        snprintf(hend,   sizeof hend,   "+%gd s", g_trend_days);
+        printf("\n%-17s%8s %8s %9s %8s %s\n",
+               dtitle, hstart, "now s", "rate s/d", hend, "trend");
         for (int i = 1; i < n; ++i) {
             obj_t *b = &objs[i];
             if (!b->loaded) continue;
             if (b->trend_valid)
-                printf("%d %-*.*s %9.1f %10.2f %9.1f %s\n",
+                printf("%d %-*.*s %8.1f %8.1f %9.2f %8.1f %s\n",
                        i + 1, NAME_COL, NAME_COL, b->name,
-                       b->trend_now_s, b->trend_rate_s_per_day, b->trend_end_s,
-                       trend_word(b->trend_now_s, b->trend_end_s));
+                       b->trend_start_s, b->trend_now_s, b->trend_rate_s_per_day,
+                       b->trend_end_s, trend_word(b->trend_start_s, b->trend_end_s));
             else
-                printf("%d %-*.*s %9s\n", i + 1, NAME_COL, NAME_COL, b->name, "--");
+                printf("%d %-*.*s %8s\n", i + 1, NAME_COL, NAME_COL, b->name, "--");
         }
     }
 }
@@ -780,11 +786,12 @@ static void usage(const char *prog)
         "  --alt <m>          Observer altitude metres (default: RAO, %.0f)\n"
         "  --freq-mhz <MHz>   Carrier for the Doppler column (default: %.3f)\n"
         "  --window-min <min> Forward search window for the next pass (default: %.0f)\n"
-        "  --trend-days <d>   Window for the along-track drift trend (default: %.1f)\n"
+        "  --trend-days <d>   Half-window (days) for the drift trend, centred on now,\n"
+        "                     so the trend spans -d..+d (default: %.1f, i.e. %.0f d total)\n"
         "  --once             Print one snapshot as plain text and exit (no UI).\n"
         "  --help             This text.\n",
         prog, RAO_LATITUDE, RAO_LONGITUDE, RAO_ALTITUDE,
-        DEFAULT_FREQ_MHZ, DEFAULT_WINDOW_MIN, g_trend_days);
+        DEFAULT_FREQ_MHZ, DEFAULT_WINDOW_MIN, g_trend_days, 2.0 * g_trend_days);
 }
 
 // Pull the value for a "--flag value" pair, or NULL if missing.
