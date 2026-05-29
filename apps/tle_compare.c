@@ -79,8 +79,8 @@ typedef struct {
 
     // Orbit shape from the elements (constant for the loaded TLE),
     // computed once at setup. Apogee/perigee as altitudes above the
-    // mean Earth radius (standard catalog convention).
-    double apogee_km, perigee_km;
+    // mean Earth radius (standard catalog convention); period in minutes.
+    double apogee_km, perigee_km, period_min;
 
     // TLE epoch as a Julian date (the instant the elements are valid).
     double epoch_jul;
@@ -204,6 +204,9 @@ static void setup_object(obj_t *o)
         o->apogee_km  = a_km * (1.0 + e) - EARTH_RADIUS_KM;
         o->perigee_km = a_km * (1.0 - e) - EARTH_RADIUS_KM;
     }
+    // Orbital period: xno is rad/min after select_ephemeris.
+    if (o->tle_ready.xno > 0.0)
+        o->period_min = 2.0 * M_PI / o->tle_ready.xno;
 
     // tle.epoch is the raw YYDDD.ddddd field (select_ephemeris leaves it
     // alone); Julian_Date_of_Epoch turns it into a Julian date.
@@ -531,13 +534,15 @@ static void draw(obj_t *objs, int n, double jul_now, double freq_hz,
     }
     row++;
 
-    // --- ORBIT (apogee / perigee altitude) ---
-    mvprintw(row++, 0, "ORBIT            %11s %11s", "apogee km", "perigee km");
+    // --- ORBIT (apogee / perigee altitude, period) ---
+    mvprintw(row++, 0, "ORBIT            %11s %11s %11s",
+             "apogee km", "perigee km", "period min");
     for (int i = 0; i < n; ++i) {
         obj_t *o = &objs[i];
         if (!o->loaded) { row++; continue; }
-        mvprintw(row++, 0, "%d %-*.*s %11.1f %11.1f",
-                 i + 1, NAME_COL, NAME_COL, o->name, o->apogee_km, o->perigee_km);
+        mvprintw(row++, 0, "%d %-*.*s %11.1f %11.1f %11.2f",
+                 i + 1, NAME_COL, NAME_COL, o->name,
+                 o->apogee_km, o->perigee_km, o->period_min);
     }
     row++;
 
@@ -688,12 +693,14 @@ static void print_text(obj_t *objs, int n, double jul_now, double freq_hz,
         printf("%d %-*.*s %8.2f %7.2f %10.1f %11.3f\n",
                i + 1, NAME_COL, NAME_COL, o->name, o->lat, o->lon, o->alt_km, o->speed_km_s);
     }
-    printf("\nORBIT            %11s %11s\n", "apogee km", "perigee km");
+    printf("\nORBIT            %11s %11s %11s\n",
+           "apogee km", "perigee km", "period min");
     for (int i = 0; i < n; ++i) {
         obj_t *o = &objs[i];
         if (!o->loaded) continue;
-        printf("%d %-*.*s %11.1f %11.1f\n",
-               i + 1, NAME_COL, NAME_COL, o->name, o->apogee_km, o->perigee_km);
+        printf("%d %-*.*s %11.1f %11.1f %11.2f\n",
+               i + 1, NAME_COL, NAME_COL, o->name,
+               o->apogee_km, o->perigee_km, o->period_min);
     }
     printf("\nDOPPLER          %10s %14s\n", "shift kHz", "downlink MHz");
     for (int i = 0; i < n; ++i) {
