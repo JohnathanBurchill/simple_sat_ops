@@ -573,6 +573,17 @@ if (SGP4SDP4_LIB)
     target_link_libraries(lifetime PRIVATE ${SGP4SDP4_LIB} m)
     list(APPEND SSO_TARGETS lifetime)
 
+    # Live side-by-side TLE comparison (needs ncurses for the live UI).
+    if (NCURSES_FOUND)
+        add_executable(tle_compare apps/tle_compare.c
+                       src/orbit/prediction.c src/orbit/oem.c src/orbit/tle_csv.c)
+        target_include_directories(tle_compare PRIVATE ${NCURSES_INCLUDE_DIRS})
+        target_link_directories(tle_compare PRIVATE ${NCURSES_LIBRARY_DIRS})
+        target_link_libraries(tle_compare PRIVATE
+                              ${SGP4SDP4_LIB} ${NCURSES_LIBRARIES} m)
+        list(APPEND SSO_TARGETS tle_compare)
+    endif()
+
     # Prediction self-test: load a frozen fixture TLE, exercise
     # tle_default_path / load_tle / update_satellite_position /
     # update_pass_predictions, and assert physically-plausible ranges.
