@@ -7,6 +7,8 @@ pagetitle: "The Sat Ops Guide"
 *A field guide to pointing antennas, pulling frames out of the noise,
 and talking to a satellite that only answers when you ask politely.*
 
+Version: 1
+
 Initial version prepared by Johnathan K. Burchill and Claude Opus 4.8
 at the University of Calgary.
 
