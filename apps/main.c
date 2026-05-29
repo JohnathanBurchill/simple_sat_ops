@@ -642,6 +642,25 @@ static rx_session_t *g_rx_session;
 // but cmd_dispatch needs to check it.
 static char g_auto_tcmd_file_path[512];
 
+// :retarget <file> swaps the tracked satellite mid-pass. retarget_to_tle
+// reads the first satellite from the file and re-points the live
+// ephemeris at it. These results let cmd_dispatch report what happened.
+enum {
+    RETARGET_OK        =  0,   // swapped; antenna re-aims on the next tick
+    RETARGET_SAME      =  1,   // same file as the current target; no-op
+    RETARGET_BAD_ARG   = -1,   // no path given
+    RETARGET_READ_ERR  = -2,   // could not read a TLE from the file
+    RETARGET_BAD_TLE   = -3,   // elements present but failed validation
+};
+static int retarget_to_tle(state_t *state, const char *path);
+// File path of the satellite currently being tracked, so a repeat
+// :retarget on the same file is a no-op. Seeded from the startup TLE
+// path; updated on every successful retarget.
+static char g_target_tle_path[1024];
+// Stable backing store for satellite_ephem.name after a retarget (the
+// startup name points at argv / an apply_args buffer).
+static char g_target_name[64];
+
 // Dispatch the typed command. state may be touched by tracking-related
 // commands; nothing else needs it. Returns nothing -- result lands in
 // g_cmd_status for the next redraw.
@@ -664,6 +683,7 @@ static void cmd_dispatch(state_t *state)
     }
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "h") == 0 || strcmp(cmd, "?") == 0) {
         cmd_set_status("commands: help tx track stop home quit "
+                       "retarget <tle-file> "
                        "freq <MHz> lo_offset <±kHz> lo_bandwidth <kHz> "
                        "gain <dB> rs on|off spectrum <sec>");
     } else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0
@@ -699,6 +719,42 @@ static void cmd_dispatch(state_t *state)
         point_to_stationary_target(state, 0.0, 0.0);
         cmd_set_status("home: az=0 el=0");
         sso_audit_event("rotator-home", "az=0 el=0");
+    } else if (strcmp(cmd, "retarget") == 0) {
+        if (arg1 == NULL) {
+            cmd_set_status("retarget: usage `retarget <tle-file>` "
+                           "(first satellite in the file is used)");
+        } else {
+            int rc = retarget_to_tle(state, arg1);
+            const char *name =
+                state->prediction.satellite_ephem.tle.sat_name;
+            double mins =
+                state->prediction.predicted_minutes_until_visible;
+            switch (rc) {
+            case RETARGET_OK:
+                if (mins > 0.0) {
+                    cmd_set_status("retarget -> %s (AOS in %.1f min)",
+                                   name, mins);
+                } else {
+                    cmd_set_status("retarget -> %s (in pass, %.0fs elapsed)",
+                                   name, -mins * 60.0);
+                }
+                sso_audit_event("retarget", name);
+                break;
+            case RETARGET_SAME:
+                cmd_set_status("retarget: already on %s (same file)", arg1);
+                break;
+            case RETARGET_READ_ERR:
+                cmd_set_status("retarget: cannot read a TLE from '%s'", arg1);
+                break;
+            case RETARGET_BAD_TLE:
+                cmd_set_status("retarget: '%s' has invalid TLE elements",
+                               arg1);
+                break;
+            default:
+                cmd_set_status("retarget: bad argument");
+                break;
+            }
+        }
     } else if (strcmp(cmd, "freq") == 0) {
         if (arg1 == NULL) {
             cmd_set_status("freq: missing argument (MHz)");
@@ -4772,6 +4828,137 @@ static void main_pursuit_build_plan(state_t *state, double jul_now)
             g_pursuit_plan.iterations_used);
 }
 
+// Two paths point at the same TLE file? Canonicalise both with
+// realpath() so /a/./tle and /a/tle compare equal; fall back to a
+// plain string compare if either path can't be resolved (e.g. a
+// relative path whose file was just removed). NULL/empty never match.
+static int retarget_same_file(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL || a[0] == '\0' || b[0] == '\0') return 0;
+    char *ra = realpath(a, NULL);
+    char *rb = realpath(b, NULL);
+    int same = strcmp(ra ? ra : a, rb ? rb : b) == 0;
+    free(ra);
+    free(rb);
+    return same;
+}
+
+// Read the FIRST satellite from a 3-line TLE file: its name line and the
+// two element lines, packed into the 139-byte buffer sgp4sdp4 wants
+// (two 69-char lines joined, NUL-padded). Stops at the first complete
+// record. Returns 0 on success, -1 if the file can't be opened or a
+// full name+line1+line2 triple isn't present.
+static int retarget_read_first_tle(const char *path,
+                                   char *name, size_t name_cap,
+                                   char tle_out[139])
+{
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return -1;
+    char line[256];
+    char l1[256] = {0};
+    char l2[256] = {0};
+    int  have_name = 0;
+    name[0] = '\0';
+    while (fgets(line, sizeof line, f) != NULL) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'
+                      || line[n - 1] == ' '  || line[n - 1] == '\t')) {
+            line[--n] = '\0';
+        }
+        if (n == 0) continue;
+        int is_elem = ((line[0] == '1' || line[0] == '2') && line[1] == ' ');
+        if (!have_name && !is_elem) {
+            snprintf(name, name_cap, "%s", line);
+            have_name = 1;
+            continue;
+        }
+        if (line[0] == '1' && line[1] == ' ' && l1[0] == '\0') {
+            snprintf(l1, sizeof l1, "%s", line);
+            continue;
+        }
+        if (line[0] == '2' && line[1] == ' ' && l2[0] == '\0') {
+            snprintf(l2, sizeof l2, "%s", line);
+            break;  // first complete record -> done
+        }
+    }
+    fclose(f);
+    if (!have_name || l1[0] == '\0' || l2[0] == '\0') return -1;
+    size_t a = strlen(l1);
+    size_t b = strlen(l2);
+    if (a > 69) a = 69;
+    if (b > 69) b = 69;
+    memset(tle_out, 0, 139);
+    memcpy(tle_out, l1, a);
+    memcpy(tle_out + 69, l2, b);
+    return 0;
+}
+
+// Swap the tracked satellite mid-pass to the first one in `path`.
+//
+// The new target's elements replace the live ephemeris; the SGP4/SDP4
+// selection (global flag state) is re-picked for it. Pass geometry is
+// recomputed from scratch so the display, flip decision and pursuit
+// plan all reflect the new object. The antenna is NOT homed first: we
+// clear the flip latch + per-pass tracking flag so the track loop
+// re-derives and aims straight at the new sat's current sky position,
+// and we keep target_azimuth_unwrapped so the azimuth accumulator picks
+// the co-terminal nearest where the antenna already is (short slew, no
+// trip through 0,0).
+//
+// A repeat :retarget on the same file is a no-op (RETARGET_SAME);
+// different files swap even when they name the same satellite. Returns
+// one of the RETARGET_* codes.
+static int retarget_to_tle(state_t *state, const char *path)
+{
+    if (path == NULL || path[0] == '\0') return RETARGET_BAD_ARG;
+    if (retarget_same_file(path, g_target_tle_path)) return RETARGET_SAME;
+
+    char name[64];
+    char tle[139];
+    if (retarget_read_first_tle(path, name, sizeof name, tle) != 0) {
+        return RETARGET_READ_ERR;
+    }
+    if (!Good_Elements(tle)) return RETARGET_BAD_TLE;
+
+    // Commit the new elements. select_ephemeris rewrites the TLE in
+    // place, so it must be called exactly once on these freshly
+    // converted elements -- clear the global flags first so the
+    // SGP4/SDP4 choice is made fresh for this object.
+    snprintf(g_target_name, sizeof g_target_name, "%s", name);
+    Convert_Satellite_Data(tle, &state->prediction.satellite_ephem.tle);
+    snprintf(state->prediction.satellite_ephem.tle.sat_name,
+             sizeof state->prediction.satellite_ephem.tle.sat_name,
+             "%s", name);
+    state->prediction.satellite_ephem.name = g_target_name;
+    ClearFlag(ALL_FLAGS);
+    select_ephemeris(&state->prediction.satellite_ephem.tle);
+
+    // Recompute pass geometry for the new target. Reset max-elevation to
+    // the sentinel so compute_predictions walks back to AOS when we're
+    // already mid-pass (otherwise it would only see the pass remainder).
+    state->prediction.predicted_max_elevation = -180.0;
+    struct tm utc;
+    struct timeval tv;
+    UTC_Calendar_Now(&utc, &tv);
+    double jul_now = Julian_Date(&utc, &tv);
+    update_satellite_position(&state->prediction, jul_now);
+    compute_predictions(state, jul_now);
+
+    // Re-aim without homing: drop the old plan and clear the per-pass
+    // latches. An active track (satellite_tracking set) re-derives the
+    // flip decision, rebuilds the pursuit plan, and slews to the new
+    // target on the next tick. If we weren't tracking, only the target
+    // changes -- nothing moves until the operator presses T.
+    main_pursuit_clear_plan();
+    state->antenna_rotator.tracking           = 0;
+    state->antenna_rotator.flip_mode_pass     = 0;
+    state->antenna_rotator.flip_decision_made = 0;
+    state->antenna_rotator.flip_half          = 0;
+
+    snprintf(g_target_tle_path, sizeof g_target_tle_path, "%s", path);
+    return RETARGET_OK;
+}
+
 // Pull az/el from the async snapshot and write them through to az/el AND
 // target_* on state. Used after a STOP / on tracking start when targets
 // should reflect the physical position. Returns 0 on success, -1 if no
@@ -5691,6 +5878,12 @@ int main(int argc, char **argv)
     }
     ClearFlag(ALL_FLAGS);
     select_ephemeris(&state.prediction.satellite_ephem.tle);
+
+    // Seed the retarget guard with the startup TLE so a `:retarget` on
+    // the same file is correctly a no-op.
+    snprintf(g_target_tle_path, sizeof g_target_tle_path, "%s",
+             state.prediction.tles_filename
+                 ? state.prediction.tles_filename : "");
 
     // With a fresh TLE loaded, find the upcoming pass and stand up
     // /FrontierSat/Operations/<yyyymmdd>/<hhmmLT>/ for it before the
