@@ -793,6 +793,14 @@ opens. Pick one explicitly with `--sdr-type=uhd` or `--sdr-type=rtlsdr`.
 The active SDR and its transmit capability are shown on the RX panel
 (`SDR <name>` or `SDR <name> (RX-only)`) and on the startup line.
 
+**Confirm the hardware first with `sdr_probe`.** Before a pass, run
+`sdr_probe` to see what's attached without starting `simple_sat_ops`. It
+opens the UHD device the same way the operator UI would, prints its name
+and the RX/TX channel counts and antennas, names the ports
+`simple_sat_ops` uses (receive on `RX2`, transmit on `TX/RX`), and then
+lists any RTL-SDR dongles. Use `sdr_probe --uhd-args=serial=...` to point
+at a specific device when more than one is present.
+
 **USRP (UHD) - the operational path.** The UHD backend transmits and
 receives, so all operator functions are available.
 

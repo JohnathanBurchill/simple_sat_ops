@@ -578,6 +578,26 @@ else()
     message(STATUS "libcrypto not found; uplink_test and rx_decode will not be built.")
 endif()
 
+# ----- SDR pre-flight probe (no OpenSSL / ncurses needed) --------------------
+#
+# `sdr_probe` reports which UHD device and antenna ports simple_sat_ops
+# would use, plus any RTL-SDR dongles. Buildable on any host with an SDR
+# library so the operator can confirm the hardware before a pass.
+if (WITH_USRP_B210)
+    add_executable(sdr_probe utils/sdr_probe.c)
+    target_compile_definitions(sdr_probe PRIVATE WITH_USRP_B210)
+    target_include_directories(sdr_probe PRIVATE ${UHD_INCLUDE_DIRS})
+    target_link_directories(sdr_probe PRIVATE ${UHD_LIBRARY_DIRS})
+    target_link_libraries(sdr_probe PRIVATE ${UHD_LIBRARIES})
+    if (WITH_RTL_SDR)
+        target_compile_definitions(sdr_probe PRIVATE WITH_RTL_SDR)
+        target_include_directories(sdr_probe PRIVATE ${RTLSDR_INCLUDE_DIRS})
+        target_link_directories(sdr_probe PRIVATE ${RTLSDR_LIBRARY_DIRS})
+        target_link_libraries(sdr_probe PRIVATE ${RTLSDR_LIBRARIES})
+    endif()
+    list(APPEND SSO_TARGETS sdr_probe)
+endif()
+
 # ----- Optional: SGP4SDP4-dependent -----------------------------------------
 
 if (SGP4SDP4_LIB)
