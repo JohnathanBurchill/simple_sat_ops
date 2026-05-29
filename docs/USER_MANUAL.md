@@ -95,8 +95,9 @@ manual can go back on the shelf where it belongs.
 3. [Hardware](#hardware)
 4. [Build and install](#build-and-install)
 5. [First-run setup](#first-run-setup)
-6. [A map of the cat: the tools](#a-map-of-the-cat-the-tools)
-7. [Operator UI: `simple_sat_ops`](#operator-ui-simple_sat_ops)
+6. [Before you operate: licensing and authorization](#before-you-operate-licensing-and-authorization)
+7. [A map of the cat: the tools](#a-map-of-the-cat-the-tools)
+8. [Operator UI: `simple_sat_ops`](#operator-ui-simple_sat_ops)
    - [Modes: operator vs. viewer](#modes-operator-vs-viewer)
    - [Command-line options](#command-line-options)
    - [Keyboard controls](#keyboard-controls)
@@ -106,32 +107,32 @@ manual can go back on the shelf where it belongs.
    - [Auto-telecommand modal (`A`)](#auto-telecommand-modal-a)
    - [Rotator calibration (`--calibrate-rotator`)](#rotator-calibration---calibrate-rotator)
    - [Pursuit tracking](#pursuit-tracking)
-8. [Pass scheduling: `next_in_queue`](#pass-scheduling-next_in_queue)
-9. [Agenda review: `agenda_check`](#agenda-review-agenda_check)
-10. [Offline analysis tools](#offline-analysis-tools)
+9. [Pass scheduling: `next_in_queue`](#pass-scheduling-next_in_queue)
+10. [Agenda review: `agenda_check`](#agenda-review-agenda_check)
+11. [Offline analysis tools](#offline-analysis-tools)
     - [`gen_waterfall`](#gen_waterfall)
     - [`rx_replay`](#rx_replay)
     - [`decode_inspector`](#decode_inspector)
     - [`beacon_detect`](#beacon_detect)
     - [`fm_preview`](#fm_preview)
     - [`packet_query` and `packet_browser`](#packet_query-and-packet_browser)
-11. [Bring-up and test tools](#bring-up-and-test-tools)
+12. [Bring-up and test tools](#bring-up-and-test-tools)
     - [`tx_frame_sdr`](#tx_frame_sdr)
     - [`b210_rx_capture` and `b210_gain_sweep`](#b210_rx_capture-and-b210_gain_sweep)
     - [`live_waterfall`](#live_waterfall)
     - [`uplink_test`](#uplink_test)
     - [`rx_decode`](#rx_decode)
     - [`lifetime`](#lifetime)
-12. [Unit tests](#unit-tests)
-13. [Architecture notes](#architecture-notes)
+13. [Unit tests](#unit-tests)
+14. [Architecture notes](#architecture-notes)
     - [IPC: one operator at a time](#ipc-one-operator-at-a-time)
     - [Worker threads](#worker-threads)
     - [TX safety gates](#tx-safety-gates)
     - [Pursuit planner internals](#pursuit-planner-internals)
-14. [File layout](#file-layout)
-15. [Troubleshooting](#troubleshooting)
-16. [A note on feel](#a-note-on-feel)
-17. [Glossary](#glossary)
+15. [File layout](#file-layout)
+16. [Troubleshooting](#troubleshooting)
+17. [A note on feel](#a-note-on-feel)
+18. [Glossary](#glossary)
 
 *Appendices:*
 
@@ -625,6 +626,56 @@ warnings Apple clang misses. Output lives in `build-lint/`.
 
 5. **T/R switch (optional).** If `/dev/ttyACM0` is present, the
    operator UI auto-probes it on start. No flags needed.
+
+## Before you operate: licensing and authorization
+
+Setting up the station is the easy part. Operating it carries legal
+and institutional obligations, and they are not optional. Before you
+run a pass - even as the person at the keyboard of a *remote* session -
+every item below must apply to you. If any is missing, you are a
+viewer, not an operator.
+
+> **Safety.** This is the one chapter where "the software won't let me"
+> is not the safeguard. The transmitter inhibit protects the hardware;
+> nothing in the code checks your licence. That check is on you.
+
+**Amateur-radio qualification (ISED Canada).** Under the University of
+Calgary's rules - which follow from the authorization Global Affairs
+Canada has granted - you personally need:
+
+- a **Basic** ISED amateur-radio qualification to operate the antenna
+  in *receive* mode, and
+- an **Advanced** qualification to *transmit*, whether you are sitting
+  at the RAO station or driving it remotely.
+
+These qualifications are yours, not the station's. Hold the right one
+before you take the corresponding role.
+
+**Approval to operate the satellite.** Hearing the spacecraft is one
+thing; commanding it is another. You must be approved by Dr. Burchill
+before you operate FrontierSat itself.
+
+**The rules of the road.** Be fluent in amateur-radio operating
+practice and etiquette: band plans, station identification, listening
+before you transmit, yielding to other users. The bands are shared and
+the hobby runs on courtesy; operate accordingly.
+
+**The RSSSA constraints.** FrontierSat is a remote-sensing space
+system, so its operation is governed by Canada's **Remote Sensing
+Space Systems Act (RSSSA)**, administered by Global Affairs Canada. The
+Act, and the licence issued under it, constrain what the system may do
+and how we may operate it. You are expected to know what the RSSSA is
+and how it limits us, and to have read both our RSSSA application and
+the GAC-issued licence before you operate.
+
+**Your own account.** Operate from a *personal* account on the RAO
+ground-station computer - never a shared or generic login. The
+same-operator enforcement and the audit log both assume one human per
+account, and the licensing obligations above are individual, so the
+record has to be too.
+
+Until the whole list is true for you, sit in viewer mode (no
+`--control`), watch, and learn. That is exactly what it is for.
 
 ## A map of the cat: the tools
 
