@@ -1592,6 +1592,23 @@ values are not disturbed).
 
 ## Troubleshooting
 
+Before guessing, three tools narrow almost anything down:
+
+- **`simple_sat_ops --self-test`** prints the fully resolved
+  configuration and exits without touching hardware: the active mode,
+  the SDR backend and TLE, the HMAC keyfile path *and whether it
+  loaded*, Doppler/frequency settings, and the rotator/observer config.
+  A missing file or a flag that didn't take shows up here - including
+  the exact path a keyfile or TLE was expected at.
+- **`sdr_probe`** (see [SDR backends](#sdr-backends)) confirms which SDR
+  is attached, which FPGA image will load, and which ports are RX vs TX.
+- **The TX log panel** (and the `tx.log` in the pass folder) record one
+  line per composed command with the outcome, and - when a burst didn't
+  reach the air - the reason. Most TX problems are answered right there.
+
+The audit log and the stderr printed at startup are the next places to
+look. Specific symptoms:
+
 **`simple_sat_ops: --control refused: operator already running as user=alice pid=12345`**
 
 Another operator is already there. Confirm with `ps -p 12345 -o
@@ -1650,6 +1667,44 @@ The TX compose modal won't commit until the `allow-tx` checkbox is
 ticked (and `allow-high-power` if `--tx-power > 10%`, and
 `allow-hf-tx` below 100 MHz). The auto-tcmd modal works the same
 way. Toggle them once per pass.
+
+**TX composed but nothing transmits (no TRX LED, no RF)**
+
+The PA only keys for the brief moment a burst is on the air, and a
+burst that's refused never keys at all - so this is almost always a
+refused burst, not a hardware fault. Read the TX log line for that
+command (or `tx.log`): `sent>` means it went out (the LED flash is just
+short - raise the repeat count to see it); `notsent>` / `err>` carry the
+reason. The usual refusals:
+
+- **Missing/invalid HMAC key** - CTS1 requires every uplink to be
+  signed, so an absent or bad keyfile blocks *every* burst. The banner
+  reads `(MISSING)` / `(BAD)`, and `--self-test` prints the exact path
+  it looked for on the `hmac:` line. Put the key there, or pass
+  `--hmac-keyfile <path>`.
+- **`allow-tx` not ticked** in the compose modal (it resets each pass).
+- **`--no-tx`** (preview only) or **`--tx-dry-run`** (composes but never
+  keys) on the command line - both show in `--self-test`.
+- An **RX-only SDR** (RTL-SDR): transmit is unavailable by design; the
+  RX panel shows `(RX-only)`.
+
+If the log says `sent>` yet there is genuinely no RF or TRX LED on a
+B210 clone, that points at the clone's FPGA not driving the transmit
+ATR/PA the way stock UHD expects - re-check the
+[clone FPGA setup](#sdr-backends).
+
+**RX shows only noise / nothing decodes**
+
+- Confirm the antenna is on the port the software receives on - for a
+  B210 that is the `RX2` antenna of channel 0 (a clone may silk-screen
+  it differently; `sdr_probe` names the ports).
+- Check the status panel's carrier/Doppler is near the satellite's
+  downlink, and the predictions panel shows the pass is actually
+  overhead.
+- Tune RX gain with `:gain <dB>` while watching the IQ peak/RMS on the
+  RX panel - too low buries the signal, too high clips it.
+- Render the last N seconds with `:spectrum <sec>` to see whether the
+  carrier is even present before chasing the decoder.
 
 **`audit-overflow dropped=N`**
 
