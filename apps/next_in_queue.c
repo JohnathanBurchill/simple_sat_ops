@@ -29,12 +29,101 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <sgp4sdp4.h>
+
+// Pull an exactly-8-digit run (a YYYYMMDD date) out of a filename and
+// return it as a long, or -1 if there isn't one. "tle-20260529.tle"
+// yields 20260529; a 14-digit timestamp's leading 8 digits also match.
+static long extract_yyyymmdd(const char *name)
+{
+    for (const char *p = name; *p != '\0'; p++) {
+        if (!isdigit((unsigned char) *p)) continue;
+        int k = 0;
+        while (isdigit((unsigned char) p[k])) k++;
+        if (k == 8) {
+            char buf[9];
+            memcpy(buf, p, 8);
+            buf[8] = '\0';
+            return atol(buf);
+        }
+        p += k > 0 ? k - 1 : 0;  // skip the run; loop's p++ steps past it
+    }
+    return -1;
+}
+
+// Recursively scan `dir` for *.tle files whose name carries a YYYYMMDD
+// date (the tle-YYYYMMDD.tle convention) and return the path of the one
+// with the largest date via out. *best carries the running max across
+// the recursion; start it at -1. Returns 0 if at least one dated .tle
+// was found in the tree, -1 otherwise (including an unreadable dir).
+static int find_latest_dated_tle(const char *dir, char *out, size_t cap,
+                                 long *best)
+{
+    DIR *d = opendir(dir);
+    if (d == NULL) return -1;
+    int found = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char child[1024];
+        int n = snprintf(child, sizeof child, "%s/%s", dir, de->d_name);
+        if (n < 0 || (size_t) n >= sizeof child) continue;
+        struct stat st;
+        if (stat(child, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (find_latest_dated_tle(child, out, cap, best) == 0) found = 1;
+        } else if (S_ISREG(st.st_mode)) {
+            size_t nlen = strlen(de->d_name);
+            if (nlen < 4 || strcmp(de->d_name + nlen - 4, ".tle") != 0) continue;
+            long date = extract_yyyymmdd(de->d_name);
+            if (date < 0) continue;
+            found = 1;
+            if (date > *best) {
+                *best = date;
+                snprintf(out, cap, "%s", child);
+            }
+        }
+    }
+    closedir(d);
+    return found ? 0 : -1;
+}
+
+// Resolve the TLE file to use when only a satellite name was given.
+// Order: the newest dated tle-YYYYMMDD.tle under /<satname>/TLEs, then
+// the shared default active.tle (the caller filters it by name). Returns
+// 0 and fills out on success, -1 if neither source exists.
+static int resolve_named_tle(const char *satname, char *out, size_t cap)
+{
+    char dir[1024];
+    int n = snprintf(dir, sizeof dir, "/%s/TLEs", satname);
+    if (n > 0 && (size_t) n < sizeof dir) {
+        long best = -1;
+        if (find_latest_dated_tle(dir, out, cap, &best) == 0) {
+            fprintf(stderr, "next_in_queue: using TLE %s\n", out);
+            return 0;
+        }
+    }
+    char active[1024];
+    if (tle_default_path(active, sizeof active) == 0
+        && access(active, R_OK) == 0) {
+        snprintf(out, cap, "%s", active);
+        fprintf(stderr,
+                "next_in_queue: no dated TLE under /%s/TLEs; "
+                "using %s (looking for '%s')\n",
+                satname, out, satname);
+        return 0;
+    }
+    return -1;
+}
 
 void usage(FILE *dest, const char *name, int full)
 {
     fprintf(dest,
         "usage:\n"
+        "  %s <satellite_name> [options]\n"
         "  %s <min_alt_km> <max_alt_km> [<satellite_name>] [options]\n"
         "  %s --tle <path> [<satellite_name>] [options]\n"
         "  %s --trajectory-id=<id> [options]\n"
@@ -43,15 +132,23 @@ void usage(FILE *dest, const char *name, int full)
         "over the ground station and report the soonest (or every) match.\n"
         "Read-only; no hardware commands.\n"
         "\n"
-        "Positional arguments (default-TLE form only):\n"
-        "  <min_alt_km>                 Minimum orbital altitude, km\n"
-        "  <max_alt_km>                 Maximum orbital altitude, km\n"
-        "  <satellite_name>             Optional. Literal, case-sensitive name\n"
-        "                               prefix (e.g. 'ISS (ZARYA)'). Must appear\n"
-        "                               before any --options. Bypasses the\n"
-        "                               constellation filter and extends the\n"
-        "                               search window to one week. For regex\n"
-        "                               matching use --regex= instead.\n"
+        "Positional arguments:\n"
+        "  <satellite_name>             Named form. A single name argument selects\n"
+        "                               one object; its TLE is found automatically\n"
+        "                               (see TLE discovery below) and its passes\n"
+        "                               are reported for the next week. No altitude\n"
+        "                               limits needed. Literal, case-sensitive name\n"
+        "                               prefix (e.g. 'ISS (ZARYA)'), before any\n"
+        "                               --options. For regex matching use --regex=.\n"
+        "  <min_alt_km> <max_alt_km>    Catalog-scan form. Two (or three) arguments\n"
+        "                               scan every object in the default TLE within\n"
+        "                               this altitude band. An optional third\n"
+        "                               argument is a name prefix.\n"
+        "\n"
+        "TLE discovery (named form):\n"
+        "  1. newest /<satellite_name>/TLEs/<date>/tle-<date>.tle (by date)\n"
+        "  2. else $HOME/.local/state/simple_sat_ops/active.tle (filtered by name)\n"
+        "  3. else error. Override either form with --tle=<path>.\n"
         "\n"
         "Trajectory source (pick one; default = implicit TLE catalog):\n"
         "  --tle <path>                 Path to a TLE file (2 or 3-line format).\n"
@@ -96,13 +193,16 @@ void usage(FILE *dest, const char *name, int full)
         "Other:\n"
         "  --help                       Short help (this message)\n"
         "  --help-full                  Detailed help with examples\n",
-        name, name, name);
+        name, name, name, name);
 
     if (!full) return;
 
     fprintf(dest,
         "\n"
         "EXAMPLES\n"
+        "\n"
+        "  # Next week of passes for one satellite (auto-discovers its TLE)\n"
+        "  %s FrontierSat\n"
         "\n"
         "  # Next satellite pass (uses default TLE at ~/.local/state/simple_sat_ops/active.tle)\n"
         "  %s 0 2000\n"
@@ -130,7 +230,7 @@ void usage(FILE *dest, const char *name, int full)
         "  - `--trajectory-id` needs `ssm` on PATH. The trajectory's window\n"
         "    (from `ssm trajectory-meta <id>`) caps how far ahead passes can\n"
         "    be predicted; `--max-minutes` is clamped if it exceeds the window.\n",
-        name, name, name, name, name);
+        name, name, name, name, name, name);
 }
 
 void print_radio_info(const char *name, satellite_status_t *sat_info, int n_entries);
@@ -367,15 +467,30 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
         if (n_positional == 1) satellite_name = argv[positional_argv[0]];
-    } else {
-        // Implicit default TLE: require 2 or 3 positionals.
-        if (n_positional != 2 && n_positional != 3) {
-            usage(stderr, argv[0], 0);
+    } else if (n_positional == 1) {
+        // Named form: a single positional is the satellite name. We know
+        // the object, so no altitude limits are needed; auto-discover its
+        // TLE from /<satname>/TLEs, then the default active.tle.
+        satellite_name = argv[positional_argv[0]];
+        static char named_tle[1024];
+        if (resolve_named_tle(satellite_name, named_tle, sizeof named_tle) != 0) {
+            fprintf(stderr,
+                "next_in_queue: no TLE for '%s'. Drop a tle-YYYYMMDD.tle "
+                "under /%s/TLEs/<date>/, stage one at the default "
+                "active.tle, or pass --tle=<path>.\n",
+                satellite_name, satellite_name);
             return EXIT_FAILURE;
         }
+        state.prediction.tles_filename = tle_path_resolve(named_tle);
+    } else if (n_positional == 2 || n_positional == 3) {
+        // Catalog-scan form: <min_alt_km> <max_alt_km> [<satellite_name>].
         min_altitude_km = atof(argv[positional_argv[0]]);
         max_altitude_km = atof(argv[positional_argv[1]]);
         if (n_positional == 3) satellite_name = argv[positional_argv[2]];
+    } else {
+        // 0 positionals (and no --tle / --trajectory-id) is ambiguous.
+        usage(stderr, argv[0], 0);
+        return EXIT_FAILURE;
     }
     if (satellite_name != NULL && !max_minutes_user_set) {
         max_minutes_away = 1440 * 7;  // one week when filtering to a specific sat
