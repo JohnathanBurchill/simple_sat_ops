@@ -397,7 +397,7 @@ static const struct {
     { SSO_EVT_YIELD_REQUEST,     "yield-request" },
     { SSO_EVT_TX_COMMAND_PREVIEW,"tx-preview" },
     { SSO_EVT_TX_REQUEST,        "tx-request" },
-    { SSO_EVT_TX_ACK,            "tx-ack" },
+    { SSO_EVT_TX_NOT_SENT,       "tx-not-sent" },
     { SSO_EVT_CMD_PREVIEW,       "cmd-preview" },
     { SSO_EVT_CMD_EXECUTED,      "cmd-executed" },
     { SSO_EVT_UNKNOWN,           NULL },
@@ -586,7 +586,7 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
     if (evt->type == SSO_EVT_TX_COMMAND_SENT
      || evt->type == SSO_EVT_TX_COMMAND_PREVIEW
      || evt->type == SSO_EVT_TX_REQUEST
-     || evt->type == SSO_EVT_TX_ACK) {
+     || evt->type == SSO_EVT_TX_NOT_SENT) {
         if (json_field_str(&p, end, &first, "ascii", evt->ascii) < 0) return -1;
         if (json_field_str(&p, end, &first, "tx_kind", evt->tx_payload_kind) < 0) return -1;
         if (json_field_str(&p, end, &first, "tx_pl",   evt->tx_payload) < 0) return -1;
@@ -626,7 +626,7 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
         if (evt->tx_gap_ms) {
             if (json_field_int(&p, end, &first, "tx_gap", evt->tx_gap_ms) < 0) return -1;
         }
-        if (json_field_str(&p, end, &first, "tx_st", evt->tx_ack_status) < 0) return -1;
+        if (json_field_str(&p, end, &first, "tx_st", evt->tx_not_sent_reason) < 0) return -1;
     }
     if (evt->type == SSO_EVT_CMD_PREVIEW || evt->type == SSO_EVT_CMD_EXECUTED) {
         if (json_field_str(&p, end, &first, "cmd_text",   evt->cmd_text)   < 0) return -1;
@@ -719,7 +719,7 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
     if (json_get_bool(line, "tx_hf",    &tx_flag) > 0) evt->tx_allow_hf_tx      = tx_flag;
     if (json_get_int(line, "tx_rep", &tx_int) > 0) evt->tx_repeat = (int) tx_int;
     if (json_get_int(line, "tx_gap", &tx_int) > 0) evt->tx_gap_ms = (int) tx_int;
-    json_get_string(line, "tx_st", evt->tx_ack_status, sizeof(evt->tx_ack_status));
+    json_get_string(line, "tx_st", evt->tx_not_sent_reason, sizeof(evt->tx_not_sent_reason));
     json_get_string(line, "cmd_text",   evt->cmd_text,   sizeof(evt->cmd_text));
     json_get_string(line, "cmd_status", evt->cmd_status, sizeof(evt->cmd_status));
 

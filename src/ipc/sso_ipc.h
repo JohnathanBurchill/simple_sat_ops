@@ -39,7 +39,7 @@ typedef enum {
     SSO_EVT_YIELD_REQUEST,  // sent by force-claim path; recipient yields
     SSO_EVT_TX_COMMAND_PREVIEW, // operator -> all viewers (debounced draft)
     SSO_EVT_TX_REQUEST,         // operator -> b210_rx_tx (commit)
-    SSO_EVT_TX_ACK,             // b210_rx_tx -> operator (queued/ok/rejected)
+    SSO_EVT_TX_NOT_SENT,        // operator-local: command did NOT reach the air (rejected / uhd-err)
     SSO_EVT_CMD_PREVIEW,        // operator -> viewers: live ":" prompt buffer
     SSO_EVT_CMD_EXECUTED,       // operator -> viewers: dispatched cmd + result
 } sso_event_type_t;
@@ -104,12 +104,12 @@ typedef struct {
     char last_packet_ts[40];
     char last_packet_summary[160];
 
-    // tx-command-sent / tx-preview / tx-request / tx-ack
+    // tx-command-sent / tx-preview / tx-request / tx-not-sent
     char ascii[160];
 
     // Carried by tx-preview, tx-request, tx-command-sent (raw payload
-    // the operator typed; viewers re-render this verbatim). tx_status is
-    // only filled on tx-ack.
+    // the operator typed; viewers re-render this verbatim).
+    // tx_not_sent_reason is only filled on tx-not-sent.
     char    tx_payload_kind[8];   // "hex" | "ascii"
     char    tx_payload[160];
     uint8_t tx_csp_src;
@@ -124,7 +124,7 @@ typedef struct {
     int     tx_allow_hf_tx;
     int     tx_repeat;
     int     tx_gap_ms;
-    char    tx_ack_status[24];    // tx-ack only: "ok" | "rejected: <reason>"
+    char    tx_not_sent_reason[24];  // tx-not-sent only: "rejected: <reason>" | "uhd-err"
 
     // cmd-preview / cmd-executed: mirror the operator's ":" prompt to
     // viewers. cmd_text is the live buffer being typed (preview) or the

@@ -107,8 +107,9 @@ static const char *g_operator_user = NULL;
 // apply_args too (which is itself a side effect).
 static int g_self_test = 0;
 
-// TX dry-run: synthesise an immediate "ok" ack instead of pushing the
-// burst through rx_session. Lets the operator exercise the auto-tcmd
+// TX dry-run: record the command as not-sent (reason "dry-run")
+// instead of pushing the burst through rx_session. Lets the operator
+// exercise the auto-tcmd
 // state machine + the TX compose modal on a dev host with no B210 (or
 // with --without-b210 to skip the device). The allow-tx safety
 // checkbox still has to be ticked to enter RUNNING — dry-run is about
@@ -1246,15 +1247,15 @@ static int g_no_tx = 0;
 // --tx-preroll-ms=<n>.
 static int g_tx_preroll_ms = 200;
 
-// TX log ring buffer — last few PREVIEW/SENT/ACK events for display.
+// TX log ring buffer — last few PREVIEW/SENT/NOT_SENT events for display.
 // Shared by operator and viewer renderers. ascii is sized to fit the
 // full upstream payload buffer (sso_event_t.ascii = 160) so the panel
 // renders the entire command text instead of a truncated preview.
 typedef struct {
-    sso_event_type_t kind;     // PREVIEW | TX_COMMAND_SENT | TX_ACK
+    sso_event_type_t kind;     // PREVIEW | TX_COMMAND_SENT | TX_NOT_SENT
     char             ts[16];   // HH:MM:SS
     char             ascii[160];
-    char             tx_ack_status[24];
+    char             tx_not_sent_reason[24];
 } tx_log_entry_t;
 #define TX_LOG_SIZE 8
 static tx_log_entry_t g_tx_log[TX_LOG_SIZE];
@@ -1264,7 +1265,7 @@ static size_t         g_tx_log_count = 0;
 // Opened lazily on the first event after g_pass_folder is set, kept
 // open for the rest of the process, fflushed after every line so a
 // crash mid-pass doesn't lose the last command sent. Captures every
-// preview / commit / ack — the same events that drive the in-memory
+// preview / commit / not-sent — the same events that drive the in-memory
 // ring above and the viewer-side mirror.
 static FILE *g_tx_log_fp = NULL;
 static char  g_tx_log_path[512] = "";
@@ -1320,14 +1321,14 @@ static void tx_log_file_append(const sso_event_t *evt)
 
 // Push an event into the ring. PREVIEW events overwrite a trailing
 // PREVIEW entry (live cursor-style update). SENT promotes a trailing
-// PREVIEW to SENT, or appends a fresh entry. ACK appends with the
+// PREVIEW to SENT, or appends a fresh entry. NOT_SENT appends with the
 // status string filled in for rendering.
 static void tx_log_push(const sso_event_t *evt)
 {
     if (!evt) return;
     if (evt->type != SSO_EVT_TX_COMMAND_PREVIEW
      && evt->type != SSO_EVT_TX_COMMAND_SENT
-     && evt->type != SSO_EVT_TX_ACK) return;
+     && evt->type != SSO_EVT_TX_NOT_SENT) return;
 
     tx_log_file_append(evt);
 
@@ -1336,8 +1337,8 @@ static void tx_log_push(const sso_event_t *evt)
     entry.kind = evt->type;
     tx_log_ts_from_event(evt, entry.ts, sizeof entry.ts);
     snprintf(entry.ascii, sizeof entry.ascii, "%s", evt->ascii);
-    snprintf(entry.tx_ack_status, sizeof entry.tx_ack_status, "%s",
-             evt->tx_ack_status);
+    snprintf(entry.tx_not_sent_reason, sizeof entry.tx_not_sent_reason, "%s",
+             evt->tx_not_sent_reason);
 
     if (evt->type == SSO_EVT_TX_COMMAND_PREVIEW
         && g_tx_log_count > 0
@@ -1363,7 +1364,7 @@ static void tx_log_push(const sso_event_t *evt)
 
 // Render the TX log at rows [start_row .. start_row + (TX_LOG_SIZE+1)).
 // Caller picks the column. Title line + one row per entry. Newest at
-// the bottom; PREVIEW lines render with A_BOLD, SENT/ACK with A_DIM.
+// the bottom; PREVIEW lines render with A_BOLD, SENT/NOT_SENT with A_DIM.
 static void render_tx_log_panel(int start_row, int col)
 {
     int row = start_row;
@@ -1382,8 +1383,8 @@ static void render_tx_log_panel(int start_row, int col)
         if (e->kind == SSO_EVT_TX_COMMAND_PREVIEW) {
             tag = "draft> ";
             attr = A_BOLD;
-        } else if (e->kind == SSO_EVT_TX_ACK) {
-            tag = "ack>   ";
+        } else if (e->kind == SSO_EVT_TX_NOT_SENT) {
+            tag = "notsent>";
             attr = A_DIM;
         }
         // Render the FULL payload — let safe_w (the column width)
@@ -1391,9 +1392,9 @@ static void render_tx_log_panel(int start_row, int col)
         // chopped the operator's command text mid-string for any
         // payload longer than that, even when the panel had room.
         char line[256];
-        if (e->kind == SSO_EVT_TX_ACK && e->tx_ack_status[0]) {
+        if (e->kind == SSO_EVT_TX_NOT_SENT && e->tx_not_sent_reason[0]) {
             snprintf(line, sizeof line, "%s  %s %s  [%s]",
-                     e->ts, tag, e->ascii, e->tx_ack_status);
+                     e->ts, tag, e->ascii, e->tx_not_sent_reason);
         } else {
             snprintf(line, sizeof line, "%s  %s %s",
                      e->ts, tag, e->ascii);
@@ -2677,8 +2678,9 @@ static int tx_compose_commit(const tx_compose_t *c, char *err, size_t err_size) 
     {
         // Audit: TX commit — the moment the operator pressed Enter in
         // the compose modal and the burst was queued for the main loop
-        // to actually transmit. The matching tx-ack event lands when
-        // the burst returns (see emit_tx_event_local site below).
+        // to actually transmit. The matching tx-command-sent (or
+        // tx-not-sent) event lands when the burst returns (see
+        // emit_tx_event_local site below).
         char det[512];
         snprintf(det, sizeof det,
                  "len=%zu freq_hz=%ld gain_db=%.1f payload=\"%.200s\"",
@@ -2711,7 +2713,7 @@ static void emit_tx_event_local(sso_event_type_t type,
         snprintf(evt.ascii, sizeof evt.ascii, "%s", summary);
     }
     if (ack_status && ack_status[0]) {
-        snprintf(evt.tx_ack_status, sizeof evt.tx_ack_status, "%s", ack_status);
+        snprintf(evt.tx_not_sent_reason, sizeof evt.tx_not_sent_reason, "%s", ack_status);
     }
     tx_log_push(&evt);
     if (g_ipc) {
@@ -4090,8 +4092,8 @@ void usage(FILE *dest, const char *name, int full)
         "                               ~51 Hz, visible as a comb of spikes\n"
         "                               in the waterfall at mid-range gain.\n"
         "                               Flip back on for A/B comparison.\n"
-        "  --tx-dry-run                 Synthesize an immediate 'ok' ack for\n"
-        "                               every TX burst instead of routing it\n"
+        "  --tx-dry-run                 Record every TX burst as not-sent\n"
+        "                               ('dry-run') instead of routing it\n"
         "                               through the SDR. Exercises the auto-\n"
         "                               tcmd state machine + TX compose modal\n"
         "                               on a dev host that has no B210 (or\n"
@@ -4933,7 +4935,7 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
     (void) user;
     if (evt->type == SSO_EVT_TX_COMMAND_PREVIEW
      || evt->type == SSO_EVT_TX_COMMAND_SENT
-     || evt->type == SSO_EVT_TX_ACK) {
+     || evt->type == SSO_EVT_TX_NOT_SENT) {
         tx_log_push(evt);
         g_viewer_last_event = time(NULL);
         g_viewer_event_pending = 1;
@@ -6507,7 +6509,7 @@ int main(int argc, char **argv)
         tx_compose_pump();
         // Drive the auto-tcmd burst loop. Queues g_tx_request when
         // it's time for the next send; the existing main-loop burst
-        // handler below transmits and emits the SENT/ACK events.
+        // handler below transmits and emits the SENT/NOT_SENT events.
         auto_tcmd_tick(&state);
 
         // Bottom-row prompt + screen flush. When the operator is typing
@@ -6677,23 +6679,22 @@ int main(int argc, char **argv)
         //                       slot rather than deadlocking.
         if (g_tx_request.pending) {
             char summary[160];
-            const char *ack = NULL;
-            int  cmd_sent = 0;
-            int  finished = 0;        // emit ack + clear pending this tick
+            const char *outcome = NULL;
+            int  on_air = 0;
+            int  finished = 0;        // emit the result + clear pending this tick
             if (g_tx_dry_run) {
                 snprintf(summary, sizeof summary, "%s",
                          g_tx_request.summary);
-                ack = "dry-run";
-                cmd_sent = 1;
+                outcome = "dry-run";   // composed but deliberately not keyed
                 finished = 1;
             } else if (g_hmac_key_len == 0) {
                 // CTS1 expects HMAC on every uplink. Without a valid
                 // key the burst would go out unsigned and the satellite
                 // would silently drop it. Refuse here so the operator
-                // sees a clear error instead of a misleading "ok" ack.
+                // sees a clear error instead of letting it go out unsigned.
                 snprintf(summary, sizeof summary, "%s",
                          g_tx_request.summary);
-                ack = "rejected: no HMAC key (see banner)";
+                outcome = "rejected: no HMAC key (see banner)";
                 finished = 1;
             } else if (g_rx_session != NULL) {
                 if (!g_tx_inflight) {
@@ -6705,7 +6706,7 @@ int main(int argc, char **argv)
                         // Worker refused (slot already busy or rxs error).
                         snprintf(summary, sizeof summary, "%s",
                                  g_tx_request.summary);
-                        ack = "rejected: rx_session busy";
+                        outcome = "rejected: rx_session busy";
                         finished = 1;
                     }
                 } else {
@@ -6714,10 +6715,10 @@ int main(int argc, char **argv)
                                                       summary, sizeof summary);
                     if (done == 1) {
                         switch (br) {
-                            case RX_BURST_OK:                 ack = "ok"; cmd_sent = 1; break;
-                            case RX_BURST_NO_CORE:            ack = "rejected: no B210"; break;
-                            case RX_BURST_FRAME_BUILD_FAILED: ack = "rejected: frame build"; break;
-                            case RX_BURST_UHD_ERROR:          ack = "uhd-err"; break;
+                            case RX_BURST_OK:                 outcome = "ok"; on_air = 1; break;
+                            case RX_BURST_NO_CORE:            outcome = "rejected: no B210"; break;
+                            case RX_BURST_FRAME_BUILD_FAILED: outcome = "rejected: frame build"; break;
+                            case RX_BURST_UHD_ERROR:          outcome = "uhd-err"; break;
                         }
                         g_tx_inflight = 0;
                         finished = 1;
@@ -6728,24 +6729,30 @@ int main(int argc, char **argv)
             } else {
                 snprintf(summary, sizeof summary, "%s",
                          g_tx_request.summary);
-                ack = "rejected: no B210";
+                outcome = "rejected: no B210";
                 finished = 1;
             }
             if (finished) {
-                emit_tx_event_local(SSO_EVT_TX_ACK, summary, ack);
-                if (cmd_sent) {
+                // A command that made it on the air gets a plain TX
+                // record, nothing more: the ground station can confirm
+                // it transmitted, but only the satellite can acknowledge,
+                // and that arrives on the downlink, not here. Anything
+                // that did NOT reach the air (rejected, dry-run, uhd-err)
+                // gets a not-sent note carrying the reason.
+                if (on_air) {
                     emit_tx_event_local(SSO_EVT_TX_COMMAND_SENT, summary, NULL);
+                } else {
+                    emit_tx_event_local(SSO_EVT_TX_NOT_SENT, summary, outcome);
                 }
-                // Audit: the result of the just-queued TX burst, so post-
-                // incident review can correlate every tx-commit with its
-                // ack (ok / uhd-err / rejected reason). cmd_sent=1 means
-                // the burst actually left the radio.
+                // Audit: the result of every queued TX burst, so post-
+                // incident review can see each tx-commit and whether it
+                // reached the air (on_air=1 means the burst left the radio).
                 {
                     char det[512];
                     snprintf(det, sizeof det,
-                             "ack=\"%.80s\" sent=%d summary=\"%.300s\"",
-                             ack ? ack : "?", cmd_sent, summary);
-                    sso_audit_event("tx-ack", det);
+                             "outcome=\"%.80s\" on_air=%d summary=\"%.300s\"",
+                             outcome ? outcome : "?", on_air, summary);
+                    sso_audit_event("tx-result", det);
                 }
                 g_tx_request.pending = 0;
             }
