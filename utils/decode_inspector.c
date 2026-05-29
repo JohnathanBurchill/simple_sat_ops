@@ -858,15 +858,6 @@ static void fmt_mmss_ndec(double t_s, int nd, char *buf, size_t cap)
              sign < 0 ? "-" : "", mm, width, nd, rem);
 }
 
-// Backwards-compatible mm:ss.sss (3 decimals) wrapper used where the
-// caller doesn't know an appropriate step size — e.g. the box-info
-// status line, where the box duration drives the precision (computed
-// below at the call site).
-static void fmt_mmss_ms(double t_s, char *buf, size_t cap)
-{
-    fmt_mmss_ndec(t_s, 3, buf, cap);
-}
-
 // HH-MM-SS.sss for filenames — colons are visually odd in Finder /
 // can be problematic on FAT, so the hh/mm/ss separators are hyphens.
 static void fmt_hhmmss_filename(double t_s, char *buf, size_t cap)
@@ -951,11 +942,6 @@ static int iq_buf_load_progress(iq_buf_t *b, const char *path, int samp_rate,
     b->samp_rate = samp_rate;
     if (progress_pct_out != NULL) *progress_pct_out = 1.0f;
     return 0;
-}
-
-static int iq_buf_load(iq_buf_t *b, const char *path, int samp_rate)
-{
-    return iq_buf_load_progress(b, path, samp_rate, 0, NULL);
 }
 
 // Pretty-print a duration in seconds using whichever unit (minutes,
@@ -2072,7 +2058,6 @@ int main(int argc, char **argv)
         for (;;) {
             pthread_mutex_lock(&lctx.lock);
             int done = lctx.done;
-            int err  = lctx.error;
             char msg[128];
             memcpy(msg, lctx.status_msg, sizeof msg);
             pthread_mutex_unlock(&lctx.lock);

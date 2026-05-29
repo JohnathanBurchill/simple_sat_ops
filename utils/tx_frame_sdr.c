@@ -135,7 +135,8 @@ static void usage(FILE *f, const char *argv0)
         "                              FrontierSat simplex carrier — uplink\n"
         "                              and downlink share this frequency)\n"
         "  --gain-db=<n>               B210 TX gain dB, 0..89.75 (default 30)\n"
-        "  --device-args=<str>         UHD device args (default \"type=b200\")\n"
+        "  --device-args=<str>         Accepted but ignored (offline IQ tool;\n"
+        "                              opens no device)\n"
         "  --repeat=<n>                Send the same frame N times back-to-back\n"
         "                              with a small gap (default 1)\n"
         "  --gap-ms=<n>                Gap between repeats in ms (default 200)\n"
@@ -259,23 +260,11 @@ static const struct {
 #define JOKE_N (sizeof JOKE_PATTERN / sizeof JOKE_PATTERN[0])
 #define JOKE_DAH_HOLD_UNITS 2.0   // dah = 1 frame + this many frame-durations of CW tail
 
-// Translate UHD error to a usable exit code and print the error string.
-static int uhd_check(uhd_error e, const char *what)
-{
-    if (e == UHD_ERROR_NONE) return 0;
-    char errbuf[256] = {0};
-    (void)uhd_get_last_error(errbuf, sizeof errbuf);
-    fprintf(stderr, "tx_frame_sdr: %s: UHD error %d: %s\n",
-            what, (int)e, errbuf[0] ? errbuf : "(no detail)");
-    return 1;
-}
-
 int main(int argc, char **argv)
 {
     const char *payload_hex = NULL;
     const char *payload_ascii = NULL;
     const char *keyfile_path = NULL;
-    const char *device_args = "type=b200";
     const char *dump_iq_path = NULL;
     double freq_hz = FRONTIERSAT_CARRIER_HZ;
     double gain_db = 30.0;
@@ -348,7 +337,7 @@ int main(int argc, char **argv)
         else if (starts_with(a, "--gauss-span="))       mp.gauss_symbol_span = atoi(a + 13);
         else if (starts_with(a, "--freq-hz="))          freq_hz      = atof(a + 10);
         else if (starts_with(a, "--gain-db="))          gain_db      = atof(a + 10);
-        else if (starts_with(a, "--device-args="))      device_args  = a + 14;
+        else if (starts_with(a, "--device-args="))      { /* accepted but ignored: this tool renders IQ offline and never opens the B210 */ }
         else if (starts_with(a, "--repeat="))           repeat       = atoi(a + 9);
         else if (starts_with(a, "--gap-ms="))           gap_ms       = atoi(a + 9);
         else if (starts_with(a, "--preroll-ms="))       preroll_ms   = atoi(a + 13);

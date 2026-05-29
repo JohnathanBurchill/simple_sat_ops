@@ -275,6 +275,15 @@ int main(int argc, char **argv)
                usage(stderr, argv[0]); return 1; }
     }
 
+#ifndef WITH_ALSA
+    // The --monitor* options drive the ALSA live-monitor path, which is
+    // compiled out on builds without ALSA. Reference the parsed values
+    // so the no-ALSA build doesn't warn that they are set-but-unused.
+    (void) monitor_device;
+    (void) monitor_sq_mode;
+    (void) monitor_sq_user_mag;
+#endif
+
     if (wav_path == NULL && raw_iq_path == NULL) {
         fprintf(stderr, "b210_rx_capture: need --wav= or --raw-iq=\n");
         return 1;

@@ -691,11 +691,6 @@ static time_t parse_ut_string_frac(const char *s, double *out_subsec)
     return t;
 }
 
-static time_t parse_ut_string(const char *s)
-{
-    return parse_ut_string_frac(s, NULL);
-}
-
 // simple_sat_ops names IQ files <prefix>_UT=YYYYMMDDTHHMMSS.fff.iq. Pull
 // the UT timestamp out of the filename. Returns 0 if there is no "UT=".
 // *out_subsec gets the .fff fractional seconds (0 if absent / NULL).
