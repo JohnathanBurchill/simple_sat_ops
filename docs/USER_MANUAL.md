@@ -793,26 +793,21 @@ opens. Pick one explicitly with `--sdr-type=uhd` or `--sdr-type=rtlsdr`.
 The active SDR and its transmit capability are shown on the RX panel
 (`SDR <name>` or `SDR <name> (RX-only)`) and on the startup line.
 
-**USRP (UHD) - the operational path.** On open the UHD backend
-enumerates the attached device and logs its `product`, `serial`, and
-`name`. It transmits and receives, so all operator functions are
-available.
+**USRP (UHD) - the operational path.** The UHD backend transmits and
+receives, so all operator functions are available.
 
 If you run a **B210-ish clone whose FPGA differs from the stock image**,
-the bitstream has to be uploaded for the board to come up. Choose it one
-of three ways (highest precedence first):
+the bitstream has to be uploaded for the board to come up. Point at it
+explicitly, one of two ways (the first wins if both are given):
 
 1. `--uhd-args="type=b200,serial=...,fpga=/path/to.bin"` - passed to UHD
    verbatim.
 2. `--sdr-fpga=/path/to.bin` - forces `fpga=` on the device args.
-3. A built-in `product -> image` map in `src/hw/sdr_uhd.c`
-   (`uhd_fpga_image_for`). Read the clone's product string off the
-   open-time log, add an entry, and detection then loads it
-   automatically.
 
-A caveat to know: if the clone's EEPROM reports the *same* identity as a
-genuine B210, auto-detection cannot tell them apart - use the
-`--sdr-fpga` / `--uhd-args` override in that case.
+UHD uploads the image during device open. There is no automatic
+product-to-image detection: UHD's device-enumeration call segfaults on
+macOS (UHD 4.10) with no device attached, so the explicit override above
+is the reliable path on every platform.
 
 **RTL-SDR - receive only.** An RTL-SDR dongle (`--sdr-type=rtlsdr`, or
 auto with no USRP present) runs the full receive chain: tracking,

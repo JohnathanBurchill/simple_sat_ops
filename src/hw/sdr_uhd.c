@@ -32,7 +32,6 @@
 #include <uhd/usrp/subdev_spec.h>
 #include <uhd/types/tune_request.h>
 #include <uhd/types/metadata.h>
-#include <uhd/types/string_vector.h>
 #include <uhd/error.h>
 
 struct sdr_uhd {
@@ -66,62 +65,16 @@ static int log_uhd(uhd_error e, const char *what)
 
 static void uhd_close(sdr_backend_t *be);
 
-// Pull "key=value" out of a comma-separated UHD device descriptor
-// ("type=b200,serial=...,product=B210,name=..."). Returns 1 and fills
-// out (NUL-terminated) on a hit, 0 on a miss.
-static int uhd_kv_get(const char *desc, const char *key, char *out, size_t cap)
-{
-    if (out == NULL || cap == 0) return 0;
-    out[0] = '\0';
-    size_t klen = strlen(key);
-    const char *p = desc;
-    while (p != NULL && *p != '\0') {
-        while (*p == ' ' || *p == ',') p++;
-        const char *eq = strchr(p, '=');
-        if (eq == NULL) break;
-        size_t fieldlen = (size_t)(eq - p);
-        const char *val = eq + 1;
-        const char *comma = strchr(val, ',');
-        size_t vlen = comma ? (size_t)(comma - val) : strlen(val);
-        if (fieldlen == klen && strncmp(p, key, klen) == 0) {
-            if (vlen >= cap) vlen = cap - 1;
-            memcpy(out, val, vlen);
-            out[vlen] = '\0';
-            return 1;
-        }
-        p = comma ? comma + 1 : NULL;
-    }
-    return 0;
-}
-
-// Built-in product/name -> FPGA image map for B2xx clones whose FPGA
-// differs from the stock UHD image. Match is a substring of the
-// product or name string that uhd_usrp_find reports (logged at open, so
-// you can read off the exact value once). Image values are absolute
-// paths. Empty by default — add your clone here, or pass --sdr-fpga=
-// / --uhd-args=... at runtime. Returns NULL when nothing matches.
-static const char *uhd_fpga_image_for(const char *product, const char *name)
-{
-    static const struct { const char *match; const char *image; } map[] = {
-        // Example (disabled): match a clone by its product string and
-        // point at the matching bitstream:
-        // { "MYCLONE", "/usr/local/share/uhd/images/usrp_myclone_fpga.bin" },
-        { NULL, NULL },
-    };
-    for (size_t i = 0; map[i].match != NULL; i++) {
-        if ((product != NULL && product[0] && strstr(product, map[i].match) != NULL) ||
-            (name    != NULL && name[0]    && strstr(name,    map[i].match) != NULL)) {
-            return map[i].image;
-        }
-    }
-    return NULL;
-}
-
-// Resolve the UHD device-args string to pass to uhd_usrp_make. Honors
-// (highest precedence first): --uhd-args verbatim; otherwise enumerate
-// the attached B2xx, log what's there, and append serial= (so we open
-// the one we probed) and fpga= (explicit --sdr-fpga, else the built-in
-// map). Writes the result into out.
+// Resolve the UHD device-args string to pass to uhd_usrp_make.
+//
+// NOTE: we deliberately do NOT call uhd_usrp_find() to enumerate /
+// auto-pick a serial or FPGA image. On macOS (UHD 4.10) uhd_usrp_find()
+// segfaults when no device is present, which would crash the whole
+// program on a dev host. uhd_usrp_make() itself fails gracefully, so we
+// just hand it the args and let it (or the AUTO fallback to RTL-SDR)
+// sort it out. For a B2xx clone whose FPGA differs from the stock
+// image, point at the bitstream explicitly with --sdr-fpga=<path> or
+// --uhd-args=...,fpga=<path> (reliable on every platform).
 static void uhd_resolve_device_args(const sdr_open_params_t *p,
                                     char *out, size_t cap)
 {
@@ -133,42 +86,16 @@ static void uhd_resolve_device_args(const sdr_open_params_t *p,
 
     const char *base = (p->device_args != NULL && p->device_args[0])
                        ? p->device_args : "type=b200";
-    char serial[64]  = {0};
-    char product[64] = {0};
-    char devname[64] = {0};
+    int want_fpga = (p->fpga_image_path != NULL && p->fpga_image_path[0]);
 
-    uhd_string_vector_handle found = NULL;
-    if (uhd_usrp_find(base, &found) == UHD_ERROR_NONE && found != NULL) {
-        size_t nfound = 0;
-        (void)uhd_string_vector_size(found, &nfound);
-        for (size_t i = 0; i < nfound; i++) {
-            char desc[256] = {0};
-            if (uhd_string_vector_at(found, i, desc, sizeof desc) != UHD_ERROR_NONE)
-                continue;
-            fprintf(stderr, "sdr_uhd: found device %zu: %s\n", i, desc);
-            if (i == 0) {
-                uhd_kv_get(desc, "serial",  serial,  sizeof serial);
-                uhd_kv_get(desc, "product", product, sizeof product);
-                uhd_kv_get(desc, "name",    devname, sizeof devname);
-            }
-        }
-        uhd_string_vector_free(&found);
-    }
-
-    const char *fpga = (p->fpga_image_path != NULL && p->fpga_image_path[0])
-                       ? p->fpga_image_path
-                       : uhd_fpga_image_for(product, devname);
-    int want_serial = (serial[0] && strstr(base, "serial=") == NULL);
-    int want_fpga   = (fpga != NULL && fpga[0]);
-
-    // One bounded snprintf: every %s is precision-capped so the worst
-    // case (200 + 8 + 63 + 6 + 200 = 477) fits in a 512-byte out.
-    snprintf(out, cap, "%.200s%s%.63s%s%.200s",
+    // One bounded snprintf: precision-capped %s (300 + 6 + 200 = 506)
+    // fits a 512-byte out.
+    snprintf(out, cap, "%.300s%s%.200s",
              base,
-             want_serial ? ",serial=" : "", want_serial ? serial : "",
-             want_fpga   ? ",fpga="   : "", want_fpga   ? fpga   : "");
+             want_fpga ? ",fpga=" : "",
+             want_fpga ? p->fpga_image_path : "");
     if (want_fpga) {
-        fprintf(stderr, "sdr_uhd: loading FPGA image %s\n", fpga);
+        fprintf(stderr, "sdr_uhd: loading FPGA image %s\n", p->fpga_image_path);
     }
 }
 
