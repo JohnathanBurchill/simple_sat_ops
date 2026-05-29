@@ -5638,7 +5638,7 @@ int main(int argc, char **argv)
             const char *who = existing_user[0] ? existing_user : "?";
             if (read_operator_pid(&op_pid) == 0) {
                 fprintf(stderr,
-                    "simple_sat_ops: --control refused — operator already "
+                    "simple_sat_ops: --control refused: operator already "
                     "running as user=%s pid=%d.\n"
                     "  To take over, run a viewer (no --control) and press\n"
                     "  'c' then 'y' to force-claim; the running operator\n"
@@ -5646,7 +5646,7 @@ int main(int argc, char **argv)
                     who, (int) op_pid);
             } else {
                 fprintf(stderr,
-                    "simple_sat_ops: --control refused — operator already "
+                    "simple_sat_ops: --control refused: operator already "
                     "running as user=%s.\n", who);
             }
             char det[96];
