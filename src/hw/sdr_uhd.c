@@ -20,6 +20,7 @@
 */
 
 #include "sdr_backend.h"
+#include "sdr_usb_detect.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -65,16 +66,17 @@ static int log_uhd(uhd_error e, const char *what)
 
 static void uhd_close(sdr_backend_t *be);
 
-// Resolve the UHD device-args string to pass to uhd_usrp_make.
-//
-// NOTE: we deliberately do NOT call uhd_usrp_find() to enumerate /
-// auto-pick a serial or FPGA image. On macOS (UHD 4.10) uhd_usrp_find()
-// segfaults when no device is present, which would crash the whole
-// program on a dev host. uhd_usrp_make() itself fails gracefully, so we
-// just hand it the args and let it (or the AUTO fallback to RTL-SDR)
-// sort it out. For a B2xx clone whose FPGA differs from the stock
-// image, point at the bitstream explicitly with --sdr-fpga=<path> or
-// --uhd-args=...,fpga=<path> (reliable on every platform).
+// Resolve the UHD device-args string to pass to uhd_usrp_make. Precedence:
+//   1. --uhd-args   verbatim (escape hatch).
+//   2. --sdr-fpga   forces fpga=<path>.
+//   3. serial->image map: read the USB serial via libusb (NOT
+//      uhd_usrp_find, which segfaults on macOS) and, if it matches an
+//      entry in ~/.local/share/simple_sat_ops/sdr_fpga_map, load that
+//      bitstream. This is how a B210 clone (identical to a genuine board
+//      except its serial) gets its non-stock FPGA automatically.
+//   4. otherwise the base args, letting UHD pick the stock image.
+// uhd_usrp_make fails gracefully when no device is present, so AUTO can
+// still fall through to the RTL-SDR backend.
 static void uhd_resolve_device_args(const sdr_open_params_t *p,
                                     char *out, size_t cap)
 {
@@ -86,16 +88,43 @@ static void uhd_resolve_device_args(const sdr_open_params_t *p,
 
     const char *base = (p->device_args != NULL && p->device_args[0])
                        ? p->device_args : "type=b200";
-    int want_fpga = (p->fpga_image_path != NULL && p->fpga_image_path[0]);
 
-    // One bounded snprintf: precision-capped %s (300 + 6 + 200 = 506)
-    // fits a 512-byte out.
-    snprintf(out, cap, "%.300s%s%.200s",
+    const char *fpga = NULL;
+    char        mapimg[768] = {0};
+    char        serial[128] = {0};
+    int         have_serial = 0;
+
+    if (p->fpga_image_path != NULL && p->fpga_image_path[0]) {
+        fpga = p->fpga_image_path;   // explicit override wins
+    } else if (sdr_usb_b2xx_serial(serial, sizeof serial) == 0) {
+        have_serial = 1;
+        fprintf(stderr, "sdr_uhd: USB serial %s\n", serial);
+        if (sdr_fpga_for_serial(serial, mapimg, sizeof mapimg)) {
+            fpga = mapimg;
+            fprintf(stderr, "sdr_uhd: serial %s -> FPGA %s (sdr_fpga_map)\n",
+                    serial, fpga);
+        } else {
+            sdr_fpga_map_ensure_template(serial);
+            char mp[512] = {0};
+            (void)sdr_fpga_map_path(mp, sizeof mp);
+            fprintf(stderr, "sdr_uhd: serial %s not in %s — using the stock "
+                    "FPGA. Add a line there to auto-load a clone image.\n",
+                    serial, mp);
+        }
+    }
+
+    int want_serial = (have_serial && serial[0]
+                       && strstr(base, "serial=") == NULL);
+    int want_fpga   = (fpga != NULL && fpga[0]);
+
+    // One bounded snprintf: precision-capped (200 + 8 + 127 + 6 + 512 =
+    // 853) fits a 1024-byte out.
+    snprintf(out, cap, "%.200s%s%.127s%s%.512s",
              base,
-             want_fpga ? ",fpga=" : "",
-             want_fpga ? p->fpga_image_path : "");
+             want_serial ? ",serial=" : "", want_serial ? serial : "",
+             want_fpga   ? ",fpga="   : "", want_fpga   ? fpga   : "");
     if (want_fpga) {
-        fprintf(stderr, "sdr_uhd: loading FPGA image %s\n", p->fpga_image_path);
+        fprintf(stderr, "sdr_uhd: loading FPGA image %s\n", fpga);
     }
 }
 
@@ -111,7 +140,7 @@ static int uhd_open(sdr_backend_t *be, const sdr_open_params_t *p, sdr_caps_t *c
     be->priv = u;
     u->tx_gain_cached = -1.0;
 
-    char device_args[512];
+    char device_args[1024];
     uhd_resolve_device_args(p, device_args, sizeof device_args);
     const char *rx_antenna  = p->rx_antenna  ? p->rx_antenna  : "RX2";
     double bw_hz = p->bw_hz > 0.0 ? p->bw_hz : p->rate_hz;

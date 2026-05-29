@@ -100,6 +100,15 @@ endif()
 # configure. simple_sat_ops can be built with UHD, RTL-SDR, or both; at
 # runtime --sdr-type / auto picks the device. An RTL-SDR cannot
 # transmit, so TX is disabled when one is in use.
+# libusb: the UHD backend reads a device's USB serial through it to
+# pick the right FPGA image for a B2xx clone before opening (UHD's own
+# uhd_usrp_find() segfaults on macOS, so we can't use it). UHD depends
+# on libusb, so it's normally present wherever UHD is; if it's somehow
+# absent, serial-based clone detection just compiles out.
+if (WITH_USRP_B210)
+    pkg_check_modules(LIBUSB libusb-1.0)
+endif()
+
 option(WITH_RTL_SDR "Build the RTL-SDR RX-only backend (needs librtlsdr)" ON)
 if (WITH_RTL_SDR)
     pkg_check_modules(RTLSDR librtlsdr)
@@ -551,6 +560,7 @@ if (OPENSSL_FOUND)
                        utils/pdf_writer.c
                        src/hw/b210_rx_tx_core.c
                        src/hw/sdr_backend.c src/hw/sdr_uhd.c
+                       src/hw/sdr_usb_detect.c
                        src/hw/carrier_trim.c
                        src/dsp/fir_decim.c src/dsp/sw_nco.c
                        src/dsp/iq_burst.c
@@ -564,6 +574,12 @@ if (OPENSSL_FOUND)
             ${UHD_LIBRARY_DIRS})
         target_link_libraries(b210_gain_sweep PRIVATE
             ${UHD_LIBRARIES} m)
+        if (LIBUSB_FOUND)
+            target_compile_definitions(b210_gain_sweep PRIVATE HAVE_LIBUSB)
+            target_include_directories(b210_gain_sweep PRIVATE ${LIBUSB_INCLUDE_DIRS})
+            target_link_directories(b210_gain_sweep PRIVATE ${LIBUSB_LIBRARY_DIRS})
+            target_link_libraries(b210_gain_sweep PRIVATE ${LIBUSB_LIBRARIES})
+        endif()
         target_link_sso_core(b210_gain_sweep)
         list(APPEND SSO_TARGETS b210_gain_sweep)
 
@@ -584,11 +600,18 @@ endif()
 # would use, plus any RTL-SDR dongles. Buildable on any host with an SDR
 # library so the operator can confirm the hardware before a pass.
 if (WITH_USRP_B210)
-    add_executable(sdr_probe utils/sdr_probe.c)
+    add_executable(sdr_probe utils/sdr_probe.c src/hw/sdr_usb_detect.c)
     target_compile_definitions(sdr_probe PRIVATE WITH_USRP_B210)
-    target_include_directories(sdr_probe PRIVATE ${UHD_INCLUDE_DIRS})
+    target_include_directories(sdr_probe PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/hw ${UHD_INCLUDE_DIRS})
     target_link_directories(sdr_probe PRIVATE ${UHD_LIBRARY_DIRS})
     target_link_libraries(sdr_probe PRIVATE ${UHD_LIBRARIES})
+    if (LIBUSB_FOUND)
+        target_compile_definitions(sdr_probe PRIVATE HAVE_LIBUSB)
+        target_include_directories(sdr_probe PRIVATE ${LIBUSB_INCLUDE_DIRS})
+        target_link_directories(sdr_probe PRIVATE ${LIBUSB_LIBRARY_DIRS})
+        target_link_libraries(sdr_probe PRIVATE ${LIBUSB_LIBRARIES})
+    endif()
     if (WITH_RTL_SDR)
         target_compile_definitions(sdr_probe PRIVATE WITH_RTL_SDR)
         target_include_directories(sdr_probe PRIVATE ${RTLSDR_INCLUDE_DIRS})
@@ -692,10 +715,16 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
     endif()
     if (WITH_USRP_B210)
         target_compile_definitions(simple_sat_ops PRIVATE WITH_USRP_B210)
-        target_sources(simple_sat_ops PRIVATE src/hw/sdr_uhd.c)
+        target_sources(simple_sat_ops PRIVATE src/hw/sdr_uhd.c src/hw/sdr_usb_detect.c)
         target_include_directories(simple_sat_ops PRIVATE ${UHD_INCLUDE_DIRS})
         target_link_directories(simple_sat_ops PRIVATE ${UHD_LIBRARY_DIRS})
         target_link_libraries(simple_sat_ops PRIVATE ${UHD_LIBRARIES})
+        if (LIBUSB_FOUND)
+            target_compile_definitions(simple_sat_ops PRIVATE HAVE_LIBUSB)
+            target_include_directories(simple_sat_ops PRIVATE ${LIBUSB_INCLUDE_DIRS})
+            target_link_directories(simple_sat_ops PRIVATE ${LIBUSB_LIBRARY_DIRS})
+            target_link_libraries(simple_sat_ops PRIVATE ${LIBUSB_LIBRARIES})
+        endif()
     endif()
     if (WITH_RTL_SDR)
         target_compile_definitions(simple_sat_ops PRIVATE WITH_RTL_SDR)

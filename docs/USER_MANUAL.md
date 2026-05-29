@@ -805,17 +805,25 @@ at a specific device when more than one is present.
 receives, so all operator functions are available.
 
 If you run a **B210-ish clone whose FPGA differs from the stock image**,
-the bitstream has to be uploaded for the board to come up. Point at it
-explicitly, one of two ways (the first wins if both are given):
+that bitstream has to be uploaded for the board to come up. A clone is
+indistinguishable from a genuine board on the USB bus *except by its
+serial number*, so detection is by serial:
 
-1. `--uhd-args="type=b200,serial=...,fpga=/path/to.bin"` - passed to UHD
-   verbatim.
-2. `--sdr-fpga=/path/to.bin` - forces `fpga=` on the device args.
+1. Find the serial: run `sdr_probe`. It prints e.g. `USB serial: 30AA038`
+   and which FPGA image will load.
+2. Map it: add a line to `~/.local/share/simple_sat_ops/sdr_fpga_map`:
+   ```
+   30AA038 /path/to/your/usrp_b210_fpga.bin
+   ```
+   (The file is created with a template, and your detected serial
+   commented in, the first time `simple_sat_ops` opens the device.)
 
-UHD uploads the image during device open. There is no automatic
-product-to-image detection: UHD's device-enumeration call segfaults on
-macOS (UHD 4.10) with no device attached, so the explicit override above
-is the reliable path on every platform.
+From then on the clone's image loads automatically whenever that serial
+is seen - a genuine board with a different serial still gets the stock
+image. To override the map, pass `--sdr-fpga=/path/to.bin`, or fold it
+into `--uhd-args="type=b200,serial=...,fpga=/path/to.bin"` (which wins
+over everything). The serial is read via libusb; UHD's own
+device-enumeration call segfaults on macOS, so it is not used.
 
 **RTL-SDR - receive only.** An RTL-SDR dongle (`--sdr-type=rtlsdr`, or
 auto with no USRP present) runs the full receive chain: tracking,
