@@ -81,6 +81,20 @@ typedef struct {
     // computed once at setup. Apogee/perigee as altitudes above the
     // mean Earth radius (standard catalog convention).
     double apogee_km, perigee_km;
+
+    // TLE epoch as a Julian date (the instant the elements are valid).
+    double epoch_jul;
+
+    // Worst-case on-sky angle (deg) from object 0 over object 0's next
+    // pass; the pointing error if we tracked object 0 but this object
+    // was really our bird. -1 until computed (object 0 itself: unused).
+    double pass_max_sep_deg;
+
+    // Signed along-track time offset vs object 0 (seconds): the time for
+    // this object to reach object 0's current track point (+ = trails,
+    // - = leads), min and max sampled over object 0's full orbit.
+    double dtsec_min, dtsec_max;
+    int    dtsec_valid;
 } obj_t;
 
 static volatile sig_atomic_t g_quit = 0;
@@ -107,6 +121,14 @@ static void fmt_clock_local(double jul_utc, char *buf, size_t n)
     struct tm lt;
     if (localtime_r(&t, &lt) == NULL) { snprintf(buf, n, "--:--:--"); return; }
     strftime(buf, n, "%H:%M:%S %Z", &lt);
+}
+
+static void fmt_utc_datetime(double jul_utc, char *buf, size_t n)
+{
+    time_t t = jul_to_unix(jul_utc);
+    struct tm ut;
+    if (gmtime_r(&t, &ut) == NULL) { snprintf(buf, n, "----------"); return; }
+    strftime(buf, n, "%Y-%m-%d %H:%M:%SZ", &ut);
 }
 
 static void fmt_hms(double secs, char *buf, size_t n)
@@ -172,6 +194,10 @@ static void setup_object(obj_t *o)
         o->apogee_km  = a_km * (1.0 + e) - EARTH_RADIUS_KM;
         o->perigee_km = a_km * (1.0 - e) - EARTH_RADIUS_KM;
     }
+
+    // tle.epoch is the raw YYDDD.ddddd field (select_ephemeris leaves it
+    // alone); Julian_Date_of_Epoch turns it into a Julian date.
+    o->epoch_jul = Julian_Date_of_Epoch(o->tle_ready.epoch);
 }
 
 // sgp4sdp4 keeps the chosen ephemeris and its init state in module-level
@@ -269,6 +295,104 @@ static void find_pass(obj_t *o, double jul_now, double window_min)
     o->dur_min  = (los - aos) * 1440.0;
 }
 
+// Maximum topocentric (look-vector) angular separation between two
+// objects over [j0, j1], in degrees. This is the on-sky angle the
+// antenna would have to swing through if it tracked one object while
+// the other was the real target — i.e. the worst-case pointing error
+// over the pass. Both predictions are left propagated at an arbitrary
+// time; the caller restores live state next tick.
+static double max_sep_over(obj_t *a, obj_t *b, double j0, double j1)
+{
+    double maxsep = -1.0;
+    for (double t = j0; t <= j1; t += 5.0 / 86400.0) {   // 5 s steps
+        prep_object(a);
+        update_satellite_position(&a->pred, t);
+        double az1 = a->pred.satellite_ephem.azimuth;
+        double el1 = a->pred.satellite_ephem.elevation;
+        prep_object(b);
+        update_satellite_position(&b->pred, t);
+        double az2 = b->pred.satellite_ephem.azimuth;
+        double el2 = b->pred.satellite_ephem.elevation;
+        double s = separation_deg(az1, el1, az2, el2);
+        if (s > maxsep) maxsep = s;
+    }
+    return maxsep;
+}
+
+// Fill each subsequent object's worst-case on-sky separation from the
+// first object across the FIRST object's next pass. Requires find_pass
+// to have run for all objects already. -1 means not computed.
+static void compute_pass_separations(obj_t *objs, int n)
+{
+    for (int i = 1; i < n; ++i) objs[i].pass_max_sep_deg = -1.0;
+    if (n < 2 || !objs[0].loaded || !objs[0].has_pass) return;
+    for (int i = 1; i < n; ++i) {
+        if (!objs[i].loaded) continue;
+        objs[i].pass_max_sep_deg =
+            max_sep_over(&objs[0], &objs[i], objs[0].aos_jul, objs[0].los_jul);
+    }
+}
+
+// ECI position + velocity (km, km/s) at a Julian date, straight from
+// SGP4/SDP4. We call the propagator directly rather than going through
+// update_satellite_position because that routine overwrites the
+// satellite position vector with the observer's (it reuses the field),
+// and the along-track time offset below needs the true satellite state.
+static void sat_state(obj_t *o, double jul, vector_t *pos, vector_t *vel)
+{
+    prep_object(o);
+    double jul_epoch = Julian_Date_of_Epoch(o->tle_ready.epoch);
+    double tsince = (jul - jul_epoch) * 1440.0;
+    if (o->deep_space) SDP4(tsince, &o->pred.satellite_ephem.tle, pos, vel);
+    else               SGP4(tsince, &o->pred.satellite_ephem.tle, pos, vel);
+    Convert_Sat_State(pos, vel);            // canonical units -> km, km/s
+}
+
+// Signed along-track time offset (seconds) of object b relative to a at
+// one instant: the dt that brings b (moving along its velocity) closest
+// to a's current position. dt = (r_a - r_b) . v_b / |v_b|^2. Positive
+// means b must advance to reach a's track point, i.e. b trails a.
+static double along_track_dtsec(const vector_t *ra,
+                                const vector_t *rb, const vector_t *vb)
+{
+    double vv = vb->x * vb->x + vb->y * vb->y + vb->z * vb->z;
+    if (vv <= 0.0) return 0.0;
+    double dot = (ra->x - rb->x) * vb->x
+               + (ra->y - rb->y) * vb->y
+               + (ra->z - rb->z) * vb->z;
+    return dot / vv;
+}
+
+// For each subsequent object, the min and max signed along-track time
+// offset vs object 0, sampled across object 0's full orbital period.
+static void compute_orbit_dtsec(obj_t *objs, int n, double jul_now)
+{
+    for (int i = 1; i < n; ++i) objs[i].dtsec_valid = 0;
+    if (n < 2 || !objs[0].loaded) return;
+    double xno = objs[0].tle_ready.xno;             // rad/min
+    if (!(xno > 0.0)) return;
+    double period_days = (2.0 * M_PI / xno) / 1440.0;
+
+    const int N = 600;
+    double step = period_days / (double) N;
+    for (int i = 1; i < n; ++i) {
+        if (!objs[i].loaded) continue;
+        double mn = 1e30, mx = -1e30;
+        for (int k = 0; k <= N; ++k) {
+            double t = jul_now + (double) k * step;
+            vector_t pa, va, pb, vb;
+            sat_state(&objs[0], t, &pa, &va);
+            sat_state(&objs[i], t, &pb, &vb);
+            double dt = along_track_dtsec(&pa, &pb, &vb);
+            if (dt < mn) mn = dt;
+            if (dt > mx) mx = dt;
+        }
+        objs[i].dtsec_min = mn;
+        objs[i].dtsec_max = mx;
+        objs[i].dtsec_valid = (mx >= mn);
+    }
+}
+
 // Propagate one object to jul_now and store the live ephemeris + Doppler.
 // prep_object() must have run for this object first.
 static void compute_live(obj_t *o, double jul_now, double freq_hz)
@@ -299,6 +423,18 @@ static void draw(obj_t *objs, int n, double jul_now, double freq_hz,
     mvprintw(row++, 0, "tle_compare    UTC %s    local %s", utc_s, loc_s);
     mvprintw(row++, 0, "TLE %s    obs %.4f, %.4f  %.0f m    Doppler @ %.4f MHz",
              tle_path, lat, lon, alt_m, freq_hz / 1e6);
+    row++;
+
+    // --- TLE EPOCH ---
+    mvprintw(row++, 0, "TLE EPOCH        %-20s %8s", "epoch (UTC)", "age (d)");
+    for (int i = 0; i < n; ++i) {
+        obj_t *o = &objs[i];
+        if (!o->loaded) { row++; continue; }
+        char ep[24];
+        fmt_utc_datetime(o->epoch_jul, ep, sizeof ep);
+        mvprintw(row++, 0, "%d %-*.*s %-20s %8.1f",
+                 i + 1, NAME_COL, NAME_COL, o->name, ep, jul_now - o->epoch_jul);
+    }
     row++;
 
     // --- SKY NOW ---
@@ -378,22 +514,41 @@ static void draw(obj_t *objs, int n, double jul_now, double freq_hz,
     // --- SEPARATION vs object 1 ---
     if (n >= 2 && objs[0].loaded) {
         obj_t *a = &objs[0];
-        mvprintw(row++, 0, "SEPARATION vs 1  %10s %10s %11s %10s",
-                 "sky deg", "range km", "doppler kHz", "AOS dsec");
+        mvprintw(row++, 0, "SEPARATION vs 1  %8s %12s %10s %11s %10s",
+                 "now deg", "pass-max deg", "range km", "doppler kHz", "AOS dsec");
         for (int i = 1; i < n; ++i) {
             obj_t *b = &objs[i];
             if (!b->loaded) { row++; continue; }
             double sep = separation_deg(a->az, a->el, b->az, b->el);
             double drange = b->range_km - a->range_km;
             double ddopp = (b->doppler_hz - a->doppler_hz) / 1e3;
-            char aosd[16] = "--";
+            char aosd[16] = "--", pmax[16] = "--";
             if (a->has_pass && b->has_pass) {
                 snprintf(aosd, sizeof aosd, "%+.0f",
                          (b->aos_jul - a->aos_jul) * 86400.0);
             }
-            mvprintw(row++, 0, "%d %-*.*s %10.3f %10.1f %11.3f %10s",
+            if (b->pass_max_sep_deg >= 0.0) {
+                snprintf(pmax, sizeof pmax, "%.3f", b->pass_max_sep_deg);
+            }
+            mvprintw(row++, 0, "%d %-*.*s %8.3f %12s %10.1f %11.3f %10s",
                      i + 1, NAME_COL, NAME_COL, b->name,
-                     sep, drange, ddopp, aosd);
+                     sep, pmax, drange, ddopp, aosd);
+        }
+        row++;
+
+        // --- ALONG-TRACK time offset over object 0's full orbit ---
+        mvprintw(row++, 0, "ALONG-TRACK vs 1 %12s %12s   s, + trails / - leads",
+                 "dtsec min", "dtsec max");
+        for (int i = 1; i < n; ++i) {
+            obj_t *b = &objs[i];
+            if (!b->loaded) { row++; continue; }
+            if (b->dtsec_valid)
+                mvprintw(row++, 0, "%d %-*.*s %12.1f %12.1f",
+                         i + 1, NAME_COL, NAME_COL, b->name,
+                         b->dtsec_min, b->dtsec_max);
+            else
+                mvprintw(row++, 0, "%d %-*.*s %12s %12s",
+                         i + 1, NAME_COL, NAME_COL, b->name, "--", "--");
         }
         row++;
     }
@@ -418,7 +573,17 @@ static void print_text(obj_t *objs, int n, double jul_now, double freq_hz,
     printf("TLE %s    obs %.4f, %.4f  %.0f m    Doppler @ %.4f MHz\n\n",
            tle_path, lat, lon, alt_m, freq_hz / 1e6);
 
-    printf("SKY NOW          %8s %7s %10s %11s\n", "az", "el", "range km", "rr km/s");
+    printf("TLE EPOCH        %-20s %8s\n", "epoch (UTC)", "age (d)");
+    for (int i = 0; i < n; ++i) {
+        obj_t *o = &objs[i];
+        if (!o->loaded) continue;
+        char ep[24];
+        fmt_utc_datetime(o->epoch_jul, ep, sizeof ep);
+        printf("%d %-*.*s %-20s %8.1f\n",
+               i + 1, NAME_COL, NAME_COL, o->name, ep, jul_now - o->epoch_jul);
+    }
+
+    printf("\nSKY NOW          %8s %7s %10s %11s\n", "az", "el", "range km", "rr km/s");
     for (int i = 0; i < n; ++i) {
         obj_t *o = &objs[i];
         if (!o->loaded) { printf("%d %-*s  (not found)\n", i + 1, NAME_COL, o->name); continue; }
@@ -464,19 +629,33 @@ static void print_text(obj_t *objs, int n, double jul_now, double freq_hz,
     }
     if (n >= 2 && objs[0].loaded) {
         obj_t *a = &objs[0];
-        printf("\nSEPARATION vs 1  %10s %10s %11s %10s\n",
-               "sky deg", "range km", "doppler kHz", "AOS dsec");
+        printf("\nSEPARATION vs 1  %8s %12s %10s %11s %10s\n",
+               "now deg", "pass-max deg", "range km", "doppler kHz", "AOS dsec");
         for (int i = 1; i < n; ++i) {
             obj_t *b = &objs[i];
             if (!b->loaded) continue;
-            char aosd[16] = "--";
+            char aosd[16] = "--", pmax[16] = "--";
             if (a->has_pass && b->has_pass)
                 snprintf(aosd, sizeof aosd, "%+.0f", (b->aos_jul - a->aos_jul) * 86400.0);
-            printf("%d %-*.*s %10.3f %10.1f %11.3f %10s\n",
+            if (b->pass_max_sep_deg >= 0.0)
+                snprintf(pmax, sizeof pmax, "%.3f", b->pass_max_sep_deg);
+            printf("%d %-*.*s %8.3f %12s %10.1f %11.3f %10s\n",
                    i + 1, NAME_COL, NAME_COL, b->name,
-                   separation_deg(a->az, a->el, b->az, b->el),
+                   separation_deg(a->az, a->el, b->az, b->el), pmax,
                    b->range_km - a->range_km,
                    (b->doppler_hz - a->doppler_hz) / 1e3, aosd);
+        }
+        printf("\nALONG-TRACK vs 1 %12s %12s   (s, + trails / - leads)\n",
+               "dtsec min", "dtsec max");
+        for (int i = 1; i < n; ++i) {
+            obj_t *b = &objs[i];
+            if (!b->loaded) continue;
+            if (b->dtsec_valid)
+                printf("%d %-*.*s %12.1f %12.1f\n",
+                       i + 1, NAME_COL, NAME_COL, b->name, b->dtsec_min, b->dtsec_max);
+            else
+                printf("%d %-*.*s %12s %12s\n",
+                       i + 1, NAME_COL, NAME_COL, b->name, "--", "--");
         }
     }
 }
@@ -601,6 +780,8 @@ int main(int argc, char **argv)
             prep_object(&objs[i]);
             find_pass(&objs[i], jul_now, window_min);
         }
+        compute_pass_separations(objs, n);
+        compute_orbit_dtsec(objs, n, jul_now);
         print_text(objs, n, jul_now, freq_hz, tle_path, lat, lon, alt_m);
         return EXIT_SUCCESS;
     }
@@ -639,6 +820,8 @@ int main(int argc, char **argv)
                 prep_object(&objs[i]);
                 find_pass(&objs[i], jul_now, window_min);
             }
+            compute_pass_separations(objs, n);
+            compute_orbit_dtsec(objs, n, jul_now);
         }
 
         draw(objs, n, jul_now, freq_hz, tle_path, lat, lon, alt_m);
