@@ -7295,12 +7295,15 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         break;
     }
 
-    // Bare invocation (no satellite_id, no --control): the standalone
-    // tracker is being phased out in favour of the operator+viewer
-    // split. Probe for the running operator and bail with a hint
-    // either way. --self-test skips the probe (a side effect) so the
-    // config dump runs cleanly without a live operator anywhere.
-    if (n_positional == 0 && !g_control_mode && !g_self_test) {
+    // Any invocation without --control: the standalone tracker is being
+    // phased out in favour of the operator+viewer split, so there is no
+    // longer a "track this on my own" path. Probe for the running
+    // operator and either attach as a viewer or bail with a hint.
+    // This holds whether or not a satellite name was given on the
+    // command line - a viewer mirrors whatever the operator is tracking,
+    // so any positional is ignored here. --self-test skips the probe (a
+    // side effect) so the config dump runs cleanly with no live operator.
+    if (!g_control_mode && !g_self_test) {
         sso_ipc_client_t *probe = sso_ipc_client_connect("simple_sat_ops");
         if (probe == NULL) {
             fprintf(stderr,
