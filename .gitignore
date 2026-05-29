@@ -15,3 +15,10 @@ rotator_docs
 wav/*.wav
 *.raw
 session
+# Vendor / clone FPGA bitstreams: large binaries, often not
+# redistributable. Keep them out of git; each operator places the file
+# locally and points ~/.local/share/simple_sat_ops/sdr_fpga_map at it
+# by absolute path (see USER_MANUAL "SDR backends").
+sdr/**/*.bin
+sdr/**/*.bit
+sdr/**/*.lvbitx

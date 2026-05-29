@@ -825,6 +825,13 @@ into `--uhd-args="type=b200,serial=...,fpga=/path/to.bin"` (which wins
 over everything). The serial is read via libusb; UHD's own
 device-enumeration call segfaults on macOS, so it is not used.
 
+The bitstream itself is **not** in the repository: it is a large binary
+derived from vendor IP, so it is git-ignored and distributed within the
+team out of band (a shared drive, not a public release). Put your copy
+wherever you like - the UHD images directory
+(`~/.local/share/uhd/images/`) or the repo's git-ignored `sdr/` folder
+are both fine - and give the map its absolute path.
+
 **RTL-SDR - receive only.** An RTL-SDR dongle (`--sdr-type=rtlsdr`, or
 auto with no USRP present) runs the full receive chain: tracking,
 Doppler, recording, waterfall, and decode all work. It **cannot
