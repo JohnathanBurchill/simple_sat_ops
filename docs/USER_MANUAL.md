@@ -105,6 +105,7 @@ manual can go back on the shelf where it belongs.
    - [Colon-command prompt](#colon-command-prompt)
    - [TX compose modal (`t`)](#tx-compose-modal-t)
    - [Auto-telecommand modal (`A`)](#auto-telecommand-modal-a)
+   - [Finding telecommands and their arguments](#finding-telecommands-and-their-arguments)
    - [Rotator calibration (`--calibrate-rotator`)](#rotator-calibration---calibrate-rotator)
    - [Pursuit tracking](#pursuit-tracking)
 9. [Pass scheduling: `next_in_queue`](#pass-scheduling-next_in_queue)
@@ -919,6 +920,32 @@ the next auto-tcmd tick keep running while each burst is in flight.
 
 The auto-tcmd loop respects the safety gates and the LOS guard.
 Once the pass ends, it stops sending commands.
+
+### Finding telecommands and their arguments
+
+`simple_sat_ops` only carries telecommands to the satellite - it does
+not define them. The authoritative list of commands, their arguments,
+and the responses to expect lives with the flight firmware in the
+CalgaryToSpace repository:
+
+- <https://github.com/CalgaryToSpace/CTS-SAT-1-OBC-Firmware/blob/main/docs/Mission_Operations/Telecommands_and_Config_Variables.md>
+
+Use that page to look up the exact function name, its argument order
+and types, and the form of the reply on the downlink. The command you
+type into the `t` compose modal (or list in a `--tc-file`) is the same
+`CTS1+function_name(...)!` string documented there.
+
+> Note: the manual link points at `main`. The image you are actually
+> flying may be a tagged release rather than `main`; when in doubt,
+> read the docs at the firmware tag that is on the spacecraft.
+
+#### Populating a `--tc-file` for auto-commanding
+
+*(To be written.)* This subsection will cover turning the documented
+commands into a `--tc-file` for the `A` auto-telecommand modal: the
+per-line `CTS1+...@tssent=...@tsexec=...!` format, how to set the
+execution times, and how to dry-run the list with
+[`agenda_check`](#agenda-review-agenda_check) before a pass.
 
 ### Rotator calibration (`--calibrate-rotator`)
 
