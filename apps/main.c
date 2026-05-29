@@ -593,6 +593,15 @@ static int    g_cmd_dirty        = 0;
 static long   g_cmd_last_edit_ns = 0;
 static long   g_cmd_debounce_ns  = 150000000L;  // 150 ms
 
+// Command history: Up/Down cycle previously executed commands,
+// shell-style. The line being edited is stashed on the first Up so Down
+// can return to it.
+#define CMD_HISTORY_SIZE 64
+static char g_cmd_history[CMD_HISTORY_SIZE][CMD_BUF_SIZE];
+static int  g_cmd_history_count = 0;   // entries in use (capped at SIZE)
+static int  g_cmd_hist_pos      = 0;   // 0..count; ==count -> editing line
+static char g_cmd_hist_saved[CMD_BUF_SIZE] = "";  // editing line stash
+
 static long cmd_now_ns(void)
 {
     struct timespec ts;
@@ -606,6 +615,8 @@ static void cmd_enter(void)
     g_cmd_buf[0] = '\0';
     g_cmd_len = 0;
     g_cmd_cursor = 0;
+    // Start a fresh history walk at the (empty) editing line.
+    g_cmd_hist_pos = g_cmd_history_count;
     // Force an immediate preview broadcast so viewers see the ":" prompt
     // appear the moment the operator opens it.
     g_cmd_dirty = 1;
@@ -618,6 +629,253 @@ static void cmd_set_status(const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(g_cmd_status, sizeof g_cmd_status, fmt, ap);
     va_end(ap);
+}
+
+// --- Command history -----------------------------------------------
+// Append a just-executed line. Skips blanks and immediate duplicates so
+// holding Enter or repeating a command doesn't bloat the ring.
+static void cmd_history_push(const char *line)
+{
+    if (line == NULL || line[0] == '\0') return;
+    if (g_cmd_history_count > 0
+        && strcmp(g_cmd_history[g_cmd_history_count - 1], line) == 0) {
+        g_cmd_hist_pos = g_cmd_history_count;
+        return;
+    }
+    if (g_cmd_history_count < CMD_HISTORY_SIZE) {
+        snprintf(g_cmd_history[g_cmd_history_count], CMD_BUF_SIZE, "%s", line);
+        g_cmd_history_count++;
+    } else {
+        memmove(&g_cmd_history[0], &g_cmd_history[1],
+                sizeof g_cmd_history[0] * (CMD_HISTORY_SIZE - 1));
+        snprintf(g_cmd_history[CMD_HISTORY_SIZE - 1], CMD_BUF_SIZE, "%s", line);
+    }
+    g_cmd_hist_pos = g_cmd_history_count;
+}
+
+// Replace the live buffer and park the cursor at the end. Marks the
+// buffer dirty so the next tick re-broadcasts the preview to viewers.
+static void cmd_buf_set(const char *s)
+{
+    snprintf(g_cmd_buf, sizeof g_cmd_buf, "%s", s);
+    g_cmd_len = (int) strlen(g_cmd_buf);
+    g_cmd_cursor = g_cmd_len;
+    g_cmd_dirty = 1;
+    g_cmd_last_edit_ns = cmd_now_ns();
+}
+
+static void cmd_history_prev(void)   // Up
+{
+    if (g_cmd_history_count == 0) return;
+    if (g_cmd_hist_pos == g_cmd_history_count) {
+        snprintf(g_cmd_hist_saved, sizeof g_cmd_hist_saved, "%s", g_cmd_buf);
+    }
+    if (g_cmd_hist_pos > 0) g_cmd_hist_pos--;
+    cmd_buf_set(g_cmd_history[g_cmd_hist_pos]);
+}
+
+static void cmd_history_next(void)   // Down
+{
+    if (g_cmd_history_count == 0) return;
+    if (g_cmd_hist_pos >= g_cmd_history_count) return;
+    g_cmd_hist_pos++;
+    cmd_buf_set(g_cmd_hist_pos == g_cmd_history_count
+                    ? g_cmd_hist_saved
+                    : g_cmd_history[g_cmd_hist_pos]);
+}
+
+// --- Path expansion + tab completion -------------------------------
+
+// Expand a leading ~ and any $VAR / ${VAR} references in `in` into
+// `out`. ~ maps to $HOME at the very start only; unknown variables
+// expand to empty. Returns 0 on success, -1 on overflow (out emptied).
+// Lets a typed `$TLES/.../tle.tle` reach the filesystem at dispatch and
+// during completion.
+static int cmd_expand(const char *in, char *out, size_t cap)
+{
+    size_t o = 0;
+#define CMD_EXPAND_PUT(c) \
+    do { if (o + 1 >= cap) { out[0] = '\0'; return -1; } out[o++] = (c); } while (0)
+    for (size_t i = 0; in[i] != '\0'; ) {
+        if (i == 0 && in[0] == '~' && (in[1] == '/' || in[1] == '\0')) {
+            const char *home = getenv("HOME");
+            if (home) for (const char *h = home; *h; ++h) CMD_EXPAND_PUT(*h);
+            i++;
+            continue;
+        }
+        if (in[i] == '$') {
+            int    braced = (in[i + 1] == '{');
+            size_t s = i + 1 + (braced ? 1 : 0);
+            size_t e = s;
+            while (in[e] && (isalnum((unsigned char) in[e]) || in[e] == '_')) e++;
+            if (e > s) {
+                char   name[64];
+                size_t nl = e - s;
+                if (nl >= sizeof name) nl = sizeof name - 1;
+                memcpy(name, in + s, nl);
+                name[nl] = '\0';
+                const char *val = getenv(name);
+                if (val) for (const char *v = val; *v; ++v) CMD_EXPAND_PUT(*v);
+                i = e;
+                if (braced && in[i] == '}') i++;
+                continue;
+            }
+            // Lone $ / ${ with no name -> emit literally.
+        }
+        CMD_EXPAND_PUT(in[i]);
+        i++;
+    }
+    out[o] = '\0';
+#undef CMD_EXPAND_PUT
+    return 0;
+}
+
+// Insert a string at the cursor, shifting the tail right. Stops at the
+// buffer cap. Marks the line dirty for the preview broadcast.
+static void cmd_insert_str(const char *s)
+{
+    for (const char *p = s; *p; ++p) {
+        if (g_cmd_len >= (int) sizeof g_cmd_buf - 1) break;
+        memmove(&g_cmd_buf[g_cmd_cursor + 1], &g_cmd_buf[g_cmd_cursor],
+                (size_t)(g_cmd_len - g_cmd_cursor + 1));  // include nul
+        g_cmd_buf[g_cmd_cursor] = *p;
+        g_cmd_len++;
+        g_cmd_cursor++;
+    }
+    g_cmd_dirty = 1;
+    g_cmd_last_edit_ns = cmd_now_ns();
+}
+
+// Command names, for first-token completion.
+static const char *const g_cmd_names[] = {
+    "help", "tx", "auto", "track", "stop", "home", "retarget",
+    "freq", "rs", "spectrum", "lo_offset", "lo_bandwidth", "gain", "quit",
+};
+
+// Tab completion at the cursor. The first token completes against
+// command names; any later token completes a filesystem path. Only the
+// trailing path component is completed -- a $VAR / ~ prefix stays
+// literal in the buffer and is expanded just to pick the directory to
+// scan, so `:retarget $TLES/20260529/<TAB>` keeps `$TLES` and fills in
+// the file. Single match -> full completion (with a trailing `/` for a
+// directory); multiple -> extend to the longest common prefix.
+static void cmd_tab_complete(void)
+{
+    if (!g_cmd_active) return;
+
+    int start = g_cmd_cursor;
+    while (start > 0 && g_cmd_buf[start - 1] != ' '
+                     && g_cmd_buf[start - 1] != '\t') {
+        start--;
+    }
+    int tok_len = g_cmd_cursor - start;
+    char token[CMD_BUF_SIZE];
+    if (tok_len < 0 || tok_len >= (int) sizeof token) return;
+    memcpy(token, g_cmd_buf + start, (size_t) tok_len);
+    token[tok_len] = '\0';
+
+    // First token -> command-name completion.
+    if (start == 0) {
+        int    n = 0;
+        size_t common = 0;
+        char   lcp[32] = "";
+        const char *only = NULL;
+        for (size_t i = 0; i < sizeof g_cmd_names / sizeof g_cmd_names[0]; ++i) {
+            if (strncmp(g_cmd_names[i], token, (size_t) tok_len) != 0) continue;
+            n++;
+            if (n == 1) {
+                only = g_cmd_names[i];
+                snprintf(lcp, sizeof lcp, "%s", g_cmd_names[i]);
+                common = strlen(lcp);
+            } else {
+                size_t k = 0;
+                while (k < common && g_cmd_names[i][k] == lcp[k]) k++;
+                common = k;
+                lcp[common] = '\0';
+            }
+        }
+        if (n == 1) {
+            cmd_insert_str(only + tok_len);
+            cmd_insert_str(" ");
+        } else if (n > 1 && common > (size_t) tok_len) {
+            // lcp is already truncated to the common prefix.
+            cmd_insert_str(lcp + tok_len);
+        }
+        return;
+    }
+
+    // Argument token -> path completion. Split into the literal dir
+    // prefix (through the last '/') and the partial basename.
+    const char *slash = strrchr(token, '/');
+    char        dir_lit[CMD_BUF_SIZE];
+    const char *base;
+    if (slash) {
+        size_t dl = (size_t)(slash - token) + 1;  // keep the '/'
+        if (dl >= sizeof dir_lit) return;
+        memcpy(dir_lit, token, dl);
+        dir_lit[dl] = '\0';
+        base = slash + 1;
+    } else {
+        dir_lit[0] = '\0';
+        base = token;
+    }
+    size_t base_len = strlen(base);
+
+    char scan_dir[1024];
+    if (dir_lit[0] == '\0') {
+        snprintf(scan_dir, sizeof scan_dir, ".");
+    } else if (cmd_expand(dir_lit, scan_dir, sizeof scan_dir) != 0
+               || scan_dir[0] == '\0') {
+        return;
+    }
+
+    DIR *d = opendir(scan_dir);
+    if (d == NULL) return;
+    int    n = 0;
+    size_t common = 0;
+    // Sized to hold any directory entry name (gcc-15 treats d_name as up
+    // to 1023 bytes for its truncation analysis).
+    char   lcp[1024]  = "";
+    char   only[1024] = "";
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        const char *nm = de->d_name;
+        // Hide dotfiles (incl. . and ..) unless the user typed a dot.
+        if (nm[0] == '.' && base[0] != '.') continue;
+        if (strncmp(nm, base, base_len) != 0) continue;
+        n++;
+        if (n == 1) {
+            snprintf(only, sizeof only, "%s", nm);
+            snprintf(lcp,  sizeof lcp,  "%s", nm);
+            common = strlen(lcp);
+        } else {
+            size_t k = 0;
+            while (k < common && nm[k] == lcp[k]) k++;
+            common = k;
+            lcp[common] = '\0';
+        }
+    }
+    closedir(d);
+    if (n == 0) return;
+
+    if (n == 1) {
+        cmd_insert_str(only + base_len);
+        // Append '/' when the single match is a directory.
+        char full[2048];
+        size_t sl = strlen(scan_dir);
+        if (sl > 0 && scan_dir[sl - 1] == '/') {
+            snprintf(full, sizeof full, "%s%s", scan_dir, only);
+        } else {
+            snprintf(full, sizeof full, "%s/%s", scan_dir, only);
+        }
+        struct stat st;
+        if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
+            cmd_insert_str("/");
+        }
+    } else if (common > base_len) {
+        // lcp is already truncated to the common prefix of all matches.
+        cmd_insert_str(lcp + base_len);
+    }
 }
 
 // Forward decls so cmd_dispatch can call the existing action helpers,
@@ -720,11 +978,14 @@ static void cmd_dispatch(state_t *state)
         cmd_set_status("home: az=0 el=0");
         sso_audit_event("rotator-home", "az=0 el=0");
     } else if (strcmp(cmd, "retarget") == 0) {
+        char expanded[1024];
         if (arg1 == NULL) {
             cmd_set_status("retarget: usage `retarget <tle-file>` "
                            "(first satellite in the file is used)");
+        } else if (cmd_expand(arg1, expanded, sizeof expanded) != 0) {
+            cmd_set_status("retarget: path too long after expansion");
         } else {
-            int rc = retarget_to_tle(state, arg1);
+            int rc = retarget_to_tle(state, expanded);
             const char *name =
                 state->prediction.satellite_ephem.tle.sat_name;
             double mins =
@@ -1021,6 +1282,8 @@ typedef enum {
     CMD_ACTION_END,
     CMD_ACTION_BACKSPACE,
     CMD_ACTION_DEL,
+    CMD_ACTION_HIST_PREV,
+    CMD_ACTION_HIST_NEXT,
 } cmd_action_t;
 
 static int cmd_apply_action(cmd_action_t a)
@@ -1059,6 +1322,12 @@ static int cmd_apply_action(cmd_action_t a)
                 g_cmd_last_edit_ns = cmd_now_ns();
             }
             return 1;
+        case CMD_ACTION_HIST_PREV:
+            cmd_history_prev();
+            return 1;
+        case CMD_ACTION_HIST_NEXT:
+            cmd_history_next();
+            return 1;
         default:
             return 0;
     }
@@ -1082,6 +1351,8 @@ static cmd_action_t cmd_drain_csi(void)
     if (b2 == ERR) return CMD_ACTION_NONE;
     if (b2 == 'D') return CMD_ACTION_LEFT;
     if (b2 == 'C') return CMD_ACTION_RIGHT;
+    if (b2 == 'A') return CMD_ACTION_HIST_PREV;
+    if (b2 == 'B') return CMD_ACTION_HIST_NEXT;
     if (b2 == 'H') return CMD_ACTION_HOME;
     if (b2 == 'F') return CMD_ACTION_END;
     // VT-style sequences: ESC [ <digits> ~ . We only care about a few.
@@ -1129,6 +1400,7 @@ static int cmd_handle_key(int key, state_t *state)
         char executed[CMD_BUF_SIZE];
         snprintf(executed, sizeof executed, "%s", g_cmd_buf);
         g_cmd_active = 0;
+        cmd_history_push(executed);
         cmd_dispatch(state);
         // Audit: one line per `:` command the operator pressed Enter on,
         // with the post-dispatch status so a reviewer sees both the
@@ -1147,6 +1419,9 @@ static int cmd_handle_key(int key, state_t *state)
         g_cmd_dirty = 0;
         return 1;
     }
+    if (key == '\t')      { cmd_tab_complete(); return 1; }
+    if (key == KEY_UP)    { cmd_history_prev(); return 1; }
+    if (key == KEY_DOWN)  { cmd_history_next(); return 1; }
     if (key == KEY_LEFT)  return cmd_apply_action(CMD_ACTION_LEFT);
     if (key == KEY_RIGHT) return cmd_apply_action(CMD_ACTION_RIGHT);
     if (key == KEY_HOME || key == 1 /* Ctrl-A */)
