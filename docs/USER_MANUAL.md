@@ -721,7 +721,7 @@ execution times.
 
 ```text
 simple_sat_ops --control [<satellite>] [options]   # operator mode
-simple_sat_ops          [<satellite>] [options]    # viewer mode
+simple_sat_ops [options]                            # viewer mode (an operator must be running)
 ```
 
 **Operator (`--control`).** Opens the IPC socket
@@ -732,10 +732,14 @@ points at the force-claim path (see
 [Troubleshooting](#troubleshooting)).
 
 **Viewer (no flag).** Connects to the running operator's socket and
-renders the same state read-only. Press `c` then `y` inside the
-confirmation window to force-claim. The running operator yields,
-the socket disappears, and the viewer re-execs into `--control`
-with the same TLE and pass folder.
+renders the same state read-only. There is no longer a "track on my
+own" standalone mode: without `--control`, if no operator is running,
+the program exits with `operator not found: try simple_sat_ops
+--control ...` rather than starting. A satellite name given without
+`--control` is ignored - a viewer mirrors whatever the operator is
+tracking. Press `c` then `y` inside the confirmation window to
+force-claim. The running operator yields, the socket disappears, and
+the viewer re-execs into `--control` with the same TLE and pass folder.
 
 > **Drill (your first pass).** Find an operator already running, or
 > start one yourself, then open a second `simple_sat_ops` with no
@@ -755,7 +759,7 @@ with the same TLE and pass folder.
 |------|---------|
 | `--control` | Operator mode (one allowed at a time). |
 | `--tle <path>` | Path to a 3-line TLE file. Default: `$HOME/.local/state/simple_sat_ops/active.tle`. Space form is tab-completable; `--tle=<path>` also works. |
-| `<satellite_id>` | Name prefix to match in the TLE. Optional with `--control` (auto-discovered from the TLE name). |
+| `<satellite_id>` | Name prefix to match in the TLE. Optional with `--control` (auto-discovered from the TLE name). Ignored without `--control` - a viewer mirrors the operator's target. |
 | `--lat=<deg>` `--lon=<deg>` `--alt=<m>` | Observer override. Defaults to the Rothney Astrophysical Observatory (Priddis, SW of Calgary). |
 | `--rotator-device <path>` | Override the SPID tty. |
 | `--without-rotator` (alias `--without-hardware`) | Skip the SPID entirely. |
@@ -831,21 +835,53 @@ Screen layout (ncurses, redrawn at ~10 Hz):
 
 Press `:` to open a one-line command bar at the bottom. The prompt
 echoes keystrokes to viewers (debounced) so observers see what the
-operator is about to commit. Enter fires, Esc cancels. Supported
-commands include:
+operator is about to commit. Enter fires, Esc cancels.
+
+Line editing:
+
+* **Up / Down** cycle a history of the commands you have run this
+  session. The line you were typing is preserved and comes back when
+  you press Down past the newest entry.
+* **Tab** completes: the first word against the command names; any
+  later word as a filesystem path.
+* **`$VAR`, `${VAR}`, and a leading `~`** are expanded when a command
+  reads a path. Tab completion keeps the `$VAR` / `~` prefix literal in
+  the buffer and only completes the trailing component, so
+  `:retarget $TLES/20260529/<Tab>` keeps `$TLES` and fills in the file.
+
+Commands:
 
 | Command | Effect |
 |---------|--------|
+| `:track` / `:stop` | Start / stop tracking the current satellite. |
+| `:home` | Stop tracking and return to (az=0, el=0). |
+| `:retarget <tle-file>` | Switch the tracked satellite mid-pass to the first one in the file (see below). |
+| `:tx` / `:auto` | Open the TX compose / auto-telecommand modal. |
+| `:freq <MHz>` | Override the nominal downlink frequency for the current pass (a value below 1e6 is read as MHz, otherwise Hz). |
 | `:gain <dB>` | Set the AD9361 RX gain. |
-| `:freq <Hz>` | Override the nominal downlink frequency for the current pass. |
-| `:lo_offset <kHz>` | Move the B210's LO offset (default ~25 kHz keeps the signal off DC). |
+| `:lo_offset <signed-kHz>` | Move the B210's LO offset to dodge a baseband artifact. |
+| `:lo_bandwidth <kHz>` | Set the live waterfall's visible bandwidth (needs `--live-waterfall`). |
 | `:spectrum <N>` | Render a spectrogram of the last `N` seconds of WAV/IQ via `gen_waterfall` (forked, non-blocking). |
-| `:tr level <0..3>` | Set the T/R switch firmware log level (0=ALWAYS, 1=INFO heartbeat, 2=DEBUG, 3=...). |
-| `:tr mode <a\|t\|r\|s>` | Serial-override mode command to the T/R switch (AUTO / FORCE_TX / FORCE_RX / clear). |
-| `:dummy` | Send a small dummy frame as a TX self-check (still subject to the safety gates). |
+| `:rs on\|off` | Reed-Solomon toggle (not yet runtime-wired; reports as much). |
+| `:help` | List the commands. |
+| `:quit` | Quit (`:q` and `:exit` too). |
 
-The exact set is whatever's wired up in `apps/main.c`'s
-`cmd_handle_key`. Check that file if you need a definitive list.
+The definitive set is whatever's wired up in `apps/main.c`'s
+`cmd_dispatch`; the line-editing keys live in `cmd_handle_key`. Check
+those if you need to be sure.
+
+#### `:retarget <tle-file>`
+
+Switch the satellite being tracked partway through a pass - for
+example when a second satellite you also want is above the horizon at
+the same time. The **first** satellite in the named file is used; its
+name need not match anything already loaded. If you are tracking, the
+antenna slews straight to the new target on the short path - it does
+**not** unwind through (0, 0) first. A repeat `:retarget` on the same
+file is a no-op; a different file swaps even when it names the same
+satellite. The satellite display row and the viewer broadcast both
+follow the new target. The path argument is expanded and
+Tab-completable, so `:retarget $TLES/20260529/tle-20260529.tle` works.
 
 ### TX compose modal (`t`)
 
