@@ -533,6 +533,7 @@ if (OPENSSL_FOUND)
         add_executable(b210_gain_sweep utils/b210_gain_sweep.c
                        utils/pdf_writer.c
                        src/hw/b210_rx_tx_core.c
+                       src/hw/sdr_backend.c src/hw/sdr_uhd.c
                        src/hw/carrier_trim.c
                        src/dsp/fir_decim.c src/dsp/sw_nco.c
                        src/dsp/iq_burst.c
@@ -639,6 +640,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
         target_compile_definitions(simple_sat_ops PRIVATE WITH_USRP_B210)
         target_sources(simple_sat_ops PRIVATE
                        src/hw/b210_rx_tx_core.c
+                       src/hw/sdr_backend.c src/hw/sdr_uhd.c
                        src/hw/carrier_trim.c
                        src/dsp/fir_decim.c src/dsp/sw_nco.c
                        src/dsp/iq_burst.c

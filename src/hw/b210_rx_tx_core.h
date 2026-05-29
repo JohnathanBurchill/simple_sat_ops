@@ -253,7 +253,14 @@ typedef struct b210_rx_tx_core_burst_params {
 // the last, drain the FPGA FIFO, restore RX freq, restart the RX
 // stream. Returns 0 on success, -1 on UHD/streamer error (stderr has
 // detail). RX is left running on return regardless of outcome.
+//
+// RX-only backends (e.g. RTL-SDR) have no transmit path: this returns
+// -1 and logs. Callers should gate on b210_rx_tx_core_can_tx() first.
 int b210_rx_tx_core_burst(b210_rx_tx_core_t *core,
                           const b210_rx_tx_core_burst_params_t *p);
+
+// 1 if the active SDR backend can transmit, 0 if it is RX-only (or core
+// is NULL). The TX UI and the burst path gate on this.
+int b210_rx_tx_core_can_tx(const b210_rx_tx_core_t *core);
 
 #endif // B210_RX_TX_CORE_H
