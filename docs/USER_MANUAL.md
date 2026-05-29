@@ -1681,10 +1681,12 @@ git log -p --reverse 00f6ba6..0246372 -- apps/main.c   # the current era, one fi
 ### How the commits are meant to be read
 
 The commit history is not bookkeeping; it is the troubleshooting
-record. Development happened across two machines: a Mac dev host that
-builds the non-hardware tools (no ALSA, no SGP4SDP4, no UHD by
-default) and the RAO ground station that has the actual radio,
-rotator, and antenna. The loop was: write on the Mac, push, pull on
+record. Development happened across two machines. Why a Mac dev host,
+you ask? No grand reason - it happened to be Burchill's work laptop,
+and it had Claude Code installed, so that is where the code got
+written. It builds the non-hardware tools (no ALSA, no SGP4SDP4, no
+UHD by default); the actual radio, rotator, and antenna live on the
+RAO ground station. So the loop was: write on the Mac, push, pull on
 RAO, test against hardware, observe, commit the fix. The commits are
 therefore deliberately small, one observable change each, so that a
 regression can be cornered with `git bisect` and a behavior can be
