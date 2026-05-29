@@ -7465,10 +7465,17 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
     state->antenna_rotator.flip_decision_made = 0;
     state->antenna_rotator.flip_half = 0;
 
-    if (!state->antenna_rotator.unwrapped_target_valid) {
-        if (main_rotator_refresh_targets_from_snapshot(state) != 0) {
-            return ANTENNA_ROTATOR_BAD_RESPONSE;
-        }
+    // Re-sync the unwrap accumulator to the antenna's *physical* position
+    // before computing the home move. target_azimuth_unwrapped can drift
+    // from reality across a pass -- e.g. it can hold a negative co-terminal
+    // that the wrapped status display still renders as a positive angle --
+    // which made "home" drive the long way around instead of unwinding.
+    // Seeding prev from the live status makes r/home always move from where
+    // the antenna actually is. If no fresh status is available, fall back to
+    // the last known target, and only fail if we have neither.
+    if (main_rotator_refresh_targets_from_snapshot(state) != 0
+        && !state->antenna_rotator.unwrapped_target_valid) {
+        return ANTENNA_ROTATOR_BAD_RESPONSE;
     }
 
     double prev = state->antenna_rotator.target_azimuth_unwrapped;
