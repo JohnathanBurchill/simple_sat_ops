@@ -20,8 +20,9 @@
 
     This is the chain gr_satellites uses (quadrature-demod → clock
     sync → slicer) and is the right primary chain for FrontierSat,
-    whose downlink is FSK at h≈2/3 (deviation 3200, baud 9600) rather
-    than the MSK h=0.5 that modem_iq.c's commentary still assumes.
+    whose downlink is FSK at h=0.5 (deviation 2400, baud 9600), i.e.
+    MSK. The slicer is sign-based on a DC-blocked signal, so it decodes
+    correctly regardless of the exact modulation index.
 
     Same signature as modem_iq_to_bits so callers can A/B-swap chains
     at the call site.
