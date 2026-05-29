@@ -575,9 +575,35 @@ Which targets actually build depends on what the host has:
 | always | `radio_ctl`, `rs_selftest`, `fm_preview`, `agenda_check` |
 | OpenSSL / libcrypto | `uplink_test`, `rx_decode`, `packet_query`, `packet_browser` |
 | SGP4SDP4 | `next_in_queue`, `lifetime`, `prediction_selftest`, `pursuit_selftest` |
-| UHD (B210) | `b210_rx_capture`, `b210_gain_sweep`, `tx_frame_sdr` |
+| UHD (B210) | `b210_rx_capture`, `b210_gain_sweep`, `tx_frame_sdr`, `sdr_probe` |
+| librtlsdr | RTL-SDR RX-only backend in `simple_sat_ops` (on by default; auto-disables if absent) |
+| libusb | USB-serial clone detection in the UHD backend (a UHD dependency, so normally already present) |
 | raylib | `live_waterfall`, `decode_inspector` |
 | ncurses + SGP4SDP4 + libcrypto | `simple_sat_ops` (pulls UHD too when present) |
+
+### Dependencies
+
+The build auto-detects each library via pkg-config; install the **`-dev`**
+packages so the headers and `.pc` files are found.
+
+Ubuntu/Debian (the ground machine):
+
+```sh
+sudo apt install build-essential cmake pkg-config \
+    libncurses-dev libssl-dev libsqlite3-dev libasound2-dev \
+    libuhd-dev librtlsdr-dev libusb-1.0-0-dev
+```
+
+macOS (Homebrew, dev host):
+
+```sh
+brew install cmake pkg-config ncurses openssl sqlite uhd librtlsdr libusb
+```
+
+Mind the Debian names: it is **`librtlsdr-dev`** and **`libusb-1.0-0-dev`**
+- the bare `librtlsdr` / `libusb` / `libusb-1.0` packages do not exist
+(`apt` says "Unable to locate package"). UHD is `libuhd-dev`; `raylib`
+(optional `live_waterfall`) is `libraylib-dev`.
 
 The bundled `sgp4sdp4/` directory is a separate CMake project; build
 and install it first (see `sgp4sdp4/README.md`). `CMakeLists.txt`
@@ -591,10 +617,13 @@ warnings Apple clang misses. Output lives in `build-lint/`.
 
 ## First-run setup
 
-1. **Confirm hardware.** B210 detected by `uhd_find_devices`. SPID
-   powered and in `A` mode on the front panel (the firmware path
-   that responds to the W-frame STATUS query). T/R switch USB-CDC
-   visible if installed. Antenna connected.
+1. **Confirm hardware.** Run `sdr_probe` (see
+   [SDR backends](#sdr-backends)): it shows the SDR, the FPGA image it
+   will load, and the RX/TX antenna ports - and, for a clone, surfaces
+   the USB serial even when a wrong-FPGA open would fail. SPID powered
+   and in `A` mode on the front panel (the firmware path that responds
+   to the W-frame STATUS query). T/R switch USB-CDC visible if
+   installed. Antenna connected to the right port.
 
 2. **TLE file.** By convention the team keeps dated TLEs under the
    FrontierSat TLE directory (referred to below as `$TLES`, i.e.
