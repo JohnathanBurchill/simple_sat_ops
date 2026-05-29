@@ -100,6 +100,7 @@ manual can go back on the shelf where it belongs.
 8. [Operator UI: `simple_sat_ops`](#operator-ui-simple_sat_ops)
    - [Modes: operator vs. viewer](#modes-operator-vs-viewer)
    - [Command-line options](#command-line-options)
+   - [SDR backends](#sdr-backends)
    - [Keyboard controls](#keyboard-controls)
    - [Status, RX, and TX panels](#status-rx-and-tx-panels)
    - [Colon-command prompt](#colon-command-prompt)
@@ -766,8 +767,12 @@ the viewer re-execs into `--control` with the same TLE and pass folder.
 | `--without-rotator` (alias `--without-hardware`) | Skip the SPID entirely. |
 | `--without-tr-switch` | Skip the T/R switch probe. |
 | `--tr-switch-device=<path>` | Override the T/R switch tty. |
-| `--without-b210` | Run UI plus rotator only. |
-| `--no-tx` | Open the B210 but block PA keying. The TX compose modal still shows preview and dry-run. |
+| `--without-b210` | Run UI plus rotator only (skip the SDR). |
+| `--sdr-type=uhd\|rtlsdr\|auto` | SDR backend (default `auto`: probe UHD, then RTL-SDR). See [SDR backends](#sdr-backends). |
+| `--uhd-args=<args>` | UHD device args verbatim (e.g. `type=b200,serial=...`); overrides detection. |
+| `--sdr-fpga=<path>` | Force a UHD FPGA image (a B2xx clone whose bitstream differs from stock). |
+| `--sdr-device=<sel>` | RTL-SDR dongle index (for UHD prefer `--uhd-args`). |
+| `--no-tx` | Open the SDR but block PA keying. The TX compose modal still shows preview and dry-run. |
 | `--hmac-keyfile <path>` | Override the HMAC keyfile. |
 | `--tc-file=<path>` | Telecommand list for the `A` auto-tcmd modal. |
 | `--calibrate-rotator` `--confirm-rotator-calibrate` | One-shot calibration mode (see below). |
@@ -778,6 +783,46 @@ the viewer re-execs into `--control` with the same TLE and pass folder.
 | `--self-test` | Print the resolved configuration and exit. Useful in scripts. |
 
 `--help-full` also lists the TX safety gates and viewer options.
+
+### SDR backends
+
+`simple_sat_ops` talks to the radio hardware through a pluggable SDR
+backend. By default (`--sdr-type=auto`) it probes the compiled-in
+backends in order - UHD first, then RTL-SDR - and uses the first that
+opens. Pick one explicitly with `--sdr-type=uhd` or `--sdr-type=rtlsdr`.
+The active SDR and its transmit capability are shown on the RX panel
+(`SDR <name>` or `SDR <name> (RX-only)`) and on the startup line.
+
+**USRP (UHD) - the operational path.** On open the UHD backend
+enumerates the attached device and logs its `product`, `serial`, and
+`name`. It transmits and receives, so all operator functions are
+available.
+
+If you run a **B210-ish clone whose FPGA differs from the stock image**,
+the bitstream has to be uploaded for the board to come up. Choose it one
+of three ways (highest precedence first):
+
+1. `--uhd-args="type=b200,serial=...,fpga=/path/to.bin"` - passed to UHD
+   verbatim.
+2. `--sdr-fpga=/path/to.bin` - forces `fpga=` on the device args.
+3. A built-in `product -> image` map in `src/hw/sdr_uhd.c`
+   (`uhd_fpga_image_for`). Read the clone's product string off the
+   open-time log, add an entry, and detection then loads it
+   automatically.
+
+A caveat to know: if the clone's EEPROM reports the *same* identity as a
+genuine B210, auto-detection cannot tell them apart - use the
+`--sdr-fpga` / `--uhd-args` override in that case.
+
+**RTL-SDR - receive only.** An RTL-SDR dongle (`--sdr-type=rtlsdr`, or
+auto with no USRP present) runs the full receive chain: tracking,
+Doppler, recording, waterfall, and decode all work. It **cannot
+transmit**: the TX compose (`t`) and auto-telecommand (`A`) modals open
+for composing and preview but the allow-tx gate is forced off, and a
+commit is refused with "TX not supported by this SDR (RX-only backend)".
+Pick the dongle with `--sdr-device=<index>` if you have more than one.
+The RTL backend must be compiled in (`-DWITH_RTL_SDR=ON`, needs
+`librtlsdr`).
 
 ### Keyboard controls
 
@@ -897,8 +942,12 @@ a `tx-preview` event, so observers see the draft before commit.
 Enter sends a `tx-request`. The main loop's next tick passes RX
 over to TX, transmits the burst, resumes RX, and records a
 `tx-command-sent` event in the TX log. If the burst never reaches the
-air - no B210, frame-build failure, UHD error, or `--tx-dry-run` - a
+air - no SDR, frame-build failure, UHD error, or `--tx-dry-run` - a
 `tx-not-sent` event carries the reason instead. Esc cancels.
+
+On an [RX-only SDR](#sdr-backends) (RTL-SDR), the modal still opens for
+composing and preview, but the allow-tx gate is forced off and a commit
+is refused with "TX not supported by this SDR (RX-only backend)".
 
 ### Auto-telecommand modal (`A`)
 
@@ -919,7 +968,9 @@ dispatch is async (submit + poll), so the rotator, redraw, IPC, and
 the next auto-tcmd tick keep running while each burst is in flight.
 
 The auto-tcmd loop respects the safety gates and the LOS guard.
-Once the pass ends, it stops sending commands.
+Once the pass ends, it stops sending commands. On an
+[RX-only SDR](#sdr-backends) the loop refuses to send (the same RX-only
+gate as the compose modal).
 
 ### Finding telecommands and their arguments
 
