@@ -4588,7 +4588,13 @@ void usage(FILE *dest, const char *name, int full)
 // during TX, for one). Restored on teardown so final console messages
 // print normally. dup2 on the fd (not the FILE*) catches direct fd-2
 // writes from C libraries too, not just our fprintf(stderr, ...).
-static int g_saved_stderr_fd = -1;
+static int   g_saved_stderr_fd = -1;
+// Path of the redirected log and its size at grab time, so on quit we
+// can tell the operator whether anything was logged THIS run (the file
+// is opened append, so we compare against the starting size, not zero).
+// Empty path => no real log file (e.g. a viewer with no pass folder).
+static char  g_stderr_log_path[320] = "";
+static off_t g_stderr_log_start_size = 0;
 
 static void tui_grab_stderr(void)
 {
@@ -4606,6 +4612,17 @@ static void tui_grab_stderr(void)
     int log_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (log_fd < 0) return;                // leave stderr as-is on failure
 
+    // Remember the log path + its current size so tui_report_errors can
+    // tell whether this run appended anything. Only for a real file; a
+    // /dev/null sink leaves the path empty and is never reported on.
+    g_stderr_log_path[0]    = '\0';
+    g_stderr_log_start_size = 0;
+    if (g_pass_folder[0]) {
+        struct stat st;
+        if (fstat(log_fd, &st) == 0) g_stderr_log_start_size = st.st_size;
+        snprintf(g_stderr_log_path, sizeof g_stderr_log_path, "%s", path);
+    }
+
     fflush(stderr);
     g_saved_stderr_fd = dup(STDERR_FILENO);
     if (g_saved_stderr_fd < 0) { close(log_fd); g_saved_stderr_fd = -1; return; }
@@ -4622,6 +4639,22 @@ static void tui_release_stderr(void)
     dup2(g_saved_stderr_fd, STDERR_FILENO);
     close(g_saved_stderr_fd);
     g_saved_stderr_fd = -1;
+}
+
+// One-line closing status: did anything hit the redirected stderr log
+// this run? Call once, last, after the TUI has been torn down and stderr
+// restored. Silent when there was no real log file (e.g. a viewer).
+static void tui_report_errors(void)
+{
+    if (g_stderr_log_path[0] == '\0') return;
+    struct stat st;
+    if (stat(g_stderr_log_path, &st) == 0
+        && st.st_size > g_stderr_log_start_size) {
+        printf("Errors logged in %s\n", g_stderr_log_path);
+    } else {
+        printf("No errors reported\n");
+    }
+    fflush(stdout);
 }
 
 void init_window(void)
@@ -7527,6 +7560,9 @@ int main(int argc, char **argv)
         free_passes();
     }
 
+    // Final line: tell the operator whether anything landed in the
+    // redirected stderr log during the pass.
+    tui_report_errors();
     return 0;
 }
 
