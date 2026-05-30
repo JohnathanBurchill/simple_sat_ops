@@ -275,12 +275,17 @@ struct rx_session {
     char         db_run_id[24];
 
     // --- Threading ---
-    // The worker thread owns `core` and runs the UHD pump + decode +
-    // wav writer + TX burst. Main thread interacts via the request
-    // flags and the snapshot, both protected by `mu`.
+    // The worker thread owns the RX side of `core`: it runs the UHD RX
+    // pump + decode + wav writer continuously and never blocks on TX.
+    // A separate tx_thread runs each TX burst (the B210 is full-duplex:
+    // RX keeps streaming on the worker while TX bursts on its own port),
+    // so a transmit never starves the RX USB transport. Main thread
+    // interacts via the request flags and the snapshot, both under `mu`.
     b210_rx_tx_core_t *core;
     pthread_t          thread;
     int                thread_started;
+    pthread_t          tx_thread;
+    int                tx_thread_started;
     pthread_mutex_t    mu;
     pthread_cond_t     cv;
     volatile int       stop_requested;
@@ -293,8 +298,11 @@ struct rx_session {
     int     wav_start_req;
     int     wav_stop_req;
 
-    // TX burst handoff (synchronous).
+    // TX burst handoff. burst_req_pending: queued, not yet picked up.
+    // burst_in_flight: the tx_thread is transmitting. burst_complete:
+    // finished, result not yet consumed.
     int                burst_req_pending;
+    int                burst_in_flight;
     int                burst_complete;
     tx_request_slot_t  burst_req;
     uint8_t            burst_hmac_key[128];
@@ -352,6 +360,7 @@ struct rx_session {
 };
 
 static void *rx_session_thread_fn(void *arg);
+static void *rx_session_tx_thread_fn(void *arg);
 
 int rx_session_open(rx_session_t **out, const rx_session_params_t *p,
                     b210_rx_tx_core_t *core)
@@ -458,8 +467,9 @@ int rx_session_open(rx_session_t **out, const rx_session_params_t *p,
     }
 
     // Threading: rx_session takes ownership of the core. The worker
-    // pumps UHD continuously and services freq retunes / WAV
-    // start-stops / TX bursts queued by the main thread.
+    // pumps UHD RX continuously and services freq retunes / WAV
+    // start-stops queued by the main thread; a separate tx_thread runs
+    // TX bursts so a transmit never blocks the RX pump.
     rxs->core = core;
     rxs->lo_offset_hz = p->lo_offset_hz;
     // lo_offset_hz is SIGNED: positive → LO above nominal, negative
@@ -478,6 +488,23 @@ int rx_session_open(rx_session_t **out, const rx_session_params_t *p,
         return -1;
     }
     rxs->thread_started = 1;
+
+    if (pthread_create(&rxs->tx_thread, NULL, rx_session_tx_thread_fn, rxs) != 0) {
+        fprintf(stderr, "rx_session: TX pthread_create failed\n");
+        // Unwind the worker thread cleanly, then the mutex/cond.
+        pthread_mutex_lock(&rxs->mu);
+        rxs->stop_requested = 1;
+        pthread_cond_broadcast(&rxs->cv);
+        pthread_mutex_unlock(&rxs->mu);
+        pthread_join(rxs->thread, NULL);
+        rxs->thread_started = 0;
+        pthread_cond_destroy (&rxs->cv);
+        pthread_mutex_destroy(&rxs->mu);
+        rxs->core = NULL;
+        rx_session_close(rxs);
+        return -1;
+    }
+    rxs->tx_thread_started = 1;
 
     *out = rxs;
     return 0;
@@ -861,11 +888,12 @@ int rx_session_submit_burst(
 {
     if (rxs == NULL || req == NULL) return -1;
     pthread_mutex_lock(&rxs->mu);
-    // Refuse to overwrite a still-pending submission. burst_req_pending
-    // is cleared by the worker when it picks up the request; burst_complete
-    // by the operator's poll. While either is set, there's an in-flight or
-    // unconsumed result the caller must reap first.
-    if (rxs->burst_req_pending || rxs->burst_complete) {
+    // Refuse to overwrite a submission that is queued (burst_req_pending),
+    // transmitting (burst_in_flight), or finished-but-unconsumed
+    // (burst_complete). The tx_thread clears pending when it starts and
+    // sets in_flight; the operator's poll clears complete. Any of the
+    // three means a result the caller must reap first.
+    if (rxs->burst_req_pending || rxs->burst_in_flight || rxs->burst_complete) {
         pthread_mutex_unlock(&rxs->mu);
         return -1;
     }
@@ -907,13 +935,23 @@ int rx_session_poll_burst(
 void rx_session_close(rx_session_t *rxs)
 {
     if (rxs == NULL) return;
-    if (rxs->thread_started) {
+    if (rxs->thread_started || rxs->tx_thread_started) {
+        // Wake both the RX worker and the TX thread, then join both
+        // before tearing down the lock they share. A TX burst in flight
+        // finishes first (it doesn't poll stop_requested mid-burst), then
+        // the tx_thread sees the stop and exits.
         pthread_mutex_lock(&rxs->mu);
         rxs->stop_requested = 1;
         pthread_cond_broadcast(&rxs->cv);
         pthread_mutex_unlock(&rxs->mu);
-        pthread_join(rxs->thread, NULL);
-        rxs->thread_started = 0;
+        if (rxs->thread_started) {
+            pthread_join(rxs->thread, NULL);
+            rxs->thread_started = 0;
+        }
+        if (rxs->tx_thread_started) {
+            pthread_join(rxs->tx_thread, NULL);
+            rxs->tx_thread_started = 0;
+        }
         pthread_cond_destroy (&rxs->cv);
         pthread_mutex_destroy(&rxs->mu);
     }
@@ -1356,6 +1394,51 @@ static void worker_update_snapshot(rx_session_t *rxs)
     pthread_mutex_unlock(&rxs->mu);
 }
 
+// Dedicated TX-burst thread. Sleeps until a burst is queued, runs it
+// (tx_burst_run maps/tunes/sends/unmaps the TX chain) while the RX
+// worker keeps streaming on its own thread, then publishes the result.
+// Keeping TX off the RX worker is what lets RX run continuously across a
+// transmit instead of starving the USB transport mid-burst.
+static void *rx_session_tx_thread_fn(void *arg)
+{
+    rx_session_t *rxs = arg;
+    for (;;) {
+        pthread_mutex_lock(&rxs->mu);
+        while (!rxs->burst_req_pending && !rxs->stop_requested) {
+            pthread_cond_wait(&rxs->cv, &rxs->mu);
+        }
+        if (rxs->stop_requested) {
+            pthread_mutex_unlock(&rxs->mu);
+            break;
+        }
+        tx_request_slot_t req = rxs->burst_req;
+        uint8_t           hmac_local[128];
+        size_t            hmac_local_len = rxs->burst_hmac_key_len;
+        if (hmac_local_len > 0)
+            memcpy(hmac_local, rxs->burst_hmac_key, hmac_local_len);
+        rxs->burst_req_pending = 0;
+        rxs->burst_in_flight   = 1;
+        pthread_mutex_unlock(&rxs->mu);
+
+        // rx_resume_freq is unused now (RX is never paused), so pass 0.0
+        // rather than read the worker-owned actual_freq across threads.
+        char summary[160];
+        tx_burst_result_t br = tx_burst_run(
+            rxs->core, &req, /*rx_resume_freq_hz=*/0.0,
+            hmac_local_len > 0 ? hmac_local : NULL, hmac_local_len,
+            summary, sizeof summary);
+
+        pthread_mutex_lock(&rxs->mu);
+        rxs->burst_result = (rx_burst_result_t) br;
+        snprintf(rxs->burst_summary, sizeof rxs->burst_summary, "%s", summary);
+        rxs->burst_in_flight = 0;
+        rxs->burst_complete  = 1;
+        pthread_cond_broadcast(&rxs->cv);
+        pthread_mutex_unlock(&rxs->mu);
+    }
+    return NULL;
+}
+
 static void *rx_session_thread_fn(void *arg)
 {
     rx_session_t *rxs = arg;
@@ -1369,16 +1452,8 @@ static void *rx_session_thread_fn(void *arg)
         double new_gain   = rxs->gain_req_db;
         int do_wav_start  = rxs->wav_start_req;
         int do_wav_stop   = rxs->wav_stop_req;
-        int do_burst      = rxs->burst_req_pending && !rxs->burst_complete;
-        tx_request_slot_t burst_local;
-        uint8_t           hmac_local[128];
-        size_t            hmac_local_len = 0;
-        if (do_burst) {
-            burst_local    = rxs->burst_req;
-            hmac_local_len = rxs->burst_hmac_key_len;
-            if (hmac_local_len > 0)
-                memcpy(hmac_local, rxs->burst_hmac_key, hmac_local_len);
-        }
+        // TX bursts are handled by the tx_thread, NOT here — the worker
+        // must never block on a transmit or the RX transport starves.
         rxs->freq_req_pending = 0;
         rxs->gain_req_pending = 0;
         rxs->wav_start_req    = 0;
@@ -1395,23 +1470,6 @@ static void *rx_session_thread_fn(void *arg)
         }
         if (do_wav_start) worker_wav_start(rxs);
         if (do_wav_stop)  worker_wav_stop(rxs);
-
-        if (do_burst) {
-            char summary[160];
-            tx_burst_result_t br = tx_burst_run(
-                rxs->core, &burst_local,
-                b210_rx_tx_core_actual_freq(rxs->core),
-                hmac_local_len > 0 ? hmac_local : NULL, hmac_local_len,
-                summary, sizeof summary);
-            pthread_mutex_lock(&rxs->mu);
-            rxs->burst_result = (rx_burst_result_t) br;
-            snprintf(rxs->burst_summary, sizeof rxs->burst_summary,
-                     "%s", summary);
-            rxs->burst_complete    = 1;
-            rxs->burst_req_pending = 0;
-            pthread_cond_broadcast(&rxs->cv);
-            pthread_mutex_unlock(&rxs->mu);
-        }
 
         // Pump UHD. recv blocks ~chunk-cadence; that's our pacing.
         if (worker_pump_once(rxs) < 0) {

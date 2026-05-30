@@ -2355,9 +2355,11 @@ static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
 // unlocked. As the operator edits a field the modal broadcasts a
 // debounced SSO_EVT_TX_COMMAND_PREVIEW so viewers see the draft and
 // can call out typos. On Enter the modal stashes the parsed request in
-// g_tx_request; the main loop runs it inline via tx_burst_run (no IPC
-// round-trip, since the B210 now lives in this process). ACK +
-// COMMAND_SENT events are published locally for viewer fan-out.
+// g_tx_request; the main loop submits it to rx_session, which runs the
+// burst on its dedicated TX thread (no IPC round-trip, since the B210
+// now lives in this process; RX keeps streaming on the worker thread
+// throughout). ACK + COMMAND_SENT events are published locally for
+// viewer fan-out.
 
 // Compose modal is intentionally minimal: a single payload line
 // (always ASCII, prefilled with "CTS1+"), a TX-power-in-dB field,

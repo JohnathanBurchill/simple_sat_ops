@@ -444,14 +444,11 @@ int b210_rx_tx_core_burst(b210_rx_tx_core_t *c,
         .start_delay_s     = p->start_delay_s,
         .rx_resume_freq_hz = p->rx_resume_freq_hz,
     };
-    int rc = sdr_backend_tx_burst(c->backend, &sp);
-    // The burst paused and resumed RX inside the backend; reset the
-    // FM-demod phase reference + level meter so the post-TX RX seam
-    // doesn't pop.
-    c->have_prev   = 0;
-    c->iq_peak_env = 0.0;
-    c->iq_rms_sq   = 0.0;
-    return rc;
+    // Full-duplex: the burst runs on the TX thread while the RX worker
+    // keeps pumping. RX is never paused, so there is no demod seam to
+    // reset here — and touching the DSP phase/level state from this
+    // thread would race the worker's pump. Leave the RX chain untouched.
+    return sdr_backend_tx_burst(c->backend, &sp);
 }
 
 int b210_rx_tx_core_can_tx(const b210_rx_tx_core_t *c)

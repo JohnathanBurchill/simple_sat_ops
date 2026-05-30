@@ -117,9 +117,13 @@ static void uhd_resolve_device_args(const sdr_open_params_t *p,
                        && strstr(base, "serial=") == NULL);
     int want_fpga   = (fpga != NULL && fpga[0]);
 
-    // One bounded snprintf: precision-capped (200 + 8 + 127 + 6 + 512 =
-    // 853) fits a 1024-byte out.
-    snprintf(out, cap, "%.200s%s%.127s%s%.512s",
+    // One bounded snprintf: precision-capped (200 + 8 + 127 + 6 + 512 +
+    // the trailing literal) fits a 1024-byte out. num_recv_frames=512
+    // enlarges the host-side RX transport ring: the B2xx buffers RX only
+    // in USB frames (no big socket buffer like the networked USRPs), so a
+    // bigger ring is the documented cure for transient overflows — it
+    // gives the continuous RX stream slack across a concurrent TX burst.
+    snprintf(out, cap, "%.200s%s%.127s%s%.512s,num_recv_frames=512",
              base,
              want_serial ? ",serial=" : "", want_serial ? serial : "",
              want_fpga   ? ",fpga="   : "", want_fpga   ? fpga   : "");
@@ -367,34 +371,14 @@ static int uhd_set_gain(sdr_backend_t *be, double gain_db)
 
 // --- TX burst (half-duplex) ----------------------------------------
 
-// Tear the RX streamer down to idle. Drain any in-flight packet so the
-// next START_CONTINUOUS doesn't pick up a stale chunk. (FM-demod phase
-// state lives in the chain and is reset there after the burst.)
-static int rx_pause_for_tx(struct sdr_uhd *u)
-{
-    if (u == NULL) return -1;
-    if (u->stream_running) {
-        uhd_stream_cmd_t stop = {
-            .stream_mode = UHD_STREAM_MODE_STOP_CONTINUOUS,
-            .num_samps   = 0,
-            .stream_now  = true,
-        };
-        if (log_uhd(uhd_rx_streamer_issue_stream_cmd(u->stream, &stop),
-                    "rx_stop_for_tx")) return -1;
-        u->stream_running = 0;
-    }
-    if (u->drain_buf != NULL && u->stream != NULL && u->md != NULL) {
-        void *bufs[1] = { u->drain_buf };
-        for (int i = 0; i < 16; ++i) {
-            size_t n_recv = 0;
-            uhd_error e = uhd_rx_streamer_recv(u->stream, bufs, u->max_iq_in,
-                                               &u->md, 0.1, false, &n_recv);
-            if (e != UHD_ERROR_NONE) break;
-            if (n_recv == 0) break;
-        }
-    }
-    return 0;
-}
+// Full-duplex model: the RX streamer is started once at open and runs
+// continuously for the device's whole life. A TX burst NEVER stops or
+// retunes RX — it only maps/tunes/sends/unmaps the independent TX chain
+// (the AD9361 RX and TX synthesizers are separate in FDD). The RX worker
+// keeps reaping the USB transport on its own thread throughout the burst,
+// so the transport never starves. Zero emission between bursts is still
+// guaranteed by unmapping the TX subdev (tx_power_down), which powers the
+// TX chain/LO down — not by stopping RX.
 
 // Map (power up) or unmap (power down) the AD9361 TX chain by setting
 // the TX subdev spec. "A:A" maps TX channel 0; "" leaves zero TX
@@ -444,36 +428,6 @@ static int tx_power_up(struct sdr_uhd *u)
     return 0;
 }
 
-static int rx_resume_after_tx(struct sdr_uhd *u, double rx_freq_hz)
-{
-    if (u == NULL || u->stream == NULL) return -1;
-    if (rx_freq_hz > 0.0) {
-        char tune_args[] = "mode_n=fractional";
-        uhd_tune_request_t req = {
-            .target_freq     = rx_freq_hz,
-            .rf_freq_policy  = UHD_TUNE_REQUEST_POLICY_AUTO, .rf_freq = 0.0,
-            .dsp_freq_policy = UHD_TUNE_REQUEST_POLICY_AUTO, .dsp_freq = 0.0,
-            .args            = tune_args,
-        };
-        uhd_tune_result_t res = {0};
-        if (log_uhd(uhd_usrp_set_rx_freq(u->dev, &req, 0, &res),
-                    "rx_resume_set_freq")) return -1;
-        double f = u->actual_freq;
-        if (uhd_usrp_get_rx_freq(u->dev, 0, &f) == UHD_ERROR_NONE) u->actual_freq = f;
-    }
-    uhd_stream_cmd_t start = {
-        .stream_mode         = UHD_STREAM_MODE_START_CONTINUOUS,
-        .num_samps           = 0,
-        .stream_now          = true,
-        .time_spec_full_secs = 0,
-        .time_spec_frac_secs = 0.0,
-    };
-    if (log_uhd(uhd_rx_streamer_issue_stream_cmd(u->stream, &start),
-                "rx_resume_after_tx")) return -1;
-    u->stream_running = 1;
-    return 0;
-}
-
 // Build the TX streamer on first use, cache rate so subsequent bursts
 // only rebuild when the rate actually changed.
 static int tx_streamer_lazy_build(struct sdr_uhd *u, double tx_rate_hz)
@@ -517,7 +471,8 @@ static int uhd_tx_burst(sdr_backend_t *be, const sdr_tx_burst_params_t *p)
     if (u == NULL || p == NULL || p->iq == NULL || p->n_samps == 0) return -1;
 
     int rc = -1;
-    if (rx_pause_for_tx(u) != 0) goto resume;
+    // RX is NOT paused — it streams continuously on the worker thread.
+    // We only bring the independent TX chain up, transmit, and drop it.
     if (tx_power_up(u) != 0) goto resume;
     if (tx_streamer_lazy_build(u, p->tx_rate_hz) != 0) goto resume;
 
@@ -526,10 +481,19 @@ static int uhd_tx_burst(sdr_backend_t *be, const sdr_tx_burst_params_t *p)
                     "set_tx_gain")) goto resume;
         u->tx_gain_cached = p->tx_gain_db;
     }
-    // Reset the device clock so the time_spec on the first chunk gives
-    // the FPGA TX FIFO room to buffer before the scheduled start.
-    if (log_uhd(uhd_usrp_set_time_now(u->dev, 0, 0.0, 0),
-                "tx_set_time_now")) goto resume;
+    // Do NOT reset the device clock here — RX is streaming and a clock
+    // reset would jump its sample timestamps. Schedule the burst at the
+    // current device time + start_delay, which still gives the FPGA TX
+    // FIFO room to buffer before emission begins.
+    double tx_start_s = p->start_delay_s;
+    {
+        int64_t now_full = 0;
+        double  now_frac = 0.0;
+        if (uhd_usrp_get_time_now(u->dev, 0, &now_full, &now_frac)
+                == UHD_ERROR_NONE) {
+            tx_start_s = (double) now_full + now_frac + p->start_delay_s;
+        }
+    }
     {
         uhd_tune_request_t req = {
             .target_freq     = p->tx_freq_hz,
@@ -556,9 +520,9 @@ static int uhd_tx_burst(sdr_backend_t *be, const sdr_tx_burst_params_t *p)
         uhd_tx_metadata_free(&md);
         if (log_uhd(uhd_tx_metadata_make(&md,
                           /*has_time_spec=*/is_first ? true : false,
-                          /*full_secs=*/(int64_t) p->start_delay_s,
-                          /*frac_secs=*/p->start_delay_s
-                                        - (double)(int64_t) p->start_delay_s,
+                          /*full_secs=*/(int64_t) tx_start_s,
+                          /*frac_secs=*/tx_start_s
+                                        - (double)(int64_t) tx_start_s,
                           /*start_of_burst=*/is_first ? true : false,
                           /*end_of_burst=*/is_last ? true : false),
                     "tx_metadata_make (loop)")) {
@@ -599,12 +563,9 @@ static int uhd_tx_burst(sdr_backend_t *be, const sdr_tx_burst_params_t *p)
 resume:
     // Power the TX chain down (empty TX subdev) so the transmit LO stops
     // feeding through to the TX/RX port — nothing on the antenna while in
-    // RX. Done even if the TX leg failed. RX is restarted right after.
+    // RX. Done even if the TX leg failed. RX was never stopped, so there
+    // is nothing to resume; it has been streaming throughout.
     tx_power_down(u);
-    if (rx_resume_after_tx(u, p->rx_resume_freq_hz) != 0) {
-        fprintf(stderr,
-            "sdr_uhd: WARNING — RX did not resume after TX burst\n");
-    }
     return rc;
 }
 
