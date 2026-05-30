@@ -50,6 +50,10 @@
 #include "tle_csv.h"
 #include "wav_read.h"
 
+#ifdef HAVE_SNDFILE
+#include <sndfile.h>
+#endif
+
 #ifdef WITH_SGP4SDP4
 #include "prediction.h"
 #endif
@@ -289,17 +293,65 @@ static int read_raw_pcm16(const char *path, int16_t **out_samples, size_t *out_n
     return 0;
 }
 
+#ifdef HAVE_SNDFILE
+// Decode a compressed audio recording (a SatNOGS .ogg, which is the
+// receiver's FM-discriminated audio — the same kind of PCM as the .wav
+// path, just Vorbis-compressed) to mono int16 in memory via libsndfile.
+// Multi-channel input is downmixed to channel 0. Returns 0 with
+// *out_samples / *out_n / *out_rate, -1 on error. Caller frees samples.
+static int read_audio_sndfile(const char *path, int16_t **out_samples,
+                              size_t *out_n, int *out_rate)
+{
+    SF_INFO info;
+    memset(&info, 0, sizeof info);
+    SNDFILE *sf = sf_open(path, SFM_READ, &info);
+    if (sf == NULL) {
+        fprintf(stderr, "rx_replay: sf_open(%s): %s\n", path, sf_strerror(NULL));
+        return -1;
+    }
+    if (info.frames <= 0 || info.channels < 1) {
+        fprintf(stderr, "rx_replay: %s has no decodable audio\n", path);
+        sf_close(sf);
+        return -1;
+    }
+    size_t ch     = (size_t) info.channels;
+    size_t frames = (size_t) info.frames;
+    int16_t *inter = (int16_t *) malloc(frames * ch * sizeof(int16_t));
+    int16_t *mono  = (int16_t *) malloc(frames * sizeof(int16_t));
+    if (inter == NULL || mono == NULL) {
+        fprintf(stderr, "rx_replay: out of memory decoding %s\n", path);
+        free(inter); free(mono); sf_close(sf);
+        return -1;
+    }
+    sf_count_t got = sf_readf_short(sf, inter, (sf_count_t) frames);
+    sf_close(sf);
+    if (got <= 0) { free(inter); free(mono); return -1; }
+    size_t nf = (size_t) got;
+    for (size_t f = 0; f < nf; ++f) mono[f] = inter[f * ch];  // keep ch 0
+    free(inter);
+    *out_samples = mono;
+    *out_n       = nf;
+    *out_rate    = info.samplerate;
+    return 0;
+}
+#endif
+
 static void usage(FILE *dest, const char *name)
 {
     fprintf(dest,
         "usage: %s <path> [options]\n"
         "\n"
-        "Offline AX100 sliding-window decoder. Reads a WAV or headerless\n"
-        "S16_LE raw PCM recording (e.g. b210_rx_tx's .wav companion)\n"
-        "and applies the same window/slide/decode loop b210_rx_tx runs\n"
-        "on live IQ capture.\n"
+        "Offline AX100 sliding-window decoder. Reads a WAV, a headerless\n"
+        "S16_LE raw PCM recording (e.g. simple_sat_ops's .wav companion),\n"
+        "or a SatNOGS .ogg audio recording, and applies the same\n"
+        "window/slide/decode loop simple_sat_ops runs on live capture.\n"
         "\n"
         "Input:\n"
+        "  <path>.ogg               SatNOGS FM-audio recording (Vorbis).\n"
+        "                           Auto-decoded to PCM via libsndfile and\n"
+        "                           run through the FM-audio chain. The .ogg\n"
+        "                           IS the discriminated audio, so it uses the\n"
+        "                           PCM path, not --iq.\n"
         "  --raw                    Treat <path> as headerless S16_LE PCM\n"
         "                           (auto-enabled when path ends in '.raw').\n"
         "  --iq                     Treat <path> as headerless int16 I,Q\n"
@@ -611,6 +663,9 @@ int main(int argc, char **argv)
     const char *keyfile_path = NULL;
     int raw_mode = 0;
     int raw_mode_explicit = 0;
+    // Auto-detected from a .ogg extension: a SatNOGS audio recording,
+    // decoded to PCM via libsndfile and run through the FM-audio chain.
+    int ogg_mode = 0;
     int raw_rate = 48000;
     int raw_rate_explicit = 0;
     int raw_channels = 2;
@@ -852,6 +907,12 @@ int main(int argc, char **argv)
         size_t plen = strlen(input_path);
         if (plen >= 3 && strcmp(input_path + plen - 3, ".iq") == 0) iq_mode = 1;
     }
+    // .ogg (SatNOGS audio) -> decode to PCM and run the FM-audio chain.
+    // Only when not already raw/iq.
+    if (!raw_mode && !iq_mode) {
+        size_t plen = strlen(input_path);
+        if (plen >= 4 && strcmp(input_path + plen - 4, ".ogg") == 0) ogg_mode = 1;
+    }
     // When given a .iq without an explicit --rate, look for a companion
     // .wav alongside it (simple_sat_ops writes them in pairs) and lift
     // the sample rate from its header. Saves the caller from having
@@ -925,6 +986,25 @@ int main(int argc, char **argv)
         if (read_raw_pcm16(input_path, &samples, &n_samples) != 0) return 1;
         samp_rate = raw_rate;
         channels = raw_channels;
+    } else if (ogg_mode) {
+#ifdef HAVE_SNDFILE
+        if (read_audio_sndfile(input_path, &samples, &n_samples,
+                               &samp_rate) != 0) {
+            return 1;
+        }
+        channels = 1;  // already downmixed to mono
+        if (raw_rate_explicit) samp_rate = raw_rate;  // allow override
+        fprintf(stderr,
+            "rx_replay: decoded %s via libsndfile (%d Hz, %zu samples)\n",
+            input_path, samp_rate, n_samples);
+#else
+        fprintf(stderr,
+            "rx_replay: %s is a .ogg but this build has no libsndfile. "
+            "Rebuild with libsndfile (brew install libsndfile / "
+            "apt install libsndfile1-dev), or convert it to .wav first.\n",
+            input_path);
+        return 1;
+#endif
     } else {
         if (wav_read_pcm16(input_path, &samples, &n_samples,
                            &samp_rate, &channels) != 0) {

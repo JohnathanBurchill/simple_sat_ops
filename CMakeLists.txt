@@ -57,6 +57,11 @@ pkg_check_modules(NCURSES ncurses)
 pkg_check_modules(OPENSSL libcrypto)
 pkg_check_modules(SQLITE3 sqlite3)
 pkg_check_modules(RAYLIB raylib)
+# libsndfile decodes SatNOGS .ogg (and .wav/.flac) straight to PCM in
+# memory, so rx_replay can replay a SatNOGS audio recording. Optional:
+# without it, rx_replay still handles .wav/.iq, and .ogg errors with a
+# clear hint.
+pkg_check_modules(SNDFILE sndfile)
 find_library(SGP4SDP4_LIB sgp4sdp4)
 # pthread for the sso_audit writer thread + the rx_session worker.
 # Used by target_link_sso_core() and the simple_sat_ops link line.
@@ -467,6 +472,12 @@ if (OPENSSL_FOUND)
     target_include_directories(rx_replay PRIVATE ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(rx_replay PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(rx_replay PRIVATE ${OPENSSL_LIBRARIES} m)
+    if (SNDFILE_FOUND)
+        target_compile_definitions(rx_replay PRIVATE HAVE_SNDFILE)
+        target_include_directories(rx_replay PRIVATE ${SNDFILE_INCLUDE_DIRS})
+        target_link_directories(rx_replay PRIVATE ${SNDFILE_LIBRARY_DIRS})
+        target_link_libraries(rx_replay PRIVATE ${SNDFILE_LIBRARIES})
+    endif()
     if (NCURSES_FOUND)
         target_compile_definitions(rx_replay PRIVATE RX_TUI_AVAILABLE)
         target_include_directories(rx_replay PRIVATE ${NCURSES_INCLUDE_DIRS})
