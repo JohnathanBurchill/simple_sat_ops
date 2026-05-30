@@ -4678,7 +4678,10 @@ static void tui_report_errors(void)
 // signal (and a core dump if enabled). SIGINT/SIGTERM instead ask the
 // main loop to quit cleanly via its normal teardown.
 static volatile sig_atomic_t g_signal_quit = 0;
-static volatile sig_atomic_t g_in_crash    = 0;
+// Claimed (test-and-set) by the first thread to enter the crash handler.
+// On device loss TWO threads abort at once (our RX worker and a UHD
+// internal thread); only one may run the terminal-restore + message.
+static volatile char g_crash_claimed = 0;
 // Terminal modes captured before ncurses took over, so the crash handler
 // can restore the tty without relying on a (thread-racy) endwin().
 static struct termios g_saved_termios;
@@ -4695,8 +4698,21 @@ static void graceful_quit_handler(int sig)
 
 static void crash_handler(int sig)
 {
-    if (g_in_crash) _exit(128 + sig);   // crashed again inside the handler
-    g_in_crash = 1;
+    // On device loss two threads abort almost simultaneously. The first
+    // claims the handler and does the cleanup; any other thread must NOT
+    // _exit here — that single fast syscall would terminate the process
+    // before the first thread finished restoring the terminal and
+    // printing the message (the bug: "waterfall down, terminal garbled,
+    // no message"). Instead, wait: the claiming thread re-raises and
+    // brings the whole process down within microseconds. Bounded so a
+    // wedged cleanup can't hang forever.
+    if (__atomic_test_and_set(&g_crash_claimed, __ATOMIC_SEQ_CST)) {
+        for (int i = 0; i < 50; i++) {
+            struct timespec ts = { 0, 10 * 1000 * 1000 };   // 10 ms
+            nanosleep(&ts, NULL);
+        }
+        _exit(128 + sig);
+    }
 
     // Kill the spawned live-waterfall window so it doesn't orphan when we
     // die — the normal teardown that usually does this won't run. kill()
