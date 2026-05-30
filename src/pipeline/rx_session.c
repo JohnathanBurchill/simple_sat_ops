@@ -289,6 +289,11 @@ struct rx_session {
     pthread_mutex_t    mu;
     pthread_cond_t     cv;
     volatile int       stop_requested;
+    // Set by the worker when the RX pump returns a fatal error (device
+    // unplugged / transport dead). The worker then parks and the main
+    // thread surfaces a TUI warning; the session object stays alive so
+    // the operator can still quit cleanly.
+    volatile int       device_lost;
 
     // Requests from main thread (set under mu, picked up by worker).
     int     freq_req_pending;
@@ -838,6 +843,13 @@ int rx_session_can_tx(const rx_session_t *rxs)
     return b210_rx_tx_core_can_tx(rxs->core);
 }
 
+// True once the RX pump has hit a fatal error (device unplugged /
+// transport dead). volatile int — a plain read is fine for a status poll.
+int rx_session_device_lost(const rx_session_t *rxs)
+{
+    return (rxs != NULL) ? rxs->device_lost : 0;
+}
+
 const char *rx_session_sdr_name(const rx_session_t *rxs)
 {
     if (rxs == NULL || rxs->core == NULL) return "";
@@ -958,7 +970,10 @@ void rx_session_close(rx_session_t *rxs)
     // Worker exited, so we own the wav/iq/core/db scratch outright.
     if (rxs->wav.fp) wav_w_close(&rxs->wav);
     if (rxs->iq_fp)  { fclose(rxs->iq_fp); rxs->iq_fp = NULL; }
-    if (rxs->core)   b210_rx_tx_core_close(rxs->core);
+    // After a device loss the SDR is gone, so closing it (stream stop +
+    // device free) could fault on the dead device. Leak the handle — the
+    // process is exiting anyway — rather than risk a crash on the way out.
+    if (rxs->core && !rxs->device_lost) b210_rx_tx_core_close(rxs->core);
     if (rxs->db)     packet_db_close(rxs->db);
     free(rxs->pcm_chunk);
     free(rxs->iq_chunk);
@@ -1416,17 +1431,26 @@ static void *rx_session_tx_thread_fn(void *arg)
         size_t            hmac_local_len = rxs->burst_hmac_key_len;
         if (hmac_local_len > 0)
             memcpy(hmac_local, rxs->burst_hmac_key, hmac_local_len);
+        int lost = rxs->device_lost;
         rxs->burst_req_pending = 0;
         rxs->burst_in_flight   = 1;
         pthread_mutex_unlock(&rxs->mu);
 
-        // rx_resume_freq is unused now (RX is never paused), so pass 0.0
-        // rather than read the worker-owned actual_freq across threads.
-        char summary[160];
-        tx_burst_result_t br = tx_burst_run(
-            rxs->core, &req, /*rx_resume_freq_hz=*/0.0,
-            hmac_local_len > 0 ? hmac_local : NULL, hmac_local_len,
-            summary, sizeof summary);
+        tx_burst_result_t br;
+        char summary[160] = "";
+        if (lost) {
+            // Device is gone — don't touch it (would risk a second
+            // fault). Refuse the burst cleanly.
+            br = TX_BURST_NO_CORE;
+            snprintf(summary, sizeof summary, "rejected: SDR disconnected");
+        } else {
+            // rx_resume_freq is unused now (RX is never paused), so pass
+            // 0.0 rather than read the worker-owned actual_freq cross-thread.
+            br = tx_burst_run(
+                rxs->core, &req, /*rx_resume_freq_hz=*/0.0,
+                hmac_local_len > 0 ? hmac_local : NULL, hmac_local_len,
+                summary, sizeof summary);
+        }
 
         pthread_mutex_lock(&rxs->mu);
         rxs->burst_result = (rx_burst_result_t) br;
@@ -1473,7 +1497,14 @@ static void *rx_session_thread_fn(void *arg)
 
         // Pump UHD. recv blocks ~chunk-cadence; that's our pacing.
         if (worker_pump_once(rxs) < 0) {
-            fprintf(stderr, "rx_session: UHD pump fatal — worker exiting\n");
+            // Fatal RX error (device unplugged / transport dead). Flag it
+            // so the main thread warns in the TUI, then stop pumping. The
+            // session object stays alive — the UI keeps running and the
+            // operator can quit cleanly.
+            pthread_mutex_lock(&rxs->mu);
+            rxs->device_lost = 1;
+            pthread_mutex_unlock(&rxs->mu);
+            fprintf(stderr, "rx_session: RX device lost — worker parked\n");
             break;
         }
         worker_update_snapshot(rxs);

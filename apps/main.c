@@ -64,6 +64,7 @@
 #include <ncurses.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <termios.h>
 
 // Carrier defaults. FrontierSat is simplex on 436.150 MHz — uplink
 // and downlink share the same frequency — so both default to the
@@ -1927,6 +1928,14 @@ static void rx_panel_collect_local(rx_panel_data_t *d)
     // Warning row is filled regardless of the B210 build — even without
     // an SDR the operator could be running short on disk for logs.
     snprintf(d->warning, sizeof d->warning, "%s", g_low_disk_msg);
+#ifdef SSO_WITH_SDR
+    // A lost SDR outranks the low-disk notice — show it instead so the
+    // operator sees immediately that RX has stopped.
+    if (d->have_session && rx_session_device_lost(g_rx_session)) {
+        snprintf(d->warning, sizeof d->warning,
+                 "SDR DISCONNECTED - RX stopped (restart to resume RX)");
+    }
+#endif
 }
 
 // Render the RX panel from a snapshot. Compiles even without UHD —
@@ -4657,6 +4666,94 @@ static void tui_report_errors(void)
     fflush(stdout);
 }
 
+// --- Crash / quit signal safety net -------------------------------
+//
+// A streaming SDR yanked off USB makes UHD throw from a C++ destructor
+// deep inside recv (on our worker thread), which the C API can't turn
+// into an error return — it goes std::terminate -> abort -> SIGABRT. We
+// can't recover from that, but we can refuse to leave the operator with
+// a cryptic "Abort trap: 6" and a terminal stuck in ncurses raw mode.
+// The handler restores the screen, prints one clear line to the real
+// terminal, and re-raises so the process still dies with the original
+// signal (and a core dump if enabled). SIGINT/SIGTERM instead ask the
+// main loop to quit cleanly via its normal teardown.
+static volatile sig_atomic_t g_signal_quit = 0;
+static volatile sig_atomic_t g_in_crash    = 0;
+// Terminal modes captured before ncurses took over, so the crash handler
+// can restore the tty without relying on a (thread-racy) endwin().
+static struct termios g_saved_termios;
+static int            g_have_saved_termios = 0;
+
+// write() a string literal — async-signal-safe (sizeof-1 drops the NUL).
+#define CRASH_WRITE(fd, s) do { ssize_t w_ = write((fd), (s), sizeof(s) - 1); (void) w_; } while (0)
+
+static void graceful_quit_handler(int sig)
+{
+    (void) sig;
+    g_signal_quit = 1;   // main loop notices and runs its normal teardown
+}
+
+static void crash_handler(int sig)
+{
+    if (g_in_crash) _exit(128 + sig);   // crashed again inside the handler
+    g_in_crash = 1;
+
+    // Kill the spawned live-waterfall window so it doesn't orphan when we
+    // die — the normal teardown that usually does this won't run. kill()
+    // is async-signal-safe.
+    if (g_live_waterfall_pid > 0) {
+        kill(g_live_waterfall_pid, SIGKILL);
+    }
+
+    // Restore the terminal DETERMINISTICALLY. The fault is usually on the
+    // RX worker thread, where ncurses endwin() races the main thread's
+    // drawing and can leave the tty half-restored ("needs reset"). So we
+    // skip endwin() and instead restore the saved termios + emit the
+    // raw escapes to leave the alt-screen, show the cursor, and reset
+    // attributes. tcsetattr + write are plain syscalls, safe from here.
+    if (g_have_saved_termios) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_termios);
+    }
+    CRASH_WRITE(STDOUT_FILENO, "\033[?1049l\033[?25h\033[0m\r\n");
+
+    // stderr is redirected to the pass-folder log during the TUI; aim the
+    // message at the real terminal so the operator actually sees it.
+    int fd = (g_saved_stderr_fd >= 0) ? g_saved_stderr_fd : STDERR_FILENO;
+    CRASH_WRITE(fd, "\n*** simple_sat_ops: fatal error");
+    switch (sig) {
+        case SIGABRT: CRASH_WRITE(fd, " (SIGABRT - a USB/SDR device was likely disconnected)"); break;
+        case SIGSEGV: CRASH_WRITE(fd, " (SIGSEGV)"); break;
+        case SIGBUS:  CRASH_WRITE(fd, " (SIGBUS)");  break;
+        default:      CRASH_WRITE(fd, "");           break;
+    }
+    CRASH_WRITE(fd,
+        ".\nThe terminal has been restored. Any detail is in the pass-folder\n"
+        "log (sso_stderr.log). Reconnect the device and restart.\n");
+
+    // Re-raise with the default disposition so the process terminates
+    // with the original signal (preserving core-dump behaviour).
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void install_signal_handlers(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = crash_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+
+    struct sigaction sq;
+    memset(&sq, 0, sizeof sq);
+    sq.sa_handler = graceful_quit_handler;
+    sigemptyset(&sq.sa_mask);
+    sigaction(SIGINT,  &sq, NULL);
+    sigaction(SIGTERM, &sq, NULL);
+}
+
 void init_window(void)
 {
     // setlocale BEFORE initscr so ncurses knows the terminal can render
@@ -6574,7 +6671,17 @@ int main(int argc, char **argv)
     /* Tracking loop */
     double jul_idle_start = 0;  // last-tracked timestamp
 
+    // Capture the cooked terminal modes BEFORE ncurses switches the tty
+    // to raw, so the crash handler can put it back deterministically.
+    if (tcgetattr(STDIN_FILENO, &g_saved_termios) == 0) {
+        g_have_saved_termios = 1;
+    }
+
     init_window();
+
+    // Catch a fatal device fault (or Ctrl-C) now that the screen is up,
+    // so it restores the terminal instead of dumping a raw abort on it.
+    install_signal_handlers();
 
     // int (not char) — getch returns KEY_* codes well above 127 for
     // arrow keys / function keys / KEY_BACKSPACE etc. A signed char
@@ -6658,6 +6765,9 @@ int main(int argc, char **argv)
     __attribute__((unused)) double t_recording_close_at = 0.0;
 
     while (state.running) {
+        // Ctrl-C / SIGTERM: leave the loop and run the normal teardown
+        // (endwin, rotator home, device close) instead of dying raw.
+        if (g_signal_quit) { state.running = 0; break; }
         double t_now = monotonic_seconds();
         UTC_Calendar_Now(&utc, &tv);
         jul_utc = Julian_Date(&utc, &tv);

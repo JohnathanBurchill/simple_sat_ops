@@ -282,6 +282,10 @@ static void uhd_close(sdr_backend_t *be)
     be->priv = NULL;
 }
 
+// Consecutive recv errors after which we declare the RX link dead (with
+// the 1.0 s recv timeout below, ~this many seconds of no data).
+#define UHD_RX_DEAD_LINK_ERRORS 8
+
 static ssize_t uhd_read_iq(sdr_backend_t *be, int16_t *out, size_t cap_pairs)
 {
     struct sdr_uhd *u = (struct sdr_uhd *)be->priv;
@@ -298,12 +302,15 @@ static ssize_t uhd_read_iq(sdr_backend_t *be, int16_t *out, size_t cap_pairs)
 
     void  *bufs[1] = { out };
     size_t n_recv = 0;
+    // 1.0 s timeout: while streaming, recv returns as soon as a chunk is
+    // ready (every few ms), so the timeout only bites when the device
+    // has stopped delivering — i.e. it was unplugged or the transport
+    // wedged. A shorter timeout means we notice a dead link in ~1 s.
     uhd_error e = uhd_rx_streamer_recv(u->stream, bufs, cap_pairs, &u->md,
-                                       /*timeout=*/3.0,
+                                       /*timeout=*/1.0,
                                        /*one_packet=*/false,
                                        &n_recv);
     if (e != UHD_ERROR_NONE) {
-        // Transient: return 0 so the caller keeps looping.
         if (recv_err_run == 0 || (recv_err_run % 2000) == 0) {
             log_uhd(e, "rx_recv");
             if (recv_err_run > 0)
@@ -311,6 +318,17 @@ static ssize_t uhd_read_iq(sdr_backend_t *be, int16_t *out, size_t cap_pairs)
                         recv_err_run + 1);
         }
         recv_err_run++;
+        // A long unbroken run of recv errors is a dead link (device
+        // unplugged / transport gone), not a transient overflow — report
+        // it FATAL (-1) so the worker parks and the UI can warn, rather
+        // than spinning forever. A real overflow recovers within a few
+        // recvs, so the counter resets long before this trips.
+        if (recv_err_run >= UHD_RX_DEAD_LINK_ERRORS) {
+            fprintf(stderr,
+                    "sdr_uhd: rx_recv: link dead after %lu consecutive "
+                    "errors — reporting device loss\n", recv_err_run);
+            return -1;
+        }
         return 0;
     }
     recv_err_run = 0;

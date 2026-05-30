@@ -115,6 +115,11 @@ double rx_session_get_bandwidth_hz(const rx_session_t *rxs);
 // capability set at open, so it is safe without the worker lock.
 int rx_session_can_tx(const rx_session_t *rxs);
 
+// True once the RX pump has hit a fatal error (device unplugged or the
+// transport died). The session stays alive so the UI can warn and the
+// operator can quit cleanly; the worker has parked.
+int rx_session_device_lost(const rx_session_t *rxs);
+
 // Friendly name of the active SDR ("USRP B210", "RTL-SDR ...") for the
 // operator banner. Returns "" with no session. Static at open.
 const char *rx_session_sdr_name(const rx_session_t *rxs);
