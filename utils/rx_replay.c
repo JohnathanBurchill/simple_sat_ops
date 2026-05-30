@@ -316,18 +316,29 @@ static int read_audio_sndfile(const char *path, int16_t **out_samples,
     }
     size_t ch     = (size_t) info.channels;
     size_t frames = (size_t) info.frames;
-    int16_t *inter = (int16_t *) malloc(frames * ch * sizeof(int16_t));
+    // Read as float and saturate to int16 ourselves. libsndfile's
+    // sf_readf_short WRAPS samples whose source float exceeds +/-1.0
+    // (overdriven SatNOGS recordings do) into garbage instead of
+    // clipping, which corrupts exactly the loud signal and kills the
+    // decode; SFC_SET_CLIPPING does not fix this path. Float + clamp
+    // matches what ffmpeg's s16 conversion produces, sample-for-sample.
+    float   *inter = (float *)   malloc(frames * ch * sizeof(float));
     int16_t *mono  = (int16_t *) malloc(frames * sizeof(int16_t));
     if (inter == NULL || mono == NULL) {
         fprintf(stderr, "rx_replay: out of memory decoding %s\n", path);
         free(inter); free(mono); sf_close(sf);
         return -1;
     }
-    sf_count_t got = sf_readf_short(sf, inter, (sf_count_t) frames);
+    sf_count_t got = sf_readf_float(sf, inter, (sf_count_t) frames);
     sf_close(sf);
     if (got <= 0) { free(inter); free(mono); return -1; }
     size_t nf = (size_t) got;
-    for (size_t f = 0; f < nf; ++f) mono[f] = inter[f * ch];  // keep ch 0
+    for (size_t f = 0; f < nf; ++f) {
+        double s = (double) inter[f * ch] * 32768.0;  // keep ch 0
+        if (s >  32767.0) s =  32767.0;
+        if (s < -32768.0) s = -32768.0;
+        mono[f] = (int16_t) lround(s);
+    }
     free(inter);
     *out_samples = mono;
     *out_n       = nf;

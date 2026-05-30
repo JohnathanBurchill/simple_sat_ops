@@ -1965,19 +1965,26 @@ int main(int argc, char **argv)
         }
         size_t ch     = (size_t) info.channels;
         size_t frames = (size_t) info.frames;
-        int16_t *inter = (int16_t *) malloc(frames * ch * sizeof(int16_t));
+        // Read as float and saturate to int16: libsndfile's sf_readf_short
+        // WRAPS samples whose source float exceeds +/-1.0 (overdriven
+        // SatNOGS recordings do) into garbage instead of clipping. Float
+        // + clamp matches ffmpeg's s16 output.
+        float   *inter = (float *) malloc(frames * ch * sizeof(float));
         iq = (int16_t *) malloc(frames * 2 * sizeof(int16_t));  // I,Q pairs
         if (!inter || !iq) {
             fprintf(stderr, "gen_waterfall: oom decoding %s\n", iq_path);
             free(inter); free(iq); sf_close(sf); return 1;
         }
-        sf_count_t got = sf_readf_short(sf, inter, (sf_count_t) frames);
+        sf_count_t got = sf_readf_float(sf, inter, (sf_count_t) frames);
         sf_close(sf);
         if (got <= 0) { free(inter); free(iq); return 1; }
         n_pairs = (size_t) got;
         for (size_t i = 0; i < n_pairs; ++i) {
-            iq[i * 2 + 0] = inter[i * ch];  // I = audio sample (channel 0)
-            iq[i * 2 + 1] = 0;              // Q = 0
+            double s = (double) inter[i * ch] * 32768.0;  // channel 0
+            if (s >  32767.0) s =  32767.0;
+            if (s < -32768.0) s = -32768.0;
+            iq[i * 2 + 0] = (int16_t) lround(s);  // I = audio sample
+            iq[i * 2 + 1] = 0;                    // Q = 0
         }
         free(inter);
         sample_rate     = info.samplerate;
