@@ -1299,8 +1299,9 @@ gen_waterfall <audio.ogg> [<out-png>] [options]
 
 The PNG path is an optional positional (not a flag). Useful options:
 `--fft=<n>`, `--db-min=<dB>`, `--db-max=<dB>`, `--zoom-khz=<kHz>`,
-`--dc-notch`, `--detrend=<mode>`, `--pdf=<path>`. The output uses a
-median-subtracted noise floor and a viridis palette.
+`--dc-notch`, `--detrend=<mode>`, `--pdf=<path>`. It renders the **full
+capture width by default**; `--zoom-khz=<kHz>` narrows the view. The
+output uses a median-subtracted noise floor and a viridis palette.
 
 A **SatNOGS `.ogg`** is accepted directly. It is FM-demodulated audio,
 not IQ, and carries its own sample rate, so there is **no rate

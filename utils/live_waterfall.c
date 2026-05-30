@@ -20,7 +20,7 @@
         --rate=<Hz>          IQ sample rate (default 96000)
         --fft=<N>            FFT size, power of two (default 1024)
         --row-ms=<ms>        Time per spectrogram row (default 100)
-        --zoom-khz=<W>       Visible bandwidth around DC (default 30)
+        --zoom-khz=<W>       Visible bandwidth around DC (default = full rate)
         --width=<px>         Window width override (default = monitor/6)
         --height=<px>        Window height override (default = full)
 
@@ -542,10 +542,11 @@ int main(int argc, char **argv)
     double rate_hz       = 96000.0;
     unsigned n_fft       = 1024;
     int      row_ms      = 100;
-    // Default = full ±48 kHz around the SDR LO. Operator can narrow
-    // mid-flight via stdin (see :wf_zoom_khz handler in simple_sat_ops),
-    // or pass --zoom-khz=<N> at launch.
-    double   zoom_khz    = 96.0;
+    // Default = full capture width. 0 means "the whole rate"; the clamp
+    // below turns it into rate/1000 kHz, so it's full at any sample rate
+    // (not a hard-coded 96). Operator can narrow mid-flight via stdin
+    // (see :lo_bandwidth in simple_sat_ops) or pass --zoom-khz=<N>.
+    double   zoom_khz    = 0.0;
     int      cli_w       = 0;
     int      cli_h       = 0;
     for (int i = 2; i < argc; ++i) {

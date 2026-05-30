@@ -1819,7 +1819,7 @@ int main(int argc, char **argv)
     opt.show_tm_csv_path = NULL;
     opt.sample_rate   = sample_rate;
     opt.center_hz     = 0.0;
-    opt.zoom_hz       = 30000.0;      // default ±15 kHz; --full-width disables
+    opt.zoom_hz       = 0.0;          // full capture width by default; --zoom-khz=<n> narrows
     // DC notch is OFF by default. The B210 in this stack ships with
     // its DC blocker active so the DC bin sits BELOW the noise floor,
     // and the bright vertical line one sees in the middle of a pass
