@@ -1294,12 +1294,19 @@ pass when an IQ sidecar exists. You can also run it directly:
 
 ```sh
 gen_waterfall <iq-path> <sample-rate-hz> [<out-png>] [options]
+gen_waterfall <audio.ogg> [<out-png>] [options]
 ```
 
-The PNG path is an optional third positional (not a flag). Useful
-options: `--fft=<n>`, `--db-min=<dB>`, `--db-max=<dB>`,
-`--zoom-khz=<kHz>`, `--dc-notch`, `--detrend=<mode>`, `--pdf=<path>`.
-The output uses a median-subtracted noise floor and a viridis palette.
+The PNG path is an optional positional (not a flag). Useful options:
+`--fft=<n>`, `--db-min=<dB>`, `--db-max=<dB>`, `--zoom-khz=<kHz>`,
+`--dc-notch`, `--detrend=<mode>`, `--pdf=<path>`. The output uses a
+median-subtracted noise floor and a viridis palette.
+
+A **SatNOGS `.ogg`** is accepted directly. It is FM-demodulated audio,
+not IQ, and carries its own sample rate, so there is **no rate
+positional** - the PNG is positional arg 2. It's rendered as an audio
+spectrogram (the real signal is fed as IQ with Q=0, so the spectrum
+mirrors about DC and the FSK tones appear at +/-f). Needs libsndfile.
 
 ### `rx_replay`
 
@@ -1374,8 +1381,13 @@ typically 48 kHz), and runs the decoder. Add the usual flags as needed
   SatNOGS pass may yield few or no frames even though the file replays
   fine.
 
-(`decode_inspector` is IQ-native and does not yet take `.ogg` audio; for
-now, inspect SatNOGS audio with `rx_replay` plus a spectrogram.)
+For a visual, render the `.ogg` as an audio spectrogram (no rate arg):
+
+```sh
+gen_waterfall /FrontierSat/SatNOGS/<date>/satnogs_<id>_<utc>.ogg wf.png
+```
+
+(`decode_inspector` is IQ-native and does not yet take `.ogg` audio.)
 
 ### `beacon_detect`
 
