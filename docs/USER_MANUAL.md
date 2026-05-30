@@ -115,6 +115,7 @@ manual can go back on the shelf where it belongs.
     - [`gen_waterfall`](#gen_waterfall)
     - [`rx_replay`](#rx_replay)
     - [`decode_inspector`](#decode_inspector)
+    - [Replaying SatNOGS recordings](#replaying-satnogs-recordings)
     - [`beacon_detect`](#beacon_detect)
     - [`fm_preview`](#fm_preview)
     - [`packet_query` and `packet_browser`](#packet_query-and-packet_browser)
@@ -578,6 +579,7 @@ Which targets actually build depends on what the host has:
 | UHD (B210) | `b210_rx_capture`, `b210_gain_sweep`, `tx_frame_sdr`, `sdr_probe` |
 | librtlsdr | RTL-SDR RX-only backend in `simple_sat_ops` (on by default; auto-disables if absent) |
 | libusb | USB-serial clone detection in the UHD backend (a UHD dependency, so normally already present) |
+| libsndfile | `rx_replay` reading SatNOGS `.ogg` audio recordings |
 | raylib | `live_waterfall`, `decode_inspector` |
 | ncurses + SGP4SDP4 + libcrypto | `simple_sat_ops` (pulls UHD too when present) |
 
@@ -591,18 +593,19 @@ Ubuntu/Debian (the ground machine):
 ```sh
 sudo apt install build-essential cmake pkg-config \
     libncurses-dev libssl-dev libsqlite3-dev libasound2-dev \
-    libuhd-dev librtlsdr-dev libusb-1.0-0-dev
+    libuhd-dev librtlsdr-dev libusb-1.0-0-dev libsndfile1-dev
 ```
 
 macOS (Homebrew, dev host):
 
 ```sh
-brew install cmake pkg-config ncurses openssl sqlite uhd librtlsdr libusb
+brew install cmake pkg-config ncurses openssl sqlite uhd librtlsdr libusb libsndfile
 ```
 
 Mind the Debian names: it is **`librtlsdr-dev`** and **`libusb-1.0-0-dev`**
 - the bare `librtlsdr` / `libusb` / `libusb-1.0` packages do not exist
-(`apt` says "Unable to locate package"). UHD is `libuhd-dev`; `raylib`
+(`apt` says "Unable to locate package"). UHD is `libuhd-dev`; libsndfile
+(lets `rx_replay` read SatNOGS `.ogg`) is `libsndfile1-dev`; `raylib`
 (optional `live_waterfall`) is `libraylib-dev`.
 
 The bundled `sgp4sdp4/` directory is a separate CMake project; build
@@ -1312,6 +1315,21 @@ rx_replay <iq-or-wav-path> [--rate=<Hz>] [--lo-shift-khz=<N>] [--viterbi] [--tle
 (All options are `=`-form. There is no `--gain`; shift the loaded IQ
 with `--lo-shift-khz=` and set the sample rate with `--rate=`.)
 
+The input format is picked from the extension: `.iq` is headerless
+int16 I/Q (the two-pass IQ decoder); `.raw` is headerless S16_LE PCM;
+anything else is read as a `.wav`. A **SatNOGS `.ogg`** recording is
+also accepted directly: it is the receiver's FM-demodulated *audio*
+(the discriminated voltages, just Vorbis-compressed), so `rx_replay`
+decodes it to PCM in memory via libsndfile and runs the **FM-audio
+chain** - the same path as a `.wav`, not the IQ path. Requires the
+build to have libsndfile; otherwise an `.ogg` errors with a hint.
+
+```sh
+rx_replay /FrontierSat/SatNOGS/.../satnogs_<id>_<utc>.ogg
+```
+
+See [Replaying SatNOGS recordings](#replaying-satnogs-recordings).
+
 With `WITH_SGP4SDP4` and a TLE, `rx_replay` can also re-derive
 Doppler from the recorded sidecar timestamps. The TLE-based
 predictions in some older `rx_replay` versions show inflated range
@@ -1332,6 +1350,32 @@ Boxes you draw are written to `<iq>.boxes.csv` and, in an
 `rx_replay`-compatible form, `<iq>.box_anchors.csv` - feed the latter
 back with `rx_replay --anchor-csv=<iq>.box_anchors.csv` to re-decode
 exactly the slice you marked.
+
+### Replaying SatNOGS recordings
+
+SatNOGS publishes a pass as an `.ogg` audio file - the ground station's
+FM-demodulated baseband, i.e. the discriminated voltages, Vorbis-
+compressed. Because it is already demodulated audio (not IQ), you run
+it through the **FM-audio** path, the same one a `.wav` uses:
+
+```sh
+rx_replay /FrontierSat/SatNOGS/<date>/satnogs_<id>_<utc>.ogg
+```
+
+`rx_replay` detects the `.ogg`, decodes it to PCM in memory via
+libsndfile, reads the sample rate from the file (SatNOGS audio is
+typically 48 kHz), and runs the decoder. Add the usual flags as needed
+(`--bit-rate=`, `--window-s=`, `--tle=`, `--satellite=`, ...). Two notes:
+
+- It is **audio, not IQ** - do not pass `--iq`, and the IQ-only knobs
+  (`--lo-shift-khz=`) don't apply. The discriminated audio is what the
+  decoder's FM-audio chain expects.
+- A clean decode still depends on the recording: a weak or off-tune
+  SatNOGS pass may yield few or no frames even though the file replays
+  fine.
+
+(`decode_inspector` is IQ-native and does not yet take `.ogg` audio; for
+now, inspect SatNOGS audio with `rx_replay` plus a spectrogram.)
 
 ### `beacon_detect`
 
