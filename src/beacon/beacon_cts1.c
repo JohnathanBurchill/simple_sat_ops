@@ -424,14 +424,16 @@ void tcmd_response_print(FILE *fp, const char *ts,
     fmt_epoch_ms(hdr.ts_sent, ts_buf, sizeof ts_buf);
 
     size_t data_len = len - COMMS_TCMD_RESPONSE_HEADER_SIZE;
-    // Strip trailing NULs on the last packet for cleaner display; the raw
-    // hex/ascii dump below still shows the wire-exact bytes for inspection.
-    size_t print_len = data_len;
-    if (hdr.response_seq_num == hdr.response_max_seq_num) {
-        while (print_len > 0
-               && payload[COMMS_TCMD_RESPONSE_HEADER_SIZE + print_len - 1] == 0x00) {
-            print_len--;
-        }
+    // The firmware NUL-terminates the response string and can carry
+    // trailing bytes past the terminator (framing/parity residue or
+    // padding), so showing the full data_len appends garbage. Display
+    // the message up to the first NUL; the raw hex/ascii dump below still
+    // shows the wire-exact bytes for inspection. A mid-stream chunk of a
+    // multi-packet response carries no NUL, so it still shows in full.
+    size_t print_len = 0;
+    while (print_len < data_len
+           && payload[COMMS_TCMD_RESPONSE_HEADER_SIZE + print_len] != 0x00) {
+        print_len++;
     }
 
     fprintf(fp,
@@ -444,7 +446,7 @@ void tcmd_response_print(FILE *fp, const char *ts,
             (unsigned)hdr.response_max_seq_num,
             ts_buf);
 
-    fprintf(fp, "%stcmd_response: data (%zu bytes): \"", prefix, data_len);
+    fprintf(fp, "%stcmd_response: data (%zu bytes): \"", prefix, print_len);
     for (size_t i = 0; i < print_len; i++) {
         uint8_t b = payload[COMMS_TCMD_RESPONSE_HEADER_SIZE + i];
         char c = (b >= 0x20 && b < 0x7F) ? (char)b : '.';
@@ -462,12 +464,12 @@ int tcmd_response_summary(const uint8_t *payload, size_t len,
     COMMS_tcmd_response_packet_t hdr;
     memcpy(&hdr, payload, COMMS_TCMD_RESPONSE_HEADER_SIZE);
     size_t data_len  = len - COMMS_TCMD_RESPONSE_HEADER_SIZE;
-    size_t print_len = data_len;
-    if (hdr.response_seq_num == hdr.response_max_seq_num) {
-        while (print_len > 0
-               && payload[COMMS_TCMD_RESPONSE_HEADER_SIZE + print_len - 1] == 0x00) {
-            print_len--;
-        }
+    // Message is NUL-terminated; trailing buffer bytes past it are
+    // garbage. Show up to the first NUL (see tcmd_response_print).
+    size_t print_len = 0;
+    while (print_len < data_len
+           && payload[COMMS_TCMD_RESPONSE_HEADER_SIZE + print_len] != 0x00) {
+        print_len++;
     }
     char text[96];
     cts1_sanitise_text(payload + COMMS_TCMD_RESPONSE_HEADER_SIZE,
