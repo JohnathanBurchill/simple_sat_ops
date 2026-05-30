@@ -63,6 +63,7 @@
 #include <time.h>
 #include <ncurses.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 // Carrier defaults. FrontierSat is simplex on 436.150 MHz — uplink
 // and downlink share the same frequency — so both default to the
@@ -4576,6 +4577,51 @@ void usage(FILE *dest, const char *name, int full)
 
 // --- ncurses ------------------------------------------------------
 
+// While the ncurses TUI owns the screen, any stray write to stderr (a
+// UHD/libusb error, a backend diagnostic, a library warning) lands on
+// top of the panels and corrupts the display until the next full
+// redraw. We therefore point fd 2 at a log file for the lifetime of
+// the TUI: nothing reaches the terminal, but every message is still
+// captured for post-pass debugging (the LIBUSB_TRANSFER_OVERFLOW flood
+// during TX, for one). Restored on teardown so final console messages
+// print normally. dup2 on the fd (not the FILE*) catches direct fd-2
+// writes from C libraries too, not just our fprintf(stderr, ...).
+static int g_saved_stderr_fd = -1;
+
+static void tui_grab_stderr(void)
+{
+    if (g_saved_stderr_fd != -1) return;   // already redirected
+
+    char path[320];
+    if (g_pass_folder[0]) {
+        snprintf(path, sizeof path, "%.300s/sso_stderr.log", g_pass_folder);
+    } else {
+        // No pass folder (e.g. a viewer): we still must not corrupt the
+        // screen, so swallow stderr rather than leave it on the tty.
+        snprintf(path, sizeof path, "/dev/null");
+    }
+
+    int log_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (log_fd < 0) return;                // leave stderr as-is on failure
+
+    fflush(stderr);
+    g_saved_stderr_fd = dup(STDERR_FILENO);
+    if (g_saved_stderr_fd < 0) { close(log_fd); g_saved_stderr_fd = -1; return; }
+    dup2(log_fd, STDERR_FILENO);
+    close(log_fd);
+    // Unbuffered so log lines land promptly even on an abnormal exit.
+    setvbuf(stderr, NULL, _IONBF, 0);
+}
+
+static void tui_release_stderr(void)
+{
+    if (g_saved_stderr_fd == -1) return;
+    fflush(stderr);
+    dup2(g_saved_stderr_fd, STDERR_FILENO);
+    close(g_saved_stderr_fd);
+    g_saved_stderr_fd = -1;
+}
+
 void init_window(void)
 {
     // setlocale BEFORE initscr so ncurses knows the terminal can render
@@ -4601,6 +4647,10 @@ void init_window(void)
     init_pair(2, COLOR_YELLOW, COLOR_BLACK);
     init_pair(3, COLOR_GREEN, COLOR_BLACK);
     curs_set(0);
+
+    // Now that ncurses owns the screen, divert stderr to the pass-folder
+    // log so backend/library errors never paint over the panels.
+    tui_grab_stderr();
 }
 
 // --- Reports -------------------------------------------------------
@@ -5682,6 +5732,7 @@ static void viewer_take_control(sso_ipc_client_t *cli, const char *argv0)
     // Close our viewer IPC + curses cleanly before exec'ing.
     sso_ipc_client_close(cli);
     endwin();
+    tui_release_stderr();
 
     // Re-exec self as --control with inherited TLE and pass folder.
     // Filename args use the space form so the spawned child sees the
@@ -5894,6 +5945,7 @@ static int run_viewer(const char *argv0)
     }
 
     endwin();
+    tui_release_stderr();
     sso_ipc_client_close(cli);
     return 0;
 }
@@ -7355,6 +7407,7 @@ int main(int argc, char **argv)
     }
 
     endwin();
+    tui_release_stderr();
     if (state.have_tr_switch) {
         tr_switch_disconnect(&state.tr_switch);
         state.have_tr_switch = 0;

@@ -283,6 +283,15 @@ static ssize_t uhd_read_iq(sdr_backend_t *be, int16_t *out, size_t cap_pairs)
     struct sdr_uhd *u = (struct sdr_uhd *)be->priv;
     if (u == NULL || u->stream == NULL || out == NULL) return -1;
 
+    // A TX burst leaves the USB transport spewing LIBUSB_TRANSFER_OVERFLOW
+    // on every recv (see the deferred B210 TX/RX overflow note). These
+    // arrive thousands per second, so log only the first of a run plus a
+    // periodic count — both counters reset on the first clean recv, so
+    // each new storm logs its onset. Keeps the stderr log readable
+    // instead of megabytes of identical lines.
+    static unsigned long recv_err_run = 0;   // consecutive recv() errors
+    static unsigned long md_err_run   = 0;   // consecutive metadata errors
+
     void  *bufs[1] = { out };
     size_t n_recv = 0;
     uhd_error e = uhd_rx_streamer_recv(u->stream, bufs, cap_pairs, &u->md,
@@ -290,19 +299,32 @@ static ssize_t uhd_read_iq(sdr_backend_t *be, int16_t *out, size_t cap_pairs)
                                        /*one_packet=*/false,
                                        &n_recv);
     if (e != UHD_ERROR_NONE) {
-        // Transient: log once, return 0 so the caller keeps looping.
-        log_uhd(e, "rx_recv");
+        // Transient: return 0 so the caller keeps looping.
+        if (recv_err_run == 0 || (recv_err_run % 2000) == 0) {
+            log_uhd(e, "rx_recv");
+            if (recv_err_run > 0)
+                fprintf(stderr, "sdr_uhd: rx_recv: (%lu errors so far)\n",
+                        recv_err_run + 1);
+        }
+        recv_err_run++;
         return 0;
     }
+    recv_err_run = 0;
     uhd_rx_metadata_error_code_t mderr = 0;
     if (uhd_rx_metadata_error_code(u->md, &mderr) == UHD_ERROR_NONE
         && mderr != UHD_RX_METADATA_ERROR_CODE_NONE) {
-        char errbuf[128] = {0};
-        (void)uhd_rx_metadata_strerror(u->md, errbuf, sizeof errbuf);
-        fprintf(stderr, "sdr_uhd: RX metadata error %d: %s\n",
-                (int)mderr, errbuf[0] ? errbuf : "(no detail)");
+        if (md_err_run == 0 || (md_err_run % 2000) == 0) {
+            char errbuf[128] = {0};
+            (void)uhd_rx_metadata_strerror(u->md, errbuf, sizeof errbuf);
+            fprintf(stderr, "sdr_uhd: RX metadata error %d: %s%s\n",
+                    (int)mderr, errbuf[0] ? errbuf : "(no detail)",
+                    md_err_run > 0 ? " (repeating)" : "");
+        }
+        md_err_run++;
         // Overflow / late-packet are non-fatal — the samples we DID get
         // are already in the buffer; demod them rather than dropping.
+    } else {
+        md_err_run = 0;
     }
     return (ssize_t)n_recv;
 }
