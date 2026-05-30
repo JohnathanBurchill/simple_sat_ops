@@ -243,6 +243,12 @@ target_link_libraries(waterfall_core PUBLIC m)
 # end-of-pass renders when an IQ sidecar is available.
 add_executable(gen_waterfall utils/gen_waterfall.c src/dsp/sw_nco.c)
 target_link_libraries(gen_waterfall PRIVATE waterfall_core m)
+if (SNDFILE_FOUND)
+    target_compile_definitions(gen_waterfall PRIVATE HAVE_SNDFILE)
+    target_include_directories(gen_waterfall PRIVATE ${SNDFILE_INCLUDE_DIRS})
+    target_link_directories(gen_waterfall PRIVATE ${SNDFILE_LIBRARY_DIRS})
+    target_link_libraries(gen_waterfall PRIVATE ${SNDFILE_LIBRARIES})
+endif()
 list(APPEND SSO_TARGETS gen_waterfall)
 
 # live_waterfall — raylib-backed real-time spectrogram viewer. Tails

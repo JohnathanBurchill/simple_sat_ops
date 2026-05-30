@@ -42,6 +42,10 @@
 #include "sw_nco.h"
 #include "waterfall_core.h"
 
+#ifdef HAVE_SNDFILE
+#include <sndfile.h>
+#endif
+
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
@@ -1611,6 +1615,7 @@ static void usage(void)
 {
     fprintf(stderr,
         "usage: gen_waterfall <iq_path> <sample_rate_hz> [<out_png>]\n"
+        "       gen_waterfall <audio.ogg> [<out_png>]\n"
         "                     [--pdf=<out_pdf>]\n"
         "                     [--fft=N] [--rows=N] [--db-min=X]\n"
         "                     [--db-max=X] [--center-hz=F]\n"
@@ -1625,6 +1630,12 @@ static void usage(void)
         "    <out_png>            full-raster PNG (positional arg 3)\n"
         "    --pdf=<out_pdf>      vector-text PDF (sharp labels at any zoom)\n"
         "  Either output is fine on its own; supply both to emit both.\n"
+        "\n"
+        "  A SatNOGS .ogg input is FM-demodulated audio, not IQ: there is\n"
+        "  no sample-rate arg (read from the file), so the PNG is\n"
+        "  positional arg 2. It is rendered as an audio spectrogram (the\n"
+        "  real signal is fed as IQ with Q=0, so the spectrum mirrors\n"
+        "  about DC). Needs libsndfile.\n"
         "\n"
         "  Options:\n"
         "    --fft=N              FFT length per frame, power of two.\n"
@@ -1755,16 +1766,32 @@ int main(int argc, char **argv)
 {
     if (argc < 3) { usage(); return 2; }
     const char *iq_path  = argv[1];
-    int sample_rate      = atoi(argv[2]);
-    // PNG path is positional but now optional — if argv[3] starts with
-    // "--" it's already an option and the user is asking for PDF-only
-    // (which they must supply via --pdf=...). We validate below.
-    const char *out_png  = NULL;
     const char *out_pdf  = NULL;  // --pdf=<path>: emit a vector-text PDF too
-    int first_opt = 3;
-    if (argc >= 4 && strncmp(argv[3], "--", 2) != 0) {
-        out_png = argv[3];
-        first_opt = 4;
+    // PNG path is positional but optional — if it starts with "--" it's
+    // already an option and the user is asking for PDF-only (supplied
+    // via --pdf=...). We validate below.
+    const char *out_png  = NULL;
+    // A .ogg input is a SatNOGS FM-audio recording: there is NO
+    // sample-rate positional (libsndfile reads it from the file), so the
+    // output PNG is positional arg 2. For .iq/.raw the rate stays
+    // positional arg 2 and the PNG arg 3.
+    size_t ipl = strlen(iq_path);
+    int is_ogg = (ipl >= 4 && strcmp(iq_path + ipl - 4, ".ogg") == 0);
+    int sample_rate = 0;
+    int first_opt;
+    if (is_ogg) {
+        first_opt = 2;
+        if (argc >= 3 && strncmp(argv[2], "--", 2) != 0) {
+            out_png = argv[2];
+            first_opt = 3;
+        }
+    } else {
+        sample_rate = atoi(argv[2]);
+        first_opt = 3;
+        if (argc >= 4 && strncmp(argv[3], "--", 2) != 0) {
+            out_png = argv[3];
+            first_opt = 4;
+        }
     }
 
     // Optional NCO shift applied to the loaded IQ before FFT. Positive
@@ -1904,7 +1931,7 @@ int main(int argc, char **argv)
     }
     if (opt.hop == 0) opt.hop = opt.fft_size / 2;
 
-    if (sample_rate <= 0) {
+    if (!is_ogg && sample_rate <= 0) {
         fprintf(stderr, "gen_waterfall: invalid sample rate %d\n", sample_rate);
         return 2;
     }
@@ -1915,34 +1942,85 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    FILE *f = fopen(iq_path, "rb");
-    if (!f) {
-        fprintf(stderr, "gen_waterfall: open %s: %s\n",
-                iq_path, strerror(errno));
+    int16_t *iq = NULL;
+    size_t   n_pairs = 0;
+
+    if (is_ogg) {
+#ifdef HAVE_SNDFILE
+        // SatNOGS .ogg: FM-demodulated audio (real PCM). Decode to mono
+        // int16, then build IQ pairs with Q=0 so the existing complex
+        // pipeline produces an audio spectrogram (real input -> the
+        // spectrum is mirrored about DC; the FSK tones show at +/-f).
+        SF_INFO info;
+        memset(&info, 0, sizeof info);
+        SNDFILE *sf = sf_open(iq_path, SFM_READ, &info);
+        if (!sf) {
+            fprintf(stderr, "gen_waterfall: sf_open %s: %s\n",
+                    iq_path, sf_strerror(NULL));
+            return 1;
+        }
+        if (info.frames <= 0 || info.channels < 1) {
+            fprintf(stderr, "gen_waterfall: %s has no decodable audio\n", iq_path);
+            sf_close(sf); return 1;
+        }
+        size_t ch     = (size_t) info.channels;
+        size_t frames = (size_t) info.frames;
+        int16_t *inter = (int16_t *) malloc(frames * ch * sizeof(int16_t));
+        iq = (int16_t *) malloc(frames * 2 * sizeof(int16_t));  // I,Q pairs
+        if (!inter || !iq) {
+            fprintf(stderr, "gen_waterfall: oom decoding %s\n", iq_path);
+            free(inter); free(iq); sf_close(sf); return 1;
+        }
+        sf_count_t got = sf_readf_short(sf, inter, (sf_count_t) frames);
+        sf_close(sf);
+        if (got <= 0) { free(inter); free(iq); return 1; }
+        n_pairs = (size_t) got;
+        for (size_t i = 0; i < n_pairs; ++i) {
+            iq[i * 2 + 0] = inter[i * ch];  // I = audio sample (channel 0)
+            iq[i * 2 + 1] = 0;              // Q = 0
+        }
+        free(inter);
+        sample_rate     = info.samplerate;
+        opt.sample_rate = sample_rate;
+        fprintf(stderr, "gen_waterfall: decoded %s via libsndfile "
+                "(%d Hz, %zu samples; audio spectrogram, Q=0)\n",
+                iq_path, sample_rate, n_pairs);
+#else
+        fprintf(stderr, "gen_waterfall: %s is a .ogg but this build has no "
+                "libsndfile (rebuild with libsndfile to render SatNOGS "
+                "audio)\n", iq_path);
         return 1;
+#endif
+    } else {
+        FILE *f = fopen(iq_path, "rb");
+        if (!f) {
+            fprintf(stderr, "gen_waterfall: open %s: %s\n",
+                    iq_path, strerror(errno));
+            return 1;
+        }
+        if (fseek(f, 0, SEEK_END) != 0) {
+            fprintf(stderr, "gen_waterfall: seek failed\n");
+            fclose(f); return 1;
+        }
+        long fsize = ftell(f);
+        if (fsize < 0) {
+            fprintf(stderr, "gen_waterfall: ftell failed\n");
+            fclose(f); return 1;
+        }
+        fseek(f, 0, SEEK_SET);
+        n_pairs = (size_t) fsize / 4;  // 2 bytes per int16 × 2 (I,Q)
+        if (n_pairs == 0) {
+            fprintf(stderr, "gen_waterfall: %s is empty\n", iq_path);
+            fclose(f); return 1;
+        }
+        iq = (int16_t *) malloc((size_t) fsize);
+        if (!iq) { fprintf(stderr, "gen_waterfall: oom\n"); fclose(f); return 1; }
+        if (fread(iq, 1, (size_t) fsize, f) != (size_t) fsize) {
+            fprintf(stderr, "gen_waterfall: short read\n");
+            free(iq); fclose(f); return 1;
+        }
+        fclose(f);
     }
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fprintf(stderr, "gen_waterfall: seek failed\n");
-        fclose(f); return 1;
-    }
-    long fsize = ftell(f);
-    if (fsize < 0) {
-        fprintf(stderr, "gen_waterfall: ftell failed\n");
-        fclose(f); return 1;
-    }
-    fseek(f, 0, SEEK_SET);
-    size_t n_pairs = (size_t) fsize / 4;  // 2 bytes per int16 × 2 (I,Q)
-    if (n_pairs == 0) {
-        fprintf(stderr, "gen_waterfall: %s is empty\n", iq_path);
-        fclose(f); return 1;
-    }
-    int16_t *iq = (int16_t *) malloc((size_t) fsize);
-    if (!iq) { fprintf(stderr, "gen_waterfall: oom\n"); fclose(f); return 1; }
-    if (fread(iq, 1, (size_t) fsize, f) != (size_t) fsize) {
-        fprintf(stderr, "gen_waterfall: short read\n");
-        free(iq); fclose(f); return 1;
-    }
-    fclose(f);
 
     if (lo_shift_hz != 0.0) {
         sw_nco_t nco;
