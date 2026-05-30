@@ -1772,7 +1772,13 @@ int main(int argc, char **argv)
     // rx_replay --lo-shift-khz.
     double lo_shift_hz = 0.0;
 
-    wf_opts_t opt;
+    // Zero-init so every field the CLI doesn't set explicitly starts
+    // NULL/0 - in particular progress_pct_out, which only the GUI
+    // (decode_inspector) uses. Left uninitialized it was stack garbage,
+    // and wf_compute's "if (progress_pct_out != NULL)" then wrote
+    // through it: a crash that showed up in the optimized clang build
+    // but not gcc.
+    wf_opts_t opt = {0};
     opt.fft_size      = 1024;
     opt.hop           = 0;            // 0 = N/2 default
     opt.out_rows      = 1080;
