@@ -77,7 +77,6 @@ int main(int argc, char **argv)
 #include <sqlite3.h>
 
 #define MAX_ROWS 1000
-#define MAX_PAYLOAD_PREVIEW 256
 
 typedef struct {
     sqlite3_int64 id;
@@ -103,9 +102,8 @@ typedef struct {
     double geom_range_km, geom_range_rate_km_s, geom_doppler_hz;
     char   session_dir[256];
     char summary[2048];
-    int  payload_len_total;
-    int  payload_len_preview;
-    uint8_t payload[MAX_PAYLOAD_PREVIEW];
+    int      payload_len;   // full payload length
+    uint8_t *payload;       // full payload, malloc'd per row (freed on reload/exit)
 } row_t;
 
 // Type cycle: NULL means "all", otherwise filter on packet_type_name.
@@ -325,6 +323,14 @@ static void run_query(sqlite3 *db)
         sqlite3_bind_text(stmt, i + 1, param_text[i], -1, SQLITE_TRANSIENT);
     }
 
+    // Free payloads from the previous load (the rows array is reused
+    // across reloads) so re-querying doesn't leak.
+    for (int i = 0; i < n_rows; i++) {
+        free(rows[i].payload);
+        rows[i].payload = NULL;
+        rows[i].payload_len = 0;
+    }
+
     int new_n = 0;
     while (new_n < MAX_ROWS && sqlite3_step(stmt) == SQLITE_ROW) {
         row_t *r = &rows[new_n];
@@ -376,10 +382,16 @@ static void run_query(sqlite3 *db)
         snprintf(r->summary,   sizeof r->summary,   "%s", sm ? sm : "");
         snprintf(r->origin,    sizeof r->origin,    "%s", og ? og : "");
 
-        r->payload_len_total = pln;
-        int cap = pln < MAX_PAYLOAD_PREVIEW ? pln : MAX_PAYLOAD_PREVIEW;
-        if (cap > 0 && pl != NULL) memcpy(r->payload, pl, (size_t)cap);
-        r->payload_len_preview = cap;
+        // Store the FULL payload so the detail view can show all of it.
+        r->payload     = NULL;
+        r->payload_len = 0;
+        if (pln > 0 && pl != NULL) {
+            r->payload = (uint8_t *) malloc((size_t)pln);
+            if (r->payload != NULL) {
+                memcpy(r->payload, pl, (size_t)pln);
+                r->payload_len = pln;
+            }
+        }
 
         new_n++;
     }
@@ -691,21 +703,39 @@ static void draw_detail(int top_y, int height, int cols)
         p = eol + 1;
     }
 
-    // Payload hex preview at the bottom (if there's room).
+    // Payload as a multi-line hex dump filling the rest of the detail
+    // pane. A single line only ever showed ~cols/2 bytes; this lays the
+    // whole payload out, wrapping, and notes any remainder that doesn't
+    // fit the visible rows (use packet_query --format=raw for those).
     if (y < max_y - 1) {
-        char hex[3 * MAX_PAYLOAD_PREVIEW + 64];
-        int pos = snprintf(hex, sizeof hex,
-                           "payload (%d bytes, preview %d): ",
-                           r->payload_len_total, r->payload_len_preview);
-        for (int i = 0; i < r->payload_len_preview && pos + 3 < (int)sizeof hex; i++) {
-            pos += snprintf(hex + pos, sizeof hex - pos, "%02x", r->payload[i]);
-        }
-        if (r->payload_len_preview < r->payload_len_total) {
-            snprintf(hex + pos, sizeof hex - pos, "...");
-        }
         move(y, 0); clrtoeol();
-        mvaddnstr(y, 2, hex, cols - 2);
+        mvprintw(y, 2, "payload (%d bytes):", r->payload_len);
         y++;
+        int per_line = (cols - 6) / 3;          // "xx " per byte
+        if (per_line < 8)  per_line = 8;
+        if (per_line > 32) per_line = 32;
+        int shown = 0;
+        while (y < max_y && shown < r->payload_len) {
+            char line[128];
+            int pos = 0;
+            int end = shown + per_line;
+            if (end > r->payload_len) end = r->payload_len;
+            for (int i = shown; i < end && pos + 3 < (int)sizeof line; i++) {
+                pos += snprintf(line + pos, sizeof line - pos, "%02x ",
+                                r->payload[i]);
+            }
+            move(y, 0); clrtoeol();
+            mvaddnstr(y, 4, line, cols - 4);
+            y++;
+            shown = end;
+        }
+        if (shown < r->payload_len && y > 0) {
+            // Overwrite the last drawn row with a remainder note.
+            move(y - 1, 0); clrtoeol();
+            mvprintw(y - 1, 4,
+                     "... %d more bytes (packet_query --format=raw)",
+                     r->payload_len - shown);
+        }
     }
     while (y < max_y) {
         move(y, 0); clrtoeol(); y++;
@@ -1037,6 +1067,7 @@ int main(int argc, char **argv)
     }
 
     endwin();
+    for (int i = 0; i < n_rows; i++) free(rows[i].payload);
     sqlite3_close(db);
     return 0;
 }

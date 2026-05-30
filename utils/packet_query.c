@@ -536,16 +536,26 @@ int main(int argc, char **argv)
         }
         case FMT_JSON: {
             char ts_e[64], tool_e[64], pname_e[32], sat_e[32];
-            char run_e[64], summary_e[3072];
-            char payload_hex[1024];
+            char run_e[64];
+            // Size the payload-hex and summary buffers to the actual
+            // data so a large packet or long decoded summary is never
+            // truncated. json_escape can expand a char to 6 (\uXXXX).
+            size_t sum_len    = summary ? strlen(summary) : 0;
+            size_t summary_cap = sum_len * 6 + 16;
+            size_t hex_cap     = (size_t) payload_n * 2 + 1;
+            char *summary_e   = (char *) malloc(summary_cap);
+            char *payload_hex = (char *) malloc(hex_cap);
+            if (summary_e == NULL || payload_hex == NULL) {
+                free(summary_e); free(payload_hex);
+                break;  // skip this row's render on (impossible) OOM
+            }
             json_escape(ts_disp[0] ? ts_disp : "", ts_e, sizeof ts_e);
             json_escape(tool ? tool : "", tool_e, sizeof tool_e);
             json_escape(pname ? pname : "", pname_e, sizeof pname_e);
             json_escape(sat ? sat : "", sat_e, sizeof sat_e);
             json_escape(run ? run : "", run_e, sizeof run_e);
-            json_escape(summary ? summary : "", summary_e, sizeof summary_e);
-            hex_encode(payload, (size_t)payload_n,
-                       payload_hex, sizeof payload_hex);
+            json_escape(summary ? summary : "", summary_e, summary_cap);
+            hex_encode(payload, (size_t)payload_n, payload_hex, hex_cap);
             if (row_count > 0) printf(",");
             printf("\n  {");
             printf("\"id\":%lld,", id);
@@ -591,19 +601,30 @@ int main(int argc, char **argv)
             printf("\"payload_hex\":\"%s\",", payload_hex);
             printf("\"summary\":\"%s\"", summary_e);
             printf("}");
+            free(summary_e); free(payload_hex);
             break;
         }
         case FMT_CSV: {
             char ts_q[80], tool_q[40], pname_q[40], sat_q[40], run_q[40];
-            char summary_q[3072], payload_hex[1024];
+            // Dynamic so a large packet / long summary isn't truncated.
+            // csv_escape can double a field (doubled quotes) + 2 wrapper
+            // quotes; hex is 2 chars/byte.
+            size_t sum_len     = summary ? strlen(summary) : 0;
+            size_t summary_cap = sum_len * 2 + 8;
+            size_t hex_cap     = (size_t) payload_n * 2 + 1;
+            char *summary_q   = (char *) malloc(summary_cap);
+            char *payload_hex = (char *) malloc(hex_cap);
+            if (summary_q == NULL || payload_hex == NULL) {
+                free(summary_q); free(payload_hex);
+                break;
+            }
             csv_escape(ts_disp[0] ? ts_disp : "", ts_q, sizeof ts_q);
             csv_escape(tool ? tool : "", tool_q, sizeof tool_q);
             csv_escape(pname ? pname : "", pname_q, sizeof pname_q);
             csv_escape(sat ? sat : "", sat_q, sizeof sat_q);
             csv_escape(run ? run : "", run_q, sizeof run_q);
-            csv_escape(summary ? summary : "", summary_q, sizeof summary_q);
-            hex_encode(payload, (size_t)payload_n,
-                       payload_hex, sizeof payload_hex);
+            csv_escape(summary ? summary : "", summary_q, summary_cap);
+            hex_encode(payload, (size_t)payload_n, payload_hex, hex_cap);
             printf("%lld,%s,%s,%d,%s,"
                    "%d,%d,%d,%d,%d,%d,"
                    "%d,%d,%d,%d,"
@@ -627,6 +648,7 @@ int main(int argc, char **argv)
             csv_escape(capture_origin_row ? capture_origin_row : "", co_q, sizeof co_q);
             printf("%s,", co_q);
             printf("%s,%s\n", payload_hex, summary_q);
+            free(summary_q); free(payload_hex);
             break;
         }
         case FMT_RAW:
