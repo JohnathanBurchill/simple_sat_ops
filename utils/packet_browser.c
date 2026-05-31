@@ -691,14 +691,25 @@ static void draw_detail(int top_y, int height, int cols)
         y++;
     }
 
-    // Decoded body, line by line.
+    // Decoded body, line by line. Each logical line is wrapped across
+    // as many physical rows as it needs rather than truncated at the
+    // right edge — the tcmd_response text in particular routinely runs
+    // past the screen width.
     const char *p = r->summary;
+    int wrap_w = cols - 2;
+    if (wrap_w < 1) wrap_w = 1;
     while (*p != '\0' && y < max_y) {
         const char *eol = strchr(p, '\n');
         int n = eol ? (int)(eol - p) : (int)strlen(p);
-        move(y, 0); clrtoeol();
-        mvaddnstr(y, 2, p, n < cols - 2 ? n : cols - 2);
-        y++;
+        int off = 0;
+        do {
+            int chunk = n - off;
+            if (chunk > wrap_w) chunk = wrap_w;
+            move(y, 0); clrtoeol();
+            mvaddnstr(y, 2, p + off, chunk);
+            y++;
+            off += chunk;
+        } while (off < n && y < max_y);
         if (!eol) break;
         p = eol + 1;
     }
