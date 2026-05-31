@@ -4964,6 +4964,41 @@ typedef struct {
     double      tr_last_tx_ago_s; // NAN or +inf -> placeholder
 } status_panel_t;
 
+// Format a duration (seconds) as a compact "Dd Hh Mm Ss" string, emitting
+// only the parts that are needed: "2s", "1h 12s", "3d 4h", etc. Leading
+// zero units are dropped, and an interior zero unit is skipped (1h 0m 12s
+// -> "1h 12s"). A duration that rounds to zero renders as "0s". Seconds
+// are rounded to the nearest whole second.
+static void format_duration_compact(double seconds, char *out, size_t n)
+{
+    if (n == 0) return;
+    if (seconds < 0) seconds = 0;
+    long total = (long) (seconds + 0.5);
+    long days  =  total / 86400;
+    long hours = (total % 86400) / 3600;
+    long mins  = (total % 3600) / 60;
+    long secs  =  total % 60;
+
+    size_t off = 0;
+    if (days > 0) {
+        off += (size_t) snprintf(out + off, n - off, "%s%ldd",
+                                 off ? " " : "", days);
+    }
+    if (hours > 0 && off < n) {
+        off += (size_t) snprintf(out + off, n - off, "%s%ldh",
+                                 off ? " " : "", hours);
+    }
+    if (mins > 0 && off < n) {
+        off += (size_t) snprintf(out + off, n - off, "%s%ldm",
+                                 off ? " " : "", mins);
+    }
+    // Show seconds when nonzero, or when nothing else was emitted (so a
+    // sub-second / zero duration still prints "0s").
+    if ((secs > 0 || off == 0) && off < n) {
+        snprintf(out + off, n - off, "%s%lds", off ? " " : "", secs);
+    }
+}
+
 static void render_status_panel(const status_panel_t *p,
                                 int *print_row, int print_col)
 {
@@ -5057,8 +5092,9 @@ static void render_status_panel(const status_panel_t *p,
             if (isnan(p->tr_last_tx_ago_s) || isinf(p->tr_last_tx_ago_s)) {
                 mvprintw(row++, col, "%15s   --", "last TX");
             } else {
-                mvprintw(row++, col, "%15s   %.1f s ago",
-                         "last TX", p->tr_last_tx_ago_s);
+                char ago[32];
+                format_duration_compact(p->tr_last_tx_ago_s, ago, sizeof ago);
+                mvprintw(row++, col, "%15s   %s ago", "last TX", ago);
             }
             clrtoeol();
         } else {
