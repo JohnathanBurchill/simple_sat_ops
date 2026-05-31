@@ -67,6 +67,7 @@
 // load_tle + update_satellite_position path rather than driving SGP4 by
 // hand, which is easy to get subtly wrong.
 #include "prediction.h"
+#include "agenda_line.h"
 #endif
 
 static void usage(FILE *out, const char *progname)
@@ -404,6 +405,22 @@ int main(int argc, char **argv)
         }
         ++total_commands;
 
+        // Split off an inline trailing comment ("cmd!  # note"). It's
+        // documentation, not part of the command, so dedup, humanize and
+        // the command count above ignore it -- but it's re-appended to the
+        // output below so it's preserved. The delimiter rule is shared with
+        // simple_sat_ops via agenda_find_inline_comment(): a '#' inside a
+        // command (no preceding whitespace) is left intact.
+        char inline_comment[4096];
+        inline_comment[0] = '\0';
+        size_t cmd_len;
+        const char *cmt = agenda_find_inline_comment(buf, &cmd_len);
+        if (cmt) {
+            snprintf(inline_comment, sizeof inline_comment, "%s", cmt);
+            strip_eol(inline_comment);
+            buf[cmd_len] = '\0';
+        }
+
         // Verbatim duplicate detection, always run (drives both the
         // summary counts and the flag/prune feature). Two lines with
         // identical commands AND identical embedded unix times are
@@ -485,11 +502,13 @@ int main(int argc, char **argv)
         // Flag duplicates inline only in the default audit mode. With
         // --no-dup-check the markers are off (counts still computed);
         // with --prune-dups the duplicate was already dropped above.
+        const char *cmt_sep = inline_comment[0] ? "  " : "";
         if (first_seen && dup_check && !prune_dups) {
-            fprintf(stdout, "%s%sDUP(line %d)>%s %s\n",
-                    prefix, dup_red, first_seen, dup_reset, body);
+            fprintf(stdout, "%s%sDUP(line %d)>%s %s%s%s\n",
+                    prefix, dup_red, first_seen, dup_reset, body,
+                    cmt_sep, inline_comment);
         } else {
-            fprintf(stdout, "%s%s\n", prefix, body);
+            fprintf(stdout, "%s%s%s%s\n", prefix, body, cmt_sep, inline_comment);
         }
     }
 

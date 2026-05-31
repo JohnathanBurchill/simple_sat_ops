@@ -35,6 +35,7 @@
 #include "tle_csv.h"
 #include "frontiersat.h"
 #include "hmac_keyfile.h"
+#include "agenda_line.h"
 
 #ifdef SSO_WITH_SDR
 #include "b210_rx_tx_core.h"
@@ -2554,10 +2555,23 @@ static char *str_trim_inplace(char *s) {
     return s;
 }
 
-// Read commands from path; one per line. Comments (#...) and blank
-// lines after trim are dropped. Returns 0 on success; allocates and
-// stores in *out_commands / *out_n on success. Caller owns the
-// allocation.
+// Truncate an inline trailing comment from a command line in place. The
+// rule (a '#' is a comment only when preceded by whitespace) is shared
+// with agenda_check via agenda_find_inline_comment(); a '#' that is part
+// of the command text is left intact -- a wrong telecommand is worse than
+// an unstripped one. Whole-line comments (a leading '#') are handled by
+// the caller before this is reached.
+static void strip_inline_comment(char *s) {
+    size_t cmd_len;
+    agenda_find_inline_comment(s, &cmd_len);
+    s[cmd_len] = '\0';
+}
+
+// Read commands from path; one per line. Whole-line comments (#...) and
+// blank lines after trim are dropped, and an inline trailing comment
+// (whitespace + #...) is stripped from each command. Returns 0 on
+// success; allocates and stores in *out_commands / *out_n on success.
+// Caller owns the allocation.
 static int auto_tcmd_load_file(const char *path,
                                char ***out_commands, int *out_n)
 {
@@ -2570,6 +2584,8 @@ static int auto_tcmd_load_file(const char *path,
     while (fgets(line, sizeof line, fp)) {
         char *t = str_trim_inplace(line);
         if (t[0] == '\0' || t[0] == '#') continue;
+        strip_inline_comment(t);
+        if (t[0] == '\0') continue;
         if (n == cap) {
             int new_cap = cap * 2;
             char **new_arr = (char **) realloc(arr,

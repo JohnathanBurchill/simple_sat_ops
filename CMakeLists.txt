@@ -189,6 +189,14 @@ target_include_directories(tle_csv_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(tle_csv_selftest PRIVATE m)
 list(APPEND SSO_TARGETS tle_csv_selftest)
 
+# Agenda-line self-test: the shared inline-comment rule (agenda_line.c)
+# that simple_sat_ops (transmit) and agenda_check (audit) both use to
+# split a telecommand from a trailing '#' comment. Pure POSIX.
+add_executable(agenda_line_selftest
+               unit_tests/agenda_line_selftest.c src/proto/agenda_line.c)
+target_include_directories(agenda_line_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+list(APPEND SSO_TARGETS agenda_line_selftest)
+
 # Curses test runner: walks the *_selftest binaries built above (and
 # any added later in this file), parses TAP from their stdout, and
 # renders a collapsible group view. Requires ncurses; if not present
@@ -214,7 +222,7 @@ list(APPEND SSO_TARGETS fm_preview)
 # also accepts --tle <file>, propagating the first satellite (via the
 # same prediction.c path next_in_queue uses) to append the sub-satellite
 # lat/lon/alt at each command's execution time.
-add_executable(agenda_check utils/agenda_check.c)
+add_executable(agenda_check utils/agenda_check.c src/proto/agenda_line.c)
 if (SGP4SDP4_LIB)
     target_compile_definitions(agenda_check PRIVATE WITH_SGP4SDP4)
     target_sources(agenda_check PRIVATE src/orbit/prediction.c src/orbit/oem.c)
@@ -707,6 +715,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
                    src/proto/ax100.c src/proto/rs.c
                    src/proto/golay24.c src/proto/csp.c
                    src/proto/hmac_keyfile.c
+                   src/proto/agenda_line.c
                    src/beacon/beacon_cts1.c
                    src/orbit/tle_csv.c
                    src/dsp/biquad.c src/dsp/monitor_squelch.c)
