@@ -9,6 +9,9 @@ and talking to a satellite that only answers when you ask politely.*
 
 Version: 2
 
+Applies to `simple_sat_ops` and friends at branch `any-sdr`, commit
+`ef82007` (2026-05-31).
+
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
 
