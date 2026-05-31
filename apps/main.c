@@ -1938,6 +1938,10 @@ static void rx_panel_collect_local(rx_panel_data_t *d)
 #endif
 }
 
+// Defined further down (with the status panel); used here for the
+// "last frame T+" age too.
+static void format_duration_compact(double seconds, char *out, size_t n);
+
 // Render the RX panel from a snapshot. Compiles even without UHD —
 // the viewer feeds this from broadcast STATE so it can draw what the
 // operator sees.
@@ -2000,7 +2004,9 @@ static void render_rx_panel(const rx_panel_data_t *d,
         clrtoeol();
     }
     if (d->age_s >= 0.0) {
-        mvprintw(row++, col, "%15s   %.1f s ago", "last frame T+", d->age_s);
+        char ago[32];
+        format_duration_compact(d->age_s, ago, sizeof ago);
+        mvprintw(row++, col, "%15s   %s ago", "last frame T+", ago);
         clrtoeol();
     }
     char by_type[160] = {0};

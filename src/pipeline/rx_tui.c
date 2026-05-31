@@ -71,6 +71,37 @@ static int   g_hist_view_idx = -1;  // -1 = editing fresh; else 0..count-1
 
 static char  g_hist_path[300] = "";
 
+// Format a non-negative duration (whole seconds) as a compact
+// "Dd Hh Mm Ss" string, emitting only the parts that are needed:
+// "2s", "1h 12s", "3d 4h". An interior zero unit is skipped and a
+// zero duration renders as "0s".
+static void format_duration_compact(long total, char *out, size_t n)
+{
+    if (n == 0) return;
+    if (total < 0) total = 0;
+    long days  =  total / 86400;
+    long hours = (total % 86400) / 3600;
+    long mins  = (total % 3600) / 60;
+    long secs  =  total % 60;
+
+    size_t off = 0;
+    if (days > 0) {
+        off += (size_t) snprintf(out + off, n - off, "%s%ldd",
+                                 off ? " " : "", days);
+    }
+    if (hours > 0 && off < n) {
+        off += (size_t) snprintf(out + off, n - off, "%s%ldh",
+                                 off ? " " : "", hours);
+    }
+    if (mins > 0 && off < n) {
+        off += (size_t) snprintf(out + off, n - off, "%s%ldm",
+                                 off ? " " : "", mins);
+    }
+    if ((secs > 0 || off == 0) && off < n) {
+        snprintf(out + off, n - off, "%s%lds", off ? " " : "", secs);
+    }
+}
+
 static const char *hist_at(int view_idx)
 {
     if (view_idx < 0 || view_idx >= g_hist_count) return NULL;
@@ -752,9 +783,11 @@ static void render(void)
         clock_gettime(CLOCK_MONOTONIC, &now);
         long age_s = (long)(now.tv_sec - g_last_frame_clock.tv_sec);
         if (age_s < 0) age_s = 0;
+        char ago[32];
+        format_duration_compact(age_s, ago, sizeof ago);
         snprintf(title_right, sizeof title_right,
-                 " frames=%llu  last_rx=%lds ago ",
-                 (unsigned long long)g_counters.total, age_s);
+                 " frames=%llu  last_rx=%s ago ",
+                 (unsigned long long)g_counters.total, ago);
     } else {
         snprintf(title_right, sizeof title_right,
                  " frames=0  last_rx=never ");
