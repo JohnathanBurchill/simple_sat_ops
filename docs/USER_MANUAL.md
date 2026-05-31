@@ -7,10 +7,10 @@ pagetitle: "The Sat Ops Guide"
 *A field guide to pointing antennas, pulling frames out of the noise,
 and talking to a satellite that only answers when you ask politely.*
 
-Version: 1
+Version: 2
 
-Initial version prepared by Johnathan K. Burchill and Claude Opus 4.8
-at the University of Calgary.
+Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
+of Calgary.
 
 A tool-by-tool reference for the Calgary-to-Space FrontierSat ground
 station software (`simple_sat_ops` and friends), written for the team
@@ -551,7 +551,7 @@ symptoms and fixes are collected in [Troubleshooting](#troubleshooting):
 
 | Component | Notes |
 |-----------|-------|
-| **USRP B210** | Two-channel SDR; we use channel 0 for RX and TX. UHD must be installed. Half-duplex by design. |
+| **USRP B210** | Two-channel SDR; channel 0 receives on `RX2` and transmits on `TX/RX`. UHD must be installed. Receive runs continuously, including during a transmit burst. |
 | **SPID Rot2ProG** | Az/El antenna rotator with a built-in controller. USB-serial CAT at any baud (it autodetects). Constant slew rates configured on the controller's front panel. |
 | **UHF T/R switch** | Optional CalgaryToSpace RP2040-Zero board on USB-CDC at `/dev/ttyACM0`. Senses RF on the TX line and flips two relays (K1 = antenna path, K2 = dummy). Auto-mode by default; the firmware emits a heartbeat the operator UI parses for a status panel. |
 
@@ -944,6 +944,21 @@ Screen layout (ncurses, redrawn at ~10 Hz):
   panel and packet database), not here. Viewers see the same lines
   via IPC.
 
+Elapsed-time readouts (T/R switch last-TX, RX last-frame age) are shown
+in a compact form that lists only the parts that matter: `2s ago`,
+`1h 12s ago`, `3d 4h ago` - not a long fractional second count.
+
+**Errors don't scramble the screen.** While the live screen is up, any
+stderr from the radio/SDR code or a system library is redirected to
+`sso_stderr.log` in the pass folder instead of landing on the panels
+(the worst offender was a B210 USB-overflow message that could repeat
+many times a second). Nothing is lost - it's captured for later - and
+normal stderr is restored when the screen is torn down. On a clean quit
+the program prints one final line: `No errors reported` if nothing was
+written this run, or `Errors logged in <file>` pointing straight at it
+(the check compares the log's size against its size at startup, so a
+reused pass folder won't give a false positive from an earlier run).
+
 ### Colon-command prompt
 
 Press `:` to open a one-line command bar at the bottom. The prompt
@@ -1006,10 +1021,13 @@ gap between repeats, preroll, and three safety-gate checkboxes
 
 Each field edit is debounced (~200 ms) and broadcast to viewers as
 a `tx-preview` event, so observers see the draft before commit.
-Enter sends a `tx-request`. The main loop's next tick passes RX
-over to TX, transmits the burst, resumes RX, and records a
-`tx-command-sent` event in the TX log. If the burst never reaches the
-air - no SDR, frame-build failure, UHD error, or `--tx-dry-run` - a
+Enter sends a `tx-request`. The burst runs on its own thread, which
+brings the transmit chain up (on the B210's `TX/RX` port), sends, and
+powers the transmit chain back down; **receive keeps running
+continuously the whole time** (on `RX2`), so the satellite's reply in
+the seconds right after a command isn't missed. A `tx-command-sent`
+event is recorded in the TX log. If the burst never reaches the air -
+no SDR, frame-build failure, UHD error, or `--tx-dry-run` - a
 `tx-not-sent` event carries the reason instead. Esc cancels.
 
 On an [RX-only SDR](#sdr-backends) (RTL-SDR), the modal still opens for
@@ -1020,11 +1038,19 @@ is refused with "TX not supported by this SDR (RX-only backend)".
 
 Requires `--tc-file=<path>` on the command line. The file format
 matches what the wider CalgaryToSpace tooling uses: one telecommand
-per line, blank and `#` lines pass through:
+per line. Blank lines and whole-line `#` comments are ignored, and an
+inline trailing comment is stripped from a command:
 
 ```
 CTS1+function_name(arg1,arg2)@tssent=<unix_ms>@tsexec=<unix_ms>@resp_fname=<f>!
+# a whole-line comment
+CTS1+adcs_identification()@tsexec=<unix_ms>!   # an inline comment, ignored
 ```
+
+A telecommand always ends with `!`, so a `#` is treated as a comment
+only when whitespace precedes it; a `#` inside the command text (no
+space before it) is left intact, so a command is never silently
+truncated on its way to the air.
 
 The `A` modal lists the commands, lets the operator set per-pass
 parameters (power, repeats, delay), and ticks the same three TX
@@ -1263,6 +1289,15 @@ lat=<deg> lon=<deg> alt=<km>` (in mech coords, lat one decimal,
 fixed-width). Without `--tle`, the inline `@tssent=` and `@tsexec=`
 timestamps are humanized in place.
 
+Comments follow the same rule the operator UI uses (the rule lives in
+one shared place, so the audit and the transmit path can't disagree).
+Whole-line `#` comments are passed through verbatim. An inline trailing
+comment (whitespace + `#...`) is split off the command: it is preserved
+in the output, but excluded from the command count and the
+duplicate/timed keys - so the same command carrying two different
+comments is still flagged as a duplicate, and a `#` inside a command is
+left intact.
+
 After processing, a stderr summary lists:
 
 ```text
@@ -1422,10 +1457,24 @@ arguments.
 `$SSO_PACKET_DB` or `--db=<path>`). Filter by satellite, frame type,
 time range, source tool, or capture origin. Output as a table
 (default), JSON, CSV, or raw bytes via `--format=table|json|csv|raw`.
+The `json`, `csv`, and `raw` forms emit the **whole** payload and
+decoded summary - there is no length cap, so a large packet comes out in
+full. `table` is the one-line-per-frame summary view; use the other
+three when you want every byte.
 
 `packet_browser` is an ncurses TUI over the same database. Scroll
 through frames, expand to inspect the raw bytes and decoded fields,
-re-run the framer with different options.
+re-run the framer with different options. The detail pane shows the
+full payload as a multi-line hex dump (with a `... N more bytes` note,
+pointing at `packet_query --format=raw`, if it overflows the visible
+rows) and wraps each decoded-body line across as many rows as it needs,
+so a long `tcmd_response` is readable rather than clipped at the right
+edge.
+
+A telecommand response is text ended by a zero byte; the decoded display
+stops at that end marker, so trailing framing/parity bytes don't show up
+as a garbage tail after the message. The raw byte dump still shows
+everything.
 
 ```sh
 packet_query --satellite=FrontierSat --since=1h --format=json
@@ -1577,10 +1626,15 @@ surface but pushes three blocking-I/O domains onto dedicated
 pthreads:
 
 * **RX session worker** (`src/pipeline/rx_session.c`). Owns the
-  B210 / UHD pump and the WAV / IQ writers. The main loop submits
-  TX bursts asynchronously via
-  `rx_session_submit_burst` and `rx_session_poll_burst`; the worker
-  pauses RX, transmits, and resumes RX without blocking the UI.
+  B210 / UHD pump and the WAV / IQ writers, and receives continuously
+  for the whole pass. The main loop submits TX bursts asynchronously via
+  `rx_session_submit_burst` and `rx_session_poll_burst`; each burst runs
+  on its own thread and brings the transmit chain up and back down
+  *without* stopping, retuning, or reclocking receive - so the USB link
+  keeps draining and the radio's buffer can't overflow during a burst
+  (an earlier stop-the-world transmit flooded the log right when the
+  reply was due). Powering the transmit chain down between bursts still
+  guarantees nothing is left on the air while receiving.
 
 * **Rotator worker** (`src/hw/antenna_rotator_async.c`). Polls the
   SPID STATUS at 2 Hz and drains a latest-wins SET slot. The UI
@@ -1792,6 +1846,24 @@ ATR/PA the way stock UHD expects - re-check the
 - Render the last N seconds with `:spectrum <sec>` to see whether the
   carrier is even present before chasing the decoder.
 
+**SDR unplugged mid-pass / `Abort trap: 6`**
+
+Pulling the SDR's USB cable (or losing its power) while receiving raises
+a fatal fault inside the radio library that can't be caught and resumed
+from within the process. `simple_sat_ops` no longer dies raw and leaves
+a wrecked terminal: it restores the terminal directly, closes the
+waterfall window, prints one line about what happened and where the log
+is, and exits cleanly. (If two threads hit the fault at once, only the
+first runs the cleanup; the second waits for it to finish, so the
+message prints and the screen is restored reliably.) Ctrl-C and
+termination signals also quit through this same clean shutdown. If a
+device error ever surfaces as an ordinary error rather than an abort,
+the receive worker parks, the RX panel shows
+`SDR DISCONNECTED - RX stopped`, and the rest of the program keeps
+running. Fully *surviving* an unplug (rather than exiting cleanly) would
+need the SDR in a separate process; that is designed and parked, not yet
+built.
+
 **`audit-overflow dropped=N`**
 
 The audit-log writer thread fell behind the producer. Almost always
@@ -1824,7 +1896,7 @@ satellite.
 |------|---------|
 | **AOS / LOS** | Acquisition of Signal / Loss of Signal. Pass start and end times. |
 | **AX100** | The frame format used on FrontierSat's UHF link: 32-bit ASM, Golay-coded length, CCSDS scrambling, Reed-Solomon FEC. |
-| **B210** | Ettus USRP B210 software-defined radio. Two-channel, 70 MHz to 6 GHz, half-duplex in this codebase. |
+| **B210** | Ettus USRP B210 software-defined radio. Two-channel, 70 MHz to 6 GHz; receives on `RX2` and transmits on `TX/RX`, with receive running continuously through a transmit burst. |
 | **CAT** | Computer-Aided Transceiver. The serial control protocol on the FT-991A (see [Appendix A](#appendix-a-what-didnt-stick---the-ft-991a-and-ic-9700-radio-path)). |
 | **CSP** | Cubesat Space Protocol. The frame inside the AX100 wrapper. |
 | **CTS-SAT-1 / FrontierSat** | Calgary-to-Space's first satellite. Often called "FrontierSat" in this codebase. |
