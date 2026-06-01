@@ -436,15 +436,20 @@ void tcmd_response_print(FILE *fp, const char *ts,
         print_len++;
     }
 
+    // Show both the humanized ts_sent and the raw unix-ms value. The
+    // humanized form drops the milliseconds, so only the raw integer can
+    // be matched exactly against the @tssent=<unix_ms> in the uplink
+    // agenda log to correlate a response with the telecommand that sent it.
     fprintf(fp,
-            "%stcmd_response: code=%u%s duration=%ums seq=%u/%u ts_sent=%s\n",
+            "%stcmd_response: code=%u%s duration=%ums seq=%u/%u ts_sent=%s (%llu)\n",
             prefix,
             (unsigned)hdr.response_code,
             (hdr.response_code == 0) ? " (OK)" : "",
             (unsigned)hdr.duration_ms,
             (unsigned)hdr.response_seq_num,
             (unsigned)hdr.response_max_seq_num,
-            ts_buf);
+            ts_buf,
+            (unsigned long long)hdr.ts_sent);
 
     fprintf(fp, "%stcmd_response: data (%zu bytes): \"", prefix, print_len);
     for (size_t i = 0; i < print_len; i++) {
