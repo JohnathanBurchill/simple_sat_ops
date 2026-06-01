@@ -457,6 +457,15 @@ if (OPENSSL_FOUND)
     target_link_sso_core(packet_query)
     list(APPEND SSO_TARGETS packet_query)
 
+    # Backfill the sent_tcmd table from historical tx.log files.
+    add_executable(tcmd_import utils/tcmd_import.c src/proto/agenda_line.c)
+    target_include_directories(tcmd_import PRIVATE ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(tcmd_import PRIVATE ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(tcmd_import PRIVATE ${OPENSSL_LIBRARIES} m)
+    target_link_packet_db(tcmd_import)
+    target_link_sso_core(tcmd_import)
+    list(APPEND SSO_TARGETS tcmd_import)
+
     # Curses TUI sibling of packet_query.
     if (NCURSES_FOUND)
         add_executable(packet_browser utils/packet_browser.c)

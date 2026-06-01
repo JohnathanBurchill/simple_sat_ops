@@ -578,7 +578,7 @@ Which targets actually build depends on what the host has:
 | Dependency | Targets it unlocks |
 |------------|---------------------|
 | always | `radio_ctl`, `rs_selftest`, `fm_preview`, `agenda_check` |
-| OpenSSL / libcrypto | `uplink_test`, `rx_decode`, `packet_query`, `packet_browser` |
+| OpenSSL / libcrypto | `uplink_test`, `rx_decode`, `packet_query`, `packet_browser`, `tcmd_import` |
 | SGP4SDP4 | `next_in_queue`, `lifetime`, `prediction_selftest`, `pursuit_selftest` |
 | UHD (B210) | `b210_rx_capture`, `b210_gain_sweep`, `tx_frame_sdr`, `sdr_probe` |
 | librtlsdr | RTL-SDR RX-only backend in `simple_sat_ops` (on by default; auto-disables if absent) |
@@ -1510,6 +1510,21 @@ command sent before the table existed), it falls back to scanning the
 agenda files under the data root for `@tssent=<value>`, and otherwise
 shows `(command unknown)`. Manually-composed commands carry no `@tssent`
 and so are not recorded or resolved.
+
+**Backfilling old commands (`tcmd_import`).** The `sent_tcmd` table is
+only filled for passes flown after it existed. To populate it from
+history, `tcmd_import` reads the per-pass `tx.log` files (each transmitted
+command is a `tx-command-sent` line whose payload is the command that went
+on the air) and inserts the ones carrying an `@tssent`. With no path it
+scans the Operations directory under the data root; pass one or more
+directories or `tx.log` files to scope it. Re-running is safe - duplicates
+are ignored.
+
+```sh
+tcmd_import                              # scan <root>/Operations recursively
+tcmd_import /FrontierSat/Operations      # an explicit tree
+tcmd_import --db=/tmp/test.sqlite path/to/tx.log
+```
 
 ```sh
 packet_query --satellite=FrontierSat --since=1h --format=json
