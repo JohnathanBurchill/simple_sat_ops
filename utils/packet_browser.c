@@ -847,10 +847,9 @@ static void usage(FILE *out, const char *argv0)
         "\n"
         "Options:\n"
         "  --db=<path>      override default DB path. Default, in order:\n"
-        "                   $SSO_PACKET_DB, else the shared FrontierSat\n"
-        "                   tree ($FRONTIERSAT_ROOT/packet_db.sqlite,\n"
-        "                   e.g. /FrontierSat/packet_db.sqlite), else\n"
-        "                   $HOME/.local/share/simple_sat_ops/packets.db\n"
+        "                   $SSO_PACKET_DB, else <root>/packet_db.sqlite\n"
+        "                   where <root> is $FRONTIERSAT_ROOT if set,\n"
+        "                   else /FrontierSat\n"
         "  --help           this message\n",
         argv0);
 }

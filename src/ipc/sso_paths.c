@@ -12,28 +12,30 @@
 static char g_root[SSO_PATHS_BUF];
 static int g_root_resolved = 0;
 
-static int is_dir(const char *p) {
-    struct stat st;
-    if (stat(p, &st) != 0) return 0;
-    return S_ISDIR(st.st_mode);
-}
-
 const char *sso_frontiersat_root(void) {
     if (g_root_resolved) return g_root;
     const char *env = getenv("FRONTIERSAT_ROOT");
     if (env && env[0]) {
         snprintf(g_root, sizeof(g_root), "%s", env);
-        g_root_resolved = 1;
-        return g_root;
-    }
-    if (is_dir("/FrontierSat")) {
+    } else {
+        // No override: always the well-known shared tree. (We used to
+        // probe for /FrontierSat and otherwise fall back to
+        // $HOME/FrontierSat; now every host without FRONTIERSAT_ROOT
+        // resolves to the same /FrontierSat, matching how the ground
+        // machine is set up. Point a dev host elsewhere with
+        // FRONTIERSAT_ROOT.)
         snprintf(g_root, sizeof(g_root), "/FrontierSat");
-        g_root_resolved = 1;
-        return g_root;
+        // If that default root is absent, say so once with the options,
+        // so files don't quietly fail to land where the user expects.
+        struct stat st;
+        if (stat(g_root, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            fprintf(stderr,
+                "simple_sat_ops: data root %s does not exist. Options:\n"
+                "       - create it:  sudo mkdir -p %s && sudo chown \"$(whoami)\" %s\n"
+                "       - or point elsewhere:  export FRONTIERSAT_ROOT=/path/to/your/tree\n",
+                g_root, g_root, g_root);
+        }
     }
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = "/tmp";
-    snprintf(g_root, sizeof(g_root), "%s/FrontierSat", home);
     g_root_resolved = 1;
     return g_root;
 }

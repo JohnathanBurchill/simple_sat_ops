@@ -117,11 +117,10 @@ int packet_db_default_path(char *buf, size_t cap)
         memcpy(buf, override, strlen(override) + 1);
         return 0;
     }
-    // Shared FrontierSat tree first — operators all see the same DB
-    // when the ground machine has /FrontierSat/ set up (or
-    // FRONTIERSAT_ROOT pointing at it). sso_packet_db_path() handles
-    // the dev-host fallback ($HOME/FrontierSat/packet_db.sqlite), so
-    // this branch covers both production and bench use cases.
+    // Shared FrontierSat tree first — operators all see the same DB.
+    // sso_packet_db_path() resolves to $FRONTIERSAT_ROOT if set, else
+    // /FrontierSat. A dev host that wants a different location sets
+    // FRONTIERSAT_ROOT (or $SSO_PACKET_DB above).
     const char *shared = sso_packet_db_path();
     if (shared != NULL && shared[0] != '\0') {
         if (strlen(shared) + 1 > cap) return -1;

@@ -7,10 +7,11 @@ pagetitle: "The Sat Ops Guide"
 *A field guide to pointing antennas, pulling frames out of the noise,
 and talking to a satellite that only answers when you ask politely.*
 
-Version: 2
+Version: 3 (working draft)
 
-Applies to `simple_sat_ops` and friends at branch `any-sdr`, commit
-`ef82007` (2026-05-31).
+Applies to `simple_sat_ops` and friends on branch `any-sdr`. This is a
+working draft and is not yet pinned to a commit; the commit and date
+will be filled in when it is finalized.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -858,7 +859,7 @@ your machine:
    ```
 
    If your FrontierSat root is elsewhere, use it - the tools resolve
-   `$FRONTIERSAT_ROOT`, then `/FrontierSat`, then `~/FrontierSat`.
+   `$FRONTIERSAT_ROOT` if set, otherwise `/FrontierSat`.
 
 2. Find the device serial: run `sdr_probe`. It prints e.g.
    `USB serial: 30AA038`.
@@ -1455,8 +1456,8 @@ arguments.
 ### `packet_query` and `packet_browser`
 
 `packet_query` is a CLI grep over the shared SQLite packet database
-(the shared `$FRONTIERSAT_ROOT/packet_db.sqlite`, falling back to
-`$HOME/.local/share/simple_sat_ops/packets.db`; override with
+(`<root>/packet_db.sqlite`, where `<root>` is `$FRONTIERSAT_ROOT` if set
+and otherwise `/FrontierSat`; override the whole path with
 `$SSO_PACKET_DB` or `--db=<path>`). Filter by satellite, frame type,
 time range, source tool, or capture origin. Output as a table
 (default), JSON, CSV, or raw bytes via `--format=table|json|csv|raw`.
@@ -1717,7 +1718,7 @@ values are not disturbed).
 
 | Path | What's there |
 |------|---------------|
-| `/FrontierSat/` | Top-level data root. Override with `$FRONTIERSAT_ROOT`; falls back to `~/FrontierSat` on dev hosts that lack `/FrontierSat`. |
+| `/FrontierSat/` | Top-level data root. Default when `$FRONTIERSAT_ROOT` is unset; set `$FRONTIERSAT_ROOT` to use a different tree (e.g. on a dev host). If the default root doesn't exist, every tool prints a one-time notice with the options (create it, or set `$FRONTIERSAT_ROOT`). |
 | `/<satname>/TLEs/` (e.g. `/FrontierSat/TLEs/`, `$TLES`) | Dated TLE files, conventionally `<date>/tle-<date>.tle`. `simple_sat_ops --control` with no `<satellite_id>`, and `next_in_queue <satellite_name>`, both load the newest dated `*.tle` found here (searched recursively). Note: an explicit `--tle <path>` is **not** resolved under this directory - it is taken relative to the working directory (a CSV TLE is auto-converted to a temp `.tle`). |
 | `/FrontierSat/Operations/<yyyymmdd>/<HHMMLT>/` | Per-pass folder. Holds the pass's WAV, IQ, decoded frames, TLE snapshot, doppler / lo_offset / burst sidecars, and the end-of-pass spectrogram and waterfall PNG. |
 | `/FrontierSat/Operations/current` | Symlink the operator UI keeps pointing at the most recent pass folder. |
@@ -1727,7 +1728,7 @@ values are not disturbed).
 | `~/.local/share/simple_sat_ops/rotator_az_rate_dps` | Calibrated rotator azimuth slew rate (deg/s). |
 | `~/.local/share/simple_sat_ops/rotator_el_rate_dps` | Calibrated rotator elevation slew rate (deg/s). |
 | `~/.local/share/simple_sat_ops/carrier-trim-hz` | Per-host carrier-trim offset that lands the B210's analog LO on the requested frequency. |
-| `~/.local/share/simple_sat_ops/packets.db` | Shared SQLite packet database. |
+| `/FrontierSat/packet_db.sqlite` | Shared SQLite packet database (under `$FRONTIERSAT_ROOT` when set). Override the path with `$SSO_PACKET_DB` or `--db=`. |
 | `~/.local/share/simple_sat_ops/runs.log` | Audit log (dev-host fallback when `/var/log/sso/` isn't writable). |
 | `/run/sso/simple_sat_ops.sock` | Operator IPC socket. |
 | `/run/sso/simple_sat_ops.pid` | Operator PID. |
@@ -1866,6 +1867,16 @@ the receive worker parks, the RX panel shows
 running. Fully *surviving* an unplug (rather than exiting cleanly) would
 need the SDR in a separate process; that is designed and parked, not yet
 built.
+
+**`simple_sat_ops: data root /FrontierSat does not exist`**
+
+The shared data root isn't present on this host. Tools still resolve to
+`/FrontierSat` (the default when `$FRONTIERSAT_ROOT` is unset), so output
+would fail to land there. Either create it
+(`sudo mkdir -p /FrontierSat && sudo chown "$(whoami)" /FrontierSat`) or
+point the tools at an existing tree with
+`export FRONTIERSAT_ROOT=/path/to/your/tree`. For the packet database
+specifically you can instead pass `--db=<path>` or set `$SSO_PACKET_DB`.
 
 **`audit-overflow dropped=N`**
 
