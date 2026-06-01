@@ -171,6 +171,7 @@ struct packet_db {
     sqlite3_stmt *update_replay_ts_stmt;
     sqlite3_stmt *register_tle_stmt;
     sqlite3_stmt *select_tle_id_stmt;
+    sqlite3_stmt *insert_sent_tcmd_stmt;
 };
 
 // Fresh-DB schema. Existing DBs from user_version=1 get the new columns
@@ -219,7 +220,26 @@ static const char SCHEMA_SQL[] =
     ");\n"
     "CREATE INDEX IF NOT EXISTS idx_packet_ts        ON packet(ts_received);\n"
     "CREATE INDEX IF NOT EXISTS idx_packet_type      ON packet(packet_type);\n"
-    "CREATE INDEX IF NOT EXISTS idx_packet_satellite ON packet(satellite);\n";
+    "CREATE INDEX IF NOT EXISTS idx_packet_satellite ON packet(satellite);\n"
+    // Telecommands transmitted by simple_sat_ops, keyed by the @tssent
+    // value the satellite echoes back in its tcmd_response. Lets a
+    // reviewer resolve a received response to the command (and arguments)
+    // that produced it. A separate, additive table: it never alters the
+    // packet table, so existing DBs gain it via CREATE TABLE IF NOT
+    // EXISTS on the next open with no migration step.
+    "CREATE TABLE IF NOT EXISTS sent_tcmd (\n"
+    "  id              INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "  ts_sent_ms      INTEGER NOT NULL,\n"
+    "  tsexec_ms       INTEGER,\n"
+    "  command_text    TEXT NOT NULL,\n"
+    "  tx_freq_hz      INTEGER,\n"
+    "  tx_gain_db      REAL,\n"
+    "  source_tool     TEXT NOT NULL,\n"
+    "  source_run      TEXT,\n"
+    "  ts_transmitted  TEXT NOT NULL,\n"
+    "  UNIQUE (ts_sent_ms, source_run)\n"
+    ");\n"
+    "CREATE INDEX IF NOT EXISTS idx_sent_tcmd_ts ON sent_tcmd(ts_sent_ms);\n";
 // The (payload_sha1, source_tool) UNIQUE INDEX is added by the V3
 // migration step below — putting it here would fail on an existing V2
 // DB whose duplicates haven't been collapsed yet.
@@ -336,6 +356,12 @@ static const char REGISTER_TLE_SQL[] =
 
 static const char SELECT_TLE_ID_SQL[] =
     "SELECT id FROM tle WHERE sha1 = ?1;";
+
+static const char INSERT_SENT_TCMD_SQL[] =
+    "INSERT OR IGNORE INTO sent_tcmd ("
+    "  ts_sent_ms, tsexec_ms, command_text, tx_freq_hz, tx_gain_db,"
+    "  source_tool, source_run, ts_transmitted"
+    ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);";
 
 packet_db_t *packet_db_open(const char *path)
 {
@@ -472,6 +498,7 @@ packet_db_t *packet_db_open(const char *path)
         { UPDATE_REPLAY_TS_SQL,      &db->update_replay_ts_stmt },
         { REGISTER_TLE_SQL,          &db->register_tle_stmt     },
         { SELECT_TLE_ID_SQL,         &db->select_tle_id_stmt    },
+        { INSERT_SENT_TCMD_SQL,      &db->insert_sent_tcmd_stmt },
     };
     for (size_t i = 0; i < sizeof stmts / sizeof stmts[0]; i++) {
         if (sqlite3_prepare_v2(raw, stmts[i].sql, -1, stmts[i].out, NULL)
@@ -562,6 +589,40 @@ int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec)
     return 0;
 }
 
+int packet_db_insert_sent_tcmd(packet_db_t *db, const sent_tcmd_record_t *rec)
+{
+    if (db == NULL || db->db == NULL || db->insert_sent_tcmd_stmt == NULL)
+        return 0;
+    if (rec == NULL || rec->command_text == NULL
+        || rec->source_tool == NULL || rec->ts_transmitted == NULL) {
+        return -1;
+    }
+    sqlite3_stmt *s = db->insert_sent_tcmd_stmt;
+    sqlite3_reset(s);
+    sqlite3_clear_bindings(s);
+
+    sqlite3_bind_int64(s, 1, rec->ts_sent_ms);
+    // tsexec_ms < 0 is the "not present" sentinel (real values are
+    // positive unix-ms); store it as NULL.
+    if (rec->tsexec_ms >= 0) sqlite3_bind_int64(s, 2, rec->tsexec_ms);
+    else sqlite3_bind_null(s, 2);
+    sqlite3_bind_text(s, 3, rec->command_text, -1, SQLITE_TRANSIENT);
+    if (rec->tx_freq_hz > 0) sqlite3_bind_int64(s, 4, rec->tx_freq_hz);
+    else sqlite3_bind_null(s, 4);
+    bind_double_or_null(s, 5, rec->tx_gain_db);
+    sqlite3_bind_text(s, 6, rec->source_tool, -1, SQLITE_TRANSIENT);
+    bind_text_or_null(s, 7, rec->source_run);
+    sqlite3_bind_text(s, 8, rec->ts_transmitted, -1, SQLITE_TRANSIENT);
+
+    int rc = sqlite3_step(s);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "packet_db: sent_tcmd insert failed: %s\n",
+                sqlite3_errmsg(db->db));
+        return -1;
+    }
+    return 0;
+}
+
 void packet_db_close(packet_db_t *db)
 {
     if (db == NULL) return;
@@ -571,6 +632,7 @@ void packet_db_close(packet_db_t *db)
     if (db->update_replay_ts_stmt != NULL) sqlite3_finalize(db->update_replay_ts_stmt);
     if (db->register_tle_stmt     != NULL) sqlite3_finalize(db->register_tle_stmt);
     if (db->select_tle_id_stmt    != NULL) sqlite3_finalize(db->select_tle_id_stmt);
+    if (db->insert_sent_tcmd_stmt != NULL) sqlite3_finalize(db->insert_sent_tcmd_stmt);
     if (db->db != NULL) sqlite3_close(db->db);
     free(db);
 }
@@ -749,6 +811,12 @@ packet_db_t *packet_db_open(const char *path)
 }
 
 int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec)
+{
+    (void)db; (void)rec;
+    return 0;
+}
+
+int packet_db_insert_sent_tcmd(packet_db_t *db, const sent_tcmd_record_t *rec)
 {
     (void)db; (void)rec;
     return 0;

@@ -90,6 +90,27 @@ typedef struct {
     const char *capture_origin;
 } packet_db_record_t;
 
+// One transmitted telecommand, recorded so a received tcmd_response can
+// be resolved back to the command that produced it. The satellite echoes
+// the originating command's @tssent value in every response, so ts_sent_ms
+// is the join key between this table and a tcmd_response packet's payload.
+//   - ts_sent_ms is the @tssent unix-ms value actually put on the air
+//     (required; this is what comes back in the response).
+//   - tsexec_ms is the @tsexec unix-ms value; < 0 stores NULL.
+//   - tx_freq_hz <= 0 stores NULL; tx_gain_db NaN stores NULL.
+//   - source_run ties to packet.source_run so the browser can group
+//     a download's file/log packets from the same pass by time.
+typedef struct {
+    long long   ts_sent_ms;
+    long long   tsexec_ms;
+    const char *command_text;
+    long        tx_freq_hz;
+    double      tx_gain_db;
+    const char *source_tool;
+    const char *source_run;
+    const char *ts_transmitted;
+} sent_tcmd_record_t;
+
 // Open the DB at `path`, creating it (with schema) if missing. Sets WAL
 // journaling so concurrent readers/writers don't block each other.
 // Returns NULL on failure (e.g. sqlite3 not available in this build, or
@@ -101,6 +122,12 @@ packet_db_t *packet_db_open(const char *path);
 // the same capture don't double-count. Returns 0 on success or silent
 // dedup, -1 on real DB errors.
 int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec);
+
+// Insert one transmitted-telecommand row. Silently ignores duplicates
+// (same ts_sent_ms + source_run) so a repeated burst of the same command
+// in one pass records a single row. Returns 0 on success or silent dedup,
+// -1 on real DB errors (or a NULL required field).
+int packet_db_insert_sent_tcmd(packet_db_t *db, const sent_tcmd_record_t *rec);
 
 // Register a TLE (3-line: name, line1, line2) and return its row id.
 // Idempotent — same TLE bytes produce the same id across runs (UNIQUE
