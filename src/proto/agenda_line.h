@@ -45,4 +45,14 @@
 // pointer onward. When no comment is found, *cmd_len is set to strlen(s).
 const char *agenda_find_inline_comment(const char *s, size_t *cmd_len);
 
+// Find the first @<key>=<digits> directive in `line` and return its
+// integer value. `key` includes the trailing '=' (e.g. "@tssent=" or
+// "@tsexec="). A leading +/- is accepted. These directives carry unix-ms
+// timestamps; @tssent in particular is the value the satellite echoes
+// back in its tcmd_response, so this is how a transmitted command is tied
+// to its response. Returns 1 and writes *out on success, 0 if the key is
+// absent or not followed by digits (*out untouched).
+int agenda_parse_directive_ms(const char *line, const char *key,
+                              long long *out);
+
 #endif

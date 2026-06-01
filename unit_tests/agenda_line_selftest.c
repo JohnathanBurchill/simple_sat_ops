@@ -2,9 +2,13 @@
 
     Simple Satellite Operations  unit_tests/agenda_line_selftest.c
 
-    Tests for agenda_find_inline_comment() -- the shared rule that
-    simple_sat_ops (transmit path) and agenda_check (audit path) use to
-    decide where a telecommand ends and an inline '#' comment begins.
+    Tests for the shared agenda_line helpers that simple_sat_ops
+    (transmit path) and agenda_check (audit path) both use:
+      - agenda_find_inline_comment() -- where a telecommand ends and an
+        inline '#' comment begins.
+      - agenda_parse_directive_ms() -- the @tssent / @tsexec extractor
+        that ties a transmitted command to the response the satellite
+        echoes back.
 
     The contract under test:
       - A '#' preceded by whitespace (or at index 0) begins a comment.
@@ -141,6 +145,52 @@ static void test_first_hash_wins(void)
                  "CTS1+ping()!", "# note with # inside");
 }
 
+// agenda_parse_directive_ms(): the @tssent / @tsexec extractor that ties a
+// transmitted command to the ts_sent the satellite echoes in its response.
+static void test_parse_directive_ms(void)
+{
+    fprintf(stderr, "parse directive: @tssent / @tsexec extraction\n");
+    const char *line =
+        "CTS1+fs_list_directory_json(/,0,20)@tssent=1779961244000@tsexec=1779961244111!";
+    long long v = -1;
+
+    check(agenda_parse_directive_ms(line, "@tssent=", &v) == 1,
+          "@tssent= found");
+    check(v == 1779961244000LL, "@tssent= value parsed");
+    v = -1;
+    check(agenda_parse_directive_ms(line, "@tsexec=", &v) == 1,
+          "@tsexec= found");
+    check(v == 1779961244111LL, "@tsexec= value parsed");
+
+    // Absent directive: returns 0, leaves *out untouched.
+    v = 42;
+    check(agenda_parse_directive_ms("CTS1+ping()!", "@tssent=", &v) == 0,
+          "missing directive returns 0");
+    check(v == 42, "missing directive leaves *out untouched");
+
+    // Present key with no following digits: not a match.
+    v = 7;
+    check(agenda_parse_directive_ms("CTS1+x()@tssent=!", "@tssent=", &v) == 0,
+          "key without digits returns 0");
+    check(v == 7, "key without digits leaves *out untouched");
+
+    // Leading sign is accepted.
+    v = 0;
+    check(agenda_parse_directive_ms("x @tsexec=-5!", "@tsexec=", &v) == 1
+          && v == -5LL, "leading-minus value parsed");
+
+    // First occurrence wins.
+    v = 0;
+    check(agenda_parse_directive_ms("@tssent=1@tssent=2", "@tssent=", &v) == 1
+          && v == 1LL, "first occurrence wins");
+
+    // NULL arguments must not crash.
+    check(agenda_parse_directive_ms(NULL, "@tssent=", &v) == 0,
+          "NULL line tolerated");
+    check(agenda_parse_directive_ms(line, "@tssent=", NULL) == 0,
+          "NULL out tolerated");
+}
+
 // Empty string and a NULL cmd_len pointer must not crash.
 static void test_edge_inputs(void)
 {
@@ -165,5 +215,6 @@ int main(void)
     test_leading_hash();
     test_first_hash_wins();
     test_edge_inputs();
+    test_parse_directive_ms();
     return tap_done();
 }

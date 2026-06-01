@@ -257,31 +257,6 @@ static void dup_table_free(dup_table_t *t)
 // and reused for every command line.
 static prediction_t g_pred;
 
-// Find the first @<key>=<digits> in `line` and return its integer value.
-// A leading +/- is accepted (matching humanize_directives' tolerance).
-// Returns 1 on success, 0 if the key is absent or not followed by digits.
-static int find_directive_ms(const char *line, const char *key, long long *out)
-{
-    size_t klen = strlen(key);
-    for (const char *p = line; *p != '\0'; ++p) {
-        if (strncmp(p, key, klen) != 0) continue;
-        const char *digits = p + klen;
-        const char *d = digits;
-        if (*d == '+' || *d == '-') ++d;
-        const char *digit_start = d;
-        while (isdigit((unsigned char) *d)) ++d;
-        if (d == digit_start) continue;
-        char numbuf[32];
-        size_t n = (size_t)(d - digits);
-        if (n >= sizeof numbuf) continue;
-        memcpy(numbuf, digits, n);
-        numbuf[n] = '\0';
-        *out = strtoll(numbuf, NULL, 10);
-        return 1;
-    }
-    return 0;
-}
-
 // Load the first satellite from `path` and prime the SGP4/SDP4 selector.
 // Mirrors next_in_queue's setup (load_tle + select_ephemeris). The empty
 // satellite name makes load_tle's zero-length prefix match the first TLE
@@ -467,8 +442,8 @@ int main(int argc, char **argv)
         if (annotate) {
             keep_intact = 1;
             long long exec_ms;
-            if (!find_directive_ms(buf, "@tsexec=", &exec_ms)
-                && !find_directive_ms(buf, "@tssent=", &exec_ms)) {
+            if (!agenda_parse_directive_ms(buf, "@tsexec=", &exec_ms)
+                && !agenda_parse_directive_ms(buf, "@tssent=", &exec_ms)) {
                 exec_ms = now_ms;
             }
             double lat, lon, alt;

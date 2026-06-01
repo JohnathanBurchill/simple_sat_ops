@@ -23,6 +23,8 @@
 
 #include "agenda_line.h"
 
+#include <ctype.h>
+#include <stdlib.h>
 #include <string.h>
 
 const char *agenda_find_inline_comment(const char *s, size_t *cmd_len)
@@ -39,4 +41,28 @@ const char *agenda_find_inline_comment(const char *s, size_t *cmd_len)
     }
     if (cmd_len) *cmd_len = strlen(s);
     return NULL;
+}
+
+int agenda_parse_directive_ms(const char *line, const char *key,
+                              long long *out)
+{
+    if (line == NULL || key == NULL || out == NULL) return 0;
+    size_t klen = strlen(key);
+    for (const char *p = line; *p != '\0'; ++p) {
+        if (strncmp(p, key, klen) != 0) continue;
+        const char *digits = p + klen;
+        const char *d = digits;
+        if (*d == '+' || *d == '-') ++d;
+        const char *digit_start = d;
+        while (isdigit((unsigned char) *d)) ++d;
+        if (d == digit_start) continue;
+        char numbuf[32];
+        size_t n = (size_t)(d - digits);
+        if (n >= sizeof numbuf) continue;
+        memcpy(numbuf, digits, n);
+        numbuf[n] = '\0';
+        *out = strtoll(numbuf, NULL, 10);
+        return 1;
+    }
+    return 0;
 }

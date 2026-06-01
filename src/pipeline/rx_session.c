@@ -3,6 +3,7 @@
 
 #include "rx_session.h"
 
+#include "agenda_line.h"
 #include "ax100.h"
 #include "b210_rx_tx_core.h"
 #include "beacon_cts1.h"
@@ -1409,6 +1410,47 @@ static void worker_update_snapshot(rx_session_t *rxs)
     pthread_mutex_unlock(&rxs->mu);
 }
 
+// After a successful on-air burst, record the transmitted telecommand so
+// a later tcmd_response can be tied back to the command (and arguments)
+// that produced it. Only commands carrying an @tssent directive are
+// recorded: that value is what the satellite echoes back in its response,
+// so it is the join key. Manual-compose commands carry no @tssent and are
+// left unrecorded; auto-telecommand agenda lines always carry one.
+//
+// Runs on the TX thread. The received-packet inserts run on the RX worker
+// thread, but they use a different prepared statement, and SQLite's
+// serialized threading mode guards the shared connection.
+static void worker_record_sent_tcmd(rx_session_t *rxs,
+                                     const tx_request_slot_t *req)
+{
+    if (rxs->db == NULL || req->is_hex) return;
+    size_t n = req->payload_len;
+    if (n == 0) return;
+    char cmd[sizeof req->payload + 1];
+    if (n >= sizeof req->payload) n = sizeof req->payload - 1;
+    memcpy(cmd, req->payload, n);
+    cmd[n] = '\0';
+
+    long long ts_sent_ms = -1;
+    if (!agenda_parse_directive_ms(cmd, "@tssent=", &ts_sent_ms)) return;
+    long long tsexec_ms = -1;
+    agenda_parse_directive_ms(cmd, "@tsexec=", &tsexec_ms);
+
+    char ts_tx[40];
+    fmt_utc(ts_tx, sizeof ts_tx);
+
+    sent_tcmd_record_t rec = {0};
+    rec.ts_sent_ms     = ts_sent_ms;
+    rec.tsexec_ms      = tsexec_ms;   // -1 -> stored NULL
+    rec.command_text   = cmd;
+    rec.tx_freq_hz     = req->tx_freq_hz;
+    rec.tx_gain_db     = req->tx_gain_db;
+    rec.source_tool    = "simple_sat_ops";
+    rec.source_run     = rxs->db_run_id;
+    rec.ts_transmitted = ts_tx;
+    packet_db_insert_sent_tcmd(rxs->db, &rec);
+}
+
 // Dedicated TX-burst thread. Sleeps until a burst is queued, runs it
 // (tx_burst_run maps/tunes/sends/unmaps the TX chain) while the RX
 // worker keeps streaming on its own thread, then publishes the result.
@@ -1451,6 +1493,8 @@ static void *rx_session_tx_thread_fn(void *arg)
                 hmac_local_len > 0 ? hmac_local : NULL, hmac_local_len,
                 summary, sizeof summary);
         }
+
+        if (br == TX_BURST_OK) worker_record_sent_tcmd(rxs, &req);
 
         pthread_mutex_lock(&rxs->mu);
         rxs->burst_result = (rx_burst_result_t) br;
