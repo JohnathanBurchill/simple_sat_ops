@@ -764,7 +764,7 @@ static void draw_bottom_bar(int cols, int rows_total, int searching)
         // ASCII only — narrow ncurses' mvaddnstr counts bytes while
         // the terminal renders columns, so multi-byte chars cause
         // stale tail content on the next render.
-        : " q quit   up/down scroll   t type   o origin   / search   L utc/lt   r reload ";
+        : " q quit   up/down scroll   t type   o origin   / search   l utc/lt   r reload ";
     mvaddnstr(rows_total - 1, 0, hint, cols);
     if (g_have_color) attroff(COLOR_PAIR(PAIR_BAR));
     else              attroff(A_REVERSE);
@@ -846,8 +846,10 @@ static void usage(FILE *out, const char *argv0)
         "                   come from <session>/satnogs_<id>.meta.json).\n"
         "\n"
         "Options:\n"
-        "  --db=<path>      override default DB path. Default:\n"
-        "                   $SSO_PACKET_DB or\n"
+        "  --db=<path>      override default DB path. Default, in order:\n"
+        "                   $SSO_PACKET_DB, else the shared FrontierSat\n"
+        "                   tree ($FRONTIERSAT_ROOT/packet_db.sqlite,\n"
+        "                   e.g. /FrontierSat/packet_db.sqlite), else\n"
         "                   $HOME/.local/share/simple_sat_ops/packets.db\n"
         "  --help           this message\n",
         argv0);
