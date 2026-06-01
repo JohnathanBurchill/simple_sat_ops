@@ -18,10 +18,14 @@
       └── key hints (bottom reverse-video bar) ────────────────────────┘
 
     Keys:
-      q | Q | Esc      quit
+      q | Q | Esc      quit (in the command group, step back to the list)
       ↑ / ↓            move selection by one row
       PgUp / PgDn      move by a page (list height)
       Home / End       jump to top / bottom
+      Enter            on a tcmd_response, open the command group (all
+                       packets sharing that command's ts_sent, plus the
+                       same-run log/bulk_file packets that follow); Esc /
+                       Left / Backspace step back
       r                reload now (auto-poll happens every ~1 s anyway)
       t                cycle type filter: all → beacon → tcmd_response →
                        log → bulk_file → all
@@ -46,11 +50,15 @@
 */
 
 #include "packet_db.h"
+#include "sso_paths.h"
 
+#include <dirent.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #if !defined(WITH_SQLITE3)
@@ -120,10 +128,34 @@ static const char *const ORIGIN_CYCLE[] = {
 };
 static const int ORIGIN_CYCLE_N = sizeof ORIGIN_CYCLE / sizeof ORIGIN_CYCLE[0];
 
-static row_t   rows[MAX_ROWS];
+// Two backing stores: the main packet list and the command-group
+// sub-view (Enter on a tcmd_response). `rows` points at whichever is
+// active, so every render/scroll path that uses rows[]/n_rows/sel/top
+// works unchanged for both views. The inactive store keeps its rows and
+// payloads alive so returning from the sub-view is instant.
+static row_t   main_rows[MAX_ROWS];
+static row_t   group_rows[MAX_ROWS];
+static row_t  *rows = main_rows;
 static int     n_rows = 0;
 static int     sel    = 0;
 static int     top    = 0;
+
+// Command-group sub-view state. `in_group` is 1 while it's up; the main
+// view's scroll position is parked in main_* and restored on return.
+// group_confirmed_n is how many leading group rows are the ts_sent-exact
+// tcmd_response matches (the rest are the same-run/time heuristic set).
+static int     in_group = 0;
+static int     group_n = 0;
+static int     group_confirmed_n = 0;
+static int     main_n = 0, main_sel = 0, main_top = 0;
+// Big enough to hold the ~512-char resolved command text plus the
+// ts_sent / count framing without format-truncation.
+static char    group_header[768] = "";
+// The 8 raw ts_sent bytes of the command the sub-view is built around,
+// kept so a reload (`r`) can rebuild the same group.
+static uint8_t group_key[8];
+static char    group_run[24] = "";
+static char    group_anchor_ts[40] = "";
 static int     type_idx = 0;
 static int     origin_idx = 0;
 static char    like_text[128] = "";
@@ -273,23 +305,106 @@ static const char *origin_filter(void)
     return ORIGIN_CYCLE[origin_idx];
 }
 
+// The column list every row query selects, in the order fill_row()
+// reads them. Shared by the main filter query and the command-group
+// query so both feed the same row_t loader.
+#define PACKET_SELECT_COLS \
+    "SELECT id, ts_received, satellite, packet_type, packet_type_name, " \
+    "csp_src, csp_dst, csp_dport, csp_sport, csp_prio, csp_flags, " \
+    "payload, golay_errs, rs_errs, hmac_ok, crc_status, " \
+    "source_tool, source_run, audio_offset_s, decoded_summary, " \
+    "capture_origin, az_deg, el_deg, range_km, range_rate_km_s, " \
+    "doppler_hz_offset, session_dir "
+
+// Free the malloc'd payloads of `n` rows in `arr` and zero the pointers,
+// so the array can be reloaded or torn down without leaking.
+static void free_rows(row_t *arr, int n)
+{
+    for (int i = 0; i < n; i++) {
+        free(arr[i].payload);
+        arr[i].payload = NULL;
+        arr[i].payload_len = 0;
+    }
+}
+
+// Fill *r from the current row of `stmt`, which must have selected
+// PACKET_SELECT_COLS. Allocates r->payload (NULL on alloc failure).
+static void fill_row(sqlite3_stmt *stmt, row_t *r)
+{
+    r->id          = sqlite3_column_int64(stmt, 0);
+    const char *ts = (const char *)sqlite3_column_text(stmt, 1);
+    const char *sat= (const char *)sqlite3_column_text(stmt, 2);
+    r->packet_type = sqlite3_column_int(stmt, 3);
+    const char *pn = (const char *)sqlite3_column_text(stmt, 4);
+    r->csp_src     = sqlite3_column_int(stmt, 5);
+    r->csp_dst     = sqlite3_column_int(stmt, 6);
+    r->csp_dport   = sqlite3_column_int(stmt, 7);
+    r->csp_sport   = sqlite3_column_int(stmt, 8);
+    r->csp_prio    = sqlite3_column_int(stmt, 9);
+    r->csp_flags   = sqlite3_column_int(stmt, 10);
+    const uint8_t *pl = sqlite3_column_blob(stmt, 11);
+    int pln           = sqlite3_column_bytes(stmt, 11);
+    r->golay_errs  = sqlite3_column_int(stmt, 12);
+    r->rs_errs     = sqlite3_column_int(stmt, 13);
+    r->hmac_ok     = sqlite3_column_int(stmt, 14);
+    r->crc_status  = sqlite3_column_int(stmt, 15);
+    const char *tl = (const char *)sqlite3_column_text(stmt, 16);
+    const char *rn = (const char *)sqlite3_column_text(stmt, 17);
+    r->has_offset  = sqlite3_column_type(stmt, 18) != SQLITE_NULL;
+    r->audio_offset_s = r->has_offset ? sqlite3_column_double(stmt, 18) : 0.0;
+    const char *sm = (const char *)sqlite3_column_text(stmt, 19);
+    const char *og = (const char *)sqlite3_column_text(stmt, 20);
+
+    r->geom_az_valid         = sqlite3_column_type(stmt, 21) != SQLITE_NULL;
+    r->geom_el_valid         = sqlite3_column_type(stmt, 22) != SQLITE_NULL;
+    r->geom_range_valid      = sqlite3_column_type(stmt, 23) != SQLITE_NULL;
+    r->geom_range_rate_valid = sqlite3_column_type(stmt, 24) != SQLITE_NULL;
+    r->geom_doppler_valid    = sqlite3_column_type(stmt, 25) != SQLITE_NULL;
+    r->geom_az_deg           = r->geom_az_valid         ? sqlite3_column_double(stmt, 21) : 0.0;
+    r->geom_el_deg           = r->geom_el_valid         ? sqlite3_column_double(stmt, 22) : 0.0;
+    r->geom_range_km         = r->geom_range_valid      ? sqlite3_column_double(stmt, 23) : 0.0;
+    r->geom_range_rate_km_s  = r->geom_range_rate_valid ? sqlite3_column_double(stmt, 24) : 0.0;
+    r->geom_doppler_hz       = r->geom_doppler_valid    ? sqlite3_column_double(stmt, 25) : 0.0;
+    r->has_geom = r->geom_az_valid || r->geom_el_valid
+               || r->geom_range_valid || r->geom_range_rate_valid
+               || r->geom_doppler_valid;
+    const char *sd = (const char *)sqlite3_column_text(stmt, 26);
+    snprintf(r->session_dir, sizeof r->session_dir, "%s", sd ? sd : "");
+
+    snprintf(r->ts,        sizeof r->ts,        "%s", ts ? ts : "");
+    snprintf(r->satellite, sizeof r->satellite, "%s", sat ? sat : "");
+    snprintf(r->type_name, sizeof r->type_name, "%s", pn ? pn : "");
+    snprintf(r->tool,      sizeof r->tool,      "%s", tl ? tl : "");
+    snprintf(r->run,       sizeof r->run,       "%s", rn ? rn : "");
+    snprintf(r->summary,   sizeof r->summary,   "%s", sm ? sm : "");
+    snprintf(r->origin,    sizeof r->origin,    "%s", og ? og : "");
+
+    // Store the FULL payload so the detail view can show all of it.
+    r->payload     = NULL;
+    r->payload_len = 0;
+    if (pln > 0 && pl != NULL) {
+        r->payload = (uint8_t *) malloc((size_t)pln);
+        if (r->payload != NULL) {
+            memcpy(r->payload, pl, (size_t)pln);
+            r->payload_len = pln;
+        }
+    }
+}
+
 // Run the current filter against the DB and refresh `rows` / `n_rows`.
 // Selection (`sel`) is preserved by row id where possible — feeling
 // like the row "stays in place" across reloads is more important than
 // always landing on the freshest packet. If the previously-selected id
-// is gone, fall back to position 0.
+// is gone, fall back to position 0. Only ever called for the main view
+// (the command-group sub-view has its own loader), so `rows` is
+// main_rows here.
 static void run_query(sqlite3 *db)
 {
     sqlite3_int64 prev_id = (n_rows > 0) ? rows[sel].id : -1;
 
     char sql[1024];
     int off = snprintf(sql, sizeof sql,
-        "SELECT id, ts_received, satellite, packet_type, packet_type_name, "
-        "csp_src, csp_dst, csp_dport, csp_sport, csp_prio, csp_flags, "
-        "payload, golay_errs, rs_errs, hmac_ok, crc_status, "
-        "source_tool, source_run, audio_offset_s, decoded_summary, "
-        "capture_origin, az_deg, el_deg, range_km, range_rate_km_s, "
-        "doppler_hz_offset, session_dir "
+        PACKET_SELECT_COLS
         "FROM packet WHERE 1=1");
     int n_params = 0;
     const char *param_text[4] = {0};
@@ -325,78 +440,16 @@ static void run_query(sqlite3 *db)
 
     // Free payloads from the previous load (the rows array is reused
     // across reloads) so re-querying doesn't leak.
-    for (int i = 0; i < n_rows; i++) {
-        free(rows[i].payload);
-        rows[i].payload = NULL;
-        rows[i].payload_len = 0;
-    }
+    free_rows(rows, n_rows);
 
     int new_n = 0;
     while (new_n < MAX_ROWS && sqlite3_step(stmt) == SQLITE_ROW) {
-        row_t *r = &rows[new_n];
-        r->id          = sqlite3_column_int64(stmt, 0);
-        const char *ts = (const char *)sqlite3_column_text(stmt, 1);
-        const char *sat= (const char *)sqlite3_column_text(stmt, 2);
-        r->packet_type = sqlite3_column_int(stmt, 3);
-        const char *pn = (const char *)sqlite3_column_text(stmt, 4);
-        r->csp_src     = sqlite3_column_int(stmt, 5);
-        r->csp_dst     = sqlite3_column_int(stmt, 6);
-        r->csp_dport   = sqlite3_column_int(stmt, 7);
-        r->csp_sport   = sqlite3_column_int(stmt, 8);
-        r->csp_prio    = sqlite3_column_int(stmt, 9);
-        r->csp_flags   = sqlite3_column_int(stmt, 10);
-        const uint8_t *pl = sqlite3_column_blob(stmt, 11);
-        int pln           = sqlite3_column_bytes(stmt, 11);
-        r->golay_errs  = sqlite3_column_int(stmt, 12);
-        r->rs_errs     = sqlite3_column_int(stmt, 13);
-        r->hmac_ok     = sqlite3_column_int(stmt, 14);
-        r->crc_status  = sqlite3_column_int(stmt, 15);
-        const char *tl = (const char *)sqlite3_column_text(stmt, 16);
-        const char *rn = (const char *)sqlite3_column_text(stmt, 17);
-        r->has_offset  = sqlite3_column_type(stmt, 18) != SQLITE_NULL;
-        r->audio_offset_s = r->has_offset ? sqlite3_column_double(stmt, 18) : 0.0;
-        const char *sm = (const char *)sqlite3_column_text(stmt, 19);
-        const char *og = (const char *)sqlite3_column_text(stmt, 20);
-
-        r->geom_az_valid         = sqlite3_column_type(stmt, 21) != SQLITE_NULL;
-        r->geom_el_valid         = sqlite3_column_type(stmt, 22) != SQLITE_NULL;
-        r->geom_range_valid      = sqlite3_column_type(stmt, 23) != SQLITE_NULL;
-        r->geom_range_rate_valid = sqlite3_column_type(stmt, 24) != SQLITE_NULL;
-        r->geom_doppler_valid    = sqlite3_column_type(stmt, 25) != SQLITE_NULL;
-        r->geom_az_deg           = r->geom_az_valid         ? sqlite3_column_double(stmt, 21) : 0.0;
-        r->geom_el_deg           = r->geom_el_valid         ? sqlite3_column_double(stmt, 22) : 0.0;
-        r->geom_range_km         = r->geom_range_valid      ? sqlite3_column_double(stmt, 23) : 0.0;
-        r->geom_range_rate_km_s  = r->geom_range_rate_valid ? sqlite3_column_double(stmt, 24) : 0.0;
-        r->geom_doppler_hz       = r->geom_doppler_valid    ? sqlite3_column_double(stmt, 25) : 0.0;
-        r->has_geom = r->geom_az_valid || r->geom_el_valid
-                   || r->geom_range_valid || r->geom_range_rate_valid
-                   || r->geom_doppler_valid;
-        const char *sd = (const char *)sqlite3_column_text(stmt, 26);
-        snprintf(r->session_dir, sizeof r->session_dir, "%s", sd ? sd : "");
-
-        snprintf(r->ts,        sizeof r->ts,        "%s", ts ? ts : "");
-        snprintf(r->satellite, sizeof r->satellite, "%s", sat ? sat : "");
-        snprintf(r->type_name, sizeof r->type_name, "%s", pn ? pn : "");
-        snprintf(r->tool,      sizeof r->tool,      "%s", tl ? tl : "");
-        snprintf(r->run,       sizeof r->run,       "%s", rn ? rn : "");
-        snprintf(r->summary,   sizeof r->summary,   "%s", sm ? sm : "");
-        snprintf(r->origin,    sizeof r->origin,    "%s", og ? og : "");
-
-        // Store the FULL payload so the detail view can show all of it.
-        r->payload     = NULL;
-        r->payload_len = 0;
-        if (pln > 0 && pl != NULL) {
-            r->payload = (uint8_t *) malloc((size_t)pln);
-            if (r->payload != NULL) {
-                memcpy(r->payload, pl, (size_t)pln);
-                r->payload_len = pln;
-            }
-        }
-
+        fill_row(stmt, &rows[new_n]);
         new_n++;
     }
     sqlite3_finalize(stmt);
     n_rows = new_n;
+    main_n = new_n;  // keep the main count current for the sub-view save/restore
 
     // Re-seat the selection on the same id when possible.
     sel = 0;
@@ -407,6 +460,245 @@ static void run_query(sqlite3 *db)
     }
     if (sel < 0) sel = 0;
     if (sel >= n_rows) sel = n_rows > 0 ? n_rows - 1 : 0;
+}
+
+// ---- Command-group sub-view (Enter on a tcmd_response) -----------------
+
+// How long after a command's first response a same-run log / bulk_file
+// packet is still considered "possibly part of this command". A generous
+// window: the satellite streams a download right after the command, but
+// the firmware doesn't tag those packets with the command's ts_sent, so
+// this is a heuristic, not a guarantee.
+#define GROUP_WINDOW_S 600
+
+// A tcmd_response payload is [type:1][ts_sent:8 LE][...]. Decode the
+// little-endian ts_sent (unix-ms). Returns 1 and writes *out_ms on
+// success, 0 if the row isn't a tcmd_response with enough bytes.
+static int row_ts_sent(const row_t *r, uint64_t *out_ms)
+{
+    if (r == NULL || r->payload == NULL || r->payload_len < 9) return 0;
+    if (r->packet_type != 0x04) return 0;
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++)
+        v |= (uint64_t)r->payload[1 + i] << (8 * i);
+    *out_ms = v;
+    return 1;
+}
+
+// Format a unix-ms instant as "YYYY-MM-DDTHH:MM:SSZ" (UTC, second
+// resolution). Used for the group header and the heuristic time window.
+static void fmt_epoch_ms(uint64_t ms, char *out, size_t outn)
+{
+    time_t t = (time_t)(ms / 1000);
+    struct tm tm;
+    if (gmtime_r(&t, &tm) == NULL) { snprintf(out, outn, "?"); return; }
+    strftime(out, outn, "%Y-%m-%dT%H:%M:%SZ", &tm);
+}
+
+// Search the agenda files under the data root for "@tssent=<ms>" and
+// copy the first matching line into `out`. Best-effort fallback used
+// when the sent_tcmd table has no row (e.g. a command sent before the
+// table existed). Bounded: only files whose name contains "agenda",
+// a capped number of files, capped read size. Returns 1 on a hit.
+static int scan_agenda_dir(const char *dir, const char *needle,
+                           char *out, size_t outn, int depth, int *budget)
+{
+    if (depth > 4 || *budget <= 0) return 0;
+    DIR *d = opendir(dir);
+    if (d == NULL) return 0;
+    struct dirent *de;
+    int found = 0;
+    while (!found && (de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char path[1024];
+        if ((size_t)snprintf(path, sizeof path, "%s/%s", dir, de->d_name)
+            >= sizeof path) continue;
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            found = scan_agenda_dir(path, needle, out, outn, depth + 1, budget);
+            continue;
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+        if (strstr(de->d_name, "agenda") == NULL) continue;
+        if (--(*budget) < 0) break;
+        FILE *f = fopen(path, "rb");
+        if (f == NULL) continue;
+        char line[2048];
+        while (fgets(line, sizeof line, f) != NULL) {
+            if (strstr(line, needle) == NULL) continue;
+            line[strcspn(line, "\r\n")] = '\0';
+            const char *s = line;
+            while (*s == ' ' || *s == '\t') s++;
+            snprintf(out, outn, "%s", s);
+            found = 1;
+            break;
+        }
+        fclose(f);
+    }
+    closedir(d);
+    return found;
+}
+
+// Resolve the command (and arguments) that produced ts_sent_ms into
+// `out`. Prefers the sent_tcmd table (exact, recorded at transmit), then
+// falls back to scanning agenda files on disk, then "(command unknown)".
+static void resolve_command_text(sqlite3 *db, uint64_t ts_sent_ms,
+                                 char *out, size_t outn)
+{
+    out[0] = '\0';
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT command_text FROM sent_tcmd WHERE ts_sent_ms=?1 LIMIT 1",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)ts_sent_ms);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *txt = (const char *)sqlite3_column_text(st, 0);
+            if (txt != NULL && txt[0] != '\0') snprintf(out, outn, "%s", txt);
+        }
+        sqlite3_finalize(st);
+    }
+    if (out[0] != '\0') return;
+
+    char needle[40];
+    snprintf(needle, sizeof needle, "@tssent=%" PRIu64, ts_sent_ms);
+    int budget = 200;
+    if (scan_agenda_dir(sso_frontiersat_root(), needle, out, outn, 0, &budget))
+        return;
+    snprintf(out, outn, "(command unknown)");
+}
+
+// Append rows returned by `sql` (bound via the bind callback's params)
+// into group_rows starting at group_n. Helper to keep run_group_query
+// readable. Returns the number of rows appended.
+static int group_append(sqlite3 *db, const char *sql,
+                        void (*bind)(sqlite3_stmt *, void *), void *ctx)
+{
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return 0;
+    if (bind) bind(stmt, ctx);
+    int added = 0;
+    while (group_n < MAX_ROWS && sqlite3_step(stmt) == SQLITE_ROW) {
+        fill_row(stmt, &group_rows[group_n]);
+        group_n++;
+        added++;
+    }
+    sqlite3_finalize(stmt);
+    return added;
+}
+
+static void bind_group_confirmed(sqlite3_stmt *stmt, void *ctx)
+{
+    (void)ctx;
+    // The 8 raw ts_sent bytes match the BLOB slice substr(payload,2,8).
+    sqlite3_bind_blob(stmt, 1, group_key, 8, SQLITE_TRANSIENT);
+}
+
+static void bind_group_related(sqlite3_stmt *stmt, void *ctx)
+{
+    char *hi = ctx;
+    sqlite3_bind_text(stmt, 1, group_run,        -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, group_anchor_ts,  -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, hi,               -1, SQLITE_TRANSIENT);
+}
+
+// Build the command-group sub-view into group_rows from the saved
+// group_key (8 ts_sent bytes) and group_run: first the ts_sent-exact
+// tcmd_response packets (ordered by response seq then time), then the
+// same-run log / bulk_file packets in the time window after the command
+// (the heuristic set). Main-view filters are ignored. Rebuildable on
+// reload because it reads only the saved key/run, not a live row.
+static void build_group(sqlite3 *db)
+{
+    free_rows(group_rows, group_n);
+    group_n = 0;
+    group_confirmed_n = 0;
+
+    uint64_t ts_ms = 0;
+    for (int i = 0; i < 8; i++) ts_ms |= (uint64_t)group_key[i] << (8 * i);
+
+    // Confirmed: every tcmd_response sharing this exact ts_sent, in
+    // response-sequence order (substr(payload,13,1) is response_seq_num),
+    // then by arrival time.
+    group_append(db,
+        PACKET_SELECT_COLS
+        "FROM packet WHERE packet_type=4 AND substr(payload,2,8)=?1 "
+        "ORDER BY substr(payload,13,1), ts_received",
+        bind_group_confirmed, NULL);
+    group_confirmed_n = group_n;
+
+    // Anchor the heuristic window at the earliest confirmed packet.
+    // Entering from a real response guarantees at least one confirmed row.
+    group_anchor_ts[0] = '\0';
+    if (group_confirmed_n > 0)
+        snprintf(group_anchor_ts, sizeof group_anchor_ts, "%s",
+                 group_rows[0].ts);
+    char hi[40];
+    {
+        int yr, mo, dd, hh, mm, ss;
+        if (sscanf(group_anchor_ts, "%4d-%2d-%2dT%2d:%2d:%2d",
+                   &yr, &mo, &dd, &hh, &mm, &ss) == 6) {
+            struct tm tm = {0};
+            tm.tm_year = yr - 1900; tm.tm_mon = mo - 1; tm.tm_mday = dd;
+            tm.tm_hour = hh; tm.tm_min = mm; tm.tm_sec = ss;
+            time_t t = timegm(&tm) + GROUP_WINDOW_S;
+            struct tm up;
+            gmtime_r(&t, &up);
+            strftime(hi, sizeof hi, "%Y-%m-%dT%H:%M:%SZ", &up);
+        } else {
+            snprintf(hi, sizeof hi, "9999");  // no parse -> unbounded upper
+        }
+    }
+
+    // Possibly related: log (3) + bulk_file (16) from the same run within
+    // the window. The firmware doesn't tag these with the command, so
+    // this is a time/run heuristic, flagged as such in the header.
+    if (group_run[0] != '\0' && group_anchor_ts[0] != '\0') {
+        group_append(db,
+            PACKET_SELECT_COLS
+            "FROM packet WHERE packet_type IN (3,16) AND source_run=?1 "
+            "AND ts_received >= ?2 AND ts_received <= ?3 "
+            "ORDER BY ts_received",
+            bind_group_related, hi);
+    }
+
+    // Header: ts_sent (raw + humanized) + resolved command + section
+    // counts. Shown in the top bar while the sub-view is up.
+    char human[40];
+    fmt_epoch_ms(ts_ms, human, sizeof human);
+    char cmd_text[512];
+    resolve_command_text(db, ts_ms, cmd_text, sizeof cmd_text);
+    int related = group_n - group_confirmed_n;
+    snprintf(group_header, sizeof group_header,
+             "cmd ts_sent=%" PRIu64 " (%s)  %s  | %d response%s, "
+             "%d related (same run, <=%dm, unconfirmed)",
+             ts_ms, human, cmd_text,
+             group_confirmed_n, group_confirmed_n == 1 ? "" : "s",
+             related, GROUP_WINDOW_S / 60);
+}
+
+// Enter the command-group sub-view for the currently-selected row (must
+// be a tcmd_response). Parks the main view's scroll position.
+static void enter_group(sqlite3 *db)
+{
+    uint64_t ts_ms = 0;
+    if (!row_ts_sent(&rows[sel], &ts_ms)) return;  // not a decodable response
+    // Save the join key + run from the selected response, then build the
+    // group from those alone (so a reload doesn't depend on a live row).
+    for (int i = 0; i < 8; i++) group_key[i] = rows[sel].payload[1 + i];
+    snprintf(group_run, sizeof group_run, "%s", rows[sel].run);
+    main_sel = sel; main_top = top; main_n = n_rows;
+    build_group(db);
+    rows = group_rows; n_rows = group_n; sel = 0; top = 0; in_group = 1;
+}
+
+// Return from the sub-view to the main list, restoring its scroll.
+static void leave_group(void)
+{
+    free_rows(group_rows, group_n);
+    group_n = 0;
+    rows = main_rows; n_rows = main_n; sel = main_sel; top = main_top;
+    in_group = 0;
 }
 
 // Render a stored ISO-8601 UTC timestamp into the user's chosen
@@ -506,12 +798,16 @@ static void draw_top_bar(int cols)
     else              attron(A_REVERSE);
     move(0, 0);
     for (int i = 0; i < cols; i++) addch(' ');
-    char buf[256];
-    snprintf(buf, sizeof buf,
-             " packet_browser  filter: type=%-13s origin=%-10s  search=\"%s\"  | %d row%s",
-             type_filter() ? type_filter() : "all",
-             origin_filter() ? origin_filter() : "all",
-             like_text, n_rows, n_rows == 1 ? "" : "s");
+    char buf[820];
+    if (in_group) {
+        snprintf(buf, sizeof buf, " packet_browser  %s", group_header);
+    } else {
+        snprintf(buf, sizeof buf,
+                 " packet_browser  filter: type=%-13s origin=%-10s  search=\"%s\"  | %d row%s",
+                 type_filter() ? type_filter() : "all",
+                 origin_filter() ? origin_filter() : "all",
+                 like_text, n_rows, n_rows == 1 ? "" : "s");
+    }
     mvaddnstr(0, 0, buf, cols);
     if (g_have_color) attroff(COLOR_PAIR(PAIR_BAR));
     else              attroff(A_REVERSE);
@@ -519,14 +815,17 @@ static void draw_top_bar(int cols)
 
 static void draw_list(int list_top, int list_h, int cols)
 {
-    // Header line for column meaning.
+    // Header line for column meaning. In the command-group sub-view it
+    // also names the section ordering so the two parts read clearly.
     if (g_have_color) attron(A_DIM);
     char header[256];
     snprintf(header, sizeof header,
              "%6s  %-30s  %-13s  %-10s  %-13s  %-9s  %s",
              "#",
              show_local_time ? "TIMESTAMP (LOCAL)" : "TIMESTAMP (UTC)",
-             "TOOL", "ORIGIN", "TYPE", "SATELLITE", "SUMMARY");
+             "TOOL", "ORIGIN", "TYPE", "SATELLITE",
+             in_group ? "SUMMARY  (responses first, then same-run/time-window)"
+                      : "SUMMARY");
     mvaddnstr(list_top, 0, header, cols);
     if (g_have_color) attroff(A_DIM);
 
@@ -759,12 +1058,17 @@ static void draw_bottom_bar(int cols, int rows_total, int searching)
     else              attron(A_REVERSE);
     move(rows_total - 1, 0);
     for (int i = 0; i < cols; i++) addch(' ');
-    const char *hint = searching
-        ? " enter accept   esc cancel   backspace edits "
-        // ASCII only — narrow ncurses' mvaddnstr counts bytes while
-        // the terminal renders columns, so multi-byte chars cause
-        // stale tail content on the next render.
-        : " q quit   up/down scroll   t type   o origin   / search   l utc/lt   r reload ";
+    // ASCII only — narrow ncurses' mvaddnstr counts bytes while the
+    // terminal renders columns, so multi-byte chars cause stale tail
+    // content on the next render.
+    const char *hint;
+    if (searching) {
+        hint = " enter accept   esc cancel   backspace edits ";
+    } else if (in_group) {
+        hint = " esc/left/bksp back   up/down scroll   r reload   l utc/lt   q quit ";
+    } else {
+        hint = " q quit   up/down scroll   enter group   t type   o origin   / search   l utc/lt   r reload ";
+    }
     mvaddnstr(rows_total - 1, 0, hint, cols);
     if (g_have_color) attroff(COLOR_PAIR(PAIR_BAR));
     else              attroff(A_REVERSE);
@@ -831,9 +1135,15 @@ static void usage(FILE *out, const char *argv0)
         "alongside a live receiver that's filling the same DB.\n"
         "\n"
         "Keys:\n"
-        "  q | Q | Esc      quit\n"
+        "  q | Q | Esc      quit (in the command group, step back to the list)\n"
         "  arrows / PgUp / PgDn / Home / End   scroll the list\n"
-        "  r                reload the list now\n"
+        "  Enter            on a tcmd_response, open the command group: every\n"
+        "                   packet sharing that command's ts_sent (its ack +\n"
+        "                   responses), then same-run log/bulk_file packets in\n"
+        "                   the following window (a time heuristic, not\n"
+        "                   firmware-confirmed). Filters are ignored in the\n"
+        "                   group. Esc / Left / Backspace step back.\n"
+        "  r                reload (rebuilds the group when one is open)\n"
         "  t                cycle type filter (all → beacon → tcmd_response\n"
         "                   → log → bulk_file → all)\n"
         "  o                cycle capture-origin filter (all → cts_ground\n"
@@ -951,8 +1261,22 @@ int main(int argc, char **argv)
         int ch = getch();
         if (ch != ERR) {
             switch (ch) {
-            case 'q': case 'Q': case 27:
-                quit = 1; break;
+            case 'q': case 'Q':
+                // In the sub-view, q steps back to the main list; in the
+                // main list it quits (Esc/Left/Backspace also step back).
+                if (in_group) leave_group(); else quit = 1;
+                break;
+            case 27: case KEY_LEFT: case KEY_BACKSPACE: case 127: case 8:
+            case 'h':
+                if (in_group) leave_group();
+                else if (ch == 27) quit = 1;
+                break;
+            case '\n': case '\r': case KEY_ENTER: case KEY_RIGHT:
+                // Enter / Right: open the command-group sub-view for the
+                // selected tcmd_response (no-op on other rows or when a
+                // sub-view is already open).
+                if (!in_group) enter_group(db);
+                break;
             case KEY_UP:   case 'k': if (sel > 0) sel--; break;
             case KEY_DOWN: case 'j': if (sel < n_rows - 1) sel++; break;
             case KEY_PPAGE:
@@ -1029,15 +1353,21 @@ int main(int argc, char **argv)
                 break;
             }
             case 'r': case 'R': case 18: // Ctrl-R
-                run_query(db);
-                last_query = monotonic_seconds();
+                // Reload: rebuild the group in the sub-view, else re-run
+                // the main filter query.
+                if (in_group) build_group(db);
+                else { run_query(db); last_query = monotonic_seconds(); }
                 break;
             case 't':
+                // Filter cycles only apply to the main list — the
+                // sub-view deliberately ignores filters.
+                if (in_group) break;
                 type_idx = (type_idx + 1) % TYPE_CYCLE_N;
                 run_query(db);
                 last_query = monotonic_seconds();
                 break;
             case 'o': case 'O':
+                if (in_group) break;
                 origin_idx = (origin_idx + 1) % ORIGIN_CYCLE_N;
                 run_query(db);
                 last_query = monotonic_seconds();
@@ -1056,6 +1386,7 @@ int main(int argc, char **argv)
                 break;
             }
             case '/':
+                if (in_group) break;  // search applies to the main list only
                 if (prompt_search(rows_total, cols)) {
                     run_query(db);
                     last_query = monotonic_seconds();
@@ -1070,16 +1401,22 @@ int main(int argc, char **argv)
 
         // 1 Hz auto-poll so live decodes from a running receiver appear
         // without manual reload. The dedup in the DB means we always
-        // see the same rows in the same order.
+        // see the same rows in the same order. Suspended while the
+        // command-group sub-view is up so it doesn't clobber group_rows
+        // (and so the parked main view stays put for an instant return).
         double now = monotonic_seconds();
-        if (now - last_query >= 1.0) {
+        if (!in_group && now - last_query >= 1.0) {
             run_query(db);
             last_query = now;
         }
     }
 
     endwin();
-    for (int i = 0; i < n_rows; i++) free(rows[i].payload);
+    // Free both backing stores. While the sub-view is up the main store
+    // still holds its parked rows; in the main view group_rows was freed
+    // on the last leave_group (group_n == 0). free(NULL) is safe either way.
+    free_rows(main_rows, in_group ? main_n : n_rows);
+    free_rows(group_rows, group_n);
     sqlite3_close(db);
     return 0;
 }
