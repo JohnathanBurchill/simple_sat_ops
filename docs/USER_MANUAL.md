@@ -1480,6 +1480,37 @@ stops at that end marker, so trailing framing/parity bytes don't show up
 as a garbage tail after the message. The raw byte dump still shows
 everything.
 
+**Command groups (Enter on a `tcmd_response`).** Each `tcmd_response`
+carries the originating command's `@tssent` value (`ts_sent`, a unix-ms
+integer) - the satellite echoes back exactly the `@tssent` it received.
+Press `Enter` on a `tcmd_response` row to open a command-group sub-view
+built around that `ts_sent`:
+
+* First, every `tcmd_response` packet sharing that `ts_sent`, in
+  response-sequence order - the command's acknowledgement, execution
+  status, and any multi-packet text result, grouped together.
+* Then, the `log` and `bulk_file` packets from the *same capture run*
+  received in the window just after the command (10 minutes). This second
+  section is a **time heuristic, not a firmware guarantee**: the flight
+  firmware (rc3) does not stamp `bulk_file`/`log` packets with the
+  command's `ts_sent`, so a download's file chunks are matched by run and
+  timing, not by a confirmed link. The header labels the two counts
+  ("N responses, M related (...unconfirmed)").
+
+The main-list type/origin/search filters are ignored inside the group, so
+you always see the whole lifecycle regardless of the filter you were
+browsing under. `Esc` / `Left` / `Backspace` step back to the list; `r`
+rebuilds the group.
+
+The header also resolves the command **text and arguments** for that
+`ts_sent`. It prefers the `sent_tcmd` table - `simple_sat_ops` records
+every telecommand it transmits that carries an `@tssent` (auto-telecommand
+agenda runs) into that table at transmit time. If there is no row (e.g. a
+command sent before the table existed), it falls back to scanning the
+agenda files under the data root for `@tssent=<value>`, and otherwise
+shows `(command unknown)`. Manually-composed commands carry no `@tssent`
+and so are not recorded or resolved.
+
 ```sh
 packet_query --satellite=FrontierSat --since=1h --format=json
 packet_browser
@@ -1728,7 +1759,7 @@ values are not disturbed).
 | `~/.local/share/simple_sat_ops/rotator_az_rate_dps` | Calibrated rotator azimuth slew rate (deg/s). |
 | `~/.local/share/simple_sat_ops/rotator_el_rate_dps` | Calibrated rotator elevation slew rate (deg/s). |
 | `~/.local/share/simple_sat_ops/carrier-trim-hz` | Per-host carrier-trim offset that lands the B210's analog LO on the requested frequency. |
-| `/FrontierSat/packet_db.sqlite` | Shared SQLite packet database (under `$FRONTIERSAT_ROOT` when set). Override the path with `$SSO_PACKET_DB` or `--db=`. |
+| `/FrontierSat/packet_db.sqlite` | Shared SQLite packet database: received packets plus a `sent_tcmd` table of transmitted telecommands (keyed by `@tssent` for response correlation). Under `$FRONTIERSAT_ROOT` when set; override the path with `$SSO_PACKET_DB` or `--db=`. |
 | `~/.local/share/simple_sat_ops/runs.log` | Audit log (dev-host fallback when `/var/log/sso/` isn't writable). |
 | `/run/sso/simple_sat_ops.sock` | Operator IPC socket. |
 | `/run/sso/simple_sat_ops.pid` | Operator PID. |
