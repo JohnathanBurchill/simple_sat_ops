@@ -169,8 +169,13 @@ static int import_tree(packet_db_t *db, const char *dir, const char *tool,
         char path[1024];
         if ((size_t) snprintf(path, sizeof path, "%s/%s", dir, de->d_name)
             >= sizeof path) continue;
+        // lstat (not stat) so symlinks aren't followed: Operations/current
+        // points at the active pass folder, which is reached on its own
+        // anyway -- following it would import that pass's tx.log twice,
+        // once under source_run "current" and once under its real name.
         struct stat st;
-        if (stat(path, &st) != 0) continue;
+        if (lstat(path, &st) != 0) continue;
+        if (S_ISLNK(st.st_mode)) continue;
         if (S_ISDIR(st.st_mode))
             total += import_tree(db, path, tool, depth + 1);
         else if (S_ISREG(st.st_mode) && strcmp(de->d_name, "tx.log") == 0)
