@@ -480,6 +480,22 @@ if (OPENSSL_FOUND)
         target_link_packet_db(packet_browser)
         target_link_sso_core(packet_browser)
         list(APPEND SSO_TARGETS packet_browser)
+
+        # Command explorer over the sent_tcmd table (mirror of
+        # packet_browser). Links beacon_cts1 for tcmd_response decoding.
+        add_executable(tcmd_browser utils/tcmd_browser.c
+                       src/beacon/beacon_cts1.c)
+        target_compile_definitions(tcmd_browser PRIVATE
+            TCMD_BROWSER_HAVE_NCURSES)
+        target_include_directories(tcmd_browser PRIVATE
+            ${OPENSSL_INCLUDE_DIRS} ${NCURSES_INCLUDE_DIRS})
+        target_link_directories(tcmd_browser PRIVATE
+            ${OPENSSL_LIBRARY_DIRS} ${NCURSES_LIBRARY_DIRS})
+        target_link_libraries(tcmd_browser PRIVATE
+            ${OPENSSL_LIBRARIES} ${NCURSES_LIBRARIES} m)
+        target_link_packet_db(tcmd_browser)
+        target_link_sso_core(tcmd_browser)
+        list(APPEND SSO_TARGETS tcmd_browser)
     endif()
 
     # Offline sliding-window decoder for WAV / raw S16_LE files.

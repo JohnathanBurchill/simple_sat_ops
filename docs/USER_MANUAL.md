@@ -578,7 +578,7 @@ Which targets actually build depends on what the host has:
 | Dependency | Targets it unlocks |
 |------------|---------------------|
 | always | `radio_ctl`, `rs_selftest`, `fm_preview`, `agenda_check` |
-| OpenSSL / libcrypto | `uplink_test`, `rx_decode`, `packet_query`, `packet_browser`, `tcmd_import` |
+| OpenSSL / libcrypto | `uplink_test`, `rx_decode`, `packet_query`, `packet_browser`, `tcmd_browser`, `tcmd_import` |
 | SGP4SDP4 | `next_in_queue`, `lifetime`, `prediction_selftest`, `pursuit_selftest` |
 | UHD (B210) | `b210_rx_capture`, `b210_gain_sweep`, `tx_frame_sdr`, `sdr_probe` |
 | librtlsdr | RTL-SDR RX-only backend in `simple_sat_ops` (on by default; auto-disables if absent) |
@@ -1524,6 +1524,23 @@ are ignored.
 tcmd_import                              # scan <root>/Operations recursively
 tcmd_import /FrontierSat/Operations      # an explicit tree
 tcmd_import --db=/tmp/test.sqlite path/to/tx.log
+```
+
+**Command explorer (`tcmd_browser`).** The mirror of `packet_browser`,
+over the `sent_tcmd` table: an ncurses TUI listing the telecommands that
+were transmitted, newest first, with the count of responses the satellite
+returned for each (a `?` marks commands with no response yet). The detail
+pane shows the full command text, `ts_sent`, `tsexec`, frequency, gain,
+and source run. `Enter` opens the command's responses - the
+`tcmd_response` packets sharing its `ts_sent`, in sequence order, with the
+response code and text. `/` searches the command text, `l` toggles
+UTC/local time, `Esc` / `Left` step back from the responses view. So the
+two browsers meet in the middle: from a response, `packet_browser`'s
+`Enter` finds the command; from a command, `tcmd_browser`'s `Enter` finds
+the responses.
+
+```sh
+tcmd_browser
 ```
 
 ```sh
