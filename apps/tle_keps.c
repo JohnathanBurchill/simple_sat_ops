@@ -139,7 +139,10 @@ static int read_all_tles(const char *path, kep_t **out, int *count)
             cap = ncap;
         }
         memset(&arr[n], 0, sizeof arr[n]);
-        snprintf(arr[n].tle.sat_name, sizeof arr[n].tle.sat_name, "%s", nm);
+        // Clamp the name to the element struct's field (a long name line
+        // would otherwise be a truncating copy from the read buffer).
+        snprintf(arr[n].tle.sat_name, sizeof arr[n].tle.sat_name, "%.*s",
+                 (int) (sizeof arr[n].tle.sat_name - 1), nm);
         Convert_Satellite_Data(set, &arr[n].tle);
         n++;
     }
@@ -182,7 +185,8 @@ static int newest_dated_tle(char *out, size_t cap)
         struct stat st;
         if (stat(sub, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
         if (strcmp(e->d_name, latest) > 0)
-            snprintf(latest, sizeof latest, "%s", e->d_name);
+            snprintf(latest, sizeof latest, "%.*s",
+                     (int) (sizeof latest - 1), e->d_name);
     }
     closedir(d);
 
