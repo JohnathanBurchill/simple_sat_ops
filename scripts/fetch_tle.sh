@@ -20,9 +20,14 @@
 # server wants. To target a different tree (a dev host), export
 # FRONTIERSAT_ROOT in the crontab line or the script's environment.
 #
+# CelesTrak's name line is upper-case ("FRONTIERSAT"); simple_sat_ops
+# matches the satellite by a case-sensitive name prefix and expects
+# "FrontierSat", so the name line is rewritten to SAT_NAME on the way out.
+#
 # Knobs (environment overrides):
-#   CATNR=<n>     NORAD catalog number to fetch (default 69015, FrontierSat)
-#   USE_UTC=1     date the path/file in UTC instead of server-local time
+#   CATNR=<n>       NORAD catalog number to fetch (default 69015, FrontierSat)
+#   SAT_NAME=<str>  name line written into the file (default FrontierSat)
+#   USE_UTC=1       date the path/file in UTC instead of server-local time
 #
 # Safe to run more than once a day: it just refreshes that day's file.
 # A failed or malformed download never overwrites an existing good file —
@@ -32,6 +37,7 @@
 set -euo pipefail
 
 CATNR="${CATNR:-69015}"
+SAT_NAME="${SAT_NAME:-FrontierSat}"
 ROOT="${FRONTIERSAT_ROOT:-/FrontierSat}"
 URL="https://celestrak.org/NORAD/elements/gp.php?CATNR=${CATNR}&FORMAT=TLE"
 
@@ -50,7 +56,7 @@ log() { printf '%s fetch_tle: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*"; }
 # is atomic, so a reader never sees a half-written TLE.
 mkdir -p "$DEST_DIR"
 work="$(mktemp "${DEST_DIR}/.tle-${CATNR}.XXXXXX")"
-trap 'rm -f "$work" "$work".lf' EXIT
+trap 'rm -f "$work" "$work".lf "$work".named' EXIT
 
 log "fetching catalog ${CATNR} from CelesTrak"
 if ! curl --fail --silent --show-error --location \
@@ -73,7 +79,17 @@ if ! grep -q "^1 ${CATNR}" "$work" || ! grep -q "^2 ${CATNR}" "$work"; then
     exit 1
 fi
 
+# Rewrite the name line: keep CelesTrak's two element lines, but replace
+# its upper-case "FRONTIERSAT" with SAT_NAME so simple_sat_ops's
+# case-sensitive name match finds it.
+{ printf '%s\n' "$SAT_NAME"; grep -E "^[12] ${CATNR}" "$work"; } > "$work".named
+mv -f "$work".named "$work"
+
+# Publish with the permissions a normally-created file would get under
+# the active umask (mktemp leaves the temp a private 0600). A cron
+# `umask 0002` then yields a group-writable 0664 — matching the rest of
+# /FrontierSat — while an interactive run with the usual 0022 yields 0644.
+chmod "$(printf '%03o' "$(( 0666 & ~0$(umask) ))")" "$work"
 mv -f "$work" "$DEST"
-chmod 0644 "$DEST"
 log "wrote ${DEST}"
 sed 's/^/    /' "$DEST"
