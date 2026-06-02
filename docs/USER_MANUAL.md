@@ -123,6 +123,8 @@ manual can go back on the shelf where it belongs.
     - [`beacon_detect`](#beacon_detect)
     - [`fm_preview`](#fm_preview)
     - [`packet_query` and `packet_browser`](#packet_query-and-packet_browser)
+    - [`tcmd_import`](#tcmd_import)
+    - [`tcmd_browser`](#tcmd_browser)
 12. [Bring-up and test tools](#bring-up-and-test-tools)
     - [`tx_frame_sdr`](#tx_frame_sdr)
     - [`b210_rx_capture` and `b210_gain_sweep`](#b210_rx_capture-and-b210_gain_sweep)
@@ -734,6 +736,15 @@ review it, or take apart what it recorded.
 | Bench bring-up, one-shot test transmits, IQ recording | [Bring-up and test tools](#bring-up-and-test-tools) |
 | Confirm the math still holds after a change | [Unit tests](#unit-tests) |
 
+Every tool accepts **`-V` / `--version`**, which prints its name and the
+git commit the build was made from (with a `-dirty` suffix if the working
+tree had uncommitted changes), e.g. `packet_query a1b2c3d4e5f6
+(2026-06-01)`. The commit is baked in at build time, so it reflects the
+exact build, not a runtime `git` call. This is the value to record on a
+pass sheet when you note which build flew the pass; `simple_sat_ops
+--self-test` also prints it on a `version:` line alongside the rest of the
+configuration snapshot.
+
 ## Operator UI: `simple_sat_ops`
 
 The operator UI is an ncurses program that:
@@ -816,7 +827,8 @@ the viewer re-execs into `--control` with the same TLE and pass folder.
 | `--scan-sky` `--scan-step=<deg>` | Drive the rotator through a sky grid, dwelling at each target. Bypasses the satellite-tracking gate. |
 | `--always-record` | Start WAV and IQ capture immediately at open; don't gate on elevation. |
 | `--live-waterfall` | Auto-launch the raylib `live_waterfall` viewer alongside the terminal UI. |
-| `--self-test` | Print the resolved configuration and exit. Useful in scripts. |
+| `--self-test` | Print the resolved configuration and exit (includes a `version:` line with the build commit). Useful in scripts. |
+| `-V` / `--version` | Print the build commit and exit (see [the tool map](#a-map-of-the-cat-the-tools)). |
 
 `--help-full` also lists the TX safety gates and viewer options.
 
@@ -1480,11 +1492,11 @@ stops at that end marker, so trailing framing/parity bytes don't show up
 as a garbage tail after the message. The raw byte dump still shows
 everything.
 
-**Command groups (Enter on a `tcmd_response`).** Each `tcmd_response`
-carries the originating command's `@tssent` value (`ts_sent`, a unix-ms
-integer) - the satellite echoes back exactly the `@tssent` it received.
-Press `Enter` on a `tcmd_response` row to open a command-group sub-view
-built around that `ts_sent`:
+**Press `Enter` on a `tcmd_response` to see more** - it opens a
+command-group sub-view, the rest of that command's lifecycle. Each
+`tcmd_response` carries the originating command's `@tssent` value
+(`ts_sent`, a unix-ms integer) - the satellite echoes back exactly the
+`@tssent` it received - and the sub-view is built around that `ts_sent`:
 
 * First, every `tcmd_response` packet sharing that `ts_sent`, in
   response-sequence order - the command's acknowledgement, execution
@@ -1511,7 +1523,9 @@ agenda files under the data root for `@tssent=<value>`, and otherwise
 shows `(command unknown)`. Manually-composed commands carry no `@tssent`
 and so are not recorded or resolved.
 
-**Backfilling old commands (`tcmd_import`).** The `sent_tcmd` table is
+### `tcmd_import`
+
+Backfill old commands into the `sent_tcmd` table. The table is
 only filled for passes flown after it existed. To populate it from
 history, `tcmd_import` reads the per-pass `tx.log` files (each transmitted
 command is a `tx-command-sent` line whose payload is the command that went
@@ -1526,21 +1540,29 @@ tcmd_import /FrontierSat/Operations      # an explicit tree
 tcmd_import --db=/tmp/test.sqlite path/to/tx.log
 ```
 
-**Command explorer (`tcmd_browser`).** The mirror of `packet_browser`,
-over the `sent_tcmd` table: an ncurses TUI listing the telecommands that
-were transmitted, newest first, with the count of responses the satellite
+### `tcmd_browser`
+
+The command explorer - an ncurses TUI over the `sent_tcmd` table, the
+mirror of `packet_browser`. It lists the telecommands that were
+transmitted, newest first, with the count of responses the satellite
 returned for each (a `?` marks commands with no response yet). The detail
 pane shows the full command text, `ts_sent`, `tsexec`, frequency, gain,
-and source run. `Enter` opens the command's responses - the
-`tcmd_response` packets sharing its `ts_sent`, in sequence order, with the
-response code and text. `f` cycles a response filter (all -> answered,
-i.e. got a response -> unanswered) so you can show just the commands the
-satellite acknowledged or just the ones still outstanding. `/` searches
-the command text, `l` toggles UTC/local time, `Esc` / `Left` step back
-from the responses view. So the
-two browsers meet in the middle: from a response, `packet_browser`'s
-`Enter` finds the command; from a command, `tcmd_browser`'s `Enter` finds
-the responses.
+and source run.
+
+**Press `Enter` on a command to see more** - it opens that command's
+responses: the `tcmd_response` packets sharing its `ts_sent`, in sequence
+order, with the response code and text. `Esc` / `Left` step back. `f`
+cycles a response filter (all -> answered, i.e. got a response ->
+unanswered) so you can show just the commands the satellite acknowledged
+or just the ones still outstanding; `/` searches the command text, `l`
+toggles UTC/local time.
+
+The two browsers are inverses of each other, and in both **`Enter` is the
+"show me more" key**: in `packet_browser`, `Enter` on a `tcmd_response`
+opens the [command group](#packet_query-and-packet_browser) (the command's
+whole lifecycle, and it resolves the command text); in `tcmd_browser`,
+`Enter` on a command opens its responses. From a response you find the
+command; from a command you find the responses.
 
 ```sh
 tcmd_browser
