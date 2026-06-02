@@ -248,8 +248,12 @@ static void format_local_aos(double jul_utc, char *buf, size_t bufsize)
     strftime(buf, bufsize, "%m-%d %H:%M", &lt);
 }
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "next_in_queue")) return 0;
     // AOS-local rendering follows the operator's TZ (system default or
     // shell-set). Set TZ=America/Edmonton in the env if you want
     // Calgary time regardless of where you're ssh'd in from.

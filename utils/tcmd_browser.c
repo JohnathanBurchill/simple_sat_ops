@@ -33,6 +33,7 @@
 
 #include "beacon_cts1.h"
 #include "packet_db.h"
+#include "sso_version.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -550,6 +551,7 @@ static void usage(FILE *out, const char *argv0)
 
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "tcmd_browser")) return 0;
     const char *db_path = NULL;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];

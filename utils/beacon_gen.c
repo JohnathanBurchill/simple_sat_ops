@@ -191,8 +191,12 @@ static size_t fill_tcmd_response(COMMS_tcmd_response_packet_t *t,
 
 typedef enum { PACKET_BEACON, PACKET_TCMD_RESPONSE } packet_kind_t;
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "beacon_gen")) return 0;
     const char *out_wav = NULL;
     int repeats = 1;
     int gap_seconds = 20;

@@ -111,8 +111,12 @@ static int starts_with(const char *s, const char *prefix)
     return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "uplink_test")) return 0;
     const char *payload_hex = NULL;
     const char *payload_ascii = NULL;
     const char *keyfile_path = NULL;

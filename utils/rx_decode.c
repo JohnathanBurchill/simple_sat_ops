@@ -257,8 +257,12 @@ static void usage(FILE *out, const char *argv0)
         argv0, argv0, HMAC_KEYFILE_DEFAULT_RELPATH);
 }
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "rx_decode")) return 0;
     const char *input_path = NULL;
     const char *keyfile_path = NULL;
     int raw_mode = 0;

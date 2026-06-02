@@ -36,6 +36,7 @@
 #include "frontiersat.h"
 #include "hmac_keyfile.h"
 #include "agenda_line.h"
+#include "sso_version.h"
 
 #ifdef SSO_WITH_SDR
 #include "b210_rx_tx_core.h"
@@ -6199,6 +6200,7 @@ static const char *baud_str(int speed_const)
 static void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
 {
     fprintf(out, "self-test: simple_sat_ops configuration snapshot\n");
+    fprintf(out, "version: %s\n", sso_version_string());
 
     // Echo the command line so the report is self-describing — the
     // reader can see at a glance which flags produced this snapshot.
@@ -6318,6 +6320,7 @@ static void self_test_report(const state_t *state, FILE *out, int argc, char **a
 
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "simple_sat_ops")) return 0;
     state_t state = {0};
     state.prediction.predicted_max_elevation = -180.0;
 

@@ -65,8 +65,12 @@ static void usage(FILE *out, const char *argv0)
         argv0);
 }
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "fm_preview")) return 0;
     const char *in_path = NULL;
     const char *out_path = NULL;
     double carrier = 1000.0;

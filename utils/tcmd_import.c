@@ -225,8 +225,12 @@ static void usage(FILE *out, const char *argv0)
         argv0);
 }
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "tcmd_import")) return 0;
     const char *db_path = NULL;
     const char *tool = "tx_log_import";
     const char *paths[64];

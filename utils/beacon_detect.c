@@ -260,8 +260,12 @@ static int write_wav_pcm16_mono(const char *path,
     return (w == n) ? 0 : -1;
 }
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "beacon_detect")) return 0;
     const char *wav_path     = NULL;
     double sig_lo            = 4500.0;
     double sig_hi            = 5100.0;

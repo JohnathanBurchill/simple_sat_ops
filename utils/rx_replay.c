@@ -667,8 +667,12 @@ static int rx_emit_decoded(rx_emit_ctx_t *ctx,
     return 1;
 }
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "rx_replay")) return 0;
     const char *input_path = NULL;
     const char *log_path = NULL;
     const char *keyfile_path = NULL;

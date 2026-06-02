@@ -193,8 +193,12 @@ static void usage(FILE *f, const char *argv0)
         argv0, argv0, argv0, FRONTIERSAT_CARRIER_HZ);
 }
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "b210_rx_capture")) return 0;
     double freq_hz   = FRONTIERSAT_CARRIER_HZ;
     double gain_db   = 50.0;
     double rate      = 250000.0;

@@ -1164,8 +1164,12 @@ static void usage(FILE *out, const char *argv0)
         argv0);
 }
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "packet_browser")) return 0;
     const char *db_path = NULL;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];

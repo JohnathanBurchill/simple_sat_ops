@@ -294,8 +294,12 @@ static void sat_subpoint(long long unix_ms,
 }
 #endif // WITH_SGP4SDP4
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "agenda_check")) return 0;
     int local = 0;
     int dup_check = 1;
     int prune_dups = 0;

@@ -532,8 +532,12 @@ static int safe_init_window(int w, int h, const char *title)
 // still OpenGL, just on the CPU. See decode_inspector.c for the
 // long explanation.)
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "live_waterfall")) return 0;
     if (argc < 2) { usage(); return 2; }
     if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
         usage(); return 0;

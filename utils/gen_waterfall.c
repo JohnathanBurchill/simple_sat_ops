@@ -1762,8 +1762,12 @@ static int parse_int_opt(const char *arg, const char *prefix, int *out)
     return 1;
 }
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "gen_waterfall")) return 0;
     if (argc < 3) { usage(); return 2; }
     const char *iq_path  = argv[1];
     const char *out_pdf  = NULL;  // --pdf=<path>: emit a vector-text PDF too

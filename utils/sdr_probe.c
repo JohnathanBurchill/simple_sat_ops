@@ -138,8 +138,12 @@ static void probe_rtl(void)
 #endif
 }
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "sdr_probe")) return 0;
     const char *user_args = "";
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--uhd-args=", 11) == 0) {

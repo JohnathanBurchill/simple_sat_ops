@@ -29,6 +29,8 @@
 */
 
 #include "packet_db.h"
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -42,6 +44,7 @@
 #ifndef WITH_SQLITE3
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "packet_query")) return 0;
     (void)argc; (void)argv;
     fprintf(stderr,
             "packet_query: built without sqlite3 support. Install\n"
@@ -269,6 +272,7 @@ static void hex_encode(const uint8_t *bytes, size_t n,
 
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "packet_query")) return 0;
     const char *db_path = NULL;
     const char *since = NULL;
     const char *until = NULL;

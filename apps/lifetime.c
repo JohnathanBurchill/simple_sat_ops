@@ -110,8 +110,12 @@ void usage(FILE *dest, const char *name, int full)
         name);
 }
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "lifetime")) return 0;
     double site_latitude = RAO_LATITUDE;
     double site_longitude = RAO_LONGITUDE;
     double site_altitude = RAO_ALTITUDE;

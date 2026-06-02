@@ -808,8 +808,12 @@ static const char *take_value(int argc, char **argv, int *i)
     return argv[++(*i)];
 }
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "tle_compare")) return 0;
     char tle_path[512] = {0};
     double lat = RAO_LATITUDE, lon = RAO_LONGITUDE, alt_m = RAO_ALTITUDE;
     double freq_hz = DEFAULT_FREQ_MHZ * 1e6;

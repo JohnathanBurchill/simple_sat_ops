@@ -260,8 +260,12 @@ static const struct {
 #define JOKE_N (sizeof JOKE_PATTERN / sizeof JOKE_PATTERN[0])
 #define JOKE_DAH_HOLD_UNITS 2.0   // dah = 1 frame + this many frame-durations of CW tail
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "tx_frame_sdr")) return 0;
     const char *payload_hex = NULL;
     const char *payload_ascii = NULL;
     const char *keyfile_path = NULL;

@@ -1804,8 +1804,12 @@ static int safe_init_window(int w, int h, const char *title)
 // Main
 // ---------------------------------------------------------------------------
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char **argv)
 {
+    if (sso_version_handle(argc, argv, "decode_inspector")) return 0;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(); return 0;

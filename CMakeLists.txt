@@ -45,7 +45,45 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/src/pipeline
     ${CMAKE_SOURCE_DIR}/src/ipc
     ${CMAKE_SOURCE_DIR}/src/db
+    ${CMAKE_BINARY_DIR}/generated
 )
+
+# Bake the git commit into sso_version.h so every tool's -V / --version
+# can report which build it is (see cmake/sso_version.h.in). Captured at
+# configure time; CMAKE_CONFIGURE_DEPENDS on the git refs below makes a
+# commit retrigger configure, so a plain `make` after committing
+# regenerates the header. configure_file only rewrites it when the
+# contents actually change, so unchanged rebuilds don't recompile.
+find_package(Git QUIET)
+set(SSO_VERSION_COMMIT "unknown")
+set(SSO_VERSION_DATE "")
+set(SSO_VERSION_DIRTY "")
+if (Git_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C ${CMAKE_SOURCE_DIR} rev-parse --short=12 HEAD
+        OUTPUT_VARIABLE _sso_commit OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET RESULT_VARIABLE _sso_rc)
+    if (_sso_rc EQUAL 0 AND NOT _sso_commit STREQUAL "")
+        set(SSO_VERSION_COMMIT "${_sso_commit}")
+    endif()
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C ${CMAKE_SOURCE_DIR} show -s --format=%cs HEAD
+        OUTPUT_VARIABLE SSO_VERSION_DATE OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C ${CMAKE_SOURCE_DIR} status --porcelain
+        OUTPUT_VARIABLE _sso_dirty OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if (NOT _sso_dirty STREQUAL "")
+        set(SSO_VERSION_DIRTY "-dirty")
+    endif()
+    foreach (_gitfile logs/HEAD index)
+        if (EXISTS ${CMAKE_SOURCE_DIR}/.git/${_gitfile})
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                         ${CMAKE_SOURCE_DIR}/.git/${_gitfile})
+        endif()
+    endforeach()
+endif()
+configure_file(${CMAKE_SOURCE_DIR}/cmake/sso_version.h.in
+               ${CMAKE_BINARY_DIR}/generated/sso_version.h @ONLY)
 
 # SDR-only build. The CAT-radio dispatcher (radio.c + radio_*.c) and the
 # ALSA-bound tools (tx_tone, tx_white_noise, tx_frame, rx_capture,

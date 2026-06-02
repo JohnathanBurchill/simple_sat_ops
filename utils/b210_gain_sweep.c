@@ -134,8 +134,12 @@ static void usage(const char *argv0)
         argv0, (double) FRONTIERSAT_CARRIER_HZ - 25000.0);
 }
 
+// -V / --version support (commit baked in at build time).
+#include "sso_version.h"
+
 int main(int argc, char *argv[])
 {
+    if (sso_version_handle(argc, argv, "b210_gain_sweep")) return 0;
     double      freq_hz       = (double) FRONTIERSAT_CARRIER_HZ - 25000.0;
     double      rate_hz       = 480000.0;
     unsigned    decim         = 5u;
