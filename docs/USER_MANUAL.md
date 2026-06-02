@@ -1533,8 +1533,11 @@ returned for each (a `?` marks commands with no response yet). The detail
 pane shows the full command text, `ts_sent`, `tsexec`, frequency, gain,
 and source run. `Enter` opens the command's responses - the
 `tcmd_response` packets sharing its `ts_sent`, in sequence order, with the
-response code and text. `/` searches the command text, `l` toggles
-UTC/local time, `Esc` / `Left` step back from the responses view. So the
+response code and text. `f` cycles a response filter (all -> answered,
+i.e. got a response -> unanswered) so you can show just the commands the
+satellite acknowledged or just the ones still outstanding. `/` searches
+the command text, `l` toggles UTC/local time, `Esc` / `Left` step back
+from the responses view. So the
 two browsers meet in the middle: from a response, `packet_browser`'s
 `Enter` finds the command; from a command, `tcmd_browser`'s `Enter` finds
 the responses.

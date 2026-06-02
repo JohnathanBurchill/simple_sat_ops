@@ -97,6 +97,18 @@ static int       sel = 0, top = 0;
 static char      like_text[128] = "";
 static int       show_local_time = 0;
 static int       g_have_color = 0;
+// Response filter: 0 = all, 1 = answered (resp>0, the "green" ones),
+// 2 = unanswered (resp==0). Cycled with `f`.
+static int       resp_filter = 0;
+
+static const char *resp_filter_label(void)
+{
+    switch (resp_filter) {
+    case 1:  return "answered";
+    case 2:  return "unanswered";
+    default: return "all";
+    }
+}
 
 // Response sub-view (Enter on a command).
 static int    in_resp = 0;
@@ -245,7 +257,13 @@ static void run_query(sqlite3 *db)
         snprintf(r->tool,  sizeof r->tool,  "%s", tool ? tool : "");
         snprintf(r->run,   sizeof r->run,   "%s", run  ? run  : "");
         snprintf(r->ts_tx, sizeof r->ts_tx, "%s", tx   ? tx   : "");
-        r->resp_count = resp_count_for(r->ts_sent_ms);
+        int rc = resp_count_for(r->ts_sent_ms);
+        // Apply the response filter here (the count isn't a DB column, so
+        // it can't go in the WHERE clause); skipping just leaves the slot
+        // for the next row.
+        if ((resp_filter == 1 && rc == 0) || (resp_filter == 2 && rc > 0))
+            continue;
+        r->resp_count = rc;
         n++;
     }
     sqlite3_finalize(st);
@@ -307,8 +325,8 @@ static void draw_top_bar(int cols)
         snprintf(buf, sizeof buf, " tcmd_browser  %s", resp_header);
     else
         snprintf(buf, sizeof buf,
-                 " tcmd_browser  sent telecommands  search=\"%s\"  | %d command%s",
-                 like_text, n_rows, n_rows == 1 ? "" : "s");
+                 " tcmd_browser  sent telecommands  show=%s  search=\"%s\"  | %d command%s",
+                 resp_filter_label(), like_text, n_rows, n_rows == 1 ? "" : "s");
     mvaddnstr(0, 0, buf, cols);
     if (g_have_color) attroff(COLOR_PAIR(PAIR_BAR)); else attroff(A_REVERSE);
 }
@@ -468,7 +486,7 @@ static void draw_bottom_bar(int cols, int rows_total, int searching)
     const char *hint;
     if (searching) hint = " enter accept   esc cancel   backspace edits ";
     else if (in_resp) hint = " esc/left/bksp back   up/down scroll   l utc/lt   q quit ";
-    else hint = " q quit   up/down scroll   enter responses   / search   l utc/lt   r reload ";
+    else hint = " q quit   up/down scroll   enter responses   f answered   / search   l utc/lt   r reload ";
     mvaddnstr(rows_total - 1, 0, hint, cols);
     if (g_have_color) attroff(COLOR_PAIR(PAIR_BAR)); else attroff(A_REVERSE);
 }
@@ -515,6 +533,8 @@ static void usage(FILE *out, const char *argv0)
         "  arrows / PgUp / PgDn / Home / End   scroll\n"
         "  Enter            open the responses for the selected command\n"
         "                   (the tcmd_response packets sharing its ts_sent)\n"
+        "  f                cycle response filter: all -> answered (got a\n"
+        "                   response) -> unanswered\n"
         "  /                substring search against the command text\n"
         "  l                toggle timestamp display: UTC (storage) <-> local\n"
         "  r                reload now\n"
@@ -633,6 +653,11 @@ int main(int argc, char **argv)
             case KEY_HOME: case 'g': *psel = 0; break;
             case KEY_END:  case 'G': *psel = pn > 0 ? pn - 1 : 0; break;
             case 'l': show_local_time = !show_local_time; break;
+            case 'f':  // cycle response filter: all -> answered -> unanswered
+                if (in_resp) break;
+                resp_filter = (resp_filter + 1) % 3;
+                run_query(db); last_query = monotonic_seconds();
+                break;
             case 'r': case 'R': case 18:
                 if (in_resp) break;
                 run_query(db); last_query = monotonic_seconds();
