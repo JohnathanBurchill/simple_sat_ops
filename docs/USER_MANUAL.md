@@ -1628,7 +1628,10 @@ sun. It uses the apparent sun, so it is local apparent solar time --
 within the equation of time (under ~16 minutes) of the mean local time
 LTAN usually means. The mean elements are decoded by the same library the
 rest of the toolchain uses; the geometry is closed-form from the mean
-motion and eccentricity, not an SGP4 fit.
+motion and eccentricity, not an SGP4 fit. Apogee and perigee are heights
+above the mean Earth radius (6371 km), matching common online TLE tools;
+the J2 precession term keeps the equatorial radius, as that formula
+expects.
 
 ## Bring-up and test tools
 

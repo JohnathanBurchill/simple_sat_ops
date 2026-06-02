@@ -48,11 +48,19 @@
 #include <unistd.h>
 
 // Physical constants. These mirror the values sgp4sdp4 uses internally
-// (xj2, an Earth radius of 6378.135-6378.137 km) but are defined here so
-// the tool does not need the library's SGP4SDP4_CONSTANTS macro block.
-#define GM_KM3_S2        398600.4418    // Earth gravitational parameter (WGS84)
-#define EARTH_RADIUS_KM  6378.137       // WGS84 equatorial radius
-#define J2_HARMONIC      1.0826158e-3   // Earth J2 (matches sgp4sdp4 xj2)
+// but are defined here so the tool does not need the library's
+// SGP4SDP4_CONSTANTS macro block.
+//
+// Apogee and perigee are radii from Earth's centre; turning them into a
+// height needs a reference surface. We subtract the mean radius, matching
+// the convention common online TLE tools use, so the heights line up with
+// what an operator sees elsewhere. The J2 nodal-precession term, by
+// contrast, is defined against the equatorial bulge and keeps the
+// equatorial radius -- mixing the two would skew the sun-sync rate.
+#define GM_KM3_S2            398600.4418  // Earth gravitational parameter (WGS84)
+#define EARTH_RADIUS_MEAN_KM 6371.0       // IUGG mean radius (apogee/perigee height)
+#define EARTH_RADIUS_EQ_KM   6378.137     // WGS84 equatorial radius (J2 precession)
+#define J2_HARMONIC          1.0826158e-3 // Earth J2 (matches sgp4sdp4 xj2)
 
 // Nodal precession rate of a sun-synchronous orbit: the node must drift
 // east at the rate the mean sun moves along the equator, 360 deg per
@@ -241,8 +249,8 @@ static int newest_dated_tle(char *out, size_t cap)
 
 typedef struct {
     double sma_km;          // semi-major axis
-    double apogee_km;       // apogee altitude above mean equatorial radius
-    double perigee_km;      // perigee altitude
+    double apogee_km;       // apogee height above the mean Earth radius
+    double perigee_km;      // perigee height above the mean Earth radius
     double period_min;      // orbital period
     double node_rate_dd;    // J2 secular nodal precession, deg/day
     int    sun_sync;        // node rate within tolerance of sun-sync
@@ -279,8 +287,8 @@ static void compute_derived(const tle_t *t, derived_t *d)
     if (n_rev_day > 0.0) {
         double n_rad_s = n_rev_day * 2.0 * M_PI / 86400.0;
         d->sma_km = cbrt(GM_KM3_S2 / (n_rad_s * n_rad_s));
-        d->apogee_km  = d->sma_km * (1.0 + e) - EARTH_RADIUS_KM;
-        d->perigee_km = d->sma_km * (1.0 - e) - EARTH_RADIUS_KM;
+        d->apogee_km  = d->sma_km * (1.0 + e) - EARTH_RADIUS_MEAN_KM;
+        d->perigee_km = d->sma_km * (1.0 - e) - EARTH_RADIUS_MEAN_KM;
         d->period_min = 1440.0 / n_rev_day;
 
         // Secular J2 regression of the ascending node:
@@ -288,7 +296,7 @@ static void compute_derived(const tle_t *t, derived_t *d)
         double incl = t->xincl * M_PI / 180.0;       // degrees -> radians
         double p = d->sma_km * (1.0 - e * e);
         if (p > 0.0) {
-            double f = EARTH_RADIUS_KM / p;
+            double f = EARTH_RADIUS_EQ_KM / p;
             double rate_rad_s = -1.5 * n_rad_s * J2_HARMONIC * f * f * cos(incl);
             d->node_rate_dd = rate_rad_s * (180.0 / M_PI) * 86400.0;
             d->sun_sync = fabs(d->node_rate_dd - SUNSYNC_DEG_DAY) < SUNSYNC_TOL;
@@ -399,7 +407,7 @@ static void print_report(const kep_t *o, double jul_now)
     printf("    %-*s %10.3e rev/day^2  (n-dot/2)\n", LBL, "mm 1st deriv", t->xndt2o);
     printf("    %-*s %10.4e 1/Re\n",  LBL, "B* drag",       t->bstar);
 
-    printf("  derived:\n");
+    printf("  derived (heights above mean radius 6371 km):\n");
     printf("    %-*s %10.1f km\n",   LBL, "semi-major axis", d.sma_km);
     printf("    %-*s %10.1f km\n",   LBL, "apogee altitude", d.apogee_km);
     printf("    %-*s %10.1f km\n",   LBL, "perigee altitude", d.perigee_km);
