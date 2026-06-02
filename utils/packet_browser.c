@@ -1209,6 +1209,13 @@ int main(int argc, char **argv)
     nonl();
     keypad(stdscr, TRUE);
     nodelay(stdscr, TRUE);
+    // A lone Esc is also the first byte of every arrow/function-key
+    // escape sequence, so ncurses waits ESCDELAY (default 1000 ms) for a
+    // continuation before reporting a bare Esc. That made Esc-to-back /
+    // Esc-to-quit feel sluggish next to an instant 'q'. 25 ms is long
+    // enough for a local or SSH terminal to deliver the rest of a real
+    // escape sequence, short enough that a deliberate Esc feels immediate.
+    set_escdelay(25);
     curs_set(0);
     if (has_colors()) {
         start_color();
