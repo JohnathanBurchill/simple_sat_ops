@@ -725,6 +725,13 @@ if (SGP4SDP4_LIB)
     target_link_libraries(lifetime PRIVATE ${SGP4SDP4_LIB} m)
     list(APPEND SSO_TARGETS lifetime)
 
+    # Orbital-elements ("keps") summary table. Static element report only,
+    # no propagation, so it needs neither ncurses nor prediction.c -- just
+    # the library decode helpers plus sso_paths for the dated-TLE default.
+    add_executable(tle_keps apps/tle_keps.c src/ipc/sso_paths.c)
+    target_link_libraries(tle_keps PRIVATE ${SGP4SDP4_LIB} m)
+    list(APPEND SSO_TARGETS tle_keps)
+
     # Live side-by-side TLE comparison (needs ncurses for the live UI).
     if (NCURSES_FOUND)
         add_executable(tle_compare apps/tle_compare.c

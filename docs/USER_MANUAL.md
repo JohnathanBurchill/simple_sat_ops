@@ -125,6 +125,7 @@ manual can go back on the shelf where it belongs.
     - [`packet_query` and `packet_browser`](#packet_query-and-packet_browser)
     - [`tcmd_import`](#tcmd_import)
     - [`tcmd_browser`](#tcmd_browser)
+    - [`tle_keps`](#tle_keps)
 12. [Bring-up and test tools](#bring-up-and-test-tools)
     - [`tx_frame_sdr`](#tx_frame_sdr)
     - [`b210_rx_capture` and `b210_gain_sweep`](#b210_rx_capture-and-b210_gain_sweep)
@@ -581,7 +582,7 @@ Which targets actually build depends on what the host has:
 |------------|---------------------|
 | always | `radio_ctl`, `rs_selftest`, `fm_preview`, `agenda_check` |
 | OpenSSL / libcrypto | `uplink_test`, `rx_decode`, `packet_query`, `packet_browser`, `tcmd_browser`, `tcmd_import` |
-| SGP4SDP4 | `next_in_queue`, `lifetime`, `prediction_selftest`, `pursuit_selftest` |
+| SGP4SDP4 | `next_in_queue`, `lifetime`, `tle_keps`, `prediction_selftest`, `pursuit_selftest` |
 | UHD (B210) | `b210_rx_capture`, `b210_gain_sweep`, `tx_frame_sdr`, `sdr_probe` |
 | librtlsdr | RTL-SDR RX-only backend in `simple_sat_ops` (on by default; auto-disables if absent) |
 | libusb | USB-serial clone detection in the UHD backend (a UHD dependency, so normally already present) |
@@ -747,6 +748,7 @@ review it, or take apart what it recorded.
 |------------------|-----------|
 | Run a live pass (the only tool that drives the radio and rotator) | [`simple_sat_ops`](#operator-ui-simple_sat_ops) |
 | Find the next pass and plan a schedule | [`next_in_queue`](#pass-scheduling-next_in_queue) |
+| Summarize a TLE's orbital elements (keps) | [`tle_keps`](#tle_keps) |
 | Sanity-check a command list before you send it | [`agenda_check`](#agenda-review-agenda_check) |
 | Pull frames out of a recorded capture offline | [Offline analysis tools](#offline-analysis-tools) |
 | Bench bring-up, one-shot test transmits, IQ recording | [Bring-up and test tools](#bring-up-and-test-tools) |
@@ -1588,6 +1590,45 @@ tcmd_browser
 packet_query --satellite=FrontierSat --since=1h --format=json
 packet_browser
 ```
+
+### `tle_keps`
+
+A one-glance summary of a TLE's orbital elements -- the "keps" you would
+read off a Keplerian element set -- and the geometry they imply. For each
+object it prints the mean elements straight from the two-line set
+(inclination, RAAN, eccentricity, argument of perigee, mean anomaly, mean
+motion, the drag terms), then what they work out to: semi-major axis,
+apogee and perigee altitude, orbital period, the J2 nodal precession rate
+(flagged when it matches a sun-synchronous orbit), and the local time of
+the ascending and descending node (LTAN / LTDN).
+
+It is read-only and static: it reports the elements at their epoch, so it
+needs no observer location and runs no SGP4 propagation. For the live sky
+position, Doppler, and the next pass, use `simple_sat_ops` or
+`next_in_queue`.
+
+```sh
+# Newest dated FrontierSat TLE, every object in it
+tle_keps
+
+# A specific file and one or more name prefixes (case-sensitive)
+tle_keps $TLES/amateur.tle "ISS (ZARYA)" FrontierSat
+
+# One comma-separated row per object, for the passes sheet
+tle_keps --csv
+```
+
+With no file it reads the newest `<root>/TLEs/YYYYMMDD/tle-YYYYMMDD.tle`
+(the one [`fetch_tle.sh`](#first-run-setup) writes); with no names it
+summarizes every object in the file. A positional that names an existing
+file is taken as the TLE file, the rest as satellite-name prefixes.
+
+The LTAN comes from the right ascension of the ascending node and of the
+sun. It uses the apparent sun, so it is local apparent solar time --
+within the equation of time (under ~16 minutes) of the mean local time
+LTAN usually means. The mean elements are decoded by the same library the
+rest of the toolchain uses; the geometry is closed-form from the mean
+motion and eccentricity, not an SGP4 fit.
 
 ## Bring-up and test tools
 
