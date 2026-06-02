@@ -644,6 +644,22 @@ warnings Apple clang misses. Output lives in `build-lint/`.
    `$HOME/.local/state/simple_sat_ops/active.tle`, which `next_in_queue`
    shares.
 
+   On the ground machine these dated files are produced automatically.
+   `scripts/fetch_tle.sh` runs once a day from cron (`/etc/cron.d/sso-tle`,
+   09:00), pulls the latest TLE for FrontierSat (NORAD **69015**) from
+   CelesTrak, and writes `$TLES/<date>/tle-<date>.tle` - exactly the layout
+   the newest-dated auto-load expects, so each morning's fresh elements are
+   picked up with no manual step. It rewrites the name line to
+   `FrontierSat` (CelesTrak returns upper-case `FRONTIERSAT`, which the
+   case-sensitive name match would miss) and, via the setgid
+   `root:sso-ops` TLE directory plus `umask 0002`, leaves the file group
+   `sso-ops` and readable by every controller account. A failed or
+   malformed download never overwrites a good file. Run it by hand any
+   time to refresh the current day (`fetch_tle.sh`), and see the script
+   header for the cron line and the `CATNR` / `SAT_NAME` / `USE_UTC`
+   knobs. It installs to `/usr/local/bin` with the other tools via
+   `sudo make install`.
+
 3. **HMAC key.** Required for any on-air uplink. The operator UI
    loads the shared keyfile (`/FrontierSat/HMAC/frontiersat_hmac`),
    failing that `$HOME/.local/state/simple_sat_ops/frontiersat_hmac`,
@@ -1807,7 +1823,7 @@ values are not disturbed).
 | Path | What's there |
 |------|---------------|
 | `/FrontierSat/` | Top-level data root. Default when `$FRONTIERSAT_ROOT` is unset; set `$FRONTIERSAT_ROOT` to use a different tree (e.g. on a dev host). If the default root doesn't exist, every tool prints a one-time notice with the options (create it, or set `$FRONTIERSAT_ROOT`). |
-| `/<satname>/TLEs/` (e.g. `/FrontierSat/TLEs/`, `$TLES`) | Dated TLE files, conventionally `<date>/tle-<date>.tle`. `simple_sat_ops --control` with no `<satellite_id>`, and `next_in_queue <satellite_name>`, both load the newest dated `*.tle` found here (searched recursively). Note: an explicit `--tle <path>` is **not** resolved under this directory - it is taken relative to the working directory (a CSV TLE is auto-converted to a temp `.tle`). |
+| `/<satname>/TLEs/` (e.g. `/FrontierSat/TLEs/`, `$TLES`) | Dated TLE files, conventionally `<date>/tle-<date>.tle`, populated daily by `fetch_tle.sh` (see [First-run setup](#first-run-setup)). `simple_sat_ops --control` with no `<satellite_id>`, and `next_in_queue <satellite_name>`, both load the newest dated `*.tle` found here (searched recursively). Note: an explicit `--tle <path>` is **not** resolved under this directory - it is taken relative to the working directory (a CSV TLE is auto-converted to a temp `.tle`). |
 | `/FrontierSat/Operations/<yyyymmdd>/<HHMMLT>/` | Per-pass folder. Holds the pass's WAV, IQ, decoded frames, TLE snapshot, doppler / lo_offset / burst sidecars, and the end-of-pass spectrogram and waterfall PNG. |
 | `/FrontierSat/Operations/current` | Symlink the operator UI keeps pointing at the most recent pass folder. |
 | `/FrontierSat/captures/` | One-off `b210_rx_capture` outputs. |
