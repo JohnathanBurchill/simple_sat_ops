@@ -36,6 +36,7 @@
 #include "frontiersat.h"
 #include "hmac_keyfile.h"
 #include "agenda_line.h"
+#include "tcmd_lint.h"
 #include "sso_version.h"
 
 #ifdef SSO_WITH_SDR
@@ -110,6 +111,11 @@ static const char *g_operator_user = NULL;
 // or claiming any shared resource. Skips the no-arg viewer-probe in
 // apply_args too (which is itself a side effect).
 static int g_self_test = 0;
+
+// Refuse to fully start when the --tc-file agenda has telecommand lint
+// errors. --ignore-at-your-peril-all-tc-errors clears this and lets a
+// known-bad agenda through anyway.
+static int g_ignore_tc_errors = 0;
 
 // TX dry-run: record the command as not-sent (reason "dry-run")
 // instead of pushing the burst through rx_session. Lets the operator
@@ -4533,6 +4539,11 @@ void usage(FILE *dest, const char *name, int full)
         "                               unattended run can't keep TXing\n"
         "                               after the pass. All TX events land\n"
         "                               in <pass_folder>/tx.log.\n"
+        "  --ignore-at-your-peril-all-tc-errors\n"
+        "                               Start even if the --tc-file agenda has\n"
+        "                               telecommand lint errors. By default a\n"
+        "                               failing agenda blocks startup; this\n"
+        "                               bypasses that check. Warnings never block.\n"
         "\n"
         "Operator coordination:\n"
         "  --control                    Open the sso_ipc server (operator mode).\n"
@@ -6381,6 +6392,36 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    // Telecommand-agenda lint gate. When a --tc-file was given, lint it
+    // against the firmware's telecommand set (names, argument counts,
+    // CTS1+...! framing, length limits) BEFORE bringing up anything that
+    // can key the PA. Lint errors mean a command would be rejected (or
+    // worse, mis-parsed) by the satellite, so refuse to start unless the
+    // operator explicitly accepts the risk. Warnings (e.g. a command not
+    // meant for routine flight operation) are printed but do not block.
+    if (g_auto_tcmd_file_path[0] != '\0') {
+        int tc_warns = 0;
+        int tc_errs = tcmd_lint_file(g_auto_tcmd_file_path, stderr, &tc_warns);
+        if (tc_errs > 0 && !g_ignore_tc_errors) {
+            fprintf(stderr,
+                "simple_sat_ops: %d error%s detected in the --tc-file content (%s).\n"
+                "Refusing to start. Fix the agenda, or re-run with\n"
+                "--ignore-at-your-peril-all-tc-errors to bypass this check.\n",
+                tc_errs, tc_errs == 1 ? "" : "s", g_auto_tcmd_file_path);
+            return EXIT_FAILURE;
+        }
+        if (tc_errs > 0) {
+            fprintf(stderr,
+                "simple_sat_ops: %d telecommand error%s in %s -- proceeding anyway "
+                "(--ignore-at-your-peril-all-tc-errors).\n",
+                tc_errs, tc_errs == 1 ? "" : "s", g_auto_tcmd_file_path);
+        } else if (tc_warns > 0) {
+            fprintf(stderr,
+                "simple_sat_ops: %d telecommand warning%s in %s (see above); proceeding.\n",
+                tc_warns, tc_warns == 1 ? "" : "s", g_auto_tcmd_file_path);
+        }
+    }
+
     // Audit + operator IPC bring-up.
     g_operator_user = sso_unix_user();
     sso_audit_start("simple_sat_ops",
@@ -7913,6 +7954,9 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 "--tc-file=<path> is no longer accepted; "
                 "use `--tc-file <path>` (TAB-completes the filename)\n");
             return EXIT_FAILURE;
+        } else if (strcmp("--ignore-at-your-peril-all-tc-errors", argv[i]) == 0) {
+            state->n_options++;
+            g_ignore_tc_errors = 1;
         } else if (strcmp("--hmac-keyfile", argv[i]) == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "--hmac-keyfile: missing <path>\n");

@@ -61,23 +61,33 @@
 #include <time.h>
 #include <unistd.h>
 
+// agenda_line: the shared command/comment split + @-directive parsing.
+// tcmd_lint: the firmware-derived telecommand linter. Both are POSIX-only
+// (no sgp4 needed), so they're included unconditionally -- agenda_check
+// lints even on a host without the satellite-tracking libraries.
+#include "agenda_line.h"
+#include "tcmd_lint.h"
+#include "tcmd_spec.h"
+
 #ifdef WITH_SGP4SDP4
 // prediction.h pulls in ephemeres.h -> sgp4sdp4.h (ClearFlag,
 // select_ephemeris, the propagators). We reuse next_in_queue's proven
 // load_tle + update_satellite_position path rather than driving SGP4 by
 // hand, which is easy to get subtly wrong.
 #include "prediction.h"
-#include "agenda_line.h"
 #endif
 
 static void usage(FILE *out, const char *progname)
 {
     fprintf(out,
-        "Usage: %s [--local-time] [--no-dup-check] [--prune-dups] [--tle <file>] [<file>]\n"
+        "Usage: %s [--local-time] [--no-dup-check] [--no-tc-lint] [--prune-dups] [--tle <file>] [<file>]\n"
         "  Replaces @tssent=<unix_ms> and @tsexec=<unix_ms> values with\n"
         "  human-readable timestamps. UTC by default; --local-time uses\n"
         "  the host's local timezone. Flags verbatim-duplicate TC lines;\n"
         "  --prune-dups drops them instead and reports how many were pruned.\n"
+        "  Lints each telecommand against the flight firmware's command set\n"
+        "  (names, argument counts, CTS1+...! framing); errors print to stderr\n"
+        "  and set a non-zero exit. --no-tc-lint disables that check.\n"
         "  With --tle <file> (sgp4sdp4 builds), prepends the execution\n"
         "  date-time plus the sub-satellite lat/lon (deg) and altitude (km),\n"
         "  leaving the command intact (@tsexec=, else @tssent=, else now).\n"
@@ -303,6 +313,7 @@ int main(int argc, char **argv)
     int local = 0;
     int dup_check = 1;
     int prune_dups = 0;
+    int tc_lint = 1;
     const char *path = NULL;
     const char *tle_path = NULL;
     for (int i = 1; i < argc; ++i) {
@@ -310,6 +321,8 @@ int main(int argc, char **argv)
             local = 1;
         } else if (strcmp(argv[i], "--no-dup-check") == 0) {
             dup_check = 0;
+        } else if (strcmp(argv[i], "--no-tc-lint") == 0) {
+            tc_lint = 0;
         } else if (strcmp(argv[i], "--prune-dups") == 0) {
             prune_dups = 1;
         } else if (strcmp(argv[i], "--tle") == 0) {
@@ -373,6 +386,7 @@ int main(int argc, char **argv)
     int lineno = 0;
     int n_dups = 0;
     int total_commands = 0;
+    int lint_errors = 0, lint_warns = 0;
     while (fgets(buf, sizeof buf, in) != NULL) {
         ++lineno;
         // Pass through comments and blank lines verbatim — they're
@@ -398,6 +412,28 @@ int main(int argc, char **argv)
             snprintf(inline_comment, sizeof inline_comment, "%s", cmt);
             strip_eol(inline_comment);
             buf[cmd_len] = '\0';
+        }
+
+        // Lint the command against the firmware's telecommand set (names,
+        // argument counts, CTS1+...! framing, length limits) so a wrong
+        // command is caught here, before it could ever be transmitted.
+        // Issues go to stderr so stdout stays the clean, pipeable humanized
+        // agenda; lint errors set the exit code below.
+        if (tc_lint) {
+            char lintbuf[4096];
+            snprintf(lintbuf, sizeof lintbuf, "%s", buf);
+            strip_eol(lintbuf);
+            char *cmd = lintbuf;
+            while (*cmd == ' ' || *cmd == '\t') ++cmd;
+            char lint_msg[512];
+            tcmd_lint_severity_t sev = tcmd_lint_command(cmd, lint_msg, sizeof lint_msg);
+            if (sev == TCMD_LINT_ERROR) {
+                ++lint_errors;
+                fprintf(stderr, "agenda_check: line %d: error: %s\n", lineno, lint_msg);
+            } else if (sev == TCMD_LINT_WARN) {
+                ++lint_warns;
+                fprintf(stderr, "agenda_check: line %d: warning: %s\n", lineno, lint_msg);
+            }
         }
 
         // Verbatim duplicate detection, always run (drives both the
@@ -498,6 +534,14 @@ int main(int argc, char **argv)
         total_commands, total_commands == 1 ? "" : "s",
         dups.n, timed_uniq.n);
 
+    if (tc_lint && (lint_errors > 0 || lint_warns > 0)) {
+        fprintf(stderr,
+            "agenda_check: telecommand lint: %d error%s, %d warning%s "
+            "(checked against firmware %s)\n",
+            lint_errors, lint_errors == 1 ? "" : "s",
+            lint_warns, lint_warns == 1 ? "" : "s", TCMD_SPEC_FW_TAG);
+    }
+
     int rc = 0;
     if (prune_dups) {
         if (n_dups > 0) {
@@ -509,6 +553,11 @@ int main(int argc, char **argv)
             "agenda_check: %d duplicate line%s detected (see DUP> rows)\n",
             n_dups, n_dups == 1 ? "" : "s");
         rc = 3;
+    }
+    // Lint errors are the most serious finding -- a command that the
+    // satellite would reject or mis-parse -- so they take the exit code.
+    if (tc_lint && lint_errors > 0) {
+        rc = 4;
     }
     dup_table_free(&dups);
     dup_table_free(&timed_uniq);

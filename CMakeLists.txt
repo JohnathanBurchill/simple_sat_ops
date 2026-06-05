@@ -235,6 +235,15 @@ add_executable(agenda_line_selftest
 target_include_directories(agenda_line_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS agenda_line_selftest)
 
+# Telecommand-lint self-test: the firmware-derived agenda linter
+# (tcmd_lint.c + the generated tcmd_spec.c table) shared by agenda_check
+# and simple_sat_ops. Pure POSIX.
+add_executable(tcmd_lint_selftest
+               unit_tests/tcmd_lint_selftest.c src/proto/tcmd_lint.c
+               src/proto/tcmd_spec.c src/proto/agenda_line.c)
+target_include_directories(tcmd_lint_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+list(APPEND SSO_TARGETS tcmd_lint_selftest)
+
 # Curses test runner: walks the *_selftest binaries built above (and
 # any added later in this file), parses TAP from their stdout, and
 # renders a collapsible group view. Requires ncurses; if not present
@@ -260,7 +269,8 @@ list(APPEND SSO_TARGETS fm_preview)
 # also accepts --tle <file>, propagating the first satellite (via the
 # same prediction.c path next_in_queue uses) to append the sub-satellite
 # lat/lon/alt at each command's execution time.
-add_executable(agenda_check utils/agenda_check.c src/proto/agenda_line.c)
+add_executable(agenda_check utils/agenda_check.c src/proto/agenda_line.c
+               src/proto/tcmd_lint.c src/proto/tcmd_spec.c)
 if (SGP4SDP4_LIB)
     target_compile_definitions(agenda_check PRIVATE WITH_SGP4SDP4)
     target_sources(agenda_check PRIVATE src/orbit/prediction.c src/orbit/oem.c)
@@ -786,6 +796,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
                    src/proto/golay24.c src/proto/csp.c
                    src/proto/hmac_keyfile.c
                    src/proto/agenda_line.c
+                   src/proto/tcmd_lint.c src/proto/tcmd_spec.c
                    src/beacon/beacon_cts1.c
                    src/orbit/tle_csv.c
                    src/dsp/biquad.c src/dsp/monitor_squelch.c)

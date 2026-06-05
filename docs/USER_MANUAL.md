@@ -115,6 +115,7 @@ manual can go back on the shelf where it belongs.
    - [Pursuit tracking](#pursuit-tracking)
 9. [Pass scheduling: `next_in_queue`](#pass-scheduling-next_in_queue)
 10. [Agenda review: `agenda_check`](#agenda-review-agenda_check)
+    - [Telecommand linting](#telecommand-linting)
 11. [Offline analysis tools](#offline-analysis-tools)
     - [`gen_waterfall`](#gen_waterfall)
     - [`rx_replay`](#rx_replay)
@@ -839,7 +840,8 @@ the viewer re-execs into `--control` with the same TLE and pass folder.
 | `--sdr-device=<sel>` | RTL-SDR dongle index (for UHD prefer `--uhd-args`). |
 | `--no-tx` | Open the SDR but block PA keying. The TX compose modal still shows preview and dry-run. |
 | `--hmac-keyfile <path>` | Override the HMAC keyfile. |
-| `--tc-file=<path>` | Telecommand list for the `A` auto-tcmd modal. |
+| `--tc-file <path>` | Telecommand list for the `A` auto-tcmd modal. Linted against the firmware at startup; lint errors refuse startup (see [Telecommand linting](#telecommand-linting)). |
+| `--ignore-at-your-peril-all-tc-errors` | Start even when the `--tc-file` agenda has telecommand lint errors. Warnings never block. |
 | `--calibrate-rotator` `--confirm-rotator-calibrate` | One-shot calibration mode (see below). |
 | `--without-rotator-pursuit` | Disable the pursuit / lead-aim planner; the track loop falls back to today's aim-where-sat-is-now logic. Useful for A/B on the bench. |
 | `--scan-sky` `--scan-step=<deg>` | Drive the rotator through a sky grid, dwelling at each target. Bypasses the satellite-tracking gate. |
@@ -1070,7 +1072,7 @@ is refused with "TX not supported by this SDR (RX-only backend)".
 
 ### Auto-telecommand modal (`A`)
 
-Requires `--tc-file=<path>` on the command line. The file format
+Requires `--tc-file <path>` on the command line. The file format
 matches what the wider CalgaryToSpace tooling uses: one telecommand
 per line. Blank lines and whole-line `#` comments are ignored, and an
 inline trailing comment is stripped from a command:
@@ -1085,6 +1087,16 @@ A telecommand always ends with `!`, so a `#` is treated as a comment
 only when whitespace precedes it; a `#` inside the command text (no
 space before it) is left intact, so a command is never silently
 truncated on its way to the air.
+
+Before the UI starts, the `--tc-file` is linted against the firmware's
+telecommand set - the same check `agenda_check` runs (see [Telecommand
+linting](#telecommand-linting)). If any line has a lint *error* (unknown
+command name, wrong argument count, broken `CTS1+...!` framing),
+`simple_sat_ops` prints the offending lines and refuses to start, so a
+malformed agenda is caught before the pass instead of on the air. Pass
+`--ignore-at-your-peril-all-tc-errors` to start anyway; *warnings* (such
+as a command not meant for routine flight operation) are printed but do
+not block startup.
 
 The `A` modal lists the commands, lets the operator set per-pass
 parameters (power, repeats, delay), and ticks the same three TX
@@ -1117,6 +1129,15 @@ order and types, and the form of the reply on the downlink. The command
 you type into the `t` compose modal (or list in a `--tc-file`) is the
 same `CTS1+function_name(...)!` string documented there.
 
+The ground tools also lint commands against a copy of this command set
+generated from the firmware: `agenda_check` and `simple_sat_ops` startup
+both check every command's name, argument count, and `CTS1+...!` framing
+(see [Telecommand linting](#telecommand-linting)), so a typo or a wrong
+argument count is caught before the pass. That copy is pinned to a
+firmware tag and regenerated when the command set changes; it validates
+the *structure* of a command, not its intent, so the firmware command
+list above remains the source of truth for what each command does.
+
 > Note: the manual link points at `main`. The image you are actually
 > flying may be a tagged release rather than `main`; when in doubt,
 > read the docs at the firmware tag that is on the spacecraft.
@@ -1126,7 +1147,7 @@ same `CTS1+function_name(...)!` string documented there.
 *(To be written.)* This subsection will cover turning the documented
 commands into a `--tc-file` for the `A` auto-telecommand modal: the
 per-line `CTS1+...@tssent=...@tsexec=...!` format, how to set the
-execution times, and how to dry-run the list with
+execution times, and how to lint and dry-run the list with
 [`agenda_check`](#agenda-review-agenda_check) before a pass.
 
 ### Rotator calibration (`--calibrate-rotator`)
@@ -1297,20 +1318,23 @@ next_in_queue --tle $TLES/amateur.tle --list \
 
 ## Agenda review: `agenda_check`
 
-Telecommand-list reviewer. Reads a TC file (same format the
+Telecommand-list reviewer and linter. Reads a TC file (same format the
 operator UI consumes via `--tc-file`) and prints it back with the
 embedded `@tssent=` and `@tsexec=` unix-millisecond timestamps
 converted to ISO 8601, so the operator can confirm the schedule
-before keying anything on air.
+before keying anything on air. It also lints each telecommand against
+the flight firmware's command set (see [Telecommand
+linting](#telecommand-linting) below).
 
 ```text
-agenda_check [--local-time] [--no-dup-check] [--prune-dups] [--tle <file>] [<file>]
+agenda_check [--local-time] [--no-dup-check] [--no-tc-lint] [--prune-dups] [--tle <file>] [<file>]
 ```
 
 | Flag | Effect |
 |------|--------|
 | `--local-time` | Render times in the host's local timezone (default UTC). |
 | `--no-dup-check` | Skip the duplicate-line audit (substitute the timestamps only). |
+| `--no-tc-lint` | Skip the telecommand lint (see [Telecommand linting](#telecommand-linting)). |
 | `--prune-dups` | Drop verbatim-duplicate command lines (keep the first occurrence). Prints a count of how many were pruned. |
 | `--tle <file>` | (sgp4sdp4 builds only) Propagate the first satellite in `<file>` and prepend the execution date-time plus sub-satellite lat/lon/alt to each command. Leaves the command intact (raw unix-ms preserved). |
 
@@ -1350,7 +1374,36 @@ Where:
 
 `--prune-dups` returns 0 with `agenda_check: pruned N duplicate
 line(s)` on stderr. The default flag mode returns 3 when duplicates
-were present (so CI can gate on it).
+were present (so CI can gate on it). Telecommand lint errors take
+precedence: the exit code is 4 when any were found.
+
+### Telecommand linting
+
+Every command line is checked against the flight firmware's telecommand
+set before it could ever be transmitted. The command names, argument
+counts, and risk levels come from a table generated from the firmware
+(`scripts/gen_tcmd_spec.py`, currently tag `sat-1-rc3`), and the checks
+mirror the firmware's own parser, so the verdict matches what the
+satellite would do with the same bytes:
+
+* the `CTS1+` prefix and the single terminating `!`,
+* a known command name (case-sensitive),
+* the parenthesised argument list with the exact argument count the
+  command expects,
+* the firmware length limits, and
+* well-formed `@tssent=` / `@tsexec=` timestamps.
+
+Findings print to stderr (so stdout stays the clean, pipeable agenda) as
+`line N: error: ...` or `line N: warning: ...`. A command not meant for
+routine flight operation - ground-only, high-risk, recovery/expert, or
+flight-testing - is a *warning*, not an error. `--no-tc-lint` disables
+the check.
+
+The same lint gates `simple_sat_ops` startup: a `--tc-file` agenda with
+lint errors refuses to start unless you pass
+`--ignore-at-your-peril-all-tc-errors` (see [Command-line
+options](#command-line-options)). To regenerate the command table after
+a firmware change, see the header of `scripts/gen_tcmd_spec.py`.
 
 ## Offline analysis tools
 
