@@ -189,7 +189,10 @@ static int newest_dated_tle(char *out, size_t cap)
         if (!is_yyyymmdd(e->d_name)) continue;
         // Confirm it is a directory (d_type is not portable enough alone).
         char sub[512];
-        snprintf(sub, sizeof sub, "%s/%s", tles, e->d_name);
+        // A directory entry name is at most NAME_MAX; bound the %s so the
+        // path can't overrun the buffer (and so -Wformat-truncation, which
+        // otherwise assumes d_name's full declared size, stays quiet).
+        snprintf(sub, sizeof sub, "%s/%.255s", tles, e->d_name);
         struct stat st;
         if (stat(sub, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
         if (strcmp(e->d_name, latest) > 0)
@@ -214,7 +217,7 @@ static int newest_dated_tle(char *out, size_t cap)
                 size_t L = strlen(f->d_name);
                 if (L > 4 && strcmp(f->d_name + L - 4, ".tle") == 0
                     && (first[0] == '\0' || strcmp(f->d_name, first) < 0))
-                    snprintf(first, sizeof first, "%s", f->d_name);
+                    snprintf(first, sizeof first, "%.255s", f->d_name);
             }
             closedir(dd);
             if (first[0]) {
@@ -234,7 +237,7 @@ static int newest_dated_tle(char *out, size_t cap)
             if (L > 4 && strncmp(f->d_name, "tle-", 4) == 0
                 && strcmp(f->d_name + L - 4, ".tle") == 0
                 && strcmp(f->d_name, best) > 0)
-                snprintf(best, sizeof best, "%s", f->d_name);
+                snprintf(best, sizeof best, "%.255s", f->d_name);
         }
         closedir(d2);
         if (best[0]) {
