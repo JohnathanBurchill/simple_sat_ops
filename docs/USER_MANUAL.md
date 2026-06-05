@@ -1327,7 +1327,7 @@ the flight firmware's command set (see [Telecommand
 linting](#telecommand-linting) below).
 
 ```text
-agenda_check [--local-time] [--no-dup-check] [--no-tc-lint] [--prune-dups] [--tle <file>] [<file>]
+agenda_check [--local-time] [--no-dup-check] [--no-tc-lint] [--errors-only] [--prune-dups] [--tle <file>] [<file>]
 ```
 
 | Flag | Effect |
@@ -1335,6 +1335,7 @@ agenda_check [--local-time] [--no-dup-check] [--no-tc-lint] [--prune-dups] [--tl
 | `--local-time` | Render times in the host's local timezone (default UTC). |
 | `--no-dup-check` | Skip the duplicate-line audit (substitute the timestamps only). |
 | `--no-tc-lint` | Skip the telecommand lint (see [Telecommand linting](#telecommand-linting)). |
+| `--errors-only` | Print only the lines with lint errors (line number, command, and reason) to stdout and suppress the rest, so errors don't scroll away in a long agenda. |
 | `--prune-dups` | Drop verbatim-duplicate command lines (keep the first occurrence). Prints a count of how many were pruned. |
 | `--tle <file>` | (sgp4sdp4 builds only) Propagate the first satellite in `<file>` and prepend the execution date-time plus sub-satellite lat/lon/alt to each command. Leaves the command intact (raw unix-ms preserved). |
 
@@ -1397,7 +1398,9 @@ Findings print to stderr (so stdout stays the clean, pipeable agenda) as
 `line N: error: ...` or `line N: warning: ...`. A command not meant for
 routine flight operation - ground-only, high-risk, recovery/expert, or
 flight-testing - is a *warning*, not an error. `--no-tc-lint` disables
-the check.
+the check. `--errors-only` flips the output around: it prints just the
+erroneous lines (number, command, and reason) to stdout and suppresses
+the echoed agenda, so the errors in a long agenda don't scroll away.
 
 The same lint gates `simple_sat_ops` startup: a `--tc-file` agenda with
 lint errors refuses to start unless you pass

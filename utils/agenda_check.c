@@ -80,7 +80,7 @@
 static void usage(FILE *out, const char *progname)
 {
     fprintf(out,
-        "Usage: %s [--local-time] [--no-dup-check] [--no-tc-lint] [--prune-dups] [--tle <file>] [<file>]\n"
+        "Usage: %s [--local-time] [--no-dup-check] [--no-tc-lint] [--errors-only] [--prune-dups] [--tle <file>] [<file>]\n"
         "  Replaces @tssent=<unix_ms> and @tsexec=<unix_ms> values with\n"
         "  human-readable timestamps. UTC by default; --local-time uses\n"
         "  the host's local timezone. Flags verbatim-duplicate TC lines;\n"
@@ -88,6 +88,9 @@ static void usage(FILE *out, const char *progname)
         "  Lints each telecommand against the flight firmware's command set\n"
         "  (names, argument counts, CTS1+...! framing); errors print to stderr\n"
         "  and set a non-zero exit. --no-tc-lint disables that check.\n"
+        "  --errors-only prints ONLY the lines with lint errors (line number,\n"
+        "  command, and reason) to stdout and suppresses the rest, so the\n"
+        "  errors don't scroll away in a long agenda.\n"
         "  With --tle <file> (sgp4sdp4 builds), prepends the execution\n"
         "  date-time plus the sub-satellite lat/lon (deg) and altitude (km),\n"
         "  leaving the command intact (@tsexec=, else @tssent=, else now).\n"
@@ -314,6 +317,7 @@ int main(int argc, char **argv)
     int dup_check = 1;
     int prune_dups = 0;
     int tc_lint = 1;
+    int errors_only = 0;
     const char *path = NULL;
     const char *tle_path = NULL;
     for (int i = 1; i < argc; ++i) {
@@ -323,6 +327,8 @@ int main(int argc, char **argv)
             dup_check = 0;
         } else if (strcmp(argv[i], "--no-tc-lint") == 0) {
             tc_lint = 0;
+        } else if (strcmp(argv[i], "--errors-only") == 0) {
+            errors_only = 1;
         } else if (strcmp(argv[i], "--prune-dups") == 0) {
             prune_dups = 1;
         } else if (strcmp(argv[i], "--tle") == 0) {
@@ -393,7 +399,7 @@ int main(int argc, char **argv)
         // documentation in a telecommand schedule, not commands.
         if (buf[0] == '#' || buf[0] == '\n' || buf[0] == '\r'
                           || buf[0] == '\0') {
-            fputs(buf, stdout);
+            if (!errors_only) fputs(buf, stdout);
             continue;
         }
         ++total_commands;
@@ -429,10 +435,22 @@ int main(int argc, char **argv)
             tcmd_lint_severity_t sev = tcmd_lint_command(cmd, lint_msg, sizeof lint_msg);
             if (sev == TCMD_LINT_ERROR) {
                 ++lint_errors;
-                fprintf(stderr, "agenda_check: line %d: error: %s\n", lineno, lint_msg);
+                if (errors_only) {
+                    // --errors-only: print just the bad lines to stdout --
+                    // the line number, the command as written, and why -- so
+                    // they don't get lost when scrolling a long agenda.
+                    fprintf(stdout, "%d: %s\n     error: %s\n",
+                            lineno, cmd, lint_msg);
+                } else {
+                    fprintf(stderr, "agenda_check: line %d: error: %s\n",
+                            lineno, lint_msg);
+                }
             } else if (sev == TCMD_LINT_WARN) {
                 ++lint_warns;
-                fprintf(stderr, "agenda_check: line %d: warning: %s\n", lineno, lint_msg);
+                if (!errors_only) {
+                    fprintf(stderr, "agenda_check: line %d: warning: %s\n",
+                            lineno, lint_msg);
+                }
             }
         }
 
@@ -517,13 +535,17 @@ int main(int argc, char **argv)
         // Flag duplicates inline only in the default audit mode. With
         // --no-dup-check the markers are off (counts still computed);
         // with --prune-dups the duplicate was already dropped above.
+        // --errors-only suppresses the echoed agenda entirely; only the
+        // erroneous lines (printed by the lint block above) reach stdout.
         const char *cmt_sep = inline_comment[0] ? "  " : "";
-        if (first_seen && dup_check && !prune_dups) {
-            fprintf(stdout, "%s%sDUP(line %d)>%s %s%s%s\n",
-                    prefix, dup_red, first_seen, dup_reset, body,
-                    cmt_sep, inline_comment);
-        } else {
-            fprintf(stdout, "%s%s%s%s\n", prefix, body, cmt_sep, inline_comment);
+        if (!errors_only) {
+            if (first_seen && dup_check && !prune_dups) {
+                fprintf(stdout, "%s%sDUP(line %d)>%s %s%s%s\n",
+                        prefix, dup_red, first_seen, dup_reset, body,
+                        cmt_sep, inline_comment);
+            } else {
+                fprintf(stdout, "%s%s%s%s\n", prefix, body, cmt_sep, inline_comment);
+            }
         }
     }
 
