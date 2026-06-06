@@ -29,6 +29,9 @@
       r                reload now (auto-poll happens every ~1 s anyway)
       t                cycle type filter: all → beacon → tcmd_response →
                        log → bulk_file → all
+      v                cycle the detail-pane payload view: hex → ascii →
+                       base64 (a bulk_file's ascii/base64 show the file
+                       data after the 5-byte type+offset header)
       /                start a LIKE search (substring match against the
                        firmware-interpreted text); Enter applies, Esc
                        cancels, Backspace edits
@@ -164,6 +167,16 @@ static char    like_text[128] = "";
 // sorting still happens server-side against the UTC strings; only the
 // rendered cells change. Toggle with `L`.
 static int     show_local_time = 0;
+
+// Payload view mode in the detail pane, cycled by `v`. Hex is the raw
+// view (whole payload, every packet type). Ascii and base64 are content
+// views: for a bulk_file they interpret the file data (the bytes after
+// the 5-byte type+offset header) so a downloaded text file reads as
+// text or copies out as base64; for any other type they cover the whole
+// payload. Default hex preserves the long-standing dump.
+enum { PV_HEX = 0, PV_ASCII, PV_BASE64 };
+static int         payload_view = PV_HEX;
+static const char *PV_NAME[] = { "hex", "ascii", "base64" };
 
 static int     g_have_color = 0;
 // Toggled by `s`: when on, draw_detail adds a "station: ..." line for
@@ -893,6 +906,178 @@ static void draw_list(int list_top, int list_h, int cols)
     }
 }
 
+// Standard base64 alphabet for the detail pane's base64 payload view.
+static const char B64[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// A bulk_file packet is [type:1][file_offset:4 LE][data...]; only the
+// data is file content. The content views (ascii / base64) skip that
+// 5-byte header so a downloaded file reads as itself. Other packet types
+// have no such framing here, so they are interpreted whole.
+#define BULK_FILE_PACKET_TYPE 0x10
+#define BULK_FILE_HEADER_SIZE 5
+
+// Point *data / *len at the bytes the content views should interpret for
+// row r: the file data for a bulk_file, otherwise the whole payload.
+// Returns 1 if the header was skipped (bulk_file), 0 otherwise.
+static int payload_content_span(const row_t *r, const uint8_t **data, int *len)
+{
+    int is_bulk = (r->packet_type == BULK_FILE_PACKET_TYPE
+                   && r->payload_len > BULK_FILE_HEADER_SIZE);
+    int off = is_bulk ? BULK_FILE_HEADER_SIZE : 0;
+    *data = (r->payload != NULL) ? r->payload + off : NULL;
+    *len  = r->payload_len - off;
+    if (*len < 0) *len = 0;
+    return is_bulk;
+}
+
+// Render r's payload into the detail pane starting at row *yp, in the
+// current payload_view, advancing *yp past what it drew. Hex dumps the
+// whole payload (every type); ascii and base64 render the content span
+// (see payload_content_span). Each mode stops at max_y and, if bytes
+// remain unshown, overwrites its last row with a remainder note.
+static void draw_payload(const row_t *r, int *yp, int max_y, int cols)
+{
+    int y = *yp;
+
+    const uint8_t *data = NULL;
+    int len = 0;
+    int is_bulk = payload_content_span(r, &data, &len);
+
+    char hdr[128];
+    if (payload_view == PV_HEX) {
+        snprintf(hdr, sizeof hdr, "payload (%d bytes) [hex]:",
+                 r->payload_len);
+    } else if (is_bulk) {
+        snprintf(hdr, sizeof hdr,
+                 "payload (%d bytes) [%s; file data %d B, header skipped]:",
+                 r->payload_len, PV_NAME[payload_view], len);
+    } else {
+        snprintf(hdr, sizeof hdr, "payload (%d bytes) [%s]:",
+                 r->payload_len, PV_NAME[payload_view]);
+    }
+    move(y, 0); clrtoeol();
+    mvaddnstr(y, 2, hdr, cols - 2);
+    y++;
+
+    if (payload_view == PV_HEX) {
+        int per_line = (cols - 6) / 3;          // "xx " per byte
+        if (per_line < 8)  per_line = 8;
+        if (per_line > 32) per_line = 32;
+        int shown = 0;
+        while (y < max_y && shown < r->payload_len) {
+            char line[128];
+            int pos = 0;
+            int end = shown + per_line;
+            if (end > r->payload_len) end = r->payload_len;
+            for (int i = shown; i < end && pos + 3 < (int)sizeof line; i++) {
+                pos += snprintf(line + pos, sizeof line - pos, "%02x ",
+                                r->payload[i]);
+            }
+            move(y, 0); clrtoeol();
+            mvaddnstr(y, 4, line, cols - 4);
+            y++;
+            shown = end;
+        }
+        if (shown < r->payload_len && y > 0) {
+            move(y - 1, 0); clrtoeol();
+            mvprintw(y - 1, 4,
+                     "... %d more bytes (packet_query --format=raw)",
+                     r->payload_len - shown);
+        }
+    } else if (payload_view == PV_ASCII) {
+        // Sanitised text: printable bytes verbatim, tab -> space, a
+        // newline breaks to the next row (so a text file reads as
+        // itself), every other byte -> '.'. Long unbroken runs wrap at
+        // the pane width.
+        if (len == 0) {
+            move(y, 0); clrtoeol();
+            mvaddnstr(y, 4, "(no content bytes)", cols - 4);
+            y++;
+        } else {
+            int wrap_w = cols - 4;
+            if (wrap_w < 8) wrap_w = 8;
+            int col = 0, i = 0;
+            move(y, 0); clrtoeol();
+            for (; i < len && y < max_y; i++) {
+                uint8_t b = data[i];
+                if (b == '\n') {
+                    y++;
+                    if (y < max_y) { move(y, 0); clrtoeol(); }
+                    col = 0;
+                    continue;
+                }
+                if (col >= wrap_w) {
+                    y++;
+                    if (y >= max_y) break;
+                    move(y, 0); clrtoeol();
+                    col = 0;
+                }
+                char c = (b >= 0x20 && b < 0x7F) ? (char)b
+                       : (b == '\t')             ? ' '
+                       :                           '.';
+                mvaddch(y, 4 + col, (chtype)c);
+                col++;
+            }
+            if (y < max_y) y++;
+            if (i < len && y > 0) {
+                move(y - 1, 0); clrtoeol();
+                mvprintw(y - 1, 4, "... %d more bytes (packet_query)",
+                         len - i);
+            }
+        }
+    } else {  // PV_BASE64
+        // Standard base64 of the content bytes, wrapped to whole 4-char
+        // quanta per row, so the operator can copy the block out and
+        // decode it elsewhere.
+        if (len == 0) {
+            move(y, 0); clrtoeol();
+            mvaddnstr(y, 4, "(no content bytes)", cols - 4);
+            y++;
+        } else {
+            char line[256];
+            int per_line = cols - 4;
+            if (per_line > (int)sizeof line - 4)
+                per_line = (int)sizeof line - 4;
+            per_line -= per_line % 4;            // whole base64 quanta per row
+            if (per_line < 4) per_line = 4;
+            int pos = 0, i = 0;
+            for (; i < len && y < max_y; i += 3) {
+                int b0 = data[i];
+                int b1 = (i + 1 < len) ? data[i + 1] : 0;
+                int b2 = (i + 2 < len) ? data[i + 2] : 0;
+                uint32_t v = ((uint32_t)b0 << 16)
+                           | ((uint32_t)b1 << 8)
+                           | (uint32_t)b2;
+                line[pos++] = B64[(v >> 18) & 0x3F];
+                line[pos++] = B64[(v >> 12) & 0x3F];
+                line[pos++] = (i + 1 < len) ? B64[(v >> 6) & 0x3F] : '=';
+                line[pos++] = (i + 2 < len) ? B64[v & 0x3F]        : '=';
+                if (pos >= per_line) {
+                    line[pos] = '\0';
+                    move(y, 0); clrtoeol();
+                    mvaddnstr(y, 4, line, cols - 4);
+                    y++;
+                    pos = 0;
+                }
+            }
+            if (pos > 0 && y < max_y) {
+                line[pos] = '\0';
+                move(y, 0); clrtoeol();
+                mvaddnstr(y, 4, line, cols - 4);
+                y++;
+            }
+            if (i < len && y > 0) {
+                move(y - 1, 0); clrtoeol();
+                mvprintw(y - 1, 4, "... %d more bytes (packet_query)",
+                         len - i);
+            }
+        }
+    }
+
+    *yp = y;
+}
+
 static void draw_detail(int top_y, int height, int cols)
 {
     move(top_y, 0);
@@ -1013,39 +1198,10 @@ static void draw_detail(int top_y, int height, int cols)
         p = eol + 1;
     }
 
-    // Payload as a multi-line hex dump filling the rest of the detail
-    // pane. A single line only ever showed ~cols/2 bytes; this lays the
-    // whole payload out, wrapping, and notes any remainder that doesn't
-    // fit the visible rows (use packet_query --format=raw for those).
+    // Payload dump filling the rest of the detail pane, in the operator's
+    // chosen view mode (hex / ascii / base64; cycle with `v`).
     if (y < max_y - 1) {
-        move(y, 0); clrtoeol();
-        mvprintw(y, 2, "payload (%d bytes):", r->payload_len);
-        y++;
-        int per_line = (cols - 6) / 3;          // "xx " per byte
-        if (per_line < 8)  per_line = 8;
-        if (per_line > 32) per_line = 32;
-        int shown = 0;
-        while (y < max_y && shown < r->payload_len) {
-            char line[128];
-            int pos = 0;
-            int end = shown + per_line;
-            if (end > r->payload_len) end = r->payload_len;
-            for (int i = shown; i < end && pos + 3 < (int)sizeof line; i++) {
-                pos += snprintf(line + pos, sizeof line - pos, "%02x ",
-                                r->payload[i]);
-            }
-            move(y, 0); clrtoeol();
-            mvaddnstr(y, 4, line, cols - 4);
-            y++;
-            shown = end;
-        }
-        if (shown < r->payload_len && y > 0) {
-            // Overwrite the last drawn row with a remainder note.
-            move(y - 1, 0); clrtoeol();
-            mvprintw(y - 1, 4,
-                     "... %d more bytes (packet_query --format=raw)",
-                     r->payload_len - shown);
-        }
+        draw_payload(r, &y, max_y, cols);
     }
     while (y < max_y) {
         move(y, 0); clrtoeol(); y++;
@@ -1065,9 +1221,9 @@ static void draw_bottom_bar(int cols, int rows_total, int searching)
     if (searching) {
         hint = " enter accept   esc cancel   backspace edits ";
     } else if (in_group) {
-        hint = " esc/left/bksp back   up/down scroll   r reload   l utc/lt   q quit ";
+        hint = " esc/left/bksp back   up/down scroll   r reload   l utc/lt   v view   q quit ";
     } else {
-        hint = " q quit   up/down scroll   enter group   t type   o origin   / search   l utc/lt   r reload ";
+        hint = " q quit   up/down scroll   enter group   t type   o origin   / search   l utc/lt   v view   r reload ";
     }
     mvaddnstr(rows_total - 1, 0, hint, cols);
     if (g_have_color) attroff(COLOR_PAIR(PAIR_BAR));
@@ -1154,6 +1310,10 @@ static void usage(FILE *out, const char *argv0)
         "  s                toggle the recording-station summary in the\n"
         "                   detail panel (satnogs rows only; the values\n"
         "                   come from <session>/satnogs_<id>.meta.json).\n"
+        "  v                cycle the detail-pane payload view: hex → ascii\n"
+        "                   → base64. A bulk_file's ascii/base64 views show\n"
+        "                   the file data (after the 5-byte type+offset\n"
+        "                   header); hex always shows the whole payload.\n"
         "\n"
         "Options:\n"
         "  --db=<path>      override default DB path. Default, in order:\n"
@@ -1388,6 +1548,13 @@ int main(int argc, char **argv)
                 break;
             case 's':
                 g_show_station = !g_show_station;
+                break;
+            case 'v':
+                // Cycle the detail-pane payload view: hex -> ascii ->
+                // base64. Applies to every row; a bulk_file's ascii /
+                // base64 views show the file data after the 5-byte
+                // header. No requery — the next redraw renders the mode.
+                payload_view = (payload_view + 1) % 3;
                 break;
             case 'L': {  // bottom of viewport (vim convention)
                 int data_h = list_h - 1;
