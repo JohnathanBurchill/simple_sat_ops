@@ -86,6 +86,12 @@
 #define MAX_DELTA_AZIMUTH_DEGREES 1.0
 #define MAX_DELTA_ELEVATION_DEGREES 1.0
 
+// How close a STATUS azimuth must be to the just-commanded home waypoint to
+// be treated as the controller's post-SET target echo -- which it reports
+// for a couple of seconds before its feedback shows real motion -- rather
+// than a real position reading. Used to gate the two-step home's final leg.
+#define HOME_ECHO_TOLERANCE_DEG 2.0
+
 #define WARN_DAYS_SINCE_EPOCH 1.0
 #define MAX_MINUTES_TO_PREDICT ((7 * 1440))
 
@@ -7019,29 +7025,28 @@ int main(int argc, char **argv)
         // Until then the short path is the opposite (winding) way, so issuing
         // the target now sends it back around and it winds up (330 -> 360).
         //
-        // The previous gate was `!antenna_is_moving`, but that flag clears
-        // before the slew even registers in STATUS (the "az unchanged since
-        // last tick" test trips at once), firing the final leg while still
-        // wound -- the reported bug. Gating on the live position instead is
-        // robust. (Unwinds of more than a full turn, prev > 360, would need
-        // more than one waypoint; a single pass winds < 360 so the one mid
-        // waypoint suffices here.)
+        // Complication: after a SET the controller's STATUS reports the
+        // just-commanded target (the mid waypoint) for a couple of seconds
+        // before its feedback shows real motion. So a reading that still
+        // equals the commanded mid is that echo, not the real position --
+        // ignore it. The first reading that DIFFERS is the antenna's true
+        // position; act on that. Mid-slew the real position is far from the
+        // mid waypoint, so there's no echo-vs-arrival ambiguity. (Unwinds
+        // past a full turn, prev > 360, would need more than one waypoint;
+        // a single pass winds < 360, so one mid waypoint suffices.)
         if (state.antenna_rotator.homing_in_progress
             && state.have_antenna_rotator) {
             double final_az  = state.antenna_rotator.home_pending_final_az;
             double mid_az    = state.antenna_rotator.target_azimuth_unwrapped;
+            double from_mid  = fabs(antenna_rotator_wrap_to_pm180(current_az - mid_az));
             double unwind    = final_az - mid_az;   // sign = unwind direction
             double remaining = antenna_rotator_wrap_to_pm180(final_az - current_az);
             int in_zone = (remaining == 0.0)
                        || ((remaining > 0.0) == (unwind > 0.0));
-            // STATUS now always reports the real position (the post-SET
-            // target echo is consumed in the driver, not mistaken for
-            // arrival), so the final leg is safe to issue as soon as the
-            // antenna has unwound into the zone where the short path to the
-            // target runs the same way as the unwind. The two-step always
-            // starts out of this zone (|prev| > 180), so the very first
-            // reading can't fire it early.
-            if (in_zone) {
+            // from_mid > tol => the reading is real feedback, not the post-SET
+            // target echo. The two-step always starts out of the unwind zone
+            // (|prev| > 180), so the stale pre-SET reading can't fire early.
+            if (from_mid > HOME_ECHO_TOLERANCE_DEG && in_zone) {
                 int rc = main_rotator_submit_set(&state, final_az, 0.0);
                 if (rc == ANTENNA_ROTATOR_OK) {
                     state.antenna_rotator.antenna_is_moving = 1;

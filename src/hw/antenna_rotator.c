@@ -127,39 +127,39 @@ int antenna_rotator_command(antenna_rotator_t *antenna_rotator, antenna_rotator_
         return ANTENNA_ROTATOR_BAD_RESPONSE;
     }
 
-    // The Rot2Prog returns a position frame after a SET as well -- it
-    // echoes the just-commanded target. Read that frame so it can't sit in
-    // the serial buffer and be picked up by the next STATUS read (which is
-    // what made STATUS report the target/stale position for a few seconds
-    // after a move, and timing-dependent control logic misbehave). For a
-    // SET, ignore the values entirely: the live position must come only
-    // from a STATUS query, never from a SET, so the target echo is never
-    // mistaken for where the antenna actually is.
+    // The Rot2Prog does not reply to a SET command. (The controller does
+    // briefly report the just-commanded target on STATUS after a move, but
+    // that surfaces in STATUS replies, not as a SET reply -- so there is
+    // nothing to read here; the home logic rejects that echo by value.)
+    if (cmd == ANTENNA_ROTATOR_SET) {
+        return ANTENNA_ROTATOR_OK;
+    }
+
     uint8_t response[AR_RESPONSE_LEN] = {0};
+    ssize_t bytes_received = -1;
     int remaining_buffer = AR_RESPONSE_LEN;
     int offset = 0;
-    while (offset < AR_RESPONSE_LEN) {
-        ssize_t bytes_received = read(antenna_rotator->fd,
-                                      response + offset, remaining_buffer);
-        if (bytes_received <= 0) {
-            // EOF or error. STATUS needs a full frame (handled below); a
-            // SET tolerates a short/absent echo -- the move already went.
+    while (bytes_received != 0) {
+        bytes_received = read(antenna_rotator->fd, response + offset, remaining_buffer);
+        if (bytes_received == -1) {
+            return ANTENNA_ROTATOR_BAD_RESPONSE;
+        }
+        offset += bytes_received;
+        if (offset > AR_RESPONSE_LEN) {
+            offset = AR_RESPONSE_LEN;
+        }
+        remaining_buffer -= bytes_received;
+        if (remaining_buffer <= 0) {
             break;
         }
-        offset += (int) bytes_received;
-        remaining_buffer -= (int) bytes_received;
     }
     printcmd("Antenna rotator response", response, offset);
-
-    if (cmd == ANTENNA_ROTATOR_SET) {
-        return ANTENNA_ROTATOR_OK;   // echo consumed and ignored
-    }
 
     if (offset != AR_RESPONSE_LEN) {
         return ANTENNA_ROTATOR_BAD_RESPONSE;
     }
 
-    // STATUS / STOP report the antenna's current position.
+    // All commands return the current position
     if (azimuth != NULL) {
         *azimuth = (double)(response[1] * 100 + response[2] * 10 + response[3]) + (double)response[4] / 10.0 - 360.0;
     }
