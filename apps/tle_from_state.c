@@ -75,6 +75,8 @@
 #include <string.h>
 #include <time.h>
 
+#include "bestxyz.h"
+
 // Earth gravitational parameter for the two-body starting guess. The
 // final elements come from the SGP4 fit, which uses the library's own
 // gravity model, so this only has to be close enough to seed Newton.
@@ -121,21 +123,52 @@ static double wrap_2pi(double a)
 
 // ---- input file -------------------------------------------------------------
 
-// Next non-blank, non-comment line, trailing whitespace/CR/LF stripped.
-// Returns 0 at end of input.
-static int next_line(FILE *fp, char *buf, size_t cap)
+// Read an entire stream (file, or stdin when path is NULL) into a
+// malloc'd, NUL-terminated buffer. Returns NULL on error.
+static char *slurp(const char *path, size_t *out_len)
 {
-    while (fgets(buf, (int) cap, fp)) {
-        size_t n = strlen(buf);
-        while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r'
-                     || buf[n - 1] == ' ' || buf[n - 1] == '\t'))
-            buf[--n] = '\0';
-        // Skip leading blanks to test for a comment / empty line.
-        const char *p = buf;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '\0' || *p == '#') continue;
-        return 1;
+    FILE *fp = path ? fopen(path, "r") : stdin;
+    if (!fp) return NULL;
+    size_t cap = 8192, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) { if (path) fclose(fp); return NULL; }
+    size_t n;
+    while ((n = fread(buf + len, 1, cap - len, fp)) > 0) {
+        len += n;
+        if (len == cap) {
+            char *grown = realloc(buf, cap *= 2);
+            if (!grown) { free(buf); if (path) fclose(fp); return NULL; }
+            buf = grown;
+        }
     }
+    if (path) fclose(fp);
+    char *fit = realloc(buf, len + 1);
+    if (fit) buf = fit;
+    buf[len] = '\0';
+    if (out_len) *out_len = len;
+    return buf;
+}
+
+// Next non-blank, non-comment line from a NUL-terminated buffer; advances
+// *cur past it and copies the trimmed text into out. Returns 0 at the end.
+static int buf_line(const char **cur, char *out, size_t cap)
+{
+    const char *p = *cur;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        const char *end = nl ? nl : p + strlen(p);
+        size_t len = (size_t) (end - p);
+        if (len >= cap) len = cap - 1;
+        memcpy(out, p, len);
+        out[len] = '\0';
+        while (len && (out[len - 1] == '\r' || out[len - 1] == ' ' || out[len - 1] == '\t'))
+            out[--len] = '\0';
+        p = nl ? nl + 1 : end;
+        const char *q = out;
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q && *q != '#') { *cur = p; return 1; }
+    }
+    *cur = p;
     return 0;
 }
 
@@ -510,6 +543,11 @@ static void usage(const char *prog)
         "  5  velocity 1-sigma    metres/second\n"
         "Position and velocity are Earth-fixed (ECEF/ITRF) unless --frame=eci.\n"
         "\n"
+        "Or paste a NovAtel OEM7 BESTXYZA log (the FrontierSat telecommand\n"
+        "response) as the input instead -- any leading wrapper is skipped, the\n"
+        "CRC is checked, and the epoch is taken from the GPS week/seconds in its\n"
+        "header. It is auto-detected; --format forces the input kind.\n"
+        "\n"
         "Options:\n"
         "  --name <s>        name line (default FrontierSat; --no-name omits it)\n"
         "  --no-name         emit a bare two-line set, no name line\n"
@@ -517,7 +555,11 @@ static void usage(const char *prog)
         "  --intl <s>        international designator, e.g. 25001A (default blank)\n"
         "  --elset <n>       element set number, 0..9999 (default 1)\n"
         "  --revnum <n>      revolution number at epoch, 0..99999 (default 0)\n"
-        "  --frame <f>       ecef (default) or eci: frame of the input vectors\n"
+        "  --frame <f>       ecef (default) or eci: frame of a 5-line state\n"
+        "  --format <k>      input kind: auto (default), state, or bestxyz\n"
+        "  --leap-seconds <n> GPS-UTC offset for BESTXYZA epochs (default 18)\n"
+        "  --strict-crc      refuse a BESTXYZA log whose CRC does not match\n"
+        "  --print-state     print the parsed 5-line state (with epoch) and stop\n"
         "  --sigma-k <x>     gate multiplier: warn if residual > x*sigma (default 1)\n"
         "  --strict-sigma    exit nonzero and emit no TLE if the gate fails\n"
         "  --max-iter <n>    differential-correction iteration cap (default 60)\n"
@@ -558,6 +600,9 @@ int main(int argc, char **argv)
     int frame_eci = 0, strict_sigma = 0;
     double sigma_k = 1.0;
     char classd = 'U';
+    enum { FMT_AUTO, FMT_STATE, FMT_BESTXYZ } fmt = FMT_AUTO;
+    int leap_seconds = BESTXYZ_DEFAULT_LEAP_SECONDS;
+    int strict_crc = 0, print_state = 0;
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i], *val;
@@ -565,6 +610,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) verbose = 1;
         else if (!strcmp(a, "--no-name")) emit_name = 0;
         else if (!strcmp(a, "--strict-sigma")) strict_sigma = 1;
+        else if (!strcmp(a, "--strict-crc")) strict_crc = 1;
+        else if (!strcmp(a, "--print-state")) print_state = 1;
         else if ((val = match_opt(argv, argc, &i, "--name"))) name = val;
         else if ((val = match_opt(argv, argc, &i, "--intl"))) intl = val;
         else if ((val = match_opt(argv, argc, &i, "--catnr"))) catnr = atoi(val);
@@ -572,6 +619,13 @@ int main(int argc, char **argv)
         else if ((val = match_opt(argv, argc, &i, "--revnum"))) revnum = atoi(val);
         else if ((val = match_opt(argv, argc, &i, "--max-iter"))) max_iter = atoi(val);
         else if ((val = match_opt(argv, argc, &i, "--sigma-k"))) sigma_k = atof(val);
+        else if ((val = match_opt(argv, argc, &i, "--leap-seconds"))) leap_seconds = atoi(val);
+        else if ((val = match_opt(argv, argc, &i, "--format"))) {
+            if (!strcmp(val, "auto")) fmt = FMT_AUTO;
+            else if (!strcmp(val, "state")) fmt = FMT_STATE;
+            else if (!strcmp(val, "bestxyz") || !strcmp(val, "bestxyza")) fmt = FMT_BESTXYZ;
+            else { fprintf(stderr, "--format must be auto, state or bestxyz\n"); return EXIT_FAILURE; }
+        }
         else if ((val = match_opt(argv, argc, &i, "--frame"))) {
             if (!strcmp(val, "eci")) frame_eci = 1;
             else if (!strcmp(val, "ecef")) frame_eci = 0;
@@ -590,34 +644,101 @@ int main(int argc, char **argv)
     if (elset < 0 || elset > 9999) { fprintf(stderr, "--elset out of range (0..9999)\n"); return EXIT_FAILURE; }
     if (revnum < 0 || revnum > 99999) { fprintf(stderr, "--revnum out of range (0..99999)\n"); return EXIT_FAILURE; }
 
-    FILE *fp = path ? fopen(path, "r") : stdin;
-    if (!fp) { fprintf(stderr, "Cannot open %s\n", path); return EXIT_FAILURE; }
+    size_t inlen = 0;
+    char *input = slurp(path, &inlen);
+    if (!input) { fprintf(stderr, "Cannot read %s\n", path ? path : "stdin"); return EXIT_FAILURE; }
 
-    // Read the five data lines.
-    char l_epoch[256], l_pos[256], l_dpos[256], l_vel[256], l_dvel[256];
-    int ok = next_line(fp, l_epoch, sizeof l_epoch)
-          && next_line(fp, l_pos,  sizeof l_pos)
-          && next_line(fp, l_dpos, sizeof l_dpos)
-          && next_line(fp, l_vel,  sizeof l_vel)
-          && next_line(fp, l_dvel, sizeof l_dvel);
-    if (path) fclose(fp);
-    if (!ok) {
-        fprintf(stderr, "Need five data lines: epoch, position, position-sigma, "
-                        "velocity, velocity-sigma.\n");
-        return EXIT_FAILURE;
-    }
+    // Either a BESTXYZA log (telecommand response) or the five-line state
+    // file. Auto-detect on the BESTXYZ marker; --format forces it.
+    int is_bestxyz = (fmt == FMT_BESTXYZ)
+                  || (fmt == FMT_AUTO && strstr(input, "BESTXYZ") != NULL);
 
     int year, mon, day, hh, mm;
     double ss;
-    if (parse_epoch(l_epoch, &year, &mon, &day, &hh, &mm, &ss) != 0) {
-        fprintf(stderr, "Bad epoch '%s' (want YYYY-MM-DDThh:mm:ssZ)\n", l_epoch);
-        return EXIT_FAILURE;
+    double r_in[3], sig_r[3], v_in[3], sig_v[3];   // metres, metres/second
+
+    if (is_bestxyz) {
+        bestxyz_t b;
+        char perr[160];
+        if (bestxyz_parse(input, &b, perr, sizeof perr) != 0) {
+            fprintf(stderr, "BESTXYZA parse failed: %s\n", perr);
+            free(input);
+            return EXIT_FAILURE;
+        }
+        free(input);
+
+        // A NovAtel solution is Earth-fixed; the --frame choice does not apply.
+        frame_eci = 0;
+
+        if (b.crc_present && !b.crc_ok) {
+            fprintf(stderr, "BESTXYZA: CRC MISMATCH (read %08x, computed %08x)%s\n",
+                    b.crc_read, b.crc_calc,
+                    strict_crc ? " -- refusing (--strict-crc)" : " -- continuing anyway");
+            if (strict_crc) return EXIT_FAILURE;
+        } else if (!b.crc_present) {
+            fprintf(stderr, "BESTXYZA: no CRC in input; message integrity not checked.\n");
+        } else {
+            fprintf(stderr, "BESTXYZA: CRC ok (%08x)\n", b.crc_read);
+        }
+        if (strcmp(b.pos_sol_status, "SOL_COMPUTED") != 0)
+            fprintf(stderr, "BESTXYZA: WARNING position solution status is %s "
+                            "(not SOL_COMPUTED) -- the fix may be unreliable.\n", b.pos_sol_status);
+        if (strcmp(b.vel_sol_status, "SOL_COMPUTED") != 0)
+            fprintf(stderr, "BESTXYZA: WARNING velocity solution status is %s "
+                            "(not SOL_COMPUTED).\n", b.vel_sol_status);
+        if (fabs(b.vel_latency) > 1e-3)
+            fprintf(stderr, "BESTXYZA: note velocity latency %.3f s; using the header "
+                            "epoch for both position and velocity.\n", b.vel_latency);
+
+        bestxyz_gps_to_utc(b.gps_week, b.gps_sow, leap_seconds,
+                           &year, &mon, &day, &hh, &mm, &ss);
+        memcpy(r_in, b.pos, sizeof r_in);
+        memcpy(sig_r, b.pos_sigma, sizeof sig_r);
+        memcpy(v_in, b.vel, sizeof v_in);
+        memcpy(sig_v, b.vel_sigma, sizeof sig_v);
+
+        fprintf(stderr,
+            "BESTXYZA: GPS week %d sow %.3f -> %04d-%02d-%02dT%02d:%02d:%06.3fZ (leap %d s)\n"
+            "          pos type %s, vel type %s, sats %d/%d, sol age %.1f s\n",
+            b.gps_week, b.gps_sow, year, mon, day, hh, mm, ss, leap_seconds,
+            b.pos_type, b.vel_type, b.num_sol_sv, b.num_sv, b.sol_age);
+    } else {
+        const char *cur = input;
+        char l_epoch[256], l_pos[256], l_dpos[256], l_vel[256], l_dvel[256];
+        int ok = buf_line(&cur, l_epoch, sizeof l_epoch)
+              && buf_line(&cur, l_pos,  sizeof l_pos)
+              && buf_line(&cur, l_dpos, sizeof l_dpos)
+              && buf_line(&cur, l_vel,  sizeof l_vel)
+              && buf_line(&cur, l_dvel, sizeof l_dvel);
+        if (!ok) {
+            fprintf(stderr, "Need five data lines: epoch, position, position-sigma, "
+                            "velocity, velocity-sigma.\n");
+            free(input);
+            return EXIT_FAILURE;
+        }
+        int bad_epoch = (parse_epoch(l_epoch, &year, &mon, &day, &hh, &mm, &ss) != 0);
+        int bad_vec = !parse_triplet(l_pos, r_in) || !parse_triplet(l_dpos, sig_r)
+                   || !parse_triplet(l_vel, v_in) || !parse_triplet(l_dvel, sig_v);
+        free(input);
+        if (bad_epoch) {
+            fprintf(stderr, "Bad epoch '%s' (want YYYY-MM-DDThh:mm:ssZ)\n", l_epoch);
+            return EXIT_FAILURE;
+        }
+        if (bad_vec) {
+            fprintf(stderr, "Could not parse three numbers from a position/velocity line.\n");
+            return EXIT_FAILURE;
+        }
     }
-    double r_in[3], sig_r[3], v_in[3], sig_v[3];
-    if (!parse_triplet(l_pos, r_in) || !parse_triplet(l_dpos, sig_r)
-        || !parse_triplet(l_vel, v_in) || !parse_triplet(l_dvel, sig_v)) {
-        fprintf(stderr, "Could not parse three numbers from a position/velocity line.\n");
-        return EXIT_FAILURE;
+
+    // Optionally just show the parsed state (metres, m/s) -- handy for
+    // checking a pasted BESTXYZA log, and reusable as a state file.
+    if (print_state) {
+        printf("%04d-%02d-%02dT%02d:%02d:%06.3fZ\n", year, mon, day, hh, mm, ss);
+        printf("%.4f, %.4f, %.4f\n", r_in[0], r_in[1], r_in[2]);
+        printf("%.4f, %.4f, %.4f\n", sig_r[0], sig_r[1], sig_r[2]);
+        printf("%.6f, %.6f, %.6f\n", v_in[0], v_in[1], v_in[2]);
+        printf("%.6f, %.6f, %.6f\n", sig_v[0], sig_v[1], sig_v[2]);
+        return EXIT_SUCCESS;
     }
 
     // metres -> km, m/s -> km/s.

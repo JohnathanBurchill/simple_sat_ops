@@ -227,6 +227,15 @@ target_include_directories(tle_csv_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(tle_csv_selftest PRIVATE m)
 list(APPEND SSO_TARGETS tle_csv_selftest)
 
+# NovAtel BESTXYZA parser self-test: the team's example log checked
+# against their Python field values, plus the GPS-week/seconds epoch,
+# the message CRC, and the wrapper / corruption paths. Pure POSIX.
+add_executable(bestxyz_selftest
+               unit_tests/bestxyz_selftest.c src/orbit/bestxyz.c)
+target_include_directories(bestxyz_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(bestxyz_selftest PRIVATE m)
+list(APPEND SSO_TARGETS bestxyz_selftest)
+
 # Agenda-line self-test: the shared inline-comment rule (agenda_line.c)
 # that simple_sat_ops (transmit) and agenda_check (audit) both use to
 # split a telecommand from a trailing '#' comment. Pure POSIX.
@@ -746,7 +755,7 @@ if (SGP4SDP4_LIB)
     # a two-body solve for a guess, then an SGP4 differential correction so
     # the elements reproduce the state under this build's own propagator.
     # Drives SGP4 directly (no select_ephemeris), so just the library + m.
-    add_executable(tle_from_state apps/tle_from_state.c)
+    add_executable(tle_from_state apps/tle_from_state.c src/orbit/bestxyz.c)
     target_link_libraries(tle_from_state PRIVATE ${SGP4SDP4_LIB} m)
     list(APPEND SSO_TARGETS tle_from_state)
 

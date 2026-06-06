@@ -393,6 +393,7 @@ int main(int argc, char **argv)
     static const char *names[] = {
         "rs_selftest",
         "tle_csv_selftest",
+        "bestxyz_selftest",
         "antenna_rotator_selftest",
         "modem_iq_selftest",
         "ax100_selftest",
@@ -408,10 +409,10 @@ int main(int argc, char **argv)
         "tx_burst_selftest",
     };
     int n_names = (int)(sizeof names / sizeof names[0]);
-    group_t groups[16];
+    group_t groups[24];
     int n_groups = 0;
     for (int i = 0; i < n_names; ++i) {
-        add_group_if_exists(groups, &n_groups, 16, rdir, names[i]);
+        add_group_if_exists(groups, &n_groups, 24, rdir, names[i]);
     }
     if (n_groups == 0) {
         fprintf(stderr, "runner: no *_selftest binaries found next to %s\n",
