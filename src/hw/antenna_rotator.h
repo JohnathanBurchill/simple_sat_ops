@@ -76,6 +76,11 @@ typedef struct antenna_rotator
     // Pending second leg when a home-return needs an intermediate waypoint.
     double home_pending_final_az;
     int homing_in_progress;
+    // Two-step home: set once we've seen the antenna's real (moving)
+    // position out of the final-approach zone, so the controller's
+    // post-SET target echo isn't mistaken for "arrived" and the final
+    // leg isn't issued while still wound.
+    int home_saw_motion;
     int fixed_target;
     int tracking;
     double tracking_prep_time_minutes;

@@ -7011,17 +7011,49 @@ int main(int argc, char **argv)
             last_el = current_el;
         }
 
-        // Drive the second leg of a two-step home once the first leg has stopped.
+        // Drive the second leg of a two-step home. The first leg drops a mid
+        // waypoint to start the antenna unwinding; the final 'go to target'
+        // must wait until the antenna has unwound far enough that the
+        // controller's SHORT path to the target runs the SAME way as the
+        // unwind -- i.e. it has reached the 0..180 zone on the unwinding side.
+        // Until then the short path is the opposite (winding) way, so issuing
+        // the target now sends it back around and it winds up (330 -> 360).
+        //
+        // The previous gate was `!antenna_is_moving`, but that flag clears
+        // before the slew even registers in STATUS (the "az unchanged since
+        // last tick" test trips at once), firing the final leg while still
+        // wound -- the reported bug. Gating on the live position instead is
+        // robust. (Unwinds of more than a full turn, prev > 360, would need
+        // more than one waypoint; a single pass winds < 360 so the one mid
+        // waypoint suffices here.)
         if (state.antenna_rotator.homing_in_progress
-            && !state.antenna_rotator.antenna_is_moving
             && state.have_antenna_rotator) {
-            double final_az = state.antenna_rotator.home_pending_final_az;
-            int rc = main_rotator_submit_set(&state, final_az, 0.0);
-            if (rc == ANTENNA_ROTATOR_OK) {
-                state.antenna_rotator.antenna_is_moving = 1;
+            double final_az  = state.antenna_rotator.home_pending_final_az;
+            double mid_az    = state.antenna_rotator.target_azimuth_unwrapped;
+            double unwind    = final_az - mid_az;   // sign = unwind direction
+            double remaining = antenna_rotator_wrap_to_pm180(final_az - current_az);
+            int aligned = (remaining == 0.0)
+                       || ((remaining > 0.0) == (unwind > 0.0));
+            if (!aligned) {
+                // Out of the final-approach zone: this is the antenna's real
+                // (moving) position, not the target the Rot2Prog echoes on
+                // the first STATUS after a SET. Seeing it makes a later
+                // in-zone reading trustworthy rather than that premature echo
+                // (which reads as the mid waypoint and would fire leg 2 while
+                // the antenna is still wound).
+                state.antenna_rotator.home_saw_motion = 1;
+            } else if (state.antenna_rotator.home_saw_motion) {
+                int rc = main_rotator_submit_set(&state, final_az, 0.0);
+                if (rc == ANTENNA_ROTATOR_OK) {
+                    state.antenna_rotator.antenna_is_moving = 1;
+                }
+                state.antenna_rotator.homing_in_progress = 0;
+                state.antenna_rotator.home_pending_final_az = 0.0;
+                char det[96];
+                snprintf(det, sizeof det, "leg2 fired at az=%.1f -> %.1f",
+                         current_az, final_az);
+                sso_audit_event("home", det);
             }
-            state.antenna_rotator.homing_in_progress = 0;
-            state.antenna_rotator.home_pending_final_az = 0.0;
         }
         // --scan-sky: drives a sky grid one target at a time, dwelling
         // SCAN_DWELL_S at each. Bypasses the satellite_tracking +
@@ -8396,6 +8428,21 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
     double final_az = antenna_rotator_home_unwrapped_target(prev, azimuth);
     double delta = final_az - prev;
 
+    // Trace the home decision (audit log + a brief on-screen line) so the
+    // unwind can be confirmed at the rotator: |delta| > 180 takes the
+    // two-step unwind (mid waypoint, then the final leg once it's reached
+    // the 0..180 zone -- see the loop), otherwise a direct move.
+    {
+        char det[128];
+        snprintf(det, sizeof det, "from az=%.1f to %.1f delta=%+.1f (%s)",
+                 prev, final_az, delta,
+                 (fabs(delta) > 180.0) ? "two-step unwind" : "direct");
+        sso_audit_event("home", det);
+        cmd_set_status("home: %.1f -> %.1f, %+.1f deg %s (%s)",
+                       prev, final_az, delta, delta < 0.0 ? "CCW" : "CW",
+                       (fabs(delta) > 180.0) ? "unwind" : "direct");
+    }
+
     if (fabs(delta) > 180.0) {
         // Two-step home: halfway waypoint first to disambiguate the
         // direction of rotation; the main loop drives the second leg
@@ -8407,6 +8454,7 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
             mid = ANTENNA_ROTATOR_MAXIMUM_AZIMUTH;
         state->antenna_rotator.home_pending_final_az = final_az;
         state->antenna_rotator.homing_in_progress = 1;
+        state->antenna_rotator.home_saw_motion = 0;
         int rc = main_rotator_submit_set(state, mid, elevation);
         if (rc == ANTENNA_ROTATOR_OK) {
             state->antenna_rotator.antenna_is_moving = 1;
