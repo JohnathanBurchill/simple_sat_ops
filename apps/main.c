@@ -7032,17 +7032,16 @@ int main(int argc, char **argv)
             double mid_az    = state.antenna_rotator.target_azimuth_unwrapped;
             double unwind    = final_az - mid_az;   // sign = unwind direction
             double remaining = antenna_rotator_wrap_to_pm180(final_az - current_az);
-            int aligned = (remaining == 0.0)
+            int in_zone = (remaining == 0.0)
                        || ((remaining > 0.0) == (unwind > 0.0));
-            if (!aligned) {
-                // Out of the final-approach zone: this is the antenna's real
-                // (moving) position, not the target the Rot2Prog echoes on
-                // the first STATUS after a SET. Seeing it makes a later
-                // in-zone reading trustworthy rather than that premature echo
-                // (which reads as the mid waypoint and would fire leg 2 while
-                // the antenna is still wound).
-                state.antenna_rotator.home_saw_motion = 1;
-            } else if (state.antenna_rotator.home_saw_motion) {
+            // STATUS now always reports the real position (the post-SET
+            // target echo is consumed in the driver, not mistaken for
+            // arrival), so the final leg is safe to issue as soon as the
+            // antenna has unwound into the zone where the short path to the
+            // target runs the same way as the unwind. The two-step always
+            // starts out of this zone (|prev| > 180), so the very first
+            // reading can't fire it early.
+            if (in_zone) {
                 int rc = main_rotator_submit_set(&state, final_az, 0.0);
                 if (rc == ANTENNA_ROTATOR_OK) {
                     state.antenna_rotator.antenna_is_moving = 1;
@@ -8454,7 +8453,6 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
             mid = ANTENNA_ROTATOR_MAXIMUM_AZIMUTH;
         state->antenna_rotator.home_pending_final_az = final_az;
         state->antenna_rotator.homing_in_progress = 1;
-        state->antenna_rotator.home_saw_motion = 0;
         int rc = main_rotator_submit_set(state, mid, elevation);
         if (rc == ANTENNA_ROTATOR_OK) {
             state->antenna_rotator.antenna_is_moving = 1;

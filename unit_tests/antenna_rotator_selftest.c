@@ -33,6 +33,7 @@
 #include "antenna_rotator.h"
 #include "tap.h"
 
+#include <fcntl.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -493,6 +494,12 @@ static int rotator_pair_init(antenna_rotator_t *r, int *test_fd)
     memset(r, 0, sizeof(*r));
     r->fd = sv[0];
     r->connected = 1;
+    // The real driver reads with the tty's 0.5 s VTIME timeout; a socketpair
+    // has no such bound, so make the rotator-side fd non-blocking. Then a
+    // command that reads a response (now including SET, which consumes the
+    // rotator's post-set echo) returns at once when no bytes are queued
+    // instead of hanging the test.
+    fcntl(sv[0], F_SETFL, O_NONBLOCK);
     *test_fd = sv[1];
     return 0;
 }
@@ -630,8 +637,10 @@ static void test_increase_azimuth_base_selection(void)
 // ---------------------------------------------- command() wire protocol
 
 // Contract: SET command writes 13 bytes: 'W' AZ4 0x00 EL4 0x00 cmd ' '
-// where AZ4 and EL4 are ASCII digit encodings of (value + 360). Returns
-// OK without reading (rotator does not respond to SET).
+// where AZ4 and EL4 are ASCII digit encodings of (value + 360). The driver
+// reads the rotator's post-set echo frame (to keep the serial stream
+// aligned for the next STATUS) but ignores its values -- the live position
+// comes only from STATUS, never from a SET.
 static void test_set_command_wire_format(void)
 {
     fprintf(stderr, "command(SET) wire format:\n");
@@ -642,9 +651,17 @@ static void test_set_command_wire_format(void)
         return;
     }
 
+    // Pre-load a post-set echo frame with values *different* from the
+    // commanded ones, so we can prove SET reads-but-ignores it.
+    uint8_t echo[AR_RESPONSE_LEN];
+    encode_status_response(echo, 200.0, 100.0);
+    write(test_fd, echo, AR_RESPONSE_LEN);
+
     double az = 10.0, el = 5.0;
     int rc = antenna_rotator_command(&r, ANTENNA_ROTATOR_SET, &az, &el);
-    check(rc == ANTENNA_ROTATOR_OK, "SET returns OK without reading");
+    check(rc == ANTENNA_ROTATOR_OK, "SET returns OK (echo consumed)");
+    check(az == 10.0 && el == 5.0,
+          "SET ignores the echoed position (az/el unchanged)");
 
     uint8_t buf[AR_CMD_LEN] = {0};
     ssize_t n = read(test_fd, buf, AR_CMD_LEN);
