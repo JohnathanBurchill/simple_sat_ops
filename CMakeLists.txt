@@ -742,6 +742,14 @@ if (SGP4SDP4_LIB)
     target_link_libraries(tle_keps PRIVATE ${SGP4SDP4_LIB} m)
     list(APPEND SSO_TARGETS tle_keps)
 
+    # TLE from a single GNSS position/velocity state vector. ECEF->inertial,
+    # a two-body solve for a guess, then an SGP4 differential correction so
+    # the elements reproduce the state under this build's own propagator.
+    # Drives SGP4 directly (no select_ephemeris), so just the library + m.
+    add_executable(tle_from_state apps/tle_from_state.c)
+    target_link_libraries(tle_from_state PRIVATE ${SGP4SDP4_LIB} m)
+    list(APPEND SSO_TARGETS tle_from_state)
+
     # Live side-by-side TLE comparison (needs ncurses for the live UI).
     if (NCURSES_FOUND)
         add_executable(tle_compare apps/tle_compare.c
