@@ -8432,6 +8432,27 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
     double final_az = antenna_rotator_home_unwrapped_target(prev, azimuth);
     double delta = final_az - prev;
 
+    // Already at the target (azimuth and elevation both within the rotator's
+    // deadband)? Do nothing instead of issuing a zero-length SET -- on this
+    // controller a SET kicks off a couple of seconds of target-echo on STATUS
+    // and a spurious "moving" state, for no actual move. delta is the raw
+    // rotation the unwind needs, so a wound antenna (|delta| large) still
+    // moves; only a genuine no-op is skipped.
+    if (fabs(delta) <= MAX_DELTA_AZIMUTH_DEGREES
+        && fabs(elevation - state->antenna_rotator.elevation)
+               <= MAX_DELTA_ELEVATION_DEGREES) {
+        state->antenna_rotator.target_azimuth_unwrapped = final_az;
+        state->antenna_rotator.target_azimuth           = final_az;
+        state->antenna_rotator.target_elevation         = elevation;
+        state->antenna_rotator.unwrapped_target_valid   = 1;
+        state->antenna_rotator.homing_in_progress       = 0;
+        state->antenna_rotator.home_pending_final_az    = 0.0;
+        cmd_set_status("home: already at %.1f, %.1f deg -- no move",
+                       prev, state->antenna_rotator.elevation);
+        sso_audit_event("home", "already at target -- no move");
+        return ANTENNA_ROTATOR_OK;
+    }
+
     // Trace the home decision (audit log + a brief on-screen line) so the
     // unwind can be confirmed at the rotator: |delta| > 180 takes the
     // two-step unwind (mid waypoint, then the final leg once it's reached
