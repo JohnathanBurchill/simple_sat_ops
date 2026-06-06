@@ -2500,6 +2500,7 @@ typedef struct {
     int    repeats_total;  // parsed from repeats at start
     double delay_s_val;    // parsed from delay_s at start
     long   next_send_ns;
+    long   start_ns;       // wall-clock at run start, for elapsed TX time
     int    sends_total;    // running tally — every queued burst
     // On-air seconds accumulated and total, computed from each
     // command's payload length using the AX100/9600/preroll/postroll
@@ -2517,26 +2518,32 @@ static auto_tcmd_t  g_auto_tcmd;
 // CLI can be parsed before all the modal infrastructure is up.
 static char         g_auto_tcmd_file_path[512]   = "";
 
-// On-air seconds for a single AX100 burst with the given ASCII
-// payload length. Mirrors the framing math in tx_burst.c's build_iq:
+// Wall-clock seconds one auto-tcmd send occupies, end to end. Mirrors
+// the framing and the fixed timing in tx_burst.c's build_iq / tx_burst_run:
 //
 //   frame_bytes = prefill(32) + ASM(4) + Golay(3)
 //                 + csp_hdr(4) + payload + hmac(4) + rs_parity(32)
 //                 + tailfill(1)
 //               = 80 + payload
 //
-//   on_air_s    = g_tx_preroll_ms/1000 + frame_bytes * 8 / bit_rate
+//   burst_s     = start_delay(0.5)            // UHD timed-start lead
+//                 + g_tx_preroll_ms/1000       // modulated 0xAA carrier
+//                 + frame_bytes * 8 / bit_rate // the frame itself
 //                 + postroll(0.050)
 //
-// auto-tcmd always sets repeat=1, gap=200ms (line 3164 region) — the
-// gap and any repeat>1 multiplier are folded in by the caller, not
-// here, so this helper stays a pure per-burst quantum.
+// The start lead matters: tx_burst_run schedules the burst 0.5 s ahead
+// and blocks until it completes, so each send is inhibited for the whole
+// span -- leaving it out is most of the per-burst underestimate. auto-tcmd
+// sends one burst per shot (repeat=1); the repeat count and inter-send
+// delay are folded in by the caller, so this stays a per-send quantum.
 static double auto_tcmd_burst_seconds(size_t payload_len) {
-    const double preroll_s  = (double) g_tx_preroll_ms * 1e-3;
-    const double postroll_s = 0.050;
-    const double bit_rate   = 9600.0;
+    const double start_delay_s = 0.500;   // tx_burst.c start_delay_s
+    const double preroll_s     = (double) g_tx_preroll_ms * 1e-3;
+    const double postroll_s    = 0.050;   // tx_burst.c postroll_ms
+    const double bit_rate      = 9600.0;
     size_t frame_bytes = 80 + payload_len;
-    return preroll_s + ((double)(frame_bytes * 8) / bit_rate) + postroll_s;
+    return start_delay_s + preroll_s
+         + ((double)(frame_bytes * 8) / bit_rate) + postroll_s;
 }
 
 // "Xm Ys" formatter for the Progress line. Caller's buffer needs ~16
@@ -3462,7 +3469,7 @@ static void auto_tcmd_draw(void) {
         fmt_minsec(a->tx_seconds_total, tx_total, sizeof tx_total);
         mvwprintw(w, 10, 2,
                   "Progress: cmd %d/%d   send %d/%d   total sent: %d   "
-                  "(TX: %s / %s)",
+                  "(elapsed %s / ~%s)",
                   a->cmd_idx + (a->state == AUTO_STATE_RUNNING ? 1 : 0),
                   a->n_commands,
                   a->repeat_idx, rt,
@@ -3620,12 +3627,23 @@ static int auto_tcmd_start(void) {
     a->repeat_idx    = 0;
     a->sends_total   = 0;
     a->tx_seconds_spent = 0.0;
+    // Wall-clock estimate for the whole run. auto_tcmd_tick spaces sends
+    // by max(delay, burst): it waits `delay` measured from the start of
+    // each send AND for that send's burst to clear, so the delay and the
+    // burst overlap rather than add. Every command is sent `repeats`
+    // times; only the final send has no trailing delay.
     a->tx_seconds_total = 0.0;
+    double last_burst = 0.0;
     for (int i = 0; i < a->n_commands; ++i) {
-        a->tx_seconds_total +=
-            auto_tcmd_burst_seconds(strlen(a->commands[i])) * (double) repeats;
+        double burst = auto_tcmd_burst_seconds(strlen(a->commands[i]));
+        double slot  = (burst > delay) ? burst : delay;
+        a->tx_seconds_total += slot * (double) repeats;
+        last_burst = burst;
     }
-    a->next_send_ns  = ts_now_ns();  // first send fires immediately
+    if (a->n_commands > 0 && delay > last_burst)
+        a->tx_seconds_total -= (delay - last_burst);
+    a->start_ns      = ts_now_ns();
+    a->next_send_ns  = a->start_ns;  // first send fires immediately
     a->state         = AUTO_STATE_RUNNING;
     snprintf(a->status_msg, sizeof a->status_msg,
              "running: %d cmds × %d repeats, %.2f s delay",
@@ -3734,6 +3752,17 @@ static void auto_tcmd_tick(state_t *state) {
     auto_tcmd_t *a = &g_auto_tcmd;
     if (a->state != AUTO_STATE_RUNNING) return;
 
+    // Elapsed wall-clock since the run started, capped at the estimate,
+    // so the Progress line reads elapsed/total (inter-send delays and the
+    // burst start lead included) rather than on-air seconds only. Frozen
+    // automatically once the state leaves RUNNING -- this returns early then.
+    {
+        double elapsed = (double) (ts_now_ns() - a->start_ns) * 1e-9;
+        if (elapsed < 0.0) elapsed = 0.0;
+        if (elapsed > a->tx_seconds_total) elapsed = a->tx_seconds_total;
+        a->tx_seconds_spent = elapsed;
+    }
+
     // LOS guard. We consider the pass over once the elevation has
     // gone negative AND the predictor has rolled the next pass into
     // the future. Sitting on a freshly-loaded prediction during AOS
@@ -3790,7 +3819,6 @@ static void auto_tcmd_tick(state_t *state) {
     g_tx_request.pending = 1;
     snprintf(a->last_sent, sizeof a->last_sent, "%s", cmd);
     a->sends_total++;
-    a->tx_seconds_spent += auto_tcmd_burst_seconds(n);
 
     a->repeat_idx++;
     if (a->repeat_idx >= a->repeats_total) {
