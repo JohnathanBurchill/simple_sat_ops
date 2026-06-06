@@ -173,9 +173,9 @@ static int     show_local_time = 0;
 // views: for a bulk_file they interpret the file data (the bytes after
 // the 5-byte type+offset header) so a downloaded text file reads as
 // text or copies out as base64; for any other type they cover the whole
-// payload. Default hex preserves the long-standing dump.
+// payload. Defaults to ascii (`v` cycles ascii -> base64 -> hex).
 enum { PV_HEX = 0, PV_ASCII, PV_BASE64 };
-static int         payload_view = PV_HEX;
+static int         payload_view = PV_ASCII;
 static const char *PV_NAME[] = { "hex", "ascii", "base64" };
 
 static int     g_have_color = 0;
