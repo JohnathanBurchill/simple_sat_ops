@@ -511,7 +511,7 @@ static void usage(const char *prog)
         "Position and velocity are Earth-fixed (ECEF/ITRF) unless --frame=eci.\n"
         "\n"
         "Options:\n"
-        "  --name <s>        name line (default FRONTIERSAT; --no-name omits it)\n"
+        "  --name <s>        name line (default FrontierSat; --no-name omits it)\n"
         "  --no-name         emit a bare two-line set, no name line\n"
         "  --catnr <n>       catalogue number, 1..99999 (default 69015)\n"
         "  --intl <s>        international designator, e.g. 25001A (default blank)\n"
@@ -551,7 +551,7 @@ int main(int argc, char **argv)
     if (sso_version_handle(argc, argv, "tle_from_state")) return 0;
 
     const char *path = NULL;
-    const char *name = "FRONTIERSAT";
+    const char *name = "FrontierSat";
     const char *intl = "";
     int emit_name = 1;
     int catnr = 69015, elset = 1, revnum = 0, max_iter = 60, verbose = 0;
