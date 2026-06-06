@@ -95,7 +95,7 @@ static void usage(FILE *out, const char *progname)
         "  date-time plus the sub-satellite lat/lon (deg) and altitude (km),\n"
         "  leaving the command intact (@tsexec=, else @tssent=, else now).\n"
         "  Prints a stderr summary: total commands, non-duplicate commands,\n"
-        "  and unique timed commands (same command at different times = 1).\n"
+        "  and distinct timed telecommands (same command at different times = 1).\n"
         "  No <file> reads from stdin.\n",
         progname);
 }
@@ -552,7 +552,7 @@ int main(int argc, char **argv)
     if (in != stdin) fclose(in);
 
     fprintf(stderr,
-        "agenda_check: %d command%s total, %zu non-duplicate, %zu unique timed\n",
+        "agenda_check: %d command%s total, %zu non-duplicate, %zu distinct timed telecommands\n",
         total_commands, total_commands == 1 ? "" : "s",
         dups.n, timed_uniq.n);
 

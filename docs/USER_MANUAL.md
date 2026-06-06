@@ -1360,7 +1360,7 @@ left intact.
 After processing, a stderr summary lists:
 
 ```text
-agenda_check: 918 commands total, 780 non-duplicate, 6 unique timed
+agenda_check: 918 commands total, 780 non-duplicate, 6 distinct timed telecommands
 ```
 
 Where:
@@ -1368,8 +1368,8 @@ Where:
 * *total* = every command line (non-comment, non-blank).
 * *non-duplicate* = distinct verbatim lines. Same command at
   different times stays distinct.
-* *unique timed* = distinct command identities (with `@tssent=` and
-  `@tsexec=` values masked out) among lines that carry a timestamp.
+* *distinct timed telecommands* = command identities (with `@tssent=`
+  and `@tsexec=` values masked out) among lines that carry a timestamp.
   A `fs_list_directory_json(/,0,20)` scheduled 30 times across the
   day counts once.
 
