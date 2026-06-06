@@ -1343,6 +1343,12 @@ Verbatim duplicates are flagged inline with a red `DUP(line N)>`
 prefix pointing at the line number of the first occurrence. Pipe
 to `grep` and the plain prefix survives.
 
+A line the linter rejects is tagged `ERROR>` and, on a terminal, the
+whole line is shown in bold bright red so it can't scroll past
+unnoticed; piped, the `ERROR>` tag stays as plain text. The
+highlighting applies only to the normal listing — `--errors-only`
+already isolates the bad lines, so it adds none there.
+
 With `--tle`, each command line is prepended with `<iso-time>
 lat=<deg> lon=<deg> alt=<km>` (in mech coords, lat one decimal,
 fixed-width). Without `--tle`, the inline `@tssent=` and `@tsexec=`
@@ -1394,8 +1400,10 @@ satellite would do with the same bytes:
 * the firmware length limits, and
 * well-formed `@tssent=` / `@tsexec=` timestamps.
 
-Findings print to stderr (so stdout stays the clean, pipeable agenda) as
-`line N: error: ...` or `line N: warning: ...`. A command not meant for
+Findings print to stderr as `line N: error: ...` or `line N:
+warning: ...`; an error additionally tags its line `ERROR>` (bold
+bright red on a terminal, plain text when piped) in the listing,
+which otherwise stays grep-friendly. A command not meant for
 routine flight operation - ground-only, high-risk, recovery/expert, or
 flight-testing - is a *warning*, not an error. `--no-tc-lint` disables
 the check. `--errors-only` flips the output around: it prints just the

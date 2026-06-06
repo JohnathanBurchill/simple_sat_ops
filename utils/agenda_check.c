@@ -40,6 +40,12 @@
     is a TTY the prefix is rendered in red bold so it stands out;
     when piped, the prefix is plain text so grep / less still see it.
 
+    A line the linter rejects is tagged "ERROR>" and, on a TTY, the
+    whole line is shown in bold bright red so it can't scroll past
+    unnoticed (the tag stays plain when piped). --errors-only instead
+    prints just the offending lines and suppresses the rest of the
+    listing, so no highlighting is applied in that mode.
+
     Copyright (C) 2026  Johnathan K Burchill
 
     This program is free software: you can redistribute it and/or modify
@@ -87,7 +93,9 @@ static void usage(FILE *out, const char *progname)
         "  --prune-dups drops them instead and reports how many were pruned.\n"
         "  Lints each telecommand against the flight firmware's command set\n"
         "  (names, argument counts, CTS1+...! framing); errors print to stderr\n"
-        "  and set a non-zero exit. --no-tc-lint disables that check.\n"
+        "  and set a non-zero exit, and the offending line is tagged ERROR>\n"
+        "  and shown bold bright red in the listing. --no-tc-lint disables\n"
+        "  that check.\n"
         "  --errors-only prints ONLY the lines with lint errors (line number,\n"
         "  command, and reason) to stdout and suppresses the rest, so the\n"
         "  errors don't scroll away in a long agenda.\n"
@@ -384,6 +392,11 @@ int main(int argc, char **argv)
     int tty = isatty(fileno(stdout));
     const char *dup_red    = tty ? "\x1b[1;31m" : "";
     const char *dup_reset  = tty ? "\x1b[0m"    : "";
+    // A lint-rejected line is shown bold + bright red in the default
+    // listing so it can't scroll past unnoticed. Empty when stdout is not
+    // a TTY (the ERROR> tag below still marks it for grep / less).
+    const char *err_hi     = tty ? "\x1b[1;91m" : "";
+    const char *err_reset  = tty ? "\x1b[0m"    : "";
 
     dup_table_t dups = {0};        // distinct verbatim command lines
     dup_table_t timed_uniq = {0};  // distinct timed commands, times ignored
@@ -424,7 +437,9 @@ int main(int argc, char **argv)
         // argument counts, CTS1+...! framing, length limits) so a wrong
         // command is caught here, before it could ever be transmitted.
         // Issues go to stderr so stdout stays the clean, pipeable humanized
-        // agenda; lint errors set the exit code below.
+        // agenda; lint errors set the exit code below. had_error drives
+        // the bold bright-red highlight of this line in the listing below.
+        int had_error = 0;
         if (tc_lint) {
             char lintbuf[4096];
             snprintf(lintbuf, sizeof lintbuf, "%s", buf);
@@ -435,6 +450,7 @@ int main(int argc, char **argv)
             tcmd_lint_severity_t sev = tcmd_lint_command(cmd, lint_msg, sizeof lint_msg);
             if (sev == TCMD_LINT_ERROR) {
                 ++lint_errors;
+                had_error = 1;
                 if (errors_only) {
                     // --errors-only: print just the bad lines to stdout --
                     // the line number, the command as written, and why -- so
@@ -539,12 +555,21 @@ int main(int argc, char **argv)
         // erroneous lines (printed by the lint block above) reach stdout.
         const char *cmt_sep = inline_comment[0] ? "  " : "";
         if (!errors_only) {
+            // A lint-rejected line gets an ERROR> tag and is rendered in
+            // bold bright red so it stands out in a long listing; a DUP
+            // marker (if any) keeps its own colour alongside it.
+            const char *err_on  = had_error ? err_hi    : "";
+            const char *err_off = had_error ? err_reset : "";
+            const char *err_tag = had_error ? "ERROR> "  : "";
             if (first_seen && dup_check && !prune_dups) {
-                fprintf(stdout, "%s%sDUP(line %d)>%s %s%s%s\n",
-                        prefix, dup_red, first_seen, dup_reset, body,
+                fprintf(stdout, "%s%sDUP(line %d)>%s %s%s%s%s%s%s\n",
+                        prefix, dup_red, first_seen, dup_reset,
+                        err_on, err_tag, body, err_off,
                         cmt_sep, inline_comment);
             } else {
-                fprintf(stdout, "%s%s%s%s\n", prefix, body, cmt_sep, inline_comment);
+                fprintf(stdout, "%s%s%s%s%s%s%s\n",
+                        prefix, err_on, err_tag, body, err_off,
+                        cmt_sep, inline_comment);
             }
         }
     }
