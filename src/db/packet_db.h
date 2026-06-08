@@ -11,9 +11,10 @@
     pre-rendered firmware-interpreted body so LIKE queries against the
     text work without a binary decode step.
 
-    Default DB path: $SSO_PACKET_DB if set, else
-    $HOME/.local/share/simple_sat_ops/packets.db. Each receiver may
-    override per-run via --db=<path> or skip writes entirely with --no-db.
+    Default DB path: $SSO_PACKET_DB if set, else <root>/packet_db.sqlite
+    where <root> is $FRONTIERSAT_ROOT if set, else /FrontierSat. Each
+    receiver may override per-run via --db=<path> or skip writes entirely
+    with --no-db.
 
     When the build doesn't have sqlite3 available, the implementation
     falls back to a no-op stub so existing receivers still link and run
@@ -175,8 +176,8 @@ void packet_db_close(packet_db_t *db);
 
 // Resolve the default DB path into `buf`. Order of preference:
 //   1. $SSO_PACKET_DB if set and non-empty.
-//   2. $HOME/.local/share/simple_sat_ops/packets.db (parent dir created
-//      if missing).
+//   2. <root>/packet_db.sqlite, where <root> is $FRONTIERSAT_ROOT if
+//      set, else /FrontierSat (parent dir created if missing).
 // Returns 0 on success, -1 if neither source could yield a path. The
 // returned path is used as the default when a receiver doesn't pass an
 // explicit --db= flag.

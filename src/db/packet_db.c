@@ -56,25 +56,6 @@ int packet_db_make_run_id(char *buf, size_t cap)
     return 0;
 }
 
-// mkdir -p behaviour for one path. Ignores EEXIST. Used to make the
-// parent of the default DB path on first ever open.
-static int mkdir_p(const char *path, mode_t mode)
-{
-    if (path == NULL || path[0] == '\0') return -1;
-    char buf[1024];
-    size_t len = strlen(path);
-    if (len >= sizeof buf) return -1;
-    memcpy(buf, path, len + 1);
-    for (size_t i = 1; i < len; ++i) {
-        if (buf[i] != '/') continue;
-        buf[i] = '\0';
-        if (mkdir(buf, mode) != 0 && errno != EEXIST) return -1;
-        buf[i] = '/';
-    }
-    if (mkdir(buf, mode) != 0 && errno != EEXIST) return -1;
-    return 0;
-}
-
 packet_db_t *packet_db_setup(const char *user_path,
                              int no_db,
                              char *run_id_out, size_t run_id_cap)
@@ -117,29 +98,16 @@ int packet_db_default_path(char *buf, size_t cap)
         memcpy(buf, override, strlen(override) + 1);
         return 0;
     }
-    // Shared FrontierSat tree first — operators all see the same DB.
-    // sso_packet_db_path() resolves to $FRONTIERSAT_ROOT if set, else
-    // /FrontierSat. A dev host that wants a different location sets
-    // FRONTIERSAT_ROOT (or $SSO_PACKET_DB above).
+    // Otherwise the shared FrontierSat tree, so every operator sees the
+    // same DB. sso_packet_db_path() resolves to $FRONTIERSAT_ROOT if
+    // set, else /FrontierSat, and never returns empty. A dev host that
+    // wants a different location sets FRONTIERSAT_ROOT (or
+    // $SSO_PACKET_DB above).
     const char *shared = sso_packet_db_path();
-    if (shared != NULL && shared[0] != '\0') {
-        if (strlen(shared) + 1 > cap) return -1;
-        sso_mkdir_p_for_file(shared);
-        memcpy(buf, shared, strlen(shared) + 1);
-        return 0;
-    }
-    // Legacy per-user fallback for hosts where sso_paths can't resolve
-    // anything (no $HOME, no /FrontierSat). Preserves the old layout
-    // so we don't regress single-user dev setups.
-    const char *home = getenv("HOME");
-    if (home == NULL || home[0] == '\0') return -1;
-    char dir[1024];
-    int rc = snprintf(dir, sizeof dir,
-                      "%s/.local/share/simple_sat_ops", home);
-    if (rc <= 0 || (size_t)rc >= sizeof dir) return -1;
-    if (mkdir_p(dir, 0755) != 0) return -1;
-    rc = snprintf(buf, cap, "%s/packets.db", dir);
-    if (rc <= 0 || (size_t)rc >= cap) return -1;
+    if (shared == NULL || shared[0] == '\0') return -1;
+    if (strlen(shared) + 1 > cap) return -1;
+    sso_mkdir_p_for_file(shared);
+    memcpy(buf, shared, strlen(shared) + 1);
     return 0;
 }
 
