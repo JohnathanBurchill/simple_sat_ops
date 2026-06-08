@@ -23,8 +23,14 @@
 # marker forces just that one file to be re-decoded.
 #
 # Usage:
-#   decode_passes.sh [--root <dir>] [--sync-threshold N] [--rx-replay <path>]
-#                    [--force-redecode]
+#   decode_passes.sh [--root <dir>] [--db <path>] [--sync-threshold N]
+#                    [--rx-replay <path>] [--force-redecode]
+#
+# --db <path> sends every decoded packet to that SQLite file (it exports
+# SSO_PACKET_DB, which rx_replay honours first) instead of the default
+# <root>/packet_db.sqlite. That's how you build a fresh DB off to the
+# side and swap it in only after checking it looks right.
+#
 # Defaults: root=., sync-threshold=4, skip already-decoded files.
 
 set -uo pipefail
@@ -44,10 +50,13 @@ ROOT="$FRONTIERSAT_ROOT"
 SYNC_THR=4
 RX_REPLAY=""
 SKIP_DECODED=1
+DB_PATH=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --root)             ROOT="$2"; shift 2 ;;
+        --db)               DB_PATH="$2"; shift 2 ;;
+        --db=*)             DB_PATH="${1#*=}"; shift ;;
         --sync-threshold)   SYNC_THR="$2"; shift 2 ;;
         --rx-replay)        RX_REPLAY="$2"; shift 2 ;;
         --force-redecode)   SKIP_DECODED=0; shift ;;
@@ -83,6 +92,18 @@ if [[ ! -d "$ROOT" ]]; then
     echo "error: root directory not found: $ROOT" >&2
     exit 2
 fi
+
+# --db routes every rx_replay to one packet DB by exporting SSO_PACKET_DB,
+# which rx_replay's default-path logic checks before <root>/packet_db.sqlite.
+# Exporting (not just setting) is what makes the child rx_replay processes
+# see it. Without --db this is left alone, so an SSO_PACKET_DB already in
+# the environment still wins and a bare run uses the usual default.
+if [[ -n "$DB_PATH" ]]; then
+    export SSO_PACKET_DB="$DB_PATH"
+fi
+echo "rx_replay:  $RX_REPLAY"
+echo "root:       $ROOT"
+echo "packet DB:  ${SSO_PACKET_DB:-<rx_replay default: $ROOT/packet_db.sqlite>}"
 
 # ffmpeg is only required when an .ogg shows up in the tree; check
 # lazily so a pure-WAV run on a host without ffmpeg still works.
