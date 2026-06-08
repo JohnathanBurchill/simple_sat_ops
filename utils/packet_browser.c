@@ -55,7 +55,9 @@
 #include "packet_db.h"
 #include "sso_paths.h"
 
+#include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -177,6 +179,28 @@ static int     show_local_time = 0;
 enum { PV_HEX = 0, PV_ASCII, PV_BASE64 };
 static int         payload_view = PV_ASCII;
 static const char *PV_NAME[] = { "hex", "ascii", "base64" };
+
+// ----- Reconstruction sub-view -------------------------------------------
+// Enter on a bulk_file reassembles the whole download (chunks placed by
+// file_offset); Enter on a tcmd_response fragment reassembles the full
+// response (fragments placed by response_seq_num). The result shows with
+// the same hex/ascii/base64 toggle (`v`); any byte no packet supplied is
+// '?'. It's an overlay — the underlying list/group view and its scroll are
+// left untouched, so leaving returns exactly where you were. `e` exports
+// the reconstructed bytes to disk via a small vim-modal filename prompt.
+enum { RECON_BULK = 0, RECON_TCMD };
+#define RECON_MAX_BYTES (16 * 1024 * 1024)
+static int      in_recon = 0;
+static int      recon_kind = RECON_BULK;
+static uint8_t *recon_buf = NULL;       // reassembled bytes; gaps pre-set '?'
+static uint8_t *recon_present = NULL;   // 1 where a packet supplied the byte
+static long     recon_len = 0;
+static long     recon_scroll = 0;       // index of the first byte shown
+static long     recon_gap_bytes = 0;
+static int      recon_chunks = 0;       // packets reassembled
+static char     recon_title[200] = "";  // shown in the view's top bar
+static char     recon_name[256] = "";   // auto filename offered by `e`
+static char     recon_status[200] = ""; // export result, shown in the footer
 
 static int     g_have_color = 0;
 // Toggled by `s`: when on, draw_detail adds a "station: ..." line for
@@ -714,6 +738,247 @@ static void leave_group(void)
     in_group = 0;
 }
 
+// Firmware packet geometry (mirrors beacon_cts1.h; defined locally so the
+// browser doesn't pull in the firmware-struct header). Canonical for the
+// whole file — used here, by payload_content_span, and by draw_recon.
+#define BULK_FILE_PACKET_TYPE      0x10
+#define BULK_FILE_HEADER_SIZE      5     // packet_type(1) + file_offset(4)
+#define BULK_FILE_MAX_DATA         195   // COMMS_BULK_FILE_..._MAX_DATA_..._PER_PACKET
+#define BULK_FILE_MAX_PLAUSIBLE    (2 * 1024 * 1024)  // firmware caps a download at 1 MB
+#define TCMD_RESPONSE_PACKET_TYPE  0x04
+#define TCMD_RESPONSE_HEADER_SIZE  14    // type+ts_sent+code+dur+seq+max_seq
+#define TCMD_RESPONSE_MAX_DATA     186   // COMMS_TCMD_RESPONSE_..._PER_PACKET
+
+static void recon_free(void)
+{
+    free(recon_buf);     recon_buf = NULL;
+    free(recon_present); recon_present = NULL;
+    recon_len = 0; recon_scroll = 0; recon_gap_bytes = 0; recon_chunks = 0;
+}
+
+// Allocate the reconstruction buffers for `size` bytes, every byte a gap
+// ('?') until a packet fills it. Returns 0 on success, -1 otherwise.
+static int recon_alloc(long size)
+{
+    if (size <= 0 || size > RECON_MAX_BYTES) return -1;
+    recon_buf     = (uint8_t *) malloc((size_t) size);
+    recon_present = (uint8_t *) calloc((size_t) size, 1);
+    if (recon_buf == NULL || recon_present == NULL) { recon_free(); return -1; }
+    memset(recon_buf, '?', (size_t) size);
+    recon_len = size;
+    return 0;
+}
+
+// Copy one chunk's bytes into the buffer at `off`, marking them present.
+static void recon_place(long off, const uint8_t *data, long n)
+{
+    if (off < 0 || data == NULL) return;
+    for (long i = 0; i < n && off + i < recon_len; i++) {
+        recon_buf[off + i] = data[i];
+        recon_present[off + i] = 1;
+    }
+}
+
+static void recon_count_gaps(void)
+{
+    recon_gap_bytes = 0;
+    for (long i = 0; i < recon_len; i++)
+        if (!recon_present[i]) recon_gap_bytes++;
+}
+
+// Little-endian uint32 file_offset out of a bulk_file payload.
+static long bulk_offset(const uint8_t *pl)
+{
+    return (long) pl[1] | ((long) pl[2] << 8)
+         | ((long) pl[3] << 16) | ((long) pl[4] << 24);
+}
+
+// Reassemble the bulk_file download in the selected chunk's pass. The
+// firmware sends one file at a time, so every bulk_file chunk in the run is
+// placed into one buffer by its file_offset (chunks arrive out of order and
+// get retransmitted, so ordering can't define file boundaries). A bit error
+// in the 4-byte offset can make it absurd, so offsets past a sane cap are
+// dropped. When an offset is received more than once, RS-clean chunks win
+// and an uncorrectable chunk only fills bytes still missing.
+static void recon_build_bulk(sqlite3 *db)
+{
+    recon_free();
+    recon_kind = RECON_BULK;
+    recon_status[0] = '\0';
+    if (rows[sel].payload == NULL) return;
+
+    const char *sql =
+        "SELECT payload, rs_errs FROM packet "
+        "WHERE packet_type=16 AND source_run=?1 "
+        "ORDER BY ts_received, id";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, rows[sel].run, -1, SQLITE_TRANSIENT);
+
+    // Pass 1: size the buffer to the highest plausible byte.
+    long size = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const uint8_t *pl = (const uint8_t *) sqlite3_column_blob(st, 0);
+        int pl_len = sqlite3_column_bytes(st, 0);
+        if (pl == NULL || pl_len < BULK_FILE_HEADER_SIZE + 1) continue;
+        long off = bulk_offset(pl);
+        long dl = pl_len - BULK_FILE_HEADER_SIZE;
+        if (dl > BULK_FILE_MAX_DATA) dl = BULK_FILE_MAX_DATA;
+        if (off < 0 || off + dl > BULK_FILE_MAX_PLAUSIBLE) continue;
+        if (off + dl > size) size = off + dl;
+    }
+    if (recon_alloc(size) != 0) { sqlite3_finalize(st); return; }
+
+    // Phase 0: place RS-clean chunks. Phase 1: let uncorrectable chunks
+    // fill only the bytes still missing, so good data is never clobbered.
+    long min_off = -1; int chunks = 0;
+    for (int phase = 0; phase < 2; phase++) {
+        sqlite3_reset(st);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const uint8_t *pl = (const uint8_t *) sqlite3_column_blob(st, 0);
+            int pl_len = sqlite3_column_bytes(st, 0);
+            int rs = sqlite3_column_int(st, 1);
+            if (pl == NULL || pl_len < BULK_FILE_HEADER_SIZE + 1) continue;
+            long off = bulk_offset(pl);
+            long dl = pl_len - BULK_FILE_HEADER_SIZE;
+            if (dl > BULK_FILE_MAX_DATA) dl = BULK_FILE_MAX_DATA;
+            if (off < 0 || off + dl > recon_len) continue;
+            int clean = (rs >= 0);                  // rs_errs == -2 = uncorrectable
+            if ((phase == 0) != clean) continue;     // phase 0 clean, phase 1 rest
+            const uint8_t *src = pl + BULK_FILE_HEADER_SIZE;
+            for (long i = 0; i < dl && off + i < recon_len; i++) {
+                if (phase == 1 && recon_present[off + i]) continue;
+                recon_buf[off + i] = src[i];
+                recon_present[off + i] = 1;
+            }
+            if (min_off < 0 || off < min_off) min_off = off;
+            chunks++;
+        }
+    }
+    sqlite3_finalize(st);
+    if (min_off < 0) min_off = 0;
+    recon_chunks = chunks;
+    recon_count_gaps();
+    snprintf(recon_title, sizeof recon_title,
+             "bulk_file  run %.16s  offset %ld..%ld  %d chunk%s  %ld gap byte%s",
+             rows[sel].run, min_off, recon_len, chunks, chunks == 1 ? "" : "s",
+             recon_gap_bytes, recon_gap_bytes == 1 ? "" : "s");
+    snprintf(recon_name, sizeof recon_name,
+             "bulkfile_%.16s_%ld-%ld.bin", rows[sel].run, min_off, recon_len);
+}
+
+// Reassemble a multi-packet tcmd_response. All fragments of one response
+// share ts_sent (payload bytes 1..8) and carry response_seq_num (1..max) at
+// byte 12. Fragment s holds response bytes [(s-1)*186, ...).
+static void recon_build_tcmd(sqlite3 *db)
+{
+    recon_free();
+    recon_kind = RECON_TCMD;
+    recon_status[0] = '\0';
+    if (rows[sel].payload == NULL || rows[sel].payload_len < TCMD_RESPONSE_HEADER_SIZE)
+        return;
+    uint8_t key[8];
+    memcpy(key, rows[sel].payload + 1, 8);   // ts_sent
+
+    const char *sql =
+        "SELECT payload FROM packet "
+        "WHERE packet_type=4 AND substr(payload,2,8)=?1 "
+        "ORDER BY substr(payload,13,1), ts_received";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_blob(st, 1, key, 8, SQLITE_TRANSIENT);
+
+    // Pass 1: size the buffer and read the expected fragment count.
+    long size = 0; int maxseq = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const uint8_t *pl = (const uint8_t *) sqlite3_column_blob(st, 0);
+        int pl_len = sqlite3_column_bytes(st, 0);
+        if (pl == NULL || pl_len < TCMD_RESPONSE_HEADER_SIZE + 1) continue;
+        int seq = pl[12];
+        if (seq < 1) continue;
+        long dl = pl_len - TCMD_RESPONSE_HEADER_SIZE;
+        if (dl > TCMD_RESPONSE_MAX_DATA) dl = TCMD_RESPONSE_MAX_DATA;
+        long end = (long)(seq - 1) * TCMD_RESPONSE_MAX_DATA + dl;
+        if (end > size) size = end;
+        if (pl[13] > maxseq) maxseq = pl[13];
+    }
+    if (recon_alloc(size) != 0) { sqlite3_finalize(st); return; }
+
+    // Pass 2: place each fragment at its sequence slot.
+    sqlite3_reset(st);
+    int chunks = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const uint8_t *pl = (const uint8_t *) sqlite3_column_blob(st, 0);
+        int pl_len = sqlite3_column_bytes(st, 0);
+        if (pl == NULL || pl_len < TCMD_RESPONSE_HEADER_SIZE + 1) continue;
+        int seq = pl[12];
+        if (seq < 1) continue;
+        long dl = pl_len - TCMD_RESPONSE_HEADER_SIZE;
+        if (dl > TCMD_RESPONSE_MAX_DATA) dl = TCMD_RESPONSE_MAX_DATA;
+        recon_place((long)(seq - 1) * TCMD_RESPONSE_MAX_DATA,
+                    pl + TCMD_RESPONSE_HEADER_SIZE, dl);
+        chunks++;
+    }
+    sqlite3_finalize(st);
+    uint64_t ts = 0;
+    for (int i = 0; i < 8; i++) ts |= (uint64_t) key[i] << (8 * i);
+    recon_chunks = chunks;
+    recon_count_gaps();
+    snprintf(recon_title, sizeof recon_title,
+             "tcmd_response  ts_sent=%" PRIu64 "  %d/%d fragment%s  %ld gap byte%s",
+             ts, chunks, maxseq, maxseq == 1 ? "" : "s",
+             recon_gap_bytes, recon_gap_bytes == 1 ? "" : "s");
+    snprintf(recon_name, sizeof recon_name, "tcmd_response_%" PRIu64 ".txt", ts);
+}
+
+static void enter_recon(sqlite3 *db)
+{
+    int pt = rows[sel].packet_type;
+    if (pt == BULK_FILE_PACKET_TYPE)        recon_build_bulk(db);
+    else if (pt == TCMD_RESPONSE_PACKET_TYPE) recon_build_tcmd(db);
+    else return;
+    if (recon_buf == NULL || recon_len == 0) { recon_free(); return; }
+    recon_scroll = 0;
+    in_recon = 1;
+}
+
+static void leave_recon(void)
+{
+    recon_free();
+    in_recon = 0;
+}
+
+// Bytes per rendered row in the reconstruction view, by current view mode.
+static int recon_bpr(int cols)
+{
+    if (payload_view == PV_HEX) return 16;
+    if (payload_view == PV_BASE64) {
+        int chars = cols - 2;
+        if (chars < 4) chars = 4;
+        int q = chars / 4;
+        if (q < 1) q = 1;
+        return q * 3;
+    }
+    int w = cols - 2;                 // ascii
+    if (w < 8) w = 8;
+    return w;
+}
+
+// Keep recon_scroll on a row boundary and within range for `body_h` rows.
+static void recon_clamp_scroll(int cols, int body_h)
+{
+    int bpr = recon_bpr(cols);
+    if (bpr < 1) bpr = 1;
+    if (body_h < 1) body_h = 1;
+    long total_rows = (recon_len + bpr - 1) / bpr;
+    long top_row = recon_scroll / bpr;
+    long max_top_row = total_rows - body_h;
+    if (max_top_row < 0) max_top_row = 0;
+    if (top_row > max_top_row) top_row = max_top_row;
+    if (top_row < 0) top_row = 0;
+    recon_scroll = top_row * bpr;
+}
+
 // Render a stored ISO-8601 UTC timestamp into the user's chosen
 // display mode. UTC mode is a passthrough; local mode parses the
 // "YYYY-MM-DDTHH:MM:SS[.fff]Z" form back to a time_t (via timegm)
@@ -914,8 +1179,7 @@ static const char B64[] =
 // data is file content. The content views (ascii / base64) skip that
 // 5-byte header so a downloaded file reads as itself. Other packet types
 // have no such framing here, so they are interpreted whole.
-#define BULK_FILE_PACKET_TYPE 0x10
-#define BULK_FILE_HEADER_SIZE 5
+// (BULK_FILE_PACKET_TYPE / BULK_FILE_HEADER_SIZE are defined once, above.)
 
 // Point *data / *len at the bytes the content views should interpret for
 // row r: the file data for a bulk_file, otherwise the whole payload.
@@ -1076,6 +1340,226 @@ static void draw_payload(const row_t *r, int *yp, int max_y, int cols)
     }
 
     *yp = y;
+}
+
+// Full-screen render of the reconstruction overlay: a scrollable dump of
+// recon_buf in the current payload_view. Gap bytes (no packet supplied
+// them) show as "??" in hex and '?' in the text/ascii columns.
+static void draw_recon(int rows_total, int cols)
+{
+    int body_h = rows_total - 2;          // title row + footer row
+    if (body_h < 1) body_h = 1;
+    recon_clamp_scroll(cols, body_h);
+    int bpr = recon_bpr(cols);
+
+    long shown_end = recon_scroll + (long) bpr * body_h;
+    if (shown_end > recon_len) shown_end = recon_len;
+    char tb[300];
+    snprintf(tb, sizeof tb, " %s   [%s]   bytes %ld-%ld of %ld",
+             recon_title, PV_NAME[payload_view],
+             recon_scroll, shown_end, recon_len);
+    if (g_have_color) attron(COLOR_PAIR(PAIR_BAR)); else attron(A_REVERSE);
+    move(0, 0); for (int i = 0; i < cols; i++) addch(' ');
+    mvaddnstr(0, 0, tb, cols);
+    if (g_have_color) attroff(COLOR_PAIR(PAIR_BAR)); else attroff(A_REVERSE);
+
+    for (int r = 0; r < body_h; r++) {
+        int y = 1 + r;
+        move(y, 0); clrtoeol();
+        long base = recon_scroll + (long) r * bpr;
+        if (base >= recon_len) continue;
+        if (payload_view == PV_HEX) {
+            char line[128];
+            int pos = snprintf(line, sizeof line, "%08lx  ", base);
+            for (int i = 0; i < 16 && pos + 4 < (int) sizeof line; i++) {
+                long idx = base + i;
+                if (idx >= recon_len)        pos += snprintf(line + pos, sizeof line - pos, "   ");
+                else if (recon_present[idx]) pos += snprintf(line + pos, sizeof line - pos, "%02x ", recon_buf[idx]);
+                else                         pos += snprintf(line + pos, sizeof line - pos, "?? ");
+            }
+            if (pos + 1 < (int) sizeof line) line[pos++] = ' ';
+            for (int i = 0; i < 16 && base + i < recon_len && pos + 1 < (int) sizeof line; i++) {
+                long idx = base + i;
+                uint8_t b = recon_buf[idx];
+                line[pos++] = !recon_present[idx] ? '?'
+                            : (b >= 0x20 && b < 0x7F) ? (char) b : '.';
+            }
+            line[pos] = '\0';
+            mvaddnstr(y, 0, line, cols);
+        } else if (payload_view == PV_ASCII) {
+            for (int i = 0; i < bpr && base + i < recon_len && i < cols; i++) {
+                long idx = base + i;
+                uint8_t b = recon_buf[idx];
+                char c = !recon_present[idx] ? '?'
+                       : (b >= 0x20 && b < 0x7F) ? (char) b
+                       : (b == '\t') ? ' ' : '.';
+                mvaddch(y, i, (chtype) c);
+            }
+        } else {  // PV_BASE64
+            char line[512];
+            int pos = 0;
+            for (int i = 0; i < bpr && base + i < recon_len
+                            && pos + 4 < (int) sizeof line; i += 3) {
+                long idx = base + i;
+                int b0 = recon_buf[idx];
+                int b1 = (idx + 1 < recon_len) ? recon_buf[idx + 1] : 0;
+                int b2 = (idx + 2 < recon_len) ? recon_buf[idx + 2] : 0;
+                uint32_t v = ((uint32_t) b0 << 16) | ((uint32_t) b1 << 8) | (uint32_t) b2;
+                line[pos++] = B64[(v >> 18) & 0x3F];
+                line[pos++] = B64[(v >> 12) & 0x3F];
+                line[pos++] = (idx + 1 < recon_len) ? B64[(v >> 6) & 0x3F] : '=';
+                line[pos++] = (idx + 2 < recon_len) ? B64[v & 0x3F]        : '=';
+            }
+            line[pos] = '\0';
+            mvaddnstr(y, 0, line, cols);
+        }
+    }
+
+    char fb[300];
+    if (recon_status[0] != '\0') {
+        snprintf(fb, sizeof fb, " %s", recon_status);
+    } else {
+        snprintf(fb, sizeof fb,
+                 " v:view  e:export  j/k PgUp/PgDn g/G:scroll  Esc:back"
+                 "   (%ld gap byte%s)",
+                 recon_gap_bytes, recon_gap_bytes == 1 ? "" : "s");
+    }
+    if (g_have_color) attron(COLOR_PAIR(PAIR_BAR)); else attron(A_REVERSE);
+    move(rows_total - 1, 0); for (int i = 0; i < cols; i++) addch(' ');
+    mvaddnstr(rows_total - 1, 0, fb, cols);
+    if (g_have_color) attroff(COLOR_PAIR(PAIR_BAR)); else attroff(A_REVERSE);
+}
+
+// Write the reconstructed buffer to `path`. Records the outcome in
+// recon_status (shown in the overlay footer). Returns 0 on success.
+static int recon_export(const char *path)
+{
+    if (recon_buf == NULL || recon_len <= 0) {
+        snprintf(recon_status, sizeof recon_status, "nothing to export");
+        return -1;
+    }
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) {
+        snprintf(recon_status, sizeof recon_status,
+                 "export failed: %s: %s", path, strerror(errno));
+        return -1;
+    }
+    size_t wrote = fwrite(recon_buf, 1, (size_t) recon_len, f);
+    int ok = (wrote == (size_t) recon_len);
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) {
+        snprintf(recon_status, sizeof recon_status,
+                 "export failed: short write to %s", path);
+        return -1;
+    }
+    snprintf(recon_status, sizeof recon_status,
+             "exported %ld bytes to %s%s", recon_len, path,
+             recon_gap_bytes ? "  (gaps written as '?')" : "");
+    return 0;
+}
+
+// Vim-modal filename prompt for the export. Opens in NORMAL mode over a
+// centred box pre-filled with `buf`. i/a/I/A enter INSERT (h l 0 $ w b x and
+// x are normal-mode motions/delete); Esc leaves INSERT to NORMAL, or cancels
+// from NORMAL; Enter saves from either mode. Returns 1 (buf is the chosen
+// name) on save, 0 on cancel.
+enum { VM_NORMAL = 0, VM_INSERT };
+static int prompt_export_filename(int rows_total, int cols, char *buf, size_t bufsz)
+{
+    long len = (long) strlen(buf);
+    long cur = 0;
+    int mode = VM_NORMAL;
+
+    int bw = cols - 6; if (bw > 74) bw = 74; if (bw < 24) bw = 24;
+    int bx = (cols - bw) / 2; if (bx < 0) bx = 0;
+    int bh = 5;
+    int by = (rows_total - bh) / 2; if (by < 1) by = 1;
+    int field_y = by + 2;
+    int field_x = bx + 4;            // after "| > "
+    int field_w = bw - 6;
+    if (field_w < 4) field_w = 4;
+
+    nodelay(stdscr, FALSE);
+    curs_set(1);
+    int result = -1;
+    while (result < 0) {
+        // Box: clear interior, draw an ASCII border.
+        for (int r = 0; r < bh; r++) { move(by + r, bx); for (int i = 0; i < bw; i++) addch(' '); }
+        mvaddch(by, bx, '+'); mvaddch(by, bx + bw - 1, '+');
+        mvaddch(by + bh - 1, bx, '+'); mvaddch(by + bh - 1, bx + bw - 1, '+');
+        for (int i = 1; i < bw - 1; i++) { mvaddch(by, bx + i, '-'); mvaddch(by + bh - 1, bx + i, '-'); }
+        for (int r = 1; r < bh - 1; r++) { mvaddch(by + r, bx, '|'); mvaddch(by + r, bx + bw - 1, '|'); }
+        mvaddnstr(by + 1, bx + 2, "Export reconstructed file", bw - 4);
+        char hint[96];
+        snprintf(hint, sizeof hint, "%s  i/a edit  Esc %s  Enter save",
+                 mode == VM_INSERT ? "-- INSERT --" : "   NORMAL   ",
+                 mode == VM_INSERT ? "->normal" : "cancel");
+        mvaddnstr(by + 3, bx + 2, hint, bw - 4);
+        mvaddch(field_y, bx + 2, '>');
+        long start = (cur > field_w - 1) ? cur - field_w + 1 : 0;
+        for (int i = 0; i < field_w && start + i < len; i++)
+            mvaddch(field_y, field_x + i, (chtype) buf[start + i]);
+        move(field_y, field_x + (int) (cur - start));
+        refresh();
+
+        int ch = getch();
+        if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) { result = 1; break; }
+
+        if (mode == VM_INSERT) {
+            if (ch == 27) { mode = VM_NORMAL; if (cur > 0) cur--; continue; }
+            if (ch == KEY_LEFT)  { if (cur > 0)   cur--; continue; }
+            if (ch == KEY_RIGHT) { if (cur < len) cur++; continue; }
+            if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+                if (cur > 0) { memmove(buf + cur - 1, buf + cur, (size_t)(len - cur + 1)); cur--; len--; }
+                continue;
+            }
+            if (ch >= 0x20 && ch < 0x7F && len + 1 < (long) bufsz) {
+                memmove(buf + cur + 1, buf + cur, (size_t)(len - cur + 1));
+                buf[cur] = (char) ch; cur++; len++;
+            }
+            continue;
+        }
+
+        // NORMAL mode
+        switch (ch) {
+            case 27: result = 0; break;
+            case 'i': mode = VM_INSERT; break;
+            case 'a': if (cur < len) cur++; mode = VM_INSERT; break;
+            case 'I': cur = 0; mode = VM_INSERT; break;
+            case 'A': cur = len; mode = VM_INSERT; break;
+            case 'h': case KEY_LEFT:  if (cur > 0) cur--; break;
+            case 'l': case KEY_RIGHT: if (cur < len - 1) cur++; break;
+            case '0': cur = 0; break;
+            case '$': cur = (len > 0) ? len - 1 : 0; break;
+            case 'x':
+                if (cur < len) {
+                    memmove(buf + cur, buf + cur + 1, (size_t)(len - cur));
+                    len--;
+                    if (cur >= len && cur > 0) cur--;
+                }
+                break;
+            case 'w': {
+                long i = cur;
+                while (i < len &&  isalnum((unsigned char) buf[i])) i++;
+                while (i < len && !isalnum((unsigned char) buf[i])) i++;
+                cur = (i < len) ? i : (len > 0 ? len - 1 : 0);
+                break;
+            }
+            case 'b': {
+                long i = cur;
+                if (i > 0) i--;
+                while (i > 0 && !isalnum((unsigned char) buf[i]))   i--;
+                while (i > 0 &&  isalnum((unsigned char) buf[i - 1])) i--;
+                cur = i;
+                break;
+            }
+            default: break;
+        }
+    }
+    curs_set(0);
+    nodelay(stdscr, TRUE);
+    if (result == 1) buf[len] = '\0';
+    return result == 1 ? 1 : 0;
 }
 
 static void draw_detail(int top_y, int height, int cols)
@@ -1293,12 +1777,22 @@ static void usage(FILE *out, const char *argv0)
         "Keys:\n"
         "  q | Q | Esc      quit (in the command group, step back to the list)\n"
         "  arrows / PgUp / PgDn / Home / End   scroll the list\n"
-        "  Enter            on a tcmd_response, open the command group: every\n"
-        "                   packet sharing that command's ts_sent (its ack +\n"
-        "                   responses), then same-run log/bulk_file packets in\n"
-        "                   the following window (a time heuristic, not\n"
-        "                   firmware-confirmed). Filters are ignored in the\n"
-        "                   group. Esc / Left / Backspace step back.\n"
+        "  Enter            bulk_file: open the reconstructed-file viewer —\n"
+        "                   the pass's chunks reassembled by file_offset, with\n"
+        "                   any missing bytes shown as '?'. tcmd_response:\n"
+        "                   open the command group (every packet sharing that\n"
+        "                   command's ts_sent, then same-run log/bulk_file in\n"
+        "                   the following window — a time heuristic); pressing\n"
+        "                   Enter again on a response reassembles its\n"
+        "                   fragments. Esc / Left / Backspace step back.\n"
+        "  (in the reconstruction view)\n"
+        "    v              cycle hex / ascii / base64\n"
+        "    j k PgUp PgDn g G   scroll\n"
+        "    e              export the reconstructed bytes to a file. A\n"
+        "                   vim-modal prompt offers an editable name: i/a to\n"
+        "                   edit, Esc to leave insert (then Esc to cancel),\n"
+        "                   Enter saves from either mode.\n"
+        "    Esc / q        back to the list\n"
         "  r                reload (rebuilds the group when one is open)\n"
         "  t                cycle type filter (all → beacon → tcmd_response\n"
         "                   → log → bulk_file → all)\n"
@@ -1422,15 +1916,50 @@ int main(int argc, char **argv)
         int detail_h   = rows_total - footer_h - detail_top;
 
         erase();
-        draw_top_bar(cols);
-        draw_list(header_h, list_h, cols);
-        draw_detail(detail_top, detail_h, cols);
-        draw_bottom_bar(cols, rows_total, /*searching=*/0);
+        if (in_recon) {
+            draw_recon(rows_total, cols);
+        } else {
+            draw_top_bar(cols);
+            draw_list(header_h, list_h, cols);
+            draw_detail(detail_top, detail_h, cols);
+            draw_bottom_bar(cols, rows_total, /*searching=*/0);
+        }
         refresh();
 
         timeout(250);
         int ch = getch();
-        if (ch != ERR) {
+        if (ch != ERR && in_recon) {
+            // Reconstruction overlay keys: scroll the reassembled buffer,
+            // toggle the view (v), export (e), step back (Esc/q/h/Left).
+            int body_h = rows_total - 2; if (body_h < 1) body_h = 1;
+            int bpr  = recon_bpr(cols);
+            int page = (body_h - 1 > 0) ? body_h - 1 : 1;
+            int half = (body_h / 2 > 0) ? body_h / 2 : 1;
+            if (ch != 'e') recon_status[0] = '\0';
+            switch (ch) {
+            case 'q': case 27: case KEY_LEFT: case KEY_BACKSPACE:
+            case 127: case 8: case 'h':   leave_recon();                  break;
+            case 'v': payload_view = (payload_view + 1) % 3;              break;
+            case KEY_DOWN:  case 'j': recon_scroll += bpr;               break;
+            case KEY_UP:    case 'k': recon_scroll -= bpr;               break;
+            case KEY_NPAGE: case 6:   recon_scroll += (long) bpr * page; break;
+            case KEY_PPAGE: case 2:   recon_scroll -= (long) bpr * page; break;
+            case 4:                   recon_scroll += (long) bpr * half; break;
+            case 21:                  recon_scroll -= (long) bpr * half; break;
+            case 'g': case KEY_HOME:  recon_scroll = 0;                  break;
+            case 'G': case KEY_END:   recon_scroll = recon_len;          break;
+            case 'e': {
+                char nm[256];
+                snprintf(nm, sizeof nm, "%s", recon_name);
+                if (prompt_export_filename(rows_total, cols, nm, sizeof nm)
+                    && nm[0] != '\0')
+                    recon_export(nm);
+                break;
+            }
+            default: break;
+            }
+            if (recon_scroll < 0) recon_scroll = 0;
+        } else if (ch != ERR) {
             switch (ch) {
             case 'q': case 'Q':
                 // In the sub-view, q steps back to the main list; in the
@@ -1443,10 +1972,16 @@ int main(int argc, char **argv)
                 else if (ch == 27) quit = 1;
                 break;
             case '\n': case '\r': case KEY_ENTER: case KEY_RIGHT:
-                // Enter / Right: open the command-group sub-view for the
-                // selected tcmd_response (no-op on other rows or when a
-                // sub-view is already open).
-                if (!in_group) enter_group(db);
+                // Enter / Right: a bulk_file opens the reconstructed-file
+                // viewer; a tcmd_response opens its command group, and Enter
+                // again inside the group reassembles the full response.
+                // No-op on other rows.
+                if (rows[sel].packet_type == BULK_FILE_PACKET_TYPE)
+                    enter_recon(db);
+                else if (rows[sel].packet_type == TCMD_RESPONSE_PACKET_TYPE) {
+                    if (in_group) enter_recon(db);
+                    else          enter_group(db);
+                }
                 break;
             case KEY_UP:   case 'k': if (sel > 0) sel--; break;
             case KEY_DOWN: case 'j': if (sel < n_rows - 1) sel++; break;
@@ -1583,7 +2118,7 @@ int main(int argc, char **argv)
         // command-group sub-view is up so it doesn't clobber group_rows
         // (and so the parked main view stays put for an instant return).
         double now = monotonic_seconds();
-        if (!in_group && now - last_query >= 1.0) {
+        if (!in_group && !in_recon && now - last_query >= 1.0) {
             run_query(db);
             last_query = now;
         }
@@ -1595,6 +2130,7 @@ int main(int argc, char **argv)
     // on the last leave_group (group_n == 0). free(NULL) is safe either way.
     free_rows(main_rows, in_group ? main_n : n_rows);
     free_rows(group_rows, group_n);
+    recon_free();
     sqlite3_close(db);
     return 0;
 }
