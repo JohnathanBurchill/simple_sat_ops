@@ -266,10 +266,16 @@ void beacon_print(FILE *fp, const char *ts,
                  since_uplink_buf, sizeof since_uplink_buf);
     fmt_epoch_ms(b.unix_epoch_time_ms, epoch_buf, sizeof epoch_buf);
 
-    // satellite_name is exactly 4 bytes "CTS1" with no terminator.
+    // satellite_name is exactly 4 bytes "CTS1" with no terminator. On a
+    // corrupted frame those bytes can be anything, so sanitise them the way
+    // the message field below is: a raw control byte (e.g. 0x0E) sent to a
+    // terminal flips it into line-drawing mode and garbles all that follows.
+    char name_buf[5];
+    cts1_sanitise_text((const uint8_t *) b.satellite_name, 4,
+                       name_buf, sizeof name_buf, NULL);
     fprintf(fp,
-            "%sbeacon: name=\"%.4s\" state=%s eps_mode=%s fs_mounted=%u count=%u\n",
-            prefix, b.satellite_name,
+            "%sbeacon: name=\"%s\" state=%s eps_mode=%s fs_mounted=%u count=%u\n",
+            prefix, name_buf,
             cts1_state_str(b.cts1_operation_state, state_buf, sizeof state_buf),
             eps_mode_str(b.eps_mode_enum, eps_mode_buf, sizeof eps_mode_buf),
             (unsigned)b.is_fs_mounted,
@@ -332,12 +338,14 @@ void beacon_print(FILE *fp, const char *ts,
             mpi_stop_reason_str(b.mpi_last_reason_for_stopping_enum,
                                 mpi_stop_buf, sizeof mpi_stop_buf));
 
-    // friendly_message may not be NUL-terminated within its 42 bytes;
-    // strnlen-bounded copy into a 43-byte buffer guarantees printf safety.
+    // friendly_message may not be NUL-terminated, and on a corrupted frame
+    // can carry control bytes that would otherwise reach the terminal raw (a
+    // stray 0x0E flips it into line-drawing mode). Sanitise non-printables to
+    // '.' the way beacon_basic_summary already does.
     char msg[COMMS_BEACON_FRIENDLY_MESSAGE_SIZE + 1];
-    size_t mlen = strnlen(b.friendly_message, COMMS_BEACON_FRIENDLY_MESSAGE_SIZE);
-    memcpy(msg, b.friendly_message, mlen);
-    msg[mlen] = '\0';
+    cts1_sanitise_text((const uint8_t *) b.friendly_message,
+                       COMMS_BEACON_FRIENDLY_MESSAGE_SIZE,
+                       msg, sizeof msg, NULL);
     fprintf(fp, "%sbeacon: msg=\"%s\"\n", prefix, msg);
 }
 
@@ -367,9 +375,12 @@ int beacon_basic_summary(const uint8_t *payload, size_t len,
     cts1_sanitise_text((const uint8_t *) b.friendly_message,
                        COMMS_BEACON_FRIENDLY_MESSAGE_SIZE,
                        msg, sizeof msg, NULL);
+    char name[5];
+    cts1_sanitise_text((const uint8_t *) b.satellite_name, 4,
+                       name, sizeof name, NULL);
     int n = snprintf(out, out_size,
-        "%.4s st=%s eps=%s batt=%.2fV/%u%% obc=%s up=%s cnt=%u \"%s\"",
-        b.satellite_name, state_str, eps_str,
+        "%s st=%s eps=%s batt=%.2fV/%u%% obc=%s up=%s cnt=%u \"%s\"",
+        name, state_str, eps_str,
         b.eps_battery_voltage_mV / 1000.0,
         (unsigned) b.eps_battery_percent,
         obc_buf, up_buf,
