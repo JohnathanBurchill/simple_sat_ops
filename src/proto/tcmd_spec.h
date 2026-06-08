@@ -43,11 +43,48 @@ typedef enum {
     TCMD_READY_HIGH_RISK          = 40,  // high risk / unsafe
 } tcmd_readiness_t;
 
+// Per-argument type, mirrored from which TCMD_extract_*_arg helper the
+// firmware callback uses for that argument. The ground linter uses these to
+// reject an argument the firmware's parser would itself reject (so we don't
+// burn an uplink on a command that can't parse). One char per argument:
+//
+//   'u'  uint64    -- digits only, 1..19 of them (TCMD_extract_uint64_arg)
+//   'i'  int64     -- optional leading '-', then digits (TCMD_extract_int64_arg)
+//   'd'  double    -- optional '-', digits, at most one '.', not at either
+//                     end, no exponent (TCMD_extract_double_arg)
+//   'h'  hex bytes -- hex digits; ' ' or '_' allowed only between whole bytes
+//                     (TCMD_extract_hex_array_arg)
+//   'b'  base64    -- base64 alphabet + '=' + URL-safe '-'/'_'; ' ' allowed
+//                     only between whole quartets (TCMD_extract_base64_array_arg)
+//   's'  string / free-form -- accepted as-is. Covers TCMD_extract_string_arg
+//                     (which trims surrounding whitespace), whole-args strings,
+//                     enum-by-name args (e.g. "nominal"), and atoi/strtol-parsed
+//                     numerics -- none of which the parser rejects on format.
+//   '?'  unknown   -- type could not be determined; the linter skips arg
+//                     checks for it (fail-open). Should not appear for a
+//                     verified table, but is honored so a future regen that
+//                     drops this column degrades safely rather than mis-flags.
+//
+// arg_types is exactly num_args characters long (empty string for 0-arg
+// commands). The linter validates only argument *format* at the parser level;
+// it does NOT check command-specific value domains (e.g. which enum strings a
+// command accepts) -- the firmware rejects those at execution, not at parse.
+typedef enum {
+    TCMD_ARG_UINT64 = 'u',
+    TCMD_ARG_INT64  = 'i',
+    TCMD_ARG_DOUBLE = 'd',
+    TCMD_ARG_HEX    = 'h',
+    TCMD_ARG_BASE64 = 'b',
+    TCMD_ARG_STRING = 's',
+    TCMD_ARG_UNKNOWN = '?',
+} tcmd_arg_type_t;
+
 // One telecommand the firmware accepts.
 typedef struct {
     const char      *name;       // exact, case-sensitive command name
     int              num_args;   // required count of comma-separated args
     tcmd_readiness_t readiness;  // risk level
+    const char      *arg_types;  // one type code per arg (see above); never NULL
 } tcmd_spec_t;
 
 // The generated table (tcmd_spec.c) and its size.

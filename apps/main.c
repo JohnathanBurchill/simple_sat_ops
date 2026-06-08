@@ -1605,13 +1605,14 @@ static int g_no_tx = 0;
 static int g_tx_preroll_ms = 200;
 
 // TX log ring buffer — last few PREVIEW/SENT/NOT_SENT events for display.
-// Shared by operator and viewer renderers. ascii is sized to fit the
-// full upstream payload buffer (sso_event_t.ascii = 160) so the panel
-// renders the entire command text instead of a truncated preview.
+// Shared by operator and viewer renderers. ascii matches the upstream
+// sso_event_t.ascii field (SSO_TX_TEXT_MAX) so the panel renders the
+// entire command text — up to a full RF telecommand — instead of a
+// truncated preview.
 typedef struct {
     sso_event_type_t kind;     // PREVIEW | TX_COMMAND_SENT | TX_NOT_SENT
     char             ts[16];   // HH:MM:SS
-    char             ascii[160];
+    char             ascii[SSO_TX_TEXT_MAX];
     char             tx_not_sent_reason[24];
 } tx_log_entry_t;
 #define TX_LOG_SIZE 8
@@ -2403,7 +2404,10 @@ typedef enum {
 } tx_field_t;
 
 typedef struct {
-    char payload[160];
+    // Big enough to type a full RF telecommand. tx_field_insert caps the
+    // payload at TCMD_RF_MAX_LEN (215) chars — the over-the-air limit —
+    // so the extra room here is headroom, not a typeable length.
+    char payload[256];
     char power[12];           // TX power in dB
     int  allow_tx;
     tx_field_t focus;
@@ -2420,13 +2424,13 @@ typedef struct {
     // history we stash the live draft into history_saved_edit so
     // DOWN can restore it.
     int  history_idx;
-    char history_saved_edit[160];
+    char history_saved_edit[256];
 } tx_compose_t;
 
 // Survives Esc / commit so the operator can reopen and pick up the
 // previous typed string. First open seeds it with "CTS1+" — the OBC's
 // CTS1 telecommand prefix.
-static char g_tx_last_payload[160] = "CTS1+";
+static char g_tx_last_payload[256] = "CTS1+";
 static char g_tx_last_power[12]    = "80.0";
 // Same idea for the --allow-tx checkbox: operators commonly send a
 // series of commands during a pass and would rather not re-arm the
@@ -2437,7 +2441,7 @@ static int  g_tx_last_allow_tx     = 0;
 // Payload-only history ring (newest at index 0). Push happens on a
 // successful commit; Esc-cancelled drafts don't enter history.
 #define TX_HISTORY_MAX 32
-static char g_tx_history[TX_HISTORY_MAX][160];
+static char g_tx_history[TX_HISTORY_MAX][256];
 static int  g_tx_history_count = 0;
 
 // Non-blocking modal state. The TX compose modal used to run a
@@ -2513,7 +2517,7 @@ typedef struct {
     // math in tx_burst.c. Drives the Progress "TX:" sub-line.
     double tx_seconds_spent;
     double tx_seconds_total;
-    char   last_sent[160];
+    char   last_sent[SSO_TX_TEXT_MAX];   // full command text, not clipped
     char   status_msg[160];
 } auto_tcmd_t;
 
@@ -2693,7 +2697,7 @@ static void tx_compose_fill_event(const tx_compose_t *c, sso_event_t *evt) {
     evt->tx_allow_tx         = c->allow_tx;
     evt->tx_allow_high_power = 0;
     evt->tx_allow_hf_tx      = 0;
-    char summary[160];
+    char summary[SSO_TX_TEXT_MAX];
     tx_compose_summary(c, summary, sizeof summary);
     snprintf(evt->ascii, sizeof evt->ascii, "%s", summary);
     snprintf(evt->from, sizeof evt->from, "%s",
@@ -2728,8 +2732,18 @@ static void tx_field_insert(tx_compose_t *c, int ch) {
     size_t cap = 0;
     char *buf = tx_field_buf(c, c->focus, &cap);
     if (!buf) return;
+    // The payload is transmitted verbatim, so cap typing at the over-the-
+    // air limit (TCMD_RF_MAX_LEN chars) even though the buffer is larger:
+    // a longer telecommand can't be framed for the radio.
+    if (c->focus == TXF_PAYLOAD && cap > (size_t) TCMD_RF_MAX_LEN + 1)
+        cap = (size_t) TCMD_RF_MAX_LEN + 1;
     int n = (int) strlen(buf);
-    if (n + 1 >= (int) cap) return;
+    if (n + 1 >= (int) cap) {
+        if (c->focus == TXF_PAYLOAD)
+            snprintf(c->status_msg, sizeof c->status_msg,
+                     "at the %d-char RF uplink limit", TCMD_RF_MAX_LEN);
+        return;
+    }
     int accept = 0;
     if (tx_field_is_text(c->focus)) {
         accept = (ch >= 32 && ch < 127);
@@ -2991,7 +3005,7 @@ static void tx_compose_draw(WINDOW *w, const tx_compose_t *c) {
     mvwprintw(w, 7, 7, "allow-tx  (required to key the PA)");
     wclrtoeol(w);
 
-    char summary[160];
+    char summary[SSO_TX_TEXT_MAX];
     tx_compose_summary(c, summary, sizeof summary);
     mvwprintw(w, 9, 2,  "Preview: %.*s",
               width - 12, summary);
@@ -3022,6 +3036,12 @@ static void tx_compose_draw(WINDOW *w, const tx_compose_t *c) {
 static int tx_compose_validate(const tx_compose_t *c, char *err, size_t err_size) {
     if (!c->payload[0]) {
         snprintf(err, err_size, "empty payload");
+        return -1;
+    }
+    if (strlen(c->payload) > (size_t) TCMD_RF_MAX_LEN) {
+        snprintf(err, err_size,
+                 "payload %zu chars exceeds the %d-char RF uplink limit",
+                 strlen(c->payload), TCMD_RF_MAX_LEN);
         return -1;
     }
     if (!c->allow_tx) {
@@ -3096,7 +3116,7 @@ static int tx_compose_commit(const tx_compose_t *c, char *err, size_t err_size) 
         // emit_tx_event_local site below).
         char det[512];
         snprintf(det, sizeof det,
-                 "len=%zu freq_hz=%ld gain_db=%.1f payload=\"%.200s\"",
+                 "len=%zu freq_hz=%ld gain_db=%.1f payload=\"%.255s\"",
                  g_tx_request.payload_len,
                  (long) g_tx_request.tx_freq_hz,
                  g_tx_request.tx_gain_db,
@@ -7593,7 +7613,7 @@ int main(int argc, char **argv)
         //                       --tx-dry-run; just clear the pending
         //                       slot rather than deadlocking.
         if (g_tx_request.pending) {
-            char summary[160];
+            char summary[SSO_TX_TEXT_MAX];
             const char *outcome = NULL;
             int  on_air = 0;
             int  finished = 0;        // emit the result + clear pending this tick

@@ -37,6 +37,17 @@ typedef enum {
     TCMD_LINT_ERROR = 2,
 } tcmd_lint_severity_t;
 
+// The longest telecommand (the whole "CTS1+...!" line, including any
+// @tssent=/@tsexec= tags) that fits in one over-the-air frame. The AX100
+// Reed-Solomon (255,223) block carries 223 payload bytes; the CSP v1
+// header takes 4 and the HMAC-SHA1 trailer 4, leaving 223 - 4 - 4 = 215
+// for the telecommand text. The firmware parser itself accepts more (up
+// to 254 visible chars) but only over the wired umbilical -- nothing
+// longer than this goes up over the radio, so the linter warns and the
+// compose modal caps typing here. HMAC is always on operationally;
+// without it the ceiling would be 219.
+#define TCMD_RF_MAX_LEN 215
+
 // Lint one telecommand string -- a single "CTS1+name(args)...!" line with any
 // inline '# comment' already removed and surrounding whitespace trimmed.
 // Every problem found is appended (semicolon-separated) to `msg` (pass NULL/0

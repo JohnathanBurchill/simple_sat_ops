@@ -44,6 +44,14 @@ typedef enum {
     SSO_EVT_CMD_EXECUTED,       // operator -> viewers: dispatched cmd + result
 } sso_event_type_t;
 
+// Buffer size for telecommand text carried on the wire (the typed payload
+// and the one-line "ascii:.../auto[...]" summary). Sized to hold a full
+// RF telecommand (TCMD_RF_MAX_LEN = 215 chars) plus a short label and the
+// null terminator, so a maximal command is logged and mirrored to viewers
+// in full rather than clipped. Both sides decode with sizeof(field), so
+// widening this here widens the wire limit automatically.
+#define SSO_TX_TEXT_MAX 256
+
 typedef struct {
     sso_event_type_t type;
     char ts[40];
@@ -105,13 +113,13 @@ typedef struct {
     char last_packet_summary[160];
 
     // tx-command-sent / tx-preview / tx-request / tx-not-sent
-    char ascii[160];
+    char ascii[SSO_TX_TEXT_MAX];
 
     // Carried by tx-preview, tx-request, tx-command-sent (raw payload
     // the operator typed; viewers re-render this verbatim).
     // tx_not_sent_reason is only filled on tx-not-sent.
     char    tx_payload_kind[8];   // "hex" | "ascii"
-    char    tx_payload[160];
+    char    tx_payload[SSO_TX_TEXT_MAX];
     uint8_t tx_csp_src;
     uint8_t tx_csp_dst;
     uint8_t tx_csp_dport;

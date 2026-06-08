@@ -37,7 +37,11 @@ typedef struct {
     int      preroll_ms;
     int      allow_high_power;
     int      allow_hf_tx;
-    char     summary[160];
+    // One-line "ascii:..." / "auto[i/n j/m]: <cmd>" description shown in
+    // the UI, logged to tx.log, and mirrored to viewers. Holds a full RF
+    // telecommand (215 chars) plus its short label; kept >= the IPC
+    // sso_event_t.ascii field (SSO_TX_TEXT_MAX) it is copied into.
+    char     summary[256];
 } tx_request_slot_t;
 
 typedef enum {

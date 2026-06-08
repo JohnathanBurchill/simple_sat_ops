@@ -58,6 +58,111 @@ static int is_name_char(char c)
     return isalnum((unsigned char) c) || c == '_';
 }
 
+// Per-argument-type validators. Each mirrors the corresponding firmware
+// extractor in telecommand_args_helpers.c and answers one question: would the
+// satellite's parser accept this token? They are deliberately conservative --
+// they reject only what the firmware definitely rejects, so the linter never
+// blocks a command the satellite would actually run. (A token is the raw text
+// between two commas; no trimming here, exactly as the firmware splits.)
+
+// 'u' uint64: 1..19 digits, nothing else (TCMD_ascii_to_uint64).
+static int arg_ok_uint64(const char *s, size_t n)
+{
+    if (n < 1 || n > 19) return 0;
+    for (size_t i = 0; i < n; ++i)
+        if (s[i] < '0' || s[i] > '9') return 0;
+    return 1;
+}
+
+// 'i' int64: optional leading '-', then digits (TCMD_ascii_to_int64).
+static int arg_ok_int64(const char *s, size_t n)
+{
+    if (n == 0) return 0;
+    size_t i = (s[0] == '-') ? 1 : 0;   // lone "-" the firmware accepts as 0
+    for (; i < n; ++i)
+        if (s[i] < '0' || s[i] > '9') return 0;
+    return 1;
+}
+
+// 'd' double: optional leading '-', digits, at most one '.', not at either
+// end, no exponent (TCMD_ascii_to_double).
+static int arg_ok_double(const char *s, size_t n)
+{
+    if (n == 0) return 0;
+    int seen_dot = 0;
+    for (size_t i = 0; i < n; ++i) {
+        char c = s[i];
+        if (i == 0 && c == '-') continue;
+        if (c == '.' && !seen_dot && i != 0 && i != n - 1) { seen_dot = 1; continue; }
+        if (c < '0' || c > '9') return 0;
+    }
+    return 1;
+}
+
+// 'h' hex bytes: hex digits; ' '/'_' only between whole bytes; even nibble
+// count (TCMD_extract_hex_array_arg). Empty token = 0 bytes, accepted.
+static int arg_ok_hex(const char *s, size_t n)
+{
+    int nibbles = 0;
+    for (size_t i = 0; i < n; ++i) {
+        char c = s[i];
+        if (c == ' ' || c == '_') {
+            if (nibbles % 2 != 0) return 0;   // separator mid-byte
+            continue;
+        }
+        if (!isxdigit((unsigned char) c)) return 0;
+        nibbles++;
+    }
+    return (nibbles % 2) == 0;
+}
+
+// 'b' base64: standard + URL-safe alphabet + '='; ' ' only between whole
+// quartets (TCMD_extract_base64_array_arg). Empty token accepted.
+static int arg_ok_base64(const char *s, size_t n)
+{
+    int q = 0;   // chars in the current quartet
+    for (size_t i = 0; i < n; ++i) {
+        char c = s[i];
+        if (c == ' ') {
+            if (q != 0 && q != 4) return 0;   // space mid-quartet
+            continue;
+        }
+        int is_b64 = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                  || (c >= '0' && c <= '9')
+                  || c == '+' || c == '/' || c == '-' || c == '_' || c == '=';
+        if (!is_b64) return 0;
+        if (++q == 4) q = 0;
+    }
+    return q == 0;   // no dangling partial quartet
+}
+
+// Validate one argument token against its firmware type code. Returns 1 if the
+// satellite's parser would accept it. 's' (string / free-form) and '?'
+// (unknown) accept anything -- the firmware doesn't gate those on format.
+static int arg_token_ok(char type_code, const char *tok, size_t n)
+{
+    switch (type_code) {
+        case 'u': return arg_ok_uint64(tok, n);
+        case 'i': return arg_ok_int64(tok, n);
+        case 'd': return arg_ok_double(tok, n);
+        case 'h': return arg_ok_hex(tok, n);
+        case 'b': return arg_ok_base64(tok, n);
+        default:  return 1;   // 's', '?', or anything unexpected: accept
+    }
+}
+
+static const char *arg_type_expectation(char type_code)
+{
+    switch (type_code) {
+        case 'u': return "an unsigned integer (digits only)";
+        case 'i': return "an integer";
+        case 'd': return "a decimal number";
+        case 'h': return "hex bytes";
+        case 'b': return "base64";
+        default:  return "a value";
+    }
+}
+
 tcmd_lint_severity_t tcmd_lint_command(const char *cmd, char *msg, size_t msg_cap)
 {
     size_t len = 0;
@@ -70,6 +175,16 @@ tcmd_lint_severity_t tcmd_lint_command(const char *cmd, char *msg, size_t msg_ca
     if (n >= TCMD_MAX_FULL_LEN) {
         flag(msg, msg_cap, &len, &worst, TCMD_LINT_ERROR,
              "exceeds firmware max telecommand length (255 chars)");
+    } else if (n > TCMD_RF_MAX_LEN) {
+        // The firmware would parse it over the umbilical, but it can't be
+        // framed for the radio (RS block capacity). Warn rather than block
+        // so an umbilical-only agenda still lints clean.
+        char m[120];
+        snprintf(m, sizeof m,
+                 "%zu chars: over the %d-char RF uplink limit, "
+                 "won't fit one radio frame (umbilical only)",
+                 n, TCMD_RF_MAX_LEN);
+        flag(msg, msg_cap, &len, &worst, TCMD_LINT_WARN, m);
     }
 
     // Prefix.
@@ -154,6 +269,50 @@ tcmd_lint_severity_t tcmd_lint_command(const char *cmd, char *msg, size_t msg_ca
                      "readiness '%s' -- not for routine flight operation",
                      tcmd_readiness_label(spec->readiness));
             flag(msg, msg_cap, &len, &worst, TCMD_LINT_WARN, m);
+        }
+
+        // Per-argument format check. Only meaningful when the arg COUNT is
+        // right (otherwise token-to-type alignment is off, and the count error
+        // above already covers it) and we have a verified arg_types of the
+        // matching length (fail open if a future spec regen dropped it). Each
+        // comma-delimited token is checked against the type the firmware will
+        // parse it as, rejecting exactly what the satellite's parser would --
+        // e.g. a space after a comma in a numeric arg -- so a doomed command
+        // never costs an uplink. Tokens are split on ',' with no trimming,
+        // matching the firmware; an arg value containing a literal ',' would
+        // mis-split here just as it does on the satellite.
+        if (provided == spec->num_args && spec->num_args > 0
+            && spec->arg_types
+            && (int) strlen(spec->arg_types) == spec->num_args) {
+            size_t tok_start = open_idx + 1;
+            int ai = 0;
+            for (size_t j = open_idx + 1; j <= close_idx && ai < spec->num_args; ++j) {
+                if (j == close_idx || cmd[j] == ',') {
+                    char tc = spec->arg_types[ai];
+                    const char *tok = cmd + tok_start;
+                    size_t tn = j - tok_start;
+                    if (!arg_token_ok(tc, tok, tn)) {
+                        // Echo the offending token (whitespace stays visible
+                        // inside the quotes), truncated to keep msg bounded.
+                        char tb[40];
+                        size_t cn = (tn < sizeof tb - 4) ? tn : sizeof tb - 4;
+                        memcpy(tb, tok, cn);
+                        if (tn > cn) {
+                            tb[cn] = tb[cn + 1] = tb[cn + 2] = '.';
+                            tb[cn + 3] = '\0';
+                        } else {
+                            tb[cn] = '\0';
+                        }
+                        char m[160];
+                        snprintf(m, sizeof m,
+                                 "arg %d expects %s; the satellite would reject \"%s\"",
+                                 ai, arg_type_expectation(tc), tb);
+                        flag(msg, msg_cap, &len, &worst, TCMD_LINT_ERROR, m);
+                    }
+                    tok_start = j + 1;
+                    ai++;
+                }
+            }
         }
     }
 
