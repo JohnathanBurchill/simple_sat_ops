@@ -226,6 +226,35 @@ void decode_loop_record_packet(const char *ts,
                                int golay_errs, int hmac_ok,
                                int rs_errs, int crc_status);
 
+// Cumulative decode stats, tallied by emit_frame and
+// decode_loop_record_packet as a run proceeds. Process-global, like the
+// packet-headers toggle. Lets a caller report the real funnel — how many
+// frames were emitted versus how many became valid, recognized packets —
+// instead of a single ambiguous count. All counts are over the frames
+// the caller passed to emit_frame (i.e. already position-deduped).
+typedef struct {
+    long emitted;            // frames handed to emit_frame
+    long csp_ok;             // of those: a valid CSP v1 header decoded
+    long rs_corrected;       // of those: RS ran and corrected >= 0 errors
+    long rs_uncorrectable;   // of those: RS gave up (rs_errs == -2)
+    long hmac_ok;            // of those (HMAC mode): authentication passed
+    long hmac_bad;           // of those (HMAC mode): authentication failed
+    long recognized;         // payload matched a known firmware type
+    long unrecognized;       // detected + stored, but no known type
+                             // (CSP-valid -> "unknown", non-CSP -> "unparsed")
+    long beacon;             // recognized, by type
+    long tcmd_response;
+    long log_message;
+    long bulk_file;
+} decode_loop_stats_t;
+
+// Zero the cumulative stats. Call before a run if the process decodes
+// more than one input.
+void decode_loop_reset_stats(void);
+
+// Copy the cumulative stats into *out (no-op if out is NULL).
+void decode_loop_get_stats(decode_loop_stats_t *out);
+
 // Observer-frame state for the next packets to be recorded. Pass NaN
 // for any unknown component. Initial state (before the first call) is
 // all-NaN, so receivers that don't track the satellite (rx_live,

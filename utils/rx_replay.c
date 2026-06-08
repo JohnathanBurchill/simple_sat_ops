@@ -1423,6 +1423,11 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
 
     int n_emitted = 0;
+    // Candidate frames handed to rx_emit_decoded across all passes,
+    // before its position dedup. The gap to n_emitted is how many were
+    // dropped as same-position duplicates.
+    long raw_decodes = 0;
+    decode_loop_reset_stats();
 
     // Build the emit context once: shared by both passes.
     rx_emit_ctx_t ectx = {
@@ -1543,6 +1548,7 @@ int main(int argc, char **argv)
             uint64_t asm_abs_sample = (uint64_t)window_start
                 + (uint64_t)sync_off_local * (uint64_t)sps
                 + (uint64_t)(sps / 2);
+            raw_decodes++;
             rx_emit_decoded(&ectx, asm_abs_sample, packet, plen,
                             golay_errs, hmac_ok, rs_errs,
                             used_golay_len, rs_locs);
@@ -1639,6 +1645,7 @@ int main(int argc, char **argv)
                 uint64_t asm_abs_v = tight_start
                     + (uint64_t)sync_off2 * (uint64_t)sps
                     + (uint64_t)(sps / 2);
+                raw_decodes++;
                 if (rx_emit_decoded(&ectx, asm_abs_v, packet, plen2,
                                     golay2, hmac2, rs2, glen2, rs_locs2)) {
                     ++p2_emitted;
@@ -1745,6 +1752,7 @@ int main(int argc, char **argv)
                     uint64_t asm_abs_a = tight_start
                         + (uint64_t)sync_off_a * (uint64_t)sps
                         + (uint64_t)(sps / 2);
+                    raw_decodes++;
                     if (rx_emit_decoded(&ectx, asm_abs_a,
                                         packet, plen_a,
                                         golay_a, hmac_a, rs_a, glen_a,
@@ -1792,8 +1800,26 @@ done:
     } else {
         chain = "iq+slicer";
     }
-    fprintf(stderr, "rx_replay: %d frame(s) emitted (chain=%s).\n",
-            n_emitted, chain);
+    decode_loop_stats_t st;
+    decode_loop_get_stats(&st);
+    fprintf(stderr, "rx_replay: decode summary (chain=%s):\n", chain);
+    fprintf(stderr, "  candidate frames (pre-dedup)   : %ld\n", raw_decodes);
+    fprintf(stderr, "  detected (after position dedup): %d  "
+            "— all recorded to the DB\n", n_emitted);
+    fprintf(stderr, "    valid CSP header             : %ld\n", st.csp_ok);
+    fprintf(stderr, "    RS corrected / uncorrectable : %ld / %ld\n",
+            st.rs_corrected, st.rs_uncorrectable);
+    if (use_hmac) {
+        fprintf(stderr, "    HMAC ok / bad                : %ld / %ld\n",
+                st.hmac_ok, st.hmac_bad);
+    }
+    fprintf(stderr, "    recognized / unrecognized    : %ld / %ld\n",
+            st.recognized, st.unrecognized);
+    fprintf(stderr, "    recognized by type           : "
+            "beacon %ld, tcmd_response %ld, log %ld, bulk_file %ld\n",
+            st.beacon, st.tcmd_response, st.log_message, st.bulk_file);
+    fprintf(stderr, "  the DB keeps one row per distinct payload, "
+            "so repeats collapse.\n");
     if (iq_mode && two_pass && !anchored_only) {
         fprintf(stderr,
                 "rx_replay: pass-1 emitted %d, pass-2 (anchored FSK) "

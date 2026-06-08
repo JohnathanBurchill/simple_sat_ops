@@ -41,6 +41,11 @@
 // no-locking single-int approach is fine.
 static int g_show_headers = 0;
 
+// Cumulative decode stats, process-global for the same reason as the
+// header toggle. emit_frame tallies the framing-level fields and
+// decode_loop_record_packet tallies the recognized-type fields.
+static decode_loop_stats_t g_stats = {0};
+
 // Optional packet-DB tap. NULL when no DB is configured (the default —
 // rx_decode without --db, or any receiver run with --no-db). Strings
 // are borrowed, not copied, so callers must keep them alive for the
@@ -125,6 +130,16 @@ void decode_loop_set_show_headers(int on)
 int decode_loop_show_headers(void)
 {
     return g_show_headers;
+}
+
+void decode_loop_reset_stats(void)
+{
+    memset(&g_stats, 0, sizeof g_stats);
+}
+
+void decode_loop_get_stats(decode_loop_stats_t *out)
+{
+    if (out != NULL) *out = g_stats;
 }
 
 static const char *skip_ws(const char *s)
@@ -541,6 +556,17 @@ void emit_frame(const char *log_path, int quiet, const char *ts,
     const uint8_t *payload = csp_ok ? packet + 4 : NULL;
     size_t payload_len = csp_ok ? packet_len - 4 : 0;
 
+    // Tally the framing-level funnel. recognized-type counts come later,
+    // from decode_loop_record_packet.
+    g_stats.emitted++;
+    if (csp_ok) g_stats.csp_ok++;
+    if (rs_errs == -2)     g_stats.rs_uncorrectable++;
+    else if (rs_errs >= 0) g_stats.rs_corrected++;
+    if (use_hmac) {
+        if (hmac_ok == 1)      g_stats.hmac_ok++;
+        else if (hmac_ok == 0) g_stats.hmac_bad++;
+    }
+
     FILE *streams[2] = { quiet ? NULL : stdout, NULL };
     FILE *log_fp = NULL;
     if (log_path != NULL) {
@@ -683,8 +709,12 @@ void emit_frame(const char *log_path, int quiet, const char *ts,
 
     if (log_fp != NULL) fclose(log_fp);
 
+    // Record every detected frame, errors or no. csp_ok frames pass the
+    // CSP-stripped payload; frames whose CSP didn't decode pass the whole
+    // packet so the raw bytes are still captured.
     decode_loop_record_packet(ts, &hdr, csp_ok,
-                              payload, payload_len,
+                              csp_ok ? payload : packet,
+                              csp_ok ? payload_len : packet_len,
                               golay_errs, hmac_ok, rs_errs, crc_status);
 }
 
@@ -694,39 +724,67 @@ void decode_loop_record_packet(const char *ts,
                                int golay_errs, int hmac_ok,
                                int rs_errs, int crc_status)
 {
-    if (g_packet_db == NULL) return;
-    if (!csp_ok || payload == NULL || payload_len == 0) return;
+    if (payload == NULL || payload_len == 0) return;
 
-    int          ptype       = -1;
+    // Identify the firmware packet type. Only attempted when the CSP
+    // header decoded, since the detectors read a CSP-stripped payload.
+    int          ptype       = 0;
     const char  *ptype_name  = NULL;
     const char  *satellite   = NULL;
-    if (beacon_is_basic(payload, payload_len)) {
-        ptype = 0x01; ptype_name = "beacon"; satellite = "CTS1";
-    } else if (tcmd_response_is(payload, payload_len)) {
-        ptype = 0x04; ptype_name = "tcmd_response";
-    } else if (log_message_is(payload, payload_len)) {
-        ptype = 0x03; ptype_name = "log";
-    } else if (bulk_file_is(payload, payload_len)) {
-        ptype = 0x10; ptype_name = "bulk_file";
+    if (csp_ok) {
+        if (beacon_is_basic(payload, payload_len)) {
+            ptype = 0x01; ptype_name = "beacon"; satellite = "CTS1";
+        } else if (tcmd_response_is(payload, payload_len)) {
+            ptype = 0x04; ptype_name = "tcmd_response";
+        } else if (log_message_is(payload, payload_len)) {
+            ptype = 0x03; ptype_name = "log";
+        } else if (bulk_file_is(payload, payload_len)) {
+            ptype = 0x10; ptype_name = "bulk_file";
+        }
     }
-    if (ptype_name == NULL) return;
+    int recognized = (ptype_name != NULL);
 
-    // Render the firmware-aware text into a stack buffer. 2 KiB is
-    // more than enough for any of the four packet types (beacon's six
-    // lines top out near 700 chars; tcmd_response adds ~200 for the
-    // data preview).
-    char summary_buf[2048];
-    FILE *mem = fmemopen(summary_buf, sizeof summary_buf, "w");
-    if (mem != NULL) {
-        cts1_packet_print(mem, NULL, payload, payload_len);
-        fflush(mem);
-        long pos = ftell(mem);
-        if (pos < 0) pos = 0;
-        if ((size_t)pos >= sizeof summary_buf) pos = sizeof summary_buf - 1;
-        summary_buf[pos] = '\0';
-        fclose(mem);
+    // Tally recognized types. Before the DB-null check so the run
+    // summary is right even with --no-db.
+    if (recognized) {
+        g_stats.recognized++;
+        switch (ptype) {
+            case 0x01: g_stats.beacon++;        break;
+            case 0x04: g_stats.tcmd_response++; break;
+            case 0x03: g_stats.log_message++;   break;
+            case 0x10: g_stats.bulk_file++;     break;
+            default: break;
+        }
     } else {
-        summary_buf[0] = '\0';
+        // Detected but not a known type — store it anyway so the DB
+        // holds every detected packet, errors or no. A frame with a
+        // valid CSP header is "unknown"; one whose CSP didn't decode is
+        // kept whole as "unparsed".
+        ptype      = 0;
+        ptype_name = csp_ok ? "unknown" : "unparsed";
+        g_stats.unrecognized++;
+    }
+
+    if (g_packet_db == NULL) return;
+
+    // Render the firmware-aware text for recognized types only. 2 KiB
+    // is more than enough (beacon's six lines top out near 700 chars;
+    // tcmd_response adds ~200 for the data preview). Unknown/unparsed
+    // frames have no firmware rendering, so the column stays NULL.
+    char summary_buf[2048];
+    const char *summary = NULL;
+    if (recognized) {
+        FILE *mem = fmemopen(summary_buf, sizeof summary_buf, "w");
+        if (mem != NULL) {
+            cts1_packet_print(mem, NULL, payload, payload_len);
+            fflush(mem);
+            long pos = ftell(mem);
+            if (pos < 0) pos = 0;
+            if ((size_t)pos >= sizeof summary_buf) pos = sizeof summary_buf - 1;
+            summary_buf[pos] = '\0';
+            fclose(mem);
+            summary = summary_buf[0] ? summary_buf : NULL;
+        }
     }
 
     // ts_received uses the ISO-8601 form when emit_frame's caller
@@ -788,7 +846,7 @@ void decode_loop_record_packet(const char *ts,
         .csp_sport        = hdr->sport,
         .csp_prio         = hdr->prio,
         .csp_flags        = hdr->flags,
-        .csp_present      = 1,
+        .csp_present      = csp_ok ? 1 : 0,
         .payload          = payload,
         .payload_len      = payload_len,
         .golay_errs       = golay_errs,
@@ -798,7 +856,7 @@ void decode_loop_record_packet(const char *ts,
         .source_tool      = g_db_source_tool,
         .source_run       = g_db_source_run,
         .audio_offset_s   = offset_s,
-        .decoded_summary  = summary_buf[0] ? summary_buf : NULL,
+        .decoded_summary  = summary,
         // Observer-frame state pulled from the setters. NaN sentinels
         // (the initial value when no setter has been called) map to
         // NULL in the DB.
