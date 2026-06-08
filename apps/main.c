@@ -1749,7 +1749,11 @@ static void render_tx_log_panel(int start_row, int col)
         // be the only truncation. Hard-coded 40/60-char caps here
         // chopped the operator's command text mid-string for any
         // payload longer than that, even when the panel had room.
-        char line[256];
+        // Holds the timestamp, tag, the full ascii command, and the
+        // not-sent reason. Sized off SSO_TX_TEXT_MAX so it tracks the
+        // command field — a fixed 256 here truncated the line once ascii
+        // widened from 160 to 256.
+        char line[SSO_TX_TEXT_MAX + 64];
         if (e->kind == SSO_EVT_TX_NOT_SENT && e->tx_not_sent_reason[0]) {
             snprintf(line, sizeof line, "%s  %s %s  [%s]",
                      e->ts, tag, e->ascii, e->tx_not_sent_reason);
