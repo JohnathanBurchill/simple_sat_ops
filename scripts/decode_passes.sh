@@ -301,7 +301,7 @@ while IFS= read -r -d '' src; do
     # up regardless of the source format.
     wav="$src"
 
-    frames=$(printf '%s\n' "$out" | awk '/^rx_replay: [0-9]+ frame\(s\) emitted/{print $2; exit}')
+    frames=$(printf '%s\n' "$out" | awk -F: '/detected \(after position dedup\)/{gsub(/[^0-9]/,"",$2); print $2; exit}')
     [[ -z "$frames" ]] && frames=0
 
     beacon_count=$(printf '%s\n' "$out" | grep -c '^\[t=[^]]*\] beacon: name=' || true)
