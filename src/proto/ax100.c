@@ -326,6 +326,11 @@ ssize_t ax100_unframe(const uint8_t *bytes, size_t n_bytes,
                       int *out_rs_locs)
 {
     if (bytes == NULL || opts == NULL || out_packet == NULL) return -1;
+    // Clear the caller's buffer before writing this frame, so a decode
+    // that ends up shorter than a previous one can never leave stale tail
+    // bytes from the prior frame for a downstream reader to pick up. The
+    // caller reuses one buffer across every window/attempt.
+    memset(out_packet, 0, out_packet_cap);
     if (out_hmac_ok) *out_hmac_ok = -1;
     if (out_golay_errors) *out_golay_errors = 0;
     if (out_rs_errors) *out_rs_errors = -1;

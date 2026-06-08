@@ -392,7 +392,8 @@ int tcmd_response_is(const uint8_t *payload, size_t len)
      || len == sizeof(COMMS_beacon_basic_packet_t) + 4) return 0;
     if (len < COMMS_TCMD_RESPONSE_HEADER_SIZE + 1) return 0;
     if (len > COMMS_TCMD_RESPONSE_HEADER_SIZE
-              + COMMS_TCMD_RESPONSE_PACKET_MAX_DATA_BYTES_PER_PACKET) return 0;
+              + COMMS_TCMD_RESPONSE_PACKET_MAX_DATA_BYTES_PER_PACKET
+              + COMMS_CSP_CRC32_TRAILER_BYTES) return 0;
     // Require exact packet_type match. The earlier 3-bit tolerance was
     // safe when only 0x01/0x02/0x04 were defined, but log_message (0x03)
     // and bulk_file (0x10) both land within 3 bits of 0x04, so any
@@ -513,7 +514,8 @@ size_t cts1_sanitise_text(const uint8_t *data, size_t data_len,
 int log_message_is(const uint8_t *payload, size_t len)
 {
     if (payload == NULL) return 0;
-    if (len < 2 || len > AX100_DOWNLINK_MAX_BYTES) return 0;
+    if (len < 2
+     || len > AX100_DOWNLINK_MAX_BYTES + COMMS_CSP_CRC32_TRAILER_BYTES) return 0;
     if (payload[0] != COMMS_PACKET_TYPE_LOG_MESSAGE) return 0;
     // Beacon and tcmd_response have stronger anchors at their own lengths;
     // route those out first so a corrupted log packet at length 130/134
@@ -568,7 +570,10 @@ int bulk_file_is(const uint8_t *payload, size_t len)
 {
     if (payload == NULL) return 0;
     if (len < COMMS_BULK_FILE_DOWNLINK_PACKET_HEADER_SIZE + 1) return 0;
-    if (len > AX100_DOWNLINK_MAX_BYTES) return 0;
+    // +trailer: a full 200-byte chunk plus the 4-byte CSP CRC32 trailer
+    // is 204 on the wire; without the slack the whole file download is
+    // rejected and lands in the "unknown" bucket.
+    if (len > AX100_DOWNLINK_MAX_BYTES + COMMS_CSP_CRC32_TRAILER_BYTES) return 0;
     if (payload[0] != COMMS_PACKET_TYPE_BULK_FILE_DOWNLINK) return 0;
     if (beacon_is_basic(payload, len)) return 0;
     return 1;

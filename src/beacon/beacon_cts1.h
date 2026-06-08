@@ -63,6 +63,13 @@
 // only filled part of the buffer (the rest is uninitialised padding).
 #define AX100_DOWNLINK_MAX_BYTES 200
 
+// The firmware appends a 4-byte CSP CRC32 trailer to downlink packets and
+// the ground doesn't always strip it (--csp-crc32 is opt-in, and a corrupt
+// trailer is left in the payload). So a recognized packet can be up to 4
+// bytes longer than its struct size. beacon_is_basic spells this out as
+// "130 || 134"; the variable-length detectors add this to their max.
+#define COMMS_CSP_CRC32_TRAILER_BYTES 4
+
 // TCMD-response packet layout. Header is 1+8+1+2+1+1 = 14 bytes, so
 // per-packet data tops out at 186. Long responses are split across
 // multiple packets, indexed via response_seq_num (1..max) /
