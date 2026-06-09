@@ -1098,9 +1098,58 @@ static int recon_bpr(int cols)
     return w;
 }
 
+// --- Text (ascii) view line navigation over the reconstructed buffer ------
+// The ascii view flows bytes as text -- breaking on '\n' and soft-wrapping at
+// the window width -- so blank lines and line breaks read like the exported
+// file. recon_scroll is the byte offset of the top display line. A gap byte
+// (recon_present == 0) shows as '?' and is never treated as a line break,
+// since the missing byte's value is unknown.
+
+// Byte where the display line after `pos` begins: the first '\n' at or after
+// pos (consumed), or pos + width when the line is longer than the window.
+static long recon_text_next(long pos, int width)
+{
+    if (width < 1) width = 1;
+    long i = pos;
+    for (int n = 0; i < recon_len && n < width; i++, n++)
+        if (recon_present[i] && recon_buf[i] == '\n') return i + 1;
+    return i;
+}
+
+// Byte where the display line at or before `pos` begins.
+static long recon_text_linestart(long pos, int width)
+{
+    if (pos <= 0) return 0;
+    if (pos > recon_len) pos = recon_len;
+    long ls = pos;            // back up to just after the previous newline
+    while (ls > 0 && !(recon_present[ls - 1] && recon_buf[ls - 1] == '\n')) ls--;
+    long s = ls, nxt;         // then advance in wraps to the last start <= pos
+    while ((nxt = recon_text_next(s, width)) <= pos && nxt > s) s = nxt;
+    return s;
+}
+
+// Byte where the display line one above `pos` begins.
+static long recon_text_prev(long pos, int width)
+{
+    if (pos <= 0) return 0;
+    return recon_text_linestart(pos - 1, width);
+}
+
 // Keep recon_scroll on a row boundary and within range for `body_h` rows.
 static void recon_clamp_scroll(int cols, int body_h)
 {
+    if (payload_view == PV_ASCII) {
+        // Text view scrolls by display lines: keep the top on a line start
+        // and never past the last screenful.
+        if (body_h < 1) body_h = 1;
+        if (recon_scroll < 0) recon_scroll = 0;
+        if (recon_scroll > recon_len) recon_scroll = recon_len;
+        recon_scroll = recon_text_linestart(recon_scroll, cols);
+        long maxtop = recon_len;
+        for (int i = 0; i < body_h; i++) maxtop = recon_text_prev(maxtop, cols);
+        if (recon_scroll > maxtop) recon_scroll = maxtop;
+        return;
+    }
     int bpr = recon_bpr(cols);
     if (bpr < 1) bpr = 1;
     if (body_h < 1) body_h = 1;
@@ -1486,7 +1535,13 @@ static void draw_recon(int rows_total, int cols)
     recon_clamp_scroll(cols, body_h);
     int bpr = recon_bpr(cols);
 
-    long shown_end = recon_scroll + (long) bpr * body_h;
+    long shown_end;
+    if (payload_view == PV_ASCII) {
+        shown_end = recon_scroll;
+        for (int r = 0; r < body_h; r++) shown_end = recon_text_next(shown_end, cols);
+    } else {
+        shown_end = recon_scroll + (long) bpr * body_h;
+    }
     if (shown_end > recon_len) shown_end = recon_len;
     char tb[300];
     snprintf(tb, sizeof tb, " %s   [%s]   bytes %ld-%ld of %ld",
@@ -1497,7 +1552,27 @@ static void draw_recon(int rows_total, int cols)
     mvaddnstr(0, 0, tb, cols);
     if (g_have_color) attroff(COLOR_PAIR(PAIR_BAR)); else attroff(A_REVERSE);
 
-    for (int r = 0; r < body_h; r++) {
+    if (payload_view == PV_ASCII) {
+        // Text view: flow on '\n' and soft-wrap at the window width, so blank
+        // lines and line breaks read like the exported file.
+        long pos = recon_scroll;
+        for (int r = 0; r < body_h; r++) {
+            int y = 1 + r;
+            move(y, 0); clrtoeol();
+            if (pos >= recon_len) continue;
+            long end = recon_text_next(pos, cols);
+            int x = 0;
+            for (long idx = pos; idx < end; idx++) {
+                if (recon_present[idx] && recon_buf[idx] == '\n') break;
+                uint8_t b = recon_buf[idx];
+                char c = !recon_present[idx] ? '?'
+                       : (b >= 0x20 && b < 0x7F) ? (char) b
+                       : (b == '\t') ? ' ' : '.';
+                if (x < cols) mvaddch(y, x++, (chtype) c);
+            }
+            pos = end;
+        }
+    } else for (int r = 0; r < body_h; r++) {
         int y = 1 + r;
         move(y, 0); clrtoeol();
         long base = recon_scroll + (long) r * bpr;
@@ -1520,15 +1595,6 @@ static void draw_recon(int rows_total, int cols)
             }
             line[pos] = '\0';
             mvaddnstr(y, 0, line, cols);
-        } else if (payload_view == PV_ASCII) {
-            for (int i = 0; i < bpr && base + i < recon_len && i < cols; i++) {
-                long idx = base + i;
-                uint8_t b = recon_buf[idx];
-                char c = !recon_present[idx] ? '?'
-                       : (b >= 0x20 && b < 0x7F) ? (char) b
-                       : (b == '\t') ? ' ' : '.';
-                mvaddch(y, i, (chtype) c);
-            }
         } else {  // PV_BASE64
             char line[512];
             int pos = 0;
@@ -2104,12 +2170,30 @@ int main(int argc, char **argv)
             case 'q': case 27: case KEY_LEFT: case KEY_BACKSPACE:
             case 127: case 8: case 'h':   leave_recon();                  break;
             case 'v': payload_view = (payload_view + 1) % 3;              break;
-            case KEY_DOWN:  case 'j': recon_scroll += bpr;               break;
-            case KEY_UP:    case 'k': recon_scroll -= bpr;               break;
-            case KEY_NPAGE: case 6:   recon_scroll += (long) bpr * page; break;
-            case KEY_PPAGE: case 2:   recon_scroll -= (long) bpr * page; break;
-            case 4:                   recon_scroll += (long) bpr * half; break;
-            case 21:                  recon_scroll -= (long) bpr * half; break;
+            case KEY_DOWN:  case 'j':
+                if (payload_view == PV_ASCII) recon_scroll = recon_text_next(recon_scroll, cols);
+                else recon_scroll += bpr;
+                break;
+            case KEY_UP:    case 'k':
+                if (payload_view == PV_ASCII) recon_scroll = recon_text_prev(recon_scroll, cols);
+                else recon_scroll -= bpr;
+                break;
+            case KEY_NPAGE: case 6:
+                if (payload_view == PV_ASCII) { for (int i = 0; i < page; i++) recon_scroll = recon_text_next(recon_scroll, cols); }
+                else recon_scroll += (long) bpr * page;
+                break;
+            case KEY_PPAGE: case 2:
+                if (payload_view == PV_ASCII) { for (int i = 0; i < page; i++) recon_scroll = recon_text_prev(recon_scroll, cols); }
+                else recon_scroll -= (long) bpr * page;
+                break;
+            case 4:
+                if (payload_view == PV_ASCII) { for (int i = 0; i < half; i++) recon_scroll = recon_text_next(recon_scroll, cols); }
+                else recon_scroll += (long) bpr * half;
+                break;
+            case 21:
+                if (payload_view == PV_ASCII) { for (int i = 0; i < half; i++) recon_scroll = recon_text_prev(recon_scroll, cols); }
+                else recon_scroll -= (long) bpr * half;
+                break;
             case 'g': case KEY_HOME:  recon_scroll = 0;                  break;
             case 'G': case KEY_END:   recon_scroll = recon_len;          break;
             case 'e': {
