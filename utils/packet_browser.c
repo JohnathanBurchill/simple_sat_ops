@@ -978,13 +978,24 @@ static void recon_build_bulk(sqlite3 *db)
     recon_chunks = chunks;
     recon_count_gaps();
 
-    char extra[64] = "";
+    // Per-file completeness in bytes (exact), not a chunk ratio: "16/45" read
+    // as "16 of this file's 45 chunks", but 45 was every bulk_file packet in
+    // the run across all downloads. Report bytes present out of the file's
+    // reconstructed span, the packets used, and -- separately -- how many
+    // other bulk_file packets sit in the run (other downloads).
+    long present = recon_len - recon_gap_bytes;
+    int other_in_run = total_in_run - chunks;
+    char extra[96] = "";
+    if (other_in_run > 0)
+        snprintf(extra + strlen(extra), sizeof extra - strlen(extra),
+                 "  (%d more bulk_file in run)", other_in_run);
     if (trigger_ts >= 0)
-        snprintf(extra, sizeof extra, "  +%.0fs after cmd", (t_lo - trigger_ts) / 1000.0);
+        snprintf(extra + strlen(extra), sizeof extra - strlen(extra),
+                 "  +%.0fs after cmd", (t_lo - trigger_ts) / 1000.0);
     snprintf(recon_title, sizeof recon_title,
-             "bulk_file  run %.16s  off %ld..%ld  %d/%d chunks  %ld gap byte%s  span %.0fs%s",
-             rows[sel].run, min_off, recon_len, chunks, total_in_run,
-             recon_gap_bytes, recon_gap_bytes == 1 ? "" : "s",
+             "bulk_file  run %.16s  off %ld..%ld  %ld/%ld bytes  %d packet%s  span %.0fs%s",
+             rows[sel].run, min_off, recon_len, present, recon_len,
+             chunks, chunks == 1 ? "" : "s",
              (t_hi - t_lo) / 1000.0, extra);
     snprintf(recon_name, sizeof recon_name,
              "bulkfile_%.16s_%ld-%ld.bin", rows[sel].run, min_off, recon_len);

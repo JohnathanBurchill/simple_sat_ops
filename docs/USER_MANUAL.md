@@ -1622,10 +1622,12 @@ per second (the radio transmits each ~244-byte framed packet during the
 firmware's ~208 ms inter-packet pacing, so the two overlap to ~250 ms/packet) -
 with a generous margin for
 missed packets and link fades, and capped at 30 s so a clearly separate
-download isn't pulled in. The header reports the offset range, how many chunks
-were used out of the run's total, the missing-byte count, the burst's
-wall-clock span, and - when a matching `sent_tcmd` row exists - how long after
-the triggering telecommand (`@tssent`) the download began. A download split
+download isn't pulled in. The header reports the offset range, the bytes
+recovered out of the file's reconstructed span (an exact per-file figure, not
+a chunk ratio), the number of packets used, the burst's wall-clock span, how
+many other `bulk_file` packets remain in the run (separate downloads), and -
+when a matching `sent_tcmd` row exists - how long after the triggering
+telecommand (`@tssent`) the download began. A download split
 across a long pause, or across separate commands, reconstructs as separate
 bursts; open each from one of its own chunks.
 
