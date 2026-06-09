@@ -108,6 +108,38 @@ echo "rx_replay:  $RX_REPLAY"
 echo "root:       $ROOT"
 echo "packet DB:  ${SSO_PACKET_DB:-$FRONTIERSAT_ROOT/packet_db.sqlite (rx_replay default)}"
 
+# Pre-flight: refuse to run if that packet DB can't be written. Otherwise a
+# permissions problem is SILENT -- rx_replay drops the inserts but still exits
+# 0, decode_passes touches each <audio>.decoded marker below, and the passes
+# are then skipped on every future run even after the DB is fixed, quietly
+# losing them. Fail loud and early instead. The writer needs write access to
+# the .sqlite file, its -wal/-shm sidecars, AND the containing directory (WAL
+# creates the sidecars there), so we check the directory, the file, and any
+# existing WAL sidecars are writable.
+db_target="${SSO_PACKET_DB:-$FRONTIERSAT_ROOT/packet_db.sqlite}"
+db_dir="$(dirname "$db_target")"
+preflight_fail() {
+    echo "error: packet DB is not writable: $db_target" >&2
+    echo "       ($1)" >&2
+    echo "       Refusing to decode -- a silent write failure would mark every" >&2
+    echo "       pass '.decoded' without storing it, and they would be skipped" >&2
+    echo "       even after the DB is fixed. Give the writer (e.g. the cron" >&2
+    echo "       user) write access to the .sqlite file, its -wal/-shm" >&2
+    echo "       sidecars, and the directory $db_dir, then re-run." >&2
+    exit 3
+}
+[[ -d "$db_dir" && -w "$db_dir" && -x "$db_dir" ]] || preflight_fail "directory not writable"
+if [[ -e "$db_target" ]]; then
+    [[ -w "$db_target" ]] || preflight_fail "file not writable"
+    # In WAL mode the writer also updates these sidecars; a stale root- or
+    # other-user-owned -shm/-wal blocks every other writer, so if they exist
+    # they must be writable too. (-w uses access(2): it honours ACLs and is
+    # evaluated as the user actually running this, e.g. the cron user.)
+    for _sx in "$db_target-wal" "$db_target-shm"; do
+        [[ ! -e "$_sx" || -w "$_sx" ]] || preflight_fail "WAL sidecar not writable: $_sx"
+    done
+fi
+
 # ffmpeg is only required when an .ogg shows up in the tree; check
 # lazily so a pure-WAV run on a host without ffmpeg still works.
 have_ffmpeg=""
