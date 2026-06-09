@@ -68,6 +68,8 @@
 #define SGP4SDP4_CONSTANTS
 #include <sgp4sdp4.h>
 
+#include "argparse.h"
+
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -525,120 +527,215 @@ static void format_tle(int catnr, char classd, const char *idesg, double epoch_f
 
 // ---- main -------------------------------------------------------------------
 
-static void usage(const char *prog)
-{
-    fprintf(stderr,
-        "Usage: %s [options] [state-file]\n"
-        "\n"
-        "Build a NORAD two-line element set from one position/velocity state\n"
-        "vector (e.g. a FrontierSat GNSS fix) and write it to stdout. With no\n"
-        "file, the state is read from stdin.\n"
-        "\n"
-        "The file has five data lines (blank and '#' lines ignored; commas or\n"
-        "spaces separate components):\n"
-        "  1  epoch, UTC          YYYY-MM-DDThh:mm:ssZ\n"
-        "  2  position x,y,z      metres\n"
-        "  3  position 1-sigma    metres\n"
-        "  4  velocity vx,vy,vz   metres/second\n"
-        "  5  velocity 1-sigma    metres/second\n"
-        "Position and velocity are Earth-fixed (ECEF/ITRF) unless --frame=eci.\n"
-        "\n"
-        "Or paste a NovAtel OEM7 BESTXYZA log (the FrontierSat telecommand\n"
-        "response) as the input instead -- any leading wrapper is skipped, the\n"
-        "CRC is checked, and the epoch is taken from the GPS week/seconds in its\n"
-        "header. It is auto-detected; --format forces the input kind.\n"
-        "\n"
-        "Options:\n"
-        "  --name <s>        name line (default FrontierSat; --no-name omits it)\n"
-        "  --no-name         emit a bare two-line set, no name line\n"
-        "  --catnr <n>       catalogue number, 1..99999 (default 69015)\n"
-        "  --intl <s>        international designator, e.g. 25001A (default blank)\n"
-        "  --elset <n>       element set number, 0..9999 (default 1)\n"
-        "  --revnum <n>      revolution number at epoch, 0..99999 (default 0)\n"
-        "  --frame <f>       ecef (default) or eci: frame of a 5-line state\n"
-        "  --format <k>      input kind: auto (default), state, or bestxyz\n"
-        "  --leap-seconds <n> GPS-UTC offset for BESTXYZA epochs (default 18)\n"
-        "  --strict-crc      refuse a BESTXYZA log whose CRC does not match\n"
-        "  --print-state     print the parsed 5-line state (with epoch) and stop\n"
-        "  --sigma-k <x>     gate multiplier: warn if residual > x*sigma (default 1)\n"
-        "  --strict-sigma    exit nonzero and emit no TLE if the gate fails\n"
-        "  --max-iter <n>    differential-correction iteration cap (default 60)\n"
-        "  -v, --verbose     print each fit iteration to stderr\n"
-        "  -h, --help        this text\n"
-        "  -V, --version     print the build commit and exit\n"
-        "\n"
-        "B* drag and the mean-motion derivatives are zero (not observable from\n"
-        "one state). The TLE goes to stdout; the fit log, orbit summary and\n"
-        "quality-gate result go to stderr.\n",
-        prog);
-}
+// Input kind. Was a bare enum local to main(); lifted to a named type so
+// parse_args() can store the --format choice.
+typedef enum { FMT_AUTO, FMT_STATE, FMT_BESTXYZ } input_fmt_t;
+
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the fields out into the working locals the (large) body below uses, so that
+// body is unchanged. The single positional <state-file> is stored in path.
+typedef struct {
+    const char *path;
+    const char *name;
+    const char *intl;
+    int         emit_name;
+    int         catnr, elset, revnum, max_iter, verbose;
+    int         frame_eci, strict_sigma;
+    double      sigma_k;
+    char        classd;
+    input_fmt_t fmt;
+    int         leap_seconds;
+    int         strict_crc, print_state;
+} tle_from_state_args_t;
+
+// Option column width: the widest label below ("--leap-seconds <n>") + a
+// small margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 22
 
 #include "sso_version.h"
 
-// Match argv[*i] against a value-bearing option in either form: "--opt
-// value" (advancing *i past the value) or "--opt=value". Returns the
-// value (possibly "") when it matches, NULL otherwise.
-static const char *match_opt(char **argv, int argc, int *i, const char *opt)
+// Match a value-bearing option in either form, exactly as the old match_opt
+// did: "--opt value" (consuming the next token by advancing *t) or
+// "--opt=value". Returns the value (possibly "") when the option name
+// matches, NULL otherwise. arg is argv[*t + 1]; the space-form value is the
+// following token, argv[*t + 2]. A trailing space-form option returns ""
+// (not NULL) so, like the original, "--name" alone sets an empty string and
+// "--catnr" alone becomes atoi("") == 0 (caught by the range check) rather
+// than an unknown-option error.
+static const char *opt_value(const char *arg, char **argv, int ntokens,
+                             int *t, const char *opt)
 {
-    const char *a = argv[*i];
     size_t len = strlen(opt);
-    if (strncmp(a, opt, len) != 0) return NULL;
-    if (a[len] == '=') return a + len + 1;
-    if (a[len] != '\0') return NULL;            // e.g. --name vs --no-name
-    return (*i + 1 < argc) ? argv[++(*i)] : "";
+    if (strncmp(arg, opt, len) != 0) return NULL;
+    if (arg[len] == '=') return arg + len + 1;
+    if (arg[len] != '\0') return NULL;          // e.g. --name vs --no-name
+    return (*t + 1 < ntokens) ? argv[(++(*t)) + 1] : "";
+}
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(tle_from_state_args_t *a, int argc, char **argv, int help)
+{
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        const char *val;
+        int matched = 0;
+
+        // Positional first so it lists above the --options. Exactly one
+        // <state-file> is accepted; a lone "-" counts as the positional (it
+        // is then handed to slurp() as a literal path, as before -- stdin is
+        // used only when NO path is given). A second positional falls to the
+        // epilog as an "Unexpected argument".
+        if ((a->path == NULL && (arg[0] != '-' || strcmp(arg, "-") == 0)) || help) {
+            if (help) parse_help_line(OPTW, "[state-file]", "5-line state vector or a BESTXYZA log (default: read stdin)");
+            else a->path = arg;
+            matched = 1;
+        }
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "-h, --help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0 || help) {
+            if (help) parse_help_line(OPTW, "-v, --verbose", "print each fit iteration to stderr");
+            else a->verbose = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-name") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-name", "emit a bare two-line set, no name line");
+            else a->emit_name = 0;
+            matched = 1;
+        }
+        if (strcmp(arg, "--strict-sigma") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--strict-sigma", "exit nonzero and emit no TLE if the sigma gate fails");
+            else a->strict_sigma = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--strict-crc") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--strict-crc", "refuse a BESTXYZA log whose CRC does not match");
+            else a->strict_crc = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--print-state") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--print-state", "print the parsed 5-line state (with epoch) and stop");
+            else a->print_state = 1;
+            matched = 1;
+        }
+        if ((val = opt_value(arg, argv, ntokens, &t, "--name")) != NULL || help) {
+            if (help) parse_help_line(OPTW, "--name <s>", "name line (default FrontierSat; --no-name omits it)");
+            else a->name = val;
+            matched = 1;
+        }
+        if ((val = opt_value(arg, argv, ntokens, &t, "--intl")) != NULL || help) {
+            if (help) parse_help_line(OPTW, "--intl <s>", "international designator, e.g. 25001A (default blank)");
+            else a->intl = val;
+            matched = 1;
+        }
+        if ((val = opt_value(arg, argv, ntokens, &t, "--catnr")) != NULL || help) {
+            if (help) parse_help_line(OPTW, "--catnr <n>", "catalogue number, 1..99999 (default 69015)");
+            else a->catnr = atoi(val);
+            matched = 1;
+        }
+        if ((val = opt_value(arg, argv, ntokens, &t, "--elset")) != NULL || help) {
+            if (help) parse_help_line(OPTW, "--elset <n>", "element set number, 0..9999 (default 1)");
+            else a->elset = atoi(val);
+            matched = 1;
+        }
+        if ((val = opt_value(arg, argv, ntokens, &t, "--revnum")) != NULL || help) {
+            if (help) parse_help_line(OPTW, "--revnum <n>", "revolution number at epoch, 0..99999 (default 0)");
+            else a->revnum = atoi(val);
+            matched = 1;
+        }
+        if ((val = opt_value(arg, argv, ntokens, &t, "--max-iter")) != NULL || help) {
+            if (help) parse_help_line(OPTW, "--max-iter <n>", "differential-correction iteration cap (default 60)");
+            else a->max_iter = atoi(val);
+            matched = 1;
+        }
+        if ((val = opt_value(arg, argv, ntokens, &t, "--sigma-k")) != NULL || help) {
+            if (help) parse_help_line(OPTW, "--sigma-k <x>", "gate multiplier: warn if residual > x*sigma (default 1)");
+            else a->sigma_k = atof(val);
+            matched = 1;
+        }
+        if ((val = opt_value(arg, argv, ntokens, &t, "--leap-seconds")) != NULL || help) {
+            if (help) parse_help_line(OPTW, "--leap-seconds <n>", "GPS-UTC offset for BESTXYZA epochs (default 18)");
+            else a->leap_seconds = atoi(val);
+            matched = 1;
+        }
+        if ((val = opt_value(arg, argv, ntokens, &t, "--format")) != NULL || help) {
+            if (help) parse_help_line(OPTW, "--format <k>", "input kind: auto (default), state, or bestxyz");
+            else {
+                if (!strcmp(val, "auto")) a->fmt = FMT_AUTO;
+                else if (!strcmp(val, "state")) a->fmt = FMT_STATE;
+                else if (!strcmp(val, "bestxyz") || !strcmp(val, "bestxyza")) a->fmt = FMT_BESTXYZ;
+                else { fprintf(stderr, "--format must be auto, state or bestxyz\n"); return PARSE_ERROR; }
+            }
+            matched = 1;
+        }
+        if ((val = opt_value(arg, argv, ntokens, &t, "--frame")) != NULL || help) {
+            if (help) parse_help_line(OPTW, "--frame <f>", "ecef (default) or eci: frame of a 5-line state");
+            else {
+                if (!strcmp(val, "eci")) a->frame_eci = 1;
+                else if (!strcmp(val, "ecef")) a->frame_eci = 0;
+                else { fprintf(stderr, "--frame must be ecef or eci\n"); return PARSE_ERROR; }
+            }
+            matched = 1;
+        }
+        if (strcmp(arg, "-V") == 0 || strcmp(arg, "--version") == 0 || help) {
+            if (help) parse_help_line(OPTW, "-V, --version", "print the build commit and exit");
+            // Handled by sso_version_handle in main; here only for --help.
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            // The original told an unknown dash option apart from a second
+            // positional: the former printed usage, the latter did not. Keep
+            // the two distinct messages.
+            if (arg[0] == '-' && strcmp(arg, "-") != 0)
+                fprintf(stderr, "Unknown option: %s\n", arg);
+            else
+                fprintf(stderr, "Unexpected argument: %s\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
 }
 
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "tle_from_state")) return 0;
 
-    const char *path = NULL;
-    const char *name = "FrontierSat";
-    const char *intl = "";
-    int emit_name = 1;
-    int catnr = 69015, elset = 1, revnum = 0, max_iter = 60, verbose = 0;
-    int frame_eci = 0, strict_sigma = 0;
-    double sigma_k = 1.0;
-    char classd = 'U';
-    enum { FMT_AUTO, FMT_STATE, FMT_BESTXYZ } fmt = FMT_AUTO;
-    int leap_seconds = BESTXYZ_DEFAULT_LEAP_SECONDS;
-    int strict_crc = 0, print_state = 0;
-
-    for (int i = 1; i < argc; ++i) {
-        const char *a = argv[i], *val;
-        if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return EXIT_SUCCESS; }
-        else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) verbose = 1;
-        else if (!strcmp(a, "--no-name")) emit_name = 0;
-        else if (!strcmp(a, "--strict-sigma")) strict_sigma = 1;
-        else if (!strcmp(a, "--strict-crc")) strict_crc = 1;
-        else if (!strcmp(a, "--print-state")) print_state = 1;
-        else if ((val = match_opt(argv, argc, &i, "--name"))) name = val;
-        else if ((val = match_opt(argv, argc, &i, "--intl"))) intl = val;
-        else if ((val = match_opt(argv, argc, &i, "--catnr"))) catnr = atoi(val);
-        else if ((val = match_opt(argv, argc, &i, "--elset"))) elset = atoi(val);
-        else if ((val = match_opt(argv, argc, &i, "--revnum"))) revnum = atoi(val);
-        else if ((val = match_opt(argv, argc, &i, "--max-iter"))) max_iter = atoi(val);
-        else if ((val = match_opt(argv, argc, &i, "--sigma-k"))) sigma_k = atof(val);
-        else if ((val = match_opt(argv, argc, &i, "--leap-seconds"))) leap_seconds = atoi(val);
-        else if ((val = match_opt(argv, argc, &i, "--format"))) {
-            if (!strcmp(val, "auto")) fmt = FMT_AUTO;
-            else if (!strcmp(val, "state")) fmt = FMT_STATE;
-            else if (!strcmp(val, "bestxyz") || !strcmp(val, "bestxyza")) fmt = FMT_BESTXYZ;
-            else { fprintf(stderr, "--format must be auto, state or bestxyz\n"); return EXIT_FAILURE; }
-        }
-        else if ((val = match_opt(argv, argc, &i, "--frame"))) {
-            if (!strcmp(val, "eci")) frame_eci = 1;
-            else if (!strcmp(val, "ecef")) frame_eci = 0;
-            else { fprintf(stderr, "--frame must be ecef or eci\n"); return EXIT_FAILURE; }
-        }
-        else if (a[0] == '-' && a[1] != '\0') {
-            fprintf(stderr, "Unknown option: %s\n", a);
-            usage(argv[0]);
-            return EXIT_FAILURE;
-        }
-        else if (!path) path = a;
-        else { fprintf(stderr, "Unexpected argument: %s\n", a); return EXIT_FAILURE; }
+    tle_from_state_args_t cfg = {0};
+    cfg.name = "FrontierSat";
+    cfg.intl = "";
+    cfg.emit_name = 1;
+    cfg.catnr = 69015;
+    cfg.elset = 1;
+    cfg.revnum = 0;
+    cfg.max_iter = 60;
+    cfg.sigma_k = 1.0;
+    cfg.classd = 'U';
+    cfg.fmt = FMT_AUTO;
+    cfg.leap_seconds = BESTXYZ_DEFAULT_LEAP_SECONDS;
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
     }
+
+    // Copy parsed config into the working locals the body below uses.
+    const char *path = cfg.path;
+    const char *name = cfg.name;
+    const char *intl = cfg.intl;
+    int emit_name = cfg.emit_name;
+    int catnr = cfg.catnr, elset = cfg.elset, revnum = cfg.revnum;
+    int max_iter = cfg.max_iter, verbose = cfg.verbose;
+    int frame_eci = cfg.frame_eci, strict_sigma = cfg.strict_sigma;
+    double sigma_k = cfg.sigma_k;
+    char classd = cfg.classd;
+    input_fmt_t fmt = cfg.fmt;
+    int leap_seconds = cfg.leap_seconds;
+    int strict_crc = cfg.strict_crc, print_state = cfg.print_state;
 
     if (catnr < 1 || catnr > 99999) { fprintf(stderr, "--catnr out of range (1..99999)\n"); return EXIT_FAILURE; }
     if (elset < 0 || elset > 9999) { fprintf(stderr, "--elset out of range (0..9999)\n"); return EXIT_FAILURE; }

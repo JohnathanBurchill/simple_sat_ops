@@ -32,6 +32,7 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "argparse.h"
 #include "ax100.h"
 #include "beacon_cts1.h"
 #include "csp.h"
@@ -42,58 +43,175 @@
 #include <string.h>
 #include <time.h>
 
-static void usage(FILE *out, const char *argv0)
-{
-    fprintf(out,
-        "usage: %s --out=<file.wav> [options]\n"
-        "\n"
-        "Fill a CTS1 firmware-canonical downlink packet with deterministic\n"
-        "plausible values, frame for the AX100, and write a 48 kHz mono\n"
-        "16-bit WAV that decodes round-trip via rx_decode / rx_replay /\n"
-        "b210_rx_tx.\n"
-        "\n"
-        "Required:\n"
-        "  --out=<file.wav>          Output WAV path\n"
-        "\n"
-        "Packet selection:\n"
-        "  --type=beacon             COMMS_beacon_basic_packet_t (DEFAULT)\n"
-        "  --type=tcmd-response      COMMS_tcmd_response_packet_t (single packet)\n"
-        "\n"
-        "Beacon options (--type=beacon):\n"
-        "  (no per-field overrides in V1; values are deterministic plausibles)\n"
-        "\n"
-        "TCMD-response options (--type=tcmd-response):\n"
-        "  --tcmd-code=N             response_code (default 0 = OK)\n"
-        "  --tcmd-duration=N         duration_ms (default 42)\n"
-        "  --tcmd-message=<STR>      response body (default \"OK: telecommand\n"
-        "                            executed\"; trailing NUL added automatically)\n"
-        "\n"
-        "Common options:\n"
-        "  --repeats=N               Emit N packets in one WAV (default 1)\n"
-        "  --gap-seconds=S           Silence between/after packets (default 20,\n"
-        "                            matches firmware beacon cadence)\n"
-        "  --reed-solomon            RS(255,223) on (DEFAULT)\n"
-        "  --no-reed-solomon         RS off (for negative-control testing)\n"
-        "  --src=<0..31>             CSP source (default 1, firmware sat)\n"
-        "  --dst=<0..31>             CSP destination (default 10, firmware GS)\n"
-        "  --dport=<0..63>           CSP destination port (default 10)\n"
-        "  --sport=<0..63>           CSP source port (default 10)\n"
-        "  --prio=<0..3>             CSP priority (default 3, firmware value)\n"
-        "  --flags=<0..255>          CSP flags byte (default 0)\n"
-        "  --bit-rate=<bps>          Bit rate (default 9600)\n"
-        "  --samp-rate=<hz>          Sample rate (default 48000)\n"
-        "  --gauss-bt=<float>        Gaussian BT (default 0.5)\n"
-        "  --gauss-span=<symbols>    Gaussian filter span (default 4)\n"
-        "  --gain-db=<float>         Output gain dB (default 0)\n"
-        "  --print-frame             Hex dump the AX100 frame to stdout\n"
-        "  --print-struct            Hex dump the wire payload to stderr\n"
-        "  --help                    This message\n",
-        argv0);
-}
-
 static int starts_with(const char *s, const char *prefix)
 {
     return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+typedef enum { PACKET_BEACON, PACKET_TCMD_RESPONSE } packet_kind_t;
+
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the fields out into working locals so the (large) synthesis body is
+// unchanged. csp_hdr / mp are carried whole so their parse actions stay
+// byte-identical (e.g. a->csp_hdr.src = (uint8_t)atoi(arg + 6)); main()
+// seeds their non-literal defaults (modem_params_defaults + CTS1 constants)
+// before parse_args runs.
+typedef struct {
+    const char *out_wav;
+    int repeats;
+    int gap_seconds;
+    int use_rs;
+    int print_frame;
+    int print_struct;
+    packet_kind_t kind;
+    int tcmd_code;
+    int tcmd_duration_ms;
+    const char *tcmd_message;
+    csp_v1_header_t csp_hdr;
+    modem_params_t mp;
+} beacon_gen_args_t;
+
+// Option column width: the widest label below ("--type=tcmd-response") + a
+// small margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 22
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(beacon_gen_args_t *a, int argc, char **argv, int help)
+{
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (starts_with(arg, "--out=") || help) {
+            if (help) parse_help_line(OPTW, "--out=<file.wav>", "output WAV path (required)");
+            else a->out_wav = arg + 6;
+            matched = 1;
+        }
+        if (strcmp(arg, "--type=beacon") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--type=beacon", "COMMS_beacon_basic_packet_t (default)");
+            else a->kind = PACKET_BEACON;
+            matched = 1;
+        }
+        if (strcmp(arg, "--type=tcmd-response") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--type=tcmd-response", "COMMS_tcmd_response_packet_t (single packet)");
+            else a->kind = PACKET_TCMD_RESPONSE;
+            matched = 1;
+        }
+        if (starts_with(arg, "--tcmd-code=") || help) {
+            if (help) parse_help_line(OPTW, "--tcmd-code=<n>", "tcmd-response: response_code (default 0 = OK)");
+            else a->tcmd_code = atoi(arg + 12);
+            matched = 1;
+        }
+        if (starts_with(arg, "--tcmd-duration=") || help) {
+            if (help) parse_help_line(OPTW, "--tcmd-duration=<n>", "tcmd-response: duration_ms (default 42)");
+            else a->tcmd_duration_ms = atoi(arg + 16);
+            matched = 1;
+        }
+        if (starts_with(arg, "--tcmd-message=") || help) {
+            if (help) parse_help_line(OPTW, "--tcmd-message=<str>", "tcmd-response: body (default \"OK: telecommand executed\"; NUL appended)");
+            else a->tcmd_message = arg + 15;
+            matched = 1;
+        }
+        if (starts_with(arg, "--repeats=") || help) {
+            if (help) parse_help_line(OPTW, "--repeats=<n>", "emit N packets in one WAV (default 1)");
+            else a->repeats = atoi(arg + 10);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gap-seconds=") || help) {
+            if (help) parse_help_line(OPTW, "--gap-seconds=<s>", "silence between/after packets (default 20)");
+            else a->gap_seconds = atoi(arg + 14);
+            matched = 1;
+        }
+        if (strcmp(arg, "--reed-solomon") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--reed-solomon", "RS(255,223) on (default)");
+            else a->use_rs = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-reed-solomon") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-reed-solomon", "RS off (for negative-control testing)");
+            else a->use_rs = 0;
+            matched = 1;
+        }
+        if (starts_with(arg, "--src=") || help) {
+            if (help) parse_help_line(OPTW, "--src=<0..31>", "CSP source (default 1, firmware sat)");
+            else a->csp_hdr.src = (uint8_t)atoi(arg + 6);
+            matched = 1;
+        }
+        if (starts_with(arg, "--dst=") || help) {
+            if (help) parse_help_line(OPTW, "--dst=<0..31>", "CSP destination (default 10, firmware GS)");
+            else a->csp_hdr.dst = (uint8_t)atoi(arg + 6);
+            matched = 1;
+        }
+        if (starts_with(arg, "--dport=") || help) {
+            if (help) parse_help_line(OPTW, "--dport=<0..63>", "CSP destination port (default 10)");
+            else a->csp_hdr.dport = (uint8_t)atoi(arg + 8);
+            matched = 1;
+        }
+        if (starts_with(arg, "--sport=") || help) {
+            if (help) parse_help_line(OPTW, "--sport=<0..63>", "CSP source port (default 10)");
+            else a->csp_hdr.sport = (uint8_t)atoi(arg + 8);
+            matched = 1;
+        }
+        if (starts_with(arg, "--prio=") || help) {
+            if (help) parse_help_line(OPTW, "--prio=<0..3>", "CSP priority (default 3, firmware value)");
+            else a->csp_hdr.prio = (uint8_t)atoi(arg + 7);
+            matched = 1;
+        }
+        if (starts_with(arg, "--flags=") || help) {
+            if (help) parse_help_line(OPTW, "--flags=<0..255>", "CSP flags byte (default 0)");
+            else a->csp_hdr.flags = (uint8_t)atoi(arg + 8);
+            matched = 1;
+        }
+        if (starts_with(arg, "--bit-rate=") || help) {
+            if (help) parse_help_line(OPTW, "--bit-rate=<bps>", "bit rate (default 9600)");
+            else a->mp.bit_rate = atoi(arg + 11);
+            matched = 1;
+        }
+        if (starts_with(arg, "--samp-rate=") || help) {
+            if (help) parse_help_line(OPTW, "--samp-rate=<hz>", "sample rate (default 48000)");
+            else a->mp.samp_rate = atoi(arg + 12);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gauss-bt=") || help) {
+            if (help) parse_help_line(OPTW, "--gauss-bt=<float>", "Gaussian BT (default 0.5)");
+            else a->mp.gauss_bt = atof(arg + 11);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gauss-span=") || help) {
+            if (help) parse_help_line(OPTW, "--gauss-span=<n>", "Gaussian filter span in symbols (default 4)");
+            else a->mp.gauss_symbol_span = atoi(arg + 13);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gain-db=") || help) {
+            if (help) parse_help_line(OPTW, "--gain-db=<float>", "output gain dB (default 0)");
+            else a->mp.gain_db = atof(arg + 10);
+            matched = 1;
+        }
+        if (strcmp(arg, "--print-frame") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--print-frame", "hex dump the AX100 frame to stdout");
+            else a->print_frame = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--print-struct") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--print-struct", "hex dump the wire payload to stderr");
+            else a->print_struct = 1;
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            fprintf(stderr, "beacon_gen: unknown option: %s\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
 }
 
 // Fill the beacon struct with deterministic plausibles. n is the
@@ -189,90 +307,70 @@ static size_t fill_tcmd_response(COMMS_tcmd_response_packet_t *t,
     return COMMS_TCMD_RESPONSE_HEADER_SIZE + mlen + 1;
 }
 
-typedef enum { PACKET_BEACON, PACKET_TCMD_RESPONSE } packet_kind_t;
-
 // -V / --version support (commit baked in at build time).
 #include "sso_version.h"
 
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "beacon_gen")) return 0;
-    const char *out_wav = NULL;
-    int repeats = 1;
-    int gap_seconds = 20;
-    int use_rs = 1;
-    int print_frame = 0;
-    int print_struct = 0;
-    packet_kind_t kind = PACKET_BEACON;
-    int tcmd_code = 0;
-    int tcmd_duration_ms = 42;
-    const char *tcmd_message = "OK: telecommand executed";
 
-    csp_v1_header_t csp_hdr = {
-        .prio  = CTS1_BEACON_CSP_PRIO,
-        .src   = CTS1_BEACON_CSP_SRC,
-        .dst   = CTS1_BEACON_CSP_DST,
-        .dport = CTS1_BEACON_CSP_DPORT,
-        .sport = CTS1_BEACON_CSP_SPORT,
-        .flags = CTS1_BEACON_CSP_FLAGS,
+    beacon_gen_args_t cfg = {
+        .repeats = 1,
+        .gap_seconds = 20,
+        .use_rs = 1,
+        .kind = PACKET_BEACON,
+        .tcmd_duration_ms = 42,
+        .tcmd_message = "OK: telecommand executed",
+        .csp_hdr = {
+            .prio  = CTS1_BEACON_CSP_PRIO,
+            .src   = CTS1_BEACON_CSP_SRC,
+            .dst   = CTS1_BEACON_CSP_DST,
+            .dport = CTS1_BEACON_CSP_DPORT,
+            .sport = CTS1_BEACON_CSP_SPORT,
+            .flags = CTS1_BEACON_CSP_FLAGS,
+        },
     };
+    // mp's defaults come from modem_params_defaults(), not literals.
+    modem_params_defaults(&cfg.mp);
 
-    modem_params_t mp;
-    modem_params_defaults(&mp);
-
-    for (int i = 1; i < argc; ++i) {
-        const char *a = argv[i];
-        if      (strcmp(a, "--help") == 0) { usage(stdout, argv[0]); return 0; }
-        else if (starts_with(a, "--out="))            out_wav = a + 6;
-        else if (starts_with(a, "--repeats="))        repeats = atoi(a + 10);
-        else if (starts_with(a, "--gap-seconds="))    gap_seconds = atoi(a + 14);
-        else if (strcmp(a, "--reed-solomon") == 0)    use_rs = 1;
-        else if (strcmp(a, "--no-reed-solomon") == 0) use_rs = 0;
-        else if (starts_with(a, "--src="))    csp_hdr.src   = (uint8_t)atoi(a + 6);
-        else if (starts_with(a, "--dst="))    csp_hdr.dst   = (uint8_t)atoi(a + 6);
-        else if (starts_with(a, "--dport="))  csp_hdr.dport = (uint8_t)atoi(a + 8);
-        else if (starts_with(a, "--sport="))  csp_hdr.sport = (uint8_t)atoi(a + 8);
-        else if (starts_with(a, "--prio="))   csp_hdr.prio  = (uint8_t)atoi(a + 7);
-        else if (starts_with(a, "--flags="))  csp_hdr.flags = (uint8_t)atoi(a + 8);
-        else if (starts_with(a, "--bit-rate="))   mp.bit_rate = atoi(a + 11);
-        else if (starts_with(a, "--samp-rate="))  mp.samp_rate = atoi(a + 12);
-        else if (starts_with(a, "--gauss-bt="))   mp.gauss_bt = atof(a + 11);
-        else if (starts_with(a, "--gauss-span=")) mp.gauss_symbol_span = atoi(a + 13);
-        else if (starts_with(a, "--gain-db="))    mp.gain_db = atof(a + 10);
-        else if (strcmp(a, "--print-frame") == 0)  print_frame = 1;
-        else if (strcmp(a, "--print-struct") == 0) print_struct = 1;
-        else if (strcmp(a, "--type=beacon") == 0)         kind = PACKET_BEACON;
-        else if (strcmp(a, "--type=tcmd-response") == 0)  kind = PACKET_TCMD_RESPONSE;
-        else if (starts_with(a, "--tcmd-code="))     tcmd_code = atoi(a + 12);
-        else if (starts_with(a, "--tcmd-duration=")) tcmd_duration_ms = atoi(a + 16);
-        else if (starts_with(a, "--tcmd-message="))  tcmd_message = a + 15;
-        else {
-            fprintf(stderr, "beacon_gen: unknown option: %s\n", a);
-            usage(stderr, argv[0]);
-            return 1;
-        }
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
     }
 
-    if (out_wav == NULL) {
+    if (cfg.out_wav == NULL) {
         fprintf(stderr, "beacon_gen: --out=<file.wav> is required\n");
-        usage(stderr, argv[0]);
         return 1;
     }
-    if (repeats < 1) {
+    if (cfg.repeats < 1) {
         fprintf(stderr, "beacon_gen: --repeats must be >= 1\n");
         return 1;
     }
-    if (gap_seconds < 0) {
+    if (cfg.gap_seconds < 0) {
         fprintf(stderr, "beacon_gen: --gap-seconds must be >= 0\n");
         return 1;
     }
-    if (mp.samp_rate <= 0 || mp.bit_rate <= 0
-        || (mp.samp_rate % mp.bit_rate) != 0) {
+    if (cfg.mp.samp_rate <= 0 || cfg.mp.bit_rate <= 0
+        || (cfg.mp.samp_rate % cfg.mp.bit_rate) != 0) {
         fprintf(stderr,
                 "beacon_gen: samp_rate (%d) must be a positive multiple of "
-                "bit_rate (%d)\n", mp.samp_rate, mp.bit_rate);
+                "bit_rate (%d)\n", cfg.mp.samp_rate, cfg.mp.bit_rate);
         return 1;
     }
+
+    // Copy parsed config into the working locals the synthesis body uses.
+    const char *out_wav = cfg.out_wav;
+    int repeats = cfg.repeats;
+    int gap_seconds = cfg.gap_seconds;
+    int use_rs = cfg.use_rs;
+    int print_frame = cfg.print_frame;
+    int print_struct = cfg.print_struct;
+    packet_kind_t kind = cfg.kind;
+    int tcmd_code = cfg.tcmd_code;
+    int tcmd_duration_ms = cfg.tcmd_duration_ms;
+    const char *tcmd_message = cfg.tcmd_message;
+    csp_v1_header_t csp_hdr = cfg.csp_hdr;
+    modem_params_t mp = cfg.mp;
 
     int sps = mp.samp_rate / mp.bit_rate;
 

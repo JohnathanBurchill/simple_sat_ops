@@ -35,6 +35,7 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "argparse.h"
 #include "biquad.h"
 #include "monitor_squelch.h"
 #include "wav_read.h"
@@ -165,61 +166,164 @@ static size_t lattice_filter(size_t *idx, size_t n,
     return out_n;
 }
 
-static void usage(FILE *dest, const char *prog)
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the fields out into the working locals below so the detection body is
+// unchanged.
+typedef struct {
+    const char *wav_path;       // positional: input WAV
+    double sig_lo;
+    double sig_hi;
+    double noise_lo;
+    double noise_hi;
+    int    env_ms;
+    double threshold_sigma;
+    double min_spacing_s;
+    double lattice_period_s;
+    double lattice_tol_s;
+    double max_burst_s;
+    const char *csv_path;
+    int    quiet;
+    int    render_png;
+    const char *render_dir;
+    double render_half_s;
+    const char *gate_wav_path;
+    double gate_offset_db;
+    int    gate_fixed_set;
+    double gate_fixed_db;
+    double gate_hold_s;
+} beacon_detect_args_t;
+
+static int starts_with(const char *s, const char *p);
+
+// Option column width: the widest label below ("--lattice-period-s=<f>") + a
+// small margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 24
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(beacon_detect_args_t *a, int argc, char **argv, int help)
 {
-    fprintf(dest,
-        "usage: %s <wavfile> [options]\n"
-        "\n"
-        "Detect AX100-style beacons in an FM-demoded WAV by finding\n"
-        "moments where (signal-band energy) / (out-of-band noise) spikes.\n"
-        "Real beacons capture the FM discriminator, dropping out-of-band\n"
-        "noise while raising the data-band tone — so the *ratio* moves,\n"
-        "not either band alone.\n"
-        "\n"
-        "Detection bands:\n"
-        "  --sig-lo=<hz>            Signal band lower edge (default 4500)\n"
-        "  --sig-hi=<hz>            Signal band upper edge (default 5100)\n"
-        "  --noise-lo=<hz>          Noise band lower edge (default 8000)\n"
-        "  --noise-hi=<hz>          Noise band upper edge (default 22000)\n"
-        "  --env-ms=<n>             RMS envelope window in ms (default 10)\n"
-        "\n"
-        "Detection:\n"
-        "  --threshold-sigma=<f>    Threshold above ratio median in σ\n"
-        "                           (MAD-based; default 2.5)\n"
-        "  --min-spacing-s=<f>      Minimum spacing between peaks (default 15)\n"
-        "  --lattice-period-s=<f>   Beacon cadence for lattice filter\n"
-        "                           (default 20; 0 disables)\n"
-        "  --lattice-tol-s=<f>      Tolerance around lattice (default 2.0)\n"
-        "  --max-burst-s=<f>        Drop peaks inside an above-threshold\n"
-        "                           run longer than this (default 1.5).\n"
-        "                           Suppresses Doppler-swept carriers\n"
-        "                           that hang in the signal band for\n"
-        "                           seconds. 0 disables.\n"
-        "\n"
-        "Output:\n"
-        "  --csv=<path>             CSV path (default stdout)\n"
-        "  --render-png[=<dir>]     Optional: shell out to ffmpeg per\n"
-        "                           detection for a ±<window-s>s\n"
-        "                           showspectrumpic PNG. <dir> defaults\n"
-        "                           to <wav_dir>/beacons. ffmpeg must\n"
-        "                           be on PATH.\n"
-        "  --window-s=<f>           Render half-window (default 0.5)\n"
-        "  --gate-wav=<path>        Run the input through the same\n"
-        "                           carrier-presence squelch b210_rx_tx\n"
-        "                           uses live, write the gated audio to\n"
-        "                           <path>. Use this to listen-test the\n"
-        "                           squelch on a recorded WAV before a\n"
-        "                           live pass — silence between beacons,\n"
-        "                           ~0.5 s of audio per detected burst.\n"
-        "  --gate-offset-db=<dB>    Auto-mode threshold offset above\n"
-        "                           bootstrap mean (default 3.0)\n"
-        "  --gate-fixed-db=<dB>     Use a fixed dB threshold instead of\n"
-        "                           auto-bootstrap.\n"
-        "  --gate-hold-s=<f>        Hold-open time after each crossing\n"
-        "                           (default 0.5).\n"
-        "  --quiet                  Suppress the human-readable summary\n"
-        "  --help                   This message.\n",
-        prog);
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        // <wavfile>: first non-option token. Declared first so it lists above
+        // the --options in help. A lone "-" counts as a positional.
+        if ((a->wav_path == NULL && (arg[0] != '-' || strcmp(arg, "-") == 0)) || help) {
+            if (help) parse_help_line(OPTW, "<wavfile>", "FM-demoded WAV to scan for beacons");
+            else a->wav_path = arg;
+            matched = 1;
+        }
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (starts_with(arg, "--sig-lo=") || help) {
+            if (help) parse_help_line(OPTW, "--sig-lo=<hz>", "signal band lower edge (default 4500)");
+            else a->sig_lo = atof(arg + 9);
+            matched = 1;
+        }
+        if (starts_with(arg, "--sig-hi=") || help) {
+            if (help) parse_help_line(OPTW, "--sig-hi=<hz>", "signal band upper edge (default 5100)");
+            else a->sig_hi = atof(arg + 9);
+            matched = 1;
+        }
+        if (starts_with(arg, "--noise-lo=") || help) {
+            if (help) parse_help_line(OPTW, "--noise-lo=<hz>", "noise band lower edge (default 8000)");
+            else a->noise_lo = atof(arg + 11);
+            matched = 1;
+        }
+        if (starts_with(arg, "--noise-hi=") || help) {
+            if (help) parse_help_line(OPTW, "--noise-hi=<hz>", "noise band upper edge (default 22000)");
+            else a->noise_hi = atof(arg + 11);
+            matched = 1;
+        }
+        if (starts_with(arg, "--env-ms=") || help) {
+            if (help) parse_help_line(OPTW, "--env-ms=<n>", "RMS envelope window in ms (default 10)");
+            else a->env_ms = atoi(arg + 9);
+            matched = 1;
+        }
+        if (starts_with(arg, "--threshold-sigma=") || help) {
+            if (help) parse_help_line(OPTW, "--threshold-sigma=<f>", "threshold above ratio median in sigma, MAD-based (default 2.5)");
+            else a->threshold_sigma = atof(arg + 18);
+            matched = 1;
+        }
+        if (starts_with(arg, "--min-spacing-s=") || help) {
+            if (help) parse_help_line(OPTW, "--min-spacing-s=<f>", "minimum spacing between peaks (default 15)");
+            else a->min_spacing_s = atof(arg + 16);
+            matched = 1;
+        }
+        if (starts_with(arg, "--lattice-period-s=") || help) {
+            if (help) parse_help_line(OPTW, "--lattice-period-s=<f>", "beacon cadence for lattice filter (default 20; 0 disables)");
+            else a->lattice_period_s = atof(arg + 19);
+            matched = 1;
+        }
+        if (starts_with(arg, "--lattice-tol-s=") || help) {
+            if (help) parse_help_line(OPTW, "--lattice-tol-s=<f>", "tolerance around lattice (default 2.0)");
+            else a->lattice_tol_s = atof(arg + 16);
+            matched = 1;
+        }
+        if (starts_with(arg, "--max-burst-s=") || help) {
+            if (help) parse_help_line(OPTW, "--max-burst-s=<f>", "drop peaks inside an above-threshold run longer than this; suppresses Doppler-swept carriers (default 1.5; 0 disables)");
+            else a->max_burst_s = atof(arg + 14);
+            matched = 1;
+        }
+        if (starts_with(arg, "--csv=") || help) {
+            if (help) parse_help_line(OPTW, "--csv=<path>", "CSV path (default stdout)");
+            else a->csv_path = arg + 6;
+            matched = 1;
+        }
+        if (strcmp(arg, "--quiet") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--quiet", "suppress the human-readable summary");
+            else a->quiet = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--render-png") == 0 || starts_with(arg, "--render-png=") || help) {
+            if (help) parse_help_line(OPTW, "--render-png[=<dir>]", "shell out to ffmpeg per detection for a +/-<window-s>s spectrogram PNG; <dir> defaults to <wav_dir>/beacons");
+            else {
+                a->render_png = 1;
+                if (arg[12] == '=') a->render_dir = arg + 13;
+            }
+            matched = 1;
+        }
+        if (starts_with(arg, "--window-s=") || help) {
+            if (help) parse_help_line(OPTW, "--window-s=<f>", "render half-window (default 0.5)");
+            else a->render_half_s = atof(arg + 11);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gate-wav=") || help) {
+            if (help) parse_help_line(OPTW, "--gate-wav=<path>", "run the input through the same carrier-presence squelch b210_rx_tx uses and write the gated audio to <path>");
+            else a->gate_wav_path = arg + 11;
+            matched = 1;
+        }
+        if (starts_with(arg, "--gate-offset-db=") || help) {
+            if (help) parse_help_line(OPTW, "--gate-offset-db=<dB>", "auto-mode threshold offset above bootstrap mean (default 3.0)");
+            else a->gate_offset_db = atof(arg + 17);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gate-fixed-db=") || help) {
+            if (help) parse_help_line(OPTW, "--gate-fixed-db=<dB>", "use a fixed dB threshold instead of auto-bootstrap");
+            else { a->gate_fixed_db = atof(arg + 16); a->gate_fixed_set = 1; }
+            matched = 1;
+        }
+        if (starts_with(arg, "--gate-hold-s=") || help) {
+            if (help) parse_help_line(OPTW, "--gate-hold-s=<f>", "hold-open time after each crossing (default 0.5)");
+            else a->gate_hold_s = atof(arg + 14);
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            if (arg[0] == '-' && arg[1] == '-')
+                fprintf(stderr, "beacon_detect: unknown flag '%s'\n", arg);
+            else
+                fprintf(stderr, "beacon_detect: unexpected positional arg '%s'\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
 }
 
 static int starts_with(const char *s, const char *p)
@@ -266,77 +370,58 @@ static int write_wav_pcm16_mono(const char *path,
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "beacon_detect")) return 0;
-    const char *wav_path     = NULL;
-    double sig_lo            = 4500.0;
-    double sig_hi            = 5100.0;
-    double noise_lo          = 8000.0;
-    double noise_hi          = 22000.0;
-    int    env_ms            = 10;
-    double threshold_sigma   = 2.5;
-    double min_spacing_s     = 15.0;
-    double lattice_period_s  = 20.0;
-    double lattice_tol_s     = 2.0;
-    // Carrier-suppression: drop peaks that sit inside an above-threshold
-    // run longer than max_burst_s. A real packet's ratio_db crosses
-    // threshold for tens of ms to a couple of seconds; a Doppler-swept
-    // carrier dwelling in the signal band can hold for many seconds and
-    // would otherwise produce a string of "detections". Set 0 to
-    // disable.
-    double max_burst_s       = 1.5;
-    const char *csv_path     = NULL;
-    int    quiet             = 0;
-    int    render_png        = 0;
-    const char *render_dir   = NULL;
-    double render_half_s     = 0.5;
-    const char *gate_wav_path = NULL;
-    double gate_offset_db    = 3.0;
-    int    gate_fixed_set    = 0;
-    double gate_fixed_db     = 0.0;
-    double gate_hold_s       = 0.5;
 
-    for (int i = 1; i < argc; i++) {
-        const char *a = argv[i];
-        if (strcmp(a, "--help") == 0) { usage(stdout, argv[0]); return 0; }
-        else if (starts_with(a, "--sig-lo="))           sig_lo = atof(a + 9);
-        else if (starts_with(a, "--sig-hi="))           sig_hi = atof(a + 9);
-        else if (starts_with(a, "--noise-lo="))         noise_lo = atof(a + 11);
-        else if (starts_with(a, "--noise-hi="))         noise_hi = atof(a + 11);
-        else if (starts_with(a, "--env-ms="))           env_ms = atoi(a + 9);
-        else if (starts_with(a, "--threshold-sigma="))  threshold_sigma = atof(a + 18);
-        else if (starts_with(a, "--min-spacing-s="))    min_spacing_s = atof(a + 16);
-        else if (starts_with(a, "--lattice-period-s=")) lattice_period_s = atof(a + 19);
-        else if (starts_with(a, "--lattice-tol-s="))    lattice_tol_s = atof(a + 16);
-        else if (starts_with(a, "--max-burst-s="))      max_burst_s = atof(a + 14);
-        else if (starts_with(a, "--csv="))              csv_path = a + 6;
-        else if (strcmp(a, "--quiet") == 0)             quiet = 1;
-        else if (strcmp(a, "--render-png") == 0)        render_png = 1;
-        else if (starts_with(a, "--render-png=")) {
-            render_png = 1;
-            render_dir = a + 13;
-        }
-        else if (starts_with(a, "--window-s="))         render_half_s = atof(a + 11);
-        else if (starts_with(a, "--gate-wav="))         gate_wav_path = a + 11;
-        else if (starts_with(a, "--gate-offset-db="))   gate_offset_db = atof(a + 17);
-        else if (starts_with(a, "--gate-fixed-db=")) {
-            gate_fixed_db  = atof(a + 16);
-            gate_fixed_set = 1;
-        }
-        else if (starts_with(a, "--gate-hold-s="))      gate_hold_s = atof(a + 14);
-        else if (a[0] == '-' && a[1] == '-') {
-            fprintf(stderr, "beacon_detect: unknown flag '%s'\n", a);
-            return EXIT_FAILURE;
-        }
-        else if (wav_path == NULL) wav_path = a;
-        else {
-            fprintf(stderr, "beacon_detect: unexpected positional arg '%s'\n", a);
-            usage(stderr, argv[0]);
-            return EXIT_FAILURE;
-        }
+    // Carrier-suppression default (max_burst_s): drop peaks that sit inside an
+    // above-threshold run longer than this. A real packet's ratio_db crosses
+    // threshold for tens of ms to a couple of seconds; a Doppler-swept carrier
+    // dwelling in the signal band can hold for many seconds and would
+    // otherwise produce a string of "detections". Set 0 to disable.
+    beacon_detect_args_t cfg = {
+        .sig_lo           = 4500.0,
+        .sig_hi           = 5100.0,
+        .noise_lo         = 8000.0,
+        .noise_hi         = 22000.0,
+        .env_ms           = 10,
+        .threshold_sigma  = 2.5,
+        .min_spacing_s    = 15.0,
+        .lattice_period_s = 20.0,
+        .lattice_tol_s    = 2.0,
+        .max_burst_s      = 1.5,
+        .render_half_s    = 0.5,
+        .gate_offset_db   = 3.0,
+        .gate_hold_s      = 0.5,
+    };
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return EXIT_FAILURE;
     }
-    if (wav_path == NULL) {
-        usage(stderr, argv[0]);
+    if (cfg.wav_path == NULL) {
+        fprintf(stderr, "beacon_detect: missing <wavfile> (try --help)\n");
         return EXIT_FAILURE;
     }
+
+    // Copy parsed config into the working locals the detection body uses.
+    const char *wav_path      = cfg.wav_path;
+    double sig_lo             = cfg.sig_lo;
+    double sig_hi             = cfg.sig_hi;
+    double noise_lo           = cfg.noise_lo;
+    double noise_hi           = cfg.noise_hi;
+    int    env_ms             = cfg.env_ms;
+    double threshold_sigma    = cfg.threshold_sigma;
+    double min_spacing_s      = cfg.min_spacing_s;
+    double lattice_period_s   = cfg.lattice_period_s;
+    double lattice_tol_s      = cfg.lattice_tol_s;
+    double max_burst_s        = cfg.max_burst_s;
+    const char *csv_path      = cfg.csv_path;
+    int    quiet              = cfg.quiet;
+    int    render_png         = cfg.render_png;
+    const char *render_dir    = cfg.render_dir;
+    double render_half_s      = cfg.render_half_s;
+    const char *gate_wav_path = cfg.gate_wav_path;
+    double gate_offset_db     = cfg.gate_offset_db;
+    int    gate_fixed_set     = cfg.gate_fixed_set;
+    double gate_fixed_db      = cfg.gate_fixed_db;
+    double gate_hold_s        = cfg.gate_hold_s;
 
     int16_t *pcm = NULL; size_t n_pcm = 0; int rate = 0; int ch = 0;
     if (wav_read_pcm16(wav_path, &pcm, &n_pcm, &rate, &ch) != 0) {

@@ -41,6 +41,7 @@
 #include <raylib.h>
 #include <rlgl.h>
 
+#include "argparse.h"
 #include "csp.h"
 #include "golay24.h"
 #include "modem.h"
@@ -1717,40 +1718,132 @@ static int decmode_recompute_window(const iq_buf_t *iqb,
         out_scratch, &n_out, &sync_off, &polarity, d);
 }
 
-static void usage(void)
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the fields out into the working locals the (large) UI/decode body uses.
+// iq_path is consumed by main() as the mandatory first positional before
+// this runs, so parse_args only walks the option tokens (argv[2..]).
+typedef struct {
+    int         samp_rate;
+    int         win_w;
+    int         win_h;
+    double      filter_center_hz_cli;
+    double      filter_lower_hz_cli;
+    double      filter_upper_hz_cli;
+    double      lo_shift_hz_cli;
+    int         live_mode_cli;
+    double      live_interval_s_cli;
+    double      live_window_s_cli;
+    const char *passthru[MAX_PASSTHRU];
+    int         n_passthru;
+} di_args_t;
+
+// Option column width: the widest label below ("--filter-center-hz=<f>") + a
+// small margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 24
+
+// Parse the option tokens into *a (help == 0), or print one right-aligned help
+// line per option and return (help != 0). Each option is one self-contained
+// block whose test carries "|| help", so help mode falls through and prints
+// them all. The mandatory <iq_path> positional is argv[1]; main() consumes it
+// before calling here, so the parse loop starts at argv[2] (t + 2).
+static int parse_args(di_args_t *a, int argc, char **argv, int help)
 {
-    fprintf(stderr,
-        "usage: decode_inspector <iq_path> [options]\n"
-        "  All gen_waterfall options are accepted and forwarded\n"
-        "  (--fft-time-bin-s, --zoom-khz, --detrend, --detrend-tau-s, --center-hz,\n"
-        "   --dc-notch, --dc-notch-bins, --db-min, --db-max,\n"
-        "   --power-offset, --start-utc, --elapsed-time, --fft, --hop,\n"
-        "   --marks-csv, --show-tm, --full-width)\n"
-        "Annotator-specific:\n"
-        "  --rate=<Hz>          IQ rate (default = auto from companion .wav)\n"
-        "  --width=<px>         Window width  (default 1280)\n"
-        "  --height=<px>        Window height (default 900)\n"
-        "  --filter-center-hz=F LPF shift target for the F-key view\n"
-        "                       (default -770 Hz)\n"
-        "  --filter-lower-hz=F  HPF cutoff in the original IQ frame\n"
-        "                       (default 500 Hz; 0 disables HPF stage)\n"
-        "  --filter-upper-hz=F  LPF cutoff around the shifted DC\n"
-        "                       (default 6000 Hz)\n"
-        "  --lo-shift-khz=N     NCO-shift the loaded IQ by -N kHz before\n"
-        "                       spectrogram and decode. Positive N moves\n"
-        "                       a signal at +N kHz baseband to DC. Use to\n"
-        "                       bring an off-DC carrier on an old capture\n"
-        "                       to baseband (e.g. -0.77 for the legacy\n"
-        "                       RAO -770 Hz LO offset). Default 0.\n"
-        "  --live               Follow the .iq as it grows on disk. The\n"
-        "                       inspector keeps a rolling window of the\n"
-        "                       most-recent --live-window-s seconds and\n"
-        "                       FFTs only the appended chunk on each\n"
-        "                       refresh. Detrend mode is forced to none in\n"
-        "                       this mode (rolling-window median would jump\n"
-        "                       on every refresh).\n"
-        "  --live-interval-s=N  Seconds between refresh ticks (default 2).\n"
-        "  --live-window-s=N    Rolling window length in seconds (default 30).\n");
+    int ntokens = help ? 1 : argc - 2;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 2];
+        int matched = 0;
+
+        // <iq_path>: the first positional, taken as argv[1] by main() before
+        // parse_args runs. Listed here (help only) so it heads the option list.
+        if (help) {
+            parse_help_line(OPTW, "<iq_path>", "IQ capture to annotate (.iq; companion .wav gives the rate)");
+            matched = 1;
+        }
+        if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0 || help) {
+            if (help) parse_help_line(OPTW, "-h, --help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strncmp(arg, "--rate=", 7) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--rate=<hz>", "IQ rate (default = auto from companion .wav)");
+            else a->samp_rate = atoi(arg + 7);
+            matched = 1;
+        }
+        if (strncmp(arg, "--width=", 8) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--width=<px>", "window width (default 1280)");
+            else a->win_w = atoi(arg + 8);
+            matched = 1;
+        }
+        if (strncmp(arg, "--height=", 9) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--height=<px>", "window height (default 900)");
+            else a->win_h = atoi(arg + 9);
+            matched = 1;
+        }
+        if (strncmp(arg, "--filter-center-hz=", 19) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--filter-center-hz=<f>", "LPF shift target for the F-key view (default -770)");
+            else a->filter_center_hz_cli = atof(arg + 19);
+            matched = 1;
+        }
+        if (strncmp(arg, "--filter-lower-hz=", 18) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--filter-lower-hz=<f>", "HPF cutoff in the original IQ frame (default 500; 0 disables)");
+            else a->filter_lower_hz_cli = atof(arg + 18);
+            matched = 1;
+        }
+        if (strncmp(arg, "--filter-upper-hz=", 18) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--filter-upper-hz=<f>", "LPF cutoff around the shifted DC (default 6000)");
+            else a->filter_upper_hz_cli = atof(arg + 18);
+            matched = 1;
+        }
+        if (strncmp(arg, "--lo-shift-khz=", 15) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--lo-shift-khz=<n>", "NCO-shift the loaded IQ by -N kHz before spectrogram/decode (default 0)");
+            else a->lo_shift_hz_cli = atof(arg + 15) * 1000.0;
+            matched = 1;
+        }
+        if (strcmp(arg, "--live") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--live", "follow the .iq as it grows on disk (detrend forced to none)");
+            else a->live_mode_cli = 1;
+            matched = 1;
+        }
+        if (strncmp(arg, "--live-interval-s=", 18) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--live-interval-s=<n>", "seconds between refresh ticks (default 2; min 0.1)");
+            else {
+                a->live_interval_s_cli = atof(arg + 18);
+                if (a->live_interval_s_cli < 0.1)
+                    a->live_interval_s_cli = 0.1;
+            }
+            matched = 1;
+        }
+        if (strncmp(arg, "--live-window-s=", 16) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--live-window-s=<n>", "rolling window length in seconds (default 30; min 1)");
+            else {
+                a->live_window_s_cli = atof(arg + 16);
+                if (a->live_window_s_cli < 1.0)
+                    a->live_window_s_cli = 1.0;
+            }
+            matched = 1;
+        }
+        // All gen_waterfall flags are forwarded verbatim into a passthru list
+        // that the spectrogram parsers consume; see is_passthru() for the set.
+        if (is_passthru(arg) || help) {
+            if (help) parse_help_line(OPTW, "[gen_waterfall flags]", "forwarded to the spectrogram (--fft-time-bin-s, --zoom-khz, --detrend, --db-min/max, ...)");
+            else {
+                if (a->n_passthru >= MAX_PASSTHRU) {
+                    fprintf(stderr,
+                        "decode_inspector: too many gen_waterfall flags (>%d)\n",
+                        MAX_PASSTHRU);
+                    return PARSE_ERROR;
+                }
+                a->passthru[a->n_passthru++] = arg;
+            }
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            fprintf(stderr, "decode_inspector: unknown option '%s'\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
 }
 
 // Trap signals (SIGSEGV / SIGABRT) raised inside InitWindow so a
@@ -1810,84 +1903,69 @@ static int safe_init_window(int w, int h, const char *title)
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "decode_inspector")) return 0;
+    // --help / -h is honoured at any position (including before the
+    // positional), so scan for it up front and print the option list.
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            usage(); return 0;
+            di_args_t h = {0};
+            parse_args(&h, argc, argv, HELP_BRIEF);
+            return 0;
         }
     }
-    if (argc < 2) { usage(); return 2; }
+    if (argc < 2) {
+        fprintf(stderr, "decode_inspector: missing <iq_path> (try --help)\n");
+        return 2;
+    }
     const char *iq_path = argv[1];
 
-    int    samp_rate = 0;
-    int    win_w     = 1280;
-    int    win_h     = 900;
-
-    // Filter knobs (overridable per-launch; the F-key handler reads
-    // these). Defaults are tuned for the FrontierSat downlink at
-    // -770 Hz on a 96 kHz IQ.
-    double filter_center_hz_cli = -770.0;
-    double filter_lower_hz_cli  = 500.0;
-    double filter_upper_hz_cli  = 6000.0;
-
-    // Optional global IQ NCO shift applied once at load, before the
-    // spectrogram and before the K-panel decode see the buffer. Lets
-    // the operator bring an off-DC carrier on an old capture to
-    // baseband without re-running the RX chain. Sign matches rx_replay
-    // --lo-shift-khz: positive value moves a signal at +N kHz down to
-    // DC.
-    double lo_shift_hz_cli = 0.0;
-
-    // Live mode: follow the .iq as it grows on disk. Keeps a rolling
-    // window of the most-recent live_window_s seconds; on each refresh
-    // appends the new bytes, drops the oldest, FFTs only the new
-    // chunk, and re-tiles the GPU texture.
-    int    live_mode_cli       = 0;
-    double live_interval_s_cli = 2.0;
-    double live_window_s_cli   = 30.0;
-
-    const char *passthru[MAX_PASSTHRU];
-    int n_passthru = 0;
-
-    for (int i = 2; i < argc; ++i) {
-        const char *a = argv[i];
-        if (strncmp(a, "--rate=", 7) == 0) {
-            samp_rate = atoi(a + 7);
-        } else if (strncmp(a, "--width=", 8) == 0) {
-            win_w = atoi(a + 8);
-        } else if (strncmp(a, "--height=", 9) == 0) {
-            win_h = atoi(a + 9);
-        } else if (strncmp(a, "--filter-center-hz=", 19) == 0) {
-            filter_center_hz_cli = atof(a + 19);
-        } else if (strncmp(a, "--filter-lower-hz=", 18) == 0) {
-            filter_lower_hz_cli = atof(a + 18);
-        } else if (strncmp(a, "--filter-upper-hz=", 18) == 0) {
-            filter_upper_hz_cli = atof(a + 18);
-        } else if (strncmp(a, "--lo-shift-khz=", 15) == 0) {
-            lo_shift_hz_cli = atof(a + 15) * 1000.0;
-        } else if (strcmp(a, "--live") == 0) {
-            live_mode_cli = 1;
-        } else if (strncmp(a, "--live-interval-s=", 18) == 0) {
-            live_interval_s_cli = atof(a + 18);
-            if (live_interval_s_cli < 0.1)
-                live_interval_s_cli = 0.1;
-        } else if (strncmp(a, "--live-window-s=", 16) == 0) {
-            live_window_s_cli = atof(a + 16);
-            if (live_window_s_cli < 1.0)
-                live_window_s_cli = 1.0;
-        } else if (is_passthru(a)) {
-            if (n_passthru >= MAX_PASSTHRU) {
-                fprintf(stderr,
-                    "decode_inspector: too many gen_waterfall flags (>%d)\n",
-                    MAX_PASSTHRU);
-                return 2;
-            }
-            passthru[n_passthru++] = a;
-        } else {
-            fprintf(stderr, "decode_inspector: unknown option '%s'\n", a);
-            usage();
-            return 2;
-        }
+    di_args_t cfg = {
+        .samp_rate = 0,
+        .win_w     = 1280,
+        .win_h     = 900,
+        // Filter knobs (overridable per-launch; the F-key handler reads
+        // these). Defaults are tuned for the FrontierSat downlink at
+        // -770 Hz on a 96 kHz IQ.
+        .filter_center_hz_cli = -770.0,
+        .filter_lower_hz_cli  = 500.0,
+        .filter_upper_hz_cli  = 6000.0,
+        // Optional global IQ NCO shift applied once at load, before the
+        // spectrogram and before the K-panel decode see the buffer. Lets
+        // the operator bring an off-DC carrier on an old capture to
+        // baseband without re-running the RX chain. Sign matches rx_replay
+        // --lo-shift-khz: positive value moves a signal at +N kHz down to
+        // DC.
+        .lo_shift_hz_cli = 0.0,
+        // Live mode: follow the .iq as it grows on disk. Keeps a rolling
+        // window of the most-recent live_window_s seconds; on each refresh
+        // appends the new bytes, drops the oldest, FFTs only the new
+        // chunk, and re-tiles the GPU texture.
+        .live_mode_cli       = 0,
+        .live_interval_s_cli = 2.0,
+        .live_window_s_cli   = 30.0,
+        .n_passthru          = 0,
+    };
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 2;
     }
+
+    // Copy parsed config into the working locals the body below uses.
+    int    samp_rate = cfg.samp_rate;
+    int    win_w     = cfg.win_w;
+    int    win_h     = cfg.win_h;
+    double filter_center_hz_cli = cfg.filter_center_hz_cli;
+    double filter_lower_hz_cli  = cfg.filter_lower_hz_cli;
+    double filter_upper_hz_cli  = cfg.filter_upper_hz_cli;
+    double lo_shift_hz_cli = cfg.lo_shift_hz_cli;
+    int    live_mode_cli       = cfg.live_mode_cli;
+    double live_interval_s_cli = cfg.live_interval_s_cli;
+    double live_window_s_cli   = cfg.live_window_s_cli;
+
+    // passthru[] is rewritten in place below (db-min/db-max are pulled out),
+    // so copy the parsed list into a mutable local array.
+    const char *passthru[MAX_PASSTHRU];
+    int n_passthru = cfg.n_passthru;
+    for (int i = 0; i < n_passthru; ++i) passthru[i] = cfg.passthru[i];
 
     // Auto-detect rate from companion .wav.
     if (samp_rate <= 0) {

@@ -52,6 +52,7 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "argparse.h"
 #include "packet_db.h"
 #include "sso_paths.h"
 
@@ -1766,56 +1767,87 @@ static int prompt_search(int rows_total, int cols)
     }
 }
 
-static void usage(FILE *out, const char *argv0)
+// Parsed command-line configuration. parse_args() fills this; main() reads it.
+typedef struct {
+    const char *db_path;
+} pbr_args_t;
+
+// Option column width: the widest label below ("--db=<path>") + a small
+// margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 13
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(pbr_args_t *a, int argc, char **argv, int help)
 {
-    fprintf(out,
-        "usage: %s [--db=<path>]\n"
-        "\n"
-        "Curses TUI over the AX100 packet DB. Read-only — safe to run\n"
-        "alongside a live receiver that's filling the same DB.\n"
-        "\n"
-        "Keys:\n"
-        "  q | Q | Esc      quit (in the command group, step back to the list)\n"
-        "  arrows / PgUp / PgDn / Home / End   scroll the list\n"
-        "  Enter            bulk_file: open the reconstructed-file viewer —\n"
-        "                   the pass's chunks reassembled by file_offset, with\n"
-        "                   any missing bytes shown as '?'. tcmd_response:\n"
-        "                   open the command group (every packet sharing that\n"
-        "                   command's ts_sent, then same-run log/bulk_file in\n"
-        "                   the following window — a time heuristic); pressing\n"
-        "                   Enter again on a response reassembles its\n"
-        "                   fragments. Esc / Left / Backspace step back.\n"
-        "  (in the reconstruction view)\n"
-        "    v              cycle hex / ascii / base64\n"
-        "    j k PgUp PgDn g G   scroll\n"
-        "    e              export the reconstructed bytes to a file. A\n"
-        "                   vim-modal prompt offers an editable name: i/a to\n"
-        "                   edit, Esc to leave insert (then Esc to cancel),\n"
-        "                   Enter saves from either mode.\n"
-        "    Esc / q        back to the list\n"
-        "  r                reload (rebuilds the group when one is open)\n"
-        "  t                cycle type filter (all → beacon → tcmd_response\n"
-        "                   → log → bulk_file → all)\n"
-        "  o                cycle capture-origin filter (all → cts_ground\n"
-        "                   → satnogs → all)\n"
-        "  /                start a substring search against the firmware-\n"
-        "                   interpreted text. Enter applies, Esc cancels.\n"
-        "  l                toggle timestamp display: UTC (storage) ↔ local\n"
-        "  s                toggle the recording-station summary in the\n"
-        "                   detail panel (satnogs rows only; the values\n"
-        "                   come from <session>/satnogs_<id>.meta.json).\n"
-        "  v                cycle the detail-pane payload view: hex → ascii\n"
-        "                   → base64. A bulk_file's ascii/base64 views show\n"
-        "                   the file data (after the 5-byte type+offset\n"
-        "                   header); hex always shows the whole payload.\n"
-        "\n"
-        "Options:\n"
-        "  --db=<path>      override default DB path. Default, in order:\n"
-        "                   $SSO_PACKET_DB, else <root>/packet_db.sqlite\n"
-        "                   where <root> is $FRONTIERSAT_ROOT if set,\n"
-        "                   else /FrontierSat\n"
-        "  --help           this message\n",
-        argv0);
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strcmp(arg, "--help-full") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help-full", "this help plus the key-binding reference");
+            else { parse_args(a, argc, argv, HELP_FULL); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (starts_with(arg, "--db=") || help) {
+            if (help) parse_help_line(OPTW, "--db=<path>", "packet DB path (default $SSO_PACKET_DB, else <root>/packet_db.sqlite)");
+            else a->db_path = arg + 5;
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            // Original behaviour: any unrecognized argument prints usage to
+            // stderr and fails. The only option is --db=; anything else lands
+            // here.
+            fprintf(stderr, "usage: %s [--db=<path>]\n", argv[0]);
+            return PARSE_ERROR;
+        }
+    }
+    // --help-full appends the key-binding reference (was in the old usage()).
+    if (help >= HELP_FULL) {
+        printf("\nKeys:\n"
+               "  q | Q | Esc      quit (in the command group, step back to the list)\n"
+               "  arrows / PgUp / PgDn / Home / End   scroll the list\n"
+               "  Enter            bulk_file: open the reconstructed-file viewer -\n"
+               "                   the pass's chunks reassembled by file_offset, with\n"
+               "                   any missing bytes shown as '?'. tcmd_response:\n"
+               "                   open the command group (every packet sharing that\n"
+               "                   command's ts_sent, then same-run log/bulk_file in\n"
+               "                   the following window - a time heuristic); pressing\n"
+               "                   Enter again on a response reassembles its\n"
+               "                   fragments. Esc / Left / Backspace step back.\n"
+               "  (in the reconstruction view)\n"
+               "    v              cycle hex / ascii / base64\n"
+               "    j k PgUp PgDn g G   scroll\n"
+               "    e              export the reconstructed bytes to a file. A\n"
+               "                   vim-modal prompt offers an editable name: i/a to\n"
+               "                   edit, Esc to leave insert (then Esc to cancel),\n"
+               "                   Enter saves from either mode.\n"
+               "    Esc / q        back to the list\n"
+               "  r                reload (rebuilds the group when one is open)\n"
+               "  t                cycle type filter (all -> beacon -> tcmd_response\n"
+               "                   -> log -> bulk_file -> all)\n"
+               "  o                cycle capture-origin filter (all -> cts_ground\n"
+               "                   -> satnogs -> all)\n"
+               "  /                start a substring search against the firmware-\n"
+               "                   interpreted text. Enter applies, Esc cancels.\n"
+               "  l                toggle timestamp display: UTC (storage) <-> local\n"
+               "  s                toggle the recording-station summary in the\n"
+               "                   detail panel (satnogs rows only; the values\n"
+               "                   come from <session>/satnogs_<id>.meta.json).\n"
+               "  v                cycle the detail-pane payload view: hex -> ascii\n"
+               "                   -> base64. A bulk_file's ascii/base64 views show\n"
+               "                   the file data (after the 5-byte type+offset\n"
+               "                   header); hex always shows the whole payload.\n");
+    }
+    return PARSE_OK;
 }
 
 // -V / --version support (commit baked in at build time).
@@ -1824,13 +1856,12 @@ static void usage(FILE *out, const char *argv0)
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "packet_browser")) return 0;
-    const char *db_path = NULL;
-    for (int i = 1; i < argc; i++) {
-        const char *a = argv[i];
-        if (strcmp(a, "--help") == 0) { usage(stdout, argv[0]); return 0; }
-        else if (starts_with(a, "--db="))  db_path = a + 5;
-        else { usage(stderr, argv[0]); return 1; }
+    pbr_args_t cfg = {0};
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
     }
+    const char *db_path = cfg.db_path;
 
     char default_db[1024];
     if (db_path == NULL) {

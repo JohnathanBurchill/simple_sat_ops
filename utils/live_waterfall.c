@@ -29,6 +29,8 @@
 
 #include <raylib.h>
 
+#include "argparse.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -487,16 +489,81 @@ static double pick_tick_step(double range, int approx_n)
 // CLI parsing.
 // --------------------------------------------------------------------
 
-static void usage(void)
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the fields out into working locals so the (large) render body is unchanged.
+typedef struct {
+    const char *iq_path;
+    double rate_hz;
+    unsigned n_fft;
+    int row_ms;
+    double zoom_khz;
+    int cli_w;
+    int cli_h;
+} wf_args_t;
+
+// Option column width: the widest label below ("--zoom-khz=<W>") + a small
+// margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 16
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(wf_args_t *a, int argc, char **argv, int help)
 {
-    fprintf(stderr,
-        "usage: live_waterfall <iq_path> [options]\n"
-        "  --rate=<Hz>        IQ rate (default 96000)\n"
-        "  --fft=<N>          FFT size, power of two (default 1024)\n"
-        "  --row-ms=<ms>      Time per spectrogram row (default 100)\n"
-        "  --zoom-khz=<W>     Visible BW around DC (default = full rate)\n"
-        "  --width=<px>       Window width override (default = monitor/3)\n"
-        "  --height=<px>      Window height override (default = 95%% of monitor)\n");
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        // <iq_path>: first non-option token. A lone "-" counts as a
+        // positional. Declared first so it lists above the --options in help.
+        if ((a->iq_path == NULL && (arg[0] != '-' || strcmp(arg, "-") == 0)) || help) {
+            if (help) parse_help_line(OPTW, "<iq_path>", "IQ capture to tail (.iq, interleaved S16_LE)");
+            else a->iq_path = arg;
+            matched = 1;
+        }
+        if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0 || help) {
+            if (help) parse_help_line(OPTW, "-h, --help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strncmp(arg, "--rate=", 7) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--rate=<Hz>", "IQ rate (default 96000)");
+            else a->rate_hz = atof(arg + 7);
+            matched = 1;
+        }
+        if (strncmp(arg, "--fft=", 6) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--fft=<N>", "FFT size, power of two (default 1024)");
+            else a->n_fft = (unsigned) atoi(arg + 6);
+            matched = 1;
+        }
+        if (strncmp(arg, "--row-ms=", 9) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--row-ms=<ms>", "Time per spectrogram row (default 100)");
+            else a->row_ms = atoi(arg + 9);
+            matched = 1;
+        }
+        if (strncmp(arg, "--zoom-khz=", 11) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--zoom-khz=<W>", "Visible BW around DC (default = full rate)");
+            else a->zoom_khz = atof(arg + 11);
+            matched = 1;
+        }
+        if (strncmp(arg, "--width=", 8) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--width=<px>", "Window width override (default = monitor/3)");
+            else a->cli_w = atoi(arg + 8);
+            matched = 1;
+        }
+        if (strncmp(arg, "--height=", 9) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--height=<px>", "Window height override (default = 95% of monitor)");
+            else a->cli_h = atoi(arg + 9);
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            fprintf(stderr, "live_waterfall: unknown option %s\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
 }
 
 // Trap signals (SIGSEGV / SIGABRT) raised inside InitWindow so a
@@ -538,31 +605,32 @@ static int safe_init_window(int w, int h, const char *title)
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "live_waterfall")) return 0;
-    if (argc < 2) { usage(); return 2; }
-    if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
-        usage(); return 0;
+    wf_args_t cfg = {
+        .rate_hz = 96000.0,
+        .n_fft   = 1024,
+        .row_ms  = 100,
+        // Default = full capture width. 0 means "the whole rate"; the clamp
+        // below turns it into rate/1000 kHz, so it's full at any sample rate
+        // (not a hard-coded 96). Operator can narrow mid-flight via stdin
+        // (see :lo_bandwidth in simple_sat_ops) or pass --zoom-khz=<N>.
+        .zoom_khz = 0.0,
+        .cli_w   = 0,
+        .cli_h   = 0,
+    };
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 2;
     }
-    const char *iq_path  = argv[1];
-    double rate_hz       = 96000.0;
-    unsigned n_fft       = 1024;
-    int      row_ms      = 100;
-    // Default = full capture width. 0 means "the whole rate"; the clamp
-    // below turns it into rate/1000 kHz, so it's full at any sample rate
-    // (not a hard-coded 96). Operator can narrow mid-flight via stdin
-    // (see :lo_bandwidth in simple_sat_ops) or pass --zoom-khz=<N>.
-    double   zoom_khz    = 0.0;
-    int      cli_w       = 0;
-    int      cli_h       = 0;
-    for (int i = 2; i < argc; ++i) {
-        if      (strncmp(argv[i], "--rate=", 7) == 0)     rate_hz  = atof(argv[i] + 7);
-        else if (strncmp(argv[i], "--fft=", 6) == 0)      n_fft    = (unsigned) atoi(argv[i] + 6);
-        else if (strncmp(argv[i], "--row-ms=", 9) == 0)   row_ms   = atoi(argv[i] + 9);
-        else if (strncmp(argv[i], "--zoom-khz=", 11) == 0) zoom_khz = atof(argv[i] + 11);
-        else if (strncmp(argv[i], "--width=", 8) == 0)    cli_w    = atoi(argv[i] + 8);
-        else if (strncmp(argv[i], "--height=", 9) == 0)   cli_h    = atoi(argv[i] + 9);
-        else { fprintf(stderr, "live_waterfall: unknown option %s\n", argv[i]);
-               usage(); return 2; }
-    }
+    if (cfg.iq_path == NULL) { return 2; }
+
+    // Copy parsed config into the working locals the render body below uses.
+    const char *iq_path  = cfg.iq_path;
+    double rate_hz       = cfg.rate_hz;
+    unsigned n_fft       = cfg.n_fft;
+    int      row_ms      = cfg.row_ms;
+    double   zoom_khz    = cfg.zoom_khz;
+    int      cli_w       = cfg.cli_w;
+    int      cli_h       = cfg.cli_h;
     if (!is_pow2(n_fft) || n_fft < 16) {
         fprintf(stderr, "live_waterfall: --fft must be power of 2 >= 16\n");
         return 2;

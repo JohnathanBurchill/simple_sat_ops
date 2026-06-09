@@ -28,6 +28,7 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "argparse.h"
 #include "packet_db.h"
 // -V / --version support (commit baked in at build time).
 #include "sso_version.h"
@@ -62,43 +63,119 @@ static int starts_with(const char *s, const char *prefix)
     return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
-static void usage(FILE *out, const char *argv0)
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the fields out into the working locals the query body below uses.
+typedef struct {
+    const char *db_path;
+    const char *since;
+    const char *until;
+    const char *type_arg;
+    const char *satellite;
+    const char *source_tool;
+    const char *capture_origin;
+    const char *like_arg;
+    long limit;
+    int order_desc;
+    enum format fmt;
+    int local_time;
+} packet_query_args_t;
+
+// Option column width: the widest label below ("--format=table|json|csv|raw")
+// + a small margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 29
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+// packet_query takes no positional argument; every token is an option.
+static int parse_args(packet_query_args_t *a, int argc, char **argv, int help)
 {
-    fprintf(out,
-        "usage: %s [options]\n"
-        "\n"
-        "Non-interactive query over the AX100 packet DB.\n"
-        "\n"
-        "Filters (all optional, AND'd together):\n"
-        "  --since=<spec>           24h | 7d | 30m | 90s | ISO-8601\n"
-        "  --until=<spec>           same syntax as --since (default: now)\n"
-        "  --type=<name|0xNN>       beacon|log|tcmd_response|bulk_file|0xNN\n"
-        "  --satellite=<name>       e.g. CTS1\n"
-        "  --source-tool=<tool>     rx_live|rx_replay|b210_rx_tx|rx_decode\n"
-        "  --capture-origin=<name>  cts_ground|satnogs (audio provenance)\n"
-        "  --like=<pattern>         SQL LIKE pattern matched against the\n"
-        "                           decoded_summary text. Use %% as the\n"
-        "                           wildcard. Example: --like='%%eps_mode=SAFETY%%'\n"
-        "  --limit=<n>              default 100; --limit=0 means unlimited\n"
-        "  --order=asc|desc         default desc (newest first)\n"
-        "\n"
-        "Output:\n"
-        "  --format=table|json|csv|raw     default table\n"
-        "    table: human-readable, one header line per row plus the\n"
-        "           firmware-interpreted body indented underneath\n"
-        "    json:  JSON array of objects, one per row, payload hex-encoded\n"
-        "    csv:   header row + data rows (decoded_summary collapsed)\n"
-        "    raw:   payload bytes to stdout. Requires --limit=1; useful\n"
-        "           piped to xxd or rx_decode --ref-hex.\n"
-        "  --local-time             render ts in the operator's local TZ\n"
-        "                           (filtering / sorting still UTC)\n"
-        "\n"
-        "Database:\n"
-        "  --db=<path>              override default DB path. Default:\n"
-        "                           $SSO_PACKET_DB or\n"
-        "                           $HOME/.local/share/simple_sat_ops/packets.db\n"
-        "  --help                   this message\n",
-        argv0);
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (starts_with(arg, "--since=") || help) {
+            if (help) parse_help_line(OPTW, "--since=<spec>", "24h | 7d | 30m | 90s | ISO-8601");
+            else a->since = arg + 8;
+            matched = 1;
+        }
+        if (starts_with(arg, "--until=") || help) {
+            if (help) parse_help_line(OPTW, "--until=<spec>", "same syntax as --since (default: now)");
+            else a->until = arg + 8;
+            matched = 1;
+        }
+        if (starts_with(arg, "--type=") || help) {
+            if (help) parse_help_line(OPTW, "--type=<name|0xNN>", "beacon|log|tcmd_response|bulk_file|0xNN");
+            else a->type_arg = arg + 7;
+            matched = 1;
+        }
+        if (starts_with(arg, "--satellite=") || help) {
+            if (help) parse_help_line(OPTW, "--satellite=<name>", "e.g. CTS1");
+            else a->satellite = arg + 12;
+            matched = 1;
+        }
+        if (starts_with(arg, "--source-tool=") || help) {
+            if (help) parse_help_line(OPTW, "--source-tool=<tool>", "rx_live|rx_replay|b210_rx_tx|rx_decode");
+            else a->source_tool = arg + 14;
+            matched = 1;
+        }
+        if (starts_with(arg, "--capture-origin=") || help) {
+            if (help) parse_help_line(OPTW, "--capture-origin=<name>", "cts_ground|satnogs (audio provenance)");
+            else a->capture_origin = arg + 17;
+            matched = 1;
+        }
+        if (starts_with(arg, "--like=") || help) {
+            if (help) parse_help_line(OPTW, "--like=<pattern>", "SQL LIKE over decoded_summary; %% is the wildcard");
+            else a->like_arg = arg + 7;
+            matched = 1;
+        }
+        if (starts_with(arg, "--limit=") || help) {
+            if (help) parse_help_line(OPTW, "--limit=<n>", "default 100; --limit=0 means unlimited");
+            else {
+                a->limit = strtol(arg + 8, NULL, 10);
+                if (a->limit < 0) a->limit = 0;
+            }
+            matched = 1;
+        }
+        if (strcmp(arg, "--order=asc") == 0 || strcmp(arg, "--order=desc") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--order=asc|desc", "default desc (newest first)");
+            else a->order_desc = (strcmp(arg, "--order=desc") == 0);
+            matched = 1;
+        }
+        if (strcmp(arg, "--format=table") == 0 || strcmp(arg, "--format=json") == 0
+            || strcmp(arg, "--format=csv") == 0 || strcmp(arg, "--format=raw") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--format=table|json|csv|raw", "default table (json/csv export, raw payload bytes)");
+            else {
+                if (strcmp(arg, "--format=table") == 0)     a->fmt = FMT_TABLE;
+                else if (strcmp(arg, "--format=json") == 0) a->fmt = FMT_JSON;
+                else if (strcmp(arg, "--format=csv") == 0)  a->fmt = FMT_CSV;
+                else                                        a->fmt = FMT_RAW;
+            }
+            matched = 1;
+        }
+        if (strcmp(arg, "--local-time") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--local-time", "render ts in local TZ (filter/sort still UTC)");
+            else a->local_time = 1;
+            matched = 1;
+        }
+        if (starts_with(arg, "--db=") || help) {
+            if (help) parse_help_line(OPTW, "--db=<path>", "override default DB path ($SSO_PACKET_DB or the default)");
+            else a->db_path = arg + 5;
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            fprintf(stderr, "packet_query: unknown option '%s'\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
 }
 
 // Convert a stored ISO-8601 UTC timestamp into the operator's local
@@ -273,48 +350,29 @@ static void hex_encode(const uint8_t *bytes, size_t n,
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "packet_query")) return 0;
-    const char *db_path = NULL;
-    const char *since = NULL;
-    const char *until = NULL;
-    const char *type_arg = NULL;
-    const char *satellite = NULL;
-    const char *source_tool = NULL;
-    const char *capture_origin = NULL;
-    const char *like_arg = NULL;
-    long limit = 100;
-    int order_desc = 1;
-    enum format fmt = FMT_TABLE;
-    int local_time = 0;
-
-    for (int i = 1; i < argc; i++) {
-        const char *a = argv[i];
-        if (strcmp(a, "--help") == 0) { usage(stdout, argv[0]); return 0; }
-        else if (starts_with(a, "--db="))           db_path     = a + 5;
-        else if (starts_with(a, "--since="))        since       = a + 8;
-        else if (starts_with(a, "--until="))        until       = a + 8;
-        else if (starts_with(a, "--type="))         type_arg    = a + 7;
-        else if (starts_with(a, "--satellite="))    satellite   = a + 12;
-        else if (starts_with(a, "--source-tool="))  source_tool = a + 14;
-        else if (starts_with(a, "--capture-origin=")) capture_origin = a + 17;
-        else if (starts_with(a, "--like="))         like_arg    = a + 7;
-        else if (starts_with(a, "--limit=")) {
-            limit = strtol(a + 8, NULL, 10);
-            if (limit < 0) limit = 0;
-        } else if (strcmp(a, "--order=asc") == 0) {
-            order_desc = 0;
-        } else if (strcmp(a, "--order=desc") == 0) {
-            order_desc = 1;
-        } else if (strcmp(a, "--format=table") == 0) fmt = FMT_TABLE;
-        else if (strcmp(a, "--format=json") == 0)    fmt = FMT_JSON;
-        else if (strcmp(a, "--format=csv") == 0)     fmt = FMT_CSV;
-        else if (strcmp(a, "--format=raw") == 0)     fmt = FMT_RAW;
-        else if (strcmp(a, "--local-time") == 0)     local_time = 1;
-        else {
-            fprintf(stderr, "packet_query: unknown option '%s'\n", a);
-            usage(stderr, argv[0]);
-            return 1;
-        }
+    packet_query_args_t cfg = {
+        .limit = 100,
+        .order_desc = 1,
+        .fmt = FMT_TABLE,
+    };
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
     }
+
+    // Copy parsed config into the working locals the query body below uses.
+    const char *db_path = cfg.db_path;
+    const char *since = cfg.since;
+    const char *until = cfg.until;
+    const char *type_arg = cfg.type_arg;
+    const char *satellite = cfg.satellite;
+    const char *source_tool = cfg.source_tool;
+    const char *capture_origin = cfg.capture_origin;
+    const char *like_arg = cfg.like_arg;
+    long limit = cfg.limit;
+    int order_desc = cfg.order_desc;
+    enum format fmt = cfg.fmt;
+    int local_time = cfg.local_time;
 
     if (fmt == FMT_RAW && limit != 1) {
         fprintf(stderr, "packet_query: --format=raw needs --limit=1 "

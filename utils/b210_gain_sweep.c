@@ -37,6 +37,7 @@
    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "argparse.h"
 #include "b210_rx_tx_core.h"
 #include "carrier_trim.h"
 #include "frontiersat.h"
@@ -87,51 +88,143 @@ static int starts_with(const char *s, const char *prefix)
     return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
-static void usage(const char *argv0)
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the fields out into working locals so the (large) sweep body is unchanged.
+typedef struct {
+    double      freq_hz;
+    double      rate_hz;
+    unsigned    decim;
+    double      decim_cutoff;
+    const char *rx_antenna;
+    double      bw_hz;
+    double      gain_start;
+    double      gain_end;
+    double      gain_step;
+    double      dwell_s;
+    double      settle_s;
+    const char *csv_path;
+    const char *iq_prefix;
+    int         testing_mode;
+    int         dc_track;
+    int         iq_track;
+} gsw_args_t;
+
+// Option column width: the widest label below ("--ad9361-dc-track=on|off") + a
+// small margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 26
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(gsw_args_t *a, int argc, char **argv, int help)
 {
-    fprintf(stderr,
-        "Usage: %s [options]\n"
-        "\n"
-        "Sweeps B210 RX gain, dwells, reports mean(I^2 + Q^2) per gain.\n"
-        "\n"
-        "  --freq=HZ            RX center frequency (default %.0f)\n"
-        "  --rate=HZ            UHD input rate (default 480000)\n"
-        "  --decim=N            IQ decimation factor (default 5 -> 96 kHz)\n"
-        "  --decim-cutoff=HZ    decim FIR -6 dB cutoff (default 18000)\n"
-        "  --antenna=NAME       RX antenna (default RX2)\n"
-        "  --bw=HZ              analog filter bandwidth (default = rate)\n"
-        "\n"
-        "  --gain-start=DB      first gain to test (default 0)\n"
-        "  --gain-end=DB        last gain to test (default 73)\n"
-        "  --gain-step=DB       step size (default 5)\n"
-        "  --dwell=S            measurement window per gain (default 5.0)\n"
-        "  --settle=S           seconds to skip after open before\n"
-        "                         starting the average (default 1.0)\n"
-        "\n"
-        "  --csv=PATH           append CSV: gain_db,n_samples,mean_sq,\n"
-        "                                   mean_sq_dbfs,peak_env\n"
-        "  --iq-prefix=PATH     also dump per-step IQ to\n"
-        "                       PATH_<gain>dB.iq (raw int16 I,Q pairs)\n"
-        "  --testing            auto-create a bench folder under\n"
-        "                       <FrontierSat>/Testing/YYYYMMDD/HHMMLT_gain_sweep/\n"
-        "                       and default --csv / --iq-prefix into it\n"
-        "                       unless you also passed them explicitly.\n"
-        "\n"
-        "  --ad9361-dc-track=on|off   AD9361 background DC-offset tracking.\n"
-        "                             Default ON, mirroring simple_sat_ops, so\n"
-        "                             the noise-floor knee found here matches\n"
-        "                             what the operator UI will see at the\n"
-        "                             same gain. Pass off to characterise the\n"
-        "                             raw ADC floor (the BBDC IIR otherwise\n"
-        "                             notches a few bins around DC).\n"
-        "  --ad9361-iq-track=on|off   AD9361 background IQ-balance tracking.\n"
-        "                             Default OFF (the spike-comb culprit).\n"
-        "                             Pass on for A/B comparison.\n"
-        "\n"
-        "Output: one row per gain on stdout — column \"mean_dBFS\" is\n"
-        "10*log10(mean(I^2+Q^2) / 32767^2). Plot dBFS vs gain; the knee\n"
-        "is the gain above which the line stops being slope ~1.\n",
-        argv0, (double) FRONTIERSAT_CARRIER_HZ - 25000.0);
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0 || help) {
+            if (help) parse_help_line(OPTW, "-h, --help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (starts_with(arg, "--freq=") || help) {
+            if (help) parse_help_line(OPTW, "--freq=<hz>", "RX center frequency (default carrier-25 kHz)");
+            else a->freq_hz = atof(arg + 7);
+            matched = 1;
+        }
+        if (starts_with(arg, "--rate=") || help) {
+            if (help) parse_help_line(OPTW, "--rate=<hz>", "UHD input rate (default 480000)");
+            else a->rate_hz = atof(arg + 7);
+            matched = 1;
+        }
+        if (starts_with(arg, "--decim=") || help) {
+            if (help) parse_help_line(OPTW, "--decim=<n>", "IQ decimation factor (default 5 -> 96 kHz)");
+            else a->decim = (unsigned) atoi(arg + 8);
+            matched = 1;
+        }
+        if (starts_with(arg, "--decim-cutoff=") || help) {
+            if (help) parse_help_line(OPTW, "--decim-cutoff=<hz>", "decim FIR -6 dB cutoff (default 18000)");
+            else a->decim_cutoff = atof(arg + 15);
+            matched = 1;
+        }
+        if (starts_with(arg, "--antenna=") || help) {
+            if (help) parse_help_line(OPTW, "--antenna=<name>", "RX antenna (default RX2)");
+            else a->rx_antenna = arg + 10;
+            matched = 1;
+        }
+        if (starts_with(arg, "--bw=") || help) {
+            if (help) parse_help_line(OPTW, "--bw=<hz>", "analog filter bandwidth (default = rate)");
+            else a->bw_hz = atof(arg + 5);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gain-start=") || help) {
+            if (help) parse_help_line(OPTW, "--gain-start=<db>", "first gain to test (default 0)");
+            else a->gain_start = atof(arg + 13);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gain-end=") || help) {
+            if (help) parse_help_line(OPTW, "--gain-end=<db>", "last gain to test (default 73)");
+            else a->gain_end = atof(arg + 11);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gain-step=") || help) {
+            if (help) parse_help_line(OPTW, "--gain-step=<db>", "step size (default 5)");
+            else a->gain_step = atof(arg + 12);
+            matched = 1;
+        }
+        if (starts_with(arg, "--dwell=") || help) {
+            if (help) parse_help_line(OPTW, "--dwell=<s>", "measurement window per gain (default 5.0)");
+            else a->dwell_s = atof(arg + 8);
+            matched = 1;
+        }
+        if (starts_with(arg, "--settle=") || help) {
+            if (help) parse_help_line(OPTW, "--settle=<s>", "seconds to skip after open before averaging (default 1.0)");
+            else a->settle_s = atof(arg + 9);
+            matched = 1;
+        }
+        if (starts_with(arg, "--csv=") || help) {
+            if (help) parse_help_line(OPTW, "--csv=<path>", "append CSV: gain_db,n_samples,mean_sq,mean_sq_dbfs,peak_env");
+            else a->csv_path = arg + 6;
+            matched = 1;
+        }
+        if (starts_with(arg, "--iq-prefix=") || help) {
+            if (help) parse_help_line(OPTW, "--iq-prefix=<path>", "also dump per-step IQ to PATH_<gain>dB.iq (raw int16 I,Q)");
+            else a->iq_prefix = arg + 12;
+            matched = 1;
+        }
+        if (strcmp(arg, "--testing") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--testing", "auto-create a bench folder and default --csv / --iq-prefix into it");
+            else a->testing_mode = 1;
+            matched = 1;
+        }
+        if (starts_with(arg, "--ad9361-dc-track=") || help) {
+            if (help) parse_help_line(OPTW, "--ad9361-dc-track=on|off", "AD9361 background DC-offset tracking (default on)");
+            else {
+                const char *v = arg + 18;
+                a->dc_track = (strcmp(v, "on") == 0
+                            || strcmp(v, "true") == 0
+                            || strcmp(v, "1") == 0) ? 1 : 0;
+            }
+            matched = 1;
+        }
+        if (starts_with(arg, "--ad9361-iq-track=") || help) {
+            if (help) parse_help_line(OPTW, "--ad9361-iq-track=on|off", "AD9361 background IQ-balance tracking (default off)");
+            else {
+                const char *v = arg + 18;
+                a->iq_track = (strcmp(v, "on") == 0
+                            || strcmp(v, "true") == 0
+                            || strcmp(v, "1") == 0) ? 1 : 0;
+            }
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            fprintf(stderr, "unknown option: %s\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
 }
 
 // -V / --version support (commit baked in at build time).
@@ -140,63 +233,48 @@ static void usage(const char *argv0)
 int main(int argc, char *argv[])
 {
     if (sso_version_handle(argc, argv, "b210_gain_sweep")) return 0;
-    double      freq_hz       = (double) FRONTIERSAT_CARRIER_HZ - 25000.0;
-    double      rate_hz       = 480000.0;
-    unsigned    decim         = 5u;
-    double      decim_cutoff  = 18000.0;
-    const char *rx_antenna    = "RX2";
-    double      bw_hz         = -1.0;
-
-    double      gain_start    = 0.0;
-    double      gain_end      = 73.0;
-    double      gain_step     = 5.0;
-    double      dwell_s       = 5.0;
-    double      settle_s      = 1.0;
-
-    const char *csv_path      = NULL;
-    const char *iq_prefix     = NULL;
-    int         testing_mode  = 0;
-
-    // Defaults mirror simple_sat_ops so a sweep finds the operator-
-    // visible noise-floor knee directly. CLI flags below override.
-    int         dc_track      = 1;
-    int         iq_track      = 0;
-
-    for (int i = 1; i < argc; ++i) {
-        const char *a = argv[i];
-        if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
-            usage(argv[0]); return 0;
-        } else if (starts_with(a, "--freq="))         freq_hz      = atof(a + 7);
-        else if (starts_with(a, "--rate="))           rate_hz      = atof(a + 7);
-        else if (starts_with(a, "--decim="))          decim        = (unsigned) atoi(a + 8);
-        else if (starts_with(a, "--decim-cutoff="))   decim_cutoff = atof(a + 15);
-        else if (starts_with(a, "--antenna="))        rx_antenna   = a + 10;
-        else if (starts_with(a, "--bw="))             bw_hz        = atof(a + 5);
-        else if (starts_with(a, "--gain-start="))     gain_start   = atof(a + 13);
-        else if (starts_with(a, "--gain-end="))       gain_end     = atof(a + 11);
-        else if (starts_with(a, "--gain-step="))      gain_step    = atof(a + 12);
-        else if (starts_with(a, "--dwell="))          dwell_s      = atof(a + 8);
-        else if (starts_with(a, "--settle="))         settle_s     = atof(a + 9);
-        else if (starts_with(a, "--csv="))            csv_path     = a + 6;
-        else if (starts_with(a, "--iq-prefix="))      iq_prefix    = a + 12;
-        else if (strcmp(a, "--testing") == 0)         testing_mode = 1;
-        else if (starts_with(a, "--ad9361-dc-track=")) {
-            const char *v = a + 18;
-            dc_track = (strcmp(v, "on") == 0
-                        || strcmp(v, "true") == 0
-                        || strcmp(v, "1") == 0) ? 1 : 0;
-        }
-        else if (starts_with(a, "--ad9361-iq-track=")) {
-            const char *v = a + 18;
-            iq_track = (strcmp(v, "on") == 0
-                        || strcmp(v, "true") == 0
-                        || strcmp(v, "1") == 0) ? 1 : 0;
-        }
-        else {
-            fprintf(stderr, "unknown option: %s\n", a);
-            usage(argv[0]); return 2;
-        }
+    gsw_args_t cfg = {
+        .freq_hz       = (double) FRONTIERSAT_CARRIER_HZ - 25000.0,
+        .rate_hz       = 480000.0,
+        .decim         = 5u,
+        .decim_cutoff  = 18000.0,
+        .rx_antenna    = "RX2",
+        .bw_hz         = -1.0,
+        .gain_start    = 0.0,
+        .gain_end      = 73.0,
+        .gain_step     = 5.0,
+        .dwell_s       = 5.0,
+        .settle_s      = 1.0,
+        .csv_path      = NULL,
+        .iq_prefix     = NULL,
+        .testing_mode  = 0,
+        // Defaults mirror simple_sat_ops so a sweep finds the operator-
+        // visible noise-floor knee directly. CLI flags override.
+        .dc_track      = 1,
+        .iq_track      = 0,
+    };
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 2;
     }
+
+    // Copy parsed config into the working locals the sweep body below uses.
+    double      freq_hz       = cfg.freq_hz;
+    double      rate_hz       = cfg.rate_hz;
+    unsigned    decim         = cfg.decim;
+    double      decim_cutoff  = cfg.decim_cutoff;
+    const char *rx_antenna    = cfg.rx_antenna;
+    double      bw_hz         = cfg.bw_hz;
+    double      gain_start    = cfg.gain_start;
+    double      gain_end      = cfg.gain_end;
+    double      gain_step     = cfg.gain_step;
+    double      dwell_s       = cfg.dwell_s;
+    double      settle_s      = cfg.settle_s;
+    const char *csv_path      = cfg.csv_path;
+    const char *iq_prefix     = cfg.iq_prefix;
+    int         testing_mode  = cfg.testing_mode;
+    int         dc_track      = cfg.dc_track;
+    int         iq_track      = cfg.iq_track;
 
     if (gain_step <= 0.0) { fprintf(stderr, "--gain-step must be > 0\n"); return 2; }
     if (gain_end < gain_start) { fprintf(stderr, "--gain-end < --gain-start\n"); return 2; }

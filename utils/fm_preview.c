@@ -24,6 +24,7 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "argparse.h"
 #include "modem.h"
 #include "utils/wav_read.h"
 
@@ -41,28 +42,67 @@ static int starts_with(const char *s, const char *prefix)
     return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
-static void usage(FILE *out, const char *argv0)
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the fields out into working locals so the modulation body is unchanged.
+typedef struct {
+    const char *in_path;
+    const char *out_path;
+    double carrier;
+    double deviation;
+    int stretch;
+} fm_preview_args_t;
+
+// Option column width: the widest label below ("--time-stretch=<N>") + a small
+// margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 20
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(fm_preview_args_t *a, int argc, char **argv, int help)
 {
-    fprintf(out,
-        "usage: %s --in=<in.wav> --out=<out.wav> [options]\n"
-        "\n"
-        "FM-modulate a baseband WAV into an audible preview:\n"
-        "  phase += 2π · (carrier + deviation · sample) / samp_rate\n"
-        "  out    = cos(phase)\n"
-        "Input must be 16-bit PCM mono; output is written at the same rate.\n"
-        "\n"
-        "Options:\n"
-        "  --carrier=<Hz>       Audio carrier (default 1000)\n"
-        "  --deviation=<Hz>     Peak frequency deviation (default 500)\n"
-        "  --time-stretch=<N>   Stretch output duration by integer factor N\n"
-        "                       while keeping the carrier pitch unchanged\n"
-        "                       (default 1, no stretch). Each input baseband\n"
-        "                       sample drives N output samples of cosine at\n"
-        "                       the instantaneous frequency, so the carrier\n"
-        "                       stays at `carrier` Hz and the bit pattern\n"
-        "                       plays N× slower. For bit-by-bit aural inspection.\n"
-        "  --help               This message\n",
-        argv0);
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (starts_with(arg, "--in=") || help) {
+            if (help) parse_help_line(OPTW, "--in=<in.wav>", "input baseband WAV (16-bit PCM mono)");
+            else a->in_path = arg + 5;
+            matched = 1;
+        }
+        if (starts_with(arg, "--out=") || help) {
+            if (help) parse_help_line(OPTW, "--out=<out.wav>", "output FM-modulated WAV (same rate as input)");
+            else a->out_path = arg + 6;
+            matched = 1;
+        }
+        if (starts_with(arg, "--carrier=") || help) {
+            if (help) parse_help_line(OPTW, "--carrier=<Hz>", "audio carrier (default 1000)");
+            else a->carrier = atof(arg + 10);
+            matched = 1;
+        }
+        if (starts_with(arg, "--deviation=") || help) {
+            if (help) parse_help_line(OPTW, "--deviation=<Hz>", "peak frequency deviation (default 500)");
+            else a->deviation = atof(arg + 12);
+            matched = 1;
+        }
+        if (starts_with(arg, "--time-stretch=") || help) {
+            if (help) parse_help_line(OPTW, "--time-stretch=<N>", "stretch output duration by integer factor N at the same pitch (default 1)");
+            else a->stretch = atoi(arg + 15);
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            fprintf(stderr, "unknown option: %s\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
 }
 
 // -V / --version support (commit baked in at build time).
@@ -71,29 +111,25 @@ static void usage(FILE *out, const char *argv0)
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "fm_preview")) return 0;
-    const char *in_path = NULL;
-    const char *out_path = NULL;
-    double carrier = 1000.0;
-    double deviation = 500.0;
-    int stretch = 1;
-
-    for (int i = 1; i < argc; ++i) {
-        const char *a = argv[i];
-        if (strcmp(a, "--help") == 0) { usage(stdout, argv[0]); return 0; }
-        else if (starts_with(a, "--in="))        in_path   = a + 5;
-        else if (starts_with(a, "--out="))       out_path  = a + 6;
-        else if (starts_with(a, "--carrier="))   carrier   = atof(a + 10);
-        else if (starts_with(a, "--deviation=")) deviation = atof(a + 12);
-        else if (starts_with(a, "--time-stretch=")) stretch   = atoi(a + 15);
-        else {
-            fprintf(stderr, "unknown option: %s\n", a);
-            usage(stderr, argv[0]);
-            return 1;
-        }
+    fm_preview_args_t cfg = {
+        .in_path = NULL,
+        .out_path = NULL,
+        .carrier = 1000.0,
+        .deviation = 500.0,
+        .stretch = 1,
+    };
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
     }
+    const char *in_path = cfg.in_path;
+    const char *out_path = cfg.out_path;
+    double carrier = cfg.carrier;
+    double deviation = cfg.deviation;
+    int stretch = cfg.stretch;
+
     if (in_path == NULL || out_path == NULL) {
         fprintf(stderr, "missing --in or --out\n");
-        usage(stderr, argv[0]);
         return 1;
     }
     if (!(carrier > 0.0) || !(deviation >= 0.0)) {

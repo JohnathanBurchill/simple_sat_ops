@@ -45,6 +45,7 @@
 //   packet decoding, 240-250 kHz gives 25-26 samples per symbol — a
 //   comfortable working point.
 
+#include "argparse.h"
 #include "modem.h"   // pcm16_write_wav
 #include "frontiersat.h"   // FRONTIERSAT_CARRIER_HZ
 #include "carrier_trim.h"
@@ -91,106 +92,173 @@ static int uhd_check(uhd_error e, const char *what)
     return 1;
 }
 
-static void usage(FILE *f, const char *argv0)
+// Demodulation mode and live-monitor squelch mode. Lifted to file scope (from
+// main's locals) so parse_args and the args struct below can name them.
+enum { DEMOD_FM = 0, DEMOD_USB = 1 };
+enum { MONSQ_AUTO = 0, MONSQ_FIXED = 1, MONSQ_OFF = 2 };
+
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the fields out into working locals so the (large) capture body is unchanged.
+typedef struct {
+    double freq_hz;
+    double gain_db;
+    double rate;
+    double bw_hz;
+    double duration_s;
+    const char *device_args;
+    const char *wav_path;
+    const char *raw_iq_path;
+    const char *rx_antenna;
+    int demod;
+    double fm_fullscale_hz;
+    double fm_squelch_mag;       // -1 = auto
+    int fm_squelch_explicit;
+    int monitor;
+    const char *monitor_device;
+    int monitor_sq_mode;
+    double monitor_sq_user_mag;  // for MONSQ_FIXED
+} b210_rx_capture_args_t;
+
+// Option column width: the widest label below ("--monitor-squelch=<a|N|0>") +
+// a small margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 27
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(b210_rx_capture_args_t *a, int argc, char **argv, int help)
 {
-    fprintf(f,
-        "usage: %s [options]\n"
-        "\n"
-        "Capture I/Q from a USRP B210 and write a mono FM-demoded WAV\n"
-        "(default) or USB-demoded WAV (legacy real(IQ) mode), plus\n"
-        "optionally the raw int16 IQ stream.\n"
-        "\n"
-        "For 9600 packet decoding (FrontierSat AX100): default --demod=fm,\n"
-        "tune to the carrier, capture at 240-250 kHz so rx_decode gets\n"
-        "25+ samples per symbol:\n"
-        "    %s --freq-hz=436150000 --rate=240000 --gain-db=50 \\\n"
-        "        --duration-s=30 --wav=/tmp/frame.wav\n"
-        "    rx_decode /tmp/frame.wav --hmac --sync-threshold=4\n"
-        "\n"
-        "For SSB / CW listening, switch to --demod=usb and tune the LO\n"
-        "~1 kHz below the carrier so the steady tone lands at +1 kHz:\n"
-        "    %s --demod=usb --freq-hz=432324000 --rate=250000 \\\n"
-        "        --gain-db=60 --duration-s=30 --wav=/tmp/cw.wav\n"
-        "    sox /tmp/cw.wav --rate 25000 /tmp/cw_25k.wav\n"
-        "    aplay /tmp/cw_25k.wav   # (or: afplay on Mac)\n"
-        "\n"
-        "Tuning:\n"
-        "  --freq-hz=<hz>             B210 LO center freq (default %.0f)\n"
-        "  --gain-db=<n>              B210 RX gain dB, 0..76 (default 50)\n"
-        "  --rate=<sps>               Sample rate (default 250000; the B210\n"
-        "                             AD9361 floor is around 200 kHz)\n"
-        "  --bw-hz=<hz>               Analog filter bandwidth (default = rate)\n"
-        "  --duration-s=<f>           Capture length in seconds (default 5,\n"
-        "                             max 600 — buffered in RAM)\n"
-        "  --rx-antenna=<name>        B210 RX antenna port (default \"RX2\" =\n"
-        "                             RF A RX-only jack; alternative: \"TX/RX\"\n"
-        "                             = RF A TX/RX jack. The B210 has two SMA\n"
-        "                             jacks per channel; antenna on the wrong\n"
-        "                             one means silence even with the LO and\n"
-        "                             gain set correctly.)\n"
-        "  --device-args=<str>        UHD device args (default \"type=b200\")\n"
-        "\n"
-        "Demodulation:\n"
-        "  --demod=<fm|usb>           Default fm. fm = FM discriminator\n"
-        "                             (inst_freq from phase diff between\n"
-        "                             consecutive complex samples), suitable\n"
-        "                             for direct rx_decode consumption. usb =\n"
-        "                             real(IQ), the legacy SSB / CW listening\n"
-        "                             mode.\n"
-        "  --fm-fullscale-hz=<hz>     Peak |inst_freq| that maps to 32767\n"
-        "                             PCM (default 25000). Smaller values\n"
-        "                             increase visual amplitude on quiet FM\n"
-        "                             signals at the cost of clipping on\n"
-        "                             wider ones. Bit-slicer doesn't care\n"
-        "                             since it only reads polarity.\n"
-        "  --fm-squelch=<auto|N>      During silence, the FM discriminator's\n"
-        "                             phase difference of two near-zero IQ\n"
-        "                             vectors is essentially a uniform-random\n"
-        "                             angle in [-pi, +pi], which scales to\n"
-        "                             saturated white noise. Squelch zeroes\n"
-        "                             the audio whenever sqrt(I^2 + Q^2) < N.\n"
-        "                             Default 'auto' = 4 * median(|IQ|) over\n"
-        "                             the capture (catches both 'mostly\n"
-        "                             silent with brief signal' and the\n"
-        "                             reverse). Pass 0 to disable.\n"
-        "\n"
-        "Output (at least one required):\n"
-        "  --wav=<path>               Mono S16 WAV (demoded per --demod=).\n"
-        "                             Header sample rate is the *actual*\n"
-        "                             rate UHD honoured (queried via\n"
-        "                             uhd_usrp_get_rx_rate). Plays at the\n"
-        "                             right speed regardless of what UHD\n"
-        "                             coerced --rate to.\n"
-        "  --raw-iq=<path>            Interleaved int16 IQ (sc16 host\n"
-        "                             format), no header. Independent of\n"
-        "                             --demod=.\n"
-        "\n"
-        "Live monitor (Linux only — requires this binary be built with ALSA):\n"
-        "  --monitor                  Pipe the demoded audio to an ALSA\n"
-        "                             playback device in real time alongside\n"
-        "                             the WAV write. Independent of --wav=\n"
-        "                             so you can monitor without saving, but\n"
-        "                             at least one of --wav= / --raw-iq= is\n"
-        "                             still required.\n"
-        "  --monitor-device=<name>    ALSA device for --monitor (default\n"
-        "                             \"default\"; use e.g. \"plughw:0,0\" to\n"
-        "                             bypass PulseAudio resampling on a\n"
-        "                             specific card).\n"
-        "  --monitor-squelch=<a|N|0>  Live FM squelch on the monitor audio\n"
-        "                             only — does not touch the WAV bytes.\n"
-        "                             Default 'auto' bootstraps a 4 * median\n"
-        "                             |IQ| threshold from the first ~0.25 s\n"
-        "                             of capture, then applies it for the\n"
-        "                             rest of the run. Pass a positive number\n"
-        "                             for a fixed |IQ| threshold (engages\n"
-        "                             immediately, no bootstrap delay), or\n"
-        "                             'off' / 0 to disable. The post-capture\n"
-        "                             WAV is governed by --fm-squelch=, which\n"
-        "                             is independent.\n"
-        "\n"
-        "Other:\n"
-        "  --help                     This message.\n",
-        argv0, argv0, argv0, FRONTIERSAT_CARRIER_HZ);
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (starts_with(arg, "--freq-hz=") || help) {
+            if (help) parse_help_line(OPTW, "--freq-hz=<hz>", "B210 LO center freq (default FrontierSat carrier)");
+            else a->freq_hz = atof(arg + 10);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gain-db=") || help) {
+            if (help) parse_help_line(OPTW, "--gain-db=<n>", "B210 RX gain dB, 0..76 (default 50)");
+            else a->gain_db = atof(arg + 10);
+            matched = 1;
+        }
+        if (starts_with(arg, "--rate=") || help) {
+            if (help) parse_help_line(OPTW, "--rate=<sps>", "sample rate (default 250000; AD9361 floor ~200 kHz)");
+            else a->rate = atof(arg + 7);
+            matched = 1;
+        }
+        if (starts_with(arg, "--bw-hz=") || help) {
+            if (help) parse_help_line(OPTW, "--bw-hz=<hz>", "analog filter bandwidth (default = rate)");
+            else a->bw_hz = atof(arg + 8);
+            matched = 1;
+        }
+        if (starts_with(arg, "--duration-s=") || help) {
+            if (help) parse_help_line(OPTW, "--duration-s=<f>", "capture length s (default 5, max 600; buffered in RAM)");
+            else a->duration_s = atof(arg + 13);
+            matched = 1;
+        }
+        if (starts_with(arg, "--device-args=") || help) {
+            if (help) parse_help_line(OPTW, "--device-args=<str>", "UHD device args (default \"type=b200\")");
+            else a->device_args = arg + 14;
+            matched = 1;
+        }
+        if (starts_with(arg, "--rx-antenna=") || help) {
+            if (help) parse_help_line(OPTW, "--rx-antenna=<name>", "B210 RX antenna port (default \"RX2\"; or \"TX/RX\")");
+            else a->rx_antenna = arg + 13;
+            matched = 1;
+        }
+        if (starts_with(arg, "--wav=") || help) {
+            if (help) parse_help_line(OPTW, "--wav=<path>", "mono S16 WAV, demoded per --demod (actual UHD rate in header)");
+            else a->wav_path = arg + 6;
+            matched = 1;
+        }
+        if (starts_with(arg, "--raw-iq=") || help) {
+            if (help) parse_help_line(OPTW, "--raw-iq=<path>", "interleaved int16 IQ (sc16), no header; independent of --demod");
+            else a->raw_iq_path = arg + 9;
+            matched = 1;
+        }
+        if (starts_with(arg, "--demod=") || help) {
+            if (help) parse_help_line(OPTW, "--demod=<fm|usb>", "fm = FM discriminator (default), usb = real(IQ) SSB/CW");
+            else {
+                const char *s = arg + 8;
+                if      (strcmp(s, "fm")  == 0) a->demod = DEMOD_FM;
+                else if (strcmp(s, "usb") == 0) a->demod = DEMOD_USB;
+                else { fprintf(stderr, "b210_rx_capture: --demod=%s must be fm|usb\n", s); return PARSE_ERROR; }
+            }
+            matched = 1;
+        }
+        if (starts_with(arg, "--fm-fullscale-hz=") || help) {
+            if (help) parse_help_line(OPTW, "--fm-fullscale-hz=<hz>", "peak |inst_freq| mapping to 32767 PCM (default 25000)");
+            else {
+                a->fm_fullscale_hz = atof(arg + 18);
+                if (a->fm_fullscale_hz <= 0.0) {
+                    fprintf(stderr, "b210_rx_capture: --fm-fullscale-hz must be > 0\n");
+                    return PARSE_ERROR;
+                }
+            }
+            matched = 1;
+        }
+        if (starts_with(arg, "--fm-squelch=") || help) {
+            if (help) parse_help_line(OPTW, "--fm-squelch=<auto|N>", "zero audio when |IQ| < N (default auto = 4*median; 0 = off)");
+            else {
+                const char *s = arg + 13;
+                a->fm_squelch_explicit = 1;
+                if (strcmp(s, "auto") == 0) {
+                    a->fm_squelch_mag = -1.0;
+                } else {
+                    a->fm_squelch_mag = atof(s);
+                    if (a->fm_squelch_mag < 0.0) {
+                        fprintf(stderr, "b210_rx_capture: --fm-squelch must be >= 0 or 'auto'\n");
+                        return PARSE_ERROR;
+                    }
+                }
+            }
+            matched = 1;
+        }
+        if (strcmp(arg, "--monitor") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--monitor", "pipe demoded audio to ALSA in real time (Linux/ALSA only)");
+            else a->monitor = 1;
+            matched = 1;
+        }
+        if (starts_with(arg, "--monitor-device=") || help) {
+            if (help) parse_help_line(OPTW, "--monitor-device=<name>", "ALSA device for --monitor (default \"default\")");
+            else a->monitor_device = arg + 17;
+            matched = 1;
+        }
+        if (starts_with(arg, "--monitor-squelch=") || help) {
+            if (help) parse_help_line(OPTW, "--monitor-squelch=<a|N|0>", "live FM squelch on monitor audio only (default auto; 'off'/0 = disable)");
+            else {
+                const char *s = arg + 18;
+                if (strcmp(s, "auto") == 0) {
+                    a->monitor_sq_mode = MONSQ_AUTO;
+                } else if (strcmp(s, "off") == 0 || strcmp(s, "0") == 0) {
+                    a->monitor_sq_mode = MONSQ_OFF;
+                } else {
+                    double v = atof(s);
+                    if (v <= 0.0) {
+                        fprintf(stderr, "b210_rx_capture: --monitor-squelch must be "
+                                        "'auto', 'off', or a positive number\n");
+                        return PARSE_ERROR;
+                    }
+                    a->monitor_sq_mode     = MONSQ_FIXED;
+                    a->monitor_sq_user_mag = v;
+                }
+            }
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            fprintf(stderr, "b210_rx_capture: unknown arg '%s'\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
 }
 
 // -V / --version support (commit baked in at build time).
@@ -199,85 +267,45 @@ static void usage(FILE *f, const char *argv0)
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "b210_rx_capture")) return 0;
-    double freq_hz   = FRONTIERSAT_CARRIER_HZ;
-    double gain_db   = 50.0;
-    double rate      = 250000.0;
-    double bw_hz     = -1.0;          // -1 → take rate
-    double duration_s = 5.0;
-    const char *device_args = "type=b200";
-    const char *wav_path    = NULL;
-    const char *raw_iq_path = NULL;
-    const char *rx_antenna  = "RX2";
-    enum { DEMOD_FM = 0, DEMOD_USB = 1 } demod = DEMOD_FM;
-    double fm_fullscale_hz = 25000.0;
-    double fm_squelch_mag = -1.0;       // -1 = auto
-    int    fm_squelch_explicit = 0;     // 1 if user passed --fm-squelch=
-    int         monitor             = 0;
-    const char *monitor_device      = "default";
-    enum { MONSQ_AUTO = 0, MONSQ_FIXED = 1, MONSQ_OFF = 2 }
-                monitor_sq_mode     = MONSQ_AUTO;
-    double      monitor_sq_user_mag = 0.0;   // for MONSQ_FIXED
-
-    for (int i = 1; i < argc; i++) {
-        const char *a = argv[i];
-        if (strcmp(a, "--help") == 0)              { usage(stdout, argv[0]); return 0; }
-        else if (starts_with(a, "--freq-hz="))      freq_hz     = atof(a + 10);
-        else if (starts_with(a, "--gain-db="))      gain_db     = atof(a + 10);
-        else if (starts_with(a, "--rate="))         rate        = atof(a + 7);
-        else if (starts_with(a, "--bw-hz="))        bw_hz       = atof(a + 8);
-        else if (starts_with(a, "--duration-s="))   duration_s  = atof(a + 13);
-        else if (starts_with(a, "--device-args="))  device_args = a + 14;
-        else if (starts_with(a, "--rx-antenna="))   rx_antenna  = a + 13;
-        else if (starts_with(a, "--wav="))          wav_path    = a + 6;
-        else if (starts_with(a, "--raw-iq="))       raw_iq_path = a + 9;
-        else if (starts_with(a, "--demod=")) {
-            const char *s = a + 8;
-            if      (strcmp(s, "fm")  == 0) demod = DEMOD_FM;
-            else if (strcmp(s, "usb") == 0) demod = DEMOD_USB;
-            else { fprintf(stderr, "b210_rx_capture: --demod=%s must be fm|usb\n", s); return 1; }
-        }
-        else if (starts_with(a, "--fm-fullscale-hz=")) {
-            fm_fullscale_hz = atof(a + 18);
-            if (fm_fullscale_hz <= 0.0) {
-                fprintf(stderr, "b210_rx_capture: --fm-fullscale-hz must be > 0\n");
-                return 1;
-            }
-        }
-        else if (starts_with(a, "--fm-squelch=")) {
-            const char *s = a + 13;
-            fm_squelch_explicit = 1;
-            if (strcmp(s, "auto") == 0) {
-                fm_squelch_mag = -1.0;
-            } else {
-                fm_squelch_mag = atof(s);
-                if (fm_squelch_mag < 0.0) {
-                    fprintf(stderr, "b210_rx_capture: --fm-squelch must be >= 0 or 'auto'\n");
-                    return 1;
-                }
-            }
-        }
-        else if (strcmp(a, "--monitor") == 0)        monitor = 1;
-        else if (starts_with(a, "--monitor-device=")) monitor_device = a + 17;
-        else if (starts_with(a, "--monitor-squelch=")) {
-            const char *s = a + 18;
-            if (strcmp(s, "auto") == 0) {
-                monitor_sq_mode = MONSQ_AUTO;
-            } else if (strcmp(s, "off") == 0 || strcmp(s, "0") == 0) {
-                monitor_sq_mode = MONSQ_OFF;
-            } else {
-                double v = atof(s);
-                if (v <= 0.0) {
-                    fprintf(stderr, "b210_rx_capture: --monitor-squelch must be "
-                                    "'auto', 'off', or a positive number\n");
-                    return 1;
-                }
-                monitor_sq_mode     = MONSQ_FIXED;
-                monitor_sq_user_mag = v;
-            }
-        }
-        else { fprintf(stderr, "b210_rx_capture: unknown arg '%s'\n", a);
-               usage(stderr, argv[0]); return 1; }
+    b210_rx_capture_args_t cfg = {
+        .freq_hz = FRONTIERSAT_CARRIER_HZ,
+        .gain_db = 50.0,
+        .rate = 250000.0,
+        .bw_hz = -1.0,            // -1 → take rate
+        .duration_s = 5.0,
+        .device_args = "type=b200",
+        .rx_antenna = "RX2",
+        .demod = DEMOD_FM,
+        .fm_fullscale_hz = 25000.0,
+        .fm_squelch_mag = -1.0,   // -1 = auto
+        .fm_squelch_explicit = 0, // 1 if user passed --fm-squelch=
+        .monitor_device = "default",
+        .monitor_sq_mode = MONSQ_AUTO,
+        .monitor_sq_user_mag = 0.0,  // for MONSQ_FIXED
+    };
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
     }
+
+    // Copy parsed config into the working locals the capture body below uses.
+    double freq_hz   = cfg.freq_hz;
+    double gain_db   = cfg.gain_db;
+    double rate      = cfg.rate;
+    double bw_hz     = cfg.bw_hz;
+    double duration_s = cfg.duration_s;
+    const char *device_args = cfg.device_args;
+    const char *wav_path    = cfg.wav_path;
+    const char *raw_iq_path = cfg.raw_iq_path;
+    const char *rx_antenna  = cfg.rx_antenna;
+    int    demod = cfg.demod;
+    double fm_fullscale_hz = cfg.fm_fullscale_hz;
+    double fm_squelch_mag = cfg.fm_squelch_mag;
+    int    fm_squelch_explicit = cfg.fm_squelch_explicit;
+    int         monitor             = cfg.monitor;
+    const char *monitor_device      = cfg.monitor_device;
+    int         monitor_sq_mode     = cfg.monitor_sq_mode;
+    double      monitor_sq_user_mag = cfg.monitor_sq_user_mag;
 
 #ifndef WITH_ALSA
     // The --monitor* options drive the ALSA live-monitor path, which is

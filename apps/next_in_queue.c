@@ -18,6 +18,7 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "argparse.h"
 #include "state.h"
 #include "prediction.h"
 #include "oem.h"
@@ -119,7 +120,13 @@ static int resolve_named_tle(const char *satname, char *out, size_t cap)
     return -1;
 }
 
-void usage(FILE *dest, const char *name, int full)
+// Print the multi-line usage synopsis (the four invocation forms + the
+// one-paragraph summary). Shared by the --help / --help-full header and
+// the post-parse "0 positionals is ambiguous" error, which writes it to
+// stderr. The per-option / per-positional detail is printed by parse_args
+// in help mode; the long EXAMPLES + NOTES live in parse_args's
+// HELP_FULL epilog.
+static void print_synopsis(FILE *dest, const char *name)
 {
     fprintf(dest,
         "usage:\n"
@@ -130,107 +137,343 @@ void usage(FILE *dest, const char *name, int full)
         "\n"
         "Scan a TLE file (or a propagated SSM trajectory) for upcoming passes\n"
         "over the ground station and report the soonest (or every) match.\n"
-        "Read-only; no hardware commands.\n"
-        "\n"
-        "Positional arguments:\n"
-        "  <satellite_name>             Named form. A single name argument selects\n"
-        "                               one object; its TLE is found automatically\n"
-        "                               (see TLE discovery below) and its passes\n"
-        "                               are reported for the next week. No altitude\n"
-        "                               limits needed. Literal, case-sensitive name\n"
-        "                               prefix (e.g. 'ISS (ZARYA)'), before any\n"
-        "                               --options. For regex matching use --regex=.\n"
-        "  <min_alt_km> <max_alt_km>    Catalog-scan form. Two (or three) arguments\n"
-        "                               scan every object in the default TLE within\n"
-        "                               this altitude band. An optional third\n"
-        "                               argument is a name prefix.\n"
-        "\n"
-        "TLE discovery (named form):\n"
-        "  1. newest /<satellite_name>/TLEs/<date>/tle-<date>.tle (by date)\n"
-        "  2. else $HOME/.local/state/simple_sat_ops/active.tle (filtered by name)\n"
-        "  3. else error. Override either form with --tle=<path>.\n"
-        "\n"
-        "Trajectory source (pick one; default = implicit TLE catalog):\n"
-        "  --tle <path>                 Path to a TLE file (2 or 3-line format).\n"
-        "                               Space form is tab-completable; the\n"
-        "                               older --tle=<path> form still works.\n"
-        "                               Default: $HOME/.local/state/simple_sat_ops/active.tle\n"
-        "                               With this flag, positional alt limits\n"
-        "                               become optional — use --min-altitude-km=\n"
-        "                               / --max-altitude-km= flags if needed.\n"
-        "  --trajectory-id=<id>         Fetch propagated ephemeris from `ssm\n"
-        "                               trajectory <id>` and plan passes against\n"
-        "                               it. Mutually exclusive with --tle=.\n"
-        "                               Run `ssm trajectories` to list IDs.\n"
-        "\n"
-        "Output:\n"
-        "  --list                       Print all matching passes (default: one)\n"
-        "  --reverse                    Sort latest-first\n"
-        "  --max-passes=<n>             Limit output to n passes\n"
-        "  --show-radio-info            Annotate with amateur-radio info\n"
-        "                               from active_radios.txt next to the TLE\n"
-        "\n"
-        "Pass filter:\n"
-        "  --min-altitude-km=<km>       Minimum orbital altitude (default 0)\n"
-        "  --max-altitude-km=<km>       Maximum orbital altitude (default unlimited)\n"
-        "  --min-minutes=<n>            Minimum minutes until AOS (default 0)\n"
-        "  --max-minutes=<n>            Maximum minutes until AOS (default 1440)\n"
-        "  --min-elevation=<deg>        Minimum peak elevation (default 0)\n"
-        "  --max-elevation=<deg>        Maximum peak elevation (default 90)\n"
-        "  --minutes-offset=<n>         Advance `now` by n minutes for planning\n"
-        "  --t0=<yyyy-mm-ddThh:mm:ss>   Absolute UTC start time (default: now).\n"
-        "                               --minutes-offset= is applied on top.\n"
-        "  --all-satellites             Include Starlink/OneWeb-style swarms\n"
-        "                               (default: constellations are excluded)\n"
-        "  --regex=<pattern>            Only satellites whose names match\n"
-        "  --ignore-case                Case-insensitive regex match\n"
-        "\n"
-        "Observer location (default RAO Priddis):\n"
-        "  --lat=<deg>                  Geodetic latitude\n"
-        "  --lon=<deg>                  Geodetic longitude (east positive)\n"
-        "  --alt=<m>                    Altitude above ellipsoid, metres\n"
-        "\n"
-        "Other:\n"
-        "  --help                       Short help (this message)\n"
-        "  --help-full                  Detailed help with examples\n",
+        "Read-only; no hardware commands.\n",
         name, name, name, name);
+}
 
-    if (!full) return;
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the fields out into working locals so the (large) prediction body is
+// unchanged. Positionals are POLYMORPHIC -- their meaning depends on count
+// and on whether --tle / --trajectory-id is present -- so they are collected
+// generically here and interpreted in main() after parse_args returns.
+typedef struct {
+    double site_latitude;
+    double site_longitude;
+    double site_altitude;
+    int list_all;
+    int max_passes;
+    int show_radio_info;
+    double min_minutes_away;
+    double max_minutes_away;
+    int max_minutes_user_set;
+    double min_elevation;
+    double max_elevation;
+    const char *regex;
+    int regex_ignore_case;
+    int with_constellations;
+    int reverse;
+    int tle_explicit;
+    char *tles_filename;
+    const char *trajectory_id;
+    const char *t0_str;
+    double min_altitude_km;
+    double max_altitude_km;
+    int minutes_offset;
+    const char *positionals[8];
+    int n_positionals;
+} niq_args_t;
 
-    fprintf(dest,
-        "\n"
-        "EXAMPLES\n"
-        "\n"
-        "  # Next week of passes for one satellite (auto-discovers its TLE)\n"
-        "  %s FrontierSat\n"
-        "\n"
-        "  # Next satellite pass (uses default TLE at ~/.local/state/simple_sat_ops/active.tle)\n"
-        "  %s 0 2000\n"
-        "\n"
-        "  # All passes in the next 3 hours above 30 deg elevation\n"
-        "  %s 0 2000 --list \\\n"
-        "      --max-minutes=180 --min-elevation=30\n"
-        "\n"
-        "  # ISS-class only with a specific TLE file, with amateur-radio info annotation\n"
-        "  %s 300 500 --list \\\n"
-        "      --tle=TLEs/amateur.tle \\\n"
-        "      --regex='ISS|ZARYA' --ignore-case --show-radio-info\n"
-        "\n"
-        "  # Passes for a specific satellite over the next week\n"
-        "  %s 0 2000 'ISS (ZARYA)' --list\n"
-        "\n"
-        "  # Passes against a SSM-propagated trajectory (FrontierSat-style)\n"
-        "  %s --trajectory-id=$(ssm trajectories | jq -r '.[0].id') --list\n"
-        "\n"
-        "NOTES\n"
-        "  - The tool never opens the radio or rotator; safe to run on any host.\n"
-        "  - `active_radios.txt` (looked for in the same directory as the TLE)\n"
-        "    is a community-maintained CSV used by --show-radio-info;\n"
-        "    missing satellites are simply omitted.\n"
-        "  - `--trajectory-id` needs `ssm` on PATH. The trajectory's window\n"
-        "    (from `ssm trajectory-meta <id>`) caps how far ahead passes can\n"
-        "    be predicted; `--max-minutes` is clamped if it exceeds the window.\n",
-        name, name, name, name, name, name);
+// Option column width: the widest label below ("--t0=<yyyy-mm-ddThh:mm:ss>") +
+// a small margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 28
+
+// Parse argv into *a (help == 0), or print the synopsis + one right-aligned
+// help line per option/positional and return (help != 0). Each block's test
+// carries "|| help", so help mode falls through and prints them all. The
+// polymorphic positionals are merely COLLECTED here (count/context is
+// interpreted in main); a token consumed by the --tle space form is taken
+// inside that block so the collector never sees it.
+static int parse_args(niq_args_t *a, int argc, char **argv, int help)
+{
+    if (help) print_synopsis(stdout, "next_in_queue");
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        // Polymorphic positionals: any non-option token (a lone "-" counts).
+        // Collected generically; main() interprets them by count/context.
+        // Declared first so the <...> forms list above the --options in help.
+        if ((arg[0] != '-' || strcmp(arg, "-") == 0) || help) {
+            if (help) {
+                parse_help_line(OPTW, "<satellite_name>", "named form: one object; TLE auto-discovered, passes for next week");
+                parse_help_line(OPTW, "<min_alt_km> <max_alt_km>", "catalog-scan form: scan default TLE in this altitude band (optional 3rd arg = name prefix)");
+            } else if (a->n_positionals < (int)(sizeof a->positionals / sizeof a->positionals[0])) {
+                a->positionals[a->n_positionals++] = arg;
+            } else {
+                fprintf(stderr, "too many positional arguments\n");
+                return PARSE_ERROR;
+            }
+            matched = 1;
+        }
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "short help (this message)");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strcmp(arg, "--help-full") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help-full", "detailed help with examples");
+            else { parse_args(a, argc, argv, HELP_FULL); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strcmp(arg, "--tle") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--tle <path>", "TLE file (2/3-line); space form is tab-completable");
+            else {
+                // arg is argv[t+1]; its value is the next token argv[t+2].
+                // Consume it (++t) so the positional collector never sees it.
+                if (t + 2 >= argc) {
+                    fprintf(stderr, "%s: --tle requires a file path\n", argv[0]);
+                    return PARSE_ERROR;
+                }
+                a->tles_filename = tle_path_resolve(argv[t + 2]);
+                a->tle_explicit = 1;
+                ++t;
+            }
+            matched = 1;
+        }
+        if (strncmp("--tle=", arg, 6) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--tle=<path>", "legacy TLE-path form (default: active.tle)");
+            else {
+                if (strlen(arg) < 7) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                a->tles_filename = tle_path_resolve(arg + 6);
+                a->tle_explicit = 1;
+            }
+            matched = 1;
+        }
+        if (strncmp("--trajectory-id=", arg, 16) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--trajectory-id=<id>", "plan against `ssm trajectory <id>` (mutually exclusive with --tle)");
+            else {
+                if (strlen(arg) < 17) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                a->trajectory_id = arg + 16;
+            }
+            matched = 1;
+        }
+        if (strcmp("--list", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--list", "print all matching passes (default: one)");
+            else a->list_all = 1;
+            matched = 1;
+        }
+        if (strcmp("--reverse", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--reverse", "sort latest-first");
+            else a->reverse = 1;
+            matched = 1;
+        }
+        if (strncmp("--max-passes=", arg, 13) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--max-passes=<n>", "limit output to n passes");
+            else {
+                if (strlen(arg) < 14) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                a->max_passes = atoi(arg + 13);
+            }
+            matched = 1;
+        }
+        if (strcmp("--show-radio-info", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--show-radio-info", "annotate with amateur-radio info from active_radios.txt next to the TLE");
+            else a->show_radio_info = 1;
+            matched = 1;
+        }
+        if (strncmp("--min-altitude-km=", arg, 18) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--min-altitude-km=<km>", "minimum orbital altitude (default 0)");
+            else {
+                if (strlen(arg) < 19) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                a->min_altitude_km = atof(arg + 18);
+            }
+            matched = 1;
+        }
+        if (strncmp("--max-altitude-km=", arg, 18) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--max-altitude-km=<km>", "maximum orbital altitude (default unlimited)");
+            else {
+                if (strlen(arg) < 19) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                a->max_altitude_km = atof(arg + 18);
+            }
+            matched = 1;
+        }
+        if (strncmp("--min-minutes=", arg, 14) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--min-minutes=<n>", "minimum minutes until AOS (default 0)");
+            else {
+                if (strlen(arg) < 15) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                a->min_minutes_away = atof(arg + 14);
+            }
+            matched = 1;
+        }
+        if (strncmp("--max-minutes=", arg, 14) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--max-minutes=<n>", "maximum minutes until AOS (default 1440)");
+            else {
+                if (strlen(arg) < 15) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                a->max_minutes_away = atof(arg + 14);
+                a->max_minutes_user_set = 1;
+            }
+            matched = 1;
+        }
+        if (strncmp("--min-elevation=", arg, 16) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--min-elevation=<deg>", "minimum peak elevation (default 0)");
+            else {
+                if (strlen(arg) < 17) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                a->min_elevation = atof(arg + 16);
+            }
+            matched = 1;
+        }
+        if (strncmp("--max-elevation=", arg, 16) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--max-elevation=<deg>", "maximum peak elevation (default 90)");
+            else {
+                if (strlen(arg) < 17) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                a->max_elevation = atof(arg + 16);
+            }
+            matched = 1;
+        }
+        if (strncmp("--minutes-offset=", arg, 17) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--minutes-offset=<n>", "advance `now` by n minutes for planning");
+            else {
+                if (strlen(arg) < 18) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                a->minutes_offset = atoi(arg + 17);
+            }
+            matched = 1;
+        }
+        if (strncmp("--t0=", arg, 5) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--t0=<yyyy-mm-ddThh:mm:ss>", "absolute UTC start time (default now; --minutes-offset on top)");
+            else {
+                if (strlen(arg) < 6) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                a->t0_str = arg + 5;
+            }
+            matched = 1;
+        }
+        if (strcmp("--all-satellites", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--all-satellites", "include Starlink/OneWeb-style swarms (default: excluded)");
+            else a->with_constellations = 1;
+            matched = 1;
+        }
+        if (strncmp("--regex=", arg, 8) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--regex=<pattern>", "only satellites whose names match");
+            else {
+                if (strlen(arg) < 9) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                a->regex = arg + 8;
+            }
+            matched = 1;
+        }
+        if (strcmp("--ignore-case", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--ignore-case", "case-insensitive regex match");
+            else a->regex_ignore_case = 1;
+            matched = 1;
+        }
+        if (strncmp("--lat=", arg, 6) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--lat=<deg>", "observer geodetic latitude (default RAO Priddis)");
+            else {
+                if (strlen(arg) < 7) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                a->site_latitude = atof(arg + 6);
+            }
+            matched = 1;
+        }
+        if (strncmp("--lon=", arg, 6) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--lon=<deg>", "observer geodetic longitude, east positive (default RAO Priddis)");
+            else {
+                if (strlen(arg) < 7) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                a->site_longitude = atof(arg + 6);
+            }
+            matched = 1;
+        }
+        if (strncmp("--alt=", arg, 6) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--alt=<m>", "observer altitude above ellipsoid, metres (default RAO Priddis)");
+            else {
+                if (strlen(arg) < 7) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                a->site_altitude = atof(arg + 6);
+            }
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            // Original behaviour: only tokens starting with "--" are
+            // rejected as options here. A lone "-" / non-dash token is
+            // claimed by the positional block above, so the sole way to
+            // land here is an unrecognized "--option".
+            fprintf(stderr, "Unable to parse option '%s'\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    if (help >= HELP_FULL) {
+        printf(
+            "\n"
+            "TLE discovery (named form):\n"
+            "  1. newest /<satellite_name>/TLEs/<date>/tle-<date>.tle (by date)\n"
+            "  2. else $HOME/.local/state/simple_sat_ops/active.tle (filtered by name)\n"
+            "  3. else error. Override either form with --tle=<path>.\n"
+            "\n"
+            "EXAMPLES\n"
+            "\n"
+            "  # Next week of passes for one satellite (auto-discovers its TLE)\n"
+            "  next_in_queue FrontierSat\n"
+            "\n"
+            "  # Next satellite pass (uses default TLE at ~/.local/state/simple_sat_ops/active.tle)\n"
+            "  next_in_queue 0 2000\n"
+            "\n"
+            "  # All passes in the next 3 hours above 30 deg elevation\n"
+            "  next_in_queue 0 2000 --list \\\n"
+            "      --max-minutes=180 --min-elevation=30\n"
+            "\n"
+            "  # ISS-class only with a specific TLE file, with amateur-radio info annotation\n"
+            "  next_in_queue 300 500 --list \\\n"
+            "      --tle=TLEs/amateur.tle \\\n"
+            "      --regex='ISS|ZARYA' --ignore-case --show-radio-info\n"
+            "\n"
+            "  # Passes for a specific satellite over the next week\n"
+            "  next_in_queue 0 2000 'ISS (ZARYA)' --list\n"
+            "\n"
+            "  # Passes against a SSM-propagated trajectory (FrontierSat-style)\n"
+            "  next_in_queue --trajectory-id=$(ssm trajectories | jq -r '.[0].id') --list\n"
+            "\n"
+            "NOTES\n"
+            "  - The tool never opens the radio or rotator; safe to run on any host.\n"
+            "  - `active_radios.txt` (looked for in the same directory as the TLE)\n"
+            "    is a community-maintained CSV used by --show-radio-info;\n"
+            "    missing satellites are simply omitted.\n"
+            "  - `--trajectory-id` needs `ssm` on PATH. The trajectory's window\n"
+            "    (from `ssm trajectory-meta <id>`) caps how far ahead passes can\n"
+            "    be predicted; `--max-minutes` is clamped if it exceeds the window.\n");
+    }
+    return PARSE_OK;
 }
 
 void print_radio_info(const char *name, satellite_status_t *sat_info, int n_entries);
@@ -259,200 +502,64 @@ int main(int argc, char **argv)
     // Calgary time regardless of where you're ssh'd in from.
     tzset();
 
-    double site_latitude = RAO_LATITUDE;
-    double site_longitude = RAO_LONGITUDE;
-    double site_altitude = RAO_ALTITUDE;
-
-    int list_all = 0;
-    int max_passes = -1;
-    int show_radio_info = 0;
-    double min_minutes_away = 0.0;
-    double max_minutes_away = 1440.0;
-    int max_minutes_user_set = 0;
-    double min_elevation = 0.0;
-    double max_elevation = 90.0;
     state_t state = {0};
-    char *regex = NULL;
-    int regex_ignore_case = 0;
-    int with_constellations = 0;
-    int reverse = 0;
-    int tle_explicit = 0;
-    const char *trajectory_id = NULL;
-    const char *t0_str = NULL;
-    double min_altitude_km = 0.0;
-    double max_altitude_km = 100000.0;
-
-    int minutes_offset = 0;
-
-    for (int i = 0; i < argc; i++) {
-        if (strncmp("--lat=", argv[i], 6) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 7) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            site_latitude = atof(argv[i] + 6);
-        } else if (strncmp("--lon=", argv[i], 6) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 7) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            site_longitude = atof(argv[i] + 6);
-        } else if (strncmp("--max-passes=", argv[i], 13) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 14) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            max_passes = atoi(argv[i] + 13);
-        } else if (strncmp("--alt=", argv[i], 6) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 7) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            site_altitude = atof(argv[i] + 6);
-        } else if (strncmp("--minutes-offset=", argv[i], 17) == 0) {
-            state.n_options++;
-            if (strlen(argv[i]) < 18) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            minutes_offset = atoi(argv[i] + 17);
-        } else if (strncmp("--t0=", argv[i], 5) == 0) {
-            state.n_options++;
-            if (strlen(argv[i]) < 6) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            t0_str = argv[i] + 5;
-        } else if (strcmp("--list", argv[i]) == 0) {
-            state.n_options++;
-            list_all = 1;
-        } else if (strcmp("--reverse", argv[i]) == 0) {
-            state.n_options++;
-            reverse = 1;
-        } else if (strcmp("--all-satellites", argv[i]) == 0) {
-            state.n_options++;
-            with_constellations = 1;
-        } else if (strncmp("--min-elevation=", argv[i], 16) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 17) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            min_elevation = atof(argv[i] + 16);
-        } else if (strncmp("--max-elevation=", argv[i], 16) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 17) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            max_elevation = atof(argv[i] + 16);
-        } else if (strncmp("--min-minutes=", argv[i], 14) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 15) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            min_minutes_away = atof(argv[i] + 14);
-        } else if (strncmp("--max-minutes=", argv[i], 14) == 0) {
-            state.n_options++;
-            if (strlen(argv[i]) < 15) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            max_minutes_away = atof(argv[i] + 14);
-            max_minutes_user_set = 1;
-        } else if (strcmp("--ignore-case", argv[i]) == 0) {
-            state.n_options++;
-            regex_ignore_case = 1;
-        } else if (strncmp("--regex=", argv[i], 8) == 0) {
-            state.n_options++; 
-            if (strlen(argv[i]) < 9) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            regex = argv[i] + 8;
-        } else if (strcmp("--show-radio-info", argv[i]) == 0) {
-            state.n_options++;
-            show_radio_info = 1;
-        } else if (strcmp("--tle", argv[i]) == 0) {
-            state.n_options++;
-            if (i + 1 >= argc) {
-                fprintf(stderr, "%s: --tle requires a file path\n", argv[0]);
-                return EXIT_FAILURE;
-            }
-            state.prediction.tles_filename = tle_path_resolve(argv[++i]);
-            tle_explicit = 1;
-        } else if (strncmp("--tle=", argv[i], 6) == 0) {
-            state.n_options++;
-            if (strlen(argv[i]) < 7) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            state.prediction.tles_filename = tle_path_resolve(argv[i] + 6);
-            tle_explicit = 1;
-        } else if (strncmp("--trajectory-id=", argv[i], 16) == 0) {
-            state.n_options++;
-            if (strlen(argv[i]) < 17) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            trajectory_id = argv[i] + 16;
-        } else if (strncmp("--min-altitude-km=", argv[i], 18) == 0) {
-            state.n_options++;
-            if (strlen(argv[i]) < 19) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            min_altitude_km = atof(argv[i] + 18);
-        } else if (strncmp("--max-altitude-km=", argv[i], 18) == 0) {
-            state.n_options++;
-            if (strlen(argv[i]) < 19) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            max_altitude_km = atof(argv[i] + 18);
-        } else if (strcmp("--help", argv[i]) == 0) {
-            usage(stdout, argv[0], 0);
-            return 0;
-        } else if (strcmp("--help-full", argv[i]) == 0) {
-            usage(stdout, argv[0], 1);
-            return 0;
-        } else if (strncmp("--", argv[i], 2) == 0) {
-            fprintf(stderr, "Unable to parse option '%s'\n", argv[i]);
-            return 1;
-        }
+    niq_args_t cfg = {
+        .site_latitude = RAO_LATITUDE,
+        .site_longitude = RAO_LONGITUDE,
+        .site_altitude = RAO_ALTITUDE,
+        .max_passes = -1,
+        .min_minutes_away = 0.0,
+        .max_minutes_away = 1440.0,
+        .min_elevation = 0.0,
+        .max_elevation = 90.0,
+        .min_altitude_km = 0.0,
+        .max_altitude_km = 100000.0,
+    };
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
     }
+
+    // Copy parsed config into the working locals the prediction body uses.
+    double site_latitude = cfg.site_latitude;
+    double site_longitude = cfg.site_longitude;
+    double site_altitude = cfg.site_altitude;
+    int list_all = cfg.list_all;
+    int max_passes = cfg.max_passes;
+    int show_radio_info = cfg.show_radio_info;
+    double min_minutes_away = cfg.min_minutes_away;
+    double max_minutes_away = cfg.max_minutes_away;
+    int max_minutes_user_set = cfg.max_minutes_user_set;
+    double min_elevation = cfg.min_elevation;
+    double max_elevation = cfg.max_elevation;
+    const char *regex = cfg.regex;
+    int regex_ignore_case = cfg.regex_ignore_case;
+    int with_constellations = cfg.with_constellations;
+    int reverse = cfg.reverse;
+    int tle_explicit = cfg.tle_explicit;
+    const char *trajectory_id = cfg.trajectory_id;
+    const char *t0_str = cfg.t0_str;
+    double min_altitude_km = cfg.min_altitude_km;
+    double max_altitude_km = cfg.max_altitude_km;
+    int minutes_offset = cfg.minutes_offset;
+    // --tle / --tle= wrote here in the old loop; carry it across so the
+    // catalog-scan / explicit-TLE branches see it (the named form below
+    // overwrites it when no --tle was given).
+    state.prediction.tles_filename = cfg.tles_filename;
 
     if (trajectory_id != NULL && tle_explicit) {
         fprintf(stderr, "--tle= and --trajectory-id= are mutually exclusive\n");
         return EXIT_FAILURE;
     }
 
-    // Collect positional args (anything that didn't match a recognized
-    // --flag). Numeric arg values like '0' / '2000' and string names like
-    // 'ISS (ZARYA)' both qualify; only --foo[=...] starts with '--'. We
-    // can't trust argv[1] as "the first positional" because flags and
-    // positionals can interleave on the command line.
-    int positional_argv[8];
-    int n_positional = 0;
-    for (int i = 1; i < argc; i++) {
-        if (strncmp("--", argv[i], 2) == 0) {
-            // Space-form options consume the next argv as their value;
-            // don't mistake that value for a positional.
-            if (strcmp(argv[i], "--tle") == 0) ++i;
-            continue;
-        }
-        if (n_positional >= (int)(sizeof positional_argv / sizeof positional_argv[0])) {
-            fprintf(stderr, "too many positional arguments\n");
-            return EXIT_FAILURE;
-        }
-        positional_argv[n_positional++] = i;
-    }
-    char *satellite_name = NULL;
+    // Interpret the polymorphic positionals collected by parse_args. Numeric
+    // values like '0' / '2000' and string names like 'ISS (ZARYA)' both land
+    // in cfg.positionals; their meaning depends on count and on whether
+    // --tle / --trajectory-id is present. (The --tle space-form value was
+    // consumed inside parse_args, so it never reached this collector.)
+    const char **positionals = cfg.positionals;
+    int n_positional = cfg.n_positionals;
+    const char *satellite_name = NULL;
 
     if (trajectory_id != NULL) {
         // OEM path: no positionals (trajectory is implicit).
@@ -470,12 +577,12 @@ int main(int argc, char **argv)
                     "Use --min-altitude-km= / --max-altitude-km= for altitude filtering.\n");
             return EXIT_FAILURE;
         }
-        if (n_positional == 1) satellite_name = argv[positional_argv[0]];
+        if (n_positional == 1) satellite_name = positionals[0];
     } else if (n_positional == 1) {
         // Named form: a single positional is the satellite name. We know
         // the object, so no altitude limits are needed; auto-discover its
         // TLE from /<satname>/TLEs, then the default active.tle.
-        satellite_name = argv[positional_argv[0]];
+        satellite_name = positionals[0];
         static char named_tle[1024];
         if (resolve_named_tle(satellite_name, named_tle, sizeof named_tle) != 0) {
             fprintf(stderr,
@@ -488,12 +595,12 @@ int main(int argc, char **argv)
         state.prediction.tles_filename = tle_path_resolve(named_tle);
     } else if (n_positional == 2 || n_positional == 3) {
         // Catalog-scan form: <min_alt_km> <max_alt_km> [<satellite_name>].
-        min_altitude_km = atof(argv[positional_argv[0]]);
-        max_altitude_km = atof(argv[positional_argv[1]]);
-        if (n_positional == 3) satellite_name = argv[positional_argv[2]];
+        min_altitude_km = atof(positionals[0]);
+        max_altitude_km = atof(positionals[1]);
+        if (n_positional == 3) satellite_name = positionals[2];
     } else {
         // 0 positionals (and no --tle / --trajectory-id) is ambiguous.
-        usage(stderr, argv[0], 0);
+        print_synopsis(stderr, argv[0]);
         return EXIT_FAILURE;
     }
     if (satellite_name != NULL && !max_minutes_user_set) {
@@ -596,7 +703,7 @@ int main(int argc, char **argv)
         .max_minutes = max_minutes_away,
         .min_elevation = min_elevation,
         .max_elevation = max_elevation,
-        .regex = regex,
+        .regex = (char *)regex,
         .regex_ignore_case = regex_ignore_case,
         .with_constellations = with_constellations,
         .name_prefix = satellite_name,

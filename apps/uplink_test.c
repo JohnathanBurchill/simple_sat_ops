@@ -26,6 +26,7 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "argparse.h"
 #include "ax100.h"
 #include "csp.h"
 #include "hmac_keyfile.h"
@@ -36,38 +37,157 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void usage(FILE *out, const char *argv0)
+static int starts_with(const char *s, const char *prefix)
 {
-    fprintf(out,
-        "usage: %s (--payload-hex=<HEX> | --payload-ascii=<STR>) [options]\n"
-        "\n"
-        "Composes a CSP v1 packet, AX100-frames it with HMAC, and writes\n"
-        "either the framed byte sequence or a modulated 48 kHz/16-bit WAV.\n"
-        "\n"
-        "Required (exactly one):\n"
-        "  --payload-hex=<HEX>      Payload as upper/lowercase hex\n"
-        "  --payload-ascii=<STR>    Payload as literal ASCII bytes (no NUL)\n"
-        "\n"
-        "Options:\n"
-        "  --keyfile=<path>         HMAC keyfile (default: $HOME/%s)\n"
-        "  --no-hmac                Skip HMAC (invalid for live ops; test-only)\n"
-        "  --reed-solomon           RS(255,223) encode (DEFAULT; matches pycsplink uplink)\n"
-        "  --no-reed-solomon        Disable RS encode (for bit-compat with legacy frames)\n"
-        "  --src=<0..31>            CSP source address (default 1)\n"
-        "  --dst=<0..31>            CSP destination address (default 2)\n"
-        "  --dport=<0..63>          CSP destination port (default 3)\n"
-        "  --sport=<0..63>          CSP source port (default 4)\n"
-        "  --prio=<0..3>            CSP priority, 2=norm (default 2)\n"
-        "  --flags=<0..255>         CSP flags byte (default 0)\n"
-        "  --print-frame            Print AX100-framed bytes as hex, one frame per line\n"
-        "  --out=<file.wav>         Write modulated PCM as WAV (48 kHz mono 16-bit)\n"
-        "  --bit-rate=<bps>         Bit rate (default 9600)\n"
-        "  --samp-rate=<hz>         Sample rate (default 48000; must be integer multiple of bit-rate)\n"
-        "  --gauss-bt=<float>       Gaussian BT (default 0.5; 0 disables filter)\n"
-        "  --gauss-span=<symbols>   Gaussian filter span in symbols (default 4)\n"
-        "  --gain-db=<float>        Output gain in dB (default 0)\n"
-        "  --help                   This message\n",
-        argv0, HMAC_KEYFILE_DEFAULT_RELPATH);
+    return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the fields out into working locals so the (large) compose body is unchanged.
+typedef struct {
+    const char *payload_hex;
+    const char *payload_ascii;
+    const char *keyfile_path;
+    const char *out_wav;
+    int use_hmac;
+    int use_rs;
+    int print_frame;
+    uint8_t csp_src;
+    uint8_t csp_dst;
+    uint8_t csp_dport;
+    uint8_t csp_sport;
+    uint8_t csp_prio;
+    uint8_t csp_flags;
+    int bit_rate;
+    int samp_rate;
+    double gauss_bt;
+    int gauss_symbol_span;
+    double gain_db;
+} uplink_args_t;
+
+// Option column width: the widest label below ("--gauss-span=<symbols>") + a
+// small margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 24
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all. The
+// "exactly one of --payload-hex / --payload-ascii" rule is a post-parse check
+// in main(), not here.
+static int parse_args(uplink_args_t *a, int argc, char **argv, int help)
+{
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (starts_with(arg, "--payload-hex=") || help) {
+            if (help) parse_help_line(OPTW, "--payload-hex=<HEX>", "payload as upper/lowercase hex (one of hex/ascii required)");
+            else a->payload_hex = arg + 14;
+            matched = 1;
+        }
+        if (starts_with(arg, "--payload-ascii=") || help) {
+            if (help) parse_help_line(OPTW, "--payload-ascii=<STR>", "payload as literal ASCII bytes (one of hex/ascii required)");
+            else a->payload_ascii = arg + 16;
+            matched = 1;
+        }
+        if (starts_with(arg, "--keyfile=") || help) {
+            if (help) parse_help_line(OPTW, "--keyfile=<path>", "HMAC keyfile (default: $HOME/" HMAC_KEYFILE_DEFAULT_RELPATH ")");
+            else a->keyfile_path = arg + 10;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-hmac") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-hmac", "skip HMAC (invalid for live ops; test-only)");
+            else a->use_hmac = 0;
+            matched = 1;
+        }
+        if (strcmp(arg, "--reed-solomon") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--reed-solomon", "RS(255,223) encode (DEFAULT; matches pycsplink uplink)");
+            else a->use_rs = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-reed-solomon") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-reed-solomon", "disable RS encode (for bit-compat with legacy frames)");
+            else a->use_rs = 0;
+            matched = 1;
+        }
+        if (starts_with(arg, "--src=") || help) {
+            if (help) parse_help_line(OPTW, "--src=<0..31>", "CSP source address (default 1)");
+            else a->csp_src = (uint8_t)atoi(arg + 6);
+            matched = 1;
+        }
+        if (starts_with(arg, "--dst=") || help) {
+            if (help) parse_help_line(OPTW, "--dst=<0..31>", "CSP destination address (default 2)");
+            else a->csp_dst = (uint8_t)atoi(arg + 6);
+            matched = 1;
+        }
+        if (starts_with(arg, "--dport=") || help) {
+            if (help) parse_help_line(OPTW, "--dport=<0..63>", "CSP destination port (default 3)");
+            else a->csp_dport = (uint8_t)atoi(arg + 8);
+            matched = 1;
+        }
+        if (starts_with(arg, "--sport=") || help) {
+            if (help) parse_help_line(OPTW, "--sport=<0..63>", "CSP source port (default 4)");
+            else a->csp_sport = (uint8_t)atoi(arg + 8);
+            matched = 1;
+        }
+        if (starts_with(arg, "--prio=") || help) {
+            if (help) parse_help_line(OPTW, "--prio=<0..3>", "CSP priority, 2=norm (default 2)");
+            else a->csp_prio = (uint8_t)atoi(arg + 7);
+            matched = 1;
+        }
+        if (starts_with(arg, "--flags=") || help) {
+            if (help) parse_help_line(OPTW, "--flags=<0..255>", "CSP flags byte (default 0)");
+            else a->csp_flags = (uint8_t)atoi(arg + 8);
+            matched = 1;
+        }
+        if (strcmp(arg, "--print-frame") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--print-frame", "print AX100-framed bytes as hex, one frame per line");
+            else a->print_frame = 1;
+            matched = 1;
+        }
+        if (starts_with(arg, "--out=") || help) {
+            if (help) parse_help_line(OPTW, "--out=<file.wav>", "write modulated PCM as WAV (48 kHz mono 16-bit)");
+            else a->out_wav = arg + 6;
+            matched = 1;
+        }
+        if (starts_with(arg, "--bit-rate=") || help) {
+            if (help) parse_help_line(OPTW, "--bit-rate=<bps>", "bit rate (default 9600)");
+            else a->bit_rate = atoi(arg + 11);
+            matched = 1;
+        }
+        if (starts_with(arg, "--samp-rate=") || help) {
+            if (help) parse_help_line(OPTW, "--samp-rate=<hz>", "sample rate (default 48000; integer multiple of bit-rate)");
+            else a->samp_rate = atoi(arg + 12);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gauss-bt=") || help) {
+            if (help) parse_help_line(OPTW, "--gauss-bt=<float>", "Gaussian BT (default 0.5; 0 disables filter)");
+            else a->gauss_bt = atof(arg + 11);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gauss-span=") || help) {
+            if (help) parse_help_line(OPTW, "--gauss-span=<symbols>", "Gaussian filter span in symbols (default 4)");
+            else a->gauss_symbol_span = atoi(arg + 13);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gain-db=") || help) {
+            if (help) parse_help_line(OPTW, "--gain-db=<float>", "output gain in dB (default 0)");
+            else a->gain_db = atof(arg + 10);
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            fprintf(stderr, "unknown option: %s\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
 }
 
 static int hex_digit(char c)
@@ -106,24 +226,12 @@ static ssize_t parse_payload_hex(const char *hex, uint8_t *out, size_t out_cap)
     return (ssize_t)n_bytes;
 }
 
-static int starts_with(const char *s, const char *prefix)
-{
-    return strncmp(s, prefix, strlen(prefix)) == 0;
-}
-
 // -V / --version support (commit baked in at build time).
 #include "sso_version.h"
 
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "uplink_test")) return 0;
-    const char *payload_hex = NULL;
-    const char *payload_ascii = NULL;
-    const char *keyfile_path = NULL;
-    const char *out_wav = NULL;
-    int use_hmac = 1;
-    int use_rs = 1;  // default ON to match pycsplink uplink
-    int print_frame = 0;
 
     csp_v1_header_t csp_hdr = {
         .prio = CSP_PRIO_NORM,
@@ -135,38 +243,55 @@ int main(int argc, char **argv)
     modem_params_t mp;
     modem_params_defaults(&mp);
 
-    for (int i = 1; i < argc; ++i) {
-        const char *a = argv[i];
-        if (strcmp(a, "--help") == 0) { usage(stdout, argv[0]); return 0; }
-        else if (starts_with(a, "--payload-hex="))   payload_hex   = a + 14;
-        else if (starts_with(a, "--payload-ascii=")) payload_ascii = a + 16;
-        else if (starts_with(a, "--keyfile="))       keyfile_path  = a + 10;
-        else if (strcmp(a, "--no-hmac") == 0)        use_hmac = 0;
-        else if (strcmp(a, "--reed-solomon") == 0)    use_rs = 1;
-        else if (strcmp(a, "--no-reed-solomon") == 0) use_rs = 0;
-        else if (starts_with(a, "--src="))     csp_hdr.src   = (uint8_t)atoi(a + 6);
-        else if (starts_with(a, "--dst="))     csp_hdr.dst   = (uint8_t)atoi(a + 6);
-        else if (starts_with(a, "--dport="))   csp_hdr.dport = (uint8_t)atoi(a + 8);
-        else if (starts_with(a, "--sport="))   csp_hdr.sport = (uint8_t)atoi(a + 8);
-        else if (starts_with(a, "--prio="))    csp_hdr.prio  = (uint8_t)atoi(a + 7);
-        else if (starts_with(a, "--flags="))   csp_hdr.flags = (uint8_t)atoi(a + 8);
-        else if (strcmp(a, "--print-frame") == 0) print_frame = 1;
-        else if (starts_with(a, "--out="))        out_wav = a + 6;
-        else if (starts_with(a, "--bit-rate="))   mp.bit_rate = atoi(a + 11);
-        else if (starts_with(a, "--samp-rate="))  mp.samp_rate = atoi(a + 12);
-        else if (starts_with(a, "--gauss-bt="))   mp.gauss_bt = atof(a + 11);
-        else if (starts_with(a, "--gauss-span=")) mp.gauss_symbol_span = atoi(a + 13);
-        else if (starts_with(a, "--gain-db="))    mp.gain_db = atof(a + 10);
-        else {
-            fprintf(stderr, "unknown option: %s\n", a);
-            usage(stderr, argv[0]);
-            return 1;
-        }
+    // Seed cfg from the struct defaults above so any option left unset keeps
+    // exactly the value it had before this tool grew a parse_args().
+    uplink_args_t cfg = {
+        .payload_hex = NULL,
+        .payload_ascii = NULL,
+        .keyfile_path = NULL,
+        .out_wav = NULL,
+        .use_hmac = 1,
+        .use_rs = 1,  // default ON to match pycsplink uplink
+        .print_frame = 0,
+        .csp_src = csp_hdr.src,
+        .csp_dst = csp_hdr.dst,
+        .csp_dport = csp_hdr.dport,
+        .csp_sport = csp_hdr.sport,
+        .csp_prio = csp_hdr.prio,
+        .csp_flags = csp_hdr.flags,
+        .bit_rate = mp.bit_rate,
+        .samp_rate = mp.samp_rate,
+        .gauss_bt = mp.gauss_bt,
+        .gauss_symbol_span = mp.gauss_symbol_span,
+        .gain_db = mp.gain_db,
+    };
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
     }
+
+    // Copy parsed config back into the working locals the compose body uses.
+    const char *payload_hex = cfg.payload_hex;
+    const char *payload_ascii = cfg.payload_ascii;
+    const char *keyfile_path = cfg.keyfile_path;
+    const char *out_wav = cfg.out_wav;
+    int use_hmac = cfg.use_hmac;
+    int use_rs = cfg.use_rs;
+    int print_frame = cfg.print_frame;
+    csp_hdr.src   = cfg.csp_src;
+    csp_hdr.dst   = cfg.csp_dst;
+    csp_hdr.dport = cfg.csp_dport;
+    csp_hdr.sport = cfg.csp_sport;
+    csp_hdr.prio  = cfg.csp_prio;
+    csp_hdr.flags = cfg.csp_flags;
+    mp.bit_rate = cfg.bit_rate;
+    mp.samp_rate = cfg.samp_rate;
+    mp.gauss_bt = cfg.gauss_bt;
+    mp.gauss_symbol_span = cfg.gauss_symbol_span;
+    mp.gain_db = cfg.gain_db;
 
     if ((payload_hex == NULL) == (payload_ascii == NULL)) {
         fprintf(stderr, "pass exactly one of --payload-hex or --payload-ascii\n");
-        usage(stderr, argv[0]);
         return 1;
     }
 

@@ -32,6 +32,7 @@
     GNU General Public License for more details.
 */
 
+#include "argparse.h"
 #include "prediction.h"
 
 #include <sgp4sdp4.h>
@@ -777,97 +778,176 @@ static void print_text(obj_t *objs, int n, double jul_now, double freq_hz,
 
 // ---- main ------------------------------------------------------------------
 
-static void usage(const char *prog)
-{
-    fprintf(stderr,
-        "Usage: %s [options] <name1> <name2> [name3 ...]\n"
-        "\n"
-        "Compare the live ephemeris and next pass of two or more catalog\n"
-        "objects from one TLE file, stacked for easy comparison. Names are\n"
-        "matched as case-sensitive prefixes against the TLE name lines.\n"
-        "\n"
-        "Options:\n"
-        "  --tle <path>       TLE file (default: $HOME/.local/state/simple_sat_ops/active.tle)\n"
-        "  --lat <deg>        Observer latitude  (default: RAO, %.4f)\n"
-        "  --lon <deg>        Observer longitude (default: RAO, %.4f)\n"
-        "  --alt <m>          Observer altitude metres (default: RAO, %.0f)\n"
-        "  --freq-mhz <MHz>   Carrier for the Doppler column (default: %.3f)\n"
-        "  --window-min <min> Forward search window for the next pass (default: %.0f)\n"
-        "  --trend-days <d>   Half-window (days) for the drift trend, centred on now,\n"
-        "                     so the trend spans -d..+d (default: %.1f, i.e. %.0f d total)\n"
-        "  --once             Print one snapshot as plain text and exit (no UI).\n"
-        "  --help             This text.\n",
-        prog, RAO_LATITUDE, RAO_LONGITUDE, RAO_ALTITUDE,
-        DEFAULT_FREQ_MHZ, DEFAULT_WINDOW_MIN, g_trend_days, 2.0 * g_trend_days);
-}
+// Parsed command-line configuration. parse_args() fills this; main() reads
+// the fields directly. tle_path keeps a char buffer (not a const char *)
+// because --tle copies into it and the default-path resolution tests
+// tle_path[0]. The object names are a *list*, kept here and copied into the
+// (heavy) obj_t array in main. --trend-days writes the file-scope global
+// g_trend_days directly, exactly as the original did.
+typedef struct {
+    char        tle_path[512];
+    double      lat, lon, alt_m;
+    double      freq_hz;
+    double      window_min;
+    int         once;
+    const char *names[MAX_OBJECTS];
+    int         n_names;
+} tle_compare_args_t;
 
-// Pull the value for a "--flag value" pair, or NULL if missing.
-static const char *take_value(int argc, char **argv, int *i)
-{
-    if (*i + 1 >= argc) return NULL;
-    return argv[++(*i)];
-}
+// Option column width: the widest label below ("--window-min <min>") + a
+// small margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 22
 
 // -V / --version support (commit baked in at build time).
 #include "sso_version.h"
 
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(tle_compare_args_t *a, int argc, char **argv, int help)
+{
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        // Positionals first so the <...> arguments list above the --options.
+        // <name ...>: every non-option token, appended to the names list.
+        // The original treated a token as an OPTION only when it began with
+        // '-', had a second character, and that second char was NOT a digit
+        // (so a lone "-" and a "-<digit>" both pass through as names). The
+        // test below is the exact complement of that.
+        if (((arg[0] != '-') || (arg[1] == '\0') || (arg[1] >= '0' && arg[1] <= '9')) || help) {
+            if (help) parse_help_line(OPTW, "<name ...>", "two or more catalog-object name prefixes (case-sensitive) to compare");
+            else if (a->n_names >= MAX_OBJECTS) {
+                fprintf(stderr, "Too many objects (max %d)\n", MAX_OBJECTS);
+                return PARSE_ERROR;
+            } else {
+                a->names[a->n_names++] = arg;
+            }
+            matched = 1;
+        }
+        if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help, -h", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strcmp(arg, "--tle") == 0 || help) {
+            if (help) { parse_help_line(OPTW, "--tle <path>", "TLE file (default: $HOME/.local/state/simple_sat_ops/active.tle)"); matched = 1; }
+            else if (t + 1 < ntokens) { snprintf(a->tle_path, sizeof a->tle_path, "%s", argv[(++t) + 1]); matched = 1; }
+            // A trailing "--tle" with no value falls through to the
+            // unknown-option epilog, matching the original (take_value
+            // returned NULL, so the && short-circuited).
+        }
+        if (strncmp(arg, "--tle=", 6) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--tle=<path>", "TLE file (= form)");
+            else snprintf(a->tle_path, sizeof a->tle_path, "%s", arg + 6);
+            matched = 1;
+        }
+        if (strcmp(arg, "--lat") == 0 || help) {
+            if (help) { parse_help_line(OPTW, "--lat <deg>", "observer latitude (default: RAO 50.8688)"); matched = 1; }
+            else if (t + 1 < ntokens) { a->lat = atof(argv[(++t) + 1]); matched = 1; }
+        }
+        if (strncmp(arg, "--lat=", 6) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--lat=<deg>", "observer latitude (= form)");
+            else a->lat = atof(arg + 6);
+            matched = 1;
+        }
+        if (strcmp(arg, "--lon") == 0 || help) {
+            if (help) { parse_help_line(OPTW, "--lon <deg>", "observer longitude (default: RAO -114.2910)"); matched = 1; }
+            else if (t + 1 < ntokens) { a->lon = atof(argv[(++t) + 1]); matched = 1; }
+        }
+        if (strncmp(arg, "--lon=", 6) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--lon=<deg>", "observer longitude (= form)");
+            else a->lon = atof(arg + 6);
+            matched = 1;
+        }
+        if (strcmp(arg, "--alt") == 0 || help) {
+            if (help) { parse_help_line(OPTW, "--alt <m>", "observer altitude metres (default: RAO 1279)"); matched = 1; }
+            else if (t + 1 < ntokens) { a->alt_m = atof(argv[(++t) + 1]); matched = 1; }
+        }
+        if (strncmp(arg, "--alt=", 6) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--alt=<m>", "observer altitude metres (= form)");
+            else a->alt_m = atof(arg + 6);
+            matched = 1;
+        }
+        if (strcmp(arg, "--freq-mhz") == 0 || help) {
+            if (help) { parse_help_line(OPTW, "--freq-mhz <MHz>", "carrier for the Doppler column (default: 436.150)"); matched = 1; }
+            else if (t + 1 < ntokens) { a->freq_hz = atof(argv[(++t) + 1]) * 1e6; matched = 1; }
+        }
+        if (strncmp(arg, "--freq-mhz=", 11) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--freq-mhz=<MHz>", "carrier for the Doppler column (= form)");
+            else a->freq_hz = atof(arg + 11) * 1e6;
+            matched = 1;
+        }
+        if (strcmp(arg, "--window-min") == 0 || help) {
+            if (help) { parse_help_line(OPTW, "--window-min <min>", "forward search window for the next pass (default: 1440)"); matched = 1; }
+            else if (t + 1 < ntokens) { a->window_min = atof(argv[(++t) + 1]); matched = 1; }
+        }
+        if (strncmp(arg, "--window-min=", 13) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--window-min=<min>", "forward search window (= form)");
+            else a->window_min = atof(arg + 13);
+            matched = 1;
+        }
+        if (strcmp(arg, "--trend-days") == 0 || help) {
+            if (help) { parse_help_line(OPTW, "--trend-days <d>", "half-window (days) for the drift trend, centred on now (default: 3.0)"); matched = 1; }
+            else if (t + 1 < ntokens) { g_trend_days = atof(argv[(++t) + 1]); matched = 1; }
+        }
+        if (strncmp(arg, "--trend-days=", 13) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--trend-days=<d>", "half-window (days) for the drift trend (= form)");
+            else g_trend_days = atof(arg + 13);
+            matched = 1;
+        }
+        if (strcmp(arg, "--once") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--once", "print one snapshot as plain text and exit (no UI)");
+            else a->once = 1;
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            // The positional block claims any non-option token (including a
+            // lone "-" and a "-<digit>"), so only a genuine unknown dash
+            // option -- or a value-less trailing space-form option -- reaches
+            // here. Same diagnostic as the original.
+            fprintf(stderr, "Unknown option: %s\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
+}
+
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "tle_compare")) return 0;
-    char tle_path[512] = {0};
-    double lat = RAO_LATITUDE, lon = RAO_LONGITUDE, alt_m = RAO_ALTITUDE;
-    double freq_hz = DEFAULT_FREQ_MHZ * 1e6;
-    double window_min = DEFAULT_WINDOW_MIN;
-    int once = 0;
+
+    tle_compare_args_t cfg = {0};
+    cfg.lat = RAO_LATITUDE;
+    cfg.lon = RAO_LONGITUDE;
+    cfg.alt_m = RAO_ALTITUDE;
+    cfg.freq_hz = DEFAULT_FREQ_MHZ * 1e6;
+    cfg.window_min = DEFAULT_WINDOW_MIN;
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
+    }
+
+    // Copy parsed config into the working locals the body below uses.
+    char tle_path[512];
+    snprintf(tle_path, sizeof tle_path, "%s", cfg.tle_path);
+    double lat = cfg.lat, lon = cfg.lon, alt_m = cfg.alt_m;
+    double freq_hz = cfg.freq_hz;
+    double window_min = cfg.window_min;
+    int once = cfg.once;
 
     obj_t objs[MAX_OBJECTS];
     memset(objs, 0, sizeof objs);
-    int n = 0;
-
-    for (int i = 1; i < argc; ++i) {
-        const char *a = argv[i];
-        const char *v = NULL;
-        if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
-            usage(argv[0]); return EXIT_SUCCESS;
-        } else if (strcmp(a, "--tle") == 0 && (v = take_value(argc, argv, &i))) {
-            snprintf(tle_path, sizeof tle_path, "%s", v);
-        } else if (strncmp(a, "--tle=", 6) == 0) {
-            snprintf(tle_path, sizeof tle_path, "%s", a + 6);
-        } else if (strcmp(a, "--lat") == 0 && (v = take_value(argc, argv, &i))) {
-            lat = atof(v);
-        } else if (strncmp(a, "--lat=", 6) == 0) { lat = atof(a + 6);
-        } else if (strcmp(a, "--lon") == 0 && (v = take_value(argc, argv, &i))) {
-            lon = atof(v);
-        } else if (strncmp(a, "--lon=", 6) == 0) { lon = atof(a + 6);
-        } else if (strcmp(a, "--alt") == 0 && (v = take_value(argc, argv, &i))) {
-            alt_m = atof(v);
-        } else if (strncmp(a, "--alt=", 6) == 0) { alt_m = atof(a + 6);
-        } else if (strcmp(a, "--freq-mhz") == 0 && (v = take_value(argc, argv, &i))) {
-            freq_hz = atof(v) * 1e6;
-        } else if (strncmp(a, "--freq-mhz=", 11) == 0) { freq_hz = atof(a + 11) * 1e6;
-        } else if (strcmp(a, "--window-min") == 0 && (v = take_value(argc, argv, &i))) {
-            window_min = atof(v);
-        } else if (strncmp(a, "--window-min=", 13) == 0) { window_min = atof(a + 13);
-        } else if (strcmp(a, "--trend-days") == 0 && (v = take_value(argc, argv, &i))) {
-            g_trend_days = atof(v);
-        } else if (strncmp(a, "--trend-days=", 13) == 0) { g_trend_days = atof(a + 13);
-        } else if (strcmp(a, "--once") == 0) { once = 1;
-        } else if (a[0] == '-' && a[1] != '\0' && !(a[0] == '-' && a[1] >= '0' && a[1] <= '9')) {
-            fprintf(stderr, "Unknown option: %s\n", a);
-            usage(argv[0]); return EXIT_FAILURE;
-        } else {
-            if (n >= MAX_OBJECTS) {
-                fprintf(stderr, "Too many objects (max %d)\n", MAX_OBJECTS);
-                return EXIT_FAILURE;
-            }
-            snprintf(objs[n].name, sizeof objs[n].name, "%s", a);
-            n++;
-        }
-    }
+    int n = cfg.n_names;
+    for (int i = 0; i < n; ++i)
+        snprintf(objs[i].name, sizeof objs[i].name, "%s", cfg.names[i]);
 
     if (n < 2) {
         fprintf(stderr, "Need at least two object names to compare.\n\n");
-        usage(argv[0]);
+        parse_args(&cfg, argc, argv, HELP_BRIEF);
         return EXIT_FAILURE;
     }
 

@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "argparse.h"
 #include "sdr_usb_detect.h"
 
 #include <uhd.h>
@@ -35,18 +36,43 @@
 #include <rtl-sdr.h>
 #endif
 
-static void usage(const char *argv0)
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the field out into the working local so the probe body is unchanged.
+typedef struct {
+    const char *user_args;
+} sdr_probe_args_t;
+
+// Option column width: the widest label below ("--uhd-args=<args>") + a small
+// margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 19
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(sdr_probe_args_t *a, int argc, char **argv, int help)
 {
-    printf(
-        "usage: %s [--uhd-args=<args>]\n"
-        "\n"
-        "Probe the SDR(s) simple_sat_ops would use, without starting a\n"
-        "pass. Reports the UHD device serial, the FPGA image it will\n"
-        "load, its RX/TX antenna ports, then lists RTL-SDR dongles.\n"
-        "\n"
-        "  --uhd-args=<args>   UHD device args verbatim; bypasses serial\n"
-        "                      detection and the FPGA map.\n",
-        argv0);
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "-h, --help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strncmp(arg, "--uhd-args=", 11) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--uhd-args=<args>", "UHD device args verbatim; bypasses serial detection and the FPGA map");
+            else a->user_args = arg + 11;
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            fprintf(stderr, "sdr_probe: unknown argument '%s'\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
 }
 
 static void probe_uhd(const char *user_args)
@@ -144,19 +170,14 @@ static void probe_rtl(void)
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "sdr_probe")) return 0;
-    const char *user_args = "";
-    for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--uhd-args=", 11) == 0) {
-            user_args = argv[i] + 11;
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            usage(argv[0]);
-            return 0;
-        } else {
-            fprintf(stderr, "sdr_probe: unknown argument '%s'\n", argv[i]);
-            usage(argv[0]);
-            return 1;
-        }
+    sdr_probe_args_t cfg = {
+        .user_args = "",
+    };
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
     }
+    const char *user_args = cfg.user_args;
 
     probe_uhd(user_args);
     probe_rtl();

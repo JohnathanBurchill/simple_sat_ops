@@ -42,6 +42,7 @@
 */
 
 #include "agenda_line.h"
+#include "argparse.h"
 #include "packet_db.h"
 #include "sso_paths.h"
 
@@ -197,32 +198,66 @@ static int import_path(packet_db_t *db, const char *path, const char *tool)
     return import_file(db, path, tool);
 }
 
-static void usage(FILE *out, const char *argv0)
+// Parsed command-line configuration. parse_args() fills this; main() reads
+// the fields directly. The positional is a *list* of dir-or-file paths, so
+// it keeps its own array + count rather than the single-claim positional form.
+typedef struct {
+    const char *db_path;
+    const char *tool;
+    const char *paths[64];
+    int n_paths;
+} tcmd_import_args_t;
+
+// Option column width: the widest label below ("--source-tool=<name>") + a
+// small margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 22
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(tcmd_import_args_t *a, int argc, char **argv, int help)
 {
-    fprintf(out,
-        "usage: %s [--db=<path>] [--source-tool=<name>] [<dir-or-file> ...]\n"
-        "\n"
-        "Backfill the sent_tcmd table from historical tx.log files so\n"
-        "packet_browser can resolve old command responses to the command\n"
-        "that produced them. Each tx.log is scanned for transmitted\n"
-        "commands carrying an @tssent (the value the satellite echoes back).\n"
-        "Hand-composed commands without an @tssent are skipped. Safe to\n"
-        "re-run: duplicates are ignored.\n"
-        "\n"
-        "Arguments:\n"
-        "  <dir-or-file>    a tx.log file, or a directory searched\n"
-        "                   recursively for files named tx.log. With none,\n"
-        "                   the Operations directory under the data root\n"
-        "                   is scanned.\n"
-        "\n"
-        "Options:\n"
-        "  --db=<path>      DB to write. Default: $SSO_PACKET_DB, else\n"
-        "                   <root>/packet_db.sqlite ($FRONTIERSAT_ROOT if\n"
-        "                   set, else /FrontierSat).\n"
-        "  --source-tool=<name>  provenance tag stored on each row\n"
-        "                   (default: tx_log_import).\n"
-        "  --help           this message\n",
-        argv0);
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        // <dir-or-file> ...: any non-option token; a lone "-" counts too.
+        // Repeating positional, so it appends rather than claiming once.
+        // Declared first so it lists above the --options in help.
+        if ((arg[0] != '-' || strcmp(arg, "-") == 0) || help) {
+            if (help) parse_help_line(OPTW, "<dir-or-file> ...", "tx.log file, or a dir searched recursively for tx.log (default: Operations dir)");
+            else if (a->n_paths < (int)(sizeof a->paths / sizeof a->paths[0]))
+                a->paths[a->n_paths++] = arg;
+            matched = 1;
+        }
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strncmp(arg, "--db=", 5) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--db=<path>", "DB to write (default: $SSO_PACKET_DB, else <root>/packet_db.sqlite)");
+            else a->db_path = arg + 5;
+            matched = 1;
+        }
+        if (strncmp(arg, "--source-tool=", 14) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--source-tool=<name>", "provenance tag stored on each row (default: tx_log_import)");
+            else a->tool = arg + 14;
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            // Original behaviour: any unrecognized option (a[0]=='-')
+            // prints usage to stderr and fails. Non-option tokens are
+            // claimed by the positional block above, so the only way to
+            // reach here is an unknown dash option.
+            fprintf(stderr, "usage: %s [--db=<path>] [--source-tool=<name>] "
+                    "[<dir-or-file> ...]\n", argv[0]);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
 }
 
 // -V / --version support (commit baked in at build time).
@@ -231,20 +266,17 @@ static void usage(FILE *out, const char *argv0)
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "tcmd_import")) return 0;
-    const char *db_path = NULL;
-    const char *tool = "tx_log_import";
-    const char *paths[64];
-    int n_paths = 0;
-
-    for (int i = 1; i < argc; i++) {
-        const char *a = argv[i];
-        if (strcmp(a, "--help") == 0) { usage(stdout, argv[0]); return 0; }
-        else if (strncmp(a, "--db=", 5) == 0)          db_path = a + 5;
-        else if (strncmp(a, "--source-tool=", 14) == 0) tool = a + 14;
-        else if (a[0] == '-') { usage(stderr, argv[0]); return 1; }
-        else if (n_paths < (int)(sizeof paths / sizeof paths[0]))
-            paths[n_paths++] = a;
+    tcmd_import_args_t cfg = {
+        .tool = "tx_log_import",
+    };
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
     }
+    const char *db_path = cfg.db_path;
+    const char *tool = cfg.tool;
+    const char **paths = cfg.paths;
+    int n_paths = cfg.n_paths;
 
     char default_db[1024];
     if (db_path == NULL) {

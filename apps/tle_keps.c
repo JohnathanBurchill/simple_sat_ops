@@ -33,6 +33,7 @@
     GNU General Public License for more details.
 */
 
+#include "argparse.h"
 #include "sso_paths.h"
 
 #include <sgp4sdp4.h>
@@ -473,69 +474,113 @@ static void print_csv_row(const kep_t *o, double jul_now)
 
 // ---- main -------------------------------------------------------------------
 
-static void usage(const char *prog)
-{
-    fprintf(stderr,
-        "Usage: %s [options] [tle-file] [name ...]\n"
-        "\n"
-        "Summarise the orbital elements (\"keps\") of objects in a TLE file:\n"
-        "the mean Keplerian elements, the geometry they imply (semi-major\n"
-        "axis, apogee/perigee altitude, period), the J2 nodal precession\n"
-        "rate, and the local time of the ascending/descending node.\n"
-        "\n"
-        "With no file it uses the newest dated FrontierSat TLE\n"
-        "(<root>/TLEs/YYYYMMDD/tle-YYYYMMDD.tle). With no names it reports\n"
-        "every object in the file; otherwise it reports each object whose\n"
-        "name line starts with one of the given prefixes (case-sensitive).\n"
-        "\n"
-        "Options:\n"
-        "  --tle <path>   TLE file to read (also accepted as a positional)\n"
-        "  --csv          one comma-separated row per object (for a sheet),\n"
-        "                 instead of the human report\n"
-        "  -h, --help     this text\n"
-        "  -V, --version  print the build commit and exit\n",
-        prog);
-}
+// Parsed command-line configuration. parse_args() fills this; main() reads
+// the fields directly. tle_path keeps a char buffer (not a const char *)
+// because --tle copies into it AND the positional logic tests tle_path[0]
+// to decide which positional is the file. names is a *list* of name
+// prefixes, so it keeps its own array + count.
+typedef struct {
+    char        tle_path[512];
+    int         csv;
+    const char *names[256];
+    int         n_names;
+} tle_keps_args_t;
+
+// Option column width: the widest label below ("-h, --help") + a small
+// margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 16
 
 // -V / --version support (commit baked in at build time).
 #include "sso_version.h"
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(tle_keps_args_t *a, int argc, char **argv, int help)
+{
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        // Positionals first so the <...> arguments list above the --options.
+        // [tle-file]: the first positional that names an existing regular
+        // file (and only when no --tle has filled tle_path yet). [name ...]:
+        // every other positional, appended to the names list. Both share one
+        // block because the original decided file-vs-name with a single
+        // stat() test, in argv order. A lone "-" counts as a positional.
+        if ((arg[0] != '-' || strcmp(arg, "-") == 0) || help) {
+            if (help) {
+                parse_help_line(OPTW, "[tle-file]", "TLE file to read (also accepted via --tle); first positional that is a file wins");
+                parse_help_line(OPTW, "[name ...]", "satellite-name prefixes to report (case-sensitive; default: all objects)");
+            } else {
+                struct stat st;
+                if (a->tle_path[0] == '\0' && stat(arg, &st) == 0 && S_ISREG(st.st_mode)) {
+                    snprintf(a->tle_path, sizeof a->tle_path, "%s", arg);
+                } else if (a->n_names < (int) (sizeof a->names / sizeof a->names[0])) {
+                    a->names[a->n_names++] = arg;
+                }
+            }
+            matched = 1;
+        }
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "-h, --help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strcmp(arg, "--csv") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--csv", "one comma-separated row per object (for a sheet)");
+            else a->csv = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--tle") == 0 || help) {
+            if (help) { parse_help_line(OPTW, "--tle <path>", "TLE file to read (also accepted as a positional)"); matched = 1; }
+            else if (t + 1 < ntokens) { snprintf(a->tle_path, sizeof a->tle_path, "%s", argv[(++t) + 1]); matched = 1; }
+            // A trailing "--tle" with no value: the original required
+            // i+1<argc, so it fell through to the unknown-option branch and
+            // failed with "Unknown option: --tle". Leaving matched == 0 in
+            // that case makes the !matched epilog below reproduce the exact
+            // diagnostic.
+        }
+        if (strncmp(arg, "--tle=", 6) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--tle=<path>", "TLE file to read (= form)");
+            else snprintf(a->tle_path, sizeof a->tle_path, "%s", arg + 6);
+            matched = 1;
+        }
+        if (strcmp(arg, "-V") == 0 || strcmp(arg, "--version") == 0 || help) {
+            if (help) parse_help_line(OPTW, "-V, --version", "print the build commit and exit");
+            // -V/--version is handled by sso_version_handle in main; this
+            // block exists only so the option shows up in --help.
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            // Original behaviour: only a non-lone dash token reaches here as
+            // an unknown option (the positional block above claims everything
+            // else, including a lone "-"). A trailing "--tle" also lands here.
+            fprintf(stderr, "Unknown option: %s\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
+}
 
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "tle_keps")) return 0;
 
-    char tle_path[512] = {0};
-    int csv = 0;
-
-    // Positionals: the first one that names an existing regular file is the
-    // TLE file; the rest are satellite-name prefixes.
-    const char *names[256];
-    int n_names = 0;
-
-    for (int i = 1; i < argc; ++i) {
-        const char *a = argv[i];
-        if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
-            usage(argv[0]);
-            return EXIT_SUCCESS;
-        } else if (strcmp(a, "--csv") == 0) {
-            csv = 1;
-        } else if (strcmp(a, "--tle") == 0 && i + 1 < argc) {
-            snprintf(tle_path, sizeof tle_path, "%s", argv[++i]);
-        } else if (strncmp(a, "--tle=", 6) == 0) {
-            snprintf(tle_path, sizeof tle_path, "%s", a + 6);
-        } else if (a[0] == '-' && a[1] != '\0') {
-            fprintf(stderr, "Unknown option: %s\n", a);
-            usage(argv[0]);
-            return EXIT_FAILURE;
-        } else {
-            struct stat st;
-            if (tle_path[0] == '\0' && stat(a, &st) == 0 && S_ISREG(st.st_mode)) {
-                snprintf(tle_path, sizeof tle_path, "%s", a);
-            } else if (n_names < (int) (sizeof names / sizeof names[0])) {
-                names[n_names++] = a;
-            }
-        }
+    tle_keps_args_t cfg = {0};
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
     }
+
+    // Copy parsed config into the working locals the body below uses.
+    char tle_path[512];
+    snprintf(tle_path, sizeof tle_path, "%s", cfg.tle_path);
+    int csv = cfg.csv;
+    const char **names = cfg.names;
+    int n_names = cfg.n_names;
 
     if (tle_path[0] == '\0' && newest_dated_tle(tle_path, sizeof tle_path) != 0) {
         fprintf(stderr,

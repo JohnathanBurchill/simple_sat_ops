@@ -35,6 +35,7 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "argparse.h"
 #include "ax100.h"
 #include "csp.h"
 #include "decode_loop.h"
@@ -347,156 +348,373 @@ static int read_audio_sndfile(const char *path, int16_t **out_samples,
 }
 #endif
 
-static void usage(FILE *dest, const char *name)
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the fields out into working locals so the (large) decode body is unchanged.
+typedef struct {
+    const char *input_path;
+    const char *log_path;
+    const char *keyfile_path;
+    int raw_mode;
+    int raw_mode_explicit;
+    int raw_rate;
+    int raw_rate_explicit;
+    int raw_channels;
+    int iq_mode;
+    int iq_mode_explicit;
+    double lo_shift_hz;
+    int use_viterbi;
+    int two_pass;
+    int bit_rate;
+    double window_s;
+    double slide_s;
+    int sync_max_ham;
+    int use_hmac;
+    int use_rs;
+    int no_dc_block;
+    int csp_crc32;
+    int allow_partial_rs;
+    int quiet;
+    int use_tui;
+    const char *ref_hex_arg;
+    int force_beacon;
+    int show_packet_headers;
+    const char *db_path;
+    const char *source_run_override;
+    int no_db;
+    const char *tle_path;
+    const char *sat_arg;
+    const char *start_utc_arg;
+    const char *session_dir_arg;
+    const char *capture_origin;
+    int update_mode;
+    const char *burst_csv_arg;
+    int burst_csv_suppress;
+    int burst_bins_threshold;
+    int burst_min_quiet;
+    int burst_merge_ms;
+    double obs_lat_deg;
+    double obs_lon_deg;
+    double obs_alt_m;
+    int no_observer;
+    double nominal_freq_hz;
+    const char *anchor_csv_arg;
+    double anchor_window_s;
+    double anchor_pre_s;
+} rxr_args_t;
+
+// Option column width: the widest label below ("--burst-bins-threshold=<n>") +
+// a small margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 28
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(rxr_args_t *a, int argc, char **argv, int help)
 {
-    fprintf(dest,
-        "usage: %s <path> [options]\n"
-        "\n"
-        "Offline AX100 sliding-window decoder. Reads a WAV, a headerless\n"
-        "S16_LE raw PCM recording (e.g. simple_sat_ops's .wav companion),\n"
-        "or a SatNOGS .ogg audio recording, and applies the same\n"
-        "window/slide/decode loop simple_sat_ops runs on live capture.\n"
-        "\n"
-        "Input:\n"
-        "  <path>.ogg               SatNOGS FM-audio recording (Vorbis).\n"
-        "                           Auto-decoded to PCM via libsndfile and\n"
-        "                           run through the FM-audio chain. The .ogg\n"
-        "                           IS the discriminated audio, so it uses the\n"
-        "                           PCM path, not --iq.\n"
-        "  --raw                    Treat <path> as headerless S16_LE PCM\n"
-        "                           (auto-enabled when path ends in '.raw').\n"
-        "  --iq                     Treat <path> as headerless int16 I,Q\n"
-        "                           pairs at --rate (auto-enabled when path\n"
-        "                           ends in '.iq'). By default runs the\n"
-        "                           two-pass IQ decoder: pass 1 is the\n"
-        "                           differential slicer (modem_iq.c) sliding\n"
-        "                           over the file, pass 2 anchors a tight\n"
-        "                           window on each pass-1 sync candidate\n"
-        "                           and retries with the MSK MLSE Viterbi\n"
-        "                           (modem_viterbi.c). On synthetic h=0.5\n"
-        "                           MSK the Viterbi delivers ~2 dB over\n"
-        "                           the slicer; on the live FrontierSat\n"
-        "                           downlink it currently no-ops (the\n"
-        "                           signal looks like h=1 GFSK and the\n"
-        "                           trellis assumes h=0.5).\n"
-        "  --viterbi                Force the Viterbi MLSE as the only\n"
-        "                           chain in --iq mode (implies\n"
-        "                           --no-two-pass). Useful for AWGN tests.\n"
-        "  --no-viterbi             Disable the Viterbi MLSE entirely;\n"
-        "                           pass-1 slicer only.\n"
-        "  --two-pass               Enable two-pass decode (default in\n"
-        "                           --iq mode).\n"
-        "  --no-two-pass            Run a single pass with whichever chain\n"
-        "                           --viterbi / --no-viterbi selects.\n"
-        "  --rate=<hz>              Sample rate for --raw / --iq (default\n"
-        "                           48000). simple_sat_ops captures since\n"
-        "                           the Gardner+PFB demod work record at\n"
-        "                           96000 Hz to give the clock-recovery\n"
-        "                           loop more sps headroom — pass\n"
-        "                           --rate=96000 on those .iq files.\n"
-        "  --channels=<n>           Channels for --raw (default 2; ch 0 used).\n"
-        "                           Pass --channels=1 for rtl_fm captures.\n"
-        "                           Ignored in --iq mode.\n"
-        "  --lo-shift-khz=<N>       NCO-shift the loaded IQ by -N kHz\n"
-        "                           before the decode loop runs.\n"
-        "                           Default 0 — current simple_sat_ops\n"
-        "                           captures already land at DC because\n"
-        "                           the live receiver cancels the LO\n"
-        "                           offset before the IQ tap. Only set\n"
-        "                           this for legacy .iq files that still\n"
-        "                           carry the +lo_offset baseband (then\n"
-        "                           N = operator's lo_offset in kHz,\n"
-        "                           e.g. 25 for the historical -25 kHz\n"
-        "                           default). --iq only.\n"
-        "\n"
-        "Decoder (same defaults as b210_rx_tx):\n"
-        "  --bit-rate=<bps>         Default 9600.\n"
-        "  --window-s=<seconds>     Decoder window size (default 1.5).\n"
-        "  --slide-s=<seconds>      Slide between decode attempts (default 0.5).\n"
-        "  --sync-threshold=<0..8>  Max ASM bit errors (default 4).\n"
-        "  --hmac                   Enable HMAC verification (off by default;\n"
-        "                           AX100 downlink frames don't carry HMAC).\n"
-        "  --keyfile=<path>         HMAC keyfile (default $HOME/%s).\n"
-        "  --reed-solomon           RS(255,223) decode (DEFAULT).\n"
-        "  --no-reed-solomon        Skip RS decode.\n"
-        "  --no-dc-block            Skip the modem's DC-block IIR (use on\n"
-        "                           radio digital taps with no DC offset).\n"
-        "  --csp-crc32              Validate + strip a trailing CSP zlib\n"
-        "                           CRC32 (off by default; opt-in only when\n"
-        "                           the TX side is known to append one).\n"
-        "  --no-partial-rs          Disable the partial-RS rescue. With it\n"
-        "                           on (default) a frame whose Golay\n"
-        "                           header decoded with 0 errors but whose\n"
-        "                           RS(255,223) was uncorrectable still\n"
-        "                           emits, marked rs=UNCORRECTABLE.\n"
-        "  --ref-hex=<hex>          Compare each decoded packet (or payload,\n"
-        "                           auto-detected by length) against this\n"
-        "                           reference and print byte positions that\n"
-        "                           differ. Whitespace and ':' in the hex\n"
-        "                           string are ignored.\n"
-        "  --force-beacon           Pad each decoded payload with zeros up\n"
-        "                           to 130 bytes and print it as a beacon\n"
-        "                           regardless of length or dispatch result.\n"
-        "                           Last-ditch view of heavily corrupted\n"
-        "                           frames. Ignored in --ui mode.\n"
-        "\n"
-        "Output:\n"
-        "  --log=<path>             Append decode lines to <path> in\n"
-        "                           addition to stdout. Re-opened per frame\n"
-        "                           so log rotation works.\n"
-        "  --quiet                  Skip stdout output (log-only mode).\n"
-        "  --ui                     Switch from streaming text to a curses\n"
-        "                           panel display (latest beacon broken\n"
-        "                           out by subsystem, scrolling list of\n"
-        "                           recent telecommand responses, frame\n"
-        "                           counters). After the file is replayed\n"
-        "                           the screen holds until you press q.\n"
-        "                           File logging continues. Default off.\n"
-        "  --packet-headers         Show the AX100 framing line, CSP v1\n"
-        "                           header line, and per-frame hex/ascii\n"
-        "                           dumps. Default off — only the\n"
-        "                           interpreted body and error conditions\n"
-        "                           print. In --ui mode, the REPL accepts\n"
-        "                           `packetheaders on|off` (or `ph on|off`)\n"
-        "                           to flip the toggle mid-replay.\n"
-        "  --no-packet-headers      Default; kept as a no-op for scripts.\n"
-        "  --db=<path>              SQLite store for decoded packets.\n"
-        "                           Default, in order: $SSO_PACKET_DB,\n"
-        "                           else <root>/packet_db.sqlite where\n"
-        "                           <root> is $FRONTIERSAT_ROOT if set,\n"
-        "                           else /FrontierSat. Append-only across\n"
-        "                           runs; re-running the same input is\n"
-        "                           dedup'd (pass --source-run=<id> to\n"
-        "                           force a fresh row group).\n"
-        "  --no-db                  Skip DB writes.\n"
-        "  --source-run=<id>        Override the per-launch run-id.\n"
-        "  --capture-origin=<name>  Tag rows with the audio's provenance,\n"
-        "                           e.g. cts_ground or satnogs. Distinct\n"
-        "                           from --source-run (which identifies\n"
-        "                           one launch) and source_tool (the\n"
-        "                           decoder). Same packet captured at\n"
-        "                           multiple sites keeps one row per\n"
-        "                           origin so cross-site decodes are\n"
-        "                           visible. Default: unset (NULL).\n"
-        "  --anchor-csv=<path>      Decode at external (time, freq)\n"
-        "                           anchors instead of (in addition to)\n"
-        "                           the sliding-window pass. Reads the\n"
-        "                           burst.csv schema gen_waterfall\n"
-        "                           --show-tm consumes — burst_start\n"
-        "                           rows with the optional 6th freq_hz\n"
-        "                           field. For each anchor the IQ is\n"
-        "                           NCO-mixed to DC at freq_hz over a\n"
-        "                           tight window around the anchor\n"
-        "                           time and run through the FSK chain.\n"
-        "                           Use when the packet sits far off DC\n"
-        "                           (e.g. LO-offset baseband at +25 kHz)\n"
-        "                           past the matched filter's passband.\n"
-        "  --anchor-window-s=<f>    Tight window around each anchor\n"
-        "                           (default 0.40).\n"
-        "  --anchor-pre-s=<f>       Pre-anchor cushion for M&M settling\n"
-        "                           (default 0.05).\n"
-        "  --help                   Show this help.\n",
-        name, HMAC_KEYFILE_DEFAULT_RELPATH);
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        // <path>: first non-option token. A lone "-" counts as a positional.
+        // Declared first so it lists above the --options in help.
+        if ((a->input_path == NULL && (arg[0] != '-' || strcmp(arg, "-") == 0)) || help) {
+            if (help) parse_help_line(OPTW, "<path>", "WAV, headerless S16_LE PCM, or SatNOGS .ogg recording");
+            else a->input_path = arg;
+            matched = 1;
+        }
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strcmp(arg, "--raw") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--raw", "treat <path> as headerless S16_LE PCM (auto for .raw)");
+            else { a->raw_mode = 1; a->raw_mode_explicit = 1; }
+            matched = 1;
+        }
+        if (strcmp(arg, "--iq") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--iq", "treat <path> as headerless int16 I,Q pairs (auto for .iq)");
+            else { a->iq_mode = 1; a->iq_mode_explicit = 1; }
+            matched = 1;
+        }
+        if (starts_with(arg, "--burst-csv=") || help) {
+            if (help) parse_help_line(OPTW, "--burst-csv=<path>", "burst.csv output path (--iq; default <input>.burst.csv)");
+            else a->burst_csv_arg = arg + 12;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-burst-csv") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-burst-csv", "suppress the burst.csv output");
+            else a->burst_csv_suppress = 1;
+            matched = 1;
+        }
+        if (starts_with(arg, "--burst-bins-threshold=") || help) {
+            if (help) parse_help_line(OPTW, "--burst-bins-threshold=<n>", "bright-bin count to declare a burst (default 16)");
+            else {
+                a->burst_bins_threshold = atoi(arg + 23);
+                if (a->burst_bins_threshold < 1) a->burst_bins_threshold = 1;
+            }
+            matched = 1;
+        }
+        if (starts_with(arg, "--burst-min-quiet=") || help) {
+            if (help) parse_help_line(OPTW, "--burst-min-quiet=<n>", "quiet snapshots needed to end a burst (default 5)");
+            else {
+                a->burst_min_quiet = atoi(arg + 18);
+                if (a->burst_min_quiet < 1) a->burst_min_quiet = 1;
+            }
+            matched = 1;
+        }
+        if (starts_with(arg, "--burst-merge-ms=") || help) {
+            if (help) parse_help_line(OPTW, "--burst-merge-ms=<ms>", "merge bursts closer than this gap (default 400)");
+            else {
+                a->burst_merge_ms = atoi(arg + 17);
+                if (a->burst_merge_ms < 0) a->burst_merge_ms = 0;
+            }
+            matched = 1;
+        }
+        if (starts_with(arg, "--lo-shift-khz=") || help) {
+            if (help) parse_help_line(OPTW, "--lo-shift-khz=<N>", "NCO-shift the loaded IQ by -N kHz first (--iq; default 0)");
+            else a->lo_shift_hz = atof(arg + 15) * 1000.0;
+            matched = 1;
+        }
+        if (strcmp(arg, "--viterbi") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--viterbi", "force the Viterbi MLSE in --iq mode (implies --no-two-pass)");
+            else a->use_viterbi = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-viterbi") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-viterbi", "disable the Viterbi MLSE; pass-1 slicer only");
+            else a->use_viterbi = 0;
+            matched = 1;
+        }
+        if (strcmp(arg, "--two-pass") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--two-pass", "enable two-pass decode (default in --iq mode)");
+            else a->two_pass = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-two-pass") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-two-pass", "single pass with whichever chain --viterbi selects");
+            else a->two_pass = 0;
+            matched = 1;
+        }
+        if (starts_with(arg, "--rate=") || help) {
+            if (help) parse_help_line(OPTW, "--rate=<hz>", "sample rate for --raw / --iq (default 48000)");
+            else { a->raw_rate = atoi(arg + 7); a->raw_rate_explicit = 1; }
+            matched = 1;
+        }
+        if (starts_with(arg, "--channels=") || help) {
+            if (help) parse_help_line(OPTW, "--channels=<n>", "channels for --raw (default 2; ch 0 used; --iq ignores)");
+            else a->raw_channels = atoi(arg + 11);
+            matched = 1;
+        }
+        if (starts_with(arg, "--bit-rate=") || help) {
+            if (help) parse_help_line(OPTW, "--bit-rate=<bps>", "modem bit rate (default 9600)");
+            else a->bit_rate = atoi(arg + 11);
+            matched = 1;
+        }
+        if (starts_with(arg, "--window-s=") || help) {
+            if (help) parse_help_line(OPTW, "--window-s=<seconds>", "decoder window size (default 1.5; clamped 0.5..30)");
+            else {
+                a->window_s = atof(arg + 11);
+                if (a->window_s < 0.5) a->window_s = 0.5;
+                if (a->window_s > 30.0) a->window_s = 30.0;
+            }
+            matched = 1;
+        }
+        if (starts_with(arg, "--slide-s=") || help) {
+            if (help) parse_help_line(OPTW, "--slide-s=<seconds>", "slide between decode attempts (default 0.5; min 0.05)");
+            else {
+                a->slide_s = atof(arg + 10);
+                if (a->slide_s < 0.05) a->slide_s = 0.05;
+            }
+            matched = 1;
+        }
+        if (starts_with(arg, "--sync-threshold=") || help) {
+            if (help) parse_help_line(OPTW, "--sync-threshold=<0..8>", "max ASM bit errors (default 4)");
+            else {
+                a->sync_max_ham = atoi(arg + 17);
+                if (a->sync_max_ham < 0 || a->sync_max_ham > 8) {
+                    fprintf(stderr, "rx_replay: --sync-threshold out of range [0,8]\n");
+                    return PARSE_ERROR;
+                }
+            }
+            matched = 1;
+        }
+        if (strcmp(arg, "--hmac") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--hmac", "enable HMAC verification (off by default)");
+            else a->use_hmac = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-hmac") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-hmac", "disable HMAC verification (the default)");
+            else a->use_hmac = 0;
+            matched = 1;
+        }
+        if (strcmp(arg, "--reed-solomon") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--reed-solomon", "RS(255,223) decode (DEFAULT)");
+            else a->use_rs = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-reed-solomon") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-reed-solomon", "skip RS decode");
+            else a->use_rs = 0;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-dc-block") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-dc-block", "skip the modem's DC-block IIR on RX");
+            else a->no_dc_block = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--csp-crc32") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--csp-crc32", "validate + strip a trailing CSP zlib CRC32");
+            else a->csp_crc32 = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-csp-crc32") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-csp-crc32", "do not check a CSP CRC32 (the default)");
+            else a->csp_crc32 = 0;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-partial-rs") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-partial-rs", "disable the partial-RS rescue path");
+            else a->allow_partial_rs = 0;
+            matched = 1;
+        }
+        if (strcmp(arg, "--quiet") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--quiet", "skip stdout output (log-only mode)");
+            else a->quiet = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--ui") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--ui", "curses panel display instead of streaming text");
+            else a->use_tui = 1;
+            matched = 1;
+        }
+        if (starts_with(arg, "--keyfile=") || help) {
+            if (help) parse_help_line(OPTW, "--keyfile=<path>", "HMAC keyfile (default $HOME/" HMAC_KEYFILE_DEFAULT_RELPATH ")");
+            else a->keyfile_path = arg + 10;
+            matched = 1;
+        }
+        if (starts_with(arg, "--log=") || help) {
+            if (help) parse_help_line(OPTW, "--log=<path>", "append decode lines to <path> as well as stdout");
+            else a->log_path = arg + 6;
+            matched = 1;
+        }
+        if (starts_with(arg, "--ref-hex=") || help) {
+            if (help) parse_help_line(OPTW, "--ref-hex=<hex>", "diff each decoded packet/payload against this reference hex");
+            else a->ref_hex_arg = arg + 10;
+            matched = 1;
+        }
+        if (strcmp(arg, "--force-beacon") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--force-beacon", "pad each payload to 130 bytes and print as a beacon");
+            else a->force_beacon = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--packet-headers") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--packet-headers", "show AX100/CSP header lines and per-frame hex/ascii");
+            else a->show_packet_headers = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-packet-headers") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-packet-headers", "default; hide header lines (kept as a no-op for scripts)");
+            else a->show_packet_headers = 0;
+            matched = 1;
+        }
+        if (starts_with(arg, "--db=") || help) {
+            if (help) parse_help_line(OPTW, "--db=<path>", "SQLite store for decoded packets");
+            else a->db_path = arg + 5;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-db") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-db", "skip DB writes");
+            else a->no_db = 1;
+            matched = 1;
+        }
+        if (starts_with(arg, "--source-run=") || help) {
+            if (help) parse_help_line(OPTW, "--source-run=<id>", "override the per-launch run-id used for dedup");
+            else a->source_run_override = arg + 13;
+            matched = 1;
+        }
+        if (starts_with(arg, "--tle=") || help) {
+            if (help) parse_help_line(OPTW, "--tle=<path>", "TLE file for observer geometry (else auto-discovered)");
+            else a->tle_path = tle_path_resolve(arg + 6);
+            matched = 1;
+        }
+        if (starts_with(arg, "--satellite=") || help) {
+            if (help) parse_help_line(OPTW, "--satellite=<name>", "satellite name prefix to pick out of the TLE file");
+            else a->sat_arg = arg + 12;
+            matched = 1;
+        }
+        if (starts_with(arg, "--start-utc=") || help) {
+            if (help) parse_help_line(OPTW, "--start-utc=<iso>", "UTC of sample 0 (YYYY-MM-DDTHH:MM:SS[.fff]Z)");
+            else a->start_utc_arg = arg + 12;
+            matched = 1;
+        }
+        if (starts_with(arg, "--session-dir=") || help) {
+            if (help) parse_help_line(OPTW, "--session-dir=<path>", "pass folder for TLE auto-discovery and DB rows");
+            else a->session_dir_arg = arg + 14;
+            matched = 1;
+        }
+        if (starts_with(arg, "--capture-origin=") || help) {
+            if (help) parse_help_line(OPTW, "--capture-origin=<name>", "tag rows with the audio's provenance (e.g. satnogs)");
+            else a->capture_origin = arg + 17;
+            matched = 1;
+        }
+        if (strcmp(arg, "--update") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--update", "backfill existing DB rows; suppress new INSERTs");
+            else a->update_mode = 1;
+            matched = 1;
+        }
+        if (starts_with(arg, "--lat=") || help) {
+            if (help) parse_help_line(OPTW, "--lat=<deg>", "observer latitude (default RAO 50.8688)");
+            else a->obs_lat_deg = atof(arg + 6);
+            matched = 1;
+        }
+        if (starts_with(arg, "--lon=") || help) {
+            if (help) parse_help_line(OPTW, "--lon=<deg>", "observer longitude (default RAO -114.2910)");
+            else a->obs_lon_deg = atof(arg + 6);
+            matched = 1;
+        }
+        if (starts_with(arg, "--alt=") || help) {
+            if (help) parse_help_line(OPTW, "--alt=<m>", "observer altitude in metres (default RAO 1279)");
+            else a->obs_alt_m = atof(arg + 6);
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-observer") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-observer", "leave geometry NULL instead of using --lat/--lon/--alt");
+            else a->no_observer = 1;
+            matched = 1;
+        }
+        if (starts_with(arg, "--carrier-mhz=") || help) {
+            if (help) parse_help_line(OPTW, "--carrier-mhz=<mhz>", "nominal carrier for Doppler (default 436.150)");
+            else a->nominal_freq_hz = atof(arg + 14) * 1e6;
+            matched = 1;
+        }
+        if (starts_with(arg, "--anchor-csv=") || help) {
+            if (help) parse_help_line(OPTW, "--anchor-csv=<path>", "decode at external (time, freq) burst.csv anchors (--iq)");
+            else a->anchor_csv_arg = arg + 13;
+            matched = 1;
+        }
+        if (starts_with(arg, "--anchor-window-s=") || help) {
+            if (help) parse_help_line(OPTW, "--anchor-window-s=<f>", "tight window around each anchor (default 0.40)");
+            else a->anchor_window_s = atof(arg + 18);
+            matched = 1;
+        }
+        if (starts_with(arg, "--anchor-pre-s=") || help) {
+            if (help) parse_help_line(OPTW, "--anchor-pre-s=<f>", "pre-anchor cushion for M&M settling (default 0.05)");
+            else a->anchor_pre_s = atof(arg + 14);
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            if (arg[0] == '-' && strcmp(arg, "-") != 0)
+                fprintf(stderr, "rx_replay: unknown option '%s'\n", arg);
+            else
+                fprintf(stderr, "rx_replay: unexpected positional '%s'\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
 }
 
 // Bundle of per-run state the emit helper needs. Built once in main()
@@ -674,25 +892,55 @@ static int rx_emit_decoded(rx_emit_ctx_t *ctx,
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "rx_replay")) return 0;
-    const char *input_path = NULL;
-    const char *log_path = NULL;
-    const char *keyfile_path = NULL;
-    int raw_mode = 0;
-    int raw_mode_explicit = 0;
+    rxr_args_t cfg = {
+        .raw_rate = 48000,
+        .raw_channels = 2,
+        .two_pass = 1,
+        .bit_rate = 9600,
+        .window_s = 1.5,
+        .slide_s = 0.5,
+        .sync_max_ham = 4,
+        .use_rs = 1,
+        .allow_partial_rs = 1,
+        .burst_bins_threshold = 16,
+        .burst_min_quiet = 5,
+        .burst_merge_ms = 400,
+        .obs_lat_deg = 50.8688,   // RAO defaults; overridden by flags
+        .obs_lon_deg = -114.2910,
+        .obs_alt_m   = 1279.0,
+        .nominal_freq_hz = 436150000.0, // FrontierSat carrier
+        .anchor_window_s = 0.40,     // tight window around each anchor
+        .anchor_pre_s    = 0.05,     // pre-anchor cushion for M&M lock
+    };
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
+    }
+    if (cfg.input_path == NULL) {
+        fprintf(stderr, "rx_replay: missing <path> (try --help)\n");
+        return 1;
+    }
+
+    // Copy parsed config into the working locals the body below uses.
+    const char *input_path = cfg.input_path;
+    const char *log_path = cfg.log_path;
+    const char *keyfile_path = cfg.keyfile_path;
+    int raw_mode = cfg.raw_mode;
+    int raw_mode_explicit = cfg.raw_mode_explicit;
     // Auto-detected from a .ogg extension: a SatNOGS audio recording,
     // decoded to PCM via libsndfile and run through the FM-audio chain.
     int ogg_mode = 0;
-    int raw_rate = 48000;
-    int raw_rate_explicit = 0;
-    int raw_channels = 2;
+    int raw_rate = cfg.raw_rate;
+    int raw_rate_explicit = cfg.raw_rate_explicit;
+    int raw_channels = cfg.raw_channels;
     // IQ-file mode: treat the input as headerless interleaved int16
     // I,Q pairs at samp_rate (the format simple_sat_ops writes as the
     // .iq sidecar next to each pass WAV). Enabled by --iq or auto-
     // detected from a .iq extension. When on, the decoder runs through
     // modem_iq / modem_viterbi instead of modem_pcm16, which on noisy
     // captures pulls more frames than the FM-discriminated WAV path.
-    int iq_mode = 0;
-    int iq_mode_explicit = 0;
+    int iq_mode = cfg.iq_mode;
+    int iq_mode_explicit = cfg.iq_mode_explicit;
     // Optional pre-demod NCO shift (Hz). Current simple_sat_ops
     // captures land at DC because the live receiver cancels both the
     // operator's lo_offset and the UHD tune residual before the IQ
@@ -703,7 +951,7 @@ int main(int argc, char **argv)
     // operator's lo_offset_hz in kHz (e.g. 25 for the historical
     // -25 kHz default). Mis-applying the flag on a centered file
     // pushes the carrier outside the 12 kHz LPF and breaks decode.
-    double lo_shift_hz = 0.0;
+    double lo_shift_hz = cfg.lo_shift_hz;
     // Viterbi default off pending a fix for the FrontierSat downlink
     // modulation. Empirically (RAO captures, 2026-05-15 pass) the
     // symbol-spaced differential phase histogram peaks near ±π — that
@@ -714,7 +962,7 @@ int main(int argc, char **argv)
     // differential decoding doesn't care about the absolute trellis
     // structure. Pass --viterbi to force it on (e.g. for synthetic
     // h=0.5 tests).
-    int use_viterbi = 0;
+    int use_viterbi = cfg.use_viterbi;
     // Two-pass IQ decoding. Pass 1: slicer (modem_iq_to_bits) on the
     // wide sliding window — fast, finds easy frames, populates the
     // dedup ring. Pass 2: rewalk the file collecting sync candidates
@@ -723,55 +971,55 @@ int main(int argc, char **argv)
     // FrontierSat downlinks (see use_viterbi note above) but cheap
     // and harmless; keep on so the wiring stays exercised. Revert
     // with --no-two-pass.
-    int two_pass = 1;
-    int bit_rate = 9600;
-    double window_s = 1.5;
-    double slide_s = 0.5;
-    int sync_max_ham = 4;
-    int use_hmac = 0;
-    int use_rs = 1;
-    int no_dc_block = 0;
-    int csp_crc32 = 0;
-    int allow_partial_rs = 1;
-    int quiet = 0;
-    int use_tui = 0;
-    const char *ref_hex_arg = NULL;
+    int two_pass = cfg.two_pass;
+    int bit_rate = cfg.bit_rate;
+    double window_s = cfg.window_s;
+    double slide_s = cfg.slide_s;
+    int sync_max_ham = cfg.sync_max_ham;
+    int use_hmac = cfg.use_hmac;
+    int use_rs = cfg.use_rs;
+    int no_dc_block = cfg.no_dc_block;
+    int csp_crc32 = cfg.csp_crc32;
+    int allow_partial_rs = cfg.allow_partial_rs;
+    int quiet = cfg.quiet;
+    int use_tui = cfg.use_tui;
+    const char *ref_hex_arg = cfg.ref_hex_arg;
     uint8_t ref_buf[4100];
     size_t ref_buf_len = 0;
-    int force_beacon = 0;
-    int show_packet_headers = 0;
-    const char *db_path = NULL;
-    const char *source_run_override = NULL;
-    int no_db = 0;
-    const char *tle_path = NULL;
-    const char *sat_arg  = NULL;
-    const char *start_utc_arg = NULL;
-    const char *session_dir_arg = NULL;
-    const char *capture_origin = NULL;
-    int update_mode = 0;
+    int force_beacon = cfg.force_beacon;
+    int show_packet_headers = cfg.show_packet_headers;
+    const char *db_path = cfg.db_path;
+    const char *source_run_override = cfg.source_run_override;
+    int no_db = cfg.no_db;
+    const char *tle_path = cfg.tle_path;
+    const char *sat_arg  = cfg.sat_arg;
+    const char *start_utc_arg = cfg.start_utc_arg;
+    const char *session_dir_arg = cfg.session_dir_arg;
+    const char *capture_origin = cfg.capture_origin;
+    int update_mode = cfg.update_mode;
     // Burst detector (iq_burst) output — same writer as the live
     // rx_session's burst.csv. Default path is "<input>.burst.csv";
     // --burst-csv= overrides; --no-burst-csv suppresses.
-    const char *burst_csv_arg     = NULL;
-    int         burst_csv_suppress = 0;
-    int         burst_bins_threshold = 16;
-    int         burst_min_quiet      = 5;
+    const char *burst_csv_arg     = cfg.burst_csv_arg;
+    int         burst_csv_suppress = cfg.burst_csv_suppress;
+    int         burst_bins_threshold = cfg.burst_bins_threshold;
+    int         burst_min_quiet      = cfg.burst_min_quiet;
     // Collapse adjacent burst events into one when the gap between
     // burst_end[k] and burst_start[k+1] is shorter than this. Tracks
     // the operator's intuitive "beacon arrival" rather than the
     // detector's finer-grained start/end transitions inside one
     // packet (FSK modulation produces brief mid-packet dropouts).
-    int         burst_merge_ms       = 400;
-    double obs_lat_deg = 50.8688;   // RAO defaults; overridden by flags
-    double obs_lon_deg = -114.2910;
-    double obs_alt_m   = 1279.0;
+    int         burst_merge_ms       = cfg.burst_merge_ms;
+    double obs_lat_deg = cfg.obs_lat_deg;
+    double obs_lon_deg = cfg.obs_lon_deg;
+    double obs_alt_m   = cfg.obs_alt_m;
     // --no-observer leaves geometry NULL in the DB instead of falling
     // back to obs_lat/lon/alt. Used by decode_passes.sh on satnogs obs
     // whose recording-station coords aren't known — better to record
     // "we don't know where it was heard from" than to silently
     // attribute the pass to RAO.
-    int no_observer = 0;
-    double nominal_freq_hz = 436150000.0; // FrontierSat carrier
+    int no_observer = cfg.no_observer;
+    double nominal_freq_hz = cfg.nominal_freq_hz;
     // Anchored-decode mode: read (time, freq) anchors from a CSV (same
     // schema gen_waterfall --show-tm consumes — burst_start rows with
     // the optional 6th freq_hz field). For each anchor we mix the IQ
@@ -779,105 +1027,10 @@ int main(int argc, char **argv)
     // around the anchor time. Useful when the beacon sits far off DC
     // and the wide sliding-window pass can't see it through the
     // matched filter's ±10 kHz passband.
-    const char *anchor_csv_arg = NULL;
-    double anchor_window_s = 0.40;     // tight window around each anchor
-    double anchor_pre_s    = 0.05;     // pre-anchor cushion for M&M lock
+    const char *anchor_csv_arg = cfg.anchor_csv_arg;
+    double anchor_window_s = cfg.anchor_window_s;     // tight window around each anchor
+    double anchor_pre_s    = cfg.anchor_pre_s;        // pre-anchor cushion for M&M lock
 
-    for (int i = 1; i < argc; ++i) {
-        const char *a = argv[i];
-        if (strcmp(a, "--help") == 0) { usage(stdout, argv[0]); return 0; }
-        else if (strcmp(a, "--raw") == 0) { raw_mode = 1; raw_mode_explicit = 1; }
-        else if (strcmp(a, "--iq") == 0)  { iq_mode = 1;  iq_mode_explicit = 1; }
-        else if (starts_with(a, "--burst-csv="))   burst_csv_arg = a + 12;
-        else if (strcmp(a, "--no-burst-csv") == 0) burst_csv_suppress = 1;
-        else if (starts_with(a, "--burst-bins-threshold=")) {
-            burst_bins_threshold = atoi(a + 23);
-            if (burst_bins_threshold < 1) burst_bins_threshold = 1;
-        }
-        else if (starts_with(a, "--burst-min-quiet=")) {
-            burst_min_quiet = atoi(a + 18);
-            if (burst_min_quiet < 1) burst_min_quiet = 1;
-        }
-        else if (starts_with(a, "--burst-merge-ms=")) {
-            burst_merge_ms = atoi(a + 17);
-            if (burst_merge_ms < 0) burst_merge_ms = 0;
-        }
-        else if (starts_with(a, "--lo-shift-khz=")) {
-            lo_shift_hz = atof(a + 15) * 1000.0;
-        }
-        else if (strcmp(a, "--viterbi") == 0)    use_viterbi = 1;
-        else if (strcmp(a, "--no-viterbi") == 0) use_viterbi = 0;
-        else if (strcmp(a, "--two-pass") == 0)    two_pass = 1;
-        else if (strcmp(a, "--no-two-pass") == 0) two_pass = 0;
-        else if (starts_with(a, "--rate=")) {
-            raw_rate = atoi(a + 7);
-            raw_rate_explicit = 1;
-        }
-        else if (starts_with(a, "--channels="))  raw_channels = atoi(a + 11);
-        else if (starts_with(a, "--bit-rate="))  bit_rate = atoi(a + 11);
-        else if (starts_with(a, "--window-s=")) {
-            window_s = atof(a + 11);
-            if (window_s < 0.5) window_s = 0.5;
-            if (window_s > 30.0) window_s = 30.0;
-        } else if (starts_with(a, "--slide-s=")) {
-            slide_s = atof(a + 10);
-            if (slide_s < 0.05) slide_s = 0.05;
-        } else if (starts_with(a, "--sync-threshold=")) {
-            sync_max_ham = atoi(a + 17);
-            if (sync_max_ham < 0 || sync_max_ham > 8) {
-                fprintf(stderr, "rx_replay: --sync-threshold out of range [0,8]\n");
-                return 1;
-            }
-        }
-        else if (strcmp(a, "--hmac") == 0)             use_hmac = 1;
-        else if (strcmp(a, "--no-hmac") == 0)          use_hmac = 0;
-        else if (strcmp(a, "--reed-solomon") == 0)     use_rs = 1;
-        else if (strcmp(a, "--no-reed-solomon") == 0)  use_rs = 0;
-        else if (strcmp(a, "--no-dc-block") == 0)      no_dc_block = 1;
-        else if (strcmp(a, "--csp-crc32") == 0)        csp_crc32 = 1;
-        else if (strcmp(a, "--no-csp-crc32") == 0)     csp_crc32 = 0;
-        else if (strcmp(a, "--no-partial-rs") == 0)    allow_partial_rs = 0;
-        else if (strcmp(a, "--quiet") == 0)            quiet = 1;
-        else if (strcmp(a, "--ui") == 0)               use_tui = 1;
-        else if (starts_with(a, "--keyfile="))         keyfile_path = a + 10;
-        else if (starts_with(a, "--log="))             log_path = a + 6;
-        else if (starts_with(a, "--ref-hex="))         ref_hex_arg = a + 10;
-        else if (strcmp(a, "--force-beacon") == 0)     force_beacon = 1;
-        else if (strcmp(a, "--packet-headers") == 0)   show_packet_headers = 1;
-        else if (strcmp(a, "--no-packet-headers") == 0) show_packet_headers = 0;
-        else if (starts_with(a, "--db="))              db_path = a + 5;
-        else if (strcmp(a, "--no-db") == 0)            no_db = 1;
-        else if (starts_with(a, "--source-run="))      source_run_override = a + 13;
-        else if (starts_with(a, "--tle="))             tle_path = tle_path_resolve(a + 6);
-        else if (starts_with(a, "--satellite="))       sat_arg = a + 12;
-        else if (starts_with(a, "--start-utc="))       start_utc_arg = a + 12;
-        else if (starts_with(a, "--session-dir="))     session_dir_arg = a + 14;
-        else if (starts_with(a, "--capture-origin="))  capture_origin = a + 17;
-        else if (strcmp(a, "--update") == 0)           update_mode = 1;
-        else if (starts_with(a, "--lat="))             obs_lat_deg = atof(a + 6);
-        else if (starts_with(a, "--lon="))             obs_lon_deg = atof(a + 6);
-        else if (starts_with(a, "--alt="))             obs_alt_m   = atof(a + 6);
-        else if (strcmp(a, "--no-observer") == 0)      no_observer = 1;
-        else if (starts_with(a, "--carrier-mhz="))     nominal_freq_hz = atof(a + 14) * 1e6;
-        else if (starts_with(a, "--anchor-csv="))      anchor_csv_arg  = a + 13;
-        else if (starts_with(a, "--anchor-window-s=")) anchor_window_s = atof(a + 18);
-        else if (starts_with(a, "--anchor-pre-s="))    anchor_pre_s    = atof(a + 14);
-        else if (a[0] == '-') {
-            fprintf(stderr, "rx_replay: unknown option '%s'\n", a);
-            usage(stderr, argv[0]);
-            return 1;
-        } else if (input_path == NULL) {
-            input_path = a;
-        } else {
-            fprintf(stderr, "rx_replay: unexpected positional '%s'\n", a);
-            return 1;
-        }
-    }
-    if (input_path == NULL) {
-        fprintf(stderr, "rx_replay: missing <path>\n");
-        usage(stderr, argv[0]);
-        return 1;
-    }
     sso_audit_start("rx_replay", input_path);
     if (ref_hex_arg != NULL) {
         size_t n = 0;

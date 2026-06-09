@@ -31,6 +31,7 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "argparse.h"
 #include "beacon_cts1.h"
 #include "packet_db.h"
 #include "sso_version.h"
@@ -520,45 +521,74 @@ static int prompt_search(int rows_total, int cols)
     }
 }
 
-static void usage(FILE *out, const char *argv0)
+// Parsed command-line configuration. parse_args() fills this; main() reads it.
+typedef struct {
+    const char *db_path;
+} tcb_args_t;
+
+// Option column width: the widest label below ("--db=<path>") + a small
+// margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 13
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(tcb_args_t *a, int argc, char **argv, int help)
 {
-    fprintf(out,
-        "usage: %s [--db=<path>]\n"
-        "\n"
-        "Curses TUI over the sent_tcmd table - the telecommands\n"
-        "simple_sat_ops has transmitted (and any backfilled by\n"
-        "tcmd_import). Read-only; safe to run beside a live receiver.\n"
-        "\n"
-        "Keys:\n"
-        "  q | Q | Esc      quit (in the responses view, step back)\n"
-        "  arrows / PgUp / PgDn / Home / End   scroll\n"
-        "  Enter            open the responses for the selected command\n"
-        "                   (the tcmd_response packets sharing its ts_sent)\n"
-        "  f                cycle response filter: all -> answered (got a\n"
-        "                   response) -> unanswered\n"
-        "  /                substring search against the command text\n"
-        "  l                toggle timestamp display: UTC (storage) <-> local\n"
-        "  r                reload now\n"
-        "\n"
-        "Options:\n"
-        "  --db=<path>      override default DB path. Default, in order:\n"
-        "                   $SSO_PACKET_DB, else <root>/packet_db.sqlite\n"
-        "                   where <root> is $FRONTIERSAT_ROOT if set,\n"
-        "                   else /FrontierSat\n"
-        "  --help           this message\n",
-        argv0);
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strcmp(arg, "--help-full") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help-full", "this help plus the key-binding reference");
+            else { parse_args(a, argc, argv, HELP_FULL); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (starts_with(arg, "--db=") || help) {
+            if (help) parse_help_line(OPTW, "--db=<path>", "packet DB path (default $SSO_PACKET_DB, else <root>/packet_db.sqlite)");
+            else a->db_path = arg + 5;
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            // Original behaviour: any unrecognized argument prints usage to
+            // stderr and fails. The only option is --db=; anything else lands
+            // here.
+            fprintf(stderr, "usage: %s [--db=<path>]\n", argv[0]);
+            return PARSE_ERROR;
+        }
+    }
+    // --help-full appends the key-binding reference (was in the old usage()).
+    if (help >= HELP_FULL) {
+        printf("\nKeys:\n"
+               "  q | Q | Esc      quit (in the responses view, step back)\n"
+               "  arrows / PgUp / PgDn / Home / End   scroll\n"
+               "  Enter            open the responses for the selected command\n"
+               "                   (the tcmd_response packets sharing its ts_sent)\n"
+               "  f                cycle response filter: all -> answered (got a\n"
+               "                   response) -> unanswered\n"
+               "  /                substring search against the command text\n"
+               "  l                toggle timestamp display: UTC (storage) <-> local\n"
+               "  r                reload now\n");
+    }
+    return PARSE_OK;
 }
 
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "tcmd_browser")) return 0;
-    const char *db_path = NULL;
-    for (int i = 1; i < argc; i++) {
-        const char *a = argv[i];
-        if (strcmp(a, "--help") == 0) { usage(stdout, argv[0]); return 0; }
-        else if (starts_with(a, "--db=")) db_path = a + 5;
-        else { usage(stderr, argv[0]); return 1; }
+    tcb_args_t cfg = {0};
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
     }
+    const char *db_path = cfg.db_path;
 
     char default_db[1024];
     if (db_path == NULL) {

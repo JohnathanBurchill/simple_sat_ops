@@ -83,29 +83,97 @@
 #include "prediction.h"
 #endif
 
-static void usage(FILE *out, const char *progname)
+#include "argparse.h"
+
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the fields out into the working locals the listing body below uses.
+typedef struct {
+    int local;          // --local-time
+    int dup_check;      // cleared by --no-dup-check
+    int prune_dups;     // --prune-dups
+    int tc_lint;        // cleared by --no-tc-lint
+    int errors_only;    // --errors-only
+    const char *path;     // optional [<file>] positional; NULL => read stdin
+    const char *tle_path; // --tle <file> (space form); NULL when absent
+} agenda_check_args_t;
+
+// Option column width: the widest label below ("--no-dup-check") + a small
+// margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 16
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(agenda_check_args_t *a, int argc, char **argv, int help)
 {
-    fprintf(out,
-        "Usage: %s [--local-time] [--no-dup-check] [--no-tc-lint] [--errors-only] [--prune-dups] [--tle <file>] [<file>]\n"
-        "  Replaces @tssent=<unix_ms> and @tsexec=<unix_ms> values with\n"
-        "  human-readable timestamps. UTC by default; --local-time uses\n"
-        "  the host's local timezone. Flags verbatim-duplicate TC lines;\n"
-        "  --prune-dups drops them instead and reports how many were pruned.\n"
-        "  Lints each telecommand against the flight firmware's command set\n"
-        "  (names, argument counts, CTS1+...! framing); errors print to stderr\n"
-        "  and set a non-zero exit, and the offending line is tagged ERROR>\n"
-        "  and shown bold bright red in the listing. --no-tc-lint disables\n"
-        "  that check.\n"
-        "  --errors-only prints ONLY the lines with lint errors (line number,\n"
-        "  command, and reason) to stdout and suppresses the rest, so the\n"
-        "  errors don't scroll away in a long agenda.\n"
-        "  With --tle <file> (sgp4sdp4 builds), prepends the execution\n"
-        "  date-time plus the sub-satellite lat/lon (deg) and altitude (km),\n"
-        "  leaving the command intact (@tsexec=, else @tssent=, else now).\n"
-        "  Prints a stderr summary: total commands, non-duplicate commands,\n"
-        "  and distinct timed telecommands (same command at different times = 1).\n"
-        "  No <file> reads from stdin.\n",
-        progname);
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        // [<file>]: first non-option token (a lone "-" counts as positional).
+        // Declared first so it lists above the --options in help.
+        if ((a->path == NULL && (arg[0] != '-' || strcmp(arg, "-") == 0)) || help) {
+            if (help) parse_help_line(OPTW, "<file>", "telecommand agenda file (reads stdin when omitted)");
+            else a->path = arg;
+            matched = 1;
+        }
+        if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strcmp(arg, "--local-time") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--local-time", "humanize times in the host's local TZ (default UTC)");
+            else a->local = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-dup-check") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-dup-check", "skip the verbatim-duplicate-line audit");
+            else a->dup_check = 0;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-tc-lint") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-tc-lint", "skip the firmware telecommand lint");
+            else a->tc_lint = 0;
+            matched = 1;
+        }
+        if (strcmp(arg, "--errors-only") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--errors-only", "print only lint-error lines; suppress the rest");
+            else a->errors_only = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--prune-dups") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--prune-dups", "drop verbatim-duplicate lines (keep the first) and count them");
+            else a->prune_dups = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--tle") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--tle <file>", "(sgp4sdp4 builds) prepend exec date-time + sub-satellite lat/lon/alt");
+            else {
+                // arg is argv[t+1]; its value is the next token argv[t+2].
+                // Consume it (++t) so the positional collector never sees it.
+                if (t + 2 >= argc) {
+                    fprintf(stderr, "%s: --tle requires a file path\n", argv[0]);
+                    return PARSE_ERROR;
+                }
+                a->tle_path = argv[t + 2];
+                ++t;
+            }
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            // Two distinct diagnostics preserved from the old parser: an
+            // unrecognized "-" option vs. a second input file.
+            if (arg[0] == '-' && strcmp(arg, "-") != 0)
+                fprintf(stderr, "unknown option %s\n", arg);
+            else
+                fprintf(stderr, "only one input file supported\n");
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
 }
 
 // Format `unix_ms` as "YYYY-MM-DDTHH:MM:SS.mmmZ" (UTC) or
@@ -321,45 +389,23 @@ static void sat_subpoint(long long unix_ms,
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "agenda_check")) return 0;
-    int local = 0;
-    int dup_check = 1;
-    int prune_dups = 0;
-    int tc_lint = 1;
-    int errors_only = 0;
-    const char *path = NULL;
-    const char *tle_path = NULL;
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--local-time") == 0) {
-            local = 1;
-        } else if (strcmp(argv[i], "--no-dup-check") == 0) {
-            dup_check = 0;
-        } else if (strcmp(argv[i], "--no-tc-lint") == 0) {
-            tc_lint = 0;
-        } else if (strcmp(argv[i], "--errors-only") == 0) {
-            errors_only = 1;
-        } else if (strcmp(argv[i], "--prune-dups") == 0) {
-            prune_dups = 1;
-        } else if (strcmp(argv[i], "--tle") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "%s: --tle requires a file path\n", argv[0]);
-                return 2;
-            }
-            tle_path = argv[++i];
-        } else if (strcmp(argv[i], "--help") == 0
-                || strcmp(argv[i], "-h") == 0) {
-            usage(stdout, argv[0]);
-            return 0;
-        } else if (argv[i][0] == '-') {
-            fprintf(stderr, "unknown option %s\n", argv[i]);
-            usage(stderr, argv[0]);
-            return 2;
-        } else if (path == NULL) {
-            path = argv[i];
-        } else {
-            fprintf(stderr, "only one input file supported\n");
-            return 2;
-        }
+    agenda_check_args_t cfg = {
+        .dup_check = 1,  // verbatim-duplicate audit on by default
+        .tc_lint = 1,    // firmware telecommand lint on by default
+    };
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;   // help printed to stdout
+        case PARSE_ERROR: return 2;   // diagnostic printed to stderr
     }
+
+    // Copy parsed config into the working locals the listing body below uses.
+    int local = cfg.local;
+    int dup_check = cfg.dup_check;
+    int prune_dups = cfg.prune_dups;
+    int tc_lint = cfg.tc_lint;
+    int errors_only = cfg.errors_only;
+    const char *path = cfg.path;
+    const char *tle_path = cfg.tle_path;
 
 #ifdef WITH_SGP4SDP4
     int annotate = 0;

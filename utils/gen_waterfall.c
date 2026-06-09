@@ -39,6 +39,7 @@
 
 #define _GNU_SOURCE
 
+#include "argparse.h"
 #include "sw_nco.h"
 #include "waterfall_core.h"
 
@@ -1611,135 +1612,6 @@ static int render_with_axes(const uint8_t *spec_rgb, int spec_w, int spec_h,
 // CLI
 // --------------------------------------------------------------------
 
-static void usage(void)
-{
-    fprintf(stderr,
-        "usage: gen_waterfall <iq_path> <sample_rate_hz> [<out_png>]\n"
-        "       gen_waterfall <audio.ogg> [<out_png>]\n"
-        "                     [--pdf=<out_pdf>]\n"
-        "                     [--fft=N] [--rows=N] [--db-min=X]\n"
-        "                     [--db-max=X] [--center-hz=F]\n"
-        "                     [--lo-shift-khz=N]\n"
-        "                     [--zoom-khz=W] [--full-width]\n"
-        "                     [--dc-notch] [--dc-notch-bins=N]\n"
-        "                     [--power-offset=X] [--power-unit=U]\n"
-        "\n"
-        "  Reads raw interleaved int16 I,Q samples (no header) from\n"
-        "  <iq_path> at <sample_rate_hz>, builds a SatNOGS-style\n"
-        "  waterfall with viridis colormap, and writes one or both of:\n"
-        "    <out_png>            full-raster PNG (positional arg 3)\n"
-        "    --pdf=<out_pdf>      vector-text PDF (sharp labels at any zoom)\n"
-        "  Either output is fine on its own; supply both to emit both.\n"
-        "\n"
-        "  A SatNOGS .ogg input is FM-demodulated audio, not IQ: there is\n"
-        "  no sample-rate arg (read from the file), so the PNG is\n"
-        "  positional arg 2. It is rendered as an audio spectrogram (the\n"
-        "  real signal is fed as IQ with Q=0, so the spectrum mirrors\n"
-        "  about DC). Needs libsndfile.\n"
-        "\n"
-        "  Options:\n"
-        "    --fft=N              FFT length per frame, power of two.\n"
-        "                         Default 1024 (≈47 Hz / bin at 48 kHz).\n"
-        "                         Bigger = finer frequency resolution,\n"
-        "                         coarser time resolution.\n"
-        "    --rows=N             Output image height in pixels = number\n"
-        "                         of time bins. Each row is the linear\n"
-        "                         average of (n_frames / rows) FFT frames.\n"
-        "                         Default 1080. Fewer rows = longer per-\n"
-        "                         row integration, which dilutes burst\n"
-        "                         peaks but cleans the noise floor.\n"
-        "    --zoom-khz=W         Visible bandwidth around DC, in kHz.\n"
-        "                         Default 30 (±15 kHz). --full-width to\n"
-        "                         disable.\n"
-        "    --center-hz=F        Label-only frequency offset added to the\n"
-        "                         displayed axis ticks; the IQ itself is\n"
-        "                         not shifted. Useful for reading absolute\n"
-        "                         RF instead of baseband. Default 0.\n"
-        "    --lo-shift-khz=N     NCO-shift the loaded IQ by -N kHz before\n"
-        "                         FFT. Positive N brings a signal at +N kHz\n"
-        "                         baseband to DC. Use to centre a carrier\n"
-        "                         that landed off-DC due to LO error.\n"
-        "                         Default 0.\n"
-        "    --dc-notch           Notch out DC and ±dc-notch-bins. Off by\n"
-        "                         default — the B210 in this stack has a\n"
-        "                         working DC blocker so DC sits BELOW the\n"
-        "                         noise floor, and the bright vertical line\n"
-        "                         one sometimes sees at DC is the satellite\n"
-        "                         carrier passing through 0 Hz baseband at\n"
-        "                         TCA. Enable for SDRs that leak DC.\n"
-        "    --power-offset=X     Constant (dB) added to every colorbar\n"
-        "                         label. Default 0 → labels are absolute\n"
-        "                         dBFS per FFT bin. Pass the gain-chain\n"
-        "                         offset (e.g. -60 for a B210 at 50 dB LNA\n"
-        "                         gain with full-scale ≈ -10 dBm) to read\n"
-        "                         dBm at the antenna directly off the bar.\n"
-        "    --power-unit=U       Unit string drawn above the colorbar.\n"
-        "                         Default 'dBFS'; auto-switches to 'dBm'\n"
-        "                         when --power-offset is non-zero unless\n"
-        "                         overridden here. Any short ASCII works.\n"
-        "    --db-min=X           Lower end of the displayed dB range, in\n"
-        "                         the SAME units shown on the colorbar\n"
-        "                         (absolute dBFS by default; dBm if you've\n"
-        "                         passed --power-offset). Cells at or below\n"
-        "                         this value map to the darkest viridis\n"
-        "                         pixel. Either endpoint left unset\n"
-        "                         falls back to the percentile auto-clip.\n"
-        "    --db-max=X           Upper end of the displayed dB range, same\n"
-        "                         units as --db-min. Cells at or above this\n"
-        "                         value map to the brightest viridis pixel.\n"
-        "    --detrend=MODE       How to subtract the slowly-varying\n"
-        "                         background. Default 'median' (whole-pass\n"
-        "                         median per frequency column; cheap and\n"
-        "                         robust). 'hpf' = zero-phase 1-pole\n"
-        "                         highpass along time per column —\n"
-        "                         tracks AGC-like drift inside the pass\n"
-        "                         while preserving short transients\n"
-        "                         (beacons, packets). 'none' = leave\n"
-        "                         cells untouched, label colorbar in\n"
-        "                         absolute dBFS via the FFT scale.\n"
-        "    --detrend-tau-s=T    Time constant for --detrend=hpf, in\n"
-        "                         seconds. Default 30 (preserves anything\n"
-        "                         shorter than ~10 s; aggressive flattens\n"
-        "                         AGC drift over minutes). For an IQ\n"
-        "                         capture without Doppler correction the\n"
-        "                         carrier dwells in each frequency bin\n"
-        "                         for tens of seconds as it sweeps —\n"
-        "                         use T = 120…300 in that case so the\n"
-        "                         HPF doesn't subtract the carrier's own\n"
-        "                         energy out of itself.\n"
-        "    --marks-csv=<path>   Overlay horizontal tick marks on the\n"
-        "                         time axis at the times listed in the\n"
-        "                         CSV. Format matches beacon_detect's\n"
-        "                         output: '#'-comment lines and a header\n"
-        "                         row, then one detection per row with\n"
-        "                         t_s in the second column. Bright orange\n"
-        "                         tick into the left margin + faint\n"
-        "                         dotted line across the spectrogram, so\n"
-        "                         each detection is easy to cross-check\n"
-        "                         against visible bursts.\n"
-        "    --show-tm=<path>     Overlay cyan right-pointing arrows in the\n"
-        "                         left margin at each burst_start row of an\n"
-        "                         rx_replay --burst-csv output. unix_time_ms\n"
-        "                         is converted to seconds-since-start using\n"
-        "                         the same start_utc the time axis uses.\n"
-        "    --start-utc=YYYYMMDDTHHMMSS\n"
-        "                         Override the capture-start UTC time used\n"
-        "                         for the time-axis labels. Default: parse\n"
-        "                         the UT= field out of <iq_path>.\n"
-        "    --elapsed-time       Force the time axis to show HH:MM:SS\n"
-        "                         elapsed-since-start instead of local\n"
-        "                         clock time (the default when the UT=\n"
-        "                         field is present in the filename).\n"
-        "    dB range auto-clipped to the 5th/99th percentile of the\n"
-        "    post-median-subtraction values for any endpoint not pinned\n"
-        "    by --db-min / --db-max. Passing one of them alone leaves\n"
-        "    auto-clip in charge of the other. The auto-clip choice is\n"
-        "    internal (median-subtracted) but the colorbar always labels\n"
-        "    in absolute dBFS (or dBm via --power-offset), and\n"
-        "    --db-min / --db-max take their values in the same absolute\n"
-        "    units the bar displays.\n");
-}
-
 static int parse_double_opt(const char *arg, const char *prefix, double *out)
 {
     size_t plen = strlen(prefix);
@@ -1762,15 +1634,292 @@ static int parse_int_opt(const char *arg, const char *prefix, int *out)
     return 1;
 }
 
+// Parsed command-line configuration. parse_args() fills this; main() then
+// resolves the extension-based positional roles (.ogg vs .iq) and copies the
+// fields out into the working locals the (large) render body below uses.
+typedef struct {
+    // Up to three positional tokens. main() maps them by file extension:
+    // .iq/.raw -> <iq_path> <sample_rate_hz> [<out_png>]; .ogg has no
+    // sample-rate arg so it is <audio.ogg> [<out_png>].
+    const char *pos1;
+    const char *pos2;
+    const char *pos3;
+    const char *out_pdf;          // --pdf=<path>
+    double lo_shift_hz;           // --lo-shift-khz=<n> * 1000
+    int start_utc_overridden;     // --start-utc / --elapsed-time given
+    wf_opts_t opt;                // every other option writes in here
+} gw_args_t;
+
+// Option column width: the widest label below ("--start-utc=YYYYMMDDTHHMMSS")
+// + a small margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 29
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(gw_args_t *a, int argc, char **argv, int help)
+{
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+        int rc = 0;
+        double d = 0.0;
+        int v = 0;
+
+        // Positionals first so the <...> arguments list above the --options.
+        // main() decides which token is the rate vs the output PNG by the
+        // input file extension; here they are captured generically.
+        if ((a->pos1 == NULL && (arg[0] != '-' || strcmp(arg, "-") == 0)) || help) {
+            if (help) parse_help_line(OPTW, "<iq_path>", "raw int16 I,Q file, or a SatNOGS .ogg audio recording");
+            else a->pos1 = arg;
+            matched = 1;
+        }
+        if ((a->pos1 != NULL && a->pos2 == NULL && (arg[0] != '-' || strcmp(arg, "-") == 0)) || help) {
+            if (help) parse_help_line(OPTW, "<sample_rate_hz>", "IQ sample rate in Hz (omit for .ogg; read from file)");
+            else a->pos2 = arg;
+            matched = 1;
+        }
+        if ((a->pos2 != NULL && a->pos3 == NULL && (arg[0] != '-' || strcmp(arg, "-") == 0)) || help) {
+            if (help) parse_help_line(OPTW, "[<out_png>]", "output PNG path (positional; optional if --pdf= given)");
+            else a->pos3 = arg;
+            matched = 1;
+        }
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if ((rc = parse_int_opt(arg, "--fft=", &v)) != 0 || help) {
+            if (help) parse_help_line(OPTW, "--fft=<n>", "FFT length per frame, power of two (default 1024)");
+            else {
+                if (rc < 0) { fprintf(stderr, "gen_waterfall: invalid number in '%s'\n", arg); return PARSE_ERROR; }
+                a->opt.fft_size = v;
+            }
+            matched = 1;
+        }
+        if ((rc = parse_int_opt(arg, "--rows=", &v)) != 0 || help) {
+            if (help) parse_help_line(OPTW, "--rows=<n>", "output image height in pixels / time bins (default 1080)");
+            else {
+                if (rc < 0) { fprintf(stderr, "gen_waterfall: invalid number in '%s'\n", arg); return PARSE_ERROR; }
+                a->opt.out_rows = v;
+            }
+            matched = 1;
+        }
+        if ((rc = parse_double_opt(arg, "--db-min=", &d)) != 0 || help) {
+            if (help) parse_help_line(OPTW, "--db-min=<x>", "lower end of displayed dB range (colorbar units)");
+            else {
+                if (rc < 0) { fprintf(stderr, "gen_waterfall: invalid number in '%s'\n", arg); return PARSE_ERROR; }
+                a->opt.db_min = (float) d;
+                a->opt.db_min_user_set = 1;
+            }
+            matched = 1;
+        }
+        if ((rc = parse_double_opt(arg, "--db-max=", &d)) != 0 || help) {
+            if (help) parse_help_line(OPTW, "--db-max=<x>", "upper end of displayed dB range (colorbar units)");
+            else {
+                if (rc < 0) { fprintf(stderr, "gen_waterfall: invalid number in '%s'\n", arg); return PARSE_ERROR; }
+                a->opt.db_max = (float) d;
+                a->opt.db_max_user_set = 1;
+            }
+            matched = 1;
+        }
+        if (strncmp(arg, "--detrend=", 10) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--detrend=<mode>", "background subtraction: median (default), hpf, none");
+            else {
+                const char *m = arg + 10;
+                if      (strcmp(m, "median") == 0) a->opt.detrend_mode = 0;
+                else if (strcmp(m, "hpf")    == 0) a->opt.detrend_mode = 1;
+                else if (strcmp(m, "none")   == 0) a->opt.detrend_mode = 2;
+                else {
+                    fprintf(stderr,
+                        "gen_waterfall: --detrend=%s: expected one of "
+                        "median, hpf, none\n", m);
+                    return PARSE_ERROR;
+                }
+            }
+            matched = 1;
+        }
+        if ((rc = parse_double_opt(arg, "--detrend-tau-s=", &d)) != 0 || help) {
+            if (help) parse_help_line(OPTW, "--detrend-tau-s=<t>", "time constant for --detrend=hpf, seconds (default 30)");
+            else {
+                if (rc < 0) { fprintf(stderr, "gen_waterfall: invalid number in '%s'\n", arg); return PARSE_ERROR; }
+                if (d <= 0.0) {
+                    fprintf(stderr,
+                        "gen_waterfall: --detrend-tau-s=%g: must be > 0\n", d);
+                    return PARSE_ERROR;
+                }
+                a->opt.detrend_tau_s = d;
+            }
+            matched = 1;
+        }
+        if (strncmp(arg, "--marks-csv=", 12) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--marks-csv=<path>", "overlay time-axis tick marks from a beacon_detect CSV");
+            else a->opt.marks_csv_path = arg + 12;
+            matched = 1;
+        }
+        if (strncmp(arg, "--show-tm=", 10) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--show-tm=<path>", "overlay burst_start arrows from an rx_replay --burst-csv");
+            else a->opt.show_tm_csv_path = arg + 10;
+            matched = 1;
+        }
+        if ((rc = parse_double_opt(arg, "--center-hz=", &d)) != 0 || help) {
+            if (help) parse_help_line(OPTW, "--center-hz=<f>", "label-only frequency offset added to axis ticks (default 0)");
+            else {
+                if (rc < 0) { fprintf(stderr, "gen_waterfall: invalid number in '%s'\n", arg); return PARSE_ERROR; }
+                a->opt.center_hz = d;
+            }
+            matched = 1;
+        }
+        if ((rc = parse_double_opt(arg, "--lo-shift-khz=", &d)) != 0 || help) {
+            if (help) parse_help_line(OPTW, "--lo-shift-khz=<n>", "NCO-shift the loaded IQ by -N kHz before FFT (default 0)");
+            else {
+                if (rc < 0) { fprintf(stderr, "gen_waterfall: invalid number in '%s'\n", arg); return PARSE_ERROR; }
+                a->lo_shift_hz = d * 1000.0;
+            }
+            matched = 1;
+        }
+        if ((rc = parse_double_opt(arg, "--zoom-khz=", &d)) != 0 || help) {
+            if (help) parse_help_line(OPTW, "--zoom-khz=<w>", "visible bandwidth around DC, kHz (default 30; --full-width off)");
+            else {
+                if (rc < 0) { fprintf(stderr, "gen_waterfall: invalid number in '%s'\n", arg); return PARSE_ERROR; }
+                a->opt.zoom_hz = d * 1000.0;
+            }
+            matched = 1;
+        }
+        if (strcmp(arg, "--full-width") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--full-width", "show the full capture width (disable --zoom-khz)");
+            else a->opt.zoom_hz = 0.0;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-dc-notch") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-dc-notch", "do not notch DC (the default)");
+            else a->opt.dc_notch = 0;
+            matched = 1;
+        }
+        if (strcmp(arg, "--dc-notch") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--dc-notch", "notch out DC and +/-dc-notch-bins (off by default)");
+            else a->opt.dc_notch = 1;
+            matched = 1;
+        }
+        if ((rc = parse_int_opt(arg, "--dc-notch-bins=", &v)) != 0 || help) {
+            if (help) parse_help_line(OPTW, "--dc-notch-bins=<n>", "half-width of the DC notch in bins (default 4)");
+            else {
+                if (rc < 0) { fprintf(stderr, "gen_waterfall: invalid number in '%s'\n", arg); return PARSE_ERROR; }
+                a->opt.dc_notch_bins = v;
+            }
+            matched = 1;
+        }
+        if (strncmp(arg, "--start-utc=", 12) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--start-utc=YYYYMMDDTHHMMSS", "override capture-start UTC for the time axis");
+            else {
+                double subsec = 0.0;
+                time_t tt = parse_ut_string_frac(arg + 12, &subsec);
+                if (tt == 0) {
+                    fprintf(stderr,
+                        "gen_waterfall: --start-utc must be YYYYMMDDTHHMMSS[.fff]\n");
+                    return PARSE_ERROR;
+                }
+                a->opt.start_utc = tt;
+                a->opt.start_utc_subsec = subsec;
+                a->start_utc_overridden = 1;
+            }
+            matched = 1;
+        }
+        if (strcmp(arg, "--elapsed-time") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--elapsed-time", "force HH:MM:SS elapsed-since-start time axis");
+            else {
+                a->opt.start_utc = 0;
+                a->opt.start_utc_subsec = 0.0;
+                a->start_utc_overridden = 1;
+            }
+            matched = 1;
+        }
+        if (strncmp(arg, "--pdf=", 6) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--pdf=<path>", "also emit a vector-text PDF (sharp labels at any zoom)");
+            else a->out_pdf = arg + 6;
+            matched = 1;
+        }
+        if ((rc = parse_double_opt(arg, "--power-offset=", &d)) != 0 || help) {
+            if (help) parse_help_line(OPTW, "--power-offset=<x>", "dB added to every colorbar label (default 0; implies dBm)");
+            else {
+                if (rc < 0) { fprintf(stderr, "gen_waterfall: invalid number in '%s'\n", arg); return PARSE_ERROR; }
+                a->opt.power_offset_db = (float) d;
+                // If the user gave us an offset, assume they want dBm
+                // labels unless they also pass --power-unit explicitly.
+                if (strcmp(a->opt.power_unit, "dBFS") == 0) {
+                    snprintf(a->opt.power_unit, sizeof a->opt.power_unit, "%s", "dBm");
+                }
+            }
+            matched = 1;
+        }
+        if (strncmp(arg, "--power-unit=", 13) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--power-unit=<u>", "unit string drawn above the colorbar (default dBFS)");
+            else snprintf(a->opt.power_unit, sizeof a->opt.power_unit, "%s", arg + 13);
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            fprintf(stderr, "gen_waterfall: unknown option '%s'\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
+}
+
 // -V / --version support (commit baked in at build time).
 #include "sso_version.h"
 
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "gen_waterfall")) return 0;
-    if (argc < 3) { usage(); return 2; }
-    const char *iq_path  = argv[1];
-    const char *out_pdf  = NULL;  // --pdf=<path>: emit a vector-text PDF too
+
+    // Zero-init so every field the CLI doesn't set explicitly starts
+    // NULL/0 - in particular wf_opts_t's progress_pct_out, which only the
+    // GUI (decode_inspector) uses. Left uninitialized it was stack garbage,
+    // and wf_compute's "if (progress_pct_out != NULL)" then wrote through
+    // it: a crash that showed up in the optimized clang build but not gcc.
+    gw_args_t cfg = {0};
+    cfg.opt.fft_size      = 1024;
+    cfg.opt.hop           = 0;            // 0 = N/2 default
+    cfg.opt.out_rows      = 1080;
+    cfg.opt.db_min          = 0.0f;
+    cfg.opt.db_max          = 0.0f;
+    cfg.opt.db_min_user_set = 0;
+    cfg.opt.db_max_user_set = 0;
+    cfg.opt.detrend_mode    = 0;        // median (backwards compatible default)
+    cfg.opt.detrend_tau_s   = 30.0;     // typical AGC ramps die in ~30 s
+    cfg.opt.marks_csv_path  = NULL;
+    cfg.opt.show_tm_csv_path = NULL;
+    cfg.opt.center_hz     = 0.0;
+    cfg.opt.zoom_hz       = 0.0;          // full capture width by default; --zoom-khz=<n> narrows
+    // DC notch is OFF by default. The B210 in this stack ships with
+    // its DC blocker active so the DC bin sits BELOW the noise floor,
+    // and the bright vertical line one sees in the middle of a pass
+    // is the satellite carrier passing through 0 Hz baseband at TCA
+    // (Doppler crossing zero) — real signal, not LO bleed. Pass
+    // --dc-notch when capturing from an SDR that leaks DC.
+    cfg.opt.dc_notch      = 0;
+    cfg.opt.dc_notch_bins = 4;            // ±4 bins ≈ ±188 Hz at fft=1024 fs=48k
+    cfg.opt.display_bw_hz   = 0.0;        // build_waterfall fills this in
+    cfg.opt.display_db_lo   = 0.0f;       // (build_waterfall fills these too)
+    cfg.opt.display_db_hi   = 0.0f;
+    cfg.opt.display_db_floor = 0.0f;
+    cfg.opt.power_offset_db  = 0.0f;
+    snprintf(cfg.opt.power_unit, sizeof cfg.opt.power_unit, "%s", "dBFS");
+
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
+    }
+
+    if (cfg.pos1 == NULL) {
+        fprintf(stderr, "gen_waterfall: missing <iq_path> (try --help)\n");
+        return 2;
+    }
+
+    const char *iq_path  = cfg.pos1;
+    const char *out_pdf  = cfg.out_pdf;  // --pdf=<path>: emit a vector-text PDF too
     // PNG path is positional but optional — if it starts with "--" it's
     // already an option and the user is asking for PDF-only (supplied
     // via --pdf=...). We validate below.
@@ -1778,161 +1927,36 @@ int main(int argc, char **argv)
     // A .ogg input is a SatNOGS FM-audio recording: there is NO
     // sample-rate positional (libsndfile reads it from the file), so the
     // output PNG is positional arg 2. For .iq/.raw the rate stays
-    // positional arg 2 and the PNG arg 3.
+    // positional arg 2 and the PNG arg 3. Explicit extension beats inferred,
+    // exactly as before — parse_args only captured the raw tokens.
     size_t ipl = strlen(iq_path);
     int is_ogg = (ipl >= 4 && strcmp(iq_path + ipl - 4, ".ogg") == 0);
     int sample_rate = 0;
-    int first_opt;
     if (is_ogg) {
-        first_opt = 2;
-        if (argc >= 3 && strncmp(argv[2], "--", 2) != 0) {
-            out_png = argv[2];
-            first_opt = 3;
+        out_png = cfg.pos2;               // optional PNG, or NULL for PDF-only
+        if (cfg.pos3 != NULL) {
+            fprintf(stderr, "gen_waterfall: unknown option '%s'\n", cfg.pos3);
+            return 2;
         }
     } else {
-        sample_rate = atoi(argv[2]);
-        first_opt = 3;
-        if (argc >= 4 && strncmp(argv[3], "--", 2) != 0) {
-            out_png = argv[3];
-            first_opt = 4;
-        }
+        sample_rate = (cfg.pos2 != NULL) ? atoi(cfg.pos2) : 0;
+        out_png = cfg.pos3;               // optional PNG, or NULL for PDF-only
     }
 
     // Optional NCO shift applied to the loaded IQ before FFT. Positive
     // N moves a signal at +N kHz baseband to DC. Sign matches
     // rx_replay --lo-shift-khz.
-    double lo_shift_hz = 0.0;
+    double lo_shift_hz = cfg.lo_shift_hz;
 
-    // Zero-init so every field the CLI doesn't set explicitly starts
-    // NULL/0 - in particular progress_pct_out, which only the GUI
-    // (decode_inspector) uses. Left uninitialized it was stack garbage,
-    // and wf_compute's "if (progress_pct_out != NULL)" then wrote
-    // through it: a crash that showed up in the optimized clang build
-    // but not gcc.
-    wf_opts_t opt = {0};
-    opt.fft_size      = 1024;
-    opt.hop           = 0;            // 0 = N/2 default
-    opt.out_rows      = 1080;
-    opt.db_min          = 0.0f;
-    opt.db_max          = 0.0f;
-    opt.db_min_user_set = 0;
-    opt.db_max_user_set = 0;
-    opt.detrend_mode    = 0;        // median (backwards compatible default)
-    opt.detrend_tau_s   = 30.0;     // typical AGC ramps die in ~30 s
-    opt.marks_csv_path  = NULL;
-    opt.show_tm_csv_path = NULL;
-    opt.sample_rate   = sample_rate;
-    opt.center_hz     = 0.0;
-    opt.zoom_hz       = 0.0;          // full capture width by default; --zoom-khz=<n> narrows
-    // DC notch is OFF by default. The B210 in this stack ships with
-    // its DC blocker active so the DC bin sits BELOW the noise floor,
-    // and the bright vertical line one sees in the middle of a pass
-    // is the satellite carrier passing through 0 Hz baseband at TCA
-    // (Doppler crossing zero) — real signal, not LO bleed. Pass
-    // --dc-notch when capturing from an SDR that leaks DC.
-    opt.dc_notch      = 0;
-    opt.dc_notch_bins = 4;            // ±4 bins ≈ ±188 Hz at fft=1024 fs=48k
-    opt.display_bw_hz   = 0.0;        // build_waterfall fills this in
-    opt.display_db_lo   = 0.0f;       // (build_waterfall fills these too)
-    opt.display_db_hi   = 0.0f;
-    opt.display_db_floor = 0.0f;
-    opt.power_offset_db  = 0.0f;
-    snprintf(opt.power_unit, sizeof opt.power_unit, "%s", "dBFS");
+    wf_opts_t opt = cfg.opt;
+    opt.sample_rate = sample_rate;
     // simple_sat_ops names IQ files <prefix>_UT=YYYYMMDDTHHMMSS.fff.iq;
-    // parse that out so the y-axis labels show local clock time. CLI
-    // --start-utc=YYYYMMDDTHHMMSS overrides.
-    opt.start_utc     = parse_ut_from_path(iq_path, &opt.start_utc_subsec);
-
-    for (int i = first_opt; i < argc; ++i) {
-        int rc = 0;
-        double d = 0.0;
-        int    v = 0;
-        if ((rc = parse_int_opt(argv[i], "--fft=", &v)) != 0) {
-            if (rc < 0) { usage(); return 2; }
-            opt.fft_size = v;
-        } else if ((rc = parse_int_opt(argv[i], "--rows=", &v)) != 0) {
-            if (rc < 0) { usage(); return 2; }
-            opt.out_rows = v;
-        } else if ((rc = parse_double_opt(argv[i], "--db-min=", &d)) != 0) {
-            if (rc < 0) { usage(); return 2; }
-            opt.db_min = (float) d;
-            opt.db_min_user_set = 1;
-        } else if ((rc = parse_double_opt(argv[i], "--db-max=", &d)) != 0) {
-            if (rc < 0) { usage(); return 2; }
-            opt.db_max = (float) d;
-            opt.db_max_user_set = 1;
-        } else if (strncmp(argv[i], "--detrend=", 10) == 0) {
-            const char *m = argv[i] + 10;
-            if      (strcmp(m, "median") == 0) opt.detrend_mode = 0;
-            else if (strcmp(m, "hpf")    == 0) opt.detrend_mode = 1;
-            else if (strcmp(m, "none")   == 0) opt.detrend_mode = 2;
-            else {
-                fprintf(stderr,
-                    "gen_waterfall: --detrend=%s: expected one of "
-                    "median, hpf, none\n", m);
-                usage(); return 2;
-            }
-        } else if ((rc = parse_double_opt(argv[i], "--detrend-tau-s=", &d)) != 0) {
-            if (rc < 0) { usage(); return 2; }
-            if (d <= 0.0) {
-                fprintf(stderr,
-                    "gen_waterfall: --detrend-tau-s=%g: must be > 0\n", d);
-                return 2;
-            }
-            opt.detrend_tau_s = d;
-        } else if (strncmp(argv[i], "--marks-csv=", 12) == 0) {
-            opt.marks_csv_path = argv[i] + 12;
-        } else if (strncmp(argv[i], "--show-tm=", 10) == 0) {
-            opt.show_tm_csv_path = argv[i] + 10;
-        } else if ((rc = parse_double_opt(argv[i], "--center-hz=", &d)) != 0) {
-            if (rc < 0) { usage(); return 2; }
-            opt.center_hz = d;
-        } else if ((rc = parse_double_opt(argv[i], "--lo-shift-khz=", &d)) != 0) {
-            if (rc < 0) { usage(); return 2; }
-            lo_shift_hz = d * 1000.0;
-        } else if ((rc = parse_double_opt(argv[i], "--zoom-khz=", &d)) != 0) {
-            if (rc < 0) { usage(); return 2; }
-            opt.zoom_hz = d * 1000.0;
-        } else if (strcmp(argv[i], "--full-width") == 0) {
-            opt.zoom_hz = 0.0;
-        } else if (strcmp(argv[i], "--no-dc-notch") == 0) {
-            opt.dc_notch = 0;
-        } else if (strcmp(argv[i], "--dc-notch") == 0) {
-            opt.dc_notch = 1;
-        } else if ((rc = parse_int_opt(argv[i], "--dc-notch-bins=", &v)) != 0) {
-            if (rc < 0) { usage(); return 2; }
-            opt.dc_notch_bins = v;
-        } else if (strncmp(argv[i], "--start-utc=", 12) == 0) {
-            double subsec = 0.0;
-            time_t t = parse_ut_string_frac(argv[i] + 12, &subsec);
-            if (t == 0) {
-                fprintf(stderr,
-                    "gen_waterfall: --start-utc must be YYYYMMDDTHHMMSS[.fff]\n");
-                return 2;
-            }
-            opt.start_utc = t;
-            opt.start_utc_subsec = subsec;
-        } else if (strcmp(argv[i], "--elapsed-time") == 0) {
-            opt.start_utc = 0;
-            opt.start_utc_subsec = 0.0;
-        } else if (strncmp(argv[i], "--pdf=", 6) == 0) {
-            out_pdf = argv[i] + 6;
-        } else if ((rc = parse_double_opt(argv[i], "--power-offset=", &d)) != 0) {
-            if (rc < 0) { usage(); return 2; }
-            opt.power_offset_db = (float) d;
-            // If the user gave us an offset, assume they want dBm
-            // labels unless they also pass --power-unit explicitly.
-            if (strcmp(opt.power_unit, "dBFS") == 0) {
-                snprintf(opt.power_unit, sizeof opt.power_unit, "%s", "dBm");
-            }
-        } else if (strncmp(argv[i], "--power-unit=", 13) == 0) {
-            snprintf(opt.power_unit, sizeof opt.power_unit, "%s", argv[i] + 13);
-        } else {
-            fprintf(stderr, "gen_waterfall: unknown option '%s'\n", argv[i]);
-            usage();
-            return 2;
-        }
+    // parse that out so the y-axis labels show local clock time, unless
+    // --start-utc=YYYYMMDDTHHMMSS / --elapsed-time already overrode it.
+    if (!cfg.start_utc_overridden) {
+        opt.start_utc = parse_ut_from_path(iq_path, &opt.start_utc_subsec);
     }
+
     if (opt.hop == 0) opt.hop = opt.fft_size / 2;
 
     if (!is_ogg && sample_rate <= 0) {
@@ -1942,7 +1966,6 @@ int main(int argc, char **argv)
     if (out_png == NULL && out_pdf == NULL) {
         fprintf(stderr,
             "gen_waterfall: need either <out_png> or --pdf=<path>\n");
-        usage();
         return 2;
     }
 

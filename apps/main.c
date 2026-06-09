@@ -38,6 +38,7 @@
 #include "agenda_line.h"
 #include "tcmd_lint.h"
 #include "sso_version.h"
+#include "argparse.h"
 
 #ifdef SSO_WITH_SDR
 #include "b210_rx_tx_core.h"
@@ -3876,7 +3877,7 @@ static void scan_sky_start(state_t *state);
 static void scan_sky_stop(state_t *state, const char *reason);
 static void scan_sky_tick(state_t *state, double t_now);
 void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, double downlink_freq);
-int  apply_args(state_t *state, int argc, char **argv, double jul_utc);
+static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help);
 
 // --- TLE auto-discovery helpers (used by --control with no
 //     positional satellite name) ------------------------------------
@@ -4421,262 +4422,6 @@ static void generate_pass_plot(state_t *state, const char *pass_folder,
     }
 }
 
-// --- Usage ---------------------------------------------------------
-
-void usage(FILE *dest, const char *name, int full)
-{
-    fprintf(dest,
-        "usage: %s [--control] [<satellite_id>] [options]\n"
-        "\n"
-        "Live satellite tracker for the FrontierSat ground station. Predicts\n"
-        "passes, drives the SPID rotator, computes Doppler-shifted simplex\n"
-        "frequencies, and (with --control) owns the USRP B210 directly:\n"
-        "RX + AX100 decode + in-process TX bursts via the 't' compose modal.\n"
-        "One process for everything live. Viewers connect over sso_ipc.\n"
-        "\n"
-        "Modes:\n"
-        "  %s --control                 Operator: opens the sso_ipc server,\n"
-        "                               drives the rotator. With no\n"
-        "                               <satellite_id>, the newest *.tle under\n"
-        "                               /FrontierSat/TLEs/ is loaded directly\n"
-        "                               and pinned into the pass folder.\n"
-        "  %s <satellite_id>            Standalone tracker (legacy / dev).\n"
-        "  %s                           No args: connects to the running\n"
-        "                               operator and shows its state\n"
-        "                               read-only. Errors out if no\n"
-        "                               operator is running.\n"
-        "\n"
-        "Positional arguments:\n"
-        "  <satellite_id>               Name prefix to match in the TLE, or `next`\n"
-        "                               to auto-select the next visible pass.\n"
-        "                               Optional when --control is given.\n"
-        "\n"
-        "TLE source:\n"
-        "  --tle <path>                 Path to a TLE file (2 or 3-line format).\n"
-        "                               Default: $HOME/.local/state/simple_sat_ops/active.tle\n"
-        "                               (auto-populated by --control without a\n"
-        "                               positional satellite_id).\n"
-        "\n"
-        "HMAC keyfile:\n"
-        "  --hmac-keyfile <path>        HMAC key file shown on the operator banner\n"
-        "                               for visual confirmation. Default: shared\n"
-        "                               " HMAC_KEYFILE_SHARED_PATH ",\n"
-        "                               falling back to $HOME/" HMAC_KEYFILE_USER_RELPATH ".\n"
-        "                               The file is opened + validated at startup;\n"
-        "                               the banner shows \"(N bytes ok)\" / \"(MISSING)\"\n"
-        "                               / \"(BAD)\". The bytes never reach the UI.\n"
-        "\n"
-        "Hardware (rotator + B210):\n"
-        "  --without-rotator            Skip the SPID Rot2Prog. Default is on:\n"
-        "                               the tracker initialises and commands\n"
-        "                               the rotator unless this flag is given.\n"
-        "  --without-hardware           Synonym for --without-rotator\n"
-        "  --calibrate-rotator          Drive the antenna across known arcs to\n"
-        "                               measure the rotator's deg/s slew rate\n"
-        "                               on each axis. Writes the rates to\n"
-        "                               $HOME/.local/share/simple_sat_ops/\n"
-        "                               rotator_{az,el}_rate_dps then exits.\n"
-        "                               Requires --confirm-rotator-calibrate\n"
-        "                               (the antenna physically moves; the\n"
-        "                               operator must clear the mast first).\n"
-        "  --confirm-rotator-calibrate  Safety interlock for --calibrate-rotator.\n"
-        "  --without-rotator-pursuit    Disable the pursuit / lead-aim planner\n"
-        "                               even if calibration is on disk. The\n"
-        "                               track loop falls back to today's\n"
-        "                               aim-where-sat-is-now behavior. Useful\n"
-        "                               for A/B comparison on the bench.\n"
-        "  --without-b210               Skip the USRP B210 (dev hosts that\n"
-        "                               have UHD but no device, or any time\n"
-        "                               you just want the UI + rotator).\n"
-        "  --sdr-type=uhd|rtlsdr|auto   SDR backend (default auto: probe UHD,\n"
-        "                               then RTL-SDR). RTL-SDR is RX-only.\n"
-        "  --sdr-device=<sel>           Backend-specific device selector\n"
-        "                               (RTL-SDR index; for UHD use --uhd-args).\n"
-        "  --uhd-args=<args>            UHD device-args verbatim (e.g.\n"
-        "                               \"type=b200,serial=...\"). Overrides detect.\n"
-        "  --sdr-fpga=<path>            Force a UHD FPGA image (B2xx clone whose\n"
-        "                               bitstream differs from the stock image).\n"
-        "  --tr-switch-device=<path>    UHF T/R antenna switch (USB-CDC).\n"
-        "                               Default /dev/ttyACM0, auto-probed on\n"
-        "                               start; absence is warned-and-continued.\n"
-        "  --without-tr-switch          Skip the T/R switch probe entirely.\n"
-        "  --no-tx                      Open the B210 for RX, but block the\n"
-        "                               TX compose modal from actually keying\n"
-        "                               the PA. Typing + preview broadcast to\n"
-        "                               viewers still work, so the operator\n"
-        "                               can rehearse a telecommand and get\n"
-        "                               eyes on it without going on air.\n"
-        "  --live-waterfall             Auto-launch the raylib live_waterfall\n"
-        "                               viewer alongside the terminal UI when\n"
-        "                               a recording starts. The viewer reads\n"
-        "                               the live .iq file directly; closing\n"
-        "                               its window leaves the recording\n"
-        "                               running. Skipped silently if\n"
-        "                               live_waterfall isn't on PATH.\n"
-        "  --always-record              Start WAV/IQ recording (and the .doppler,\n"
-        "                               .lo_offset, .burst sidecars) as soon as\n"
-        "                               the B210 opens, and keep it open until\n"
-        "                               shutdown. Skips the usual elevation-driven\n"
-        "                               per-pass start/stop, so bench runs that\n"
-        "                               aren't tied to a satellite (noise-floor\n"
-        "                               vs. antenna orientation, no-antenna\n"
-        "                               baseline, hours of gain-stability data)\n"
-        "                               still produce a continuous capture.\n"
-        "                               Pair with --pass-folder to land the files\n"
-        "                               somewhere specific.\n"
-        "  --testing                    Bench / characterisation mode. Pass folder\n"
-        "                               lands under <root>/Testing/yyyymmdd/hhmmLT/\n"
-        "                               using the CURRENT local time — no TLE\n"
-        "                               prediction needed, and the Operations/\n"
-        "                               tree (plus its 'current' symlink) is left\n"
-        "                               untouched. Usually paired with\n"
-        "                               --always-record and --without-rotator.\n"
-        "  --scan-sky                   Rebind T to walk the rotator through a\n"
-        "                               sky grid (roughly equal-solid-angle\n"
-        "                               (az, el) targets), dwelling 5 s at each.\n"
-        "                               First target is (0, 0); azimuth stays in\n"
-        "                               (-180, 180) so the rotator never crosses\n"
-        "                               the wrap boundary. Each arrival is\n"
-        "                               appended to scan_sky_UT=*.csv in the pass\n"
-        "                               folder. Press s to stop mid-scan. TLE /\n"
-        "                               in-pass state is ignored.\n"
-        "  --scan-step=<deg>            Elevation ring spacing for --scan-sky\n"
-        "                               (default 15.0, clamped to [1, 45]). Az\n"
-        "                               samples per ring scale with cos(el) so\n"
-        "                               cells stay approximately equal area.\n"
-        "  --rx-gain=<dB>               AD9361 RX gain at session open, dB.\n"
-        "                               Default 30; range [0, 76]. Pick from a\n"
-        "                               b210_gain_sweep run — operate ~5 dB above\n"
-        "                               the knee where the noise floor stops\n"
-        "                               tracking gain 1:1. Adjustable mid-pass\n"
-        "                               via the ':gain <dB>' colon command.\n"
-        "  --lo-offset=<kHz>            Park the SDR LO this far off the nominal\n"
-        "                               carrier (signed, default -25). Adjustable\n"
-        "                               mid-pass via ':lo_offset <signed_kHz>'.\n"
-        "  --ad9361-dc-track=on|off     AD9361 background DC-offset tracking.\n"
-        "                               Default ON (UHD default). The slow IIR\n"
-        "                               notch suppresses the AD9361's static\n"
-        "                               ADC DC bias; turning it off and\n"
-        "                               letting fm_lo_nco rotate the raw bias\n"
-        "                               leaks a large +lo_offset_hz sinusoid\n"
-        "                               into the decode-path IQ.\n"
-        "  --ad9361-iq-track=on|off     AD9361 background IQ-balance tracking.\n"
-        "                               Default OFF — the loop kicks discrete\n"
-        "                               phase-rotation steps into the IQ at\n"
-        "                               ~51 Hz, visible as a comb of spikes\n"
-        "                               in the waterfall at mid-range gain.\n"
-        "                               Flip back on for A/B comparison.\n"
-        "  --tx-dry-run                 Record every TX burst as not-sent\n"
-        "                               ('dry-run') instead of routing it\n"
-        "                               through the SDR. Exercises the auto-\n"
-        "                               tcmd state machine + TX compose modal\n"
-        "                               on a dev host that has no B210 (or\n"
-        "                               with --without-b210). The allow-tx\n"
-        "                               safety checkbox still has to be\n"
-        "                               ticked — dry-run is about hardware\n"
-        "                               presence, not operator intent.\n"
-        "  --tx-preroll-ms=<n>          Modulated 0xAA carrier prepended in\n"
-        "                               front of every TX burst (default 200,\n"
-        "                               clamped to [0, 5000]). Gives the\n"
-        "                               receiver a longer symbol-clock train\n"
-        "                               and lets the B210 TX FIFO buffer the\n"
-        "                               whole burst before the real preamble\n"
-        "                               so a one-time host stall doesn't eat\n"
-        "                               the AX100 ASM.\n"
-        "  --tc-file <path>             Load a file of ASCII telecommands\n"
-        "                               (CTS1+...; one per line; '#' lines\n"
-        "                               and blank lines ignored). Press 'A'\n"
-        "                               (or `:auto`) in the operator UI to\n"
-        "                               open the auto-tcmd modal, set TX\n"
-        "                               power / repeats-per-command / inter-\n"
-        "                               send delay / allow-tx, and Enter to\n"
-        "                               start. Sends each command N times\n"
-        "                               with the chosen delay between every\n"
-        "                               shot, then advances to the next line.\n"
-        "                               Stops automatically at LOS so an\n"
-        "                               unattended run can't keep TXing\n"
-        "                               after the pass. All TX events land\n"
-        "                               in <pass_folder>/tx.log.\n"
-        "  --ignore-at-your-peril-all-tc-errors\n"
-        "                               Start even if the --tc-file agenda has\n"
-        "                               telecommand lint errors. By default a\n"
-        "                               failing agenda blocks startup; this\n"
-        "                               bypasses that check. Warnings never block.\n"
-        "\n"
-        "Operator coordination:\n"
-        "  --control                    Open the sso_ipc server (operator mode).\n"
-        "                               Without it, simple_sat_ops runs standalone\n"
-        "                               and no other operator-aware tool can verify\n"
-        "                               against it.\n"
-        "\n"
-        "Carrier display (informational; the B210 tools tune themselves):\n"
-        "  --uplink-freq-mhz=<mhz>      Uplink nominal (default %.6f)\n"
-        "  --downlink-freq-mhz=<mhz>    Downlink / simplex carrier nominal\n"
-        "                               (default %.6f)\n"
-        "  --no-doppler-correction      Display nominal freqs without Doppler\n"
-        "\n"
-        "Rotator overrides:\n"
-        "  --rotator-device <path>           SPID Rot2Prog tty. Default\n"
-        "                                    /dev/ttyUSB0 (Linux).\n"
-        "  --rotator-target-azimuth=<deg>    Park on a fixed azimuth\n"
-        "  --rotator-target-elevation=<deg>  Park on a fixed elevation\n"
-        "\n"
-        "Observer location (default RAO Priddis):\n"
-        "  --lat=<deg>                  Geodetic latitude\n"
-        "  --lon=<deg>                  Geodetic longitude (east positive)\n"
-        "  --alt=<m>                    Altitude above ellipsoid, metres\n"
-        "\n"
-        "Pass filter (used when <satellite_id> = `next`):\n"
-        "  --include-constellations     Include Starlink/OneWeb-style swarms\n"
-        "  --min-altitude-km=<km>       Minimum orbital altitude (default 0)\n"
-        "  --max-altitude-km=<km>       Maximum orbital altitude (default 1000)\n"
-        "  --min-elevation=<deg>        Minimum peak elevation (default 0)\n"
-        "  --min-minutes=<n>            Minimum minutes until AOS (default 1)\n"
-        "  --max-minutes=<n>            Maximum minutes until AOS (default 90)\n"
-        "\n"
-        "Other:\n"
-        "  --verbose=<level>            Verbosity integer\n"
-        "  --self-test                  Parse the rest of the command line,\n"
-        "                               resolve the HMAC keyfile, print the\n"
-        "                               settings simple_sat_ops would run\n"
-        "                               with (HMAC, TX Doppler, freqs,\n"
-        "                               rotator, B210, TX gates, ...) to\n"
-        "                               stdout, and exit 0. No socket, no\n"
-        "                               hardware, no TLE open — safe to run\n"
-        "                               while another operator is live.\n"
-        "  --help                       Short help (this message)\n"
-        "  --help-full                  Detailed help with keyboard layout\n",
-        name, name, name, name,
-        UPLINK_FREQ_MHZ, DOWNLINK_FREQ_MHZ);
-
-    if (!full) return;
-
-    fprintf(dest,
-        "\n"
-        "KEYBOARD (unlocked by default, press K to toggle lock state)\n"
-        "\n"
-        "  K         Toggle keyboard lock\n"
-        "  T         Start tracking the current satellite\n"
-        "  s         Stop tracking\n"
-        "  r         Reset rotator to az=0, el=0\n"
-        "  [ / ]     Nudge antenna azimuth -5 / +5 deg\n"
-        "  { / }     Nudge antenna azimuth -1 / +1 deg (fine)\n"
-        "  , / .     Nudge antenna elevation -5 / +5 deg\n"
-        "  < / >     Nudge antenna elevation -1 / +1 deg (fine)\n"
-        "  q         Quit\n"
-        "\n"
-        "EXAMPLES\n"
-        "\n"
-        "  # Auto-pick next visible pass above 10 deg (rotator is on by default)\n"
-        "  %s next --min-elevation=10 --min-minutes=10 --max-minutes=45\n"
-        "\n"
-        "  # Dry-run prediction on a dev host (no rotator hardware)\n"
-        "  %s 'ISS (ZARYA)' --without-rotator\n"
-        "\n"
-        "  # Operator coordination (broadcasts state to b210_rx_tx + tx_frame_sdr)\n"
-        "  %s next --control\n",
-        name, name, name);
-}
 
 // --- ncurses ------------------------------------------------------
 
@@ -6397,9 +6142,14 @@ int main(int argc, char **argv)
     struct timeval tv;
     UTC_Calendar_Now(&utc, &tv);
     double jul_utc = Julian_Date(&utc, &tv);
-    int status = apply_args(&state, argc, argv, jul_utc);
-    if (status != 0) {
-        return status;
+    // --help / --help-full historically exited 2; preserve that. Every
+    // parse-or-runtime failure inside apply_args collapses to exit 1
+    // (the old code returned 1 for too-many-positionals / startup
+    // errors and 3 for an unknown --option; both are now PARSE_ERROR ->
+    // 1, each still printing its own distinct stderr message).
+    switch (apply_args(&state, argc, argv, jul_utc, HELP_OFF)) {
+        case PARSE_HELP:  return 2;
+        case PARSE_ERROR: return 1;
     }
 
     // Bare invocation found a running operator — run as a read-only
@@ -7884,7 +7634,18 @@ int main(int argc, char **argv)
 
 // --- apply_args ---------------------------------------------------
 
-int apply_args(state_t *state, int argc, char **argv, double jul_utc)
+// One self-contained block per option, each testing "... || help" so
+// that in help mode (help != HELP_OFF) every block prints its one-line
+// help and falls through to the next. In parse mode only the matching
+// block runs its body and writes its result straight into *state (there
+// is no separate config struct; apply_args has always filled state).
+// See src/cli/argparse.h for the convention.
+//
+// Option column width: widest label below is
+// "--ignore-at-your-peril-all-tc-errors" (36) + a small margin.
+#define OPTW 38
+
+static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
 {
     double site_latitude = RAO_LATITUDE;
     double site_longitude = RAO_LONGITUDE;
@@ -7896,370 +7657,677 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
     double min_elevation = 0.0;
     double max_elevation = 90.0;
     int with_constellations = 0;
-    state->antenna_rotator.tracking_prep_time_minutes = TRACKING_PREP_TIME_MINUTES;
-    state->satellite_tracking = 0;
+    char *positional = NULL;
 
-    state->nominal_uplink_frequency_hz = UPLINK_FREQ_MHZ * 1e6;
-    state->nominal_downlink_frequency_hz = DOWNLINK_FREQ_MHZ * 1e6;
-    state->doppler_uplink_frequency_hz = state->nominal_uplink_frequency_hz;
-    state->doppler_downlink_frequency_hz = state->nominal_downlink_frequency_hz;
-    state->doppler_correction_enabled = 1;
-    // SIGNED LO offset from the nominal carrier. Positive → LO ABOVE
-    // nominal (signal lands at negative baseband). Negative → LO
-    // BELOW nominal (signal at positive baseband). Default -25 kHz
-    // puts the corrected signal at +25 kHz baseband, away from the
-    // B210's DC null. Operator can shift it to dodge fixed-pattern
-    // spurs — comfortable range is roughly ±5..±35 kHz: at least
-    // 5 kHz to clear DC, and at most ~35 kHz so the ±10 kHz Doppler
-    // swing stays inside the 48 kHz post-decim half-band.
-    state->rx_lo_offset_hz = -25000.0;
-    state->rx_gain_db      = 30.0;
-    // AD9361 background tracking. The visible ~51 Hz comb of impulsive
-    // spikes at mid-range gain is from the IQ-balance loop (discrete
-    // phase-rotation steps applied to the captured IQ); the DC-offset
-    // loop is a slow continuous IIR notch that DOESN'T produce
-    // spikes but DOES suppress the AD9361's static ADC DC bias.
-    // Turn IQ tracking off by default (kills the spikes), leave DC
-    // tracking on (otherwise the static DC bias rotates into a strong
-    // +lo_offset_hz sinusoid via fm_lo_nco on the decode path, which
-    // dominates the IQ time series).
-    state->rx_dc_offset_track  = 1;
-    state->rx_iq_balance_track = 0;
+    if (!help) {
+        state->antenna_rotator.tracking_prep_time_minutes = TRACKING_PREP_TIME_MINUTES;
+        state->satellite_tracking = 0;
 
-    state->run_with_antenna_rotator = 1;
-    state->antenna_rotator.device_filename = "/dev/ttyUSB0";
-    state->antenna_rotator.serial_speed = B600;
-    state->antenna_rotator.fixed_target = 0;
+        state->nominal_uplink_frequency_hz = UPLINK_FREQ_MHZ * 1e6;
+        state->nominal_downlink_frequency_hz = DOWNLINK_FREQ_MHZ * 1e6;
+        state->doppler_uplink_frequency_hz = state->nominal_uplink_frequency_hz;
+        state->doppler_downlink_frequency_hz = state->nominal_downlink_frequency_hz;
+        state->doppler_correction_enabled = 1;
+        // SIGNED LO offset from the nominal carrier. Positive → LO ABOVE
+        // nominal (signal lands at negative baseband). Negative → LO
+        // BELOW nominal (signal at positive baseband). Default -25 kHz
+        // puts the corrected signal at +25 kHz baseband, away from the
+        // B210's DC null. Operator can shift it to dodge fixed-pattern
+        // spurs — comfortable range is roughly ±5..±35 kHz: at least
+        // 5 kHz to clear DC, and at most ~35 kHz so the ±10 kHz Doppler
+        // swing stays inside the 48 kHz post-decim half-band.
+        state->rx_lo_offset_hz = -25000.0;
+        state->rx_gain_db      = 30.0;
+        // AD9361 background tracking. The visible ~51 Hz comb of impulsive
+        // spikes at mid-range gain is from the IQ-balance loop (discrete
+        // phase-rotation steps applied to the captured IQ); the DC-offset
+        // loop is a slow continuous IIR notch that DOESN'T produce
+        // spikes but DOES suppress the AD9361's static ADC DC bias.
+        // Turn IQ tracking off by default (kills the spikes), leave DC
+        // tracking on (otherwise the static DC bias rotates into a strong
+        // +lo_offset_hz sinusoid via fm_lo_nco on the decode path, which
+        // dominates the IQ time series).
+        state->rx_dc_offset_track  = 1;
+        state->rx_iq_balance_track = 0;
 
-    // T/R antenna switch: auto-probe /dev/ttyACM0. Failure is a
-    // one-line warning, not an error.
-    state->run_with_tr_switch = 1;
-    state->have_tr_switch     = 0;
-    state->tr_switch.device_filename = "/dev/ttyACM0";
-    state->tr_switch.serial_speed    = B115200;
+        state->run_with_antenna_rotator = 1;
+        state->antenna_rotator.device_filename = "/dev/ttyUSB0";
+        state->antenna_rotator.serial_speed = B600;
+        state->antenna_rotator.fixed_target = 0;
 
-    for (int i = 0; i < argc; i++) {
-        if (strncmp("--verbose=", argv[i], 10) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 11) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
+        // T/R antenna switch: auto-probe /dev/ttyACM0. Failure is a
+        // one-line warning, not an error.
+        state->run_with_tr_switch = 1;
+        state->have_tr_switch     = 0;
+        state->tr_switch.device_filename = "/dev/ttyACM0";
+        state->tr_switch.serial_speed    = B115200;
+    }
+
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        // Positional first so <satellite_id> lists above the options.
+        // A token that is not "--"-prefixed counts as the positional.
+        // The actual pointer is resolved by the discovery scan AFTER the
+        // loop (which re-walks argv exactly as the pre-conversion code
+        // did, including its quirk that a space-form option value can be
+        // grabbed as the positional); here we only print the help line
+        // and mark the token matched so a bare extra positional falls
+        // through to the post-loop n_positional > 1 check rather than the
+        // unknown-token branch.
+        if (strncmp("--", arg, 2) != 0 || help) {
+            if (help) parse_help_line(OPTW, "<satellite_id>",
+                "name prefix in the TLE, or `next` to auto-pick the next pass");
+            matched = 1;
+        }
+        if (strcmp("--help", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "short help (this message)");
+            else { apply_args(state, argc, argv, jul_utc, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strcmp("--help-full", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help-full", "detailed help with keyboard layout");
+            else { apply_args(state, argc, argv, jul_utc, HELP_FULL); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strncmp("--verbose=", arg, 10) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--verbose=<level>", "verbosity integer");
+            else {
+                state->n_options++;
+                if (strlen(arg) < 11) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                state->verbose_level = atoi(arg + 10);
             }
-            state->verbose_level = atoi(argv[i] + 10);
-        } else if (strcmp("--with-rotator", argv[i]) == 0
-                || strcmp("--with-hardware", argv[i]) == 0) {
-            // Rotator is on by default now. These flags survive as
-            // silent no-ops so existing scripts and muscle memory
-            // keep working.
-            state->n_options++;
-            state->run_with_antenna_rotator = 1;
-        } else if (strcmp("--without-rotator", argv[i]) == 0
-                || strcmp("--without-hardware", argv[i]) == 0) {
-            state->n_options++;
-            state->run_with_antenna_rotator = 0;
-        } else if (strcmp("--calibrate-rotator", argv[i]) == 0) {
-            state->n_options++;
-            g_calibrate_rotator = 1;
-        } else if (strcmp("--confirm-rotator-calibrate", argv[i]) == 0) {
-            state->n_options++;
-            g_confirm_rotator_calibrate = 1;
-        } else if (strcmp("--without-rotator-pursuit", argv[i]) == 0) {
-            state->n_options++;
-            g_without_rotator_pursuit = 1;
-        } else if (strcmp("--without-tr-switch", argv[i]) == 0) {
-            state->n_options++;
-            state->run_with_tr_switch = 0;
-        } else if (strncmp("--tr-switch-device=", argv[i], 19) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 20) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
+            matched = 1;
+        }
+        if (strcmp("--with-rotator", arg) == 0
+                || strcmp("--with-hardware", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--with-rotator",
+                "drive the rotator (default; --with-hardware synonym, no-op)");
+            else {
+                // Rotator is on by default now. These flags survive as
+                // silent no-ops so existing scripts and muscle memory
+                // keep working.
+                state->n_options++;
+                state->run_with_antenna_rotator = 1;
             }
-            state->tr_switch.device_filename = argv[i] + 19;
-        } else if (strcmp("--without-b210", argv[i]) == 0) {
-            state->n_options++;
-            g_without_b210 = 1;
+            matched = 1;
+        }
+        if (strcmp("--without-rotator", arg) == 0
+                || strcmp("--without-hardware", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--without-rotator",
+                "skip the SPID Rot2Prog (--without-hardware synonym)");
+            else {
+                state->n_options++;
+                state->run_with_antenna_rotator = 0;
+            }
+            matched = 1;
+        }
+        if (strcmp("--calibrate-rotator", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--calibrate-rotator",
+                "measure rotator slew rates then exit (needs --confirm-rotator-calibrate)");
+            else { state->n_options++; g_calibrate_rotator = 1; }
+            matched = 1;
+        }
+        if (strcmp("--confirm-rotator-calibrate", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--confirm-rotator-calibrate",
+                "safety interlock for --calibrate-rotator (antenna moves)");
+            else { state->n_options++; g_confirm_rotator_calibrate = 1; }
+            matched = 1;
+        }
+        if (strcmp("--without-rotator-pursuit", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--without-rotator-pursuit",
+                "disable the pursuit / lead-aim planner even if calibrated");
+            else { state->n_options++; g_without_rotator_pursuit = 1; }
+            matched = 1;
+        }
+        if (strcmp("--without-tr-switch", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--without-tr-switch",
+                "skip the T/R switch probe entirely");
+            else { state->n_options++; state->run_with_tr_switch = 0; }
+            matched = 1;
+        }
+        if (strncmp("--tr-switch-device=", arg, 19) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--tr-switch-device=<path>",
+                "UHF T/R antenna switch tty (default /dev/ttyACM0)");
+            else {
+                state->n_options++;
+                if (strlen(arg) < 20) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                state->tr_switch.device_filename = arg + 19;
+            }
+            matched = 1;
+        }
+        if (strcmp("--without-b210", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--without-b210",
+                "skip the USRP B210 (UI + rotator only)");
+            else { state->n_options++; g_without_b210 = 1; }
+            matched = 1;
+        }
 #ifdef SSO_WITH_SDR
-        } else if (strncmp("--sdr-type=", argv[i], 11) == 0) {
-            state->n_options++;
-            if (sdr_backend_type_from_string(argv[i] + 11, &g_sdr_type) != 0) {
-                fprintf(stderr, "--sdr-type: unknown '%s' "
-                        "(want uhd | rtlsdr | auto)\n", argv[i] + 11);
-                return EXIT_FAILURE;
+        if (strncmp("--sdr-type=", arg, 11) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--sdr-type=uhd|rtlsdr|auto",
+                "SDR backend (default auto; RTL-SDR is RX-only)");
+            else {
+                state->n_options++;
+                if (sdr_backend_type_from_string(arg + 11, &g_sdr_type) != 0) {
+                    fprintf(stderr, "--sdr-type: unknown '%s' "
+                            "(want uhd | rtlsdr | auto)\n", arg + 11);
+                    return PARSE_ERROR;
+                }
             }
-        } else if (strncmp("--sdr-device=", argv[i], 13) == 0) {
-            state->n_options++;
-            snprintf(g_sdr_device, sizeof g_sdr_device, "%s", argv[i] + 13);
-        } else if (strncmp("--uhd-args=", argv[i], 11) == 0) {
-            state->n_options++;
-            snprintf(g_uhd_args, sizeof g_uhd_args, "%s", argv[i] + 11);
-        } else if (strncmp("--sdr-fpga=", argv[i], 11) == 0) {
-            state->n_options++;
-            snprintf(g_sdr_fpga, sizeof g_sdr_fpga, "%s", argv[i] + 11);
+            matched = 1;
+        }
+        if (strncmp("--sdr-device=", arg, 13) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--sdr-device=<sel>",
+                "backend device selector (RTL-SDR index; UHD use --uhd-args)");
+            else {
+                state->n_options++;
+                snprintf(g_sdr_device, sizeof g_sdr_device, "%s", arg + 13);
+            }
+            matched = 1;
+        }
+        if (strncmp("--uhd-args=", arg, 11) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--uhd-args=<args>",
+                "UHD device-args verbatim; overrides detection");
+            else {
+                state->n_options++;
+                snprintf(g_uhd_args, sizeof g_uhd_args, "%s", arg + 11);
+            }
+            matched = 1;
+        }
+        if (strncmp("--sdr-fpga=", arg, 11) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--sdr-fpga=<path>",
+                "force a UHD FPGA image (B2xx clone with non-stock bitstream)");
+            else {
+                state->n_options++;
+                snprintf(g_sdr_fpga, sizeof g_sdr_fpga, "%s", arg + 11);
+            }
+            matched = 1;
+        }
 #endif
-        } else if (strcmp("--no-tx", argv[i]) == 0) {
-            state->n_options++;
-            g_no_tx = 1;
-        } else if (strcmp("--live-waterfall", argv[i]) == 0) {
-            state->n_options++;
-            g_run_live_waterfall = 1;
-        } else if (strcmp("--always-record", argv[i]) == 0) {
-            state->n_options++;
-            g_always_record = 1;
-        } else if (strcmp("--testing", argv[i]) == 0) {
-            state->n_options++;
-            g_testing_mode = 1;
-        } else if (strcmp("--scan-sky", argv[i]) == 0) {
-            state->n_options++;
-            g_scan_sky_mode = 1;
-        } else if (strncmp("--scan-step=", argv[i], 12) == 0) {
-            state->n_options++;
-            g_scan_step_deg = atof(argv[i] + 12);
-            if (g_scan_step_deg < 1.0)  g_scan_step_deg = 1.0;
-            if (g_scan_step_deg > 45.0) g_scan_step_deg = 45.0;
-        } else if (strcmp("--tx-dry-run", argv[i]) == 0) {
-            state->n_options++;
-            g_tx_dry_run = 1;
-        } else if (strncmp("--tx-preroll-ms=", argv[i], 16) == 0) {
-            state->n_options++;
-            int v = atoi(argv[i] + 16);
-            if (v < 0)    v = 0;
-            if (v > 5000) v = 5000;
-            g_tx_preroll_ms = v;
+        if (strcmp("--no-tx", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-tx",
+                "open the B210 for RX but block the TX compose modal from keying the PA");
+            else { state->n_options++; g_no_tx = 1; }
+            matched = 1;
+        }
+        if (strcmp("--live-waterfall", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--live-waterfall",
+                "auto-launch the raylib live_waterfall viewer when recording starts");
+            else { state->n_options++; g_run_live_waterfall = 1; }
+            matched = 1;
+        }
+        if (strcmp("--always-record", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--always-record",
+                "record from B210 open until shutdown (skip per-pass start/stop)");
+            else { state->n_options++; g_always_record = 1; }
+            matched = 1;
+        }
+        if (strcmp("--testing", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--testing",
+                "bench mode: pass folder under Testing/ at current local time, no TLE");
+            else { state->n_options++; g_testing_mode = 1; }
+            matched = 1;
+        }
+        if (strcmp("--scan-sky", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--scan-sky",
+                "rebind T to walk the rotator through a sky grid, dwelling 5 s each");
+            else { state->n_options++; g_scan_sky_mode = 1; }
+            matched = 1;
+        }
+        if (strncmp("--scan-step=", arg, 12) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--scan-step=<deg>",
+                "elevation ring spacing for --scan-sky (default 15, clamped [1,45])");
+            else {
+                state->n_options++;
+                g_scan_step_deg = atof(arg + 12);
+                if (g_scan_step_deg < 1.0)  g_scan_step_deg = 1.0;
+                if (g_scan_step_deg > 45.0) g_scan_step_deg = 45.0;
+            }
+            matched = 1;
+        }
+        if (strcmp("--tx-dry-run", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--tx-dry-run",
+                "record every TX burst as not-sent instead of routing it through the SDR");
+            else { state->n_options++; g_tx_dry_run = 1; }
+            matched = 1;
+        }
+        if (strncmp("--tx-preroll-ms=", arg, 16) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--tx-preroll-ms=<n>",
+                "modulated 0xAA carrier before each TX burst (default 200, [0,5000])");
+            else {
+                state->n_options++;
+                int v = atoi(arg + 16);
+                if (v < 0)    v = 0;
+                if (v > 5000) v = 5000;
+                g_tx_preroll_ms = v;
+            }
+            matched = 1;
+        }
         // Filename args use the space form (--foo <path>) so bash
         // tab-completion works. The old --foo=<path> form is rejected
         // with a one-line hint pointing at the new spelling.
-        } else if (strcmp("--tc-file", argv[i]) == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "--tc-file: missing <path>\n");
-                return EXIT_FAILURE;
+        if (strcmp("--tc-file", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--tc-file <path>",
+                "load ASCII telecommands (one per line; 'A' / `:auto` in the UI to send)");
+            else {
+                // arg is argv[t + 1]; its value is the next token,
+                // argv[t + 2]. Consume it and step t past it.
+                if (t + 2 >= argc) {
+                    fprintf(stderr, "--tc-file: missing <path>\n");
+                    return PARSE_ERROR;
+                }
+                state->n_options += 2;
+                snprintf(g_auto_tcmd_file_path, sizeof g_auto_tcmd_file_path,
+                         "%s", argv[t + 2]);
+                ++t;
             }
-            state->n_options += 2;
-            snprintf(g_auto_tcmd_file_path, sizeof g_auto_tcmd_file_path,
-                     "%s", argv[++i]);
-        } else if (strncmp("--tc-file=", argv[i], 10) == 0) {
+            matched = 1;
+        }
+        if (strncmp("--tc-file=", arg, 10) == 0) {
             fprintf(stderr,
                 "--tc-file=<path> is no longer accepted; "
                 "use `--tc-file <path>` (TAB-completes the filename)\n");
-            return EXIT_FAILURE;
-        } else if (strcmp("--ignore-at-your-peril-all-tc-errors", argv[i]) == 0) {
-            state->n_options++;
-            g_ignore_tc_errors = 1;
-        } else if (strcmp("--hmac-keyfile", argv[i]) == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "--hmac-keyfile: missing <path>\n");
-                return EXIT_FAILURE;
+            return PARSE_ERROR;
+        }
+        if (strcmp("--ignore-at-your-peril-all-tc-errors", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--ignore-at-your-peril-all-tc-errors",
+                "start even if the --tc-file agenda has telecommand lint errors");
+            else { state->n_options++; g_ignore_tc_errors = 1; }
+            matched = 1;
+        }
+        if (strcmp("--hmac-keyfile", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--hmac-keyfile <path>",
+                "HMAC key file shown on the operator banner (default shared, then user)");
+            else {
+                if (t + 2 >= argc) {
+                    fprintf(stderr, "--hmac-keyfile: missing <path>\n");
+                    return PARSE_ERROR;
+                }
+                state->n_options += 2;
+                snprintf(g_hmac_keyfile_path, sizeof g_hmac_keyfile_path,
+                         "%s", argv[t + 2]);
+                ++t;
             }
-            state->n_options += 2;
-            snprintf(g_hmac_keyfile_path, sizeof g_hmac_keyfile_path,
-                     "%s", argv[++i]);
-        } else if (strncmp("--hmac-keyfile=", argv[i], 15) == 0) {
+            matched = 1;
+        }
+        if (strncmp("--hmac-keyfile=", arg, 15) == 0) {
             fprintf(stderr,
                 "--hmac-keyfile=<path> is no longer accepted; "
                 "use `--hmac-keyfile <path>` (TAB-completes the filename)\n");
-            return EXIT_FAILURE;
-        } else if (strcmp("--tle", argv[i]) == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "--tle: missing <path>\n");
-                return EXIT_FAILURE;
+            return PARSE_ERROR;
+        }
+        if (strcmp("--tle", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--tle <path>",
+                "path to a TLE file (default $HOME/.local/state/simple_sat_ops/active.tle)");
+            else {
+                if (t + 2 >= argc) {
+                    fprintf(stderr, "--tle: missing <path>\n");
+                    return PARSE_ERROR;
+                }
+                state->n_options += 2;
+                state->prediction.tles_filename = tle_path_resolve(argv[t + 2]);
+                ++t;
             }
-            state->n_options += 2;
-            state->prediction.tles_filename = tle_path_resolve(argv[++i]);
-        } else if (strncmp("--tle=", argv[i], 6) == 0) {
+            matched = 1;
+        }
+        if (strncmp("--tle=", arg, 6) == 0) {
             fprintf(stderr,
                 "--tle=<path> is no longer accepted; "
                 "use `--tle <path>` (TAB-completes the filename)\n");
-            return EXIT_FAILURE;
-        } else if (strcmp("--pass-folder", argv[i]) == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "--pass-folder: missing <path>\n");
-                return EXIT_FAILURE;
+            return PARSE_ERROR;
+        }
+        if (strcmp("--pass-folder", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--pass-folder <path>",
+                "pre-seed the pass folder (handoff: inherit a previous operator's folder)");
+            else {
+                if (t + 2 >= argc) {
+                    fprintf(stderr, "--pass-folder: missing <path>\n");
+                    return PARSE_ERROR;
+                }
+                state->n_options += 2;
+                // Pre-seed g_pass_folder; setup_pass_folder() then skips
+                // its AOS-driven auto-discovery and uses the inherited
+                // path (handoff case: new operator picks up the previous
+                // operator's pass folder).
+                snprintf(g_pass_folder, sizeof g_pass_folder, "%s", argv[t + 2]);
+                ++t;
             }
-            state->n_options += 2;
-            // Pre-seed g_pass_folder; setup_pass_folder() then skips
-            // its AOS-driven auto-discovery and uses the inherited
-            // path (handoff case: new operator picks up the previous
-            // operator's pass folder).
-            snprintf(g_pass_folder, sizeof g_pass_folder, "%s", argv[++i]);
-        } else if (strncmp("--pass-folder=", argv[i], 14) == 0) {
+            matched = 1;
+        }
+        if (strncmp("--pass-folder=", arg, 14) == 0) {
             fprintf(stderr,
                 "--pass-folder=<path> is no longer accepted; "
                 "use `--pass-folder <path>` (TAB-completes the filename)\n");
-            return EXIT_FAILURE;
-        } else if (strcmp("--rotator-device", argv[i]) == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "--rotator-device: missing <path>\n");
-                return EXIT_FAILURE;
+            return PARSE_ERROR;
+        }
+        if (strcmp("--rotator-device", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--rotator-device <path>",
+                "SPID Rot2Prog tty (default /dev/ttyUSB0)");
+            else {
+                if (t + 2 >= argc) {
+                    fprintf(stderr, "--rotator-device: missing <path>\n");
+                    return PARSE_ERROR;
+                }
+                state->n_options += 2;
+                state->antenna_rotator.device_filename = argv[t + 2];
+                ++t;
             }
-            state->n_options += 2;
-            state->antenna_rotator.device_filename = argv[++i];
-        } else if (strncmp("--rotator-device=", argv[i], 17) == 0) {
+            matched = 1;
+        }
+        if (strncmp("--rotator-device=", arg, 17) == 0) {
             fprintf(stderr,
                 "--rotator-device=<path> is no longer accepted; "
                 "use `--rotator-device <path>` (TAB-completes the filename)\n");
-            return EXIT_FAILURE;
-        } else if (strncmp("--uplink-freq-mhz=", argv[i], 18) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 19) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
+            return PARSE_ERROR;
+        }
+        if (strncmp("--uplink-freq-mhz=", arg, 18) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--uplink-freq-mhz=<mhz>",
+                "uplink nominal carrier, MHz (informational)");
+            else {
+                state->n_options++;
+                if (strlen(arg) < 19) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                state->nominal_uplink_frequency_hz = atof(arg + 18) * 1e6;
             }
-            state->nominal_uplink_frequency_hz = atof(argv[i] + 18) * 1e6;
-        } else if (strncmp("--downlink-freq-mhz=", argv[i], 20) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 21) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
+            matched = 1;
+        }
+        if (strncmp("--downlink-freq-mhz=", arg, 20) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--downlink-freq-mhz=<mhz>",
+                "downlink / simplex carrier nominal, MHz (informational)");
+            else {
+                state->n_options++;
+                if (strlen(arg) < 21) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                state->nominal_downlink_frequency_hz = atof(arg + 20) * 1e6;
             }
-            state->nominal_downlink_frequency_hz = atof(argv[i] + 20) * 1e6;
-        } else if (strcmp("--no-doppler-correction", argv[i]) == 0) {
-            state->n_options++;
-            state->doppler_correction_enabled = 0;
-        } else if (strncmp("--lo-offset=", argv[i], 12) == 0) {
-            state->n_options++;
-            // Argument is kHz so an integer is easy to type; we store Hz.
-            state->rx_lo_offset_hz = atof(argv[i] + 12) * 1000.0;
-        } else if (strncmp("--rx-gain=", argv[i], 10) == 0) {
-            state->n_options++;
-            double g = atof(argv[i] + 10);
-            // AD9361 RX gain range is 0-76 dB; UHD coerces values outside
-            // this and prints a warning, but we clip here so the value in
-            // state matches what the hardware will use.
-            if (g < 0.0)       g = 0.0;
-            else if (g > 76.0) g = 76.0;
-            state->rx_gain_db = g;
-        } else if (strncmp("--ad9361-dc-track=", argv[i], 18) == 0) {
-            // on|off|true|false|1|0
-            const char *v = argv[i] + 18;
-            state->n_options++;
-            state->rx_dc_offset_track =
-                (strcmp(v, "on")   == 0
-                 || strcmp(v, "true") == 0
-                 || strcmp(v, "1")  == 0) ? 1 : 0;
-        } else if (strncmp("--ad9361-iq-track=", argv[i], 18) == 0) {
-            const char *v = argv[i] + 18;
-            state->n_options++;
-            state->rx_iq_balance_track =
-                (strcmp(v, "on")   == 0
-                 || strcmp(v, "true") == 0
-                 || strcmp(v, "1")  == 0) ? 1 : 0;
-        } else if (strncmp("--rotator-target-elevation=", argv[i], 27) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 28) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
+            matched = 1;
+        }
+        if (strcmp("--no-doppler-correction", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-doppler-correction",
+                "display nominal freqs without Doppler");
+            else { state->n_options++; state->doppler_correction_enabled = 0; }
+            matched = 1;
+        }
+        if (strncmp("--lo-offset=", arg, 12) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--lo-offset=<kHz>",
+                "park the SDR LO this far off the nominal carrier (signed, default -25)");
+            else {
+                state->n_options++;
+                // Argument is kHz so an integer is easy to type; we store Hz.
+                state->rx_lo_offset_hz = atof(arg + 12) * 1000.0;
             }
-            state->antenna_rotator.target_elevation = atof(argv[i] + 27);
-            if (state->antenna_rotator.target_elevation < 0.0) {
-                state->antenna_rotator.target_elevation = 0.0;
-            } else if (state->antenna_rotator.target_elevation
-                       > ANTENNA_ROTATOR_MAXIMUM_ELEVATION) {
-                state->antenna_rotator.target_elevation =
-                    ANTENNA_ROTATOR_MAXIMUM_ELEVATION;
+            matched = 1;
+        }
+        if (strncmp("--rx-gain=", arg, 10) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--rx-gain=<dB>",
+                "AD9361 RX gain at session open, dB (default 30, range [0,76])");
+            else {
+                state->n_options++;
+                double g = atof(arg + 10);
+                // AD9361 RX gain range is 0-76 dB; UHD coerces values outside
+                // this and prints a warning, but we clip here so the value in
+                // state matches what the hardware will use.
+                if (g < 0.0)       g = 0.0;
+                else if (g > 76.0) g = 76.0;
+                state->rx_gain_db = g;
             }
-            state->antenna_rotator.fixed_target = 1;
-        } else if (strncmp("--rotator-target-azimuth=", argv[i], 25) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 26) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
+            matched = 1;
+        }
+        if (strncmp("--ad9361-dc-track=", arg, 18) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--ad9361-dc-track=on|off",
+                "AD9361 background DC-offset tracking (default on)");
+            else {
+                // on|off|true|false|1|0
+                const char *v = arg + 18;
+                state->n_options++;
+                state->rx_dc_offset_track =
+                    (strcmp(v, "on")   == 0
+                     || strcmp(v, "true") == 0
+                     || strcmp(v, "1")  == 0) ? 1 : 0;
             }
-            double az = atof(argv[i] + 25);
-            if (az < ANTENNA_ROTATOR_MINIMUM_AZIMUTH) {
-                az = ANTENNA_ROTATOR_MINIMUM_AZIMUTH;
-            } else if (az > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
-                az = ANTENNA_ROTATOR_MAXIMUM_AZIMUTH;
+            matched = 1;
+        }
+        if (strncmp("--ad9361-iq-track=", arg, 18) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--ad9361-iq-track=on|off",
+                "AD9361 background IQ-balance tracking (default off; ~51 Hz spike comb)");
+            else {
+                const char *v = arg + 18;
+                state->n_options++;
+                state->rx_iq_balance_track =
+                    (strcmp(v, "on")   == 0
+                     || strcmp(v, "true") == 0
+                     || strcmp(v, "1")  == 0) ? 1 : 0;
             }
-            state->antenna_rotator.target_azimuth = az;
-            state->antenna_rotator.target_azimuth_unwrapped = az;
-            state->antenna_rotator.unwrapped_target_valid = 1;
-            state->antenna_rotator.fixed_target = 1;
-        } else if (strncmp("--lat=", argv[i], 6) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 7) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
+            matched = 1;
+        }
+        if (strncmp("--rotator-target-elevation=", arg, 27) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--rotator-target-elevation=<deg>",
+                "park on a fixed elevation");
+            else {
+                state->n_options++;
+                if (strlen(arg) < 28) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                state->antenna_rotator.target_elevation = atof(arg + 27);
+                if (state->antenna_rotator.target_elevation < 0.0) {
+                    state->antenna_rotator.target_elevation = 0.0;
+                } else if (state->antenna_rotator.target_elevation
+                           > ANTENNA_ROTATOR_MAXIMUM_ELEVATION) {
+                    state->antenna_rotator.target_elevation =
+                        ANTENNA_ROTATOR_MAXIMUM_ELEVATION;
+                }
+                state->antenna_rotator.fixed_target = 1;
             }
-            site_latitude = atof(argv[i] + 6);
-        } else if (strncmp("--lon=", argv[i], 6) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 7) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
+            matched = 1;
+        }
+        if (strncmp("--rotator-target-azimuth=", arg, 25) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--rotator-target-azimuth=<deg>",
+                "park on a fixed azimuth");
+            else {
+                state->n_options++;
+                if (strlen(arg) < 26) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                double az = atof(arg + 25);
+                if (az < ANTENNA_ROTATOR_MINIMUM_AZIMUTH) {
+                    az = ANTENNA_ROTATOR_MINIMUM_AZIMUTH;
+                } else if (az > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
+                    az = ANTENNA_ROTATOR_MAXIMUM_AZIMUTH;
+                }
+                state->antenna_rotator.target_azimuth = az;
+                state->antenna_rotator.target_azimuth_unwrapped = az;
+                state->antenna_rotator.unwrapped_target_valid = 1;
+                state->antenna_rotator.fixed_target = 1;
             }
-            site_longitude = atof(argv[i] + 6);
-        } else if (strncmp("--alt=", argv[i], 6) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 7) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
+            matched = 1;
+        }
+        if (strncmp("--lat=", arg, 6) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--lat=<deg>", "geodetic latitude (default RAO Priddis)");
+            else {
+                state->n_options++;
+                if (strlen(arg) < 7) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                site_latitude = atof(arg + 6);
             }
-            site_altitude = atof(argv[i] + 6);
-        } else if (strcmp("--include-constellations", argv[i]) == 0) {
-            state->n_options++;
-            with_constellations = 1;
-        } else if (strncmp("--min-altitude-km=", argv[i], 18) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 19) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
+            matched = 1;
+        }
+        if (strncmp("--lon=", arg, 6) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--lon=<deg>", "geodetic longitude, east positive");
+            else {
+                state->n_options++;
+                if (strlen(arg) < 7) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                site_longitude = atof(arg + 6);
             }
-            min_altitude_km = atof(argv[i] + 18);
-        } else if (strncmp("--max-altitude-km=", argv[i], 18) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 19) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
+            matched = 1;
+        }
+        if (strncmp("--alt=", arg, 6) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--alt=<m>", "altitude above ellipsoid, metres");
+            else {
+                state->n_options++;
+                if (strlen(arg) < 7) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                site_altitude = atof(arg + 6);
             }
-            max_altitude_km = atof(argv[i] + 18);
-        } else if (strncmp("--min-elevation=", argv[i], 16) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 17) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
+            matched = 1;
+        }
+        if (strcmp("--include-constellations", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--include-constellations",
+                "include Starlink/OneWeb-style swarms in the `next` pass filter");
+            else { state->n_options++; with_constellations = 1; }
+            matched = 1;
+        }
+        if (strncmp("--min-altitude-km=", arg, 18) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--min-altitude-km=<km>",
+                "minimum orbital altitude (default 0)");
+            else {
+                state->n_options++;
+                if (strlen(arg) < 19) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                min_altitude_km = atof(arg + 18);
             }
-            min_elevation = atof(argv[i] + 16);
-        } else if (strncmp("--min-minutes=", argv[i], 14) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 15) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
+            matched = 1;
+        }
+        if (strncmp("--max-altitude-km=", arg, 18) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--max-altitude-km=<km>",
+                "maximum orbital altitude (default 1000)");
+            else {
+                state->n_options++;
+                if (strlen(arg) < 19) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                max_altitude_km = atof(arg + 18);
             }
-            min_minutes_away = atof(argv[i] + 14);
-        } else if (strncmp("--max-minutes=", argv[i], 14) == 0) {
-            state->n_options++;
-            if (strlen(argv[i]) < 15) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
+            matched = 1;
+        }
+        if (strncmp("--min-elevation=", arg, 16) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--min-elevation=<deg>",
+                "minimum peak elevation (default 0)");
+            else {
+                state->n_options++;
+                if (strlen(arg) < 17) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                min_elevation = atof(arg + 16);
             }
-            max_minutes_away = atof(argv[i] + 14);
-        } else if (strcmp("--help", argv[i]) == 0) {
-            usage(stdout, argv[0], 0);
-            return 2;
-        } else if (strcmp("--help-full", argv[i]) == 0) {
-            usage(stdout, argv[0], 1);
-            return 2;
-        } else if (strcmp("--control", argv[i]) == 0) {
-            state->n_options++;
-            g_control_mode = 1;
-        } else if (strcmp("--self-test", argv[i]) == 0) {
-            state->n_options++;
-            g_self_test = 1;
-        } else if (strncmp("--", argv[i], 2) == 0) {
-            fprintf(stderr, "Unable to parse option '%s'\n", argv[i]);
-            return 3;
+            matched = 1;
+        }
+        if (strncmp("--min-minutes=", arg, 14) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--min-minutes=<n>",
+                "minimum minutes until AOS (default 1)");
+            else {
+                state->n_options++;
+                if (strlen(arg) < 15) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                min_minutes_away = atof(arg + 14);
+            }
+            matched = 1;
+        }
+        if (strncmp("--max-minutes=", arg, 14) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--max-minutes=<n>",
+                "maximum minutes until AOS (default 90)");
+            else {
+                state->n_options++;
+                if (strlen(arg) < 15) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                max_minutes_away = atof(arg + 14);
+            }
+            matched = 1;
+        }
+        if (strcmp("--control", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--control",
+                "open the sso_ipc server (operator mode)");
+            else { state->n_options++; g_control_mode = 1; }
+            matched = 1;
+        }
+        if (strcmp("--self-test", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--self-test",
+                "print the settings simple_sat_ops would run with, then exit 0");
+            else { state->n_options++; g_self_test = 1; }
+            matched = 1;
+        }
+
+        // Unknown token. Only "--"-prefixed tokens are an error here
+        // (the old code's final `strncmp("--", ...) == 0` branch);
+        // a bare extra positional falls through and is caught by the
+        // n_positional > 1 check after the loop.
+        if (!matched && !help) {
+            if (strncmp("--", arg, 2) == 0) {
+                fprintf(stderr, "Unable to parse option '%s'\n", arg);
+                return PARSE_ERROR;
+            }
         }
     }
+
+    // Full-help epilog: the keyboard layout + examples, printed once
+    // after all the option lines (only for --help-full).
+    if (help >= HELP_FULL) {
+        printf(
+            "\n"
+            "KEYBOARD (unlocked by default, press K to toggle lock state)\n"
+            "\n"
+            "  K         Toggle keyboard lock\n"
+            "  T         Start tracking the current satellite\n"
+            "  s         Stop tracking\n"
+            "  r         Reset rotator to az=0, el=0\n"
+            "  [ / ]     Nudge antenna azimuth -5 / +5 deg\n"
+            "  { / }     Nudge antenna azimuth -1 / +1 deg (fine)\n"
+            "  , / .     Nudge antenna elevation -5 / +5 deg\n"
+            "  < / >     Nudge antenna elevation -1 / +1 deg (fine)\n"
+            "  q         Quit\n"
+            "\n"
+            "EXAMPLES\n"
+            "\n"
+            "  # Auto-pick next visible pass above 10 deg (rotator on by default)\n"
+            "  simple_sat_ops next --min-elevation=10 --min-minutes=10 --max-minutes=45\n"
+            "\n"
+            "  # Dry-run prediction on a dev host (no rotator hardware)\n"
+            "  simple_sat_ops 'ISS (ZARYA)' --without-rotator\n"
+            "\n"
+            "  # Operator coordination (broadcasts state to viewers over sso_ipc)\n"
+            "  simple_sat_ops next --control\n");
+    }
+    if (help) return PARSE_OK;
+
     int n_positional = argc - state->n_options - 1;  // -1 for argv[0]
     if (n_positional > 1) {
-        usage(stderr, argv[0], 0);
-        return 1;
+        fprintf(stderr,
+            "simple_sat_ops: too many positional arguments "
+            "(expected at most one <satellite_id>)\n");
+        return PARSE_ERROR;
     }
 
     // Find the (single) positional, if any. Existing convention is
     // "positional at argv[1]" but loop is robust to options-before /
     // options-after orderings.
-    char *positional = NULL;
     for (int i = 1; i < argc; i++) {
         if (strncmp("--", argv[i], 2) == 0) continue;
         positional = argv[i];
@@ -8280,13 +8348,13 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             fprintf(stderr,
                 "operator not found: try `simple_sat_ops --control` "
                 "to operate FrontierSat\n");
-            return 1;
+            return PARSE_ERROR;
         }
         sso_ipc_client_close(probe);
         // Operator is up — main() will dispatch into run_viewer()
         // instead of the standalone-tracker path.
         g_viewer_mode = 1;
-        return 0;
+        return PARSE_OK;
     }
 
     state->prediction.observer_ephem.position_geodetic.lat =
@@ -8311,7 +8379,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                     "simple_sat_ops: --control wants a TLE under %s, "
                     "but no *.tle was found there. Drop one in "
                     "(or pass --tle=<path>).\n", tles_root);
-                return EXIT_FAILURE;
+                return PARSE_ERROR;
             }
             fprintf(stderr, "simple_sat_ops: using TLE %s\n", src_tle);
             state->prediction.tles_filename = tle_path_resolve(src_tle);
@@ -8323,7 +8391,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
                 "simple_sat_ops: %s has no name line (2-line TLE?); "
                 "pass the satellite name explicitly\n",
                 state->prediction.tles_filename);
-            return EXIT_FAILURE;
+            return PARSE_ERROR;
         }
         state->prediction.satellite_ephem.name = sat_name;
         fprintf(stderr, "simple_sat_ops: tracking '%s'\n", sat_name);
@@ -8333,7 +8401,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
             if (tle_default_path(default_tle, sizeof(default_tle)) != 0) {
                 fprintf(stderr,
                     "HOME unset or path too long; pass --tle=<path>\n");
-                return EXIT_FAILURE;
+                return PARSE_ERROR;
             }
             state->prediction.tles_filename = tle_path_resolve(default_tle);
         }
@@ -8369,7 +8437,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         const size_t n = number_of_passes();
         if (n == 0) {
             fprintf(stderr, "Unable to automatically find next in queue.\n");
-            return 1;
+            return PARSE_ERROR;
         }
 
         const pass_t *p = get_pass(0);
@@ -8377,7 +8445,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc)
         printf("Satellite: %s\n", state->prediction.satellite_ephem.name);
     }
 
-    return 0;
+    return PARSE_OK;
 }
 
 // --- Tracking helpers ---------------------------------------------

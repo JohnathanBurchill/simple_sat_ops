@@ -37,6 +37,7 @@
 // to the satellite and bench-looping back to the FT-991A on the
 // operator desk. Override with --freq-hz= for any other test frequency.
 
+#include "argparse.h"
 #include "csp.h"
 #include "ax100.h"
 #include "modem.h"
@@ -95,94 +96,217 @@ static ssize_t parse_payload_hex(const char *hex, uint8_t *out, size_t out_cap)
     return (ssize_t)n;
 }
 
-static void usage(FILE *f, const char *argv0)
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the fields out into the existing modem_params_t / csp_v1_header_t / locals
+// so the (large) frame-build + IQ-render body is unchanged.
+typedef struct {
+    const char *payload_hex;
+    const char *payload_ascii;
+    const char *keyfile_path;
+    const char *dump_iq_path;
+    const char *device_args;  // accepted but ignored (offline IQ tool)
+    double freq_hz;
+    double gain_db;
+    double tx_rate;
+    double deviation_hz;
+    int bit_rate;
+    double gauss_bt;
+    int gauss_symbol_span;
+    int csp_src, csp_dst, csp_dport, csp_sport, csp_prio;
+    int use_hmac;
+    int use_rs;
+    int allow_tx;
+    int dry_run;
+    int no_control_check;
+    int repeat;
+    int gap_ms;
+    int preroll_ms;
+    int postroll_ms;
+    int joke;
+    double start_delay_s;
+    double ramp_ms;
+} tx_frame_sdr_args_t;
+
+// Option column width: the widest label below ("--payload-ascii=<str>") + a
+// small margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 23
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(tx_frame_sdr_args_t *a, int argc, char **argv, int help)
 {
-    fprintf(f,
-        "usage: %s (--payload-hex=<HEX> | --payload-ascii=<STR>) [options]\n"
-        "\n"
-        "Build a CSP+AX100 frame and transmit it via a USRP B210. The frame\n"
-        "is FM-modulated in software (peak deviation = bit_rate/4 by default,\n"
-        "so 2.4 kHz at 9600 baud — modulation index h = 0.5 to match the\n"
-        "gr-satellites fsk_demodulator the gold-reference receiver uses) and\n"
-        "pushed to the B210's TX streamer at --tx-rate.\n"
-        "\n"
-        "Payload (exactly one):\n"
-        "  --payload-hex=<HEX>         Payload as hex (whitespace/':' ignored)\n"
-        "  --payload-ascii=<STR>       Payload as literal ASCII bytes\n"
-        "\n"
-        "CSP / framing (defaults match cts_send to FrontierSat OBC):\n"
-        "  --src=<n> --dst=<n>         CSP src/dst (defaults 10 = GCS, 1 = OBC)\n"
-        "  --dport=<n> --sport=<n>     CSP dport/sport (defaults 7 = CTS1 cmd, 16)\n"
-        "  --prio=<n>                  CSP priority 0..3 (default 2 = normal)\n"
-        "  --no-hmac                   Disable HMAC (default ON, matches uplink)\n"
-        "  --keyfile=<path>            HMAC keyfile (default $HOME/%s)\n"
-        "  --no-reed-solomon           Disable RS(255,223) (default ON)\n"
-        "\n"
-        "Modem / FM:\n"
-        "  --bit-rate=<bps>            Default 9600\n"
-        "  --tx-rate=<sps>             B210 TX sample rate (default 480000;\n"
-        "                              must be a multiple of --bit-rate so\n"
-        "                              modem can render directly at this rate)\n"
-        "  --deviation-hz=<hz>         FM peak deviation in Hz (default\n"
-        "                              bit_rate/4 = 2400 Hz at 9600 baud)\n"
-        "  --gauss-bt=<f>              Gaussian BT product (default 0 = no\n"
-        "                              filter; rectangular NRZ matches the\n"
-        "                              gr-satellites fsk_demodulator)\n"
-        "  --gauss-span=<n>            Gaussian symbol span (default 4)\n"
-        "\n"
-        "Radio:\n"
-        "  --freq-hz=<hz>              Carrier center freq (default %.0f Hz =\n"
-        "                              FrontierSat simplex carrier — uplink\n"
-        "                              and downlink share this frequency)\n"
-        "  --gain-db=<n>               B210 TX gain dB, 0..89.75 (default 30)\n"
-        "  --device-args=<str>         Accepted but ignored (offline IQ tool;\n"
-        "                              opens no device)\n"
-        "  --repeat=<n>                Send the same frame N times back-to-back\n"
-        "                              with a small gap (default 1)\n"
-        "  --gap-ms=<n>                Gap between repeats in ms (default 200)\n"
-        "  --ramp-ms=<f>               Raised-cosine envelope ramp at the\n"
-        "                              start and end of each modulated burst,\n"
-        "                              in milliseconds (default 1.0). Smooths\n"
-        "                              the on/off keying transition so the\n"
-        "                              wide-band click that would otherwise\n"
-        "                              splatter energy outside the receiver's\n"
-        "                              IF passband doesn't trip its AGC.\n"
-        "                              Set to 0 for instantaneous keying.\n"
-        "  --joke                      Replace --repeat/--gap-ms with a\n"
-        "                              \"da   da-da da  da, dah   dah!\"\n"
-        "                              rhythm — five short bursts and two\n"
-        "                              long ones (held carrier tail) with\n"
-        "                              the gap timing scaled to the frame's\n"
-        "                              on-air duration. Don't use for real\n"
-        "                              telecommands. Plays once.\n"
-        "  --preroll-ms=<n>            Modulated 0xAA tone in front of the\n"
-        "                              AX100 frame (default 100). Acts as\n"
-        "                              extra symbol-clock training tone for\n"
-        "                              the receiver and lets the FPGA TX\n"
-        "                              FIFO fully buffer the burst so a one-\n"
-        "                              time host stall doesn't eat the\n"
-        "                              real frame's preamble. Quantized to\n"
-        "                              whole bytes so it stays bit-aligned\n"
-        "                              with the frame's 0xAA prefill.\n"
-        "  --postroll-ms=<n>           Constant-carrier pad after the last burst,\n"
-        "                              before EOB (default 50).\n"
-        "  --start-delay-s=<f>         Schedule the burst to start at this many\n"
-        "                              seconds after the device clock is reset\n"
-        "                              (default 0.5). Adds latency from invocation\n"
-        "                              to first sample on-air; raise if you still\n"
-        "                              see mid-burst underruns.\n"
-        "\n"
-        "Safety / dry-run:\n"
-        "  --allow-tx                  Required to actually key the streamer\n"
-        "                              (no upstream radio_t inhibit here, but\n"
-        "                              we still ask for explicit consent)\n"
-        "  --dump-iq=<path>            Dump the IQ buffer to a file instead\n"
-        "                              of streaming (sc16 interleaved, no\n"
-        "                              header). Useful with tx_samples_from_file\n"
-        "                              for offline replay.\n"
-        "  --dry-run                   Build the frame, print sizes, exit.\n"
-        "  --help                      This message.\n",
-        argv0, HMAC_KEYFILE_DEFAULT_RELPATH, FRONTIERSAT_CARRIER_HZ);
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (starts_with(arg, "--payload-hex=") || help) {
+            if (help) parse_help_line(OPTW, "--payload-hex=<hex>", "payload as hex (whitespace/':' ignored)");
+            else a->payload_hex = arg + 14;
+            matched = 1;
+        }
+        if (starts_with(arg, "--payload-ascii=") || help) {
+            if (help) parse_help_line(OPTW, "--payload-ascii=<str>", "payload as literal ASCII bytes");
+            else a->payload_ascii = arg + 16;
+            matched = 1;
+        }
+        if (starts_with(arg, "--keyfile=") || help) {
+            if (help) parse_help_line(OPTW, "--keyfile=<path>", "HMAC keyfile (default $HOME/" HMAC_KEYFILE_DEFAULT_RELPATH ")");
+            else a->keyfile_path = arg + 10;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-hmac") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-hmac", "disable HMAC (default ON, matches uplink)");
+            else a->use_hmac = 0;
+            matched = 1;
+        }
+        if (strcmp(arg, "--reed-solomon") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--reed-solomon", "enable RS(255,223) (the default)");
+            else a->use_rs = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-reed-solomon") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-reed-solomon", "disable RS(255,223) (default ON)");
+            else a->use_rs = 0;
+            matched = 1;
+        }
+        if (starts_with(arg, "--src=") || help) {
+            if (help) parse_help_line(OPTW, "--src=<n>", "CSP src (default 10 = GCS)");
+            else a->csp_src = (uint8_t)atoi(arg + 6);
+            matched = 1;
+        }
+        if (starts_with(arg, "--dst=") || help) {
+            if (help) parse_help_line(OPTW, "--dst=<n>", "CSP dst (default 1 = OBC)");
+            else a->csp_dst = (uint8_t)atoi(arg + 6);
+            matched = 1;
+        }
+        if (starts_with(arg, "--dport=") || help) {
+            if (help) parse_help_line(OPTW, "--dport=<n>", "CSP dport (default 7 = CTS1 cmd)");
+            else a->csp_dport = (uint8_t)atoi(arg + 8);
+            matched = 1;
+        }
+        if (starts_with(arg, "--sport=") || help) {
+            if (help) parse_help_line(OPTW, "--sport=<n>", "CSP sport (default 16)");
+            else a->csp_sport = (uint8_t)atoi(arg + 8);
+            matched = 1;
+        }
+        if (starts_with(arg, "--prio=") || help) {
+            if (help) parse_help_line(OPTW, "--prio=<n>", "CSP priority 0..3 (default 2 = normal)");
+            else a->csp_prio = (uint8_t)atoi(arg + 7);
+            matched = 1;
+        }
+        if (starts_with(arg, "--bit-rate=") || help) {
+            if (help) parse_help_line(OPTW, "--bit-rate=<bps>", "modem bit rate (default 9600)");
+            else {
+                int bps = atoi(arg + 11);
+                if (bps <= 0) { fprintf(stderr, "--bit-rate must be positive\n"); return PARSE_ERROR; }
+                a->bit_rate = bps;
+            }
+            matched = 1;
+        }
+        if (starts_with(arg, "--tx-rate=") || help) {
+            if (help) parse_help_line(OPTW, "--tx-rate=<sps>", "B210 TX sample rate, multiple of --bit-rate (default 480000)");
+            else a->tx_rate = atof(arg + 10);
+            matched = 1;
+        }
+        if (starts_with(arg, "--deviation-hz=") || help) {
+            if (help) parse_help_line(OPTW, "--deviation-hz=<hz>", "FM peak deviation Hz (default bit_rate/4 = 2400)");
+            else a->deviation_hz = atof(arg + 15);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gauss-bt=") || help) {
+            if (help) parse_help_line(OPTW, "--gauss-bt=<f>", "Gaussian BT product (default 0 = no filter)");
+            else a->gauss_bt = atof(arg + 11);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gauss-span=") || help) {
+            if (help) parse_help_line(OPTW, "--gauss-span=<n>", "Gaussian symbol span (default 4)");
+            else a->gauss_symbol_span = atoi(arg + 13);
+            matched = 1;
+        }
+        if (starts_with(arg, "--freq-hz=") || help) {
+            if (help) parse_help_line(OPTW, "--freq-hz=<hz>", "carrier center freq (default FrontierSat simplex carrier)");
+            else a->freq_hz = atof(arg + 10);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gain-db=") || help) {
+            if (help) parse_help_line(OPTW, "--gain-db=<n>", "B210 TX gain dB, 0..89.75 (default 30)");
+            else a->gain_db = atof(arg + 10);
+            matched = 1;
+        }
+        if (starts_with(arg, "--device-args=") || help) {
+            if (help) parse_help_line(OPTW, "--device-args=<str>", "accepted but ignored (offline IQ tool; opens no device)");
+            else { /* accepted but ignored: this tool renders IQ offline and never opens the B210 */ a->device_args = arg + 14; }
+            matched = 1;
+        }
+        if (starts_with(arg, "--repeat=") || help) {
+            if (help) parse_help_line(OPTW, "--repeat=<n>", "send the same frame N times back-to-back (default 1)");
+            else a->repeat = atoi(arg + 9);
+            matched = 1;
+        }
+        if (starts_with(arg, "--gap-ms=") || help) {
+            if (help) parse_help_line(OPTW, "--gap-ms=<n>", "gap between repeats in ms (default 200)");
+            else a->gap_ms = atoi(arg + 9);
+            matched = 1;
+        }
+        if (starts_with(arg, "--preroll-ms=") || help) {
+            if (help) parse_help_line(OPTW, "--preroll-ms=<n>", "modulated 0xAA tone before the frame, ms (default 100)");
+            else a->preroll_ms = atoi(arg + 13);
+            matched = 1;
+        }
+        if (starts_with(arg, "--postroll-ms=") || help) {
+            if (help) parse_help_line(OPTW, "--postroll-ms=<n>", "constant-carrier pad after last burst, ms (default 50)");
+            else a->postroll_ms = atoi(arg + 14);
+            matched = 1;
+        }
+        if (starts_with(arg, "--start-delay-s=") || help) {
+            if (help) parse_help_line(OPTW, "--start-delay-s=<f>", "burst start delay after clock reset, s (default 0.5)");
+            else a->start_delay_s = atof(arg + 16);
+            matched = 1;
+        }
+        if (starts_with(arg, "--ramp-ms=") || help) {
+            if (help) parse_help_line(OPTW, "--ramp-ms=<f>", "raised-cosine envelope ramp per burst, ms (default 1.0; 0 = instant)");
+            else a->ramp_ms = atof(arg + 10);
+            matched = 1;
+        }
+        if (starts_with(arg, "--dump-iq=") || help) {
+            if (help) parse_help_line(OPTW, "--dump-iq=<path>", "dump IQ buffer to file (sc16 interleaved, no header) instead of streaming");
+            else a->dump_iq_path = arg + 10;
+            matched = 1;
+        }
+        if (strcmp(arg, "--joke") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--joke", "replace --repeat/--gap-ms with a \"da da-da...\" rhythm; not for real telecommands");
+            else a->joke = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--allow-tx") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--allow-tx", "required to actually key the streamer (explicit consent)");
+            else a->allow_tx = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--dry-run") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--dry-run", "build the frame, print sizes, exit");
+            else a->dry_run = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-control-check") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-control-check", "no-op (offline tool has no operator gate)");
+            else a->no_control_check = 1;
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            fprintf(stderr, "tx_frame_sdr: unknown arg '%s'\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
 }
 
 // FM-modulate a real-valued PCM input (S16_LE, normalized to [-1, +1]
@@ -266,46 +390,74 @@ static const struct {
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "tx_frame_sdr")) return 0;
-    const char *payload_hex = NULL;
-    const char *payload_ascii = NULL;
-    const char *keyfile_path = NULL;
-    const char *dump_iq_path = NULL;
-    double freq_hz = FRONTIERSAT_CARRIER_HZ;
-    double gain_db = 30.0;
-    double tx_rate = 480000.0;
     // Default = bit_rate / 4 = 2400 Hz at 9600 bps. This produces an FM
     // modulation index h = 2*fdev/baud = 0.5 (MSK-like), which is what
     // the gold-reference gr-satellites fsk_demodulator in
     // gnu_radio/usrp_b210_gnu_radio/radio_ax100.py expects. h above 0.5
     // (e.g. 3000 Hz at 9600 baud → h = 0.625) widens the eye in a way
     // the demodulator does not match-filter for and reduces SNR margin.
-    double deviation_hz = -1.0;
-    int use_hmac = 1;
-    int use_rs = 1;
-    int allow_tx = 0;
-    int dry_run = 0;
-    // Operator gating: tx_frame_sdr keys the PA, so it refuses to run
-    // unless simple_sat_ops is in operator mode with $USER == that
-    // operator's user. --no-control-check skips the gate (dev/test
-    // only; logged as such in runs.log).
-    int no_control_check = 0;
-    int repeat = 1;
-    int gap_ms = 200;
-    int preroll_ms = 100;
-    int postroll_ms = 50;
-    int joke = 0;
-    double start_delay_s = 0.5;
-    double ramp_ms = 1.0;
-
-    // Defaults match the cts_send gold reference in
+    //
+    // Operator gating: tx_frame_sdr used to refuse to run unless
+    // simple_sat_ops was in operator mode; --no-control-check skipped
+    // the gate. It is offline-only now, so the field is a no-op.
+    //
+    // CSP defaults match the cts_send gold reference in
     // CalgaryToSpace/CTS-SAT-1-Ground-Station/gnu_radio/supporting_demo_scripts/pycsp_tx.py:
     // src = GCS_ADDR (10), dst = OBC_ADDR (1), dport = 7 (CTS1 command
     // handler), sport = 16, prio = norm. CSP-layer flags stay 0 — the
     // HMAC trailer is added at the AX100 layer, not inside the packet.
+    tx_frame_sdr_args_t cfg = {
+        .freq_hz = FRONTIERSAT_CARRIER_HZ,
+        .gain_db = 30.0,
+        .tx_rate = 480000.0,
+        .deviation_hz = -1.0,
+        .bit_rate = -1,            // -1 = leave modem_params_defaults() value
+        .gauss_bt = -1.0,          // -1 = leave modem_params_defaults() value
+        .gauss_symbol_span = -1,   // -1 = leave modem_params_defaults() value
+        .csp_src = 10, .csp_dst = 1,
+        .csp_dport = 7, .csp_sport = 16,
+        .csp_prio = CSP_PRIO_NORM,
+        .use_hmac = 1,
+        .use_rs = 1,
+        .repeat = 1,
+        .gap_ms = 200,
+        .preroll_ms = 100,
+        .postroll_ms = 50,
+        .start_delay_s = 0.5,
+        .ramp_ms = 1.0,
+    };
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
+    }
+
+    // Copy parsed config into the locals / structs the build body below uses.
+    const char *payload_hex = cfg.payload_hex;
+    const char *payload_ascii = cfg.payload_ascii;
+    const char *keyfile_path = cfg.keyfile_path;
+    const char *dump_iq_path = cfg.dump_iq_path;
+    double freq_hz = cfg.freq_hz;
+    double gain_db = cfg.gain_db;
+    double tx_rate = cfg.tx_rate;
+    double deviation_hz = cfg.deviation_hz;
+    int use_hmac = cfg.use_hmac;
+    int use_rs = cfg.use_rs;
+    int allow_tx = cfg.allow_tx;
+    int dry_run = cfg.dry_run;
+    int no_control_check = cfg.no_control_check;
+    int repeat = cfg.repeat;
+    int gap_ms = cfg.gap_ms;
+    int preroll_ms = cfg.preroll_ms;
+    int postroll_ms = cfg.postroll_ms;
+    int joke = cfg.joke;
+    double start_delay_s = cfg.start_delay_s;
+    double ramp_ms = cfg.ramp_ms;
+    (void) cfg.device_args;  // accepted but ignored (offline IQ tool)
+
     csp_v1_header_t csp_hdr = {
-        .prio = CSP_PRIO_NORM,
-        .src = 10, .dst = 1,
-        .dport = 7, .sport = 16,
+        .prio = (uint8_t)cfg.csp_prio,
+        .src = (uint8_t)cfg.csp_src, .dst = (uint8_t)cfg.csp_dst,
+        .dport = (uint8_t)cfg.csp_dport, .sport = (uint8_t)cfg.csp_sport,
         .flags = 0,
     };
     modem_params_t mp;
@@ -315,46 +467,9 @@ int main(int argc, char **argv)
     // of bit_rate; the default tx_rate = 480000 / bit_rate = 9600 → 50
     // samples per symbol. Plenty for the Gaussian filter to do its job.
     mp.samp_rate = (int)tx_rate;
-
-    for (int i = 1; i < argc; i++) {
-        const char *a = argv[i];
-        if (strcmp(a, "--help") == 0)                   { usage(stdout, argv[0]); return 0; }
-        else if (starts_with(a, "--payload-hex="))      payload_hex   = a + 14;
-        else if (starts_with(a, "--payload-ascii="))    payload_ascii = a + 16;
-        else if (starts_with(a, "--keyfile="))          keyfile_path  = a + 10;
-        else if (strcmp(a, "--no-hmac") == 0)           use_hmac = 0;
-        else if (strcmp(a, "--reed-solomon") == 0)      use_rs = 1;
-        else if (strcmp(a, "--no-reed-solomon") == 0)   use_rs = 0;
-        else if (starts_with(a, "--src="))     csp_hdr.src   = (uint8_t)atoi(a + 6);
-        else if (starts_with(a, "--dst="))     csp_hdr.dst   = (uint8_t)atoi(a + 6);
-        else if (starts_with(a, "--dport="))   csp_hdr.dport = (uint8_t)atoi(a + 8);
-        else if (starts_with(a, "--sport="))   csp_hdr.sport = (uint8_t)atoi(a + 8);
-        else if (starts_with(a, "--prio="))    csp_hdr.prio  = (uint8_t)atoi(a + 7);
-        else if (starts_with(a, "--bit-rate=")) {
-            int bps = atoi(a + 11);
-            if (bps <= 0) { fprintf(stderr, "--bit-rate must be positive\n"); return 1; }
-            mp.bit_rate = bps;
-        }
-        else if (starts_with(a, "--tx-rate="))          tx_rate      = atof(a + 10);
-        else if (starts_with(a, "--deviation-hz="))     deviation_hz = atof(a + 15);
-        else if (starts_with(a, "--gauss-bt="))         mp.gauss_bt  = atof(a + 11);
-        else if (starts_with(a, "--gauss-span="))       mp.gauss_symbol_span = atoi(a + 13);
-        else if (starts_with(a, "--freq-hz="))          freq_hz      = atof(a + 10);
-        else if (starts_with(a, "--gain-db="))          gain_db      = atof(a + 10);
-        else if (starts_with(a, "--device-args="))      { /* accepted but ignored: this tool renders IQ offline and never opens the B210 */ }
-        else if (starts_with(a, "--repeat="))           repeat       = atoi(a + 9);
-        else if (starts_with(a, "--gap-ms="))           gap_ms       = atoi(a + 9);
-        else if (starts_with(a, "--preroll-ms="))       preroll_ms   = atoi(a + 13);
-        else if (starts_with(a, "--postroll-ms="))      postroll_ms  = atoi(a + 14);
-        else if (starts_with(a, "--start-delay-s="))    start_delay_s = atof(a + 16);
-        else if (starts_with(a, "--ramp-ms="))           ramp_ms      = atof(a + 10);
-        else if (starts_with(a, "--dump-iq="))          dump_iq_path = a + 10;
-        else if (strcmp(a, "--joke") == 0)              joke = 1;
-        else if (strcmp(a, "--allow-tx") == 0)          allow_tx = 1;
-        else if (strcmp(a, "--dry-run") == 0)           dry_run = 1;
-        else if (strcmp(a, "--no-control-check") == 0)  no_control_check = 1;
-        else { fprintf(stderr, "tx_frame_sdr: unknown arg '%s'\n", a); usage(stderr, argv[0]); return 1; }
-    }
+    if (cfg.bit_rate > 0)           mp.bit_rate = cfg.bit_rate;
+    if (cfg.gauss_bt >= 0.0)        mp.gauss_bt = cfg.gauss_bt;
+    if (cfg.gauss_symbol_span >= 0) mp.gauss_symbol_span = cfg.gauss_symbol_span;
 
     if ((payload_hex == NULL) == (payload_ascii == NULL)) {
         fprintf(stderr, "tx_frame_sdr: pass exactly one of --payload-hex or --payload-ascii\n");

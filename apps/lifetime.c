@@ -18,6 +18,7 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "argparse.h"
 #include "prediction.h"
 #include "tle_csv.h"
 
@@ -58,56 +59,104 @@ double lifetime(prediction_t *prediction, double jul_utc_start, double delta_t_m
     return years;
 }
 
-void usage(FILE *dest, const char *name, int full)
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the fields out into the working locals below so the propagation body is
+// unchanged.
+typedef struct {
+    const char *satellite_name;  // positional 1: name prefix to match in the TLE
+    const char *max_years_arg;   // positional 2: stop after this many years
+    char *tle_path;              // --tle=<path>, run through tle_path_resolve
+} lifetime_args_t;
+
+// Option column width: the widest label below ("<satellite_name>") + a small
+// margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 18
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). HELP_FULL also prints the extended notes
+// the old --help-full carried. Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(lifetime_args_t *a, int argc, char **argv, int help)
 {
-    fprintf(dest,
-        "usage: %s <satellite_name> <max_years> [--tle=<path>]\n"
-        "\n"
-        "Toy orbit-decay estimator. Propagates the SGP4/SDP4 state forward in\n"
-        "time and reports how long until the satellite drops below 100 km.\n"
-        "The TLE's empirical drag term is used; do not treat the result as\n"
-        "an engineering-grade lifetime prediction.\n"
-        "\n"
-        "Positional arguments:\n"
-        "  <satellite_name>             Name prefix to match in the TLE\n"
-        "  <max_years>                  Stop propagating after this many years\n"
-        "\n"
-        "TLE source:\n"
-        "  --tle=<path>                 Path to a TLE file (2 or 3-line format).\n"
-        "                               Default: $HOME/.local/state/simple_sat_ops/active.tle\n"
-        "\n"
-        "Output:\n"
-        "  Prints `Years above 100.0 km: <years>` to stdout.\n"
-        "  Writes /tmp/lifetime_<name>.dat with time,altitude samples.\n"
-        "\n"
-        "Other:\n"
-        "  --help                       Short help (this message)\n"
-        "  --help-full                  Detailed help with example and caveats\n",
-        name);
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
 
-    if (!full) return;
+        // Positionals first so the <...> arguments list above the --options.
+        // Two positionals: each claims the first as-yet-unfilled slot. The
+        // !matched guard on the second keeps a single token from filling both
+        // in the same pass; both still print their line in help mode.
+        if ((a->satellite_name == NULL && (arg[0] != '-' || strcmp(arg, "-") == 0)) || help) {
+            if (help) parse_help_line(OPTW, "<satellite_name>", "name prefix to match in the TLE");
+            else a->satellite_name = arg;
+            matched = 1;
+        }
+        if ((!matched && a->max_years_arg == NULL && (arg[0] != '-' || strcmp(arg, "-") == 0)) || help) {
+            if (help) parse_help_line(OPTW, "<max_years>", "stop propagating after this many years");
+            else a->max_years_arg = arg;
+            matched = 1;
+        }
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "short help (this message)");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strcmp(arg, "--help-full") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help-full", "detailed help with example and caveats");
+            else { parse_args(a, argc, argv, HELP_FULL); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strncmp(arg, "--tle=", 6) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--tle=<path>", "path to a TLE file (2 or 3-line); default $HOME/.local/state/simple_sat_ops/active.tle");
+            else {
+                if (strlen(arg) < 7) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                a->tle_path = tle_path_resolve(arg + 6);
+            }
+            matched = 1;
+        }
 
-    fprintf(dest,
-        "\n"
-        "EXAMPLE\n"
-        "\n"
-        "  %s 'ISS (ZARYA)' 20 --tle=TLEs/amateur.tle\n"
-        "  # then plot the result:\n"
-        "  gnuplot -p -e \"plot '/tmp/lifetime_ISS (ZARYA).dat' with lines\"\n"
-        "\n"
-        "ACCURACY CAVEATS\n"
-        "\n"
-        "The SGP4/SDP4 drag model uses the BSTAR term recorded in the TLE at\n"
-        "epoch. It does not account for:\n"
-        "  - Changes in solar activity over the propagation window\n"
-        "  - Satellite attitude or drag-area changes\n"
-        "  - Orbital manoeuvres\n"
-        "  - Long-term BSTAR drift (TLEs are snapshots, not time-series)\n"
-        "\n"
-        "Treat the result as a `what-if` sanity check. For real end-of-life\n"
-        "predictions, use a dedicated propagator with atmospheric density\n"
-        "models (NRLMSISE-00 etc.) and updated drag observations.\n",
-        name);
+        if (!matched && !help) {
+            fprintf(stderr, "Unable to parse option '%s'\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    if (help >= HELP_FULL) {
+        printf(
+            "\n"
+            "Toy orbit-decay estimator. Propagates the SGP4/SDP4 state forward in\n"
+            "time and reports how long until the satellite drops below 100 km.\n"
+            "The TLE's empirical drag term is used; do not treat the result as\n"
+            "an engineering-grade lifetime prediction.\n"
+            "\n"
+            "OUTPUT\n"
+            "\n"
+            "  Prints `Years above 100.0 km: <years>` to stdout.\n"
+            "  Writes /tmp/lifetime_<name>.dat with time,altitude samples.\n"
+            "\n"
+            "EXAMPLE\n"
+            "\n"
+            "  lifetime 'ISS (ZARYA)' 20 --tle=TLEs/amateur.tle\n"
+            "  # then plot the result:\n"
+            "  gnuplot -p -e \"plot '/tmp/lifetime_ISS (ZARYA).dat' with lines\"\n"
+            "\n"
+            "ACCURACY CAVEATS\n"
+            "\n"
+            "The SGP4/SDP4 drag model uses the BSTAR term recorded in the TLE at\n"
+            "epoch. It does not account for:\n"
+            "  - Changes in solar activity over the propagation window\n"
+            "  - Satellite attitude or drag-area changes\n"
+            "  - Orbital manoeuvres\n"
+            "  - Long-term BSTAR drift (TLEs are snapshots, not time-series)\n"
+            "\n"
+            "Treat the result as a `what-if` sanity check. For real end-of-life\n"
+            "predictions, use a dedicated propagator with atmospheric density\n"
+            "models (NRLMSISE-00 etc.) and updated drag observations.\n");
+    }
+    return PARSE_OK;
 }
 
 // -V / --version support (commit baked in at build time).
@@ -122,33 +171,17 @@ int main(int argc, char **argv)
 
     prediction_t prediction = {0};
 
-    int n_options = 0;
-
-    for (int i = 0; i < argc; i++) {
-        if (strcmp("--help", argv[i]) == 0) {
-            usage(stdout, argv[0], 0);
-            return 0;
-        } else if (strcmp("--help-full", argv[i]) == 0) {
-            usage(stdout, argv[0], 1);
-            return 0;
-        } else if (strncmp("--tle=", argv[i], 6) == 0) {
-            n_options++;
-            if (strlen(argv[i]) < 7) {
-                fprintf(stderr, "Unable to parse %s\n", argv[i]);
-                return EXIT_FAILURE;
-            }
-            prediction.tles_filename = tle_path_resolve(argv[i] + 6);
-        } else if (strncmp("--", argv[i], 2) == 0) {
-            fprintf(stderr, "Unable to parse option '%s'\n", argv[i]);
-            return 1;
-        }
+    lifetime_args_t cfg = {0};
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return EXIT_FAILURE;
     }
-
-    if (argc - n_options != 3) {
-        usage(stderr, argv[0], 0);
+    if (cfg.satellite_name == NULL || cfg.max_years_arg == NULL) {
+        fprintf(stderr, "usage: lifetime <satellite_name> <max_years> [--tle=<path>] (try --help)\n");
         return EXIT_FAILURE;
     }
 
+    prediction.tles_filename = cfg.tle_path;
     if (prediction.tles_filename == NULL) {
         static char default_tle[1024];
         if (tle_default_path(default_tle, sizeof(default_tle)) != 0) {
@@ -157,8 +190,8 @@ int main(int argc, char **argv)
         }
         prediction.tles_filename = tle_path_resolve(default_tle);
     }
-    prediction.satellite_ephem.name = argv[1];
-    double max_years = atof(argv[2]);
+    prediction.satellite_ephem.name = (char *)cfg.satellite_name;
+    double max_years = atof(cfg.max_years_arg);
     double min_alt_km = 100.0;
 
     /* Set up observer location */
