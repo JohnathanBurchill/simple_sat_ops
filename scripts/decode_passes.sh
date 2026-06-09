@@ -94,16 +94,19 @@ if [[ ! -d "$ROOT" ]]; then
 fi
 
 # --db routes every rx_replay to one packet DB by exporting SSO_PACKET_DB,
-# which rx_replay's default-path logic checks before <root>/packet_db.sqlite.
-# Exporting (not just setting) is what makes the child rx_replay processes
-# see it. Without --db this is left alone, so an SSO_PACKET_DB already in
-# the environment still wins and a bare run uses the usual default.
+# which rx_replay's default-path logic checks first. Exporting (not just
+# setting) is what makes the child rx_replay processes see it. Without --db
+# this is left alone: an SSO_PACKET_DB already in the environment still wins,
+# otherwise rx_replay falls back to $FRONTIERSAT_ROOT/packet_db.sqlite. That
+# fallback keys off the shared tree ROOT, NOT --root -- so a bare run that
+# scans, say, satnogs_archive still writes to the one main packet DB, never a
+# DB under the scanned directory.
 if [[ -n "$DB_PATH" ]]; then
     export SSO_PACKET_DB="$DB_PATH"
 fi
 echo "rx_replay:  $RX_REPLAY"
 echo "root:       $ROOT"
-echo "packet DB:  ${SSO_PACKET_DB:-<rx_replay default: $ROOT/packet_db.sqlite>}"
+echo "packet DB:  ${SSO_PACKET_DB:-$FRONTIERSAT_ROOT/packet_db.sqlite (rx_replay default)}"
 
 # ffmpeg is only required when an .ogg shows up in the tree; check
 # lazily so a pure-WAV run on a host without ffmpeg still works.
