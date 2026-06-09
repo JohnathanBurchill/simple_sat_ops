@@ -45,6 +45,7 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/src/pipeline
     ${CMAKE_SOURCE_DIR}/src/ipc
     ${CMAKE_SOURCE_DIR}/src/db
+    ${CMAKE_SOURCE_DIR}/src/cli
     ${CMAKE_BINARY_DIR}/generated
 )
 
@@ -252,6 +253,14 @@ add_executable(tcmd_lint_selftest
                src/proto/tcmd_spec.c src/proto/agenda_line.c)
 target_include_directories(tcmd_lint_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS tcmd_lint_selftest)
+
+# argparse self-test: the dual-mode parse_args() convention
+# (src/cli/argparse.h). Header-only, so the test compiles on its own.
+# Pure POSIX.
+add_executable(argparse_selftest
+               unit_tests/argparse_selftest.c)
+target_include_directories(argparse_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+list(APPEND SSO_TARGETS argparse_selftest)
 
 # Curses test runner: walks the *_selftest binaries built above (and
 # any added later in this file), parses TAP from their stdout, and

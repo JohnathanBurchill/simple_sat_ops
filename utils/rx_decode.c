@@ -35,6 +35,7 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include "argparse.h"
 #include "ax100.h"
 #include "beacon_cts1.h"
 #include "csp.h"
@@ -131,130 +132,207 @@ static size_t extract_channel_zero(int16_t *samples, size_t n, int channels)
     return frames;
 }
 
-static void usage(FILE *out, const char *argv0)
+// Parsed command-line configuration. parse_args() fills this; main() copies
+// the fields out into working locals so the (large) decode body is unchanged.
+typedef struct {
+    const char *input_path;
+    const char *keyfile_path;
+    int raw_mode;
+    int raw_mode_explicit;
+    int raw_rate;
+    int raw_channels;
+    int bit_rate;
+    int invert;
+    int sync_max_ham;
+    int use_hmac;
+    int use_rs;
+    int csp_crc32;
+    int verbose;
+    int hex_only;
+    int dump_bits;
+    int no_dc_block;
+    const char *ref_hex_arg;
+    int allow_partial_rs;
+    int force_beacon;
+    int show_packet_headers;
+    const char *db_path;
+    const char *source_run_override;
+    int no_db;
+} rxd_args_t;
+
+// Option column width: the widest label below ("--sync-threshold=<0..8>") + a
+// small margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 25
+
+// Parse argv into *a (help == 0), or print one right-aligned help line per
+// option and return (help != 0). Each option is one self-contained block whose
+// test carries "|| help", so help mode falls through and prints them all.
+static int parse_args(rxd_args_t *a, int argc, char **argv, int help)
 {
-    fprintf(out,
-        "usage: %s <path> [options]\n"
-        "\n"
-        "Decodes an AX100 frame from a WAV or headerless S16_LE raw PCM\n"
-        "recording and prints the CSP header and payload. Primary end-to-end\n"
-        "test: `uplink_test --payload-ascii=HELLO --out=/tmp/h.wav && \\\n"
-        "                  %s /tmp/h.wav`.\n"
-        "\n"
-        "Input:\n"
-        "  --raw                      Treat <path> as headerless S16_LE PCM\n"
-        "                             (output of `rtl_fm -M fm -s 48000` or\n"
-        "                             rx_capture's .raw companion). Auto-\n"
-        "                             enabled when <path> ends in '.raw'.\n"
-        "  --rate=<hz>                Sample rate for --raw (default 48000)\n"
-        "  --channels=<n>             Channels for --raw (default 2; ch 0\n"
-        "                             used — matches rx_capture's stereo\n"
-        "                             output. Pass --channels=1 for rtl_fm.)\n"
-        "\n"
-        "Framing / FEC / HMAC:\n"
-        "  --reed-solomon             RS(255,223) decode (DEFAULT for uplink)\n"
-        "  --no-reed-solomon          Disable RS decode. Use when talking to\n"
-        "                             a TX that did not RS-encode (e.g.,\n"
-        "                             downlink which uses CRC instead per\n"
-        "                             pycsplink).\n"
-        "  --hmac                     Enable HMAC verification. AX100\n"
-        "                             downlink frames do NOT use HMAC, so\n"
-        "                             this is OFF by default. Use when\n"
-        "                             round-tripping uplink_test output.\n"
-        "  --keyfile=<path>           HMAC keyfile (only relevant with\n"
-        "                             --hmac; default $HOME/%s)\n"
-        "\n"
-        "Modem:\n"
-        "  --bit-rate=<bps>           Default 9600\n"
-        "  --invert                   Try inverted polarity first (both are\n"
-        "                             always tried; this just reorders)\n"
-        "  --sync-threshold=<0..8>    Max bit errors in the 32-bit ASM match\n"
-        "                             (default 0 = strict; relax to 4-6 for\n"
-        "                             real-RF captures where the sync word\n"
-        "                             gets ~5 bit errors from ISI). When HMAC\n"
-        "                             is enabled, rx_decode iterates through\n"
-        "                             successive sync candidates until one\n"
-        "                             HMAC-validates, so relaxing this is safe.\n"
-        "\n"
-        "Output:\n"
-        "  -v                         Verbose: pipeline-stage diagnostics\n"
-        "  --hex-only                 Print only the decoded payload as hex\n"
-        "                             (for scripting)\n"
-        "  --dump-bits[=<N>]          Print N bits at the detected ASM (default\n"
-        "                             512). On success: bits from the modem's\n"
-        "                             post-slicer stream starting at sync_off,\n"
-        "                             with the expected ASM (0x930B51DE) shown\n"
-        "                             above for visual Hamming inspection. On\n"
-        "                             failure: 512 bits per phase from the\n"
-        "                             diagnostic raw-slicer's best ASM-match\n"
-        "                             window (was -v-only before).\n"
-        "  --csp-crc32                Validate + strip a trailing CSP zlib\n"
-        "                             CRC32. Off by default. AX100 frames\n"
-        "                             in either direction don't necessarily\n"
-        "                             carry one (uplink has HMAC; downlink\n"
-        "                             depends on firmware). Enable only\n"
-        "                             when you know the TX side appends a\n"
-        "                             CRC; otherwise frames fail validation\n"
-        "                             and the trailer stays in the payload.\n"
-        "  --ref-hex=<hex>            Compare the decoded packet (or payload,\n"
-        "                             auto-detected by length) against this\n"
-        "                             reference and print byte positions\n"
-        "                             that differ. Useful with the\n"
-        "                             partial-RS rescue path to see where\n"
-        "                             bit errors landed in a corrupted\n"
-        "                             beacon. Whitespace and ':' in the hex\n"
-        "                             string are ignored.\n"
-        "  --no-partial-rs            Disable the partial-RS rescue. By\n"
-        "                             default, when RS is on but the frame\n"
-        "                             exceeds RS's 16-byte budget,\n"
-        "                             rx_decode retries with RS off and\n"
-        "                             reports the descrambled (uncorrected)\n"
-        "                             bytes with rs=UNCORRECTABLE so the\n"
-        "                             operator still sees the frame.\n"
-        "  --force-beacon             Pad the decoded payload with zeros\n"
-        "                             up to 130 bytes and print it as a\n"
-        "                             beacon regardless of length or\n"
-        "                             dispatch result. Last-ditch view of\n"
-        "                             a heavily corrupted frame; a notice\n"
-        "                             reports how many bytes were synthetic.\n"
-        "  --quiet-headers            Hide the AX100 framing line, CSP\n"
-        "                             header line, and payload hex/ascii\n"
-        "                             dumps. Only the interpreted body\n"
-        "                             (beacon/tcmd/log/bulk_file) and\n"
-        "                             error states (HMAC/CRC mismatch,\n"
-        "                             rs=UNCORRECTABLE) print. Default off\n"
-        "                             — rx_decode is a forensic tool and\n"
-        "                             ships with full headers. The same\n"
-        "                             toggle is `--no-packet-headers` for\n"
-        "                             consistency with rx_replay.\n"
-        "  --packet-headers           Default; show every field. Kept as\n"
-        "                             a no-op for scripts.\n"
-        "  --db=<path>                Append decoded packets to a SQLite\n"
-        "                             store. Default: $SSO_PACKET_DB or\n"
-        "                             $HOME/.local/share/simple_sat_ops/\n"
-        "                             packets.db. Rows are deduplicated\n"
-        "                             on payload SHA1 + source-tool +\n"
-        "                             source-run, so re-decoding the same\n"
-        "                             capture is harmless.\n"
-        "  --no-db                    Skip DB writes (the .log text\n"
-        "                             output continues unchanged).\n"
-        "  --source-run=<id>          Override the auto-generated\n"
-        "                             per-launch run-id used for dedup.\n"
-        "                             Useful when re-running the same\n"
-        "                             input and you DO want a fresh row.\n"
-        "  --no-dc-block              Skip the modem's DC-block IIR (alpha=0.995)\n"
-        "                             on RX. Default-ON setting was added for\n"
-        "                             rtl_fm's discriminator drift; for radio\n"
-        "                             paths with no DC offset the HPF only adds\n"
-        "                             baseline transients across burst\n"
-        "                             boundaries that cost a few bits in the\n"
-        "                             ASM detector. If the failure-path\n"
-        "                             diagnostic shows ASM at HD=2-4 in the raw\n"
-        "                             slicer but the modem reports 'no valid\n"
-        "                             AX100 frame', this flag often closes the\n"
-        "                             gap.\n"
-        "  --help                     This message\n",
-        argv0, argv0, HMAC_KEYFILE_DEFAULT_RELPATH);
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        // <path>: first non-option token. A lone "-" counts as a positional.
+        // Declared first so it lists above the --options in help.
+        if ((a->input_path == NULL && (arg[0] != '-' || strcmp(arg, "-") == 0)) || help) {
+            if (help) parse_help_line(OPTW, "<path>", "WAV or headerless S16_LE raw PCM recording");
+            else a->input_path = arg;
+            matched = 1;
+        }
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strcmp(arg, "--raw") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--raw", "treat <path> as headerless S16_LE PCM (auto for .raw)");
+            else { a->raw_mode = 1; a->raw_mode_explicit = 1; }
+            matched = 1;
+        }
+        if (starts_with(arg, "--rate=") || help) {
+            if (help) parse_help_line(OPTW, "--rate=<hz>", "sample rate for --raw (default 48000)");
+            else a->raw_rate = atoi(arg + 7);
+            matched = 1;
+        }
+        if (starts_with(arg, "--channels=") || help) {
+            if (help) parse_help_line(OPTW, "--channels=<n>", "channels for --raw (default 2; ch 0 used)");
+            else a->raw_channels = atoi(arg + 11);
+            matched = 1;
+        }
+        if (strcmp(arg, "--reed-solomon") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--reed-solomon", "RS(255,223) decode (DEFAULT for uplink)");
+            else a->use_rs = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-reed-solomon") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-reed-solomon", "disable RS decode (downlink/CRC frames)");
+            else a->use_rs = 0;
+            matched = 1;
+        }
+        if (strcmp(arg, "--hmac") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--hmac", "enable HMAC verification (off by default)");
+            else a->use_hmac = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-hmac") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-hmac", "disable HMAC verification (the default)");
+            else a->use_hmac = 0;
+            matched = 1;
+        }
+        if (starts_with(arg, "--keyfile=") || help) {
+            if (help) parse_help_line(OPTW, "--keyfile=<path>", "HMAC keyfile (only relevant with --hmac)");
+            else a->keyfile_path = arg + 10;
+            matched = 1;
+        }
+        if (starts_with(arg, "--bit-rate=") || help) {
+            if (help) parse_help_line(OPTW, "--bit-rate=<bps>", "modem bit rate (default 9600)");
+            else a->bit_rate = atoi(arg + 11);
+            matched = 1;
+        }
+        if (strcmp(arg, "--invert") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--invert", "try inverted polarity first (both are tried)");
+            else a->invert = 1;
+            matched = 1;
+        }
+        if (starts_with(arg, "--sync-threshold=") || help) {
+            if (help) parse_help_line(OPTW, "--sync-threshold=<0..8>", "max bit errors in the 32-bit ASM match (default 0)");
+            else {
+                a->sync_max_ham = atoi(arg + 17);
+                if (a->sync_max_ham < 0 || a->sync_max_ham > 8) {
+                    fprintf(stderr, "rx_decode: --sync-threshold out of range [0,8]\n");
+                    return PARSE_ERROR;
+                }
+            }
+            matched = 1;
+        }
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0 || help) {
+            if (help) parse_help_line(OPTW, "-v, --verbose", "verbose: pipeline-stage diagnostics");
+            else a->verbose = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--hex-only") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--hex-only", "print only the decoded payload as hex");
+            else a->hex_only = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--dump-bits") == 0 || starts_with(arg, "--dump-bits=") || help) {
+            if (help) parse_help_line(OPTW, "--dump-bits[=<n>]", "print N bits at the detected ASM (default 512)");
+            else {
+                a->dump_bits = (arg[11] == '=') ? atoi(arg + 12) : 512;
+                if (a->dump_bits <= 0) {
+                    fprintf(stderr, "rx_decode: --dump-bits must be > 0\n");
+                    return PARSE_ERROR;
+                }
+            }
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-dc-block") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-dc-block", "skip the modem's DC-block IIR on RX");
+            else a->no_dc_block = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--csp-crc32") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--csp-crc32", "validate + strip a trailing CSP zlib CRC32");
+            else a->csp_crc32 = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-csp-crc32") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-csp-crc32", "do not check a CSP CRC32 (the default)");
+            else a->csp_crc32 = 0;
+            matched = 1;
+        }
+        if (starts_with(arg, "--ref-hex=") || help) {
+            if (help) parse_help_line(OPTW, "--ref-hex=<hex>", "diff the decoded packet against this reference hex");
+            else a->ref_hex_arg = arg + 10;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-partial-rs") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-partial-rs", "disable the partial-RS rescue path");
+            else a->allow_partial_rs = 0;
+            matched = 1;
+        }
+        if (strcmp(arg, "--force-beacon") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--force-beacon", "pad payload to 130 bytes and print it as a beacon");
+            else a->force_beacon = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--packet-headers") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--packet-headers", "default; show every header field");
+            else a->show_packet_headers = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--quiet-headers") == 0 || strcmp(arg, "--no-packet-headers") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--quiet-headers", "hide AX100/CSP header lines (alias --no-packet-headers)");
+            else a->show_packet_headers = 0;
+            matched = 1;
+        }
+        if (starts_with(arg, "--db=") || help) {
+            if (help) parse_help_line(OPTW, "--db=<path>", "append decoded packets to a SQLite store");
+            else a->db_path = arg + 5;
+            matched = 1;
+        }
+        if (strcmp(arg, "--no-db") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-db", "skip DB writes");
+            else a->no_db = 1;
+            matched = 1;
+        }
+        if (starts_with(arg, "--source-run=") || help) {
+            if (help) parse_help_line(OPTW, "--source-run=<id>", "override the per-launch run-id used for dedup");
+            else a->source_run_override = arg + 13;
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            if (arg[0] == '-' && strcmp(arg, "-") != 0)
+                fprintf(stderr, "rx_decode: unknown option '%s'\n", arg);
+            else
+                fprintf(stderr, "rx_decode: unexpected positional '%s'\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK;
 }
 
 // -V / --version support (commit baked in at build time).
@@ -263,121 +341,50 @@ static void usage(FILE *out, const char *argv0)
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "rx_decode")) return 0;
-    const char *input_path = NULL;
-    const char *keyfile_path = NULL;
-    int raw_mode = 0;
-    int raw_mode_explicit = 0;
-    int raw_rate = 48000;
-    int raw_channels = 2;
-    int bit_rate = 9600;
-    int invert = 0;
-    int sync_max_ham = 0;
-    int use_hmac = 0;  // AX100 downlink does not use HMAC; opt in with --hmac
-    int use_rs = 1;  // default ON to match pycsplink uplink
-    int csp_crc32 = 0;  // opt-in via --csp-crc32
-    int verbose = 0;
-    int hex_only = 0;
-    int dump_bits = 0;  // 0 = disabled; >0 = bits to print on success/failure
-    int no_dc_block = 0;
-    const char *ref_hex_arg = NULL;
-    uint8_t ref_buf[4100];
-    size_t ref_buf_len = 0;
-    int allow_partial_rs = 1;  // rescue path on by default; --no-partial-rs to disable
-    int force_beacon = 0;
-    // Forensic CLI: default to showing the raw header lines so single-frame
-    // post-mortems aren't missing context. --quiet-headers flips it.
-    int show_packet_headers = 1;
-    const char *db_path = NULL;
-    const char *source_run_override = NULL;
-    int no_db = 0;
-
-    for (int i = 1; i < argc; ++i) {
-        const char *a = argv[i];
-        if (strcmp(a, "--help") == 0) {
-            usage(stdout, argv[0]);
-            return 0;
-        } else if (strcmp(a, "--raw") == 0) {
-            raw_mode = 1;
-            raw_mode_explicit = 1;
-        } else if (starts_with(a, "--rate=")) {
-            raw_rate = atoi(a + 7);
-        } else if (starts_with(a, "--channels=")) {
-            raw_channels = atoi(a + 11);
-        } else if (starts_with(a, "--keyfile=")) {
-            keyfile_path = a + 10;
-        } else if (strcmp(a, "--hmac") == 0) {
-            use_hmac = 1;
-        } else if (strcmp(a, "--no-hmac") == 0) {
-            // Default is now --no-hmac; kept as a no-op so existing
-            // scripts / docs don't break.
-            use_hmac = 0;
-        } else if (strcmp(a, "--reed-solomon") == 0) {
-            use_rs = 1;
-        } else if (strcmp(a, "--no-reed-solomon") == 0) {
-            use_rs = 0;
-        } else if (starts_with(a, "--bit-rate=")) {
-            bit_rate = atoi(a + 11);
-        } else if (strcmp(a, "--invert") == 0) {
-            invert = 1;
-        } else if (starts_with(a, "--sync-threshold=")) {
-            sync_max_ham = atoi(a + 17);
-            if (sync_max_ham < 0 || sync_max_ham > 8) {
-                fprintf(stderr, "rx_decode: --sync-threshold out of range [0,8]\n");
-                return 1;
-            }
-        } else if (strcmp(a, "-v") == 0 || strcmp(a, "--verbose") == 0) {
-            verbose = 1;
-        } else if (strcmp(a, "--hex-only") == 0) {
-            hex_only = 1;
-        } else if (strcmp(a, "--dump-bits") == 0) {
-            dump_bits = 512;
-        } else if (starts_with(a, "--dump-bits=")) {
-            dump_bits = atoi(a + 12);
-            if (dump_bits <= 0) {
-                fprintf(stderr, "rx_decode: --dump-bits must be > 0\n");
-                return 1;
-            }
-        } else if (strcmp(a, "--no-dc-block") == 0) {
-            no_dc_block = 1;
-        } else if (strcmp(a, "--csp-crc32") == 0) {
-            csp_crc32 = 1;
-        } else if (strcmp(a, "--no-csp-crc32") == 0) {
-            csp_crc32 = 0;
-        } else if (starts_with(a, "--ref-hex=")) {
-            ref_hex_arg = a + 10;
-        } else if (strcmp(a, "--no-partial-rs") == 0) {
-            allow_partial_rs = 0;
-        } else if (strcmp(a, "--force-beacon") == 0) {
-            force_beacon = 1;
-        } else if (strcmp(a, "--packet-headers") == 0) {
-            show_packet_headers = 1;
-        } else if (strcmp(a, "--quiet-headers") == 0
-                   || strcmp(a, "--no-packet-headers") == 0) {
-            show_packet_headers = 0;
-        } else if (starts_with(a, "--db=")) {
-            db_path = a + 5;
-        } else if (strcmp(a, "--no-db") == 0) {
-            no_db = 1;
-        } else if (starts_with(a, "--source-run=")) {
-            source_run_override = a + 13;
-        } else if (a[0] == '-') {
-            fprintf(stderr, "rx_decode: unknown option '%s'\n", a);
-            usage(stderr, argv[0]);
-            return 1;
-        } else if (input_path == NULL) {
-            input_path = a;
-        } else {
-            fprintf(stderr, "rx_decode: unexpected positional '%s'\n", a);
-            usage(stderr, argv[0]);
-            return 1;
-        }
+    rxd_args_t cfg = {
+        .raw_rate = 48000,
+        .raw_channels = 2,
+        .bit_rate = 9600,
+        .use_hmac = 0,   // AX100 downlink does not use HMAC; opt in with --hmac
+        .use_rs = 1,     // default ON to match pycsplink uplink
+        .allow_partial_rs = 1,  // rescue path on by default; --no-partial-rs disables
+        .show_packet_headers = 1,  // forensic CLI: full headers by default
+    };
+    switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
     }
-
-    if (input_path == NULL) {
-        fprintf(stderr, "rx_decode: missing <path>\n");
-        usage(stderr, argv[0]);
+    if (cfg.input_path == NULL) {
+        fprintf(stderr, "rx_decode: missing <path> (try --help)\n");
         return 1;
     }
+
+    // Copy parsed config into the working locals the decode body below uses.
+    const char *input_path = cfg.input_path;
+    const char *keyfile_path = cfg.keyfile_path;
+    int raw_mode = cfg.raw_mode;
+    int raw_mode_explicit = cfg.raw_mode_explicit;
+    int raw_rate = cfg.raw_rate;
+    int raw_channels = cfg.raw_channels;
+    int bit_rate = cfg.bit_rate;
+    int invert = cfg.invert;
+    int sync_max_ham = cfg.sync_max_ham;
+    int use_hmac = cfg.use_hmac;
+    int use_rs = cfg.use_rs;
+    int csp_crc32 = cfg.csp_crc32;
+    int verbose = cfg.verbose;
+    int hex_only = cfg.hex_only;
+    int dump_bits = cfg.dump_bits;
+    int no_dc_block = cfg.no_dc_block;
+    const char *ref_hex_arg = cfg.ref_hex_arg;
+    uint8_t ref_buf[4100];
+    size_t ref_buf_len = 0;
+    int allow_partial_rs = cfg.allow_partial_rs;
+    int force_beacon = cfg.force_beacon;
+    int show_packet_headers = cfg.show_packet_headers;
+    const char *db_path = cfg.db_path;
+    const char *source_run_override = cfg.source_run_override;
+    int no_db = cfg.no_db;
 
     // Open the packet DB (or skip on --no-db) and plug it into emit_frame.
     // Note rx_decode doesn't actually call emit_frame (it has its own
