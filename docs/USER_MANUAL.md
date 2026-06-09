@@ -1605,6 +1605,30 @@ agenda files under the data root for `@tssent=<value>`, and otherwise
 shows `(command unknown)`. Manually-composed commands carry no `@tssent`
 and so are not recorded or resolved.
 
+**Press `Enter` on a `bulk_file` packet to reconstruct the downloaded
+file.** The satellite splits a file into 195-byte chunks, each tagged with
+its `file_offset`, and downlinks them at 9600 baud; `packet_browser`
+reassembles them in offset order into one buffer and shows any bytes it never
+received as `?`. `v` cycles the view (hex / ASCII / base64) and `e` exports
+the reconstructed bytes to a file.
+
+Because a single capture run can hold more than one download (a second file,
+or the same file fetched again), the reconstruction is scoped to the **one
+download "burst"** the selected chunk belongs to, not every `bulk_file` chunk
+in the run. Starting from the chosen chunk it walks outward in time and keeps
+a neighbouring chunk only while the gap between the two is consistent with the
+firmware streaming the chunks between their `file_offset`s at about 4 packets
+per second (the radio transmits each ~244-byte framed packet during the
+firmware's ~208 ms inter-packet pacing, so the two overlap to ~250 ms/packet) -
+with a generous margin for
+missed packets and link fades, and capped at 30 s so a clearly separate
+download isn't pulled in. The header reports the offset range, how many chunks
+were used out of the run's total, the missing-byte count, the burst's
+wall-clock span, and - when a matching `sent_tcmd` row exists - how long after
+the triggering telecommand (`@tssent`) the download began. A download split
+across a long pause, or across separate commands, reconstructs as separate
+bursts; open each from one of its own chunks.
+
 ### `tcmd_import`
 
 Backfill old commands into the `sent_tcmd` table. The table is

@@ -750,6 +750,29 @@ static void leave_group(void)
 #define TCMD_RESPONSE_HEADER_SIZE  14    // type+ts_sent+code+dur+seq+max_seq
 #define TCMD_RESPONSE_MAX_DATA     186   // COMMS_TCMD_RESPONSE_..._PER_PACKET
 
+// Downlink timing model, used to scope a reconstruction to ONE contiguous
+// download burst instead of every bulk_file chunk in the run. The firmware
+// downlinks 195 file bytes per packet (BULK_FILE_MAX_DATA) and paces packets
+// with COMMS_bulk_downlink_delay_per_packet_ms = 208 ms. The AX100 transmits a
+// packet (~244 framed bytes, ~203 ms at 9600 baud) *during* that pacing delay
+// rather than after it, so transmit and pacing overlap and the observed
+// cadence is about 4 packets/second -- ~250 ms/packet on a waterfall -- not
+// the sum of the two. So one packet of file_offset progress costs about
+// DOWNLINK_PER_PACKET_MS of wall-clock.
+#define DOWNLINK_PER_PACKET_MS   250.0
+// Two decoded chunks join the same burst when the time between them is within
+// (packets-of-offset-between-them) * per-packet time * this margin, plus a
+// small floor. Deliberately generous: keeping a real download whole matters
+// more than trimming it, and a separate download in the same run is minutes
+// away, well outside the window.
+#define DOWNLINK_GAP_MARGIN      3.0
+#define DOWNLINK_GAP_SLACK_MS    2000.0
+// Hard cap on a single inter-chunk gap. A separate download in the same run is
+// assumed to be at least this far away, so a large file_offset jump at a
+// download boundary (which would otherwise inflate the estimate above) can't
+// bridge two downloads across a gap this big.
+#define DOWNLINK_MAX_BURST_GAP_MS 30000.0
+
 static void recon_free(void)
 {
     free(recon_buf);     recon_buf = NULL;
@@ -794,29 +817,123 @@ static long bulk_offset(const uint8_t *pl)
          | ((long) pl[3] << 16) | ((long) pl[4] << 24);
 }
 
-// Reassemble the bulk_file download in the selected chunk's pass. The
-// firmware sends one file at a time, so every bulk_file chunk in the run is
-// placed into one buffer by its file_offset (chunks arrive out of order and
-// get retransmitted, so ordering can't define file boundaries). A bit error
-// in the 4-byte offset can make it absurd, so offsets past a sane cap are
-// dropped. When an offset is received more than once, RS-clean chunks win
-// and an uncorrectable chunk only fills bytes still missing.
+// Reassemble ONE bulk_file download from the selected chunk. A single run can
+// hold more than one download (a second file, or the same file fetched again),
+// so we don't merge every bulk_file chunk in the run. Instead we scope the
+// reconstruction to the one contiguous download "burst" the selected chunk
+// belongs to: starting from it, we walk outward in time and keep a neighbour
+// only while the gap between the two is consistent with the firmware streaming
+// the chunks between their file_offsets at 9600 baud (the DOWNLINK_* model
+// above), within a generous margin. A burst from a different download sits
+// minutes away, outside the window.
+//
+// Within the window, chunks are placed by file_offset (they arrive out of
+// order and get retransmitted, so arrival order can't define file boundaries).
+// A bit error in the 4-byte offset can make it absurd, so offsets past a sane
+// cap are dropped. When an offset is received more than once, RS-clean chunks
+// win and an uncorrectable chunk only fills bytes still missing.
 static void recon_build_bulk(sqlite3 *db)
 {
     recon_free();
     recon_kind = RECON_BULK;
     recon_status[0] = '\0';
     if (rows[sel].payload == NULL) return;
+    sqlite3_int64 anchor_id = rows[sel].id;
 
+    // Pass A: load (reception time, file_offset) for every bulk_file chunk in
+    // the run and find the selected one, so we can bound the burst it's in.
+    typedef struct { double ts_ms; long off; } bchunk_t;
+    bchunk_t *cs = NULL;
+    int n = 0, cap = 0, anchor = -1;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, (julianday(ts_received) - 2440587.5) * 86400000.0, payload "
+            "FROM packet WHERE packet_type=16 AND source_run=?1 "
+            "ORDER BY ts_received, id", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, rows[sel].run, -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const uint8_t *pl = (const uint8_t *) sqlite3_column_blob(st, 2);
+        int pl_len = sqlite3_column_bytes(st, 2);
+        if (pl == NULL || pl_len < BULK_FILE_HEADER_SIZE + 1) continue;
+        long off = bulk_offset(pl);
+        if (off < 0 || off > BULK_FILE_MAX_PLAUSIBLE) continue;
+        if (n == cap) {
+            int ncap = cap ? cap * 2 : 256;
+            bchunk_t *t = (bchunk_t *) realloc(cs, (size_t) ncap * sizeof *cs);
+            if (t == NULL) { free(cs); sqlite3_finalize(st); return; }
+            cs = t; cap = ncap;
+        }
+        if (sqlite3_column_int64(st, 0) == anchor_id) anchor = n;
+        cs[n].ts_ms = sqlite3_column_double(st, 1);
+        cs[n].off = off;
+        n++;
+    }
+    sqlite3_finalize(st);
+    if (n == 0) { free(cs); return; }
+
+    // Wall-clock budget for one chunk of file_offset progress (see the
+    // DOWNLINK_PER_PACKET_MS note: ~4 packets/second observed on waterfalls).
+    const double per_pkt_ms = DOWNLINK_PER_PACKET_MS;
+
+    int lo, hi;
+    if (anchor < 0) {
+        // Selected chunk not in the list (e.g. an absurd offset): fall back to
+        // the whole run rather than guess a window.
+        lo = 0; hi = n - 1;
+    } else {
+        lo = hi = anchor;
+        for (int j = anchor + 1; j < n; j++) {
+            long d = labs(cs[j].off - cs[j - 1].off);
+            double npk = (double) (d / BULK_FILE_MAX_DATA);
+            if (npk < 1.0) npk = 1.0;
+            double allowed = npk * per_pkt_ms * DOWNLINK_GAP_MARGIN + DOWNLINK_GAP_SLACK_MS;
+            if (allowed > DOWNLINK_MAX_BURST_GAP_MS) allowed = DOWNLINK_MAX_BURST_GAP_MS;
+            if (cs[j].ts_ms - cs[j - 1].ts_ms <= allowed) hi = j; else break;
+        }
+        for (int k = anchor - 1; k >= 0; k--) {
+            long d = labs(cs[k + 1].off - cs[k].off);
+            double npk = (double) (d / BULK_FILE_MAX_DATA);
+            if (npk < 1.0) npk = 1.0;
+            double allowed = npk * per_pkt_ms * DOWNLINK_GAP_MARGIN + DOWNLINK_GAP_SLACK_MS;
+            if (allowed > DOWNLINK_MAX_BURST_GAP_MS) allowed = DOWNLINK_MAX_BURST_GAP_MS;
+            if (cs[k + 1].ts_ms - cs[k].ts_ms <= allowed) lo = k; else break;
+        }
+    }
+    double t_lo = cs[lo].ts_ms, t_hi = cs[hi].ts_ms;
+    int total_in_run = n;
+    free(cs);
+
+    // The telecommand that most likely triggered this burst: the latest one
+    // sent at or before the burst start. tssent is an absolute unix-ms time,
+    // so we can report how long after the command the download began. (No
+    // sent_tcmd table, or none before this burst, just leaves it blank.)
+    double trigger_ts = -1;
+    {
+        sqlite3_stmt *tq = NULL;
+        if (sqlite3_prepare_v2(db,
+                "SELECT MAX(ts_sent_ms) FROM sent_tcmd WHERE ts_sent_ms <= ?1",
+                -1, &tq, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(tq, 1, (sqlite3_int64) t_lo);
+            if (sqlite3_step(tq) == SQLITE_ROW
+                && sqlite3_column_type(tq, 0) != SQLITE_NULL)
+                trigger_ts = sqlite3_column_double(tq, 0);
+            sqlite3_finalize(tq);
+        }
+    }
+
+    // Pass B: size the buffer, then place the chunks -- but only those inside
+    // the burst window [t_lo, t_hi] (widened 1 ms so the edge chunks match).
     const char *sql =
         "SELECT payload, rs_errs FROM packet "
         "WHERE packet_type=16 AND source_run=?1 "
+        "AND (julianday(ts_received) - 2440587.5) * 86400000.0 BETWEEN ?2 AND ?3 "
         "ORDER BY ts_received, id";
-    sqlite3_stmt *st = NULL;
+    st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return;
     sqlite3_bind_text(st, 1, rows[sel].run, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(st, 2, t_lo - 1.0);
+    sqlite3_bind_double(st, 3, t_hi + 1.0);
 
-    // Pass 1: size the buffer to the highest plausible byte.
     long size = 0;
     while (sqlite3_step(st) == SQLITE_ROW) {
         const uint8_t *pl = (const uint8_t *) sqlite3_column_blob(st, 0);
@@ -860,10 +977,15 @@ static void recon_build_bulk(sqlite3 *db)
     if (min_off < 0) min_off = 0;
     recon_chunks = chunks;
     recon_count_gaps();
+
+    char extra[64] = "";
+    if (trigger_ts >= 0)
+        snprintf(extra, sizeof extra, "  +%.0fs after cmd", (t_lo - trigger_ts) / 1000.0);
     snprintf(recon_title, sizeof recon_title,
-             "bulk_file  run %.16s  offset %ld..%ld  %d chunk%s  %ld gap byte%s",
-             rows[sel].run, min_off, recon_len, chunks, chunks == 1 ? "" : "s",
-             recon_gap_bytes, recon_gap_bytes == 1 ? "" : "s");
+             "bulk_file  run %.16s  off %ld..%ld  %d/%d chunks  %ld gap byte%s  span %.0fs%s",
+             rows[sel].run, min_off, recon_len, chunks, total_in_run,
+             recon_gap_bytes, recon_gap_bytes == 1 ? "" : "s",
+             (t_hi - t_lo) / 1000.0, extra);
     snprintf(recon_name, sizeof recon_name,
              "bulkfile_%.16s_%ld-%ld.bin", rows[sel].run, min_off, recon_len);
 }
