@@ -29,6 +29,9 @@
       r                reload now (auto-poll happens every ~1 s anyway)
       t                cycle type filter: all → beacon → tcmd_response →
                        log → bulk_file → all
+      o                cycle origin filter: all → cts_ground → satnogs → all
+      e                toggle hiding erroneous decodes (RS-uncorrectable,
+                       HMAC mismatch, or CRC failure) from the list
       v                cycle the detail-pane payload view: hex → ascii →
                        base64 (a bulk_file's ascii/base64 show the file
                        data after the 5-byte type+offset header)
@@ -165,6 +168,12 @@ static char    group_anchor_ts[40] = "";
 static int     type_idx = 0;
 static int     origin_idx = 0;
 static char    like_text[128] = "";
+// Hide rows whose decode had trouble — the same test as row_has_error()
+// and the "!" list marker: RS-uncorrectable, HMAC mismatch, or CRC
+// failure. 0 = show every detected frame (default; this is a forensic
+// tool, so bad decodes stay visible), 1 = filter them out of the list.
+// Toggled with `e`; applies to the main list only, like type/origin.
+static int     hide_errors = 0;
 // Display mode: 0 = UTC (storage form, ISO-8601 Z), 1 = local time
 // (parsed back to time_t and re-formatted with tzname). Filtering and
 // sorting still happens server-side against the UTC strings; only the
@@ -456,6 +465,14 @@ static void run_query(sqlite3 *db)
         off += snprintf(sql + off, sizeof sql - off,
                         " AND capture_origin = ?%d", n_params + 1);
         param_text[n_params++] = origin_filter();
+    }
+    if (hide_errors) {
+        // Mirror row_has_error(): drop RS-uncorrectable / HMAC-mismatch /
+        // CRC-fail rows. These columns are always stored as ints (the
+        // -1 "not checked" sentinel included), never NULL, so a plain
+        // boolean test is safe — no COALESCE needed.
+        off += snprintf(sql + off, sizeof sql - off,
+                        " AND NOT (rs_errs = -2 OR hmac_ok = 0 OR crc_status = 0)");
     }
     if (like_text[0] != '\0') {
         snprintf(like_pattern, sizeof like_pattern, "%%%s%%", like_text);
@@ -1264,9 +1281,10 @@ static void draw_top_bar(int cols)
         snprintf(buf, sizeof buf, " packet_browser  %s", group_header);
     } else {
         snprintf(buf, sizeof buf,
-                 " packet_browser  filter: type=%-13s origin=%-10s  search=\"%s\"  | %d row%s",
+                 " packet_browser  filter: type=%-13s origin=%-10s errors=%-6s  search=\"%s\"  | %d row%s",
                  type_filter() ? type_filter() : "all",
                  origin_filter() ? origin_filter() : "all",
+                 hide_errors ? "hidden" : "shown",
                  like_text, n_rows, n_rows == 1 ? "" : "s");
     }
     mvaddnstr(0, 0, buf, cols);
@@ -2323,6 +2341,14 @@ int main(int argc, char **argv)
             case 'o': case 'O':
                 if (in_group) break;
                 origin_idx = (origin_idx + 1) % ORIGIN_CYCLE_N;
+                run_query(db);
+                last_query = monotonic_seconds();
+                break;
+            case 'e': case 'E':
+                // Toggle hiding erroneous decodes. Filters apply to the
+                // main list only — the sub-view ignores them.
+                if (in_group) break;
+                hide_errors = !hide_errors;
                 run_query(db);
                 last_query = monotonic_seconds();
                 break;

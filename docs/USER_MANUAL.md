@@ -1574,6 +1574,17 @@ stops at that end marker, so trailing framing/parity bytes don't show up
 as a garbage tail after the message. The raw byte dump still shows
 everything.
 
+Rows whose decode had trouble - Reed-Solomon uncorrectable, an HMAC
+mismatch, or a CRC failure - are flagged with a `!` and shown in red.
+Press `e` to toggle hiding those erroneous decodes from the list; the
+top bar reads `errors=shown` or `errors=hidden`, and like the type and
+origin filters it applies to the main list only (the command group and
+file-reconstruction sub-views always show every packet). Cycle the type
+filter with `t`, the capture-origin filter with `o`, and start a
+substring search of the decoded text with `/`. (In the file-reconstruction
+view `e` means something different - it exports the reconstructed bytes,
+described below.)
+
 **Press `Enter` on a `tcmd_response` to see more** - it opens a
 command-group sub-view, the rest of that command's lifecycle. Each
 `tcmd_response` carries the originating command's `@tssent` value
