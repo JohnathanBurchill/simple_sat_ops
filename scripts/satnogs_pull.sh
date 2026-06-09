@@ -66,6 +66,10 @@
 #   --user-agent=<str>      HTTP User-Agent (default "sso-satnogs-pull/1.0")
 #   --decode-passes=<path>  Override decode_passes.sh location
 #   --db=<path>             Pass SSO_PACKET_DB into the --decode invocation
+#   --jobs=<n>              Parallel decode workers for --decode (passed
+#                           through to decode_passes.sh --jobs; default
+#                           there is one per CPU). The download itself is
+#                           always serial and rate-limited.
 #   -h | --help             This help
 
 set -uo pipefail
@@ -94,6 +98,7 @@ RATE_LIMIT_MS=250
 USER_AGENT="sso-satnogs-pull/1.0"
 DECODE_PASSES_BIN=""
 DB_PATH=""
+JOBS_SPEC=""
 TLE_DIR="$FRONTIERSAT_ROOT/TLEs"
 USE_LOCAL_TLE=1
 # Maximum reach-back when --since is auto-resolved from the state file.
@@ -120,6 +125,7 @@ while [[ $# -gt 0 ]]; do
         --user-agent=*)     USER_AGENT="${1#--user-agent=}";;
         --decode-passes=*)  DECODE_PASSES_BIN="${1#--decode-passes=}";;
         --db=*)             DB_PATH="${1#--db=}";;
+        --jobs=*)           JOBS_SPEC="${1#--jobs=}";;
         --tle-dir=*)        TLE_DIR="${1#--tle-dir=}";;
         --no-local-tle)     USE_LOCAL_TLE=0;;
         --lookback-cap=*)   LOOKBACK_CAP_SPEC="${1#--lookback-cap=}";;
@@ -598,10 +604,12 @@ if [[ "$DECODE_AFTER" -eq 1 ]]; then
         echo "satnogs_pull: --decode requested but decode_passes.sh not found" >&2
         exit 1
     fi
-    echo "satnogs_pull: invoking $DECODE_PASSES_BIN --root $OUT"
+    DECODE_ARGS=( --root "$OUT" )
+    [[ -n "$JOBS_SPEC" ]] && DECODE_ARGS+=( --jobs "$JOBS_SPEC" )
+    echo "satnogs_pull: invoking $DECODE_PASSES_BIN ${DECODE_ARGS[*]}"
     if [[ -n "$DB_PATH" ]]; then
-        SSO_PACKET_DB="$DB_PATH" "$DECODE_PASSES_BIN" --root "$OUT"
+        SSO_PACKET_DB="$DB_PATH" "$DECODE_PASSES_BIN" "${DECODE_ARGS[@]}"
     else
-        "$DECODE_PASSES_BIN" --root "$OUT"
+        "$DECODE_PASSES_BIN" "${DECODE_ARGS[@]}"
     fi
 fi
