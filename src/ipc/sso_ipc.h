@@ -106,6 +106,16 @@ typedef struct {
     double range_km;
     double range_rate_kms;
 
+    // Auto-TCMD progress mirror, carried inside STATE / WELCOME events.
+    // auto_tcmd_on is 1 while the operator's Auto-TCMD modal has a run
+    // to report (running, or finished and still on screen); viewers
+    // render "<sent>/<total> (<state>)". Zero when no run, so the
+    // viewer's line disappears when the operator closes the modal.
+    int  auto_tcmd_on;
+    int  auto_tcmd_sent;        // bursts queued so far (sends_total)
+    int  auto_tcmd_total;       // planned sends: n_commands * repeats
+    char auto_tcmd_state[12];   // "running" | "stopped" | "done" | "pass-over"
+
     // rx-stats
     double snr_db;
     long packets;

@@ -492,6 +492,14 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
         if (evt->roster_json[0]) {
             if (json_field_raw(&p, end, &first, "roster", evt->roster_json) < 0) return -1;
         }
+        // Auto-TCMD progress. Only on the wire while the operator has a
+        // run to report; viewers render "<sent>/<total> (<state>)".
+        if (evt->auto_tcmd_on) {
+            if (json_field_bool(&p, end, &first, "at_on", 1) < 0) return -1;
+            if (json_field_int (&p, end, &first, "at_sent", evt->auto_tcmd_sent) < 0) return -1;
+            if (json_field_int (&p, end, &first, "at_tot",  evt->auto_tcmd_total) < 0) return -1;
+            if (json_field_str (&p, end, &first, "at_st",   evt->auto_tcmd_state) < 0) return -1;
+        }
         // Operator-level warning (e.g., low disk). Emitted outside the
         // rx_have_session block so viewers see it even on builds without
         // an SDR — disk pressure matters either way.
@@ -698,6 +706,15 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
     if (json_get_raw(line, "roster", evt->roster_json, sizeof(evt->roster_json)) > 0) {
         evt->has_state = 1;
     }
+    // Auto-TCMD progress mirror. Absent fields stay zeroed (memset at
+    // top of decode), which is what tells the viewer "no run to show".
+    int at_flag = 0;
+    if (json_get_bool(line, "at_on", &at_flag) > 0) evt->auto_tcmd_on = at_flag;
+    long at_int = 0;
+    if (json_get_int(line, "at_sent", &at_int) > 0) evt->auto_tcmd_sent  = (int) at_int;
+    if (json_get_int(line, "at_tot",  &at_int) > 0) evt->auto_tcmd_total = (int) at_int;
+    json_get_string(line, "at_st", evt->auto_tcmd_state, sizeof(evt->auto_tcmd_state));
+
     json_get_double(line, "snr_db", &evt->snr_db);
     json_get_int(line, "packets", &evt->packets);
     json_get_string(line, "last_packet_ts", evt->last_packet_ts, sizeof(evt->last_packet_ts));

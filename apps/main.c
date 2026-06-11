@@ -916,6 +916,10 @@ static rx_session_t *g_rx_session;
 // definition lives next to the rest of the modal state further down,
 // but cmd_dispatch needs to check it.
 static char g_auto_tcmd_file_path[512];
+// Forward-decl the auto-tcmd progress snapshot: the STATE / WELCOME
+// builders (above the modal code) embed it so viewers can mirror the
+// run's <sent>/<total>. Defined with the rest of the modal helpers.
+static int auto_tcmd_progress(int *sent, int *total, const char **label);
 
 // :retarget <file> swaps the tracked satellite mid-pass. retarget_to_tle
 // reads the first satellite from the file and re-points the live
@@ -2240,6 +2244,19 @@ static void ipc_broadcast_state(state_t *s,
     evt.speed_kms      = s->prediction.satellite_ephem.speed_km_s;
     evt.range_km       = s->prediction.satellite_ephem.range_km;
     evt.range_rate_kms = s->prediction.satellite_ephem.range_rate_km_s;
+
+    // Auto-TCMD progress so viewers can follow the run without the modal.
+    {
+        int at_sent = 0, at_total = 0;
+        const char *at_label = NULL;
+        if (auto_tcmd_progress(&at_sent, &at_total, &at_label)) {
+            evt.auto_tcmd_on    = 1;
+            evt.auto_tcmd_sent  = at_sent;
+            evt.auto_tcmd_total = at_total;
+            snprintf(evt.auto_tcmd_state, sizeof evt.auto_tcmd_state,
+                     "%s", at_label);
+        }
+    }
     sso_roster_entry_t entries[SSO_IPC_MAX_CLIENTS_FOR_ROSTER];
     size_t n = 0;
     if (n < sizeof(entries) / sizeof(entries[0])) {
@@ -2348,6 +2365,19 @@ static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
         welcome.speed_kms      = g_last_state_speed_kms;
         welcome.range_km       = g_last_state_range_km;
         welcome.range_rate_kms = g_last_state_rrate_kms;
+        // Auto-TCMD progress reads the live modal state (like
+        // ipc_fill_rx_panel below) — no g_last_state_* cache needed.
+        {
+            int at_sent = 0, at_total = 0;
+            const char *at_label = NULL;
+            if (auto_tcmd_progress(&at_sent, &at_total, &at_label)) {
+                welcome.auto_tcmd_on    = 1;
+                welcome.auto_tcmd_sent  = at_sent;
+                welcome.auto_tcmd_total = at_total;
+                snprintf(welcome.auto_tcmd_state,
+                         sizeof welcome.auto_tcmd_state, "%s", at_label);
+            }
+        }
         // Roster — operator first, then the existing clients we know
         // of. The newly-connecting client is already in the slot table
         // (slot_dispatch_line ran first) but its role isn't populated
@@ -3310,6 +3340,21 @@ static const char *auto_tcmd_state_label(auto_tcmd_state_t s) {
         case AUTO_STATE_PASS_OVER: return "pass-over";
     }
     return "?";
+}
+
+// Snapshot of the auto-tcmd run for the viewer broadcast: sends queued
+// so far vs. the run's planned total (commands × repeats), plus the
+// run-state label. Returns 1 when there is a run to report — the modal
+// is open and Enter has started it (running, or finished and still on
+// screen so viewers see the final tally). Returns 0 in setup or when
+// the modal is closed, which drops the fields from the wire entirely.
+static int auto_tcmd_progress(int *sent, int *total, const char **label) {
+    const auto_tcmd_t *a = &g_auto_tcmd;
+    if (!g_auto_tcmd_active || a->state == AUTO_STATE_SETUP) return 0;
+    *sent  = a->sends_total;
+    *total = a->n_commands * a->repeats_total;
+    *label = auto_tcmd_state_label(a->state);
+    return 1;
 }
 
 static int auto_field_is_text(auto_tcmd_field_t f) {
@@ -5490,6 +5535,14 @@ static int    g_viewer_running            = 1;
 static int    g_viewer_cmd_active         = 0;
 static char   g_viewer_cmd_buf[160]       = "";
 static char   g_viewer_cmd_status[160]    = "";
+// Mirror of the operator's auto-tcmd run. auto_on = 1 while the
+// operator has a run to show; the render line is "<sent>/<total>
+// sent (<state>)" and disappears when the operator closes the modal
+// (the fields drop off the wire, decode zeroes them, we stash that).
+static int  g_viewer_auto_on        = 0;
+static int  g_viewer_auto_sent      = 0;
+static int  g_viewer_auto_total     = 0;
+static char g_viewer_auto_state[12] = "";
 // Mirror of the operator's RX panel. Filled from STATE / WELCOME events;
 // render_rx_panel reads it directly during viewer_render.
 static rx_panel_data_t g_viewer_rx_panel;
@@ -5593,6 +5646,14 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
         snprintf(g_viewer_pass_folder, sizeof g_viewer_pass_folder,
                  "%s", evt->pass_folder);
     }
+
+    // Auto-tcmd progress — stashed unconditionally so a broadcast
+    // without the fields (run over, modal closed) clears the line.
+    g_viewer_auto_on    = evt->auto_tcmd_on;
+    g_viewer_auto_sent  = evt->auto_tcmd_sent;
+    g_viewer_auto_total = evt->auto_tcmd_total;
+    snprintf(g_viewer_auto_state, sizeof g_viewer_auto_state,
+             "%s", evt->auto_tcmd_state);
 
     // Mirror the operator's RX panel from the broadcast. Wipe to zero
     // first so a slot that the operator hasn't decoded in this run
@@ -5813,6 +5874,21 @@ static void viewer_render(int connected)
         sp.target_el     = g_viewer_state.antenna_rotator.target_elevation;
         sp.flip          = g_viewer_state.antenna_rotator.flip_mode_pass;
         render_status_panel(&sp, &srow, col);
+
+        // Auto-tcmd run progress, mirrored from the operator's modal.
+        // Red while the run is live (the PA is being keyed on a timer),
+        // matching the T/R panel's red-while-transmitting convention.
+        if (g_viewer_auto_on) {
+            srow++;
+            int at_running = strcmp(g_viewer_auto_state, "running") == 0;
+            if (at_running) attron(COLOR_PAIR(1));
+            mvprintw(srow++, col, "%15s   %d/%d sent (%s)",
+                     "auto-tcmd",
+                     g_viewer_auto_sent, g_viewer_auto_total,
+                     g_viewer_auto_state[0] ? g_viewer_auto_state : "?");
+            if (at_running) attroff(COLOR_PAIR(1));
+            clrtoeol();
+        }
 
         int prow = 5;
         report_position(&g_viewer_state, &prow, 50);

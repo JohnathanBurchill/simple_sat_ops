@@ -1111,6 +1111,14 @@ Once the pass ends, it stops sending commands. On an
 [RX-only SDR](#sdr-backends) the loop refuses to send (the same RX-only
 gate as the compose modal).
 
+Viewers follow the run too: once a run starts, the state broadcast
+carries its progress, and every viewer's status panel gains an
+`auto-tcmd   <sent>/<total> sent (<state>)` line - red while running,
+then `stopped`, `done`, or `pass-over` with the final tally. The line
+disappears when the operator closes the modal. (The per-send detail -
+each command as it goes out - already appears in everyone's TX log
+panel; this line is the at-a-glance summary.)
+
 ### Finding telecommands and their arguments
 
 `simple_sat_ops` only carries telecommands to the satellite - it does
