@@ -71,12 +71,24 @@ int sdr_fpga_map_path(char *out, size_t cap)
     return (n > 0 && (size_t)n < cap) ? 0 : -1;
 }
 
-int sdr_fpga_for_serial(const char *serial, char *out, size_t cap)
+// The system-wide FPGA map: one admin-managed file that serves every
+// operator, consulted after the per-user map. This is how all regular
+// users auto-load a clone's bitstream without each editing their own
+// ~/.local map. Hardcoded under the same /usr/local tree the binaries
+// install into. The FPGA image it points at is supplied out of band by
+// the admin — neither the image nor this map is shipped or installed by
+// the build. Overridable at build time (e.g. for a non-/usr/local prefix
+// or for tests) via -DSDR_FPGA_MAP_SYSTEM_PATH=...
+#ifndef SDR_FPGA_MAP_SYSTEM_PATH
+#define SDR_FPGA_MAP_SYSTEM_PATH "/usr/local/share/sso/sdr_fpga_map"
+#endif
+
+// Scan one map file for `serial`, writing the mapped image path to `out`.
+// Lines are "<serial> <absolute-image-path>"; '#' and blank lines are
+// skipped. Returns 1 on a hit, 0 on miss or an unreadable/absent file.
+static int fpga_scan_map_file(const char *path, const char *serial,
+                              char *out, size_t cap)
 {
-    if (out != NULL && cap > 0) out[0] = '\0';
-    if (serial == NULL || serial[0] == '\0' || out == NULL) return 0;
-    char path[512];
-    if (sdr_fpga_map_path(path, sizeof path) != 0) return 0;
     FILE *f = fopen(path, "r");
     if (f == NULL) return 0;
     char line[1024];
@@ -96,6 +108,21 @@ int sdr_fpga_for_serial(const char *serial, char *out, size_t cap)
     }
     fclose(f);
     return hit;
+}
+
+int sdr_fpga_for_serial(const char *serial, char *out, size_t cap)
+{
+    if (out != NULL && cap > 0) out[0] = '\0';
+    if (serial == NULL || serial[0] == '\0' || out == NULL) return 0;
+    // Per-user map first, so a developer can override the shared entry
+    // for their own bring-up; then the system-wide map so every operator
+    // shares one admin-managed file.
+    char path[512];
+    if (sdr_fpga_map_path(path, sizeof path) == 0
+        && fpga_scan_map_file(path, serial, out, cap)) {
+        return 1;
+    }
+    return fpga_scan_map_file(SDR_FPGA_MAP_SYSTEM_PATH, serial, out, cap);
 }
 
 static void ensure_parent_dir(const char *path)
@@ -120,13 +147,19 @@ void sdr_fpga_map_ensure_template(const char *serial)
     ensure_parent_dir(path);
     FILE *f = fopen(path, "w");
     if (f == NULL) return;
-    fputs("# simple_sat_ops SDR FPGA map\n"
+    fputs("# simple_sat_ops SDR FPGA map (per-user)\n"
           "# One line per device:  <usb-serial>  <absolute-path-to-fpga.bin>\n"
           "#\n"
           "# A B210 clone is identical to a genuine board on the USB bus\n"
           "# except for its serial number. Map that serial to the clone's\n"
           "# bitstream and simple_sat_ops loads it automatically. Lines\n"
           "# starting with # are ignored.\n"
+          "#\n"
+          "# This per-user file is checked first; entries here OVERRIDE the\n"
+          "# system-wide map at /usr/local/share/sso/sdr_fpga_map. For a\n"
+          "# shared ground station, put the serial->image line in that\n"
+          "# admin-managed file instead and every operator picks it up; use\n"
+          "# this file only to override the shared entry for your own runs.\n"
           "#\n", f);
     if (serial != NULL && serial[0]) {
         fputs("# Detected device below - replace the path to enable auto-load:\n", f);

@@ -896,22 +896,36 @@ your machine:
 2. Find the device serial: run `sdr_probe`. It prints e.g.
    `USB serial: 30AA038`.
 
-3. Map the serial to the image - add a line to
-   `~/.local/share/simple_sat_ops/sdr_fpga_map`:
+3. Map the serial to the image. There are two map files, checked in this
+   order:
+
+   - **Per-user**: `~/.local/share/simple_sat_ops/sdr_fpga_map` (created
+     with a template, and your serial commented in, the first time
+     `simple_sat_ops` opens the device).
+   - **System-wide**: `/usr/local/share/sso/sdr_fpga_map` (admin-managed,
+     consulted when the per-user file has no entry for the serial).
+
+   Each line is `<serial> <absolute-image-path>`:
 
    ```
    30AA038 /FrontierSat/sdr/usrp_b210_fpga.bin
    ```
 
-   (That file is created with a template, and your serial commented in,
-   the first time `simple_sat_ops` opens the device.)
+   On a **shared ground station, put the line in the system-wide map** so
+   every operator picks it up without per-home setup. The image lives in
+   the shared tree (`/FrontierSat/sdr/`) where all operators can read it -
+   the bitstream isn't a secret, so it just needs to be group-readable.
+   Use the per-user file only to override the shared entry for your own
+   bring-up. Neither the image nor the system-wide map is shipped or
+   installed by the build; the admin supplies both out of band.
 
 4. Confirm: re-run `sdr_probe`. It should report the clone image and the
    board should open (RX2 / TX-RX).
 
 From then on the clone's image loads automatically whenever that serial
 is seen; a genuine board with a different serial still gets the stock
-image. To override the map for a one-off, pass `--sdr-fpga=<path>`, or
+image. A per-user entry overrides the system-wide one for the same
+serial. To override the map for a one-off, pass `--sdr-fpga=<path>`, or
 fold it into `--uhd-args="type=b200,serial=...,fpga=<path>"` (which wins
 over everything). The serial is read via libusb; UHD's own
 device-enumeration call segfaults on macOS, so it is not used.
