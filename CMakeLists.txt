@@ -882,6 +882,57 @@ endif()
 
 install(TARGETS ${SSO_TARGETS} DESTINATION /usr/local/bin)
 
+# simple_sat_ops and the other uplink tools read the HMAC keyfile to sign
+# (and, with --hmac, verify) AX100 frames. Operators must be able to run
+# them without being able to read the key bytes themselves. The mechanism:
+# install each keyfile-reading binary setgid to SSO_RUNNER_GROUP — the
+# group allowed to read the key (the key file is
+# root:${SSO_RUNNER_GROUP} 0640) — while operators are NOT members of that
+# group. The binary's effective group lets it read the key; a setgid
+# process is also non-dumpable, so the key can't be scraped out of its
+# memory. See the HMAC keyfile notes in the manual.
+#
+# This has to live in `install` rather than as a one-off chmod on the
+# ground machine, because every `sudo make install` copies a fresh binary
+# back to plain 0755 and would silently drop the setgid bit.
+#
+# SSO_HMAC_TARGETS is exactly the set of binaries that #include
+# hmac_keyfile.h — keep it in sync with that set. (Display-only tools that
+# merely show the hmac_ok DB column, e.g. packet_browser, are not here:
+# they never read the key.)
+#
+# Self-gating: if the group doesn't exist (dev hosts, or a new ground
+# machine before its one-time `groupadd ${SSO_RUNNER_GROUP}`), chgrp fails
+# and the binary is left at the default 0755 with a clear notice — never
+# an install error. Set SSO_RUNNER_GROUP empty to opt out entirely.
+set(SSO_RUNNER_GROUP "sso-runner" CACHE STRING
+    "Group allowed to read the HMAC keyfile; the uplink tools install setgid to it so operators can TX/verify without reading the key. Empty = plain install.")
+set(SSO_HMAC_TARGETS simple_sat_ops uplink_test rx_decode rx_replay tx_frame_sdr)
+
+if (SSO_RUNNER_GROUP)
+    foreach(_sso_t IN LISTS SSO_HMAC_TARGETS)
+        if (TARGET ${_sso_t})
+            install(CODE "
+                set(_sso_bin \"\$ENV{DESTDIR}/usr/local/bin/${_sso_t}\")
+                execute_process(
+                    COMMAND chgrp \"${SSO_RUNNER_GROUP}\" \"\${_sso_bin}\"
+                    RESULT_VARIABLE _sso_chgrp_rc
+                    ERROR_QUIET)
+                if (_sso_chgrp_rc STREQUAL \"0\")
+                    # chgrp clears the setgid bit (the kernel does this even
+                    # for root on modern Linux), so set the mode AFTER it.
+                    execute_process(COMMAND chmod 2755 \"\${_sso_bin}\")
+                    message(STATUS
+                        \"${_sso_t}: installed setgid ${SSO_RUNNER_GROUP} — HMAC key readable by the program, not by operators\")
+                else()
+                    message(STATUS
+                        \"${_sso_t}: group '${SSO_RUNNER_GROUP}' not present; left at 0755 — HMAC setgid protection NOT applied (run 'sudo groupadd --system ${SSO_RUNNER_GROUP}' on the ground machine, then re-install)\")
+                endif()
+            ")
+        endif()
+    endforeach()
+endif()
+
 file(GLOB SSO_SCRIPTS
     "${CMAKE_SOURCE_DIR}/scripts/*.sh"
     "${CMAKE_SOURCE_DIR}/scripts/*.py")
