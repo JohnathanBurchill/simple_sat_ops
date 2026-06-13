@@ -71,9 +71,9 @@ static void uhd_close(sdr_backend_t *be);
 //   2. --sdr-fpga   forces fpga=<path>.
 //   3. serial->image map: read the USB serial via libusb (NOT
 //      uhd_usrp_find, which segfaults on macOS) and, if it matches an
-//      entry in ~/.local/share/simple_sat_ops/sdr_fpga_map, load that
-//      bitstream. This is how a B210 clone (identical to a genuine board
-//      except its serial) gets its non-stock FPGA automatically.
+//      entry in the shared map /usr/local/share/sso/sdr_fpga_map, load
+//      that bitstream. This is how a B210 clone (identical to a genuine
+//      board except its serial) gets its non-stock FPGA automatically.
 //   4. otherwise the base args, letting UHD pick the stock image.
 // uhd_usrp_make fails gracefully when no device is present, so AUTO can
 // still fall through to the RTL-SDR backend.
@@ -104,7 +104,6 @@ static void uhd_resolve_device_args(const sdr_open_params_t *p,
             fprintf(stderr, "sdr_uhd: serial %s -> FPGA %s (sdr_fpga_map)\n",
                     serial, fpga);
         } else {
-            sdr_fpga_map_ensure_template(serial);
             char mp[512] = {0};
             (void)sdr_fpga_map_path(mp, sizeof mp);
             fprintf(stderr, "sdr_uhd: serial %s not in %s — using the stock "

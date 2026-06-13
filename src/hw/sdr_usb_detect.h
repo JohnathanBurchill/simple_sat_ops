@@ -29,19 +29,14 @@
 // (built without HAVE_LIBUSB).
 int sdr_usb_b2xx_serial(char *out, size_t cap);
 
-// Resolve the FPGA image mapped to a USB serial in the per-host map
-// file (see sdr_fpga_map_path). Lines are "<serial> <absolute-path>";
-// '#' and blank lines are ignored. Returns 1 + path on a hit, 0 on a
-// miss.
+// Resolve the FPGA image mapped to a USB serial in the shared, admin-
+// managed map file (see sdr_fpga_map_path). Lines are "<serial>
+// <absolute-path>"; '#' and blank lines are ignored. Returns 1 + path on
+// a hit, 0 on a miss.
 int sdr_fpga_for_serial(const char *serial, char *out, size_t cap);
 
-// Absolute path of the map file
-// (~/.local/share/simple_sat_ops/sdr_fpga_map). Returns 0 on success.
+// Absolute path of the shared FPGA map file
+// (/usr/local/share/sso/sdr_fpga_map). Returns 0 on success.
 int sdr_fpga_map_path(char *out, size_t cap);
-
-// Create the map file with a template comment if it doesn't exist yet,
-// seeding a commented example line for `serial` so the operator can see
-// where to add their clone. Best-effort, no-op if it already exists.
-void sdr_fpga_map_ensure_template(const char *serial);
 
 #endif // SDR_USB_DETECT_H
