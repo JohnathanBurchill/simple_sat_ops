@@ -22,6 +22,7 @@
 #include "tcmd_lint.h"
 #include "tcmd_spec.h"
 #include "agenda_line.h"
+#include "sso_pseudo.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -171,6 +172,26 @@ tcmd_lint_severity_t tcmd_lint_command(const char *cmd, char *msg, size_t msg_ca
 
     size_t n = strlen(cmd);
     if (n == 0) return TCMD_LINT_OK;   // caller skips blank lines
+
+    // A simple_sat_ops-directed pseudo-command (SSO+...). It is not a literal
+    // telecommand: expand it with placeholder clocks and lint the concrete
+    // CTS1+ command it becomes, so a well-formed SSO+ line is accepted and an
+    // unknown/garbled one is still flagged. The placeholders are realistic
+    // 13-digit unix-ms values so the length checks below reflect the real
+    // on-air size of the expansion.
+    if (sso_pseudo_is_directed(cmd)) {
+        char expanded[512];
+        char e[160];
+        sso_pseudo_ctx_t pc = { .now_ms    = 1700000000000LL,
+                                .tssent_ms = 1700000000000LL / 60000LL * 60000LL };
+        sso_pseudo_status_t st =
+            sso_pseudo_expand(cmd, &pc, expanded, sizeof expanded, e, sizeof e);
+        if (st != SSO_PSEUDO_OK) {
+            flag(msg, msg_cap, &len, &worst, TCMD_LINT_ERROR, e);
+            return worst;
+        }
+        return tcmd_lint_command(expanded, msg, msg_cap);
+    }
 
     if (n >= TCMD_MAX_FULL_LEN) {
         flag(msg, msg_cap, &len, &worst, TCMD_LINT_ERROR,

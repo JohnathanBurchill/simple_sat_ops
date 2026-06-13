@@ -314,7 +314,10 @@ struct rx_session {
     uint8_t            burst_hmac_key[128];
     size_t             burst_hmac_key_len;
     rx_burst_result_t  burst_result;
-    char               burst_summary[160];
+    // 256 to match tx_request_slot_t.summary / the IPC SSO_TX_TEXT_MAX field:
+    // an expanded "SSO+..." command plus its " (replaced 'SSO+...')" heritage
+    // note can exceed 160.
+    char               burst_summary[256];
 
     // Snapshot (updated by worker, read by main under mu).
     uint64_t snap_frames_total;
@@ -1479,7 +1482,7 @@ static void *rx_session_tx_thread_fn(void *arg)
         pthread_mutex_unlock(&rxs->mu);
 
         tx_burst_result_t br;
-        char summary[160] = "";
+        char summary[256] = "";
         if (lost) {
             // Device is gone — don't touch it (would risk a second
             // fault). Refuse the burst cleanly.

@@ -250,9 +250,19 @@ list(APPEND SSO_TARGETS agenda_line_selftest)
 # and simple_sat_ops. Pure POSIX.
 add_executable(tcmd_lint_selftest
                unit_tests/tcmd_lint_selftest.c src/proto/tcmd_lint.c
-               src/proto/tcmd_spec.c src/proto/agenda_line.c)
+               src/proto/tcmd_spec.c src/proto/agenda_line.c
+               src/proto/sso_pseudo.c)
 target_include_directories(tcmd_lint_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS tcmd_lint_selftest)
+
+# SSO+ pseudo-command self-test: the expander/registry (sso_pseudo.c) that
+# simple_sat_ops expands at TX time, plus a round-trip that the expansion
+# lints clean (so it links the linter + spec + agenda_line too). Pure POSIX.
+add_executable(sso_pseudo_selftest
+               unit_tests/sso_pseudo_selftest.c src/proto/sso_pseudo.c
+               src/proto/tcmd_lint.c src/proto/tcmd_spec.c src/proto/agenda_line.c)
+target_include_directories(sso_pseudo_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+list(APPEND SSO_TARGETS sso_pseudo_selftest)
 
 # argparse self-test: the dual-mode parse_args() convention
 # (src/cli/argparse.h). Header-only, so the test compiles on its own.
@@ -288,7 +298,7 @@ list(APPEND SSO_TARGETS fm_preview)
 # same prediction.c path next_in_queue uses) to append the sub-satellite
 # lat/lon/alt at each command's execution time.
 add_executable(agenda_check utils/agenda_check.c src/proto/agenda_line.c
-               src/proto/tcmd_lint.c src/proto/tcmd_spec.c)
+               src/proto/tcmd_lint.c src/proto/tcmd_spec.c src/proto/sso_pseudo.c)
 if (SGP4SDP4_LIB)
     target_compile_definitions(agenda_check PRIVATE WITH_SGP4SDP4)
     target_sources(agenda_check PRIVATE src/orbit/prediction.c src/orbit/oem.c)
@@ -823,6 +833,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
                    src/proto/hmac_keyfile.c
                    src/proto/agenda_line.c
                    src/proto/tcmd_lint.c src/proto/tcmd_spec.c
+                   src/proto/sso_pseudo.c
                    src/beacon/beacon_cts1.c
                    src/orbit/tle_csv.c
                    src/dsp/biquad.c src/dsp/monitor_squelch.c)

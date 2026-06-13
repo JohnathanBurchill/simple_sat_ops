@@ -226,6 +226,14 @@ tx_burst_result_t tx_burst_run(b210_rx_tx_core_t *core,
     if (req == NULL) return TX_BURST_FRAME_BUILD_FAILED;
     summarize(req->payload, req->payload_len, req->is_hex,
                out_summary, summary_n);
+    // Note the heritage of an expanded "SSO+..." pseudo-command on the same
+    // summary that lands in tx.log / the viewer fan-out.
+    if (req->sso_origin[0] && out_summary && summary_n) {
+        size_t l = strlen(out_summary);
+        if (l < summary_n)
+            snprintf(out_summary + l, summary_n - l,
+                     " (replaced '%s')", req->sso_origin);
+    }
     if (core == NULL) return TX_BURST_NO_CORE;
 
     int bit_rate     = 9600;

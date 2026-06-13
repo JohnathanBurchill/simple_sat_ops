@@ -37,6 +37,7 @@
 #include "hmac_keyfile.h"
 #include "agenda_line.h"
 #include "tcmd_lint.h"
+#include "sso_pseudo.h"
 #include "sso_version.h"
 #include "argparse.h"
 
@@ -1595,6 +1596,21 @@ static int                g_tx_inflight = 0;
 // before SGP4 has produced a valid range_rate.
 static long               g_tx_freq_hz_doppler =
                               (long) FRONTIERSAT_CARRIER_HZ;
+
+// Current UTC in milliseconds -- the queue-time clock for expanding an
+// "SSO+..." pseudo-command (see sso_pseudo.h). Captured fresh per send so each
+// transmission carries a current time.
+static long long sso_now_utc_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long) tv.tv_sec * 1000LL + tv.tv_usec / 1000LL;
+}
+// The @tssent dedup key stamped into every SSO+ expansion this session: the
+// startup UTC truncated to the minute, pinned once in main(). One fixed value
+// per process makes the flight firmware run an SSO+ time-sync once per pass
+// (correct across an hour/midnight boundary within the pass); a later relaunch
+// in a new minute runs it again. See sso_pseudo.h.
+static long long g_sso_pass_tssent_ms = 0;
 #endif
 
 // CLI gate: --no-tx blocks the compose modal from actually committing
@@ -3122,13 +3138,26 @@ static int tx_compose_commit(const tx_compose_t *c, char *err, size_t err_size) 
         snprintf(err, err_size, "previous burst still in flight");
         return -1;
     }
-    size_t n = strlen(c->payload);
+    // Expand a simple_sat_ops-directed "SSO+..." pseudo-command into the
+    // concrete telecommand to transmit, with the clock captured now so the
+    // embedded timestamp is current. A normal command passes through verbatim.
+    sso_pseudo_ctx_t pc = { .now_ms    = sso_now_utc_ms(),
+                            .tssent_ms = g_sso_pass_tssent_ms };
+    char wire[512];
+    char sso_err[160];
+    sso_pseudo_status_t pst =
+        sso_pseudo_expand(c->payload, &pc, wire, sizeof wire, sso_err, sizeof sso_err);
+    if (pst != SSO_PSEUDO_OK && pst != SSO_PSEUDO_NOT_PSEUDO) {
+        snprintf(err, err_size, "SSO+ expansion failed: %s", sso_err);
+        return -1;
+    }
+    size_t n = strlen(wire);
     if (n == 0) {
         snprintf(err, err_size, "empty payload");
         return -1;
     }
     if (n > sizeof g_tx_request.payload) n = sizeof g_tx_request.payload;
-    memcpy(g_tx_request.payload, c->payload, n);
+    memcpy(g_tx_request.payload, wire, n);
     g_tx_request.payload_len  = n;
     g_tx_request.is_hex       = 0;  // always ascii in the simplified modal
     g_tx_request.csp_hdr      = (csp_v1_header_t){
@@ -3141,7 +3170,18 @@ static int tx_compose_commit(const tx_compose_t *c, char *err, size_t err_size) 
     g_tx_request.preroll_ms       = g_tx_preroll_ms;
     g_tx_request.allow_high_power = 0;
     g_tx_request.allow_hf_tx      = 0;
-    tx_compose_summary(c, g_tx_request.summary, sizeof g_tx_request.summary);
+    if (pst == SSO_PSEUDO_OK) {
+        // Heritage: stash the SSO+ origin so the on-air summary notes it, and
+        // bake the same note into the queue-time summary the dry-run /
+        // rejected paths show.
+        snprintf(g_tx_request.sso_origin, sizeof g_tx_request.sso_origin,
+                 "%s", c->payload);
+        snprintf(g_tx_request.summary, sizeof g_tx_request.summary,
+                 "ascii:%.150s (replaced '%.80s')", wire, c->payload);
+    } else {
+        g_tx_request.sso_origin[0] = '\0';
+        tx_compose_summary(c, g_tx_request.summary, sizeof g_tx_request.summary);
+    }
     g_tx_request.pending = 1;
     {
         // Audit: TX commit — the moment the operator pressed Enter in
@@ -3868,10 +3908,30 @@ static void auto_tcmd_tick(state_t *state) {
     if (now < a->next_send_ns) return;
     if (g_tx_request.pending)  return;  // prior burst still inflight
 
-    const char *cmd = a->commands[a->cmd_idx];
-    size_t n = strlen(cmd);
+    const char *raw = a->commands[a->cmd_idx];
+    // Expand a simple_sat_ops-directed "SSO+..." line into the concrete
+    // telecommand, clock captured now so each send (and each repeat) carries a
+    // fresh time. A normal line passes through verbatim. Startup lint already
+    // vetted SSO+ lines, so a failure here is defensive: skip the whole command
+    // rather than key a half-built payload.
+    sso_pseudo_ctx_t pc = { .now_ms    = sso_now_utc_ms(),
+                            .tssent_ms = g_sso_pass_tssent_ms };
+    char wire[512];
+    char sso_err[160];
+    sso_pseudo_status_t pst =
+        sso_pseudo_expand(raw, &pc, wire, sizeof wire, sso_err, sizeof sso_err);
+    if (pst != SSO_PSEUDO_OK && pst != SSO_PSEUDO_NOT_PSEUDO) {
+        snprintf(a->status_msg, sizeof a->status_msg,
+                 "skipped SSO+ line %d: %.120s", a->cmd_idx + 1, sso_err);
+        a->cmd_idx++;
+        a->repeat_idx   = 0;
+        a->next_send_ns = now + (long)(a->delay_s_val * 1e9);
+        auto_tcmd_draw();
+        return;
+    }
+    size_t n = strlen(wire);
     if (n > sizeof g_tx_request.payload) n = sizeof g_tx_request.payload;
-    memcpy(g_tx_request.payload, cmd, n);
+    memcpy(g_tx_request.payload, wire, n);
     g_tx_request.payload_len  = n;
     g_tx_request.is_hex       = 0;
     g_tx_request.csp_hdr      = (csp_v1_header_t){
@@ -3887,13 +3947,22 @@ static void auto_tcmd_tick(state_t *state) {
     // is ticked), same way tx_compose_validate handles it before commit.
     g_tx_request.allow_high_power = 0;
     g_tx_request.allow_hf_tx      = 0;
-    snprintf(g_tx_request.summary, sizeof g_tx_request.summary,
-             "auto[%d/%d %d/%d]: %s",
-             a->cmd_idx + 1, a->n_commands,
-             a->repeat_idx + 1, a->repeats_total,
-             cmd);
+    if (pst == SSO_PSEUDO_OK)
+        snprintf(g_tx_request.sso_origin, sizeof g_tx_request.sso_origin, "%s", raw);
+    else
+        g_tx_request.sso_origin[0] = '\0';
+    {
+        int m = snprintf(g_tx_request.summary, sizeof g_tx_request.summary,
+                         "auto[%d/%d %d/%d]: %.190s",
+                         a->cmd_idx + 1, a->n_commands,
+                         a->repeat_idx + 1, a->repeats_total,
+                         wire);
+        if (pst == SSO_PSEUDO_OK && m > 0 && (size_t) m < sizeof g_tx_request.summary)
+            snprintf(g_tx_request.summary + m, sizeof g_tx_request.summary - m,
+                     " (replaced '%s')", raw);
+    }
     g_tx_request.pending = 1;
-    snprintf(a->last_sent, sizeof a->last_sent, "%s", cmd);
+    snprintf(a->last_sent, sizeof a->last_sent, "%.255s", wire);
     a->sends_total++;
 
     a->repeat_idx++;
@@ -6233,6 +6302,13 @@ int main(int argc, char **argv)
     if (g_viewer_mode) {
         return run_viewer(argv[0]);
     }
+
+#ifdef SSO_WITH_SDR
+    // Pin the SSO+ @tssent dedup key for this session: the startup UTC,
+    // truncated to the minute. Constant for the life of the process so the
+    // satellite runs an SSO+ time-sync once per pass. See sso_pseudo.h.
+    g_sso_pass_tssent_ms = (sso_now_utc_ms() / 60000LL) * 60000LL;
+#endif
 
     // Resolve + load the HMAC keyfile. The bytes feed every TX burst's
     // AX100 frame (CTS1 firmware expects HMAC on every uplink), AND

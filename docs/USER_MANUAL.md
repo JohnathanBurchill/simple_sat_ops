@@ -110,6 +110,7 @@ manual can go back on the shelf where it belongs.
    - [Colon-command prompt](#colon-command-prompt)
    - [TX compose modal (`t`)](#tx-compose-modal-t)
    - [Auto-telecommand modal (`A`)](#auto-telecommand-modal-a)
+   - [simple_sat_ops-directed commands (`SSO+`)](#simple_sat_ops-directed-commands-sso)
    - [Finding telecommands and their arguments](#finding-telecommands-and-their-arguments)
    - [Rotator calibration (`--calibrate-rotator`)](#rotator-calibration---calibrate-rotator)
    - [Pursuit tracking](#pursuit-tracking)
@@ -1132,6 +1133,54 @@ then `stopped`, `done`, or `pass-over` with the final tally. The line
 disappears when the operator closes the modal. (The per-send detail -
 each command as it goes out - already appears in everyone's TX log
 panel; this line is the at-a-glance summary.)
+
+### simple_sat_ops-directed commands (`SSO+`)
+
+Some operations need a value only the ground knows at the moment of
+transmission - the current time, say. For those, an agenda line (or a line
+typed into the `t` compose modal) may use a `SSO+` directive in place of a
+literal `CTS1+...!` telecommand. `simple_sat_ops` expands it into a real
+telecommand *at transmit time*, then sends and logs that.
+
+The first such directive is the clock sync:
+
+```
+SSO+sync_sat_time_to_ground()!
+```
+
+which expands, each time it is queued, to:
+
+```
+CTS1+set_system_time(<current_utc_ms + 500>)@tssent=<pass-start ms>!
+```
+
+The argument is the ground's current UTC in milliseconds plus 500 ms - a budget
+for ~250 ms of transmit lag and ~250 ms of average on-board execution lag - so
+the satellite's clock lands close to true UTC when the command runs. The
+timestamp is recomputed every time the line is queued, so if the agenda is
+retransmitted, or the command is sent more than once, each copy carries a fresh
+time rather than a stale copy of the first.
+
+The `@tssent` value is the pass-start time: the UTC at which `simple_sat_ops`
+started, truncated to the minute, held constant for the whole session. The
+flight firmware can be configured to ignore a telecommand whose `@tssent` it has
+already seen, so a value constant across the session means a re-sync runs once
+per pass and retransmissions are dropped - while the next pass (a new
+`simple_sat_ops` run, a new minute) syncs again. Relaunch `simple_sat_ops` for
+each pass.
+
+What goes on the air is the expanded `CTS1+...!` command, and that is what the
+TX log records - annotated with the directive it came from:
+
+```
+ascii:CTS1+set_system_time(1749752645623)@tssent=1749752580000! (replaced 'SSO+sync_sat_time_to_ground()!')
+```
+
+`SSO+` lines are checked at startup with everything else in the `--tc-file` (an
+unknown directive or a wrong argument count refuses startup the same way a
+malformed `CTS1+` line does, see [Telecommand
+linting](#telecommand-linting)), and they behave identically from the `A`
+auto-telecommand modal and the `t` compose modal.
 
 ### Finding telecommands and their arguments
 

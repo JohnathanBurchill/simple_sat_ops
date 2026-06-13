@@ -37,6 +37,11 @@ typedef struct {
     int      preroll_ms;
     int      allow_high_power;
     int      allow_hf_tx;
+    // Non-empty only when `payload` was produced by expanding a
+    // simple_sat_ops-directed "SSO+..." pseudo-command. Carries the original
+    // SSO+ text so the on-air summary can note the heritage:
+    //   "ascii:<actual telecommand> (replaced 'SSO+...')"
+    char     sso_origin[256];
     // One-line "ascii:..." / "auto[i/n j/m]: <cmd>" description shown in
     // the UI, logged to tx.log, and mirrored to viewers. Holds a full RF
     // telecommand (215 chars) plus its short label; kept >= the IPC
