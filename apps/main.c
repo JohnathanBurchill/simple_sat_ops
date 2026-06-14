@@ -53,14 +53,9 @@
 #include "tx_burst.h"
 #endif
 
-#include <ctype.h>
-#include <dirent.h>
 #include <errno.h>
-#include <limits.h>
-#include <locale.h>
 #include <math.h>
 #include <pthread.h>
-#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
