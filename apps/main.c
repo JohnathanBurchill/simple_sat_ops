@@ -1552,37 +1552,8 @@ static void render_tx_log_panel(const state_t *state, int start_row, int col)
     }
 }
 
-// Latest broadcast snapshot, kept so a newly-connecting viewer gets
-// state in its WELCOME response without having to wait up to 500 ms
-// for the next periodic STATE broadcast.
-static int    g_last_state_valid     = 0;
-static char   g_last_state_sat[64]   = "";
-static double g_last_state_az        = 0.0;
-static double g_last_state_el        = 0.0;
-static long   g_last_state_freq_hz   = 0;
-static double g_last_state_doppler   = 0.0;
-static char   g_last_state_tle[256]  = "";
-static double g_last_state_tgt_az    = 0.0;
-static double g_last_state_tgt_el    = 0.0;
-static int    g_last_state_flip      = 0;
-static int    g_last_state_in_pass   = 0;
-static int    g_last_state_tracking  = 0;
-static int    g_last_state_has_rot   = 0;
-static double g_last_state_jul       = 0.0;
-static char   g_last_state_idesg[9]  = "";
-static double g_last_state_epoch_min   = 0.0;
-static double g_last_state_min_visible = 0.0;
-static double g_last_state_min_above_0 = 0.0;
-static double g_last_state_min_above_30 = 0.0;
-static double g_last_state_max_el      = 0.0;
-static double g_last_state_pred_az     = 0.0;
-static double g_last_state_pred_el     = 0.0;
-static double g_last_state_alt_km      = 0.0;
-static double g_last_state_lat_deg     = 0.0;
-static double g_last_state_lon_deg     = 0.0;
-static double g_last_state_speed_kms   = 0.0;
-static double g_last_state_range_km    = 0.0;
-static double g_last_state_rrate_kms   = 0.0;
+// The last-broadcast snapshot (g_last_state_*) now lives on state_t as
+// state.last_state (see last_state_t in state.h).
 
 // Snapshot the operator's live RX panel data into a self-contained
 // struct so the same renderer can be driven by either the operator
@@ -2070,34 +2041,34 @@ static void ipc_broadcast_state(state_t *s,
 
     // Cache for WELCOME replies so a viewer doesn't have to wait for
     // the next periodic broadcast to see anything.
-    snprintf(g_last_state_sat, sizeof g_last_state_sat, "%s", evt.satellite);
-    snprintf(g_last_state_tle, sizeof g_last_state_tle, "%s", evt.tle_path);
-    g_last_state_az      = evt.az;
-    g_last_state_el      = evt.el;
-    g_last_state_freq_hz = evt.freq_hz;
-    g_last_state_doppler = evt.doppler_hz;
-    g_last_state_tgt_az  = evt.target_az;
-    g_last_state_tgt_el  = evt.target_el;
-    g_last_state_flip    = evt.flip;
-    g_last_state_in_pass = evt.in_pass;
-    g_last_state_tracking= evt.tracking;
-    g_last_state_has_rot = evt.has_rotator;
-    g_last_state_jul     = evt.jul_utc;
-    snprintf(g_last_state_idesg, sizeof g_last_state_idesg, "%s", evt.idesg);
-    g_last_state_epoch_min    = evt.epoch_min;
-    g_last_state_min_visible  = evt.min_visible;
-    g_last_state_min_above_0  = evt.min_above_0;
-    g_last_state_min_above_30 = evt.min_above_30;
-    g_last_state_max_el       = evt.max_el;
-    g_last_state_pred_az      = evt.pred_az;
-    g_last_state_pred_el      = evt.pred_el;
-    g_last_state_alt_km       = evt.alt_km;
-    g_last_state_lat_deg      = evt.lat_deg;
-    g_last_state_lon_deg      = evt.lon_deg;
-    g_last_state_speed_kms    = evt.speed_kms;
-    g_last_state_range_km     = evt.range_km;
-    g_last_state_rrate_kms    = evt.range_rate_kms;
-    g_last_state_valid   = 1;
+    snprintf(s->last_state.sat, sizeof s->last_state.sat, "%s", evt.satellite);
+    snprintf(s->last_state.tle, sizeof s->last_state.tle, "%s", evt.tle_path);
+    s->last_state.az      = evt.az;
+    s->last_state.el      = evt.el;
+    s->last_state.freq_hz = evt.freq_hz;
+    s->last_state.doppler = evt.doppler_hz;
+    s->last_state.tgt_az  = evt.target_az;
+    s->last_state.tgt_el  = evt.target_el;
+    s->last_state.flip    = evt.flip;
+    s->last_state.in_pass = evt.in_pass;
+    s->last_state.tracking= evt.tracking;
+    s->last_state.has_rot = evt.has_rotator;
+    s->last_state.jul     = evt.jul_utc;
+    snprintf(s->last_state.idesg, sizeof s->last_state.idesg, "%s", evt.idesg);
+    s->last_state.epoch_min    = evt.epoch_min;
+    s->last_state.min_visible  = evt.min_visible;
+    s->last_state.min_above_0  = evt.min_above_0;
+    s->last_state.min_above_30 = evt.min_above_30;
+    s->last_state.max_el       = evt.max_el;
+    s->last_state.pred_az      = evt.pred_az;
+    s->last_state.pred_el      = evt.pred_el;
+    s->last_state.alt_km       = evt.alt_km;
+    s->last_state.lat_deg      = evt.lat_deg;
+    s->last_state.lon_deg      = evt.lon_deg;
+    s->last_state.speed_kms    = evt.speed_kms;
+    s->last_state.range_km     = evt.range_km;
+    s->last_state.rrate_kms    = evt.range_rate_kms;
+    s->last_state.valid   = 1;
 }
 
 static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
@@ -2114,39 +2085,39 @@ static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
         snprintf(welcome.pass_folder, sizeof(welcome.pass_folder), "%s",
                  state->pass_folder);
     }
-    if (g_last_state_valid) {
+    if (state->last_state.valid) {
         welcome.has_state   = 1;
         snprintf(welcome.satellite, sizeof welcome.satellite,
-                 "%s", g_last_state_sat);
+                 "%s", state->last_state.sat);
         snprintf(welcome.tle_path, sizeof welcome.tle_path,
-                 "%s", g_last_state_tle);
-        welcome.az          = g_last_state_az;
-        welcome.el          = g_last_state_el;
-        welcome.freq_hz     = g_last_state_freq_hz;
-        welcome.doppler_hz  = g_last_state_doppler;
-        welcome.target_az   = g_last_state_tgt_az;
-        welcome.target_el   = g_last_state_tgt_el;
-        welcome.flip        = g_last_state_flip;
-        welcome.in_pass     = g_last_state_in_pass;
-        welcome.tracking    = g_last_state_tracking;
-        welcome.has_rotator = g_last_state_has_rot;
-        welcome.jul_utc     = g_last_state_jul;
-        snprintf(welcome.idesg, sizeof welcome.idesg, "%s", g_last_state_idesg);
-        welcome.epoch_min      = g_last_state_epoch_min;
-        welcome.min_visible    = g_last_state_min_visible;
-        welcome.min_above_0    = g_last_state_min_above_0;
-        welcome.min_above_30   = g_last_state_min_above_30;
-        welcome.max_el         = g_last_state_max_el;
-        welcome.pred_az        = g_last_state_pred_az;
-        welcome.pred_el        = g_last_state_pred_el;
-        welcome.alt_km         = g_last_state_alt_km;
-        welcome.lat_deg        = g_last_state_lat_deg;
-        welcome.lon_deg        = g_last_state_lon_deg;
-        welcome.speed_kms      = g_last_state_speed_kms;
-        welcome.range_km       = g_last_state_range_km;
-        welcome.range_rate_kms = g_last_state_rrate_kms;
+                 "%s", state->last_state.tle);
+        welcome.az          = state->last_state.az;
+        welcome.el          = state->last_state.el;
+        welcome.freq_hz     = state->last_state.freq_hz;
+        welcome.doppler_hz  = state->last_state.doppler;
+        welcome.target_az   = state->last_state.tgt_az;
+        welcome.target_el   = state->last_state.tgt_el;
+        welcome.flip        = state->last_state.flip;
+        welcome.in_pass     = state->last_state.in_pass;
+        welcome.tracking    = state->last_state.tracking;
+        welcome.has_rotator = state->last_state.has_rot;
+        welcome.jul_utc     = state->last_state.jul;
+        snprintf(welcome.idesg, sizeof welcome.idesg, "%s", state->last_state.idesg);
+        welcome.epoch_min      = state->last_state.epoch_min;
+        welcome.min_visible    = state->last_state.min_visible;
+        welcome.min_above_0    = state->last_state.min_above_0;
+        welcome.min_above_30   = state->last_state.min_above_30;
+        welcome.max_el         = state->last_state.max_el;
+        welcome.pred_az        = state->last_state.pred_az;
+        welcome.pred_el        = state->last_state.pred_el;
+        welcome.alt_km         = state->last_state.alt_km;
+        welcome.lat_deg        = state->last_state.lat_deg;
+        welcome.lon_deg        = state->last_state.lon_deg;
+        welcome.speed_kms      = state->last_state.speed_kms;
+        welcome.range_km       = state->last_state.range_km;
+        welcome.range_rate_kms = state->last_state.rrate_kms;
         // Auto-TCMD progress reads the live modal state (like
-        // ipc_fill_rx_panel below) — no g_last_state_* cache needed.
+        // ipc_fill_rx_panel below) — no state->last_state.* cache needed.
         {
             int at_sent = 0, at_total = 0;
             const char *at_label = NULL;
