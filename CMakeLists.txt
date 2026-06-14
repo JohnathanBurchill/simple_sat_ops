@@ -827,7 +827,7 @@ endif()
 if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
     add_executable(simple_sat_ops apps/main.c
                    src/ui/tui.c src/ui/spectrogram.c
-                   src/control/pass_session.c
+                   src/control/pass_session.c src/control/scan_sky.c
                    src/orbit/prediction.c src/orbit/oem.c
                    src/orbit/pursuit.c
                    src/hw/antenna_rotator.c
