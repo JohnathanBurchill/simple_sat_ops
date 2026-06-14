@@ -107,8 +107,6 @@
 // state event on every UI tick. Other operator-aware tools
 // (b210_rx_tx --control, tx_frame_sdr) verify the operator's Unix
 // user matches their own via this socket.
-static int g_control_mode = 0;
-static int g_viewer_mode = 0;  // bare invocation found a running operator
 static sso_ipc_server_t *g_ipc = NULL;
 static const char *g_operator_user = NULL;
 
@@ -118,12 +116,10 @@ static const char *g_operator_user = NULL;
 // "did my command line do what I think?" without keying any hardware
 // or claiming any shared resource. Skips the no-arg viewer-probe in
 // apply_args too (which is itself a side effect).
-static int g_self_test = 0;
 
 // Refuse to fully start when the --tc-file agenda has telecommand lint
 // errors. --ignore-at-your-peril-all-tc-errors clears this and lets a
 // known-bad agenda through anyway.
-static int g_ignore_tc_errors = 0;
 
 // TX dry-run: record the command as not-sent (reason "dry-run")
 // instead of pushing the burst through rx_session. Lets the operator
@@ -132,7 +128,6 @@ static int g_ignore_tc_errors = 0;
 // with --without-b210 to skip the device). The allow-tx safety
 // checkbox still has to be ticked to enter RUNNING — dry-run is about
 // hardware presence, not about the operator's intent to transmit.
-static int   g_tx_dry_run         = 0;
 
 // Live raylib waterfall viewer. Off by default; --live-waterfall on
 // the command line opts in. When recording starts, fork+exec the
@@ -141,7 +136,6 @@ static int   g_tx_dry_run         = 0;
 // referenced inside the WITH_USRP_B210 launch block, so tag it
 // unused — the cleanup path at the bottom of main() does use the
 // pid, so that one stays unannotated.
-static int   g_run_live_waterfall = 0;
 
 // --always-record: start the WAV / IQ / sidecar recording as soon
 // as rx_session opens and keep it open until shutdown, ignoring the
@@ -149,14 +143,12 @@ static int   g_run_live_waterfall = 0;
 // runs (noise floor vs. antenna orientation, no-antenna baseline,
 // gain stability over hours) where the operator wants continuous
 // capture without a satellite pass to drive AOS / LOS.
-static int   g_always_record      = 0;
 
 // --testing: bench / characterisation runs that aren't tied to a
 // pass. Pass folder lands under <root>/Testing/yyyymmdd/hhmmLT/ using
 // the CURRENT local time, not a predicted AOS — keeps test captures
 // out of the operational Operations/ tree and skips the "no AOS in
 // next N minutes" abort in setup_pass_folder.
-static int   g_testing_mode       = 0;
 
 // --scan-sky: rebinds T to "scan the sky" — drive the rotator through
 // a grid of (az, el) targets spaced for roughly equal solid angle,
@@ -4199,7 +4191,7 @@ static void setup_pass_folder(state_t *state, double jul_utc_now)
     // --testing: bench run, not a pass. Land the folder under the
     // sibling Testing/ tree using the CURRENT local time so we don't
     // need a TLE / prediction at all.
-    if (g_testing_mode) {
+    if (state->testing_mode) {
         time_t now = time(NULL);
         struct tm now_local;
         localtime_r(&now, &now_local);
@@ -5480,7 +5472,7 @@ void report_status(state_t *state, int *print_row, int print_col)
 
     status_panel_t p;
     memset(&p, 0, sizeof p);
-    p.control_mode  = g_control_mode;
+    p.control_mode  = state->control_mode;
     p.operator_user = g_operator_user;
     p.viewers       = viewers[0] ? viewers : "(none)";
 
@@ -6157,11 +6149,11 @@ static void self_test_report(const state_t *state, FILE *out, int argc, char **a
     }
     fprintf(out, "\n");
 
-    // Mode. apply_args has already set g_control_mode / g_viewer_mode
+    // Mode. apply_args has already set state->control_mode / state->viewer_mode
     // (the latter only via the auto-probe path, which --self-test
     // skips). Standalone is the default.
-    const char *mode = g_control_mode ? "operator (--control)"
-                     : g_viewer_mode  ? "viewer (auto-detected)"
+    const char *mode = state->control_mode ? "operator (--control)"
+                     : state->viewer_mode  ? "viewer (auto-detected)"
                                        : "standalone";
     fprintf(out, "mode: %s\n", mode);
 
@@ -6227,7 +6219,7 @@ static void self_test_report(const state_t *state, FILE *out, int argc, char **a
 
     // TX safety / staging gates the operator might have set.
     fprintf(out, "tx-no-tx: %s\n", g_no_tx ? "on (--no-tx)" : "off");
-    fprintf(out, "tx-dry-run: %s\n", g_tx_dry_run ? "on (--tx-dry-run)" : "off");
+    fprintf(out, "tx-dry-run: %s\n", state->tx_dry_run ? "on (--tx-dry-run)" : "off");
     fprintf(out, "tx-auto-tcmd-file: %s\n",
             g_auto_tcmd_file_path[0] ? g_auto_tcmd_file_path : "(none)");
 
@@ -6245,7 +6237,7 @@ static void self_test_report(const state_t *state, FILE *out, int argc, char **a
                 : "enabled");
 
     fprintf(out, "live-waterfall: %s\n",
-            g_run_live_waterfall ? "on (--live-waterfall)" : "off");
+            state->run_live_waterfall ? "on (--live-waterfall)" : "off");
 
     fprintf(out, "pass-folder-seed: %s\n",
             g_pass_folder[0] ? g_pass_folder : "(auto)");
@@ -6287,7 +6279,7 @@ int main(int argc, char **argv)
 
     // Bare invocation found a running operator — run as a read-only
     // viewer and skip the rest of the operator/standalone bring-up.
-    if (g_viewer_mode) {
+    if (state.viewer_mode) {
         return run_viewer(argv[0]);
     }
 
@@ -6335,7 +6327,7 @@ int main(int argc, char **argv)
     // resolved; runs BEFORE the IPC socket bind, the rotator open,
     // the B210 open, and load_tle, so the process makes no observable
     // changes to the rest of the system.
-    if (g_self_test) {
+    if (state.self_test) {
         self_test_report(&state, stdout, argc, argv);
         return 0;
     }
@@ -6350,7 +6342,7 @@ int main(int argc, char **argv)
     if (g_auto_tcmd_file_path[0] != '\0') {
         int tc_warns = 0;
         int tc_errs = tcmd_lint_file(g_auto_tcmd_file_path, stderr, &tc_warns);
-        if (tc_errs > 0 && !g_ignore_tc_errors) {
+        if (tc_errs > 0 && !state.ignore_tc_errors) {
             fprintf(stderr,
                 "simple_sat_ops: %d error%s detected in the --tc-file content (%s).\n"
                 "Refusing to start. Fix the agenda, or re-run with\n"
@@ -6373,7 +6365,7 @@ int main(int argc, char **argv)
     // Audit + operator IPC bring-up.
     g_operator_user = sso_unix_user();
     sso_audit_start("simple_sat_ops",
-                    g_control_mode ? "operator" : "standalone");
+                    state.control_mode ? "operator" : "standalone");
     // Record the exact command line so post-incident review can tie
     // every operator action back to the flags the session was started
     // with (recording mode, --tx settings, TLE, etc.). One line, tab-
@@ -6391,7 +6383,7 @@ int main(int argc, char **argv)
         }
         sso_audit_event("argv", argv_buf);
     }
-    if (g_control_mode) {
+    if (state.control_mode) {
         // Refuse if another simple_sat_ops --control is already
         // bound — two operators driving the same SDR / rotator is
         // exactly the failure mode the IPC server existed to avoid.
@@ -6471,7 +6463,7 @@ int main(int argc, char **argv)
     // /FrontierSat/Operations/<yyyymmdd>/<hhmmLT>/ for it before the
     // tracking loop opens ncurses. Only on --control — the
     // standalone-tracker / dev path leaves Operations/ alone.
-    if (g_control_mode) {
+    if (state.control_mode) {
         UTC_Calendar_Now(&utc, &tv);
         double jul_now = Julian_Date(&utc, &tv);
         update_satellite_position(&state.prediction, jul_now);
@@ -6606,7 +6598,7 @@ int main(int argc, char **argv)
     // UHD error so a dev host without a device can still run the UI.
     // rx_session takes ownership of the core; we drop our local handle
     // afterwards so main never touches UHD off-thread.
-    if (g_control_mode && !g_without_b210) {
+    if (state.control_mode && !g_without_b210) {
         // B210 RX rate doubled from the original 240 kHz / sps=5 to
         // 480 kHz / sps=10 (after the integer-5 decimation FIR). That
         // gives the modem_fsk clock-recovery loop the same oversampling
@@ -6722,8 +6714,8 @@ int main(int argc, char **argv)
             // --always-record: start WAV + .iq + sidecars right now,
             // before any pass logic gets a chance to gate them. The
             // per-pass start/stop block in the tracking loop checks
-            // g_always_record and skips itself when this is on.
-            if (g_always_record && g_rx_session) {
+            // state.always_record and skips itself when this is on.
+            if (state.always_record && g_rx_session) {
                 rx_session_request_wav_start(g_rx_session);
                 fprintf(stderr,
                     "simple_sat_ops: --always-record on — WAV/IQ "
@@ -6889,7 +6881,7 @@ int main(int argc, char **argv)
         //
         // --always-record disables this gate entirely: recording was
         // started once at rx_session_open and stays open until shutdown.
-        if (g_rx_session && !g_always_record) {
+        if (g_rx_session && !state.always_record) {
             double sec_to_aos =
                 state.prediction.predicted_minutes_until_visible * 60.0;
             int visible   = (state.prediction.satellite_ephem.elevation > 0.0);
@@ -7392,7 +7384,7 @@ int main(int argc, char **argv)
             // to a new path. We poll once per second on the same
             // cadence as the ribbon — cheap, and a single second of
             // lag at viewer-launch is invisible to the operator.
-            if (g_run_live_waterfall) {
+            if (state.run_live_waterfall) {
                 char iq_path[512] = "";
                 int  iq_rate      = 0;
                 rx_session_iq_snapshot(g_rx_session,
@@ -7511,7 +7503,7 @@ int main(int argc, char **argv)
             const char *outcome = NULL;
             int  on_air = 0;
             int  finished = 0;        // emit the result + clear pending this tick
-            if (g_tx_dry_run) {
+            if (state.tx_dry_run) {
                 snprintf(summary, sizeof summary, "%s",
                          g_tx_request.summary);
                 outcome = "dry-run";   // composed but deliberately not keyed
@@ -8001,19 +7993,19 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
         if (strcmp("--live-waterfall", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--live-waterfall",
                 "auto-launch the raylib live_waterfall viewer when recording starts");
-            else { state->n_options++; g_run_live_waterfall = 1; }
+            else { state->n_options++; state->run_live_waterfall = 1; }
             matched = 1;
         }
         if (strcmp("--always-record", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--always-record",
                 "record from B210 open until shutdown (skip per-pass start/stop)");
-            else { state->n_options++; g_always_record = 1; }
+            else { state->n_options++; state->always_record = 1; }
             matched = 1;
         }
         if (strcmp("--testing", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--testing",
                 "bench mode: pass folder under Testing/ at current local time, no TLE");
-            else { state->n_options++; g_testing_mode = 1; }
+            else { state->n_options++; state->testing_mode = 1; }
             matched = 1;
         }
         if (strcmp("--scan-sky", arg) == 0 || help) {
@@ -8036,7 +8028,7 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
         if (strcmp("--tx-dry-run", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--tx-dry-run",
                 "record every TX burst as not-sent instead of routing it through the SDR");
-            else { state->n_options++; g_tx_dry_run = 1; }
+            else { state->n_options++; state->tx_dry_run = 1; }
             matched = 1;
         }
         if (strncmp("--tx-preroll-ms=", arg, 16) == 0 || help) {
@@ -8080,7 +8072,7 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
         if (strcmp("--ignore-at-your-peril-all-tc-errors", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--ignore-at-your-peril-all-tc-errors",
                 "start even if the --tc-file agenda has telecommand lint errors");
-            else { state->n_options++; g_ignore_tc_errors = 1; }
+            else { state->n_options++; state->ignore_tc_errors = 1; }
             matched = 1;
         }
         if (strcmp("--hmac-keyfile", arg) == 0 || help) {
@@ -8405,13 +8397,13 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
         if (strcmp("--control", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--control",
                 "open the sso_ipc server (operator mode)");
-            else { state->n_options++; g_control_mode = 1; }
+            else { state->n_options++; state->control_mode = 1; }
             matched = 1;
         }
         if (strcmp("--self-test", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--self-test",
                 "print the settings simple_sat_ops would run with, then exit 0");
-            else { state->n_options++; g_self_test = 1; }
+            else { state->n_options++; state->self_test = 1; }
             matched = 1;
         }
 
@@ -8482,7 +8474,7 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
     // command line - a viewer mirrors whatever the operator is tracking,
     // so any positional is ignored here. --self-test skips the probe (a
     // side effect) so the config dump runs cleanly with no live operator.
-    if (!g_control_mode && !g_self_test) {
+    if (!state->control_mode && !state->self_test) {
         sso_ipc_client_t *probe = sso_ipc_client_connect("simple_sat_ops");
         if (probe == NULL) {
             fprintf(stderr,
@@ -8493,7 +8485,7 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
         sso_ipc_client_close(probe);
         // Operator is up — main() will dispatch into run_viewer()
         // instead of the standalone-tracker path.
-        g_viewer_mode = 1;
+        state->viewer_mode = 1;
         return PARSE_OK;
     }
 
@@ -8508,7 +8500,7 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
     // under /FrontierSat/TLEs/ and load it directly. setup_pass_folder
     // pins this source file (under its original tle-YYYYMMDD.tle name)
     // into the pass folder once AOS is known.
-    if (n_positional == 0 && g_control_mode) {
+    if (n_positional == 0 && state->control_mode) {
         if (state->prediction.tles_filename == NULL) {
             const char *tles_root = sso_tles_dir();
             static char src_tle[1024];

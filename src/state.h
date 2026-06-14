@@ -68,6 +68,16 @@ typedef struct state
     int verbose_level;
     int in_pass;
 
+    // Run mode + one-shot CLI flags (set once in apply_args / main).
+    int control_mode;        // --control: this process is the operator
+    int viewer_mode;         // bare invocation found a running operator
+    int self_test;           // --self-test: print a report and exit
+    int ignore_tc_errors;    // --ignore-...-all-tc-errors
+    int tx_dry_run;          // --tx-dry-run
+    int run_live_waterfall;  // --live-waterfall
+    int always_record;       // --always-record
+    int testing_mode;        // --testing
+
     // Tracking
     int satellite_tracking;
     prediction_t prediction;
