@@ -45,6 +45,12 @@ void ipc_broadcast_state(state_t *s, double az, double el,
 void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
                   const sso_event_t *evt, void *user);
 
+// Startup: audit-log the session + command line, and (in --control mode)
+// bind the operator IPC socket, register ipc_on_event, and install the
+// take-control yield handler. Returns 0 on success; EXIT_FAILURE if another
+// operator is already running or the socket bind fails.
+int ipc_operator_startup(state_t *state, int argc, char **argv);
+
 #ifdef __cplusplus
 }
 #endif

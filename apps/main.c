@@ -29,7 +29,6 @@
 #include "prediction.h"
 #include "sso_audit.h"
 #include "sso_ipc.h"
-#include "sso_operator.h"
 #include "frontiersat.h"
 #include "hmac_keyfile.h"
 #include "tcmd_lint.h"
@@ -272,83 +271,10 @@ int main(int argc, char **argv)
         }
     }
 
-    // Audit + operator IPC bring-up.
-    state.operator_user = sso_unix_user();
-    sso_audit_start("simple_sat_ops",
-                    state.control_mode ? "operator" : "standalone");
-    // Record the exact command line so post-incident review can tie
-    // every operator action back to the flags the session was started
-    // with (recording mode, --tx settings, TLE, etc.). One line, tab-
-    // safe (sso_audit's sanitiser replaces tabs/newlines with spaces).
-    {
-        char argv_buf[1024];
-        size_t off = 0;
-        argv_buf[0] = '\0';
-        for (int i = 0; i < argc && off + 2 < sizeof argv_buf; ++i) {
-            int n = snprintf(argv_buf + off, sizeof argv_buf - off,
-                             "%s%s", (i == 0) ? "" : " ", argv[i]);
-            if (n <= 0) break;
-            off += (size_t) n;
-            if (off >= sizeof argv_buf) { off = sizeof argv_buf - 1; break; }
-        }
-        sso_audit_event("argv", argv_buf);
-    }
-    if (state.control_mode) {
-        // Refuse if another simple_sat_ops --control is already
-        // bound — two operators driving the same SDR / rotator is
-        // exactly the failure mode the IPC server existed to avoid.
-        // The probe connects as a transient viewer, reads the
-        // operator's identity off the welcome reply, and disconnects.
-        char existing_user[64]    = {0};
-        char existing_folder[256] = {0};
-        int op_status = sso_operator_verify("viewer",
-                                             existing_folder,
-                                             sizeof existing_folder,
-                                             existing_user,
-                                             sizeof existing_user);
-        if (op_status == SSO_OP_OK || op_status == SSO_OP_MISMATCH) {
-            pid_t op_pid = 0;
-            const char *who = existing_user[0] ? existing_user : "?";
-            if (read_operator_pid(&op_pid) == 0) {
-                fprintf(stderr,
-                    "simple_sat_ops: --control refused: operator already "
-                    "running as user=%s pid=%d.\n"
-                    "  To take over, run a viewer (no --control) and press\n"
-                    "  'c' then 'y' to force-claim; the running operator\n"
-                    "  will yield and your viewer will re-exec into --control.\n",
-                    who, (int) op_pid);
-            } else {
-                fprintf(stderr,
-                    "simple_sat_ops: --control refused: operator already "
-                    "running as user=%s.\n", who);
-            }
-            char det[96];
-            snprintf(det, sizeof det,
-                     "existing_user=%s existing_pid=%d",
-                     who, (int) op_pid);
-            sso_audit_event("control-refused", det);
-            return EXIT_FAILURE;
-        }
-
-        state.ipc = sso_ipc_server_open("simple_sat_ops");
-        if (state.ipc == NULL) {
-            // Probe said "no operator" yet bind still failed — most
-            // likely a stale socket / pid file from a crashed
-            // previous operator (or a vanishingly-rare race with
-            // another --control starting at the same instant).
-            // Either way, refuse so we don't quietly drive hardware
-            // alongside something else.
-            fprintf(stderr,
-                "simple_sat_ops: --control: socket bind failed. If this is "
-                "from a crashed previous operator, remove "
-                "/run/sso/simple_sat_ops.{sock,pid} and retry.\n");
-            sso_audit_event("ipc-bind-failed", "");
-            return EXIT_FAILURE;
-        }
-        sso_ipc_server_on_event(state.ipc, ipc_on_event, &state);
-        tui_install_yield_handler();
-        fprintf(stderr, "simple_sat_ops: operator=%s ipc=on\n",
-                state.operator_user);
+    // Audit-log the session + command line and, in --control mode, bind the
+    // operator IPC socket. See control/operator_ipc.c.
+    if ((status = ipc_operator_startup(&state, argc, argv)) != 0) {
+        return status;
     }
 
     /* Parse TLE data */
