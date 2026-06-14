@@ -831,6 +831,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
                    src/ui/auto_tcmd.c src/ui/cmd_line.c
                    src/control/pass_session.c src/control/scan_sky.c
                    src/control/tracking.c src/control/operator_ipc.c
+                   src/control/hw_bringup.c
                    src/orbit/prediction.c src/orbit/oem.c
                    src/orbit/pursuit.c
                    src/hw/antenna_rotator.c
