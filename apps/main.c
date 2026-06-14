@@ -5217,91 +5217,97 @@ void report_position(state_t *state, int *print_row, int print_col)
 // field into a state_t and calls the same render helpers the operator
 // uses, so the two displays are byte-identical except for the help text.
 
-static int    g_viewer_event_pending      = 0;
-static int    g_viewer_has_state          = 0;
-static char   g_viewer_operator[64]       = "";
-static char   g_viewer_roster_json[1024]  = "";
-static time_t g_viewer_last_event         = 0;
-static int    g_viewer_running            = 1;
-// Mirror of the operator's ":" prompt state. cmd_active = 1 between
-// the first cmd-preview after :  and the cmd-executed that closes it.
-// cmd_buf and cmd_status track g_cmd_buf / g_cmd_status verbatim so
-// the viewer's bottom row matches the operator's exactly. Sized to the
-// wire field (sso_event_t.cmd_text) so snprintf can't truncate.
-static int    g_viewer_cmd_active         = 0;
-static char   g_viewer_cmd_buf[160]       = "";
-static char   g_viewer_cmd_status[160]    = "";
-// Mirror of the operator's auto-tcmd run. auto_on = 1 while the
-// operator has a run to show; the render line is "<sent>/<total>
-// sent (<state>)" and disappears when the operator closes the modal
-// (the fields drop off the wire, decode zeroes them, we stash that).
-static int  g_viewer_auto_on        = 0;
-static int  g_viewer_auto_sent      = 0;
-static int  g_viewer_auto_total     = 0;
-static char g_viewer_auto_state[12] = "";
-// Mirror of the operator's RX panel. Filled from STATE / WELCOME events;
-// render_rx_panel reads it directly during viewer_render.
-static rx_panel_data_t g_viewer_rx_panel;
-// state_t whose fields the viewer mirrors from the broadcast each tick.
-static state_t g_viewer_state;
-static double  g_viewer_carrier_hz        = 0.0;
-static double  g_viewer_jul_utc           = 0.0;
-static int     g_viewer_has_rotator       = 0;
-static char    g_viewer_tle_path[256]     = "";
-static char    g_viewer_pass_folder[256]  = "";
-// Take-control confirmation. Press 'c' once to arm, 'y' within
-// CONFIRM_WINDOW_S seconds to commit. Anything else cancels.
+// All viewer-mode state in one struct, owned as a local in run_viewer and
+// threaded by pointer through the viewer helpers (viewer_on_event receives
+// it via the IPC callback's user channel). Kept separate from state_t: the
+// viewer mirrors an operator's broadcast into `state` and never runs the
+// tracker itself.
+typedef struct viewer {
+    int    event_pending;
+    int    has_state;
+    char   operator[64];
+    char   roster_json[1024];
+    time_t last_event;
+    int    running;
+    // Mirror of the operator's ":" prompt state. cmd_active = 1 between
+    // the first cmd-preview after ':' and the cmd-executed that closes it.
+    // cmd_buf and cmd_status track the operator's verbatim so the viewer's
+    // bottom row matches exactly. Sized to the wire field (cmd_text).
+    int    cmd_active;
+    char   cmd_buf[160];
+    char   cmd_status[160];
+    // Mirror of the operator's auto-tcmd run. auto_on = 1 while the
+    // operator has a run to show; the render line is "<sent>/<total>
+    // sent (<state>)" and disappears when the operator closes the modal.
+    int    auto_on;
+    int    auto_sent;
+    int    auto_total;
+    char   auto_state[12];
+    // Mirror of the operator's RX panel. Filled from STATE / WELCOME events;
+    // render_rx_panel reads it directly during viewer_render.
+    rx_panel_data_t rx_panel;
+    // state_t whose fields the viewer mirrors from the broadcast each tick.
+    state_t state;
+    double carrier_hz;
+    double jul_utc;
+    int    has_rotator;
+    char   tle_path[256];
+    char   pass_folder[256];
+    // Take-control confirmation. Press 'c' once to arm, 'y' within
+    // VIEWER_CONFIRM_WINDOW_S seconds to commit. Anything else cancels.
+    time_t confirm_until;
+} viewer_t;
+
 #define VIEWER_CONFIRM_WINDOW_S 5
-static time_t  g_viewer_confirm_until     = 0;
 
 static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
                             void *user)
 {
     (void) cli;
-    (void) user;
+    viewer_t *v = (viewer_t *) user;
     if (evt->type == SSO_EVT_TX_COMMAND_PREVIEW
      || evt->type == SSO_EVT_TX_COMMAND_SENT
      || evt->type == SSO_EVT_TX_NOT_SENT) {
-        tx_log_push(&g_viewer_state, evt);
-        g_viewer_last_event = time(NULL);
-        g_viewer_event_pending = 1;
+        tx_log_push(&v->state, evt);
+        v->last_event = time(NULL);
+        v->event_pending = 1;
         return;
     }
     if (evt->type == SSO_EVT_CMD_PREVIEW) {
-        g_viewer_cmd_active = 1;
-        snprintf(g_viewer_cmd_buf, sizeof g_viewer_cmd_buf,
+        v->cmd_active = 1;
+        snprintf(v->cmd_buf, sizeof v->cmd_buf,
                  "%s", evt->cmd_text);
-        g_viewer_last_event = time(NULL);
-        g_viewer_event_pending = 1;
+        v->last_event = time(NULL);
+        v->event_pending = 1;
         return;
     }
     if (evt->type == SSO_EVT_CMD_EXECUTED) {
         // Empty cmd_text + empty cmd_status = Esc/cancel; clear the row.
         // Otherwise show the executed-command result string just like the
         // operator does after cmd_dispatch returns.
-        g_viewer_cmd_active = 0;
-        g_viewer_cmd_buf[0] = '\0';
-        snprintf(g_viewer_cmd_status, sizeof g_viewer_cmd_status,
+        v->cmd_active = 0;
+        v->cmd_buf[0] = '\0';
+        snprintf(v->cmd_status, sizeof v->cmd_status,
                  "%s", evt->cmd_status);
-        g_viewer_last_event = time(NULL);
-        g_viewer_event_pending = 1;
+        v->last_event = time(NULL);
+        v->event_pending = 1;
         return;
     }
     if (evt->type != SSO_EVT_STATE && evt->type != SSO_EVT_WELCOME) {
         return;
     }
-    g_viewer_last_event = time(NULL);
+    v->last_event = time(NULL);
     if (evt->operator_user[0]) {
-        snprintf(g_viewer_operator, sizeof g_viewer_operator, "%s",
+        snprintf(v->operator, sizeof v->operator, "%s",
                  evt->operator_user);
     }
     if (evt->roster_json[0]) {
-        snprintf(g_viewer_roster_json, sizeof g_viewer_roster_json, "%s",
+        snprintf(v->roster_json, sizeof v->roster_json, "%s",
                  evt->roster_json);
     }
     if (!evt->has_state) return;
 
-    state_t *s = &g_viewer_state;
+    state_t *s = &v->state;
     snprintf(s->prediction.satellite_ephem.tle.sat_name,
              sizeof s->prediction.satellite_ephem.tle.sat_name, "%s",
              evt->satellite);
@@ -5329,75 +5335,75 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
     s->antenna_rotator.target_elevation            = evt->target_el;
     s->antenna_rotator.flip_mode_pass              = evt->flip;
 
-    g_viewer_has_rotator = evt->has_rotator;
-    g_viewer_jul_utc     = evt->jul_utc;
-    g_viewer_carrier_hz  = (evt->doppler_hz != 0.0)
+    v->has_rotator = evt->has_rotator;
+    v->jul_utc     = evt->jul_utc;
+    v->carrier_hz  = (evt->doppler_hz != 0.0)
         ? (double)evt->freq_hz + evt->doppler_hz
         : (double)evt->freq_hz;
     if (evt->tle_path[0]) {
-        snprintf(g_viewer_tle_path, sizeof g_viewer_tle_path,
+        snprintf(v->tle_path, sizeof v->tle_path,
                  "%s", evt->tle_path);
     }
     if (evt->pass_folder[0]) {
-        snprintf(g_viewer_pass_folder, sizeof g_viewer_pass_folder,
+        snprintf(v->pass_folder, sizeof v->pass_folder,
                  "%s", evt->pass_folder);
     }
 
     // Auto-tcmd progress — stashed unconditionally so a broadcast
     // without the fields (run over, modal closed) clears the line.
-    g_viewer_auto_on    = evt->auto_tcmd_on;
-    g_viewer_auto_sent  = evt->auto_tcmd_sent;
-    g_viewer_auto_total = evt->auto_tcmd_total;
-    snprintf(g_viewer_auto_state, sizeof g_viewer_auto_state,
+    v->auto_on    = evt->auto_tcmd_on;
+    v->auto_sent  = evt->auto_tcmd_sent;
+    v->auto_total = evt->auto_tcmd_total;
+    snprintf(v->auto_state, sizeof v->auto_state,
              "%s", evt->auto_tcmd_state);
 
     // Mirror the operator's RX panel from the broadcast. Wipe to zero
     // first so a slot that the operator hasn't decoded in this run
     // doesn't carry stale state from a previous event.
-    memset(&g_viewer_rx_panel, 0, sizeof g_viewer_rx_panel);
-    g_viewer_rx_panel.have_session  = evt->rx_have_session;
-    snprintf(g_viewer_rx_panel.warning, sizeof g_viewer_rx_panel.warning,
+    memset(&v->rx_panel, 0, sizeof v->rx_panel);
+    v->rx_panel.have_session  = evt->rx_have_session;
+    snprintf(v->rx_panel.warning, sizeof v->rx_panel.warning,
              "%s", evt->rx_warning);
     if (evt->rx_have_session) {
-        g_viewer_rx_panel.rec_active     = evt->rx_rec_active;
-        g_viewer_rx_panel.rx_freq_hz     = evt->rx_freq_hz;
-        g_viewer_rx_panel.peak_dbfs      = evt->rx_peak_dbfs;
-        g_viewer_rx_panel.rms_dbfs       = evt->rx_rms_dbfs;
-        g_viewer_rx_panel.frames_total   = (uint64_t) evt->rx_frames_total;
-        g_viewer_rx_panel.frames_pcm     = (uint64_t) evt->rx_frames_pcm;
-        g_viewer_rx_panel.frames_vit     = (uint64_t) evt->rx_frames_vit;
-        snprintf(g_viewer_rx_panel.last_frame_summary,
-                 sizeof g_viewer_rx_panel.last_frame_summary,
+        v->rx_panel.rec_active     = evt->rx_rec_active;
+        v->rx_panel.rx_freq_hz     = evt->rx_freq_hz;
+        v->rx_panel.peak_dbfs      = evt->rx_peak_dbfs;
+        v->rx_panel.rms_dbfs       = evt->rx_rms_dbfs;
+        v->rx_panel.frames_total   = (uint64_t) evt->rx_frames_total;
+        v->rx_panel.frames_pcm     = (uint64_t) evt->rx_frames_pcm;
+        v->rx_panel.frames_vit     = (uint64_t) evt->rx_frames_vit;
+        snprintf(v->rx_panel.last_frame_summary,
+                 sizeof v->rx_panel.last_frame_summary,
                  "%s", evt->rx_last_frame_summary);
-        g_viewer_rx_panel.age_s = evt->rx_age_s;
+        v->rx_panel.age_s = evt->rx_age_s;
         int slots = RX_PANEL_PT_COUNT < SSO_RX_PT_SLOTS
                   ? RX_PANEL_PT_COUNT : SSO_RX_PT_SLOTS;
         for (int s = 0; s < slots; ++s) {
-            g_viewer_rx_panel.pt_count[s] = (uint64_t) evt->rx_pt_count[s];
+            v->rx_panel.pt_count[s] = (uint64_t) evt->rx_pt_count[s];
             int pl = evt->rx_pt_payload_len[s];
             if (pl < 0) pl = 0;
             int copy = pl;
             if (copy > RX_PANEL_PAYLOAD_MAX) copy = RX_PANEL_PAYLOAD_MAX;
-            g_viewer_rx_panel.pt_payload_len[s] = pl;
-            memcpy(g_viewer_rx_panel.pt_payload[s],
+            v->rx_panel.pt_payload_len[s] = pl;
+            memcpy(v->rx_panel.pt_payload[s],
                    evt->rx_pt_payload[s], (size_t) copy);
-            snprintf(g_viewer_rx_panel.pt_summary[s],
-                     sizeof g_viewer_rx_panel.pt_summary[s],
+            snprintf(v->rx_panel.pt_summary[s],
+                     sizeof v->rx_panel.pt_summary[s],
                      "%.*s",
-                     (int)(sizeof g_viewer_rx_panel.pt_summary[s] - 1),
+                     (int)(sizeof v->rx_panel.pt_summary[s] - 1),
                      evt->rx_pt_summary[s]);
         }
         int rn = evt->rx_ribbon_n;
         if (rn > RIBBON_LEN) rn = RIBBON_LEN;
-        g_viewer_rx_panel.ribbon_n = rn;
-        memcpy(g_viewer_rx_panel.ribbon, evt->rx_ribbon, (size_t) rn);
-        g_viewer_rx_panel.ribbon[rn] = '\0';
-        memcpy(g_viewer_rx_panel.ribbon_peak, evt->rx_ribbon_peak,
-               (size_t) rn * sizeof g_viewer_rx_panel.ribbon_peak[0]);
+        v->rx_panel.ribbon_n = rn;
+        memcpy(v->rx_panel.ribbon, evt->rx_ribbon, (size_t) rn);
+        v->rx_panel.ribbon[rn] = '\0';
+        memcpy(v->rx_panel.ribbon_peak, evt->rx_ribbon_peak,
+               (size_t) rn * sizeof v->rx_panel.ribbon_peak[0]);
     }
 
-    g_viewer_has_state   = 1;
-    g_viewer_event_pending = 1;
+    v->has_state   = 1;
+    v->event_pending = 1;
 }
 
 // Format the roster array into "alice,bob,carol" for the header bar,
@@ -5405,11 +5411,11 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
 // user is empty. The roster JSON is built by sso_event_set_roster with
 // the schema [{"user":"...","role":"...","since":"..."},...], so we
 // can scan for "user":"..." and "role":"..." pairs.
-static void viewer_roster_users(char *out, size_t out_size)
+static void viewer_roster_users(viewer_t *v, char *out, size_t out_size)
 {
     if (out_size == 0) return;
     out[0] = '\0';
-    const char *p = g_viewer_roster_json;
+    const char *p = v->roster_json;
     size_t written = 0;
     while ((p = strstr(p, "\"user\":\"")) != NULL) {
         p += 8;
@@ -5465,9 +5471,9 @@ static int read_operator_pid(pid_t *out_pid)
 // re-exec this process as `simple_sat_ops --control` with the
 // inherited TLE + pass folder so the new operator picks up where the
 // old one left off. Does not return on success.
-static void viewer_take_control(sso_ipc_client_t *cli, const char *argv0)
+static void viewer_take_control(viewer_t *v, sso_ipc_client_t *cli, const char *argv0)
 {
-    if (!g_viewer_tle_path[0]) {
+    if (!v->tle_path[0]) {
         fprintf(stderr,
             "simple_sat_ops viewer: no TLE path from operator yet — "
             "wait for a state broadcast and try again.\n");
@@ -5523,17 +5529,17 @@ static void viewer_take_control(sso_ipc_client_t *cli, const char *argv0)
     new_argv[ai++] = (char *) exe;
     new_argv[ai++] = "--control";
     new_argv[ai++] = "--tle";
-    new_argv[ai++] = g_viewer_tle_path;
-    if (g_viewer_pass_folder[0]) {
+    new_argv[ai++] = v->tle_path;
+    if (v->pass_folder[0]) {
         new_argv[ai++] = "--pass-folder";
-        new_argv[ai++] = g_viewer_pass_folder;
+        new_argv[ai++] = v->pass_folder;
     }
     new_argv[ai] = NULL;
     fprintf(stderr,
         "simple_sat_ops: taking control with --tle %s%s%s\n",
-        g_viewer_tle_path,
-        g_viewer_pass_folder[0] ? "  --pass-folder " : "",
-        g_viewer_pass_folder[0] ? g_viewer_pass_folder : "");
+        v->tle_path,
+        v->pass_folder[0] ? "  --pass-folder " : "",
+        v->pass_folder[0] ? v->pass_folder : "");
     execv(exe, new_argv);
     // If we got here exec failed — best to bail loudly.
     fprintf(stderr,
@@ -5542,55 +5548,55 @@ static void viewer_take_control(sso_ipc_client_t *cli, const char *argv0)
     exit(EXIT_FAILURE);
 }
 
-static void viewer_render(int connected)
+static void viewer_render(viewer_t *v, int connected)
 {
     int cols = COLS;
     erase();
 
-    if (!g_viewer_has_state) {
+    if (!v->has_state) {
         mvprintw(2, 2, "(waiting for state from the operator...)");
     } else {
         int row = 1, col = 1;
-        render_predictions_panel(&g_viewer_state, g_viewer_jul_utc,
+        render_predictions_panel(&v->state, v->jul_utc,
                                  &row, col);
 
         char viewers[160];
-        viewer_roster_users(viewers, sizeof viewers);
+        viewer_roster_users(v, viewers, sizeof viewers);
         int srow = row + 1;
         status_panel_t sp;
         memset(&sp, 0, sizeof sp);
         sp.control_mode  = 0;
-        sp.operator_user = g_viewer_operator;
+        sp.operator_user = v->operator;
         sp.viewers       = viewers[0] ? viewers : "(none)";
-        sp.carrier_hz    = g_viewer_carrier_hz;
-        sp.have_rotator  = g_viewer_has_rotator;
-        sp.current_az    = g_viewer_state.antenna_rotator.azimuth;
-        sp.current_el    = g_viewer_state.antenna_rotator.elevation;
-        sp.target_az     = g_viewer_state.antenna_rotator.target_azimuth;
-        sp.target_el     = g_viewer_state.antenna_rotator.target_elevation;
-        sp.flip          = g_viewer_state.antenna_rotator.flip_mode_pass;
+        sp.carrier_hz    = v->carrier_hz;
+        sp.have_rotator  = v->has_rotator;
+        sp.current_az    = v->state.antenna_rotator.azimuth;
+        sp.current_el    = v->state.antenna_rotator.elevation;
+        sp.target_az     = v->state.antenna_rotator.target_azimuth;
+        sp.target_el     = v->state.antenna_rotator.target_elevation;
+        sp.flip          = v->state.antenna_rotator.flip_mode_pass;
         render_status_panel(&sp, &srow, col);
 
         // Auto-tcmd run progress, mirrored from the operator's modal.
         // Red while the run is live (the PA is being keyed on a timer),
         // matching the T/R panel's red-while-transmitting convention.
-        if (g_viewer_auto_on) {
+        if (v->auto_on) {
             srow++;
-            int at_running = strcmp(g_viewer_auto_state, "running") == 0;
+            int at_running = strcmp(v->auto_state, "running") == 0;
             if (at_running) attron(COLOR_PAIR(1));
             mvprintw(srow++, col, "%15s   %d/%d sent (%s)",
                      "auto-tcmd",
-                     g_viewer_auto_sent, g_viewer_auto_total,
-                     g_viewer_auto_state[0] ? g_viewer_auto_state : "?");
+                     v->auto_sent, v->auto_total,
+                     v->auto_state[0] ? v->auto_state : "?");
             if (at_running) attroff(COLOR_PAIR(1));
             clrtoeol();
         }
 
         int prow = 5;
-        report_position(&g_viewer_state, &prow, 50);
+        report_position(&v->state, &prow, 50);
         // RX panel directly below position (matches the operator's layout).
         prow++;
-        render_rx_panel(&g_viewer_rx_panel, &prow, 50);
+        render_rx_panel(&v->rx_panel, &prow, 50);
 
         // Vertical ribbon on the right edge, same placement as the
         // operator. The wire delivers the same '.'/'-' chars the
@@ -5599,19 +5605,19 @@ static void viewer_render(int connected)
         int ribbon_top = 1;
         int ribbon_bot = LINES - 2;
         if (ribbon_col >= 64 && ribbon_bot > ribbon_top) {
-            render_ribbon_vertical(&g_viewer_rx_panel,
+            render_ribbon_vertical(&v->rx_panel,
                                    ribbon_top, ribbon_bot, ribbon_col);
         }
 
         int tx_log_row = LINES - TX_LOG_SIZE - 2;
         if (tx_log_row >= 17) {
-            render_tx_log_panel(&g_viewer_state, tx_log_row, 1);
+            render_tx_log_panel(&v->state, tx_log_row, 1);
         }
     }
 
     time_t now = time(NULL);
-    long stale_s = g_viewer_last_event > 0
-        ? (long)(now - g_viewer_last_event)
+    long stale_s = v->last_event > 0
+        ? (long)(now - v->last_event)
         : -1;
     const char *status = !connected ? "DISCONNECTED"
                                     : (stale_s < 0 ? "WAITING"
@@ -5623,19 +5629,19 @@ static void viewer_render(int connected)
     // own LINES-1; the footer (connection status + viewer-only shortcuts)
     // is the fallback when neither is active. The mirror does not invert
     // the row — matches the operator's plain ":" prompt rendering.
-    int show_confirm = (g_viewer_confirm_until > 0
-                        && now < g_viewer_confirm_until);
+    int show_confirm = (v->confirm_until > 0
+                        && now < v->confirm_until);
     int show_mirror  = !show_confirm
-        && (g_viewer_cmd_active || g_viewer_cmd_status[0]);
+        && (v->cmd_active || v->cmd_status[0]);
 
     move(LINES - 1, 0);
     clrtoeol();
     if (show_mirror) {
-        if (g_viewer_cmd_active) {
-            mvprintw(LINES - 1, 0, ":%s", g_viewer_cmd_buf);
+        if (v->cmd_active) {
+            mvprintw(LINES - 1, 0, ":%s", v->cmd_buf);
             addch(' ' | A_REVERSE);
         } else {
-            mvprintw(LINES - 1, 0, "%s", g_viewer_cmd_status);
+            mvprintw(LINES - 1, 0, "%s", v->cmd_status);
         }
     } else {
         attron(A_REVERSE);
@@ -5644,7 +5650,7 @@ static void viewer_render(int connected)
             snprintf(foot, sizeof foot,
                 " %s     Take control from %s? y/N ",
                 status,
-                g_viewer_operator[0] ? g_viewer_operator : "?");
+                v->operator[0] ? v->operator : "?");
         } else {
             snprintf(foot, sizeof foot,
                 " %s     c : take control   q : quit ", status);
@@ -5661,6 +5667,8 @@ static void viewer_render(int connected)
 
 static int run_viewer(const char *argv0)
 {
+    viewer_t v = {0};
+    v.running = 1;
     sso_ipc_client_t *cli = sso_ipc_client_connect("simple_sat_ops");
     if (cli == NULL) {
         fprintf(stderr,
@@ -5668,12 +5676,12 @@ static int run_viewer(const char *argv0)
                 strerror(errno));
         return EXIT_FAILURE;
     }
-    sso_ipc_client_on_event(cli, viewer_on_event, NULL);
+    sso_ipc_client_on_event(cli, viewer_on_event, &v);
 
     // Viewer doesn't run SGP4 or load a TLE — it deposits every
-    // displayed value into g_viewer_state from the broadcast and uses
+    // displayed value into v.state from the broadcast and uses
     // the same render helpers the operator does. zero-init is enough.
-    memset(&g_viewer_state, 0, sizeof g_viewer_state);
+    memset(&v.state, 0, sizeof v.state);
 
     sso_event_t hello;
     sso_event_init(&hello, SSO_EVT_HELLO);
@@ -5686,29 +5694,29 @@ static int run_viewer(const char *argv0)
         sso_ipc_client_send(cli, buf);
     }
 
-    init_window(&g_viewer_state);
+    init_window(&v.state);
     int last_connected = -1;
     time_t last_render = 0;
-    viewer_render(sso_ipc_client_is_connected(cli));
+    viewer_render(&v, sso_ipc_client_is_connected(cli));
     last_render = time(NULL);
     int confirm_was_armed = 0;
-    while (g_viewer_running) {
+    while (v.running) {
         int rc = sso_ipc_client_step(cli, 200);
         if (rc < 0) break;
         int connected = sso_ipc_client_is_connected(cli);
         time_t now = time(NULL);
-        int confirm_armed = (g_viewer_confirm_until > 0
-                             && now < g_viewer_confirm_until);
+        int confirm_armed = (v.confirm_until > 0
+                             && now < v.confirm_until);
         if (!confirm_armed && confirm_was_armed) {
             // Window just expired — re-render to drop the confirm footer.
-            g_viewer_event_pending = 1;
+            v.event_pending = 1;
         }
         confirm_was_armed = confirm_armed;
-        if (g_viewer_event_pending
+        if (v.event_pending
             || connected != last_connected
             || (now - last_render) >= 5) {
-            viewer_render(connected);
-            g_viewer_event_pending = 0;
+            viewer_render(&v, connected);
+            v.event_pending = 0;
             last_connected = connected;
             last_render = now;
         }
@@ -5719,21 +5727,21 @@ static int run_viewer(const char *argv0)
                 // Commits: viewer_take_control re-execs on success and
                 // doesn't return; if it returns, the operator wasn't
                 // reachable and we just stay as a viewer.
-                viewer_take_control(cli, argv0);
-                g_viewer_confirm_until = 0;
-                g_viewer_event_pending = 1;
+                viewer_take_control(&v, cli, argv0);
+                v.confirm_until = 0;
+                v.event_pending = 1;
             } else {
                 // Anything else cancels the confirm window.
-                g_viewer_confirm_until = 0;
-                g_viewer_event_pending = 1;
+                v.confirm_until = 0;
+                v.event_pending = 1;
             }
             continue;
         }
         if (key == 'q' || key == 'Q' || key == 27 /* Esc */) {
-            g_viewer_running = 0;
+            v.running = 0;
         } else if (key == 'c' || key == 'C') {
-            g_viewer_confirm_until = now + VIEWER_CONFIRM_WINDOW_S;
-            g_viewer_event_pending = 1;
+            v.confirm_until = now + VIEWER_CONFIRM_WINDOW_S;
+            v.event_pending = 1;
         }
     }
 
