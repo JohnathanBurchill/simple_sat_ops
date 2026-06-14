@@ -27,7 +27,29 @@
 #include "tr_switch.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <termios.h>
+
+#define SCAN_MAX_TARGETS 512
+
+// --scan-sky: drive the rotator through a grid of (az, el) targets spaced
+// for roughly equal solid angle, dwelling at each while writing per-target
+// arrival timestamps to a CSV. Owned by the operator loop.
+typedef struct { double az_deg; double el_deg; } scan_target_t;
+typedef struct scan_sky
+{
+    int           mode;            // CLI: --scan-sky rebinds T to a sky scan
+    double        step_deg;        // elevation ring spacing (deg)
+    scan_target_t targets[SCAN_MAX_TARGETS];
+    int           n_targets;
+    int           active;
+    int           idx;
+    // Set to t_now when the rotator's motion-flag clears at a target; the
+    // dwell expires SCAN_DWELL_S later. 0 means "haven't arrived yet".
+    double        dwell_start_s;
+    FILE         *csv_fp;
+    char          csv_path[640];
+} scan_sky_t;
 
 #define MAX_TLE_LINE_LENGTH 128
 #define TRACKING_PREP_TIME_MINUTES 5.0
@@ -96,6 +118,9 @@ typedef struct state
 
     // Telemetry overlay (still rendered alongside the prediction).
     telemetry_t telemetry;
+
+    // Sky-scan grid + per-target CSV logging (--scan-sky).
+    scan_sky_t scan;
 } state_t;
 
 
