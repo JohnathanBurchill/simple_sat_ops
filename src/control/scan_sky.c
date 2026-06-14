@@ -21,6 +21,8 @@
 #include "scan_sky.h"
 #include "state.h"
 
+#include "tracking.h"
+
 #include "sso_audit.h"
 
 #include <math.h>
@@ -32,8 +34,6 @@
 // Seconds the rotator dwells at each scan target before logging + stepping.
 #define SCAN_DWELL_S 5.0
 
-// Defined in control/tracking (extracted later); declared here until then.
-int point_to_stationary_target(state_t *state, double azimuth, double elevation);
 
 // -------------------------------------------------------------------
 // --scan-sky helpers
