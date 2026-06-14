@@ -40,6 +40,7 @@
 #include "sso_pseudo.h"
 #include "sso_time.h"
 #include "sso_version.h"
+#include "tui.h"
 #include "argparse.h"
 
 #ifdef SSO_WITH_SDR
@@ -1383,15 +1384,6 @@ static void cmd_render(state_t *state)
 // broadcast on every STATE event so b210_rx_tx and tx_frame_sdr
 // can drop their captures/logs in the same spot. Empty until set.
 // (Now state.pass_folder.)
-// SIGUSR1 sets this — used by the force-claim takeover path to nudge
-// the operator-mode loop into a graceful exit. (Full in-place
-// demotion is a follow-up; for now SIGUSR1 = quit.)
-static volatile sig_atomic_t g_yield_requested = 0;
-static void on_sigusr1(int sig) {
-    (void) sig;
-    g_yield_requested = 1;
-}
-
 // Pull "HH:MM:SS" out of an event's ISO ts ("2026-05-14T13:22:01.450Z").
 // Falls back to local clock if the event ts is empty/garbled.
 static void tx_log_ts_from_event(const sso_event_t *evt,
@@ -4137,221 +4129,6 @@ static void generate_pass_plot(state_t *state, const char *pass_folder,
 }
 
 
-// --- ncurses ------------------------------------------------------
-
-// While the ncurses TUI owns the screen, any stray write to stderr (a
-// UHD/libusb error, a backend diagnostic, a library warning) lands on
-// top of the panels and corrupts the display until the next full
-// redraw. We therefore point fd 2 at a log file for the lifetime of
-// the TUI: nothing reaches the terminal, but every message is still
-// captured for post-pass debugging (the LIBUSB_TRANSFER_OVERFLOW flood
-// during TX, for one). Restored on teardown so final console messages
-// print normally. dup2 on the fd (not the FILE*) catches direct fd-2
-// writes from C libraries too, not just our fprintf(stderr, ...).
-static int   g_saved_stderr_fd = -1;
-// Path of the redirected log and its size at grab time, so on quit we
-// can tell the operator whether anything was logged THIS run (the file
-// is opened append, so we compare against the starting size, not zero).
-// Empty path => no real log file (e.g. a viewer with no pass folder).
-static char  g_stderr_log_path[320] = "";
-static off_t g_stderr_log_start_size = 0;
-
-static void tui_grab_stderr(state_t *state)
-{
-    if (g_saved_stderr_fd != -1) return;   // already redirected
-
-    char path[320];
-    if (state->pass_folder[0]) {
-        snprintf(path, sizeof path, "%.300s/sso_stderr.log", state->pass_folder);
-    } else {
-        // No pass folder (e.g. a viewer): we still must not corrupt the
-        // screen, so swallow stderr rather than leave it on the tty.
-        snprintf(path, sizeof path, "/dev/null");
-    }
-
-    int log_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (log_fd < 0) return;                // leave stderr as-is on failure
-
-    // Remember the log path + its current size so tui_report_errors can
-    // tell whether this run appended anything. Only for a real file; a
-    // /dev/null sink leaves the path empty and is never reported on.
-    g_stderr_log_path[0]    = '\0';
-    g_stderr_log_start_size = 0;
-    if (state->pass_folder[0]) {
-        struct stat st;
-        if (fstat(log_fd, &st) == 0) g_stderr_log_start_size = st.st_size;
-        snprintf(g_stderr_log_path, sizeof g_stderr_log_path, "%s", path);
-    }
-
-    fflush(stderr);
-    g_saved_stderr_fd = dup(STDERR_FILENO);
-    if (g_saved_stderr_fd < 0) { close(log_fd); g_saved_stderr_fd = -1; return; }
-    dup2(log_fd, STDERR_FILENO);
-    close(log_fd);
-    // Unbuffered so log lines land promptly even on an abnormal exit.
-    setvbuf(stderr, NULL, _IONBF, 0);
-}
-
-static void tui_release_stderr(void)
-{
-    if (g_saved_stderr_fd == -1) return;
-    fflush(stderr);
-    dup2(g_saved_stderr_fd, STDERR_FILENO);
-    close(g_saved_stderr_fd);
-    g_saved_stderr_fd = -1;
-}
-
-// One-line closing status: did anything hit the redirected stderr log
-// this run? Call once, last, after the TUI has been torn down and stderr
-// restored. Silent when there was no real log file (e.g. a viewer).
-static void tui_report_errors(void)
-{
-    if (g_stderr_log_path[0] == '\0') return;
-    struct stat st;
-    if (stat(g_stderr_log_path, &st) == 0
-        && st.st_size > g_stderr_log_start_size) {
-        printf("Errors logged in %s\n", g_stderr_log_path);
-    } else {
-        printf("No errors reported\n");
-    }
-    fflush(stdout);
-}
-
-// --- Crash / quit signal safety net -------------------------------
-//
-// A streaming SDR yanked off USB makes UHD throw from a C++ destructor
-// deep inside recv (on our worker thread), which the C API can't turn
-// into an error return — it goes std::terminate -> abort -> SIGABRT. We
-// can't recover from that, but we can refuse to leave the operator with
-// a cryptic "Abort trap: 6" and a terminal stuck in ncurses raw mode.
-// The handler restores the screen, prints one clear line to the real
-// terminal, and re-raises so the process still dies with the original
-// signal (and a core dump if enabled). SIGINT/SIGTERM instead ask the
-// main loop to quit cleanly via its normal teardown.
-static volatile sig_atomic_t g_signal_quit = 0;
-// Claimed (test-and-set) by the first thread to enter the crash handler.
-// On device loss TWO threads abort at once (our RX worker and a UHD
-// internal thread); only one may run the terminal-restore + message.
-static volatile char g_crash_claimed = 0;
-// Terminal modes captured before ncurses took over, so the crash handler
-// can restore the tty without relying on a (thread-racy) endwin().
-static struct termios g_saved_termios;
-static int            g_have_saved_termios = 0;
-
-// write() a string literal — async-signal-safe (sizeof-1 drops the NUL).
-#define CRASH_WRITE(fd, s) do { ssize_t w_ = write((fd), (s), sizeof(s) - 1); (void) w_; } while (0)
-
-static void graceful_quit_handler(int sig)
-{
-    (void) sig;
-    g_signal_quit = 1;   // main loop notices and runs its normal teardown
-}
-
-static void crash_handler(int sig)
-{
-    // On device loss two threads abort almost simultaneously. The first
-    // claims the handler and does the cleanup; any other thread must NOT
-    // _exit here — that single fast syscall would terminate the process
-    // before the first thread finished restoring the terminal and
-    // printing the message (the bug: "waterfall down, terminal garbled,
-    // no message"). Instead, wait: the claiming thread re-raises and
-    // brings the whole process down within microseconds. Bounded so a
-    // wedged cleanup can't hang forever.
-    if (__atomic_test_and_set(&g_crash_claimed, __ATOMIC_SEQ_CST)) {
-        for (int i = 0; i < 50; i++) {
-            struct timespec ts = { 0, 10 * 1000 * 1000 };   // 10 ms
-            nanosleep(&ts, NULL);
-        }
-        _exit(128 + sig);
-    }
-
-    // Kill the spawned live-waterfall window so it doesn't orphan when we
-    // die — the normal teardown that usually does this won't run. kill()
-    // is async-signal-safe.
-    if (g_live_waterfall_pid > 0) {
-        kill(g_live_waterfall_pid, SIGKILL);
-    }
-
-    // Restore the terminal DETERMINISTICALLY. The fault is usually on the
-    // RX worker thread, where ncurses endwin() races the main thread's
-    // drawing and can leave the tty half-restored ("needs reset"). So we
-    // skip endwin() and instead restore the saved termios + emit the
-    // raw escapes to leave the alt-screen, show the cursor, and reset
-    // attributes. tcsetattr + write are plain syscalls, safe from here.
-    if (g_have_saved_termios) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_termios);
-    }
-    CRASH_WRITE(STDOUT_FILENO, "\033[?1049l\033[?25h\033[0m\r\n");
-
-    // stderr is redirected to the pass-folder log during the TUI; aim the
-    // message at the real terminal so the operator actually sees it.
-    int fd = (g_saved_stderr_fd >= 0) ? g_saved_stderr_fd : STDERR_FILENO;
-    CRASH_WRITE(fd, "\n*** simple_sat_ops: fatal error");
-    switch (sig) {
-        case SIGABRT: CRASH_WRITE(fd, " (SIGABRT - a USB/SDR device was likely disconnected)"); break;
-        case SIGSEGV: CRASH_WRITE(fd, " (SIGSEGV)"); break;
-        case SIGBUS:  CRASH_WRITE(fd, " (SIGBUS)");  break;
-        default:      CRASH_WRITE(fd, "");           break;
-    }
-    CRASH_WRITE(fd,
-        ".\nThe terminal has been restored. Any detail is in the pass-folder\n"
-        "log (sso_stderr.log). Reconnect the device and restart.\n");
-
-    // Re-raise with the default disposition so the process terminates
-    // with the original signal (preserving core-dump behaviour).
-    signal(sig, SIG_DFL);
-    raise(sig);
-}
-
-static void install_signal_handlers(void)
-{
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = crash_handler;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGABRT, &sa, NULL);
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS,  &sa, NULL);
-
-    struct sigaction sq;
-    memset(&sq, 0, sizeof sq);
-    sq.sa_handler = graceful_quit_handler;
-    sigemptyset(&sq.sa_mask);
-    sigaction(SIGINT,  &sq, NULL);
-    sigaction(SIGTERM, &sq, NULL);
-}
-
-void init_window(state_t *state)
-{
-    // setlocale BEFORE initscr so ncurses knows the terminal can render
-    // its alternate-character-set line glyphs (and UTF-8 elsewhere).
-    // Without this, box() and friends emit the ACS fallback letters
-    // (q for horizontal, x for vertical, lkjm for corners) instead of
-    // line-drawing characters.
-    setlocale(LC_ALL, "");
-
-    initscr(); cbreak(); noecho();
-    nonl();
-    timeout(0);
-    intrflush(stdscr, FALSE);
-    keypad(stdscr, TRUE);
-    // ncurses defaults ESCDELAY to 1000 ms — fine for distinguishing
-    // bare Esc from the leading byte of a function-key sequence, but
-    // makes Esc-to-cancel and arrow-key composition feel sluggish.
-    // 25 ms is the conventional snappy value; any real escape sequence
-    // arrives in a few ms so this isn't tight.
-    set_escdelay(25);
-    start_color();
-    init_pair(1, COLOR_RED, COLOR_BLACK);
-    init_pair(2, COLOR_YELLOW, COLOR_BLACK);
-    init_pair(3, COLOR_GREEN, COLOR_BLACK);
-    curs_set(0);
-
-    // Now that ncurses owns the screen, divert stderr to the pass-folder
-    // log so backend/library errors never paint over the panels.
-    tui_grab_stderr(state);
-}
-
 // --- Reports -------------------------------------------------------
 
 // Pure-render predictions panel — operator runs the SGP4 search
@@ -6074,11 +5851,7 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
         sso_ipc_server_on_event(state.ipc, ipc_on_event, &state);
-        struct sigaction sa;
-        memset(&sa, 0, sizeof(sa));
-        sa.sa_handler = on_sigusr1;
-        sigemptyset(&sa.sa_mask);
-        sigaction(SIGUSR1, &sa, NULL);
+        tui_install_yield_handler();
         fprintf(stderr, "simple_sat_ops: operator=%s ipc=on\n",
                 state.operator_user);
     }
@@ -6369,15 +6142,16 @@ int main(int argc, char **argv)
 
     // Capture the cooked terminal modes BEFORE ncurses switches the tty
     // to raw, so the crash handler can put it back deterministically.
-    if (tcgetattr(STDIN_FILENO, &g_saved_termios) == 0) {
-        g_have_saved_termios = 1;
-    }
+    tui_save_termios();
 
     init_window(&state);
 
     // Catch a fatal device fault (or Ctrl-C) now that the screen is up,
     // so it restores the terminal instead of dumping a raw abort on it.
     install_signal_handlers();
+    // Let the crash handler reach the live-waterfall child (owned here) so
+    // it doesn't orphan when a device-loss abort skips normal teardown.
+    tui_register_waterfall_pid(&g_live_waterfall_pid);
 
     // int (not char) — getch returns KEY_* codes well above 127 for
     // arrow keys / function keys / KEY_BACKSPACE etc. A signed char
@@ -6463,7 +6237,7 @@ int main(int argc, char **argv)
     while (state.running) {
         // Ctrl-C / SIGTERM: leave the loop and run the normal teardown
         // (endwin, rotator home, device close) instead of dying raw.
-        if (g_signal_quit) { state.running = 0; break; }
+        if (tui_should_quit()) { state.running = 0; break; }
         double t_now = monotonic_seconds();
         UTC_Calendar_Now(&utc, &tv);
         jul_utc = Julian_Date(&utc, &tv);
@@ -7247,7 +7021,7 @@ int main(int argc, char **argv)
                 state.cmd.dirty = 0;
             }
         }
-        if (g_yield_requested) {
+        if (tui_yield_requested()) {
             sso_audit_event("yield-requested",
                             "SIGUSR1 (--force takeover) — exiting");
             state.running = 0;
