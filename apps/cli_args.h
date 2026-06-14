@@ -39,8 +39,9 @@ typedef struct state state_t;
 // HELP_FULL). Returns a PARSE_* code (see argparse.h).
 int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help);
 
-// Print the resolved configuration snapshot (after parse + HMAC load) in a
-// stable "key: value" layout for --self-test.
+// Print the resolved configuration snapshot in a stable "key: value" layout
+// for --self-test. Called at the end of the bring-up (after the rotator and
+// SDR are opened), so the hardware lines report the live opened state.
 void self_test_report(const state_t *state, FILE *out, int argc, char **argv);
 
 #ifdef __cplusplus

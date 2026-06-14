@@ -22,6 +22,7 @@
 #include "state.h"
 
 #include "antenna_rotator.h"
+#include "antenna_rotator_async.h"
 #include "argparse.h"
 #include "frontiersat.h"
 #include "hmac_keyfile.h"
@@ -65,11 +66,14 @@
 
 // --- --self-test report -------------------------------------------
 //
-// Prints the resolved configuration after CLI parse + HMAC keyfile
-// load, in a stable key: value layout so test harnesses can grep it.
-// Every line is "key: value" with no surrounding quoting; values are
-// short enough to fit on one line. The "self-test:" header line is
-// the contract — downstream scripts can use it as a sentinel.
+// Prints the resolved configuration in a stable key: value layout so
+// test harnesses can grep it. Called at the very end of the bring-up
+// (after the TLE load, pass-folder setup, rotator + SDR open, IPC bind
+// and --tc-file lint), so the hardware lines report the live opened
+// state, not just the requested intent. Every line is "key: value"
+// with no surrounding quoting; values are short enough to fit on one
+// line. The "self-test:" header line is the contract — downstream
+// scripts can use it as a sentinel.
 
 static const char *hmac_status_str(hmac_display_status_t s)
 {
@@ -100,6 +104,16 @@ static const char *baud_str(int speed_const)
         case B57600:  return "57600";
         case B115200: return "115200";
         default:      return "?";
+    }
+}
+
+static const char *sdr_type_str(sdr_backend_type_t t)
+{
+    switch (t) {
+        case SDR_TYPE_UHD:    return "uhd (B2xx)";
+        case SDR_TYPE_RTLSDR: return "rtl-sdr";
+        case SDR_TYPE_AUTO:   /* fall through */
+        default:              return "auto (probe UHD, then RTL-SDR)";
     }
 }
 
@@ -144,10 +158,15 @@ void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
             uhd_compiled ? "on" : "off",
             rtl_compiled ? "on" : "off");
 
-    fprintf(out, "tle: %s\n",
+    // TLE — loaded by the time this prints, so report the satellite the
+    // bring-up actually selected plus the file it came from.
+    fprintf(out, "tle: %s (file=%s)\n",
+            state->prediction.satellite_ephem.tle.sat_name[0]
+                ? state->prediction.satellite_ephem.tle.sat_name
+                : "(no satellite loaded)",
             state->prediction.tles_filename
                 ? state->prediction.tles_filename
-                : "(auto-discover at startup)");
+                : "(none)");
 
     // HMAC --- the operator's banner-and-sign state. CTS1 firmware
     // expects every uplink to be HMAC-signed; the dispatcher refuses
@@ -190,18 +209,52 @@ void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
     fprintf(out, "tx-auto-tcmd-file: %s\n",
             state->auto_tcmd_file_path[0] ? state->auto_tcmd_file_path : "(none)");
 
-    // Hardware. The flags don't reflect "is it physically present" —
-    // they reflect "does this run intend to talk to it". The actual
-    // open happens after the self-test exit.
-    fprintf(out, "rotator: %s (device=%s, baud=%s)\n",
-            state->run_with_antenna_rotator ? "enabled"
-                                            : "disabled (--without-rotator)",
-            state->antenna_rotator.device_filename,
-            baud_str(state->antenna_rotator.serial_speed));
-    fprintf(out, "sdr: %s\n",
-            (!sdr_compiled || state->without_b210)
-                ? "disabled (--without-b210 or build-time)"
-                : "enabled");
+    // Hardware — reported live: the rotator and SDR have already been
+    // opened by the time --self-test prints this, so these lines show the
+    // real opened state (device, current position, slew rates, SDR
+    // backend, TX capability), not just the requested intent.
+    if (state->have_antenna_rotator) {
+        double az = 0.0, el = 0.0;
+        int ok = 0, stale_ms = 0, inflight = 0;
+        if (state->rot_async) {
+            antenna_rotator_async_snapshot(state->rot_async, &az, &el,
+                                           &ok, &stale_ms, &inflight);
+        }
+        fprintf(out,
+                "rotator: open (device=%s, baud=%s, az=%.1f el=%.1f, "
+                "slew az=%.3f el=%.3f deg/s)\n",
+                state->antenna_rotator.device_filename,
+                baud_str(state->antenna_rotator.serial_speed),
+                az, el, state->pursuit_az_dps, state->pursuit_el_dps);
+    } else {
+        fprintf(out, "rotator: %s (device=%s, baud=%s)\n",
+                state->run_with_antenna_rotator
+                    ? "enabled but not opened (no controller?)"
+                    : "disabled (--without-rotator)",
+                state->antenna_rotator.device_filename,
+                baud_str(state->antenna_rotator.serial_speed));
+    }
+
+    fprintf(out, "sdr-type: %s\n", sdr_type_str(state->sdr_type));
+#ifdef SSO_WITH_SDR
+    if (state->rx_session) {
+        double actual_freq_hz = 0.0;
+        rx_session_snapshot(state->rx_session, NULL, NULL, NULL,
+                            &actual_freq_hz, NULL, 0);
+        fprintf(out, "sdr: open (%s, tx=%s, rx-freq-mhz=%.6f)\n",
+                rx_session_sdr_name(state->rx_session),
+                rx_session_can_tx(state->rx_session) ? "yes" : "no (RX-only)",
+                actual_freq_hz / 1e6);
+    } else if (state->without_b210) {
+        fprintf(out, "sdr: disabled (--without-b210)\n");
+    } else if (!state->control_mode) {
+        fprintf(out, "sdr: not opened (standalone; SDR opens only with --control)\n");
+    } else {
+        fprintf(out, "sdr: not opened (open failed — see stderr)\n");
+    }
+#else
+    fprintf(out, "sdr: disabled (built without SDR support)\n");
+#endif
 
     fprintf(out, "live-waterfall: %s\n",
             state->run_live_waterfall ? "on (--live-waterfall)" : "off");
@@ -299,17 +352,16 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         int matched = 0;
 
         // Positional first so <satellite_id> lists above the options.
-        // A token that is not "--"-prefixed counts as the positional.
-        // The actual pointer is resolved by the discovery scan AFTER the
-        // loop (which re-walks argv exactly as the pre-conversion code
-        // did, including its quirk that a space-form option value can be
-        // grabbed as the positional); here we only print the help line
-        // and mark the token matched so a bare extra positional falls
-        // through to the post-loop n_positional > 1 check rather than the
-        // unknown-token branch.
+        // A token that is not "--"-prefixed is the positional. Capture it
+        // here, inside the loop, where t has already advanced past every
+        // space-form option value (each value-taking option does ++t), so
+        // a bare token at this point is genuinely the <satellite_id> and
+        // not, say, the path after "--tle". The first one wins; a second
+        // bare token falls through to the post-loop n_positional > 1 check.
         if (strncmp("--", arg, 2) != 0 || help) {
             if (help) parse_help_line(OPTW, "<satellite_id>",
                 "name prefix in the TLE, or `next` to auto-pick the next pass");
+            else if (positional == NULL) positional = (char *) arg;
             matched = 1;
         }
         if (strcmp("--help", arg) == 0 || help) {
@@ -915,14 +967,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         return PARSE_ERROR;
     }
 
-    // Find the (single) positional, if any. Existing convention is
-    // "positional at argv[1]" but loop is robust to options-before /
-    // options-after orderings.
-    for (int i = 1; i < argc; i++) {
-        if (strncmp("--", argv[i], 2) == 0) continue;
-        positional = argv[i];
-        break;
-    }
+    // positional was captured in the parse loop above (which correctly
+    // skips space-form option values), so there is no second re-scan here.
 
     // Any invocation without --control: the standalone tracker is being
     // phased out in favour of the operator+viewer split, so there is no

@@ -166,22 +166,6 @@ static int   g_live_waterfall_stdin_fd = -1;
 // live-waterfall child's stdin without owning the pipe; main spawns/reaps it.
 int live_waterfall_stdin_fd(void) { return g_live_waterfall_stdin_fd; }
 
-
-
-
-
-
-
-// --- Forward decls -------------------------------------------------
-
-
-
-
-
-
-
-
-
 // --- main ---------------------------------------------------------
 
 int main(int argc, char **argv)
@@ -257,16 +241,6 @@ int main(int argc, char **argv)
                 memset(state.hmac_key, 0, sizeof state.hmac_key);
             }
         }
-    }
-
-    // --self-test: configuration snapshot, then exit. Runs after CLI
-    // parse + HMAC keyfile load so every TX-relevant policy is
-    // resolved; runs BEFORE the IPC socket bind, the rotator open,
-    // the B210 open, and load_tle, so the process makes no observable
-    // changes to the rest of the system.
-    if (state.self_test) {
-        self_test_report(&state, stdout, argc, argv);
-        return 0;
     }
 
     // Telecommand-agenda lint gate. When a --tc-file was given, lint it
@@ -412,43 +386,57 @@ int main(int argc, char **argv)
         antenna_rotator_result = antenna_rotator_init(&state.antenna_rotator);
         if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
             fprintf(stderr, "Error initializing antenna rotator\n");
-            return EXIT_FAILURE;
-        }
-        state.have_antenna_rotator = 1;
-        // Spawn the async worker. From here on, every serial roundtrip
-        // happens on the worker thread; the main loop only reads the
-        // snapshot via main_rotator_refresh_targets_from_snapshot() and
-        // posts SETs via main_rotator_submit_set().
-        if (antenna_rotator_async_open(&state.rot_async,
-                                        &state.antenna_rotator, 0.5) != 0) {
-            fprintf(stderr, "Error spawning antenna rotator worker\n");
-            return EXIT_FAILURE;
-        }
-        // Adopt whatever extended position the SPID is already at so the
-        // unwrapped accumulator starts grounded in reality. We wait
-        // briefly for the worker's first STATUS read; the timeout is
-        // bounded so a missing controller doesn't hang startup.
-        //
-        // The seed snapshot also overwrites target_* with the current
-        // physical position — fine when nobody asked for a specific park
-        // position, but a problem when the operator passed
-        // --rotator-target-azimuth / --rotator-target-elevation: those
-        // user-specified targets would be silently clobbered before T
-        // ever fired. Snapshot them and restore after seeding.
-        double sav_az    = state.antenna_rotator.target_azimuth;
-        double sav_el    = state.antenna_rotator.target_elevation;
-        double sav_az_uw = state.antenna_rotator.target_azimuth_unwrapped;
-        int    sav_uw_ok = state.antenna_rotator.unwrapped_target_valid;
-        if (antenna_rotator_async_wait_first_status(state.rot_async, 1500) != 0
-            || main_rotator_refresh_targets_from_snapshot(&state) != 0) {
-            fprintf(stderr, "Warning: could not read SPID position; "
-                            "check that the Rot2ProG is in 'A' mode\n");
-        }
-        if (state.antenna_rotator.fixed_target) {
-            state.antenna_rotator.target_azimuth            = sav_az;
-            state.antenna_rotator.target_elevation          = sav_el;
-            state.antenna_rotator.target_azimuth_unwrapped  = sav_az_uw;
-            state.antenna_rotator.unwrapped_target_valid    = sav_uw_ok;
+            // --self-test is a dry run: a missing rotator must not abort the
+            // bring-up, so the configuration report still prints. Outside
+            // --self-test this stays fatal.
+            if (!state.self_test) {
+                return EXIT_FAILURE;
+            }
+            fprintf(stderr,
+                    "--self-test: continuing without the rotator (dry run)\n");
+        } else {
+            state.have_antenna_rotator = 1;
+            // Spawn the async worker. From here on, every serial roundtrip
+            // happens on the worker thread; the main loop only reads the
+            // snapshot via main_rotator_refresh_targets_from_snapshot() and
+            // posts SETs via main_rotator_submit_set().
+            if (antenna_rotator_async_open(&state.rot_async,
+                                            &state.antenna_rotator, 0.5) != 0) {
+                fprintf(stderr, "Error spawning antenna rotator worker\n");
+                if (!state.self_test) {
+                    return EXIT_FAILURE;
+                }
+                fprintf(stderr,
+                        "--self-test: rotator worker unavailable (dry run)\n");
+                state.have_antenna_rotator = 0;
+            } else {
+                // Adopt whatever extended position the SPID is already at so the
+                // unwrapped accumulator starts grounded in reality. We wait
+                // briefly for the worker's first STATUS read; the timeout is
+                // bounded so a missing controller doesn't hang startup.
+                //
+                // The seed snapshot also overwrites target_* with the current
+                // physical position — fine when nobody asked for a specific park
+                // position, but a problem when the operator passed
+                // --rotator-target-azimuth / --rotator-target-elevation: those
+                // user-specified targets would be silently clobbered before T
+                // ever fired. Snapshot them and restore after seeding.
+                double sav_az    = state.antenna_rotator.target_azimuth;
+                double sav_el    = state.antenna_rotator.target_elevation;
+                double sav_az_uw = state.antenna_rotator.target_azimuth_unwrapped;
+                int    sav_uw_ok = state.antenna_rotator.unwrapped_target_valid;
+                if (antenna_rotator_async_wait_first_status(state.rot_async, 1500) != 0
+                    || main_rotator_refresh_targets_from_snapshot(&state) != 0) {
+                    fprintf(stderr, "Warning: could not read SPID position; "
+                                    "check that the Rot2ProG is in 'A' mode\n");
+                }
+                if (state.antenna_rotator.fixed_target) {
+                    state.antenna_rotator.target_azimuth            = sav_az;
+                    state.antenna_rotator.target_elevation          = sav_el;
+                    state.antenna_rotator.target_azimuth_unwrapped  = sav_az_uw;
+                    state.antenna_rotator.unwrapped_target_valid    = sav_uw_ok;
+                }
+            }
         }
     }
 
@@ -648,7 +636,9 @@ int main(int argc, char **argv)
             // before any pass logic gets a chance to gate them. The
             // per-pass start/stop block in the tracking loop checks
             // state.always_record and skips itself when this is on.
-            if (state.always_record && state.rx_session) {
+            // Suppressed under --self-test: the dry run opens the SDR to
+            // prove it comes up, but must never write capture files.
+            if (state.always_record && state.rx_session && !state.self_test) {
                 rx_session_request_wav_start(state.rx_session);
                 fprintf(stderr,
                     "simple_sat_ops: --always-record on — WAV/IQ "
@@ -661,6 +651,43 @@ int main(int argc, char **argv)
 
     /* Tracking loop */
     double jul_idle_start = 0;  // last-tracked timestamp
+
+    // --self-test: the full bring-up has now run — TLE load, pass-folder
+    // setup, rotator open, SDR open, IPC bind, and the --tc-file lint — so
+    // the report below reflects the live, resolved state of each piece of
+    // hardware, not just the requested intent. Print it to stdout (we are
+    // still BEFORE init_window, so ncurses has not taken the screen), tear
+    // the bring-up back down, and exit. This is a true end-to-end dry run:
+    // it confirms the session would come up without flying a pass.
+    if (state.self_test) {
+        self_test_report(&state, stdout, argc, argv);
+#ifdef SSO_WITH_SDR
+        if (state.rx_session) {
+            rx_session_close(state.rx_session);
+            state.rx_session = NULL;
+        }
+#endif
+        if (state.rot_async != NULL) {
+            antenna_rotator_async_close(state.rot_async);
+            state.rot_async = NULL;
+        }
+        if (state.have_antenna_rotator) {
+            antenna_rotator_disconnect(&state.antenna_rotator);
+            state.have_antenna_rotator = 0;
+        }
+        if (state.have_tr_switch) {
+            tr_switch_disconnect(&state.tr_switch);
+            state.have_tr_switch = 0;
+        }
+        if (state.ipc) {
+            sso_ipc_server_close(state.ipc);
+            state.ipc = NULL;
+        }
+        if (state.prediction.auto_sat) {
+            free_passes();
+        }
+        return 0;
+    }
 
     // Capture the cooked terminal modes BEFORE ncurses switches the tty
     // to raw, so the crash handler can put it back deterministically.
