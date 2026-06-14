@@ -8,6 +8,17 @@
 #include "csp.h"
 #include "modem.h"
 
+#ifdef SSO_WITH_SDR
+// Only the in-loop request servicer below needs the operator session,
+// the RX/TX session, and the TX-event emitter; gate them so the standalone
+// tx_burst selftest (built without SSO_WITH_SDR) still links.
+#include "state.h"
+#include "rx_session.h"
+#include "tx_compose.h"     // emit_tx_event_local
+#include "sso_audit.h"
+#include "sso_ipc.h"        // SSO_TX_TEXT_MAX, SSO_EVT_TX_*
+#endif
+
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -271,3 +282,115 @@ tx_burst_result_t tx_burst_run(b210_rx_tx_core_t *core,
     free(iq);
     return (rc == 0) ? TX_BURST_OK : TX_BURST_UHD_ERROR;
 }
+
+#ifdef SSO_WITH_SDR
+// Service a pending TX request from the main loop. Three paths:
+//
+//   1. --tx-dry-run:    synthesize "ok" without touching the SDR, so
+//                       auto-tcmd + compose still exercise all their UI
+//                       state on a dev host.
+//   2. rx_session up:   real burst -- submitted async to the worker, which
+//                       pauses RX, transmits and resumes RX (~1 s). The main
+//                       loop keeps running between submit and poll so the
+//                       rotator, redraw, IPC and the next auto-tcmd tick
+//                       aren't frozen by the burst. tx_request.pending stays
+//                       set across the in-flight window so auto-tcmd will not
+//                       queue a second burst on top.
+//   3. neither:         reject so auto-tcmd can move on (started
+//                       --without-b210 and without --tx-dry-run): just clear
+//                       the pending slot rather than deadlocking.
+//
+// Emits the SENT / NOT_SENT event + the tx-result audit line and clears the
+// pending slot once a path resolves; a still-in-flight burst returns with
+// the slot still pending so the next tick polls again.
+void tx_burst_service_request(state_t *state)
+{
+    if (state->tx_request.pending) {
+        char summary[SSO_TX_TEXT_MAX];
+        const char *outcome = NULL;
+        int  on_air = 0;
+        int  finished = 0;        // emit the result + clear pending this tick
+        if (state->tx_dry_run) {
+            snprintf(summary, sizeof summary, "%s",
+                     state->tx_request.summary);
+            outcome = "dry-run";   // composed but deliberately not keyed
+            finished = 1;
+        } else if (state->hmac_key_len == 0) {
+            // CTS1 expects HMAC on every uplink. Without a valid
+            // key the burst would go out unsigned and the satellite
+            // would silently drop it. Refuse here so the operator
+            // sees a clear error instead of letting it go out unsigned.
+            snprintf(summary, sizeof summary, "%s",
+                     state->tx_request.summary);
+            outcome = "rejected: no HMAC key (see banner)";
+            finished = 1;
+        } else if (state->rx_session != NULL && !rx_session_can_tx(state->rx_session)) {
+            // RX-only backend (e.g. RTL-SDR): never reaches the air.
+            // Backstop for a stale queued burst that slipped past the
+            // compose / auto-tcmd gates.
+            snprintf(summary, sizeof summary, "%s", state->tx_request.summary);
+            outcome = "rejected: RX-only SDR";
+            finished = 1;
+        } else if (state->rx_session != NULL) {
+            if (!state->tx_inflight) {
+                if (rx_session_submit_burst(state->rx_session, &state->tx_request,
+                                             state->hmac_key, state->hmac_key_len) == 0) {
+                    state->tx_inflight = 1;
+                    // Stay pending; we'll poll on subsequent ticks.
+                } else {
+                    // Worker refused (slot already busy or rxs error).
+                    snprintf(summary, sizeof summary, "%s",
+                             state->tx_request.summary);
+                    outcome = "rejected: rx_session busy";
+                    finished = 1;
+                }
+            } else {
+                rx_burst_result_t br;
+                int done = rx_session_poll_burst(state->rx_session, &br,
+                                                  summary, sizeof summary);
+                if (done == 1) {
+                    switch (br) {
+                        case RX_BURST_OK:                 outcome = "ok"; on_air = 1; break;
+                        case RX_BURST_NO_CORE:            outcome = "rejected: no B210"; break;
+                        case RX_BURST_FRAME_BUILD_FAILED: outcome = "rejected: frame build"; break;
+                        case RX_BURST_UHD_ERROR:          outcome = "uhd-err"; break;
+                    }
+                    state->tx_inflight = 0;
+                    finished = 1;
+                }
+                // else: still in flight; fall through and let the
+                // rest of the main loop run.
+            }
+        } else {
+            snprintf(summary, sizeof summary, "%s",
+                     state->tx_request.summary);
+            outcome = "rejected: no B210";
+            finished = 1;
+        }
+        if (finished) {
+            // A command that made it on the air gets a plain TX
+            // record, nothing more: the ground station can confirm
+            // it transmitted, but only the satellite can acknowledge,
+            // and that arrives on the downlink, not here. Anything
+            // that did NOT reach the air (rejected, dry-run, uhd-err)
+            // gets a not-sent note carrying the reason.
+            if (on_air) {
+                emit_tx_event_local(state, SSO_EVT_TX_COMMAND_SENT, summary, NULL);
+            } else {
+                emit_tx_event_local(state, SSO_EVT_TX_NOT_SENT, summary, outcome);
+            }
+            // Audit: the result of every queued TX burst, so post-
+            // incident review can see each tx-commit and whether it
+            // reached the air (on_air=1 means the burst left the radio).
+            {
+                char det[512];
+                snprintf(det, sizeof det,
+                         "outcome=\"%.80s\" on_air=%d summary=\"%.300s\"",
+                         outcome ? outcome : "?", on_air, summary);
+                sso_audit_event("tx-result", det);
+            }
+            state->tx_request.pending = 0;
+        }
+    }
+}
+#endif
