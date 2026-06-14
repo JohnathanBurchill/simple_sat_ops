@@ -22,6 +22,7 @@
 #include "state.h"
 
 #include "auto_tcmd.h"
+#include "live_waterfall.h"
 #include "spectrogram.h"
 #include "sso_audit.h"
 #include "sso_ipc.h"
@@ -44,10 +45,6 @@
 #ifdef SSO_WITH_SDR
 #include "rx_session.h"
 #endif
-
-// Defined in main.c (owns the live-waterfall child): write end of the
-// viewer's stdin pipe, or -1 when no viewer is running.
-int live_waterfall_stdin_fd(void);
 
 // Command line: vi-style ":" prompt at the bottom of the screen for
 // runtime actions. State now lives in state_t.cmd (cmdline_t); the

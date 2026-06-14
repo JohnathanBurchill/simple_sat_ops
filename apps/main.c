@@ -41,6 +41,7 @@
 #include "auto_tcmd.h"
 #include "cmd_line.h"
 #include "input.h"
+#include "live_waterfall.h"
 #include "tx_compose.h"
 #include "viewer.h"
 #include "tx_log.h"
@@ -59,7 +60,6 @@
 #include <locale.h>
 #include <math.h>
 #include <pthread.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -68,7 +68,6 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <ncurses.h>
 #include <unistd.h>
@@ -121,13 +120,9 @@
 // checkbox still has to be ticked to enter RUNNING — dry-run is about
 // hardware presence, not about the operator's intent to transmit.
 
-// Live raylib waterfall viewer. Off by default; --live-waterfall on
-// the command line opts in. When recording starts, fork+exec the
-// live_waterfall binary with the active .iq path. Track the child
-// PID so we can SIGTERM it on shutdown. The iq-path scratch is only
-// referenced inside the WITH_USRP_B210 launch block, so tag it
-// unused — the cleanup path at the bottom of main() does use the
-// pid, so that one stays unannotated.
+// Live raylib waterfall viewer. Off by default; --live-waterfall on the
+// command line opts in. The spawn / reap / shutdown of the child viewer and
+// the pipe to its stdin live in ui/live_waterfall.c.
 
 // --always-record: start the WAV / IQ / sidecar recording as soon
 // as rx_session opens and keep it open until shutdown, ignoring the
@@ -141,19 +136,6 @@
 // the CURRENT local time, not a predicted AOS — keeps test captures
 // out of the operational Operations/ tree and skips the "no AOS in
 // next N minutes" abort in setup_pass_folder.
-
-static pid_t g_live_waterfall_pid = -1;
-__attribute__((unused))
-static char  g_live_waterfall_iq[512] = "";
-// Write end of the pipe whose read end is dup2'd to the viewer's
-// stdin. Colon commands like :wf_zoom_khz write line-based commands
-// here so the running viewer can adjust without a relaunch. -1 when
-// no viewer is alive.
-static int   g_live_waterfall_stdin_fd = -1;
-
-// Accessor so the (extracted) command-line :wf_* handlers can write to the
-// live-waterfall child's stdin without owning the pipe; main spawns/reaps it.
-int live_waterfall_stdin_fd(void) { return g_live_waterfall_stdin_fd; }
 
 // --- main ---------------------------------------------------------
 
@@ -285,7 +267,7 @@ int main(int argc, char **argv)
     install_signal_handlers();
     // Let the crash handler reach the live-waterfall child (owned here) so
     // it doesn't orphan when a device-loss abort skips normal teardown.
-    tui_register_waterfall_pid(&g_live_waterfall_pid);
+    tui_register_waterfall_pid(live_waterfall_pid_ref());
 
     state.running = 1;
 
@@ -528,79 +510,11 @@ int main(int argc, char **argv)
             ribbon_push(&state, peak, burst_bins);
             state.ribbon_last_t = t_now;
 
-            // Live waterfall: launch the raylib viewer the first time
-            // a recording's .iq path appears, OR if the pass switched
-            // to a new path. We poll once per second on the same
-            // cadence as the ribbon — cheap, and a single second of
-            // lag at viewer-launch is invisible to the operator.
+            // Live waterfall: (re)launch / reap the out-of-process viewer on
+            // the same once-per-second cadence as the ribbon. See
+            // ui/live_waterfall.c.
             if (state.run_live_waterfall) {
-                char iq_path[512] = "";
-                int  iq_rate      = 0;
-                rx_session_iq_snapshot(state.rx_session,
-                                       iq_path, sizeof iq_path,
-                                       NULL, &iq_rate);
-                if (iq_path[0]
-                    && strcmp(iq_path, g_live_waterfall_iq) != 0) {
-                    // Tear down a viewer pointed at a stale path.
-                    if (g_live_waterfall_pid > 0) {
-                        kill(g_live_waterfall_pid, SIGTERM);
-                        waitpid(g_live_waterfall_pid, NULL, 0);
-                        g_live_waterfall_pid = -1;
-                    }
-                    if (g_live_waterfall_stdin_fd >= 0) {
-                        close(g_live_waterfall_stdin_fd);
-                        g_live_waterfall_stdin_fd = -1;
-                    }
-                    snprintf(g_live_waterfall_iq,
-                             sizeof g_live_waterfall_iq, "%s", iq_path);
-                    char rate_arg[32];
-                    snprintf(rate_arg, sizeof rate_arg,
-                             "--rate=%d",
-                             iq_rate > 0 ? iq_rate : 96000);
-                    // pipe()+dup2 so the parent can shove
-                    // line-based commands (e.g. "zoom 60\n") at the
-                    // viewer's stdin.
-                    int pfd[2] = {-1, -1};
-                    if (pipe(pfd) != 0) { pfd[0] = pfd[1] = -1; }
-                    pid_t pid = fork();
-                    if (pid == 0) {
-                        if (pfd[0] >= 0) {
-                            close(pfd[1]);
-                            dup2(pfd[0], STDIN_FILENO);
-                            close(pfd[0]);
-                        }
-                        char *args[] = {
-                            (char *) "live_waterfall",
-                            (char *) g_live_waterfall_iq,
-                            rate_arg,
-                            NULL
-                        };
-                        execvp("live_waterfall", args);
-                        _exit(127);
-                    } else if (pid > 0) {
-                        g_live_waterfall_pid = pid;
-                        if (pfd[0] >= 0) close(pfd[0]);
-                        g_live_waterfall_stdin_fd = pfd[1];
-                    } else {
-                        if (pfd[0] >= 0) close(pfd[0]);
-                        if (pfd[1] >= 0) close(pfd[1]);
-                    }
-                }
-                // Reap a viewer that the operator closed via its
-                // window — non-blocking so the main loop never stalls.
-                if (g_live_waterfall_pid > 0) {
-                    int status;
-                    pid_t r = waitpid(g_live_waterfall_pid,
-                                      &status, WNOHANG);
-                    if (r == g_live_waterfall_pid) {
-                        g_live_waterfall_pid = -1;
-                        g_live_waterfall_iq[0] = '\0';
-                        if (g_live_waterfall_stdin_fd >= 0) {
-                            close(g_live_waterfall_stdin_fd);
-                            g_live_waterfall_stdin_fd = -1;
-                        }
-                    }
-                }
+                live_waterfall_poll(state.rx_session);
             }
         }
         // Software Doppler tracking: the SDR LO stays fixed at the
@@ -706,29 +620,7 @@ int main(int argc, char **argv)
         state.ipc = NULL;
     }
     // Politely terminate the live raylib waterfall if we spawned one.
-    // 5 s timeout via WNOHANG polling so the operator doesn't wait on
-    // a hung viewer at shutdown.
-    if (g_live_waterfall_pid > 0) {
-        kill(g_live_waterfall_pid, SIGTERM);
-        for (int t = 0; t < 50; ++t) {
-            int status;
-            pid_t r = waitpid(g_live_waterfall_pid, &status, WNOHANG);
-            if (r == g_live_waterfall_pid) {
-                g_live_waterfall_pid = -1;
-                break;
-            }
-            usleep(100000);
-        }
-        if (g_live_waterfall_pid > 0) {
-            kill(g_live_waterfall_pid, SIGKILL);
-            waitpid(g_live_waterfall_pid, NULL, 0);
-            g_live_waterfall_pid = -1;
-        }
-        if (g_live_waterfall_stdin_fd >= 0) {
-            close(g_live_waterfall_stdin_fd);
-            g_live_waterfall_stdin_fd = -1;
-        }
-    }
+    live_waterfall_shutdown();
 #ifdef SSO_WITH_SDR
     char final_wav_path[512] = "";
     char final_iq_path[512]  = "";
