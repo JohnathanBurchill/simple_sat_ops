@@ -167,61 +167,23 @@ static char  g_live_waterfall_iq[512] = "";
 // no viewer is alive.
 static int   g_live_waterfall_stdin_fd = -1;
 
-// HMAC keyfile selection. Path is resolved at startup (CLI override
-// or hmac_keyfile_default_path); the file is loaded into g_hmac_key
-// once so (a) the operator banner can show "(N bytes ok)" / "(missing)"
-// / "(bad)" and (b) every TX burst signs the AX100 frame with these
-// bytes. The CTS1 flight firmware expects HMAC on every uplink — if
-// the keyfile is missing or won't parse, TX is REFUSED rather than
-// sending unsigned frames the satellite would silently drop.
-typedef enum {
-    HMAC_DISPLAY_UNSET   = 0,
-    HMAC_DISPLAY_OK      = 1,
-    HMAC_DISPLAY_MISSING = 2,
-    HMAC_DISPLAY_BAD     = 3,
-} hmac_display_status_t;
-static char                  g_hmac_keyfile_path[512] = "";
-static hmac_display_status_t g_hmac_display_status    = HMAC_DISPLAY_UNSET;
-static uint8_t               g_hmac_key[64];
-static size_t                g_hmac_key_len           = 0;
-
-// Signal ribbon: 60-second 1 Hz rolling window of RX peak dBFS rendered
-// as a UTF-8 block-character strip in the RX panel. Oldest sample on
-// the left, newest on the right. Cheap fixed-size; the sampler is
-// gated by monotonic seconds in the main loop.
-// Signal ribbon: 1 Hz timeline of "I am alive" marks rendered as a
-// vertical strip on the right side of the screen. Each char represents
-// one second; the most recent sample sits at the bottom of the strip
-// and older samples sit above. Plain ASCII ('.' / '-') so the display
-// works on minimal SSH sessions / TTYs without UTF-8 fonts.
+// HMAC keyfile + signal ribbon + spectrogram job state now live on
+// state_t (see state.h: hmac_display_status_t, RIBBON_LEN, spectrum_job_t).
 //
-// Tick semantics: every 20 seconds in absolute push-time gets a bold
-// '-' instead of '.'. Because the tick is keyed to absolute push count
-// (not to a fixed visual position), the tick crawls upward by one row
-// per second — the eye reads the timeline progressing even when the
-// signal is flat.
-#define RIBBON_LEN 60
-static double g_ribbon_peak[RIBBON_LEN];
-// Parallel bright-bin samples from iq_burst, indexed in lock-step
-// with g_ribbon_peak. Lets the renderer pick a different character
-// for broadband bursts (many bright bins) vs narrowband / carrier
-// (few bright bins) at the same peak-dBFS level.
-static int    g_ribbon_bright[RIBBON_LEN];
-static int    g_ribbon_count       = 0;  // number of valid samples (caps at RIBBON_LEN)
-static int    g_ribbon_head        = 0;  // next write index (circular)
-// Only written by ribbon_push inside #ifdef WITH_USRP_B210; without
-// B210 the variable + helper exist but no one calls them.
-__attribute__((unused)) static double g_ribbon_last_t      = 0.0;
-static long   g_ribbon_push_count  = 0;  // total pushes since startup; drives ticks
+// Ribbon tick semantics: every 20 seconds in absolute push-time gets a
+// bold '-' instead of '.'. Because the tick is keyed to absolute push
+// count (not a fixed visual position), it crawls upward by one row per
+// second — the eye reads the timeline progressing even when the signal
+// is flat.
 
 __attribute__((unused))
-static void ribbon_push(double peak_dbfs, int bright_bins)
+static void ribbon_push(state_t *state, double peak_dbfs, int bright_bins)
 {
-    g_ribbon_peak[g_ribbon_head]   = peak_dbfs;
-    g_ribbon_bright[g_ribbon_head] = bright_bins;
-    g_ribbon_head = (g_ribbon_head + 1) % RIBBON_LEN;
-    if (g_ribbon_count < RIBBON_LEN) g_ribbon_count++;
-    g_ribbon_push_count++;
+    state->ribbon_peak[state->ribbon_head]   = peak_dbfs;
+    state->ribbon_bright[state->ribbon_head] = bright_bins;
+    state->ribbon_head = (state->ribbon_head + 1) % RIBBON_LEN;
+    if (state->ribbon_count < RIBBON_LEN) state->ribbon_count++;
+    state->ribbon_push_count++;
 }
 
 // Low-disk warning. statvfs on the pass folder filesystem; rendered in
@@ -268,11 +230,7 @@ static void low_disk_refresh(state_t *state, double t_now)
              "LOW DISK: %.2f GB free at %.50s", gb, probe);
 }
 
-// Spectrogram render job. The `:spectrum N` REPL command snapshots the
-// last N seconds of the live WAV (which the rx_session worker is still
-// appending to), copies them into a temporary WAV, and shells out to
-// ffmpeg's showspectrumpic. Runs on its own pthread so the main loop
-// keeps ticking. Single slot — only one render at a time.
+// Spectrogram render job state (spectrum_job_t) now lives on state_t.
 //
 // Caveat: the WAV is FM-demoded mono PCM, not IQ. That puts a hard
 // ceiling on how SatNOGS-like these spectrograms can look — see the
@@ -280,26 +238,6 @@ static void low_disk_refresh(state_t *state, double t_now)
 // noise floor dropping on carrier capture. For a SatNOGS-style waterfall
 // against a flat thermal floor we'd need to tap the IQ stream before
 // the discriminator; that's a separate feature.
-typedef struct spectrum_job {
-    pthread_t       thr;
-    int             active;          // 1 once the thread has been launched
-    volatile int    done;            // worker sets to 1 just before return
-    // Source — pick one. When iq_in[0] is non-empty the worker renders
-    // a SatNOGS-style waterfall via gen_waterfall(1) on the IQ slice;
-    // otherwise it falls back to the FM-demod WAV slice through ffmpeg.
-    char            wav_in[512];
-    int             sample_rate;
-    long            start_sample;
-    long            n_samples;
-    char            iq_in[512];
-    int             iq_sample_rate;
-    long             iq_start_pair;
-    long             iq_pairs;
-    char            png_out[640];
-    char            status_msg[1024];
-} spectrum_job_t;
-
-static spectrum_job_t g_spec_job;
 
 // Render a full IQ recording with gen_waterfall — SatNOGS-style
 // viridis waterfall, no ffmpeg dependency, signals pop against a
@@ -562,11 +500,11 @@ static void *spectrum_worker(void *arg)
 // Reap a finished spectrum job so the slot is free for the next request.
 // Called both from cmd_dispatch (so the operator can retry) and from the
 // shutdown path (so we don't leak the worker thread).
-static void spectrum_job_reap(void)
+static void spectrum_job_reap(state_t *state)
 {
-    if (g_spec_job.active && g_spec_job.done) {
-        pthread_join(g_spec_job.thr, NULL);
-        g_spec_job.active = 0;
+    if (state->spec_job.active && state->spec_job.done) {
+        pthread_join(state->spec_job.thr, NULL);
+        state->spec_job.active = 0;
     }
 }
 
@@ -1018,8 +956,8 @@ static void cmd_dispatch(state_t *state)
                 if (duration_s > 600.0) duration_s = 600.0;
                 if (duration_s < 1.0)   duration_s = 1.0;
 
-                spectrum_job_reap();
-                if (g_spec_job.active) {
+                spectrum_job_reap(state);
+                if (state->spec_job.active) {
                     cmd_set_status(state, "spectrum: a render is already in progress");
                 } else {
                     char wav_path[512];
@@ -1056,15 +994,15 @@ static void cmd_dispatch(state_t *state)
                             strftime(ts_start, sizeof ts_start, "%Y-%m-%d_%H-%M-%S", &lt_start);
                             strftime(ts_end,   sizeof ts_end,   "%H-%M-%S",          &lt_end);
 
-                            memset(&g_spec_job, 0, sizeof g_spec_job);
-                            snprintf(g_spec_job.wav_in, sizeof g_spec_job.wav_in,
+                            memset(&state->spec_job, 0, sizeof state->spec_job);
+                            snprintf(state->spec_job.wav_in, sizeof state->spec_job.wav_in,
                                      "%s", wav_path);
-                            snprintf(g_spec_job.png_out, sizeof g_spec_job.png_out,
+                            snprintf(state->spec_job.png_out, sizeof state->spec_job.png_out,
                                      "%.480s_LOCAL_%s_to_%s.png",
                                      base, ts_start, ts_end);
-                            g_spec_job.sample_rate  = sample_rate;
-                            g_spec_job.start_sample = start;
-                            g_spec_job.n_samples    = want;
+                            state->spec_job.sample_rate  = sample_rate;
+                            state->spec_job.start_sample = start;
+                            state->spec_job.n_samples    = want;
 
                             // Pair the WAV slice with an IQ slice if the
                             // sidecar exists — worker prefers IQ and only
@@ -1081,24 +1019,24 @@ static void cmd_dispatch(state_t *state)
                                 long start_p = iq_pairs - want_p;
                                 if (start_p < 0) { start_p = 0; want_p = iq_pairs; }
                                 if (want_p > 0) {
-                                    snprintf(g_spec_job.iq_in,
-                                             sizeof g_spec_job.iq_in, "%s", iq_path);
-                                    g_spec_job.iq_sample_rate = iq_rate;
-                                    g_spec_job.iq_start_pair  = start_p;
-                                    g_spec_job.iq_pairs       = want_p;
+                                    snprintf(state->spec_job.iq_in,
+                                             sizeof state->spec_job.iq_in, "%s", iq_path);
+                                    state->spec_job.iq_sample_rate = iq_rate;
+                                    state->spec_job.iq_start_pair  = start_p;
+                                    state->spec_job.iq_pairs       = want_p;
                                 }
                             }
 
-                            if (pthread_create(&g_spec_job.thr, NULL,
-                                               spectrum_worker, &g_spec_job) != 0) {
+                            if (pthread_create(&state->spec_job.thr, NULL,
+                                               spectrum_worker, &state->spec_job) != 0) {
                                 cmd_set_status(state, "spectrum: pthread_create failed: %s",
                                                strerror(errno));
                             } else {
-                                g_spec_job.active = 1;
+                                state->spec_job.active = 1;
                                 cmd_set_status(state, "spectrum: rendering %.1fs (%s) -> %s",
                                                (double) want / (double) sample_rate,
-                                               g_spec_job.iq_in[0] ? "iq" : "wav",
-                                               g_spec_job.png_out);
+                                               state->spec_job.iq_in[0] ? "iq" : "wav",
+                                               state->spec_job.png_out);
                             }
                         }
                     }
@@ -1648,7 +1586,7 @@ static double g_last_state_rrate_kms   = 0.0;
 
 // Snapshot the operator's live RX panel data into a self-contained
 // struct so the same renderer can be driven by either the operator
-// (reading rx_session + g_ribbon_*) or the viewer (filling it from a
+// (reading rx_session + state->ribbon_*) or the viewer (filling it from a
 // STATE event). RX_PT_COUNT comes from rx_session.h. ribbon is a
 // nul-terminated string of glyph-index chars (' ' or '0'..'7'); empty
 // when no samples have arrived yet.
@@ -1766,9 +1704,9 @@ static void rx_panel_collect_local(state_t *state, rx_panel_data_t *d)
     // ribbon_peak[i] is the peak dBFS that was pushed at that same
     // second, clamped into int8 — rendered alongside the marker so
     // the operator sees the signal level on every row.
-    int n = g_ribbon_count;
+    int n = state->ribbon_count;
     if (n > (int) sizeof d->ribbon - 1) n = (int) sizeof d->ribbon - 1;
-    long P = g_ribbon_push_count;
+    long P = state->ribbon_push_count;
     // Bright-bin thresholds for ribbon character selection. With
     // iq_burst's 10 dB / N=512 FFT, stationary noise lights ~30 bins
     // and a CW carrier adds ~5-6 more. A wideband packet burst lights
@@ -1777,12 +1715,12 @@ static void rx_panel_collect_local(state_t *state, rx_panel_data_t *d)
     const int BRIGHT_HI = 80;   // broadband — '#'
     for (int i = 0; i < n; ++i) {
         long abs_t = P - (long) i;
-        int idx = (g_ribbon_head - 1 - i + RIBBON_LEN) % RIBBON_LEN;
-        int bright = g_ribbon_bright[idx];
+        int idx = (state->ribbon_head - 1 - i + RIBBON_LEN) % RIBBON_LEN;
+        int bright = state->ribbon_bright[idx];
         if (bright >= BRIGHT_HI)             d->ribbon[i] = '#';
         else if (abs_t > 0 && (abs_t % 20) == 0) d->ribbon[i] = '_';
         else                                 d->ribbon[i] = '.';
-        double dbfs = g_ribbon_peak[idx];
+        double dbfs = state->ribbon_peak[idx];
         long lr = lround(dbfs);
         if (lr > 127)  lr = 127;
         if (lr < -127) lr = -127;
@@ -5218,9 +5156,9 @@ void report_status(state_t *state, int *print_row, int print_col)
     if (display_dl_hz == 0.0) display_dl_hz = state->nominal_downlink_frequency_hz;
     p.carrier_hz = display_dl_hz;
 
-    p.hmac_path   = g_hmac_keyfile_path;
-    p.hmac_status = g_hmac_display_status;
-    p.hmac_bytes  = (ssize_t) g_hmac_key_len;
+    p.hmac_path   = state->hmac_keyfile_path;
+    p.hmac_status = state->hmac_display_status;
+    p.hmac_bytes  = (ssize_t) state->hmac_key_len;
 
     p.have_rotator = state->have_antenna_rotator;
     if (state->have_antenna_rotator) {
@@ -5922,14 +5860,14 @@ static void self_test_report(const state_t *state, FILE *out, int argc, char **a
 
     // HMAC --- the operator's banner-and-sign state. CTS1 firmware
     // expects every uplink to be HMAC-signed; the dispatcher refuses
-    // to key the PA if g_hmac_key_len == 0, so this line is the
+    // to key the PA if state->hmac_key_len == 0, so this line is the
     // single most-important pre-flight check.
     fprintf(out,
             "hmac: %s (path=%s, status=%s, bytes=%zu)\n",
-            g_hmac_key_len > 0 ? "enabled (default)" : "DISABLED",
-            g_hmac_keyfile_path[0] ? g_hmac_keyfile_path : "(unresolved)",
-            hmac_status_str(g_hmac_display_status),
-            g_hmac_key_len);
+            state->hmac_key_len > 0 ? "enabled (default)" : "DISABLED",
+            state->hmac_keyfile_path[0] ? state->hmac_keyfile_path : "(unresolved)",
+            hmac_status_str(state->hmac_display_status),
+            state->hmac_key_len);
 
     // Doppler --- both the display correction and the TX-side burst
     // staging key off state->doppler_correction_enabled. On by
@@ -6044,28 +5982,28 @@ int main(int argc, char **argv)
     // "(MISSING)" / "(BAD)" means the next TX request will be refused
     // before keying the PA. If --hmac-keyfile= wasn't given, fall back
     // to hmac_keyfile_default_path (shared first, per-user second).
-    if (g_hmac_keyfile_path[0] == '\0') {
-        if (hmac_keyfile_default_path(g_hmac_keyfile_path,
-                                      sizeof g_hmac_keyfile_path) != 0) {
-            g_hmac_keyfile_path[0] = '\0';
-            g_hmac_display_status  = HMAC_DISPLAY_MISSING;
+    if (state.hmac_keyfile_path[0] == '\0') {
+        if (hmac_keyfile_default_path(state.hmac_keyfile_path,
+                                      sizeof state.hmac_keyfile_path) != 0) {
+            state.hmac_keyfile_path[0] = '\0';
+            state.hmac_display_status  = HMAC_DISPLAY_MISSING;
         }
     }
-    if (g_hmac_keyfile_path[0] != '\0') {
+    if (state.hmac_keyfile_path[0] != '\0') {
         struct stat st;
-        if (stat(g_hmac_keyfile_path, &st) != 0) {
-            g_hmac_display_status = HMAC_DISPLAY_MISSING;
+        if (stat(state.hmac_keyfile_path, &st) != 0) {
+            state.hmac_display_status = HMAC_DISPLAY_MISSING;
         } else {
-            ssize_t got = hmac_keyfile_load(g_hmac_keyfile_path,
-                                            g_hmac_key,
-                                            sizeof g_hmac_key);
+            ssize_t got = hmac_keyfile_load(state.hmac_keyfile_path,
+                                            state.hmac_key,
+                                            sizeof state.hmac_key);
             if (got > 0) {
-                g_hmac_display_status = HMAC_DISPLAY_OK;
-                g_hmac_key_len        = (size_t) got;
+                state.hmac_display_status = HMAC_DISPLAY_OK;
+                state.hmac_key_len        = (size_t) got;
             } else {
-                g_hmac_display_status = HMAC_DISPLAY_BAD;
-                g_hmac_key_len        = 0;
-                memset(g_hmac_key, 0, sizeof g_hmac_key);
+                state.hmac_display_status = HMAC_DISPLAY_BAD;
+                state.hmac_key_len        = 0;
+                memset(state.hmac_key, 0, sizeof state.hmac_key);
             }
         }
     }
@@ -7118,14 +7056,14 @@ int main(int argc, char **argv)
         // grab the iq_burst bright-bin count so the renderer can pick
         // a character that distinguishes broadband packets from a CW
         // carrier at the same peak level.
-        if (state.rx_session && (t_now - g_ribbon_last_t) >= 1.0) {
+        if (state.rx_session && (t_now - state.ribbon_last_t) >= 1.0) {
             double peak = -90.0;
             rx_session_snapshot(state.rx_session, NULL, &peak, NULL,
                                 NULL, NULL, 0);
             int burst_bins = 0;
             rx_session_burst_snapshot(state.rx_session, &burst_bins, NULL);
-            ribbon_push(peak, burst_bins);
-            g_ribbon_last_t = t_now;
+            ribbon_push(&state, peak, burst_bins);
+            state.ribbon_last_t = t_now;
 
             // Live waterfall: launch the raylib viewer the first time
             // a recording's .iq path appears, OR if the pass switched
@@ -7256,7 +7194,7 @@ int main(int argc, char **argv)
                          state.tx_request.summary);
                 outcome = "dry-run";   // composed but deliberately not keyed
                 finished = 1;
-            } else if (g_hmac_key_len == 0) {
+            } else if (state.hmac_key_len == 0) {
                 // CTS1 expects HMAC on every uplink. Without a valid
                 // key the burst would go out unsigned and the satellite
                 // would silently drop it. Refuse here so the operator
@@ -7275,7 +7213,7 @@ int main(int argc, char **argv)
             } else if (state.rx_session != NULL) {
                 if (!state.tx_inflight) {
                     if (rx_session_submit_burst(state.rx_session, &state.tx_request,
-                                                 g_hmac_key, g_hmac_key_len) == 0) {
+                                                 state.hmac_key, state.hmac_key_len) == 0) {
                         state.tx_inflight = 1;
                         // Stay pending; we'll poll on subsequent ticks.
                     } else {
@@ -7367,11 +7305,11 @@ int main(int argc, char **argv)
         // outcome (PNG path or ffmpeg error) in the command-line status.
         // The reap only joins the worker thread; status_msg is left
         // alone, so reading it after reap is safe.
-        if (g_spec_job.active && g_spec_job.done) {
-            if (g_spec_job.status_msg[0]) {
-                cmd_set_status(&state, "%s", g_spec_job.status_msg);
+        if (state.spec_job.active && state.spec_job.done) {
+            if (state.spec_job.status_msg[0]) {
+                cmd_set_status(&state, "%s", state.spec_job.status_msg);
             }
-            spectrum_job_reap();
+            spectrum_job_reap(&state);
         }
 
         if (state.running) {
@@ -7459,11 +7397,11 @@ int main(int argc, char **argv)
 
     // Any in-flight `:spectrum N` worker is touching the same WAV / IQ
     // — let it finish before we hand the file to the full-pass render.
-    if (g_spec_job.active) {
-        pthread_join(g_spec_job.thr, NULL);
-        g_spec_job.active = 0;
-        if (g_spec_job.status_msg[0]) {
-            fprintf(stderr, "simple_sat_ops: %s\n", g_spec_job.status_msg);
+    if (state.spec_job.active) {
+        pthread_join(state.spec_job.thr, NULL);
+        state.spec_job.active = 0;
+        if (state.spec_job.status_msg[0]) {
+            fprintf(stderr, "simple_sat_ops: %s\n", state.spec_job.status_msg);
         }
     }
 
@@ -7832,7 +7770,7 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
                     return PARSE_ERROR;
                 }
                 state->n_options += 2;
-                snprintf(g_hmac_keyfile_path, sizeof g_hmac_keyfile_path,
+                snprintf(state->hmac_keyfile_path, sizeof state->hmac_keyfile_path,
                          "%s", argv[t + 2]);
                 ++t;
             }

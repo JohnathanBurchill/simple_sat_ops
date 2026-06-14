@@ -30,6 +30,7 @@
 #include "tr_switch.h"
 #include "tx_burst.h"
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <termios.h>
@@ -56,6 +57,46 @@ typedef struct {
     double *el;
     size_t  n;
 } pursuit_track_t;
+
+// HMAC keyfile status, resolved once at startup so the operator banner can
+// show "(N bytes ok)" / "(missing)" / "(bad)". The CTS1 flight firmware
+// expects HMAC on every uplink — if the keyfile is missing or won't parse,
+// TX is REFUSED rather than sending unsigned frames the satellite drops.
+typedef enum {
+    HMAC_DISPLAY_UNSET   = 0,
+    HMAC_DISPLAY_OK      = 1,
+    HMAC_DISPLAY_MISSING = 2,
+    HMAC_DISPLAY_BAD     = 3,
+} hmac_display_status_t;
+
+// Signal ribbon: 1 Hz timeline of "I am alive" marks rendered as a vertical
+// strip on the right side of the screen. Each char is one second; newest at
+// the bottom. Plain ASCII so it works on minimal TTYs without UTF-8 fonts.
+#define RIBBON_LEN 60
+
+// Spectrogram render job. The `:spectrum N` command snapshots the last N
+// seconds of the live WAV (which the rx_session worker is still appending
+// to), copies them into a temporary WAV, and shells out to ffmpeg's
+// showspectrumpic on its own pthread so the main loop keeps ticking.
+// Single slot — only one render at a time.
+typedef struct spectrum_job {
+    pthread_t       thr;
+    int             active;          // 1 once the thread has been launched
+    volatile int    done;            // worker sets to 1 just before return
+    // Source — pick one. When iq_in[0] is non-empty the worker renders
+    // a SatNOGS-style waterfall via gen_waterfall(1) on the IQ slice;
+    // otherwise it falls back to the FM-demod WAV slice through ffmpeg.
+    char            wav_in[512];
+    int             sample_rate;
+    long            start_sample;
+    long            n_samples;
+    char            iq_in[512];
+    int             iq_sample_rate;
+    long            iq_start_pair;
+    long            iq_pairs;
+    char            png_out[640];
+    char            status_msg[1024];
+} spectrum_job_t;
 
 #define SCAN_MAX_TARGETS 512
 
@@ -285,6 +326,26 @@ typedef struct state
     // retarget (the startup name points at argv / an apply_args buffer).
     char               target_tle_path[1024];
     char               target_name[64];
+
+    // HMAC keyfile resolved once at startup: path, parse status, and the
+    // key bytes used to sign every TX burst's AX100 frame.
+    char                  hmac_keyfile_path[512];
+    hmac_display_status_t hmac_display_status;
+    uint8_t               hmac_key[64];
+    size_t                hmac_key_len;
+
+    // Signal ribbon (1 Hz RX peak-dBFS timeline). peak/bright are parallel
+    // circular buffers; ribbon_last_t gates the sampler; ribbon_push_count
+    // drives the crawling 20 s tick mark.
+    double ribbon_peak[RIBBON_LEN];
+    int    ribbon_bright[RIBBON_LEN];
+    int    ribbon_count;        // valid samples (caps at RIBBON_LEN)
+    int    ribbon_head;         // next write index (circular)
+    double ribbon_last_t;
+    long   ribbon_push_count;   // total pushes since startup
+
+    // Spectrogram render job (:spectrum N). Single slot.
+    spectrum_job_t spec_job;
 
     // Antenna rotator
     antenna_rotator_t antenna_rotator;
