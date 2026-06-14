@@ -22,7 +22,6 @@
 
 #include "antenna_rotator.h"
 #include "antenna_rotator_async.h"
-#include "pursuit.h"
 #include "tr_switch.h"
 #include "state.h"
 #include "prediction.h"
