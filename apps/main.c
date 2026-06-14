@@ -38,6 +38,7 @@
 #include "agenda_line.h"
 #include "tcmd_lint.h"
 #include "sso_pseudo.h"
+#include "sso_time.h"
 #include "sso_version.h"
 #include "argparse.h"
 
@@ -1390,28 +1391,6 @@ static void on_sigusr1(int sig) {
     (void) sig;
     g_yield_requested = 1;
 }
-
-// Loop pacing helper. With the B210 attached, the main loop runs at
-// UHD-chunk cadence (~120 Hz at 240 kHz / 2040-sample chunks); slow-
-// cadence work (IPC broadcast, ncurses redraw) is timestamp-gated so
-// it stays at its historical 2 Hz / 10 Hz rates.
-static double monotonic_seconds(void)
-{
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
-    return (double) ts.tv_sec + (double) ts.tv_nsec * 1e-9;
-}
-
-#ifdef SSO_WITH_SDR
-// Current UTC in milliseconds -- the queue-time clock for expanding an
-// "SSO+..." pseudo-command (see sso_pseudo.h). Captured fresh per send so each
-// transmission carries a current time.
-static long long sso_now_utc_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (long long) tv.tv_sec * 1000LL + tv.tv_usec / 1000LL;
-}
-#endif
 
 // Pull "HH:MM:SS" out of an event's ISO ts ("2026-05-14T13:22:01.450Z").
 // Falls back to local clock if the event ts is empty/garbled.
@@ -2860,12 +2839,6 @@ static void emit_tx_event_local(state_t *state, sso_event_type_t type,
 }
 
 #endif
-
-static long ts_now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long) ts.tv_sec * 1000000000L + (long) ts.tv_nsec;
-}
 
 // Open the modal — allocate the window, seed the compose state, draw
 // once, and flip state->tx_compose_active so the main loop starts ticking
