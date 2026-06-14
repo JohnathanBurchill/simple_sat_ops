@@ -287,8 +287,6 @@ int main(int argc, char **argv)
     // it doesn't orphan when a device-loss abort skips normal teardown.
     tui_register_waterfall_pid(&g_live_waterfall_pid);
 
-    int row = 0;
-    int col = 2;
     state.running = 1;
 
     double current_uplink_frequency = state.nominal_uplink_frequency_hz;
@@ -456,41 +454,8 @@ int main(int argc, char **argv)
 
         int redraw_due = (t_now - t_last_redraw) >= REDRAW_PERIOD_S;
         if (redraw_due) {
-            row = 1;
-            col = 1;
-            report_predictions(&state, jul_utc, &row, col);
-
-            row++;
-            report_status(&state, &row, col);
-            row = 5;
-            col = 50;
-            report_position(&state, &row, col);
-            row++;
-            // Refresh the low-disk warning lazily — statvfs every 30 s
-            // is plenty given how slowly disk fills.
-            low_disk_refresh(&state, t_now);
-            rx_panel_data_t rxd;
-            rx_panel_collect_local(&state, &rxd);
-            render_rx_panel(&rxd, &row, 50);
-
-            clrtoeol();
-
-            // Vertical ribbon on the right edge — bottom = newest, with
-            // a bold '-' tick crawling up one row per second so the
-            // timeline is visibly alive even when the signal is flat.
-            int ribbon_col = COLS - 2;
-            int ribbon_top = 1;
-            int ribbon_bot = LINES - 2;
-            if (ribbon_col >= 64 && ribbon_bot > ribbon_top) {
-                render_ribbon_vertical(&rxd, ribbon_top, ribbon_bot, ribbon_col);
-            }
-
-            // TX log lives below the keyboard info / antenna status if
-            // the terminal is tall enough to host it without colliding.
-            int tx_log_row = LINES - TX_LOG_SIZE - 2;
-            if (tx_log_row >= keyboard_info_row + 4) {
-                render_tx_log_panel(&state, tx_log_row, 1);
-            }
+            // Paint the whole operator layout for this tick. See ui/panels.c.
+            render_operator_screen(&state, jul_utc, t_now, keyboard_info_row);
         }
 
         // Read one key and route it: modals / command line / keyboard lock /

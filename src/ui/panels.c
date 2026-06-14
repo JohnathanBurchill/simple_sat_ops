@@ -894,3 +894,49 @@ int tx_drain_csi(WINDOW *w) {
     }
     return -1;
 }
+
+
+// Paint the operator's whole-screen layout for one redraw tick: the
+// predictions / status / position columns, the lazy low-disk refresh, the
+// RX panel, the right-edge signal ribbon, and (if the terminal is tall
+// enough below the keyboard-info rows) the TX log. keyboard_info_row is the
+// first keyboard-help row, used to decide whether the TX log fits.
+void render_operator_screen(state_t *state, double jul_utc, double t_now,
+                            int keyboard_info_row)
+{
+    int row = 1;
+    int col = 1;
+    report_predictions(state, jul_utc, &row, col);
+
+    row++;
+    report_status(state, &row, col);
+    row = 5;
+    col = 50;
+    report_position(state, &row, col);
+    row++;
+    // Refresh the low-disk warning lazily -- statvfs every 30 s is plenty
+    // given how slowly disk fills.
+    low_disk_refresh(state, t_now);
+    rx_panel_data_t rxd;
+    rx_panel_collect_local(state, &rxd);
+    render_rx_panel(&rxd, &row, 50);
+
+    clrtoeol();
+
+    // Vertical ribbon on the right edge -- bottom = newest, with a bold '-'
+    // tick crawling up one row per second so the timeline is visibly alive
+    // even when the signal is flat.
+    int ribbon_col = COLS - 2;
+    int ribbon_top = 1;
+    int ribbon_bot = LINES - 2;
+    if (ribbon_col >= 64 && ribbon_bot > ribbon_top) {
+        render_ribbon_vertical(&rxd, ribbon_top, ribbon_bot, ribbon_col);
+    }
+
+    // TX log lives below the keyboard info / antenna status if the terminal
+    // is tall enough to host it without colliding.
+    int tx_log_row = LINES - TX_LOG_SIZE - 2;
+    if (tx_log_row >= keyboard_info_row + 4) {
+        render_tx_log_panel(state, tx_log_row, 1);
+    }
+}
