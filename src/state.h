@@ -23,12 +23,14 @@
 
 #include "antenna_rotator.h"
 #include "prediction.h"
+#include "sso_ipc.h"
 #include "telemetry.h"
 #include "tr_switch.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <termios.h>
+#include <time.h>
 
 #define SCAN_MAX_TARGETS 512
 
@@ -74,6 +76,87 @@ typedef struct cmdline
     int  hist_pos;        // 0..count; ==count -> editing line
     char hist_saved[CMD_BUF_SIZE];  // editing line stash
 } cmdline_t;
+
+#define TX_HISTORY_MAX 32
+
+// TX compose modal. payload (ASCII telecommand), a TX-power-in-dB field,
+// and the --allow-tx checkbox. CSP fields, freq, repeat/gap and the
+// secondary allow-flags are hard-coded to FrontierSat defaults at fill.
+typedef enum {
+    TXF_PAYLOAD = 0,
+    TXF_POWER,
+    TXF_ALLOW_TX,
+    TXF_COUNT,
+} tx_field_t;
+
+typedef struct tx_compose {
+    // Big enough to type a full RF telecommand. tx_field_insert caps the
+    // payload at TCMD_RF_MAX_LEN (215) chars — the over-the-air limit —
+    // so the extra room here is headroom, not a typeable length.
+    char payload[256];
+    char power[12];           // TX power in dB
+    int  allow_tx;
+    tx_field_t focus;
+    int  preview_dirty;
+    struct timespec last_edit;
+    char status_msg[160];
+    // Per-field text cursor (only meaningful for the text fields —
+    // payload, power). 0..strlen(buf).
+    int  cursors[TXF_COUNT];
+    // Payload-history navigation. history_idx == -1 means "editing the
+    // current draft"; 0..N-1 points at state.tx_history[i] (newest at 0).
+    int  history_idx;
+    char history_saved_edit[256];
+} tx_compose_t;
+
+// Auto-TCMD modal: drives a file of ASCII telecommands through the TX
+// path automatically (--tc-file). Ticked alongside the main loop.
+typedef enum {
+    AUTO_F_POWER = 0,
+    AUTO_F_REPEATS,
+    AUTO_F_DELAY,
+    AUTO_F_ALLOW_TX,
+    AUTO_F_COUNT,
+} auto_tcmd_field_t;
+
+typedef enum {
+    AUTO_STATE_SETUP = 0,
+    AUTO_STATE_RUNNING,
+    AUTO_STATE_STOPPED,    // user stopped, file not exhausted
+    AUTO_STATE_DONE,       // file exhausted
+    AUTO_STATE_PASS_OVER,  // LOS hit while running
+} auto_tcmd_state_t;
+
+typedef struct auto_tcmd {
+    // Commands loaded from --tc-file. commands[i] is one CTS1+ line,
+    // trimmed; comment lines (#...) and blank lines are dropped at load.
+    char **commands;
+    int    n_commands;
+    char   file_path[256];
+
+    // Editable fields (text-edit semantics shared with TX compose).
+    char power[12];
+    char repeats[8];
+    char delay_s[12];
+    int  allow_tx;
+    auto_tcmd_field_t focus;
+    int               cursors[AUTO_F_COUNT];
+
+    // Run state.
+    auto_tcmd_state_t state;
+    int    cmd_idx;        // index into commands[]
+    int    repeat_idx;     // how many sends of commands[cmd_idx] so far
+    int    repeats_total;  // parsed from repeats at start
+    double delay_s_val;    // parsed from delay_s at start
+    long   next_send_ns;
+    long   start_ns;       // wall-clock at run start, for elapsed TX time
+    int    sends_total;    // running tally — every queued burst
+    // On-air seconds accumulated and total (AX100/9600/preroll math).
+    double tx_seconds_spent;
+    double tx_seconds_total;
+    char   last_sent[SSO_TX_TEXT_MAX];   // full command text, not clipped
+    char   status_msg[160];
+} auto_tcmd_t;
 
 #define MAX_TLE_LINE_LENGTH 128
 #define TRACKING_PREP_TIME_MINUTES 5.0
@@ -158,6 +241,25 @@ typedef struct state
 
     // Bottom-of-screen ":" command line.
     cmdline_t cmd;
+
+    // TX compose modal + payload history. tx_last_* survive Esc/commit so
+    // a reopened modal picks up the previous draft (seeded "CTS1+" once).
+    char         tx_last_payload[256];
+    char         tx_last_power[12];
+    int          tx_last_allow_tx;
+    char         tx_history[TX_HISTORY_MAX][256];  // newest at index 0
+    int          tx_history_count;
+    int          tx_compose_active;
+    void        *tx_compose_win;          // WINDOW* (ncurses kept out of this header)
+    tx_compose_t tx_compose;
+    long         tx_compose_last_edit_ns;
+
+    // Auto-TCMD modal (--tc-file). file_path is captured from the CLI and
+    // read lazily when the modal opens.
+    int          auto_tcmd_active;
+    void        *auto_tcmd_win;           // WINDOW*
+    auto_tcmd_t  auto_tcmd;
+    char         auto_tcmd_file_path[512];
 } state_t;
 
 
