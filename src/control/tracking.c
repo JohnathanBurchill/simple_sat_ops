@@ -26,15 +26,13 @@
 #include "panels.h"          // compute_predictions
 #include "prediction.h"
 #include "pursuit.h"
+#include "cmd_line.h"
 #include "sso_audit.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-
-// Defined in ui/cmd_line (extracted later); declared here until then.
-void cmd_set_status(state_t *state, const char *fmt, ...);
 
 // Range-check, write target_* bookkeeping, and submit the wire-level SET
 // to the rotator worker. Replaces the previous direct
