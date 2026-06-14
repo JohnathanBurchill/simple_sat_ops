@@ -1626,8 +1626,8 @@ typedef struct {
     char       warning[80];
 } rx_panel_data_t;
 
-// Operator-side collector. Reads the live rx_session + g_ribbon globals
-// into the struct. On non-B210 builds, only have_session=0 is filled.
+// Operator-side collector. Reads the live rx_session + state.ribbon_*
+// fields into the struct. On non-B210 builds, only have_session=0 is filled.
 static void rx_panel_collect_local(state_t *state, rx_panel_data_t *d)
 {
     memset(d, 0, sizeof *d);
