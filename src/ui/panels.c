@@ -832,3 +832,65 @@ void report_position(state_t *state, int *print_row, int print_col)
 
     *print_row = row;
 }
+
+// Plain ASCII modal box drawer. ncurses' built-in box() uses ACS
+// line-drawing glyphs, which fall back to raw vt100 alphabet on
+// terminals where the charset map fails — that's where the "q" /
+// "x" / "l m k j" letter soup came from. We can't safely upgrade to
+// Unicode line-drawing here either: the project links against
+// narrow ncurses (libncurses), so writing UTF-8 bytes through
+// mvwprintw makes ncurses count each byte as its own screen cell,
+// which mangles every subsequent write on the same row. Plain
+// ASCII '+'/'-'/'|' is uglier but bulletproof on every locale and
+// every terminal we plausibly run under, including dumb SSH
+// sessions. Switching to libncursesw + add_wch is the only way to
+// get nice line glyphs; left as a future change.
+void draw_box(WINDOW *w) {
+    int h = getmaxy(w), wd = getmaxx(w);
+    if (h < 2 || wd < 2) return;
+    mvwaddch(w, 0, 0, '+');
+    for (int x = 1; x < wd - 1; ++x) mvwaddch(w, 0, x, '-');
+    mvwaddch(w, 0, wd - 1, '+');
+    for (int y = 1; y < h - 1; ++y) {
+        mvwaddch(w, y, 0, '|');
+        mvwaddch(w, y, wd - 1, '|');
+    }
+    mvwaddch(w, h - 1, 0, '+');
+    for (int x = 1; x < wd - 1; ++x) mvwaddch(w, h - 1, x, '-');
+    mvwaddch(w, h - 1, wd - 1, '+');
+}
+
+// Tiny CSI fallback parser for terminals where ncurses' keypad mode
+// doesn't translate arrow / nav keys into KEY_* (notably some tmux
+// configurations). Same idea as cmd_drain_csi in the `:` prompt.
+// Returns a KEY_* code on success, or -1 if the lookahead isn't a
+// CSI we recognise.
+int tx_drain_csi(WINDOW *w) {
+    int b1 = wgetch(w);
+    if (b1 == ERR || b1 != '[') return -1;
+    int b2 = wgetch(w);
+    if (b2 == ERR) return -1;
+    switch (b2) {
+        case 'A': return KEY_UP;
+        case 'B': return KEY_DOWN;
+        case 'C': return KEY_RIGHT;
+        case 'D': return KEY_LEFT;
+        case 'H': return KEY_HOME;
+        case 'F': return KEY_END;
+        default: break;
+    }
+    if (b2 >= '0' && b2 <= '9') {
+        int b3 = wgetch(w);
+        if (b3 == '~') {
+            switch (b2) {
+                case '1': return KEY_HOME;
+                case '3': return KEY_DC;
+                case '4': return KEY_END;
+                case '7': return KEY_HOME;
+                case '8': return KEY_END;
+                default: break;
+            }
+        }
+    }
+    return -1;
+}

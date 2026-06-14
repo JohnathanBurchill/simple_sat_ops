@@ -29,6 +29,7 @@
 
 #include "state.h"
 
+#include <ncurses.h>
 #include <stdint.h>
 #include <sys/types.h>
 
@@ -146,6 +147,15 @@ void compute_predictions(state_t *state, double jul_utc);
 void report_predictions(state_t *state, double jul_utc, int *print_row, int print_col);
 void report_status(state_t *state, int *print_row, int print_col);
 void report_position(state_t *state, int *print_row, int print_col);
+
+// Plain-ASCII modal box drawer (locale-bulletproof, unlike ncurses box()).
+// Shared by the TX-compose and auto-tcmd modals.
+void draw_box(WINDOW *w);
+
+// CSI fallback parser for terminals where ncurses' keypad mode doesn't
+// translate arrow/nav keys into KEY_* (some tmux configs). Returns a KEY_*
+// code, or -1 if the lookahead isn't a recognised CSI. Shared by the modals.
+int tx_drain_csi(WINDOW *w);
 
 #ifdef __cplusplus
 }
