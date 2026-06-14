@@ -26,6 +26,7 @@
 #include "panels.h"          // compute_predictions
 #include "prediction.h"
 #include "pursuit.h"
+#include "scan_sky.h"
 #include "cmd_line.h"
 #include "sso_audit.h"
 
@@ -578,4 +579,250 @@ void update_doppler_shifted_frequencies(state_t *state,
         - state->prediction.satellite_ephem.range_rate_km_s / 299792.458;
     state->doppler_uplink_frequency_hz   = uplink_freq   * doppler_factor;
     state->doppler_downlink_frequency_hz = downlink_freq * doppler_factor;
+}
+
+
+// HOME_ECHO_TOLERANCE_DEG: how close a STATUS azimuth must be to the
+// just-commanded home waypoint to be treated as the controller's post-SET
+// target echo -- which it reports for a couple of seconds before its
+// feedback shows real motion -- rather than a real position reading. Gates
+// the two-step home's final leg.
+#define HOME_ECHO_TOLERANCE_DEG 2.0
+
+// Per-tick antenna pointing. Detect motion-settle, drive the second leg of a
+// two-step home, advance an active sky scan, and -- when a pass is in range --
+// run the satellite-tracking / pursuit-plan aim loop (or release the rotator
+// and tear down the planner at LOS). All pointing state lives on
+// state->antenna_rotator; jul_utc is the current Julian date, t_now the
+// monotonic-seconds clock (drives the scan dwell).
+void tracking_tick(state_t *state, double jul_utc, double t_now)
+{
+    // These persist across ticks. last_az/last_el feed the settle check;
+    // jul_idle_start is reserved for a future idle-window behavior.
+    static double last_az = 0.0;
+    static double last_el = 0.0;
+    static double jul_idle_start = 0.0;
+    double delta_az = 0.0;
+    double delta_el = 0.0;
+
+    double current_az = state->antenna_rotator.azimuth;
+    double current_el = state->antenna_rotator.elevation;
+        if (state->antenna_rotator.antenna_is_moving) {
+            if (fabs(current_az - last_az) == 0
+                && fabs(current_el - last_el) == 0) {
+                state->antenna_rotator.antenna_is_moving = 0;
+            }
+            last_az = current_az;
+            last_el = current_el;
+        }
+
+        // Drive the second leg of a two-step home. The first leg drops a mid
+        // waypoint to start the antenna unwinding; the final 'go to target'
+        // must wait until the antenna has unwound far enough that the
+        // controller's SHORT path to the target runs the SAME way as the
+        // unwind -- i.e. it has reached the 0..180 zone on the unwinding side.
+        // Until then the short path is the opposite (winding) way, so issuing
+        // the target now sends it back around and it winds up (330 -> 360).
+        //
+        // Complication: after a SET the controller's STATUS reports the
+        // just-commanded target (the mid waypoint) for a couple of seconds
+        // before its feedback shows real motion. So a reading that still
+        // equals the commanded mid is that echo, not the real position --
+        // ignore it. The first reading that DIFFERS is the antenna's true
+        // position; act on that. Mid-slew the real position is far from the
+        // mid waypoint, so there's no echo-vs-arrival ambiguity. (Unwinds
+        // past a full turn, prev > 360, would need more than one waypoint;
+        // a single pass winds < 360, so one mid waypoint suffices.)
+        if (state->antenna_rotator.homing_in_progress
+            && state->have_antenna_rotator) {
+            double final_az  = state->antenna_rotator.home_pending_final_az;
+            double mid_az    = state->antenna_rotator.target_azimuth_unwrapped;
+            double from_mid  = fabs(antenna_rotator_wrap_to_pm180(current_az - mid_az));
+            double unwind    = final_az - mid_az;   // sign = unwind direction
+            double remaining = antenna_rotator_wrap_to_pm180(final_az - current_az);
+            int in_zone = (remaining == 0.0)
+                       || ((remaining > 0.0) == (unwind > 0.0));
+            // from_mid > tol => the reading is real feedback, not the post-SET
+            // target echo. The two-step always starts out of the unwind zone
+            // (|prev| > 180), so the stale pre-SET reading can't fire early.
+            if (from_mid > HOME_ECHO_TOLERANCE_DEG && in_zone) {
+                int rc = main_rotator_submit_set(state, final_az, 0.0);
+                if (rc == ANTENNA_ROTATOR_OK) {
+                    state->antenna_rotator.antenna_is_moving = 1;
+                }
+                state->antenna_rotator.homing_in_progress = 0;
+                state->antenna_rotator.home_pending_final_az = 0.0;
+                char det[96];
+                snprintf(det, sizeof det, "leg2 fired at az=%.1f -> %.1f",
+                         current_az, final_az);
+                sso_audit_event("home", det);
+            }
+        }
+        // --scan-sky: drives a sky grid one target at a time, dwelling
+        // SCAN_DWELL_S at each. Bypasses the satellite_tracking +
+        // pass-timing gate below entirely, so the operator can scan
+        // regardless of TLE / pass state-> 's' stops mid-scan.
+        if (state->scan.active) {
+            scan_sky_tick(state, t_now);
+        }
+        if (state->satellite_tracking
+            && state->prediction.predicted_minutes_until_visible
+                   < state->antenna_rotator.tracking_prep_time_minutes) {
+            if (!state->in_pass) {
+                state->in_pass = 1;
+            }
+            if (state->antenna_rotator.antenna_should_be_controlled
+                && !state->antenna_rotator.tracking) {
+                if (!state->antenna_rotator.fixed_target
+                    && !state->antenna_rotator.flip_decision_made) {
+                    state->antenna_rotator.flip_mode_pass = 0;
+                    state->antenna_rotator.flip_half = 0;
+                    if (ANTENNA_ROTATOR_MAXIMUM_ELEVATION > 90
+                        && state->prediction.predicted_max_elevation
+                               >= ANTENNA_ROTATOR_FLIP_ELEVATION_THRESHOLD) {
+                        state->antenna_rotator.flip_mode_pass = 1;
+                        // Prefer the prediction-derived AOS azimuth (the
+                        // satellite_ephem.azimuth here may be a few deg
+                        // off as we are still pre-AOS); fall back to the
+                        // live position if the pass walk didn't capture
+                        // an ascension sample.
+                        double aos_az_pred =
+                            state->prediction.predicted_ascension_azimuth;
+                        state->antenna_rotator.flip_aos_az =
+                            (aos_az_pred != 0.0)
+                                ? aos_az_pred
+                                : state->prediction.satellite_ephem.azimuth;
+                        state->antenna_rotator.flip_los_az =
+                            state->prediction.predicted_descent_azimuth;
+                        state->antenna_rotator.flip_aos_jul =
+                            state->prediction.predicted_ascension_jul_utc;
+                        state->antenna_rotator.flip_los_jul =
+                            state->prediction.predicted_descent_jul_utc;
+                    }
+                    state->antenna_rotator.flip_decision_made = 1;
+                    state->antenna_rotator.tracking = 1;
+                    // Pre-sample the trajectory and ask the planner
+                    // for a rate-feasible whole-pass aim sequence. On
+                    // any failure (no calibration, planner unhappy,
+                    // --without-rotator-pursuit) the helper leaves
+                    // state->pursuit_plan zero and the track loop below
+                    // falls back to today's aim-where-sat-is-now path.
+                    main_pursuit_build_plan(state, jul_utc);
+                }
+            }
+
+            if (state->antenna_rotator.tracking
+                && state->antenna_rotator.antenna_is_under_control) {
+                if (!state->antenna_rotator.unwrapped_target_valid) {
+                    if (main_rotator_refresh_targets_from_snapshot(state)
+                        != 0) {
+                        state->antenna_rotator.tracking = 0;
+                        main_pursuit_clear_plan(state);
+                    }
+                } else if (!state->antenna_rotator.antenna_is_moving) {
+                    double next_az = 0.0, next_el = 0.0;
+                    double prev_unwrapped =
+                        state->antenna_rotator.target_azimuth_unwrapped;
+                    int    used_pursuit = 0;
+                    if (state->pursuit_plan.waypoints != NULL
+                        && pursuit_aim_at(&state->pursuit_plan, jul_utc,
+                                          &next_az, &next_el) == 0) {
+                        used_pursuit = 1;
+                    }
+                    if (!used_pursuit) {
+                        double pred_az =
+                            state->prediction.satellite_ephem.azimuth;
+                        double pred_el =
+                            state->prediction.satellite_ephem.elevation;
+                        double mech_az = pred_az;
+                        double mech_el = pred_el;
+                        int half = 0;
+                        // AOS->LOS progress: drives the boom-meridian
+                        // lerp in flip mode. Clamped to [0, 1] inside
+                        // the function. Ignored for non-flip passes.
+                        double progress = 0.0;
+                        double pass_jul =
+                            state->antenna_rotator.flip_los_jul
+                            - state->antenna_rotator.flip_aos_jul;
+                        if (pass_jul > 0.0) {
+                            progress = (jul_utc
+                                        - state->antenna_rotator.flip_aos_jul)
+                                       / pass_jul;
+                        }
+                        antenna_rotator_to_mech_coords(
+                            state->antenna_rotator.flip_mode_pass,
+                            state->antenna_rotator.flip_aos_az,
+                            state->antenna_rotator.flip_los_az,
+                            progress,
+                            pred_az, pred_el,
+                            &mech_az, &mech_el, &half);
+                        if (state->antenna_rotator.flip_mode_pass
+                            && half != state->antenna_rotator.flip_half) {
+                            state->antenna_rotator.target_azimuth_unwrapped =
+                                mech_az;
+                            state->antenna_rotator.flip_half = half;
+                            prev_unwrapped =
+                                state->antenna_rotator.target_azimuth_unwrapped;
+                        }
+                        next_az = antenna_rotator_accumulate_unwrapped(
+                            prev_unwrapped, mech_az);
+                        next_el = mech_el;
+                    }
+                    if (next_el < ANTENNA_ROTATOR_MINIMUM_ELEVATION) {
+                        next_el = ANTENNA_ROTATOR_MINIMUM_ELEVATION;
+                    } else if (next_el > ANTENNA_ROTATOR_MAXIMUM_ELEVATION) {
+                        next_el = ANTENNA_ROTATOR_MAXIMUM_ELEVATION;
+                    }
+                    delta_az = next_az - prev_unwrapped;
+                    // With a plan in play the elevation is part of the
+                    // trajectory; respect it even below the horizon.
+                    // The pre-pursuit fallback keeps the existing
+                    // "only chase el while the sat is visible" rule.
+                    if (used_pursuit
+                        || state->antenna_rotator.flip_mode_pass
+                        || state->prediction.satellite_ephem.elevation >= 0) {
+                        delta_el = next_el
+                                   - state->antenna_rotator.target_elevation;
+                    } else {
+                        delta_el = 0.0;
+                    }
+
+                    if (fabs(delta_az) >= MAX_DELTA_AZIMUTH_DEGREES
+                        || fabs(delta_el) >= MAX_DELTA_ELEVATION_DEGREES) {
+                        if (next_az < ANTENNA_ROTATOR_MINIMUM_AZIMUTH
+                            || next_az > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
+                            state->antenna_rotator.tracking = 0;
+                            main_pursuit_clear_plan(state);
+                        } else {
+                            int rc = main_rotator_submit_set(
+                                state, next_az, next_el);
+                            if (rc != ANTENNA_ROTATOR_OK) {
+                                fprintf(stderr,
+                                        "Error setting antenna rotator position\n");
+                            } else {
+                                state->antenna_rotator.antenna_is_moving = 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            jul_idle_start = 0;
+        } else {
+            if (state->in_pass) {
+                state->in_pass = 0;
+                jul_idle_start = jul_utc;
+            }
+            if (state->antenna_rotator.tracking) {
+                state->antenna_rotator.tracking = 0;
+                state->antenna_rotator.flip_mode_pass = 0;
+                state->antenna_rotator.flip_decision_made = 0;
+                state->antenna_rotator.flip_half = 0;
+                // Released the pass; tear down the planner so the
+                // memory comes back and so the next pass / mid-pass
+                // 'T' rebuilds against fresh state.
+                main_pursuit_clear_plan(state);
+            }
+        }
+        (void) jul_idle_start;  // reserved for any future idle-window behavior
 }

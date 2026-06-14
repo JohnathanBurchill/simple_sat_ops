@@ -69,6 +69,12 @@ int  point_to_stationary_target(state_t *state, double azimuth, double elevation
 // current range rate.
 void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, double downlink_freq);
 
+// Per-tick antenna pointing: motion-settle detection, the two-step home's
+// second leg, an active sky scan, and the satellite-tracking / pursuit aim
+// loop (or rotator release at LOS). jul_utc is the current Julian date,
+// t_now the monotonic-seconds clock.
+void tracking_tick(state_t *state, double jul_utc, double t_now);
+
 // Swap the tracked satellite to the first object in `path`. Returns a
 // RETARGET_* code.
 int retarget_to_tle(state_t *state, const char *path);
