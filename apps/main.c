@@ -1464,42 +1464,6 @@ static double monotonic_seconds(void)
     return (double) ts.tv_sec + (double) ts.tv_nsec * 1e-9;
 }
 
-// Async wrapper around antenna_rotator's serial I/O. NULL if no rotator
-// (--without-rotator, or antenna_rotator_init failed). Spawned right
-// after antenna_rotator_init succeeds; joined on shutdown. While set, no
-// other thread touches state.antenna_rotator's serial FD.
-static antenna_rotator_async_t *g_rot_async = NULL;
-// --calibrate-rotator: when 1, simple_sat_ops runs the calibration
-// routine after opening the rotator and exits without entering the
-// ncurses UI. --confirm-rotator-calibrate is the safety interlock so
-// the physical motion is always deliberate.
-static int g_calibrate_rotator = 0;
-static int g_confirm_rotator_calibrate = 0;
-// Rotator slew rates loaded from disk at startup (deg/s). Either both
-// > 0 (calibration present, pursuit planner can run) or both 0
-// (calibration absent, the track loop falls back to today's "aim
-// where sat is now" behavior).
-static double g_pursuit_az_dps = 0.0;
-static double g_pursuit_el_dps = 0.0;
-// --without-rotator-pursuit disables the planner without removing the
-// calibration files. Useful for A/B comparisons on the bench.
-static int    g_without_rotator_pursuit = 0;
-
-// Pre-sampled mech-frame satellite trajectory backing the planner's
-// sat_sample_fn_t callback. Sampled once at plan-build time so the
-// planner's iterations see a consistent, order-independent function
-// without us ever mutating state.prediction.satellite_ephem on the
-// side. Owned alongside g_pursuit_plan; both live for the duration of
-// the current tracking session and are freed together at LOS / 's' /
-// shutdown.
-typedef struct {
-    double *t_jul;
-    double *az_unwrapped;
-    double *el;
-    size_t  n;
-} pursuit_track_t;
-static pursuit_plan_t  g_pursuit_plan  = {0};
-static pursuit_track_t g_pursuit_track = {0};
 #ifdef SSO_WITH_SDR
 // Current UTC in milliseconds -- the queue-time clock for expanding an
 // "SSO+..." pseudo-command (see sso_pseudo.h). Captured fresh per send so each
@@ -4858,8 +4822,8 @@ static int main_rotator_submit_set(state_t *state,
     state->antenna_rotator.target_azimuth           = az_unwrapped;
     state->antenna_rotator.target_elevation         = elevation;
     state->antenna_rotator.unwrapped_target_valid   = 1;
-    if (g_rot_async != NULL) {
-        antenna_rotator_async_submit_set(g_rot_async, az_unwrapped, elevation);
+    if (state->rot_async != NULL) {
+        antenna_rotator_async_submit_set(state->rot_async, az_unwrapped, elevation);
     }
     return ANTENNA_ROTATOR_OK;
 }
@@ -4891,7 +4855,7 @@ static int main_rotator_increase_elevation(state_t *state, double delta)
 // --- Pursuit planner integration ----------------------------------
 //
 // At AOS we pre-sample the satellite trajectory in unwrapped mech
-// coords into g_pursuit_track, then ask the planner (src/orbit/
+// coords into state->pursuit_track, then ask the planner (src/orbit/
 // pursuit.c) for a rate-feasible whole-pass antenna trajectory. Each
 // track-loop tick the loop reads the next waypoint via
 // pursuit_aim_at() and submits it through the existing
@@ -5008,10 +4972,10 @@ static int pursuit_track_build(const state_t *state,
 }
 
 // Free the current plan + its sampled trajectory. Idempotent.
-static void main_pursuit_clear_plan(void)
+static void main_pursuit_clear_plan(state_t *state)
 {
-    pursuit_plan_free(&g_pursuit_plan);
-    pursuit_track_free(&g_pursuit_track);
+    pursuit_plan_free(&state->pursuit_plan);
+    pursuit_track_free(&state->pursuit_track);
 }
 
 // Build (or rebuild) the whole-pass plan from the current prediction.
@@ -5021,10 +4985,10 @@ static void main_pursuit_clear_plan(void)
 // just keeps the existing aim-where-sat-is-now logic.
 static void main_pursuit_build_plan(state_t *state, double jul_now)
 {
-    main_pursuit_clear_plan();
-    if (g_without_rotator_pursuit)              return;
-    if (g_pursuit_az_dps <= 0.0)                return;
-    if (g_pursuit_el_dps <= 0.0)                return;
+    main_pursuit_clear_plan(state);
+    if (state->without_rotator_pursuit)              return;
+    if (state->pursuit_az_dps <= 0.0)                return;
+    if (state->pursuit_el_dps <= 0.0)                return;
     if (!state->have_antenna_rotator)           return;
     if (!state->antenna_rotator.unwrapped_target_valid) return;
 
@@ -5044,10 +5008,10 @@ static void main_pursuit_build_plan(state_t *state, double jul_now)
 
     if (pursuit_track_build(state, aos, los,
                              flip, aos_az, los_az, aos_jul, los_jul,
-                             a0, &g_pursuit_track) != 0) {
+                             a0, &state->pursuit_track) != 0) {
         fprintf(stderr, "pursuit: track sampling failed; "
                         "falling back to aim-where-sat-is-now\n");
-        main_pursuit_clear_plan();
+        main_pursuit_clear_plan(state);
         return;
     }
 
@@ -5055,35 +5019,35 @@ static void main_pursuit_build_plan(state_t *state, double jul_now)
     pursuit_config_defaults(&cfg);
     cfg.jul_aos      = aos;
     cfg.jul_los      = los;
-    cfg.r_az_dps     = g_pursuit_az_dps;
-    cfg.r_el_dps     = g_pursuit_el_dps;
+    cfg.r_az_dps     = state->pursuit_az_dps;
+    cfg.r_el_dps     = state->pursuit_el_dps;
     cfg.a0_unwrapped = a0;
     cfg.e0           = e0;
 
-    if (pursuit_plan_build(&cfg, pursuit_track_lookup, &g_pursuit_track,
-                            &g_pursuit_plan) != 0) {
+    if (pursuit_plan_build(&cfg, pursuit_track_lookup, &state->pursuit_track,
+                            &state->pursuit_plan) != 0) {
         fprintf(stderr, "pursuit: plan build failed; "
                         "falling back to aim-where-sat-is-now\n");
-        main_pursuit_clear_plan();
+        main_pursuit_clear_plan(state);
         return;
     }
     // Sanity bound: a plan with > 30 deg max error is suspect; the
     // calibration may be wildly off. Discard and let the track loop
     // fall back rather than driving the antenna to bogus targets.
-    if (g_pursuit_plan.max_error_deg > 30.0) {
+    if (state->pursuit_plan.max_error_deg > 30.0) {
         fprintf(stderr,
                 "pursuit: plan max_err=%.1f deg > 30; disabled, "
                 "falling back to aim-where-sat-is-now\n",
-                g_pursuit_plan.max_error_deg);
-        main_pursuit_clear_plan();
+                state->pursuit_plan.max_error_deg);
+        main_pursuit_clear_plan(state);
         return;
     }
     fprintf(stderr,
             "pursuit: plan built %zu waypoints, "
             "max_err=%.2f mean_err=%.2f deg, %d iter\n",
-            g_pursuit_plan.n_waypoints,
-            g_pursuit_plan.max_error_deg, g_pursuit_plan.mean_error_deg,
-            g_pursuit_plan.iterations_used);
+            state->pursuit_plan.n_waypoints,
+            state->pursuit_plan.max_error_deg, state->pursuit_plan.mean_error_deg,
+            state->pursuit_plan.iterations_used);
 }
 
 // Two paths point at the same TLE file? Canonicalise both with
@@ -5207,7 +5171,7 @@ static int retarget_to_tle(state_t *state, const char *path)
     // flip decision, rebuilds the pursuit plan, and slews to the new
     // target on the next tick. If we weren't tracking, only the target
     // changes -- nothing moves until the operator presses T.
-    main_pursuit_clear_plan();
+    main_pursuit_clear_plan(state);
     state->antenna_rotator.tracking           = 0;
     state->antenna_rotator.flip_mode_pass     = 0;
     state->antenna_rotator.flip_decision_made = 0;
@@ -5223,10 +5187,10 @@ static int retarget_to_tle(state_t *state, const char *path)
 // good status has landed yet (or it's gone stale).
 static int main_rotator_refresh_targets_from_snapshot(state_t *state)
 {
-    if (g_rot_async == NULL) return -1;
+    if (state->rot_async == NULL) return -1;
     double az = 0.0, el = 0.0;
     int    ok = 0, stale_ms = 0;
-    antenna_rotator_async_snapshot(g_rot_async, &az, &el, &ok, &stale_ms, NULL);
+    antenna_rotator_async_snapshot(state->rot_async, &az, &el, &ok, &stale_ms, NULL);
     if (!ok || stale_ms > 1500) return -1;
     state->antenna_rotator.azimuth                  = az;
     state->antenna_rotator.elevation                = el;
@@ -5268,8 +5232,8 @@ void report_status(state_t *state, int *print_row, int print_col)
         double elevation = state->antenna_rotator.elevation;
         int    rot_ok = 0;
         int    rot_stale_ms = 0;
-        if (g_rot_async != NULL) {
-            antenna_rotator_async_snapshot(g_rot_async,
+        if (state->rot_async != NULL) {
+            antenna_rotator_async_snapshot(state->rot_async,
                                             &azimuth, &elevation,
                                             &rot_ok, &rot_stale_ms, NULL);
             // Cache the snapshot back into state so other code (the
@@ -6270,7 +6234,7 @@ int main(int argc, char **argv)
         // happens on the worker thread; the main loop only reads the
         // snapshot via main_rotator_refresh_targets_from_snapshot() and
         // posts SETs via main_rotator_submit_set().
-        if (antenna_rotator_async_open(&g_rot_async,
+        if (antenna_rotator_async_open(&state.rot_async,
                                         &state.antenna_rotator, 0.5) != 0) {
             fprintf(stderr, "Error spawning antenna rotator worker\n");
             return EXIT_FAILURE;
@@ -6290,7 +6254,7 @@ int main(int argc, char **argv)
         double sav_el    = state.antenna_rotator.target_elevation;
         double sav_az_uw = state.antenna_rotator.target_azimuth_unwrapped;
         int    sav_uw_ok = state.antenna_rotator.unwrapped_target_valid;
-        if (antenna_rotator_async_wait_first_status(g_rot_async, 1500) != 0
+        if (antenna_rotator_async_wait_first_status(state.rot_async, 1500) != 0
             || main_rotator_refresh_targets_from_snapshot(&state) != 0) {
             fprintf(stderr, "Warning: could not read SPID position; "
                             "check that the Rot2ProG is in 'A' mode\n");
@@ -6307,13 +6271,13 @@ int main(int argc, char **argv)
     // measure deg/s on each axis, save the result to disk, and exit
     // without entering the operator UI. Requires the safety interlock
     // so a stray flag in a script can't move hardware.
-    if (g_calibrate_rotator) {
+    if (state.calibrate_rotator) {
         if (!state.have_antenna_rotator) {
             fprintf(stderr, "--calibrate-rotator: no rotator open "
                             "(was --without-rotator passed?)\n");
             return EXIT_FAILURE;
         }
-        if (!g_confirm_rotator_calibrate) {
+        if (!state.confirm_rotator_calibrate) {
             fprintf(stderr,
                     "--calibrate-rotator will physically move the antenna.\n"
                     "Confirm the mast area is clear, then re-run with\n"
@@ -6322,7 +6286,7 @@ int main(int argc, char **argv)
         }
         double az_dps = 0.0, el_dps = 0.0;
         rotator_calibrate_result_t cres = rotator_calibrate_run(
-            g_rot_async, &az_dps, &el_dps, stderr);
+            state.rot_async, &az_dps, &el_dps, stderr);
         fprintf(stderr, "calibrate: result = %s\n",
                 rotator_calibrate_result_name(cres));
         if (cres == ROTATOR_CALIBRATE_OK) {
@@ -6332,9 +6296,9 @@ int main(int argc, char **argv)
         }
         // Shutdown cleanly — the operator UI never started, but the
         // rotator FD and worker are open.
-        if (g_rot_async != NULL) {
-            antenna_rotator_async_close(g_rot_async);
-            g_rot_async = NULL;
+        if (state.rot_async != NULL) {
+            antenna_rotator_async_close(state.rot_async);
+            state.rot_async = NULL;
         }
         if (state.have_antenna_rotator) {
             antenna_rotator_disconnect(&state.antenna_rotator);
@@ -6348,11 +6312,11 @@ int main(int argc, char **argv)
     // disabled (Phase 2 hooks this in front of the track loop; Phase
     // 1 just loads + warns so the bench can see the values).
     if (state.have_antenna_rotator) {
-        if (pursuit_load_rotator_rates(&g_pursuit_az_dps,
-                                        &g_pursuit_el_dps) == 0) {
+        if (pursuit_load_rotator_rates(&state.pursuit_az_dps,
+                                        &state.pursuit_el_dps) == 0) {
             fprintf(stderr,
                     "pursuit: loaded slew rates az=%.3f deg/s el=%.3f deg/s\n",
-                    g_pursuit_az_dps, g_pursuit_el_dps);
+                    state.pursuit_az_dps, state.pursuit_el_dps);
         } else {
             fprintf(stderr,
                     "pursuit: no calibration on disk; run "
@@ -6796,7 +6760,7 @@ int main(int argc, char **argv)
                     // for a rate-feasible whole-pass aim sequence. On
                     // any failure (no calibration, planner unhappy,
                     // --without-rotator-pursuit) the helper leaves
-                    // g_pursuit_plan zero and the track loop below
+                    // state.pursuit_plan zero and the track loop below
                     // falls back to today's aim-where-sat-is-now path.
                     main_pursuit_build_plan(&state, jul_utc);
                 }
@@ -6808,15 +6772,15 @@ int main(int argc, char **argv)
                     if (main_rotator_refresh_targets_from_snapshot(&state)
                         != 0) {
                         state.antenna_rotator.tracking = 0;
-                        main_pursuit_clear_plan();
+                        main_pursuit_clear_plan(&state);
                     }
                 } else if (!state.antenna_rotator.antenna_is_moving) {
                     double next_az = 0.0, next_el = 0.0;
                     double prev_unwrapped =
                         state.antenna_rotator.target_azimuth_unwrapped;
                     int    used_pursuit = 0;
-                    if (g_pursuit_plan.waypoints != NULL
-                        && pursuit_aim_at(&g_pursuit_plan, jul_utc,
+                    if (state.pursuit_plan.waypoints != NULL
+                        && pursuit_aim_at(&state.pursuit_plan, jul_utc,
                                           &next_az, &next_el) == 0) {
                         used_pursuit = 1;
                     }
@@ -6883,7 +6847,7 @@ int main(int argc, char **argv)
                         if (next_az < ANTENNA_ROTATOR_MINIMUM_AZIMUTH
                             || next_az > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
                             state.antenna_rotator.tracking = 0;
-                            main_pursuit_clear_plan();
+                            main_pursuit_clear_plan(&state);
                         } else {
                             int rc = main_rotator_submit_set(
                                 &state, next_az, next_el);
@@ -6912,7 +6876,7 @@ int main(int argc, char **argv)
                 // Released the pass; tear down the planner so the
                 // memory comes back and so the next pass / mid-pass
                 // 'T' rebuilds against fresh state.
-                main_pursuit_clear_plan();
+                main_pursuit_clear_plan(&state);
             }
         }
         (void) jul_idle_start;  // reserved for any future idle-window behavior
@@ -7431,9 +7395,9 @@ int main(int argc, char **argv)
     }
     // Join the rotator worker before closing the serial FD — otherwise a
     // mid-read in the worker would see EBADF and corrupt the snapshot.
-    if (g_rot_async != NULL) {
-        antenna_rotator_async_close(g_rot_async);
-        g_rot_async = NULL;
+    if (state.rot_async != NULL) {
+        antenna_rotator_async_close(state.rot_async);
+        state.rot_async = NULL;
     }
     if (state.have_antenna_rotator) {
         antenna_rotator_disconnect(&state.antenna_rotator);
@@ -7441,7 +7405,7 @@ int main(int argc, char **argv)
     }
     // Free any plan that survived (mid-pass exit / crash on a key
     // before the LOS branch had a chance to clear it).
-    main_pursuit_clear_plan();
+    main_pursuit_clear_plan(&state);
     if (state.ipc) {
         sso_ipc_server_close(state.ipc);
         state.ipc = NULL;
@@ -7686,19 +7650,19 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
         if (strcmp("--calibrate-rotator", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--calibrate-rotator",
                 "measure rotator slew rates then exit (needs --confirm-rotator-calibrate)");
-            else { state->n_options++; g_calibrate_rotator = 1; }
+            else { state->n_options++; state->calibrate_rotator = 1; }
             matched = 1;
         }
         if (strcmp("--confirm-rotator-calibrate", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--confirm-rotator-calibrate",
                 "safety interlock for --calibrate-rotator (antenna moves)");
-            else { state->n_options++; g_confirm_rotator_calibrate = 1; }
+            else { state->n_options++; state->confirm_rotator_calibrate = 1; }
             matched = 1;
         }
         if (strcmp("--without-rotator-pursuit", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--without-rotator-pursuit",
                 "disable the pursuit / lead-aim planner even if calibrated");
-            else { state->n_options++; g_without_rotator_pursuit = 1; }
+            else { state->n_options++; state->without_rotator_pursuit = 1; }
             matched = 1;
         }
         if (strcmp("--without-tr-switch", arg) == 0 || help) {
@@ -8396,14 +8360,14 @@ void stop_tracking(state_t *state)
     state->satellite_tracking = 0;
     state->doppler_correction_enabled = 1;
     state->antenna_rotator.antenna_is_under_control = 0;
-    if (state->run_with_antenna_rotator && g_rot_async != NULL) {
-        antenna_rotator_async_submit_stop(g_rot_async);
-        antenna_rotator_async_kick_status(g_rot_async);
+    if (state->run_with_antenna_rotator && state->rot_async != NULL) {
+        antenna_rotator_async_submit_stop(state->rot_async);
+        antenna_rotator_async_kick_status(state->rot_async);
         // Wait briefly for the next OK STATUS so target_* reflect the
         // position the antenna actually stopped at (not where the
         // satellite was). Bounded — the operator's 's' / 'r' keystroke
         // shouldn't hang if the controller is unresponsive.
-        if (antenna_rotator_async_wait_next_good_status(g_rot_async, 750) == 0) {
+        if (antenna_rotator_async_wait_next_good_status(state->rot_async, 750) == 0) {
             (void) main_rotator_refresh_targets_from_snapshot(state);
         }
     }
