@@ -20,6 +20,12 @@
 cmake_minimum_required(VERSION 3.10)
 project(simple_sat_ops)
 
+# Emit compile_commands.json so clangd (LSP) gets exact per-file flags and
+# include paths. Symlink it into the source root once: `ln -sf
+# build/compile_commands.json compile_commands.json`. clangd prefers it over
+# the hand-maintained compile_flags.txt fallback.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 #set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
 #set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g -fsanitize=address")
