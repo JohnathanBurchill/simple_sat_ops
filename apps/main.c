@@ -33,7 +33,6 @@
 #include "sso_version.h"
 #include "panels.h"
 #include "pass_session.h"
-#include "scan_sky.h"
 #include "operator_ipc.h"
 #include "tracking.h"
 #include "hw_bringup.h"
@@ -41,6 +40,7 @@
 #include "tui.h"
 #include "auto_tcmd.h"
 #include "cmd_line.h"
+#include "input.h"
 #include "tx_compose.h"
 #include "viewer.h"
 #include "tx_log.h"
@@ -287,16 +287,8 @@ int main(int argc, char **argv)
     // it doesn't orphan when a device-loss abort skips normal teardown.
     tui_register_waterfall_pid(&g_live_waterfall_pid);
 
-    // int (not char) — getch returns KEY_* codes well above 127 for
-    // arrow keys / function keys / KEY_BACKSPACE etc. A signed char
-    // would silently truncate those into bogus low-byte values, which
-    // is what made KEY_LEFT (260) look like Ctrl-D (4) in the modal
-    // handlers and broke field editing inside the auto-tcmd modal.
-    int key = ERR;
     int row = 0;
     int col = 2;
-    // Scratch for the jog-key handlers' main_rotator_increase_* return codes.
-    int antenna_rotator_result = 0;
     state.running = 1;
 
     double current_uplink_frequency = state.nominal_uplink_frequency_hz;
@@ -501,146 +493,9 @@ int main(int argc, char **argv)
             }
         }
 
-        key = getch();
-        if (state.tx_compose_active) {
-            if (!tx_compose_handle_key(&state, key)) {
-                tx_compose_close(&state);
-            }
-        } else if (state.auto_tcmd_active) {
-            if (!auto_tcmd_handle_key(&state, key)) {
-                auto_tcmd_close(&state);
-            }
-        } else if (state.cmd.active) {
-            cmd_handle_key(key, &state);
-        } else if (key == 'K') {
-            keyboard_unlocked = !keyboard_unlocked;
-        } else if (keyboard_unlocked) {
-            switch (key) {
-                case ':':
-                    cmd_enter(&state);
-                    break;
-                case 'q':
-                    state.running = 0;
-                    break;
-                case 'T':
-                    if (state.scan.mode) {
-                        scan_sky_start(&state);
-                    } else {
-                        start_tracking(&state);
-                        if (state.antenna_rotator.fixed_target) {
-                            char det[128];
-                            snprintf(det, sizeof det,
-                                "mode=fixed-target az=%.1f el=%.1f",
-                                state.antenna_rotator.target_azimuth,
-                                state.antenna_rotator.target_elevation);
-                            sso_audit_event("track-on", det);
-                        } else {
-                            sso_audit_event("track-on",
-                                state.prediction.satellite_ephem.tle.sat_name[0]
-                                    ? state.prediction.satellite_ephem.tle.sat_name : "");
-                        }
-                    }
-                    break;
-                case 's':
-                    if (state.scan.active) {
-                        scan_sky_stop(&state, "user");
-                    }
-                    stop_tracking(&state);
-                    break;
-                case 'r':
-                    stop_tracking(&state);
-                    point_to_stationary_target(&state, 0.0, 0.0);
-                    break;
-                case '[':
-                    state.satellite_tracking = 0;
-                    state.antenna_rotator.antenna_is_under_control = 0;
-                    antenna_rotator_result = main_rotator_increase_azimuth(
-                        &state, -5.0);
-                    if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                        state.antenna_rotator.antenna_is_moving = 1;
-                    }
-                    flushinp();
-                    break;
-                case ']':
-                    state.satellite_tracking = 0;
-                    state.antenna_rotator.antenna_is_under_control = 0;
-                    antenna_rotator_result = main_rotator_increase_azimuth(
-                        &state, 5.0);
-                    if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                        state.antenna_rotator.antenna_is_moving = 1;
-                    }
-                    flushinp();
-                    break;
-                case '{':
-                    state.satellite_tracking = 0;
-                    state.antenna_rotator.antenna_is_under_control = 0;
-                    antenna_rotator_result = main_rotator_increase_azimuth(
-                        &state, -1.0);
-                    if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                        state.antenna_rotator.antenna_is_moving = 1;
-                    }
-                    flushinp();
-                    break;
-                case '}':
-                    state.satellite_tracking = 0;
-                    state.antenna_rotator.antenna_is_under_control = 0;
-                    antenna_rotator_result = main_rotator_increase_azimuth(
-                        &state, 1.0);
-                    if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                        state.antenna_rotator.antenna_is_moving = 1;
-                    }
-                    flushinp();
-                    break;
-                case ',':
-                    state.satellite_tracking = 0;
-                    state.antenna_rotator.antenna_is_under_control = 0;
-                    antenna_rotator_result = main_rotator_increase_elevation(
-                        &state, -5.0);
-                    if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                        state.antenna_rotator.antenna_is_moving = 1;
-                    }
-                    flushinp();
-                    break;
-                case '.':
-                    state.satellite_tracking = 0;
-                    state.antenna_rotator.antenna_is_under_control = 0;
-                    antenna_rotator_result = main_rotator_increase_elevation(
-                        &state, 5.0);
-                    if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                        state.antenna_rotator.antenna_is_moving = 1;
-                    }
-                    flushinp();
-                    break;
-                case '<':
-                    state.satellite_tracking = 0;
-                    state.antenna_rotator.antenna_is_under_control = 0;
-                    antenna_rotator_result = main_rotator_increase_elevation(
-                        &state, -1.0);
-                    if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                        state.antenna_rotator.antenna_is_moving = 1;
-                    }
-                    flushinp();
-                    break;
-                case '>':
-                    state.satellite_tracking = 0;
-                    state.antenna_rotator.antenna_is_under_control = 0;
-                    antenna_rotator_result = main_rotator_increase_elevation(
-                        &state, 1.0);
-                    if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                        state.antenna_rotator.antenna_is_moving = 1;
-                    }
-                    flushinp();
-                    break;
-                case 't':
-                    tx_compose_open(&state);
-                    break;
-                case 'A':
-                    auto_tcmd_open(&state);
-                    break;
-                default:
-                    break;
-            }
-        }
+        // Read one key and route it: modals / command line / keyboard lock /
+        // unlocked operator keys (track, jog, modal openers). See ui/input.c.
+        input_handle_keys(&state, &keyboard_unlocked);
 
         if (redraw_due) {
             // Width-padded prints (not clrtoeol) so we don't wipe the
