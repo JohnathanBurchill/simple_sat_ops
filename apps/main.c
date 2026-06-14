@@ -1533,20 +1533,6 @@ static pursuit_track_t g_pursuit_track = {0};
 // keeps a local handle long enough to open the device and hand it
 // over.
 static rx_session_t      *g_rx_session  = NULL;
-static tx_request_slot_t  g_tx_request  = {0};
-// Set when a burst has been submitted to the rx_session worker but not
-// yet polled to completion. Gates submit-vs-poll in the main loop so the
-// loop stays responsive (rotator / redraw / IPC / auto-tcmd ticks) while
-// the worker pauses RX, transmits, and resumes RX.
-static int                g_tx_inflight = 0;
-// Doppler-corrected uplink carrier (Hz). Refreshed every main-loop
-// tick from range_rate_km_s. The compose-preview, modal commit, and
-// auto-tcmd staging all snapshot this so the burst is keyed at the
-// frequency the satellite actually hears the nominal carrier on.
-// Falls back to the bare nominal when Doppler correction is off or
-// before SGP4 has produced a valid range_rate.
-static long               g_tx_freq_hz_doppler =
-                              (long) FRONTIERSAT_CARRIER_HZ;
 
 // Current UTC in milliseconds -- the queue-time clock for expanding an
 // "SSO+..." pseudo-command (see sso_pseudo.h). Captured fresh per send so each
@@ -1556,49 +1542,7 @@ static long long sso_now_utc_ms(void) {
     gettimeofday(&tv, NULL);
     return (long long) tv.tv_sec * 1000LL + tv.tv_usec / 1000LL;
 }
-// The @tssent dedup key stamped into every SSO+ expansion this session: the
-// startup UTC truncated to the minute, pinned once in main(). One fixed value
-// per process makes the flight firmware run an SSO+ time-sync once per pass
-// (correct across an hour/midnight boundary within the pass); a later relaunch
-// in a new minute runs it again. See sso_pseudo.h.
-static long long g_sso_pass_tssent_ms = 0;
 #endif
-
-// CLI gate: --no-tx blocks the compose modal from actually committing
-// a burst. Typing + preview broadcast still work so the operator can
-// rehearse / get advice from viewers without keying the PA.
-static int g_no_tx = 0;
-
-// Modulated 0xAA carrier prepended in front of every TX burst, ms.
-// Stamped into g_tx_request.preroll_ms at slot-build time and read by
-// auto_tcmd_burst_seconds for the on-air progress estimate. Default
-// matches the tx_burst_run fallback (200 ms). Override with
-// --tx-preroll-ms=<n>.
-static int g_tx_preroll_ms = 200;
-
-// TX log ring buffer — last few PREVIEW/SENT/NOT_SENT events for display.
-// Shared by operator and viewer renderers. ascii matches the upstream
-// sso_event_t.ascii field (SSO_TX_TEXT_MAX) so the panel renders the
-// entire command text — up to a full RF telecommand — instead of a
-// truncated preview.
-typedef struct {
-    sso_event_type_t kind;     // PREVIEW | TX_COMMAND_SENT | TX_NOT_SENT
-    char             ts[16];   // HH:MM:SS
-    char             ascii[SSO_TX_TEXT_MAX];
-    char             tx_not_sent_reason[24];
-} tx_log_entry_t;
-#define TX_LOG_SIZE 8
-static tx_log_entry_t g_tx_log[TX_LOG_SIZE];
-static size_t         g_tx_log_count = 0;
-
-// Persistent on-disk TX log. JSONL — one encoded sso_event_t per line.
-// Opened lazily on the first event after state->pass_folder is set, kept
-// open for the rest of the process, fflushed after every line so a
-// crash mid-pass doesn't lose the last command sent. Captures every
-// preview / commit / not-sent — the same events that drive the in-memory
-// ring above and the viewer-side mirror.
-static FILE *g_tx_log_fp = NULL;
-static char  g_tx_log_path[512] = "";
 
 // Pull "HH:MM:SS" out of an event's ISO ts ("2026-05-14T13:22:01.450Z").
 // Falls back to local clock if the event ts is empty/garbled.
@@ -1633,20 +1577,20 @@ static void tx_log_ts_from_event(const sso_event_t *evt,
 static void tx_log_file_append(state_t *state, const sso_event_t *evt)
 {
     if (!evt) return;
-    if (g_tx_log_fp == NULL) {
+    if (state->tx_log_fp == NULL) {
         if (state->pass_folder[0] == '\0') return;
         char path[512];
         snprintf(path, sizeof path, "%.500s/tx.log", state->pass_folder);
         FILE *fp = fopen(path, "a");
         if (!fp) return;
-        snprintf(g_tx_log_path, sizeof g_tx_log_path, "%s", path);
-        g_tx_log_fp = fp;
+        snprintf(state->tx_log_path, sizeof state->tx_log_path, "%s", path);
+        state->tx_log_fp = fp;
     }
     char buf[2048];
     if (sso_event_encode(evt, buf, sizeof buf) != 0) return;
     // sso_event_encode already terminates with "}\n" — don't add another.
-    fputs(buf, g_tx_log_fp);
-    fflush(g_tx_log_fp);
+    fputs(buf, state->tx_log_fp);
+    fflush(state->tx_log_fp);
 }
 
 // Push an event into the ring. PREVIEW events overwrite a trailing
@@ -1671,31 +1615,31 @@ static void tx_log_push(state_t *state, const sso_event_t *evt)
              evt->tx_not_sent_reason);
 
     if (evt->type == SSO_EVT_TX_COMMAND_PREVIEW
-        && g_tx_log_count > 0
-        && g_tx_log[g_tx_log_count - 1].kind == SSO_EVT_TX_COMMAND_PREVIEW) {
-        g_tx_log[g_tx_log_count - 1] = entry;
+        && state->tx_log_count > 0
+        && state->tx_log[state->tx_log_count - 1].kind == SSO_EVT_TX_COMMAND_PREVIEW) {
+        state->tx_log[state->tx_log_count - 1] = entry;
         return;
     }
     if (evt->type == SSO_EVT_TX_COMMAND_SENT
-        && g_tx_log_count > 0
-        && g_tx_log[g_tx_log_count - 1].kind == SSO_EVT_TX_COMMAND_PREVIEW) {
+        && state->tx_log_count > 0
+        && state->tx_log[state->tx_log_count - 1].kind == SSO_EVT_TX_COMMAND_PREVIEW) {
         // Promote the trailing draft in-place.
-        g_tx_log[g_tx_log_count - 1] = entry;
+        state->tx_log[state->tx_log_count - 1] = entry;
         return;
     }
-    if (g_tx_log_count < TX_LOG_SIZE) {
-        g_tx_log[g_tx_log_count++] = entry;
+    if (state->tx_log_count < TX_LOG_SIZE) {
+        state->tx_log[state->tx_log_count++] = entry;
     } else {
-        memmove(&g_tx_log[0], &g_tx_log[1],
-                sizeof(g_tx_log[0]) * (TX_LOG_SIZE - 1));
-        g_tx_log[TX_LOG_SIZE - 1] = entry;
+        memmove(&state->tx_log[0], &state->tx_log[1],
+                sizeof(state->tx_log[0]) * (TX_LOG_SIZE - 1));
+        state->tx_log[TX_LOG_SIZE - 1] = entry;
     }
 }
 
 // Render the TX log at rows [start_row .. start_row + (TX_LOG_SIZE+1)).
 // Caller picks the column. Title line + one row per entry. Newest at
 // the bottom; PREVIEW lines render with A_BOLD, SENT/NOT_SENT with A_DIM.
-static void render_tx_log_panel(int start_row, int col)
+static void render_tx_log_panel(const state_t *state, int start_row, int col)
 {
     int row = start_row;
     // Cap width so clrtoeol-equivalent padding doesn't wipe the
@@ -1706,8 +1650,8 @@ static void render_tx_log_panel(int start_row, int col)
 
     mvprintw(row++, col, "%-*.*s", safe_w, safe_w, "TX log");
 
-    for (size_t i = 0; i < g_tx_log_count; ++i) {
-        const tx_log_entry_t *e = &g_tx_log[i];
+    for (size_t i = 0; i < state->tx_log_count; ++i) {
+        const tx_log_entry_t *e = &state->tx_log[i];
         const char *tag = "sent>  ";
         int attr = A_DIM;
         if (e->kind == SSO_EVT_TX_COMMAND_PREVIEW) {
@@ -2387,7 +2331,7 @@ static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
 // unlocked. As the operator edits a field the modal broadcasts a
 // debounced SSO_EVT_TX_COMMAND_PREVIEW so viewers see the draft and
 // can call out typos. On Enter the modal stashes the parsed request in
-// g_tx_request; the main loop submits it to rx_session, which runs the
+// state->tx_request; the main loop submits it to rx_session, which runs the
 // burst on its dedicated TX thread (no IPC round-trip, since the B210
 // now lives in this process; RX keeps streaming on the worker thread
 // throughout). ACK + COMMAND_SENT events are published locally for
@@ -2413,7 +2357,7 @@ static const long    g_tx_compose_debounce_ns   = 200000000L;
 // CTS1+ telecommand. The operator picks TX power, how many times each
 // command should be sent, and the inter-send delay. Once started the
 // modal's tick runs alongside the main loop — non-blocking, like the
-// TX compose modal — and queues one g_tx_request per shot, advancing
+// TX compose modal — and queues one state->tx_request per shot, advancing
 // through the file. Stops automatically when the satellite drops
 // below the horizon (LOS) so an unattended run can't keep TXing after
 // the pass. Every send goes through emit_tx_event_local, so the
@@ -2431,7 +2375,7 @@ static const long    g_tx_compose_debounce_ns   = 200000000L;
 //               = 80 + payload
 //
 //   burst_s     = start_delay(0.5)            // UHD timed-start lead
-//                 + g_tx_preroll_ms/1000       // modulated 0xAA carrier
+//                 + state->tx_preroll_ms/1000       // modulated 0xAA carrier
 //                 + frame_bytes * 8 / bit_rate // the frame itself
 //                 + postroll(0.050)
 //
@@ -2440,9 +2384,9 @@ static const long    g_tx_compose_debounce_ns   = 200000000L;
 // span -- leaving it out is most of the per-burst underestimate. auto-tcmd
 // sends one burst per shot (repeat=1); the repeat count and inter-send
 // delay are folded in by the caller, so this stays a per-send quantum.
-static double auto_tcmd_burst_seconds(size_t payload_len) {
+static double auto_tcmd_burst_seconds(state_t *state, size_t payload_len) {
     const double start_delay_s = 0.500;   // tx_burst.c start_delay_s
-    const double preroll_s     = (double) g_tx_preroll_ms * 1e-3;
+    const double preroll_s     = (double) state->tx_preroll_ms * 1e-3;
     const double postroll_s    = 0.050;   // tx_burst.c postroll_ms
     const double bit_rate      = 9600.0;
     size_t frame_bytes = 80 + payload_len;
@@ -2581,7 +2525,7 @@ static void tx_compose_fill_event(state_t *state, const tx_compose_t *c, sso_eve
     evt->tx_csp_sport = 16;
     evt->tx_csp_prio  = 2;
 #ifdef SSO_WITH_SDR
-    evt->tx_freq_hz   = g_tx_freq_hz_doppler;
+    evt->tx_freq_hz   = state->tx_freq_hz_doppler;
 #else
     evt->tx_freq_hz   = (long) FRONTIERSAT_CARRIER_HZ;
 #endif
@@ -2868,7 +2812,7 @@ static void tx_compose_draw(state_t *state, WINDOW *w, const tx_compose_t *c) {
 
     mvwprintw(w, 0, 2, " TX compose (operator: %s)%s ",
               state->operator_user ? state->operator_user : "?",
-              g_no_tx ? "  [--no-tx]" : "");
+              state->no_tx ? "  [--no-tx]" : "");
 #ifdef SSO_WITH_SDR
     mvwprintw(w, 1, 2,
               "B210: %s",
@@ -2967,7 +2911,7 @@ static void tx_compose_broadcast_preview(state_t *state, const tx_compose_t *c) 
 
 static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, size_t err_size) {
 #ifdef SSO_WITH_SDR
-    if (g_no_tx) {
+    if (state->no_tx) {
         snprintf(err, err_size,
                  "TX disabled by --no-tx (preview still goes to viewers)");
         return -1;
@@ -2977,7 +2921,7 @@ static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, s
                  "TX not supported by this SDR (RX-only backend)");
         return -1;
     }
-    if (g_tx_request.pending) {
+    if (state->tx_request.pending) {
         snprintf(err, err_size, "previous burst still in flight");
         return -1;
     }
@@ -2985,7 +2929,7 @@ static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, s
     // concrete telecommand to transmit, with the clock captured now so the
     // embedded timestamp is current. A normal command passes through verbatim.
     sso_pseudo_ctx_t pc = { .now_ms    = sso_now_utc_ms(),
-                            .tssent_ms = g_sso_pass_tssent_ms };
+                            .tssent_ms = state->sso_pass_tssent_ms };
     char wire[512];
     char sso_err[160];
     sso_pseudo_status_t pst =
@@ -2999,33 +2943,33 @@ static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, s
         snprintf(err, err_size, "empty payload");
         return -1;
     }
-    if (n > sizeof g_tx_request.payload) n = sizeof g_tx_request.payload;
-    memcpy(g_tx_request.payload, wire, n);
-    g_tx_request.payload_len  = n;
-    g_tx_request.is_hex       = 0;  // always ascii in the simplified modal
-    g_tx_request.csp_hdr      = (csp_v1_header_t){
+    if (n > sizeof state->tx_request.payload) n = sizeof state->tx_request.payload;
+    memcpy(state->tx_request.payload, wire, n);
+    state->tx_request.payload_len  = n;
+    state->tx_request.is_hex       = 0;  // always ascii in the simplified modal
+    state->tx_request.csp_hdr      = (csp_v1_header_t){
         .prio  = 2, .src = 10, .dst = 1, .dport = 7, .sport = 16, .flags = 0,
     };
-    g_tx_request.tx_freq_hz       = g_tx_freq_hz_doppler;
-    g_tx_request.tx_gain_db       = atof(c->power);
-    g_tx_request.repeat           = 1;
-    g_tx_request.gap_ms           = 200;
-    g_tx_request.preroll_ms       = g_tx_preroll_ms;
-    g_tx_request.allow_high_power = 0;
-    g_tx_request.allow_hf_tx      = 0;
+    state->tx_request.tx_freq_hz       = state->tx_freq_hz_doppler;
+    state->tx_request.tx_gain_db       = atof(c->power);
+    state->tx_request.repeat           = 1;
+    state->tx_request.gap_ms           = 200;
+    state->tx_request.preroll_ms       = state->tx_preroll_ms;
+    state->tx_request.allow_high_power = 0;
+    state->tx_request.allow_hf_tx      = 0;
     if (pst == SSO_PSEUDO_OK) {
         // Heritage: stash the SSO+ origin so the on-air summary notes it, and
         // bake the same note into the queue-time summary the dry-run /
         // rejected paths show.
-        snprintf(g_tx_request.sso_origin, sizeof g_tx_request.sso_origin,
+        snprintf(state->tx_request.sso_origin, sizeof state->tx_request.sso_origin,
                  "%s", c->payload);
-        snprintf(g_tx_request.summary, sizeof g_tx_request.summary,
+        snprintf(state->tx_request.summary, sizeof state->tx_request.summary,
                  "ascii:%.150s (replaced '%.80s')", wire, c->payload);
     } else {
-        g_tx_request.sso_origin[0] = '\0';
-        tx_compose_summary(c, g_tx_request.summary, sizeof g_tx_request.summary);
+        state->tx_request.sso_origin[0] = '\0';
+        tx_compose_summary(c, state->tx_request.summary, sizeof state->tx_request.summary);
     }
-    g_tx_request.pending = 1;
+    state->tx_request.pending = 1;
     {
         // Audit: TX commit — the moment the operator pressed Enter in
         // the compose modal and the burst was queued for the main loop
@@ -3035,9 +2979,9 @@ static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, s
         char det[512];
         snprintf(det, sizeof det,
                  "len=%zu freq_hz=%ld gain_db=%.1f payload=\"%.255s\"",
-                 g_tx_request.payload_len,
-                 (long) g_tx_request.tx_freq_hz,
-                 g_tx_request.tx_gain_db,
+                 state->tx_request.payload_len,
+                 (long) state->tx_request.tx_freq_hz,
+                 state->tx_request.tx_gain_db,
                  c->payload);
         sso_audit_event("tx-commit", det);
     }
@@ -3380,7 +3324,7 @@ static void auto_tcmd_draw(state_t *state) {
 
     mvwprintw(w, 0, 2, " Auto-TCMD (operator: %s)%s ",
               state->operator_user ? state->operator_user : "?",
-              g_no_tx ? "  [--no-tx]" : "");
+              state->no_tx ? "  [--no-tx]" : "");
 
     mvwprintw(w, 1, 2, "File:    %.*s  (%d commands)",
               width - 28, a->file_path[0] ? a->file_path : "(none)",
@@ -3594,7 +3538,7 @@ static int auto_tcmd_start(state_t *state) {
     a->tx_seconds_total = 0.0;
     double last_burst = 0.0;
     for (int i = 0; i < a->n_commands; ++i) {
-        double burst = auto_tcmd_burst_seconds(strlen(a->commands[i]));
+        double burst = auto_tcmd_burst_seconds(state, strlen(a->commands[i]));
         double slot  = (burst > delay) ? burst : delay;
         a->tx_seconds_total += slot * (double) repeats;
         last_burst = burst;
@@ -3700,7 +3644,7 @@ static int auto_tcmd_handle_key(state_t *state, int key) {
     return 1;
 }
 
-// Per-tick burst driver. When running, queues one g_tx_request when
+// Per-tick burst driver. When running, queues one state->tx_request when
 // (a) the previous burst has cleared, and (b) the inter-send delay
 // has elapsed. Stops automatically on LOS so an unattended run won't
 // keep TXing after the pass. emit_tx_event_local fires from the main
@@ -3749,7 +3693,7 @@ static void auto_tcmd_tick(state_t *state) {
 #ifdef SSO_WITH_SDR
     long now = ts_now_ns();
     if (now < a->next_send_ns) return;
-    if (g_tx_request.pending)  return;  // prior burst still inflight
+    if (state->tx_request.pending)  return;  // prior burst still inflight
 
     const char *raw = a->commands[a->cmd_idx];
     // Expand a simple_sat_ops-directed "SSO+..." line into the concrete
@@ -3758,7 +3702,7 @@ static void auto_tcmd_tick(state_t *state) {
     // vetted SSO+ lines, so a failure here is defensive: skip the whole command
     // rather than key a half-built payload.
     sso_pseudo_ctx_t pc = { .now_ms    = sso_now_utc_ms(),
-                            .tssent_ms = g_sso_pass_tssent_ms };
+                            .tssent_ms = state->sso_pass_tssent_ms };
     char wire[512];
     char sso_err[160];
     sso_pseudo_status_t pst =
@@ -3773,38 +3717,38 @@ static void auto_tcmd_tick(state_t *state) {
         return;
     }
     size_t n = strlen(wire);
-    if (n > sizeof g_tx_request.payload) n = sizeof g_tx_request.payload;
-    memcpy(g_tx_request.payload, wire, n);
-    g_tx_request.payload_len  = n;
-    g_tx_request.is_hex       = 0;
-    g_tx_request.csp_hdr      = (csp_v1_header_t){
+    if (n > sizeof state->tx_request.payload) n = sizeof state->tx_request.payload;
+    memcpy(state->tx_request.payload, wire, n);
+    state->tx_request.payload_len  = n;
+    state->tx_request.is_hex       = 0;
+    state->tx_request.csp_hdr      = (csp_v1_header_t){
         .prio  = 2, .src = 10, .dst = 1, .dport = 7, .sport = 16, .flags = 0,
     };
-    g_tx_request.tx_freq_hz       = g_tx_freq_hz_doppler;
-    g_tx_request.tx_gain_db       = atof(a->power);
-    g_tx_request.repeat           = 1;
-    g_tx_request.gap_ms           = 200;
-    g_tx_request.preroll_ms       = g_tx_preroll_ms;
-    // No g_tx_request.allow_tx field — the TX-inhibit gate is enforced
+    state->tx_request.tx_freq_hz       = state->tx_freq_hz_doppler;
+    state->tx_request.tx_gain_db       = atof(a->power);
+    state->tx_request.repeat           = 1;
+    state->tx_request.gap_ms           = 200;
+    state->tx_request.preroll_ms       = state->tx_preroll_ms;
+    // No state->tx_request.allow_tx field — the TX-inhibit gate is enforced
     // at auto_tcmd_start time (refuses to enter RUNNING unless allow_tx
     // is ticked), same way tx_compose_validate handles it before commit.
-    g_tx_request.allow_high_power = 0;
-    g_tx_request.allow_hf_tx      = 0;
+    state->tx_request.allow_high_power = 0;
+    state->tx_request.allow_hf_tx      = 0;
     if (pst == SSO_PSEUDO_OK)
-        snprintf(g_tx_request.sso_origin, sizeof g_tx_request.sso_origin, "%s", raw);
+        snprintf(state->tx_request.sso_origin, sizeof state->tx_request.sso_origin, "%s", raw);
     else
-        g_tx_request.sso_origin[0] = '\0';
+        state->tx_request.sso_origin[0] = '\0';
     {
-        int m = snprintf(g_tx_request.summary, sizeof g_tx_request.summary,
+        int m = snprintf(state->tx_request.summary, sizeof state->tx_request.summary,
                          "auto[%d/%d %d/%d]: %.190s",
                          a->cmd_idx + 1, a->n_commands,
                          a->repeat_idx + 1, a->repeats_total,
                          wire);
-        if (pst == SSO_PSEUDO_OK && m > 0 && (size_t) m < sizeof g_tx_request.summary)
-            snprintf(g_tx_request.summary + m, sizeof g_tx_request.summary - m,
+        if (pst == SSO_PSEUDO_OK && m > 0 && (size_t) m < sizeof state->tx_request.summary)
+            snprintf(state->tx_request.summary + m, sizeof state->tx_request.summary - m,
                      " (replaced '%s')", raw);
     }
-    g_tx_request.pending = 1;
+    state->tx_request.pending = 1;
     snprintf(a->last_sent, sizeof a->last_sent, "%.255s", wire);
     a->sends_total++;
 
@@ -5821,7 +5765,7 @@ static void viewer_render(int connected)
 
         int tx_log_row = LINES - TX_LOG_SIZE - 2;
         if (tx_log_row >= 17) {
-            render_tx_log_panel(tx_log_row, 1);
+            render_tx_log_panel(&g_viewer_state, tx_log_row, 1);
         }
     }
 
@@ -6081,7 +6025,7 @@ static void self_test_report(const state_t *state, FILE *out, int argc, char **a
     fprintf(out, "rx-lo-offset-khz: %+.3f\n", state->rx_lo_offset_hz / 1000.0);
 
     // TX safety / staging gates the operator might have set.
-    fprintf(out, "tx-no-tx: %s\n", g_no_tx ? "on (--no-tx)" : "off");
+    fprintf(out, "tx-no-tx: %s\n", state->no_tx ? "on (--no-tx)" : "off");
     fprintf(out, "tx-dry-run: %s\n", state->tx_dry_run ? "on (--tx-dry-run)" : "off");
     fprintf(out, "tx-auto-tcmd-file: %s\n",
             state->auto_tcmd_file_path[0] ? state->auto_tcmd_file_path : "(none)");
@@ -6129,6 +6073,12 @@ int main(int argc, char **argv)
     // so set the first-open defaults explicitly: the CTS1 prefix and 80 dB.
     snprintf(state.tx_last_payload, sizeof state.tx_last_payload, "CTS1+");
     snprintf(state.tx_last_power,   sizeof state.tx_last_power,   "80.0");
+    // Non-zero TX-core defaults (state_t is zero-initialised). The Doppler
+    // carrier falls back to the bare nominal until SGP4 has a range rate;
+    // preroll matches the tx_burst_run fallback. Both may be overridden in
+    // apply_args (--tx-preroll-ms) / the per-tick Doppler refresh.
+    state.tx_freq_hz_doppler = (long) FRONTIERSAT_CARRIER_HZ;
+    state.tx_preroll_ms      = 200;
 
     struct tm utc;
     struct timeval tv;
@@ -6154,7 +6104,7 @@ int main(int argc, char **argv)
     // Pin the SSO+ @tssent dedup key for this session: the startup UTC,
     // truncated to the minute. Constant for the life of the process so the
     // satellite runs an SSO+ time-sync once per pass. See sso_pseudo.h.
-    g_sso_pass_tssent_ms = (sso_now_utc_ms() / 60000LL) * 60000LL;
+    state.sso_pass_tssent_ms = (sso_now_utc_ms() / 60000LL) * 60000LL;
 #endif
 
     // Resolve + load the HMAC keyfile. The bytes feed every TX burst's
@@ -6729,7 +6679,7 @@ int main(int argc, char **argv)
         // amateur nominal and would give the wrong absolute frequency
         // here. Off when doppler_correction_enabled is false (e.g.
         // bench loopback) so RX and TX share one constant carrier.
-        g_tx_freq_hz_doppler = tx_burst_doppler_freq_hz(
+        state.tx_freq_hz_doppler = tx_burst_doppler_freq_hz(
             FRONTIERSAT_CARRIER_HZ,
             state.prediction.satellite_ephem.range_rate_km_s,
             state.doppler_correction_enabled);
@@ -7035,7 +6985,7 @@ int main(int argc, char **argv)
             // the terminal is tall enough to host it without colliding.
             int tx_log_row = LINES - TX_LOG_SIZE - 2;
             if (tx_log_row >= keyboard_info_row + 4) {
-                render_tx_log_panel(tx_log_row, 1);
+                render_tx_log_panel(&state, tx_log_row, 1);
             }
         }
 
@@ -7195,7 +7145,7 @@ int main(int argc, char **argv)
         // Pump the modal's debounced preview broadcast before the
         // screen flush so the mirror line is current when we paint.
         tx_compose_pump(&state);
-        // Drive the auto-tcmd burst loop. Queues g_tx_request when
+        // Drive the auto-tcmd burst loop. Queues state.tx_request when
         // it's time for the next send; the existing main-loop burst
         // handler below transmits and emits the SENT/NOT_SENT events.
         auto_tcmd_tick(&state);
@@ -7357,7 +7307,7 @@ int main(int argc, char **argv)
         //                       running between submit and poll so the
         //                       rotator, redraw, IPC and the next auto-
         //                       tcmd tick aren't frozen by the burst.
-        //                       g_tx_request.pending stays set across
+        //                       state.tx_request.pending stays set across
         //                       the in-flight window, so auto-tcmd will
         //                       not queue a second burst on top.
         //   3. neither:         reject so auto-tcmd can move on. The
@@ -7365,14 +7315,14 @@ int main(int argc, char **argv)
         //                       --without-b210 without also passing
         //                       --tx-dry-run; just clear the pending
         //                       slot rather than deadlocking.
-        if (g_tx_request.pending) {
+        if (state.tx_request.pending) {
             char summary[SSO_TX_TEXT_MAX];
             const char *outcome = NULL;
             int  on_air = 0;
             int  finished = 0;        // emit the result + clear pending this tick
             if (state.tx_dry_run) {
                 snprintf(summary, sizeof summary, "%s",
-                         g_tx_request.summary);
+                         state.tx_request.summary);
                 outcome = "dry-run";   // composed but deliberately not keyed
                 finished = 1;
             } else if (g_hmac_key_len == 0) {
@@ -7381,26 +7331,26 @@ int main(int argc, char **argv)
                 // would silently drop it. Refuse here so the operator
                 // sees a clear error instead of letting it go out unsigned.
                 snprintf(summary, sizeof summary, "%s",
-                         g_tx_request.summary);
+                         state.tx_request.summary);
                 outcome = "rejected: no HMAC key (see banner)";
                 finished = 1;
             } else if (g_rx_session != NULL && !rx_session_can_tx(g_rx_session)) {
                 // RX-only backend (e.g. RTL-SDR): never reaches the air.
                 // Backstop for a stale queued burst that slipped past the
                 // compose / auto-tcmd gates.
-                snprintf(summary, sizeof summary, "%s", g_tx_request.summary);
+                snprintf(summary, sizeof summary, "%s", state.tx_request.summary);
                 outcome = "rejected: RX-only SDR";
                 finished = 1;
             } else if (g_rx_session != NULL) {
-                if (!g_tx_inflight) {
-                    if (rx_session_submit_burst(g_rx_session, &g_tx_request,
+                if (!state.tx_inflight) {
+                    if (rx_session_submit_burst(g_rx_session, &state.tx_request,
                                                  g_hmac_key, g_hmac_key_len) == 0) {
-                        g_tx_inflight = 1;
+                        state.tx_inflight = 1;
                         // Stay pending; we'll poll on subsequent ticks.
                     } else {
                         // Worker refused (slot already busy or rxs error).
                         snprintf(summary, sizeof summary, "%s",
-                                 g_tx_request.summary);
+                                 state.tx_request.summary);
                         outcome = "rejected: rx_session busy";
                         finished = 1;
                     }
@@ -7415,7 +7365,7 @@ int main(int argc, char **argv)
                             case RX_BURST_FRAME_BUILD_FAILED: outcome = "rejected: frame build"; break;
                             case RX_BURST_UHD_ERROR:          outcome = "uhd-err"; break;
                         }
-                        g_tx_inflight = 0;
+                        state.tx_inflight = 0;
                         finished = 1;
                     }
                     // else: still in flight; fall through and let the
@@ -7423,7 +7373,7 @@ int main(int argc, char **argv)
                 }
             } else {
                 snprintf(summary, sizeof summary, "%s",
-                         g_tx_request.summary);
+                         state.tx_request.summary);
                 outcome = "rejected: no B210";
                 finished = 1;
             }
@@ -7449,7 +7399,7 @@ int main(int argc, char **argv)
                              outcome ? outcome : "?", on_air, summary);
                     sso_audit_event("tx-result", det);
                 }
-                g_tx_request.pending = 0;
+                state.tx_request.pending = 0;
             }
         }
 #endif
@@ -7854,7 +7804,7 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
         if (strcmp("--no-tx", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--no-tx",
                 "open the B210 for RX but block the TX compose modal from keying the PA");
-            else { state->n_options++; g_no_tx = 1; }
+            else { state->n_options++; state->no_tx = 1; }
             matched = 1;
         }
         if (strcmp("--live-waterfall", arg) == 0 || help) {
@@ -7906,7 +7856,7 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
                 int v = atoi(arg + 16);
                 if (v < 0)    v = 0;
                 if (v > 5000) v = 5000;
-                g_tx_preroll_ms = v;
+                state->tx_preroll_ms = v;
             }
             matched = 1;
         }

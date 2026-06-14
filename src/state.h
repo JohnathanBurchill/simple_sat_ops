@@ -26,6 +26,7 @@
 #include "sso_ipc.h"
 #include "telemetry.h"
 #include "tr_switch.h"
+#include "tx_burst.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -158,6 +159,18 @@ typedef struct auto_tcmd {
     char   status_msg[160];
 } auto_tcmd_t;
 
+// TX log ring buffer entry — one PREVIEW / TX_COMMAND_SENT / TX_NOT_SENT
+// event for the operator + viewer TX panels. ascii matches the upstream
+// sso_event_t.ascii field (SSO_TX_TEXT_MAX) so the panel renders the full
+// command text instead of a truncated preview.
+typedef struct {
+    sso_event_type_t kind;     // PREVIEW | TX_COMMAND_SENT | TX_NOT_SENT
+    char             ts[16];   // HH:MM:SS
+    char             ascii[SSO_TX_TEXT_MAX];
+    char             tx_not_sent_reason[24];
+} tx_log_entry_t;
+#define TX_LOG_SIZE 8
+
 #define MAX_TLE_LINE_LENGTH 128
 #define TRACKING_PREP_TIME_MINUTES 5.0
 
@@ -266,6 +279,37 @@ typedef struct state
     void        *auto_tcmd_win;           // WINDOW*
     auto_tcmd_t  auto_tcmd;
     char         auto_tcmd_file_path[512];
+
+    // TX burst path (SDR side). tx_request is the slot tx_compose_commit /
+    // auto_tcmd_tick stage a burst into; the main loop submits it to the
+    // rx_session worker and clears pending. tx_inflight gates submit-vs-poll
+    // so the loop stays responsive while the worker pauses RX, transmits,
+    // and resumes RX.
+    tx_request_slot_t tx_request;
+    int               tx_inflight;
+    // Doppler-corrected uplink carrier (Hz), refreshed each tick from the
+    // range rate; snapshotted by compose-preview / commit / auto-tcmd so a
+    // burst is keyed where the satellite hears the nominal carrier. Seeded
+    // to the bare nominal in main() before SGP4 has a valid range rate.
+    long              tx_freq_hz_doppler;
+    // @tssent dedup key for SSO+ expansions: startup UTC truncated to the
+    // minute, pinned once in main() so the flight firmware runs an SSO+
+    // time-sync once per pass. See sso_pseudo.h.
+    long long         sso_pass_tssent_ms;
+    // --no-tx blocks the compose modal from keying the PA; typing/preview
+    // still work so the operator can rehearse.
+    int               no_tx;
+    // Modulated 0xAA carrier prepended to every burst (ms). Stamped into
+    // tx_request.preroll_ms and read for the on-air estimate. Default 200,
+    // overridable via --tx-preroll-ms.
+    int               tx_preroll_ms;
+    // TX log ring buffer — last few PREVIEW/SENT/NOT_SENT events for the
+    // operator + viewer panels. Plus a persistent JSONL on-disk log opened
+    // lazily after pass_folder is set and fflushed per line.
+    tx_log_entry_t    tx_log[TX_LOG_SIZE];
+    size_t            tx_log_count;
+    FILE             *tx_log_fp;
+    char              tx_log_path[512];
 } state_t;
 
 
