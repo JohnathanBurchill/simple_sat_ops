@@ -51,6 +51,30 @@ typedef struct scan_sky
     char          csv_path[640];
 } scan_sky_t;
 
+#define CMD_BUF_SIZE 128
+#define CMD_HISTORY_SIZE 64
+
+// Bottom-of-screen ":" command line (vi-style). While active, every key
+// is routed through the command handler instead of the main key switch.
+typedef struct cmdline
+{
+    int  active;
+    char buf[CMD_BUF_SIZE];
+    int  len;
+    int  cursor;          // 0..len; insert position
+    char status[160];
+    // Preview debounce: dirty is set on every edit; the main loop
+    // broadcasts a preview event once the buffer has been idle long enough.
+    int  dirty;
+    long last_edit_ns;
+    // History: Up/Down cycle previously executed commands. The line being
+    // edited is stashed on the first Up so Down can return to it.
+    char history[CMD_HISTORY_SIZE][CMD_BUF_SIZE];
+    int  history_count;   // entries in use (capped at SIZE)
+    int  hist_pos;        // 0..count; ==count -> editing line
+    char hist_saved[CMD_BUF_SIZE];  // editing line stash
+} cmdline_t;
+
 #define MAX_TLE_LINE_LENGTH 128
 #define TRACKING_PREP_TIME_MINUTES 5.0
 
@@ -131,6 +155,9 @@ typedef struct state
 
     // Sky-scan grid + per-target CSV logging (--scan-sky).
     scan_sky_t scan;
+
+    // Bottom-of-screen ":" command line.
+    cmdline_t cmd;
 } state_t;
 
 

@@ -575,30 +575,9 @@ static void spectrum_job_reap(void)
 }
 
 // Command line: vi-style ":" prompt at the bottom of the screen for
-// runtime actions. While g_cmd_active, every key is routed through the
-// command handler instead of the main key switch.
-#define CMD_BUF_SIZE 128
-static int  g_cmd_active = 0;
-static char g_cmd_buf[CMD_BUF_SIZE];
-static int  g_cmd_len = 0;
-static int  g_cmd_cursor = 0;            // 0..g_cmd_len; insert position
-static char g_cmd_status[160] = "";
-// cmd-preview debounce state. cmd_dirty is set every time the buffer is
-// edited (or :  is entered fresh); the main loop broadcasts a preview
-// event once the buffer has been idle for cmd_debounce_ns. Mirrors how
-// the TX compose modal debounces its tx-preview events.
-static int    g_cmd_dirty        = 0;
-static long   g_cmd_last_edit_ns = 0;
+// runtime actions. State now lives in state_t.cmd (cmdline_t); the
+// preview-debounce interval is the one remaining tunable here.
 static long   g_cmd_debounce_ns  = 150000000L;  // 150 ms
-
-// Command history: Up/Down cycle previously executed commands,
-// shell-style. The line being edited is stashed on the first Up so Down
-// can return to it.
-#define CMD_HISTORY_SIZE 64
-static char g_cmd_history[CMD_HISTORY_SIZE][CMD_BUF_SIZE];
-static int  g_cmd_history_count = 0;   // entries in use (capped at SIZE)
-static int  g_cmd_hist_pos      = 0;   // 0..count; ==count -> editing line
-static char g_cmd_hist_saved[CMD_BUF_SIZE] = "";  // editing line stash
 
 static long cmd_now_ns(void)
 {
@@ -607,79 +586,79 @@ static long cmd_now_ns(void)
     return (long) ts.tv_sec * 1000000000L + (long) ts.tv_nsec;
 }
 
-static void cmd_enter(void)
+static void cmd_enter(state_t *state)
 {
-    g_cmd_active = 1;
-    g_cmd_buf[0] = '\0';
-    g_cmd_len = 0;
-    g_cmd_cursor = 0;
+    state->cmd.active = 1;
+    state->cmd.buf[0] = '\0';
+    state->cmd.len = 0;
+    state->cmd.cursor = 0;
     // Start a fresh history walk at the (empty) editing line.
-    g_cmd_hist_pos = g_cmd_history_count;
+    state->cmd.hist_pos = state->cmd.history_count;
     // Force an immediate preview broadcast so viewers see the ":" prompt
     // appear the moment the operator opens it.
-    g_cmd_dirty = 1;
-    g_cmd_last_edit_ns = 0;
+    state->cmd.dirty = 1;
+    state->cmd.last_edit_ns = 0;
 }
 
-static void cmd_set_status(const char *fmt, ...)
+static void cmd_set_status(state_t *state, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(g_cmd_status, sizeof g_cmd_status, fmt, ap);
+    vsnprintf(state->cmd.status, sizeof state->cmd.status, fmt, ap);
     va_end(ap);
 }
 
 // --- Command history -----------------------------------------------
 // Append a just-executed line. Skips blanks and immediate duplicates so
 // holding Enter or repeating a command doesn't bloat the ring.
-static void cmd_history_push(const char *line)
+static void cmd_history_push(state_t *state, const char *line)
 {
     if (line == NULL || line[0] == '\0') return;
-    if (g_cmd_history_count > 0
-        && strcmp(g_cmd_history[g_cmd_history_count - 1], line) == 0) {
-        g_cmd_hist_pos = g_cmd_history_count;
+    if (state->cmd.history_count > 0
+        && strcmp(state->cmd.history[state->cmd.history_count - 1], line) == 0) {
+        state->cmd.hist_pos = state->cmd.history_count;
         return;
     }
-    if (g_cmd_history_count < CMD_HISTORY_SIZE) {
-        snprintf(g_cmd_history[g_cmd_history_count], CMD_BUF_SIZE, "%s", line);
-        g_cmd_history_count++;
+    if (state->cmd.history_count < CMD_HISTORY_SIZE) {
+        snprintf(state->cmd.history[state->cmd.history_count], CMD_BUF_SIZE, "%s", line);
+        state->cmd.history_count++;
     } else {
-        memmove(&g_cmd_history[0], &g_cmd_history[1],
-                sizeof g_cmd_history[0] * (CMD_HISTORY_SIZE - 1));
-        snprintf(g_cmd_history[CMD_HISTORY_SIZE - 1], CMD_BUF_SIZE, "%s", line);
+        memmove(&state->cmd.history[0], &state->cmd.history[1],
+                sizeof state->cmd.history[0] * (CMD_HISTORY_SIZE - 1));
+        snprintf(state->cmd.history[CMD_HISTORY_SIZE - 1], CMD_BUF_SIZE, "%s", line);
     }
-    g_cmd_hist_pos = g_cmd_history_count;
+    state->cmd.hist_pos = state->cmd.history_count;
 }
 
 // Replace the live buffer and park the cursor at the end. Marks the
 // buffer dirty so the next tick re-broadcasts the preview to viewers.
-static void cmd_buf_set(const char *s)
+static void cmd_buf_set(state_t *state, const char *s)
 {
-    snprintf(g_cmd_buf, sizeof g_cmd_buf, "%s", s);
-    g_cmd_len = (int) strlen(g_cmd_buf);
-    g_cmd_cursor = g_cmd_len;
-    g_cmd_dirty = 1;
-    g_cmd_last_edit_ns = cmd_now_ns();
+    snprintf(state->cmd.buf, sizeof state->cmd.buf, "%s", s);
+    state->cmd.len = (int) strlen(state->cmd.buf);
+    state->cmd.cursor = state->cmd.len;
+    state->cmd.dirty = 1;
+    state->cmd.last_edit_ns = cmd_now_ns();
 }
 
-static void cmd_history_prev(void)   // Up
+static void cmd_history_prev(state_t *state)   // Up
 {
-    if (g_cmd_history_count == 0) return;
-    if (g_cmd_hist_pos == g_cmd_history_count) {
-        snprintf(g_cmd_hist_saved, sizeof g_cmd_hist_saved, "%s", g_cmd_buf);
+    if (state->cmd.history_count == 0) return;
+    if (state->cmd.hist_pos == state->cmd.history_count) {
+        snprintf(state->cmd.hist_saved, sizeof state->cmd.hist_saved, "%s", state->cmd.buf);
     }
-    if (g_cmd_hist_pos > 0) g_cmd_hist_pos--;
-    cmd_buf_set(g_cmd_history[g_cmd_hist_pos]);
+    if (state->cmd.hist_pos > 0) state->cmd.hist_pos--;
+    cmd_buf_set(state, state->cmd.history[state->cmd.hist_pos]);
 }
 
-static void cmd_history_next(void)   // Down
+static void cmd_history_next(state_t *state)   // Down
 {
-    if (g_cmd_history_count == 0) return;
-    if (g_cmd_hist_pos >= g_cmd_history_count) return;
-    g_cmd_hist_pos++;
-    cmd_buf_set(g_cmd_hist_pos == g_cmd_history_count
-                    ? g_cmd_hist_saved
-                    : g_cmd_history[g_cmd_hist_pos]);
+    if (state->cmd.history_count == 0) return;
+    if (state->cmd.hist_pos >= state->cmd.history_count) return;
+    state->cmd.hist_pos++;
+    cmd_buf_set(state, state->cmd.hist_pos == state->cmd.history_count
+                    ? state->cmd.hist_saved
+                    : state->cmd.history[state->cmd.hist_pos]);
 }
 
 // --- Path expansion + tab completion -------------------------------
@@ -730,18 +709,18 @@ static int cmd_expand(const char *in, char *out, size_t cap)
 
 // Insert a string at the cursor, shifting the tail right. Stops at the
 // buffer cap. Marks the line dirty for the preview broadcast.
-static void cmd_insert_str(const char *s)
+static void cmd_insert_str(state_t *state, const char *s)
 {
     for (const char *p = s; *p; ++p) {
-        if (g_cmd_len >= (int) sizeof g_cmd_buf - 1) break;
-        memmove(&g_cmd_buf[g_cmd_cursor + 1], &g_cmd_buf[g_cmd_cursor],
-                (size_t)(g_cmd_len - g_cmd_cursor + 1));  // include nul
-        g_cmd_buf[g_cmd_cursor] = *p;
-        g_cmd_len++;
-        g_cmd_cursor++;
+        if (state->cmd.len >= (int) sizeof state->cmd.buf - 1) break;
+        memmove(&state->cmd.buf[state->cmd.cursor + 1], &state->cmd.buf[state->cmd.cursor],
+                (size_t)(state->cmd.len - state->cmd.cursor + 1));  // include nul
+        state->cmd.buf[state->cmd.cursor] = *p;
+        state->cmd.len++;
+        state->cmd.cursor++;
     }
-    g_cmd_dirty = 1;
-    g_cmd_last_edit_ns = cmd_now_ns();
+    state->cmd.dirty = 1;
+    state->cmd.last_edit_ns = cmd_now_ns();
 }
 
 // Command names, for first-token completion.
@@ -757,19 +736,19 @@ static const char *const g_cmd_names[] = {
 // scan, so `:retarget $TLES/20260529/<TAB>` keeps `$TLES` and fills in
 // the file. Single match -> full completion (with a trailing `/` for a
 // directory); multiple -> extend to the longest common prefix.
-static void cmd_tab_complete(void)
+static void cmd_tab_complete(state_t *state)
 {
-    if (!g_cmd_active) return;
+    if (!state->cmd.active) return;
 
-    int start = g_cmd_cursor;
-    while (start > 0 && g_cmd_buf[start - 1] != ' '
-                     && g_cmd_buf[start - 1] != '\t') {
+    int start = state->cmd.cursor;
+    while (start > 0 && state->cmd.buf[start - 1] != ' '
+                     && state->cmd.buf[start - 1] != '\t') {
         start--;
     }
-    int tok_len = g_cmd_cursor - start;
+    int tok_len = state->cmd.cursor - start;
     char token[CMD_BUF_SIZE];
     if (tok_len < 0 || tok_len >= (int) sizeof token) return;
-    memcpy(token, g_cmd_buf + start, (size_t) tok_len);
+    memcpy(token, state->cmd.buf + start, (size_t) tok_len);
     token[tok_len] = '\0';
 
     // First token -> command-name completion.
@@ -793,11 +772,11 @@ static void cmd_tab_complete(void)
             }
         }
         if (n == 1) {
-            cmd_insert_str(only + tok_len);
-            cmd_insert_str(" ");
+            cmd_insert_str(state, only + tok_len);
+            cmd_insert_str(state, " ");
         } else if (n > 1 && common > (size_t) tok_len) {
             // lcp is already truncated to the common prefix.
-            cmd_insert_str(lcp + tok_len);
+            cmd_insert_str(state, lcp + tok_len);
         }
         return;
     }
@@ -857,7 +836,7 @@ static void cmd_tab_complete(void)
     if (n == 0) return;
 
     if (n == 1) {
-        cmd_insert_str(only + base_len);
+        cmd_insert_str(state, only + base_len);
         // Append '/' when the single match is a directory.
         char full[2048];
         size_t sl = strlen(scan_dir);
@@ -868,11 +847,11 @@ static void cmd_tab_complete(void)
         }
         struct stat st;
         if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
-            cmd_insert_str("/");
+            cmd_insert_str(state, "/");
         }
     } else if (common > base_len) {
         // lcp is already truncated to the common prefix of all matches.
-        cmd_insert_str(lcp + base_len);
+        cmd_insert_str(state, lcp + base_len);
     }
 }
 
@@ -923,69 +902,69 @@ static char g_target_name[64];
 
 // Dispatch the typed command. state may be touched by tracking-related
 // commands; nothing else needs it. Returns nothing -- result lands in
-// g_cmd_status for the next redraw.
+// state->cmd.status for the next redraw.
 static void cmd_dispatch(state_t *state)
 {
     char buf[CMD_BUF_SIZE];
-    snprintf(buf, sizeof buf, "%s", g_cmd_buf);
+    snprintf(buf, sizeof buf, "%s", state->cmd.buf);
     // Trim leading whitespace; an empty command is a no-op.
     char *p = buf;
     while (*p == ' ' || *p == '\t') ++p;
-    if (*p == '\0') { cmd_set_status(""); return; }
+    if (*p == '\0') { cmd_set_status(state, ""); return; }
 
     char *save = NULL;
     char *cmd  = strtok_r(p, " \t", &save);
     char *arg1 = strtok_r(NULL, " \t", &save);
 
     if (cmd == NULL) {
-        cmd_set_status("");
+        cmd_set_status(state, "");
         return;
     }
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "h") == 0 || strcmp(cmd, "?") == 0) {
-        cmd_set_status("commands: help tx track stop home quit "
+        cmd_set_status(state, "commands: help tx track stop home quit "
                        "retarget <tle-file> "
                        "freq <MHz> lo_offset <±kHz> lo_bandwidth <kHz> "
                        "gain <dB> rs on|off spectrum <sec>");
     } else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0
                || strcmp(cmd, "exit") == 0) {
         state->running = 0;
-        cmd_set_status("quitting");
+        cmd_set_status(state, "quitting");
     } else if (strcmp(cmd, "tx") == 0) {
         // Defer the modal until after we leave command-mode so the
         // bottom prompt doesn't bleed under the modal box.
-        cmd_set_status("opening TX compose...");
-        g_cmd_active = 0;
+        cmd_set_status(state, "opening TX compose...");
+        state->cmd.active = 0;
         tx_compose_open();
     } else if (strcmp(cmd, "auto") == 0) {
         if (g_auto_tcmd_file_path[0] == '\0') {
-            cmd_set_status("auto: no --tc-file=<path> given on the cmdline");
+            cmd_set_status(state, "auto: no --tc-file=<path> given on the cmdline");
         } else {
-            cmd_set_status("opening auto-tcmd...");
-            g_cmd_active = 0;
+            cmd_set_status(state, "opening auto-tcmd...");
+            state->cmd.active = 0;
             auto_tcmd_open();
         }
     } else if (strcmp(cmd, "track") == 0) {
         start_tracking(state);
-        cmd_set_status("tracking on");
+        cmd_set_status(state, "tracking on");
         sso_audit_event("track-on",
             state->prediction.satellite_ephem.tle.sat_name[0]
                 ? state->prediction.satellite_ephem.tle.sat_name : "");
     } else if (strcmp(cmd, "stop") == 0) {
         stop_tracking(state);
-        cmd_set_status("tracking stopped");
+        cmd_set_status(state, "tracking stopped");
         sso_audit_event("track-off", "");
     } else if (strcmp(cmd, "home") == 0) {
         stop_tracking(state);
         point_to_stationary_target(state, 0.0, 0.0);
-        cmd_set_status("home: az=0 el=0");
+        cmd_set_status(state, "home: az=0 el=0");
         sso_audit_event("rotator-home", "az=0 el=0");
     } else if (strcmp(cmd, "retarget") == 0) {
         char expanded[1024];
         if (arg1 == NULL) {
-            cmd_set_status("retarget: usage `retarget <tle-file>` "
+            cmd_set_status(state, "retarget: usage `retarget <tle-file>` "
                            "(first satellite in the file is used)");
         } else if (cmd_expand(arg1, expanded, sizeof expanded) != 0) {
-            cmd_set_status("retarget: path too long after expansion");
+            cmd_set_status(state, "retarget: path too long after expansion");
         } else {
             int rc = retarget_to_tle(state, expanded);
             const char *name =
@@ -995,46 +974,46 @@ static void cmd_dispatch(state_t *state)
             switch (rc) {
             case RETARGET_OK:
                 if (mins > 0.0) {
-                    cmd_set_status("retarget -> %s (AOS in %.1f min)",
+                    cmd_set_status(state, "retarget -> %s (AOS in %.1f min)",
                                    name, mins);
                 } else {
-                    cmd_set_status("retarget -> %s (in pass, %.0fs elapsed)",
+                    cmd_set_status(state, "retarget -> %s (in pass, %.0fs elapsed)",
                                    name, -mins * 60.0);
                 }
                 sso_audit_event("retarget", name);
                 break;
             case RETARGET_SAME:
-                cmd_set_status("retarget: already on %s (same file)", arg1);
+                cmd_set_status(state, "retarget: already on %s (same file)", arg1);
                 break;
             case RETARGET_READ_ERR:
-                cmd_set_status("retarget: cannot read a TLE from '%s'", arg1);
+                cmd_set_status(state, "retarget: cannot read a TLE from '%s'", arg1);
                 break;
             case RETARGET_BAD_TLE:
-                cmd_set_status("retarget: '%s' has invalid TLE elements",
+                cmd_set_status(state, "retarget: '%s' has invalid TLE elements",
                                arg1);
                 break;
             default:
-                cmd_set_status("retarget: bad argument");
+                cmd_set_status(state, "retarget: bad argument");
                 break;
             }
         }
     } else if (strcmp(cmd, "freq") == 0) {
         if (arg1 == NULL) {
-            cmd_set_status("freq: missing argument (MHz)");
+            cmd_set_status(state, "freq: missing argument (MHz)");
         } else {
 #ifdef SSO_WITH_SDR
             double v = atof(arg1);
             double hz = (v < 1e6) ? v * 1e6 : v;   // accept MHz or Hz
             if (hz < 1e6 || hz > 6e9) {
-                cmd_set_status("freq: %g out of [1 MHz, 6 GHz]", hz);
+                cmd_set_status(state, "freq: %g out of [1 MHz, 6 GHz]", hz);
             } else if (g_rx_session == NULL) {
-                cmd_set_status("freq: no RX session");
+                cmd_set_status(state, "freq: no RX session");
             } else {
                 rx_session_request_freq(g_rx_session, hz);
-                cmd_set_status("freq -> %.6f MHz", hz / 1e6);
+                cmd_set_status(state, "freq -> %.6f MHz", hz / 1e6);
             }
 #else
-            cmd_set_status("freq: this build has no USRP support");
+            cmd_set_status(state, "freq: this build has no USRP support");
 #endif
         }
     } else if (strcmp(cmd, "rs") == 0) {
@@ -1042,28 +1021,28 @@ static void cmd_dispatch(state_t *state)
         // sets reed_solomon at open() time. Flag this clearly instead
         // of silently no-op'ing.
         if (arg1 == NULL) {
-            cmd_set_status("rs: usage: rs on|off (not yet runtime-toggleable)");
+            cmd_set_status(state, "rs: usage: rs on|off (not yet runtime-toggleable)");
         } else {
-            cmd_set_status("rs %s: NOT YET WIRED -- rx_session_open params only",
+            cmd_set_status(state, "rs %s: NOT YET WIRED -- rx_session_open params only",
                            arg1);
         }
     } else if (strcmp(cmd, "spectrum") == 0 || strcmp(cmd, "spec") == 0) {
 #ifdef SSO_WITH_SDR
         if (arg1 == NULL) {
-            cmd_set_status("spectrum: usage `spectrum <seconds>` (1..600)");
+            cmd_set_status(state, "spectrum: usage `spectrum <seconds>` (1..600)");
         } else if (g_rx_session == NULL) {
-            cmd_set_status("spectrum: no RX session");
+            cmd_set_status(state, "spectrum: no RX session");
         } else {
             double duration_s = atof(arg1);
             if (duration_s <= 0.0) {
-                cmd_set_status("spectrum: invalid duration '%s'", arg1);
+                cmd_set_status(state, "spectrum: invalid duration '%s'", arg1);
             } else {
                 if (duration_s > 600.0) duration_s = 600.0;
                 if (duration_s < 1.0)   duration_s = 1.0;
 
                 spectrum_job_reap();
                 if (g_spec_job.active) {
-                    cmd_set_status("spectrum: a render is already in progress");
+                    cmd_set_status(state, "spectrum: a render is already in progress");
                 } else {
                     char wav_path[512];
                     long n_samples = 0;
@@ -1073,13 +1052,13 @@ static void cmd_dispatch(state_t *state)
                                             wav_path, sizeof wav_path,
                                             &n_samples, &sample_rate, &wav_active);
                     if (wav_path[0] == '\0' || sample_rate <= 0) {
-                        cmd_set_status("spectrum: no WAV (recording not started yet)");
+                        cmd_set_status(state, "spectrum: no WAV (recording not started yet)");
                     } else {
                         long want  = (long)(duration_s * (double) sample_rate);
                         long start = n_samples - want;
                         if (start < 0) { start = 0; want = n_samples; }
                         if (want <= 0) {
-                            cmd_set_status("spectrum: no samples captured yet");
+                            cmd_set_status(state, "spectrum: no samples captured yet");
                         } else {
                             // Filename: strip .wav and append a local-time stamp range.
                             char base[512];
@@ -1134,11 +1113,11 @@ static void cmd_dispatch(state_t *state)
 
                             if (pthread_create(&g_spec_job.thr, NULL,
                                                spectrum_worker, &g_spec_job) != 0) {
-                                cmd_set_status("spectrum: pthread_create failed: %s",
+                                cmd_set_status(state, "spectrum: pthread_create failed: %s",
                                                strerror(errno));
                             } else {
                                 g_spec_job.active = 1;
-                                cmd_set_status("spectrum: rendering %.1fs (%s) -> %s",
+                                cmd_set_status(state, "spectrum: rendering %.1fs (%s) -> %s",
                                                (double) want / (double) sample_rate,
                                                g_spec_job.iq_in[0] ? "iq" : "wav",
                                                g_spec_job.png_out);
@@ -1149,7 +1128,7 @@ static void cmd_dispatch(state_t *state)
             }
         }
 #else
-        cmd_set_status("spectrum: this build has no USRP support");
+        cmd_set_status(state, "spectrum: this build has no USRP support");
 #endif
     } else if (strcmp(cmd, "lo_offset") == 0) {
         // Move the hardware LO mid-pass to dodge a baseband artifact.
@@ -1159,26 +1138,26 @@ static void cmd_dispatch(state_t *state)
         // range ~±5..±40 kHz; clipped here to ±45 kHz so the worst
         // case still keeps a 3 kHz margin to the post-decim band edge.
         if (arg1 == NULL) {
-            cmd_set_status("lo_offset: usage `lo_offset <signed_kHz>` "
+            cmd_set_status(state, "lo_offset: usage `lo_offset <signed_kHz>` "
                            "(comfort range ±5..±40)");
         } else {
 #ifdef SSO_WITH_SDR
             double khz = atof(arg1);
             if (khz < -45.0 || khz > 45.0) {
-                cmd_set_status("lo_offset: %g kHz out of [-45, +45]", khz);
+                cmd_set_status(state, "lo_offset: %g kHz out of [-45, +45]", khz);
             } else if (g_rx_session == NULL) {
-                cmd_set_status("lo_offset: no RX session");
+                cmd_set_status(state, "lo_offset: no RX session");
             } else {
                 double new_offset_hz = khz * 1000.0;
                 state->rx_lo_offset_hz = new_offset_hz;
                 rx_session_set_lo_offset(g_rx_session,
                                          state->nominal_downlink_frequency_hz,
                                          new_offset_hz);
-                cmd_set_status("lo_offset -> %+.1f kHz (PLL glitching, "
+                cmd_set_status(state, "lo_offset -> %+.1f kHz (PLL glitching, "
                                "decode resumes shortly)", khz);
             }
 #else
-            cmd_set_status("lo_offset: this build has no USRP support");
+            cmd_set_status(state, "lo_offset: this build has no USRP support");
 #endif
         }
     } else if (strcmp(cmd, "lo_bandwidth") == 0) {
@@ -1188,23 +1167,23 @@ static void cmd_dispatch(state_t *state)
         // "bandwidth N\n". Name mirrors :lo_offset so both LO-
         // relative knobs live in the same command family.
         if (arg1 == NULL) {
-            cmd_set_status("lo_bandwidth: usage `lo_bandwidth <N>` (kHz)");
+            cmd_set_status(state, "lo_bandwidth: usage `lo_bandwidth <N>` (kHz)");
         } else if (g_live_waterfall_stdin_fd < 0) {
-            cmd_set_status("lo_bandwidth: no live viewer running "
+            cmd_set_status(state, "lo_bandwidth: no live viewer running "
                            "(launch with --live-waterfall)");
         } else {
             double n = atof(arg1);
             if (n <= 0.0 || n > 1000.0) {
-                cmd_set_status("lo_bandwidth: %g out of (0, 1000] kHz", n);
+                cmd_set_status(state, "lo_bandwidth: %g out of (0, 1000] kHz", n);
             } else {
                 char line[64];
                 int  ln = snprintf(line, sizeof line, "bandwidth %g\n", n);
                 ssize_t w = (ln > 0) ? write(g_live_waterfall_stdin_fd,
                                              line, (size_t) ln) : -1;
                 if (w == ln) {
-                    cmd_set_status("lo_bandwidth: -> %g kHz", n);
+                    cmd_set_status(state, "lo_bandwidth: -> %g kHz", n);
                 } else {
-                    cmd_set_status("lo_bandwidth: write failed: %s",
+                    cmd_set_status(state, "lo_bandwidth: write failed: %s",
                                    strerror(errno));
                 }
             }
@@ -1215,26 +1194,26 @@ static void cmd_dispatch(state_t *state)
         // worker thread so we don't touch the UHD streamer from this
         // thread (same handoff as :lo_offset).
         if (arg1 == NULL) {
-            cmd_set_status("gain: usage `gain <dB>` (range 0-76; current %.1f)",
+            cmd_set_status(state, "gain: usage `gain <dB>` (range 0-76; current %.1f)",
                            state->rx_gain_db);
         } else {
 #ifdef SSO_WITH_SDR
             double g = atof(arg1);
             if (g < 0.0 || g > 76.0) {
-                cmd_set_status("gain: %g dB out of [0, 76]", g);
+                cmd_set_status(state, "gain: %g dB out of [0, 76]", g);
             } else if (g_rx_session == NULL) {
-                cmd_set_status("gain: no RX session");
+                cmd_set_status(state, "gain: no RX session");
             } else {
                 state->rx_gain_db = g;
                 rx_session_set_gain(g_rx_session, g);
-                cmd_set_status("gain -> %.1f dB", g);
+                cmd_set_status(state, "gain -> %.1f dB", g);
             }
 #else
-            cmd_set_status("gain: this build has no USRP support");
+            cmd_set_status(state, "gain: this build has no USRP support");
 #endif
         }
     } else {
-        cmd_set_status("unknown command '%s' (try :help)", cmd);
+        cmd_set_status(state, "unknown command '%s' (try :help)", cmd);
     }
 }
 
@@ -1242,21 +1221,21 @@ static void cmd_dispatch(state_t *state)
 // live buffer (debounced in the main loop); cmd-executed carries the
 // dispatched command + the resulting status string. Both helpers no-op
 // when g_ipc isn't open (e.g., --no-control).
-static void cmd_broadcast_preview(void)
+static void cmd_broadcast_preview(state_t *state)
 {
     if (!g_ipc) return;
     sso_event_t evt;
     sso_event_init(&evt, SSO_EVT_CMD_PREVIEW);
     snprintf(evt.from, sizeof evt.from, "%s",
              g_operator_user ? g_operator_user : "?");
-    snprintf(evt.cmd_text, sizeof evt.cmd_text, "%s", g_cmd_buf);
+    snprintf(evt.cmd_text, sizeof evt.cmd_text, "%s", state->cmd.buf);
     char buf[2048];
     if (sso_event_encode(&evt, buf, sizeof buf) == 0) {
         sso_ipc_server_broadcast(g_ipc, buf);
     }
 }
 
-static void cmd_broadcast_executed(const char *executed_cmd)
+static void cmd_broadcast_executed(state_t *state, const char *executed_cmd)
 {
     if (!g_ipc) return;
     sso_event_t evt;
@@ -1265,7 +1244,7 @@ static void cmd_broadcast_executed(const char *executed_cmd)
              g_operator_user ? g_operator_user : "?");
     snprintf(evt.cmd_text,   sizeof evt.cmd_text,   "%s",
              executed_cmd ? executed_cmd : "");
-    snprintf(evt.cmd_status, sizeof evt.cmd_status, "%s", g_cmd_status);
+    snprintf(evt.cmd_status, sizeof evt.cmd_status, "%s", state->cmd.status);
     char buf[2048];
     if (sso_event_encode(&evt, buf, sizeof buf) == 0) {
         sso_ipc_server_broadcast(g_ipc, buf);
@@ -1288,47 +1267,47 @@ typedef enum {
     CMD_ACTION_HIST_NEXT,
 } cmd_action_t;
 
-static int cmd_apply_action(cmd_action_t a)
+static int cmd_apply_action(state_t *state, cmd_action_t a)
 {
     switch (a) {
         case CMD_ACTION_LEFT:
-            if (g_cmd_cursor > 0) g_cmd_cursor--;
+            if (state->cmd.cursor > 0) state->cmd.cursor--;
             return 1;
         case CMD_ACTION_RIGHT:
-            if (g_cmd_cursor < g_cmd_len) g_cmd_cursor++;
+            if (state->cmd.cursor < state->cmd.len) state->cmd.cursor++;
             return 1;
         case CMD_ACTION_HOME:
-            g_cmd_cursor = 0;
+            state->cmd.cursor = 0;
             return 1;
         case CMD_ACTION_END:
-            g_cmd_cursor = g_cmd_len;
+            state->cmd.cursor = state->cmd.len;
             return 1;
         case CMD_ACTION_BACKSPACE:
-            if (g_cmd_cursor > 0) {
-                memmove(&g_cmd_buf[g_cmd_cursor - 1],
-                        &g_cmd_buf[g_cmd_cursor],
-                        (size_t)(g_cmd_len - g_cmd_cursor + 1));
-                g_cmd_len--;
-                g_cmd_cursor--;
-                g_cmd_dirty = 1;
-                g_cmd_last_edit_ns = cmd_now_ns();
+            if (state->cmd.cursor > 0) {
+                memmove(&state->cmd.buf[state->cmd.cursor - 1],
+                        &state->cmd.buf[state->cmd.cursor],
+                        (size_t)(state->cmd.len - state->cmd.cursor + 1));
+                state->cmd.len--;
+                state->cmd.cursor--;
+                state->cmd.dirty = 1;
+                state->cmd.last_edit_ns = cmd_now_ns();
             }
             return 1;
         case CMD_ACTION_DEL:
-            if (g_cmd_cursor < g_cmd_len) {
-                memmove(&g_cmd_buf[g_cmd_cursor],
-                        &g_cmd_buf[g_cmd_cursor + 1],
-                        (size_t)(g_cmd_len - g_cmd_cursor));
-                g_cmd_len--;
-                g_cmd_dirty = 1;
-                g_cmd_last_edit_ns = cmd_now_ns();
+            if (state->cmd.cursor < state->cmd.len) {
+                memmove(&state->cmd.buf[state->cmd.cursor],
+                        &state->cmd.buf[state->cmd.cursor + 1],
+                        (size_t)(state->cmd.len - state->cmd.cursor));
+                state->cmd.len--;
+                state->cmd.dirty = 1;
+                state->cmd.last_edit_ns = cmd_now_ns();
             }
             return 1;
         case CMD_ACTION_HIST_PREV:
-            cmd_history_prev();
+            cmd_history_prev(state);
             return 1;
         case CMD_ACTION_HIST_NEXT:
-            cmd_history_next();
+            cmd_history_next(state);
             return 1;
         default:
             return 0;
@@ -1380,29 +1359,29 @@ static cmd_action_t cmd_drain_csi(void)
 // wire field carries the buffer verbatim; cursor position stays local.
 static int cmd_handle_key(int key, state_t *state)
 {
-    if (!g_cmd_active) return 0;
+    if (!state->cmd.active) return 0;
     if (key == ERR) return 1;
     if (key == 27 /* Esc OR start of a CSI sequence */) {
         cmd_action_t a = cmd_drain_csi();
         if (a != CMD_ACTION_NONE) {
-            cmd_apply_action(a);
+            cmd_apply_action(state, a);
             return 1;
         }
         // Truly bare Esc — cancel.
-        g_cmd_active = 0;
-        g_cmd_status[0] = '\0';
-        g_cmd_buf[0] = '\0';
-        g_cmd_len = 0;
-        g_cmd_cursor = 0;
-        cmd_broadcast_executed("");
-        g_cmd_dirty = 0;
+        state->cmd.active = 0;
+        state->cmd.status[0] = '\0';
+        state->cmd.buf[0] = '\0';
+        state->cmd.len = 0;
+        state->cmd.cursor = 0;
+        cmd_broadcast_executed(state, "");
+        state->cmd.dirty = 0;
         return 1;
     }
     if (key == '\n' || key == '\r' || key == KEY_ENTER) {
         char executed[CMD_BUF_SIZE];
-        snprintf(executed, sizeof executed, "%s", g_cmd_buf);
-        g_cmd_active = 0;
-        cmd_history_push(executed);
+        snprintf(executed, sizeof executed, "%s", state->cmd.buf);
+        state->cmd.active = 0;
+        cmd_history_push(state, executed);
         cmd_dispatch(state);
         // Audit: one line per `:` command the operator pressed Enter on,
         // with the post-dispatch status so a reviewer sees both the
@@ -1412,60 +1391,60 @@ static int cmd_handle_key(int key, state_t *state)
             char det[480];
             snprintf(det, sizeof det,
                      "input=\"%.100s\" result=\"%.150s\"",
-                     executed, g_cmd_status);
+                     executed, state->cmd.status);
             sso_audit_event("cmd", det);
         }
-        // After dispatch, g_cmd_status holds the result string. Mirror
+        // After dispatch, state->cmd.status holds the result string. Mirror
         // both to viewers so they see exactly what the operator sees.
-        cmd_broadcast_executed(executed);
-        g_cmd_dirty = 0;
+        cmd_broadcast_executed(state, executed);
+        state->cmd.dirty = 0;
         return 1;
     }
-    if (key == '\t')      { cmd_tab_complete(); return 1; }
-    if (key == KEY_UP)    { cmd_history_prev(); return 1; }
-    if (key == KEY_DOWN)  { cmd_history_next(); return 1; }
-    if (key == KEY_LEFT)  return cmd_apply_action(CMD_ACTION_LEFT);
-    if (key == KEY_RIGHT) return cmd_apply_action(CMD_ACTION_RIGHT);
+    if (key == '\t')      { cmd_tab_complete(state); return 1; }
+    if (key == KEY_UP)    { cmd_history_prev(state); return 1; }
+    if (key == KEY_DOWN)  { cmd_history_next(state); return 1; }
+    if (key == KEY_LEFT)  return cmd_apply_action(state, CMD_ACTION_LEFT);
+    if (key == KEY_RIGHT) return cmd_apply_action(state, CMD_ACTION_RIGHT);
     if (key == KEY_HOME || key == 1 /* Ctrl-A */)
-        return cmd_apply_action(CMD_ACTION_HOME);
+        return cmd_apply_action(state, CMD_ACTION_HOME);
     if (key == KEY_END  || key == 5 /* Ctrl-E */)
-        return cmd_apply_action(CMD_ACTION_END);
+        return cmd_apply_action(state, CMD_ACTION_END);
     if (key == KEY_BACKSPACE || key == 127 || key == 8)
-        return cmd_apply_action(CMD_ACTION_BACKSPACE);
+        return cmd_apply_action(state, CMD_ACTION_BACKSPACE);
     if (key == KEY_DC || key == 4 /* Ctrl-D */)
-        return cmd_apply_action(CMD_ACTION_DEL);
-    if (key >= 32 && key < 127 && g_cmd_len < (int) sizeof g_cmd_buf - 1) {
+        return cmd_apply_action(state, CMD_ACTION_DEL);
+    if (key >= 32 && key < 127 && state->cmd.len < (int) sizeof state->cmd.buf - 1) {
         // Insert at cursor: shift the tail right by one, drop char in.
-        memmove(&g_cmd_buf[g_cmd_cursor + 1],
-                &g_cmd_buf[g_cmd_cursor],
-                (size_t)(g_cmd_len - g_cmd_cursor + 1));  // include nul
-        g_cmd_buf[g_cmd_cursor] = (char) key;
-        g_cmd_len++;
-        g_cmd_cursor++;
-        g_cmd_dirty = 1;
-        g_cmd_last_edit_ns = cmd_now_ns();
+        memmove(&state->cmd.buf[state->cmd.cursor + 1],
+                &state->cmd.buf[state->cmd.cursor],
+                (size_t)(state->cmd.len - state->cmd.cursor + 1));  // include nul
+        state->cmd.buf[state->cmd.cursor] = (char) key;
+        state->cmd.len++;
+        state->cmd.cursor++;
+        state->cmd.dirty = 1;
+        state->cmd.last_edit_ns = cmd_now_ns();
     }
     return 1;
 }
 
 // Render the command prompt (or last-result status) on the bottom row.
-// Cursor is drawn as a reverse-video block on the char at g_cmd_cursor
+// Cursor is drawn as a reverse-video block on the char at state->cmd.cursor
 // — or on a trailing space when the cursor is at end-of-line. The
 // surrounding text is plain so cursor position is unambiguous.
-static void cmd_render(void)
+static void cmd_render(state_t *state)
 {
     int row = LINES - 1;
-    if (g_cmd_active) {
+    if (state->cmd.active) {
         move(row, 0);
         addch(':');
-        for (int i = 0; i < g_cmd_len; ++i) {
-            if (i == g_cmd_cursor) {
-                addch(((unsigned char) g_cmd_buf[i]) | A_REVERSE);
+        for (int i = 0; i < state->cmd.len; ++i) {
+            if (i == state->cmd.cursor) {
+                addch(((unsigned char) state->cmd.buf[i]) | A_REVERSE);
             } else {
-                addch((unsigned char) g_cmd_buf[i]);
+                addch((unsigned char) state->cmd.buf[i]);
             }
         }
-        if (g_cmd_cursor == g_cmd_len) {
+        if (state->cmd.cursor == state->cmd.len) {
             addch(' ' | A_REVERSE);
         }
         clrtoeol();
@@ -1473,10 +1452,10 @@ static void cmd_render(void)
         // block highlights. The layered refresh below will curs_set(1)
         // when an editable context is active so the operator sees a
         // visible blinking cursor on top of the inverse block.
-        move(row, 1 + g_cmd_cursor);
+        move(row, 1 + state->cmd.cursor);
         return;
-    } else if (g_cmd_status[0]) {
-        mvprintw(row, 0, "%s", g_cmd_status);
+    } else if (state->cmd.status[0]) {
+        mvprintw(row, 0, "%s", state->cmd.status);
     } else {
         move(row, 0);
     }
@@ -7181,14 +7160,14 @@ int main(int argc, char **argv)
             if (!auto_tcmd_handle_key(key)) {
                 auto_tcmd_close();
             }
-        } else if (g_cmd_active) {
+        } else if (state.cmd.active) {
             cmd_handle_key(key, &state);
         } else if (key == 'K') {
             keyboard_unlocked = !keyboard_unlocked;
         } else if (keyboard_unlocked) {
             switch (key) {
                 case ':':
-                    cmd_enter();
+                    cmd_enter(&state);
                     break;
                 case 'q':
                     state.running = 0;
@@ -7343,9 +7322,9 @@ int main(int argc, char **argv)
         // diff is otherwise free to skip "unchanged" modal cells, which
         // is what was letting panel updates (e.g. the antenna status
         // row) bleed through and overwrite the modal.
-        if (redraw_due || g_cmd_active || g_tx_compose_active
+        if (redraw_due || state.cmd.active || g_tx_compose_active
             || g_auto_tcmd_active) {
-            cmd_render();
+            cmd_render(&state);
             refresh();
             int show_hw_cursor = 0;
             if (g_tx_compose_active && g_tx_compose_win) {
@@ -7358,7 +7337,7 @@ int main(int argc, char **argv)
                 wrefresh(g_auto_tcmd_win);
                 show_hw_cursor = (g_auto_tcmd.state != AUTO_STATE_RUNNING)
                               && auto_field_is_text(g_auto_tcmd.focus);
-            } else if (g_cmd_active) {
+            } else if (state.cmd.active) {
                 show_hw_cursor = 1;
             }
             curs_set(show_hw_cursor ? 1 : 0);
@@ -7603,10 +7582,10 @@ int main(int argc, char **argv)
             // Debounced cmd-preview broadcast: viewers see the operator's
             // ":" prompt as it's typed, lagging by g_cmd_debounce_ns so we
             // don't fire a packet per keystroke.
-            if (g_cmd_active && g_cmd_dirty
-                && (cmd_now_ns() - g_cmd_last_edit_ns) >= g_cmd_debounce_ns) {
-                cmd_broadcast_preview();
-                g_cmd_dirty = 0;
+            if (state.cmd.active && state.cmd.dirty
+                && (cmd_now_ns() - state.cmd.last_edit_ns) >= g_cmd_debounce_ns) {
+                cmd_broadcast_preview(&state);
+                state.cmd.dirty = 0;
             }
         }
         if (g_yield_requested) {
@@ -7621,7 +7600,7 @@ int main(int argc, char **argv)
         // alone, so reading it after reap is safe.
         if (g_spec_job.active && g_spec_job.done) {
             if (g_spec_job.status_msg[0]) {
-                cmd_set_status("%s", g_spec_job.status_msg);
+                cmd_set_status(&state, "%s", g_spec_job.status_msg);
             }
             spectrum_job_reap();
         }
@@ -7634,7 +7613,7 @@ int main(int argc, char **argv)
             // Exception: while the operator is typing in the ":" prompt,
             // drop to 20 ms so getch() echoes each keystroke promptly
             // (the 500 ms tick was capping input at ~2 chars/sec).
-            usleep((g_cmd_active || g_tx_compose_active || g_auto_tcmd_active)
+            usleep((state.cmd.active || g_tx_compose_active || g_auto_tcmd_active)
                    ? 20000 : UPDATE_INTERVAL_MICROSEC);
         }
     }
@@ -8671,7 +8650,7 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
         state->antenna_rotator.unwrapped_target_valid   = 1;
         state->antenna_rotator.homing_in_progress       = 0;
         state->antenna_rotator.home_pending_final_az    = 0.0;
-        cmd_set_status("home: already at %.1f, %.1f deg -- no move",
+        cmd_set_status(state, "home: already at %.1f, %.1f deg -- no move",
                        prev, state->antenna_rotator.elevation);
         sso_audit_event("home", "already at target -- no move");
         return ANTENNA_ROTATOR_OK;
@@ -8687,7 +8666,7 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
                  prev, final_az, delta,
                  (fabs(delta) > 180.0) ? "two-step unwind" : "direct");
         sso_audit_event("home", det);
-        cmd_set_status("home: %.1f -> %.1f, %+.1f deg %s (%s)",
+        cmd_set_status(state, "home: %.1f -> %.1f, %+.1f deg %s (%s)",
                        prev, final_az, delta, delta < 0.0 ? "CCW" : "CW",
                        (fabs(delta) > 180.0) ? "unwind" : "direct");
     }
