@@ -447,6 +447,16 @@ add_executable(csp_selftest unit_tests/csp_selftest.c src/proto/csp.c)
 target_include_directories(csp_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS csp_selftest)
 
+# sso_ipc codec selftest. Round-trips the newline-JSON wire format every
+# operator/viewer link rides on (encode -> decode across event types,
+# escaping, the RX-panel + roster blocks, and the decoder's tolerance of
+# unknown / malformed input). Links only the codec TU — no socket.
+add_executable(sso_ipc_codec_selftest
+               unit_tests/sso_ipc_codec_selftest.c src/ipc/sso_ipc_codec.c)
+target_include_directories(sso_ipc_codec_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(sso_ipc_codec_selftest PRIVATE m)
+list(APPEND SSO_TARGETS sso_ipc_codec_selftest)
+
 # Bandpass biquad selftest. Pins the RBJ-cookbook coefficients, peak
 # gain at f0, DC + Nyquist nulls, stopband attenuation, impulse-decay
 # stability, Q < 0.5 floor, and cascade-deepens-stopband behaviour.
