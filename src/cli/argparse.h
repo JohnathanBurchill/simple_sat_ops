@@ -137,8 +137,8 @@
 // already printed to stderr).
 enum {
     PARSE_OK = 0,
+    PARSE_ERROR,
     PARSE_HELP,
-    PARSE_ERROR
 };
 
 // `help` levels passed to a tool's parse_args(). HELP_OFF parses argv;

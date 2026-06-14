@@ -6292,9 +6292,9 @@ int main(int argc, char **argv)
     // (the old code returned 1 for too-many-positionals / startup
     // errors and 3 for an unknown --option; both are now PARSE_ERROR ->
     // 1, each still printing its own distinct stderr message).
-    switch (apply_args(&state, argc, argv, jul_utc, HELP_OFF)) {
-        case PARSE_HELP:  return 2;
-        case PARSE_ERROR: return 1;
+    int status = apply_args(&state, argc, argv, jul_utc, HELP_OFF);
+    if (status != 0) {
+        return status;
     }
 
     // Bare invocation found a running operator — run as a read-only
