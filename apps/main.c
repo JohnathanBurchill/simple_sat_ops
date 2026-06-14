@@ -107,8 +107,8 @@
 // state event on every UI tick. Other operator-aware tools
 // (b210_rx_tx --control, tx_frame_sdr) verify the operator's Unix
 // user matches their own via this socket.
-static sso_ipc_server_t *g_ipc = NULL;
-static const char *g_operator_user = NULL;
+// The IPC fan-out server and the operator's Unix user now live on
+// state_t (state.ipc / state.operator_user).
 
 // --self-test: after CLI parse + HMAC keyfile load, print the resolved
 // configuration to stdout and exit 0 — BEFORE opening the IPC socket,
@@ -229,12 +229,8 @@ static void ribbon_push(double peak_dbfs, int bright_bins)
 // every LOW_DISK_PERIOD_S seconds so we don't statvfs on every redraw.
 #define LOW_DISK_BYTES   ((uint64_t)10 * 1000 * 1000 * 1000)
 #define LOW_DISK_PERIOD_S 30.0
-static char   g_low_disk_msg[80] = "";
-static double g_low_disk_last_t  = 0.0;
-// Tentative declaration so low_disk_refresh can reference g_pass_folder
-// without reordering the whole file; the definition with an initialiser
-// lives further down.
-static char   g_pass_folder[256];
+// Low-disk warning + the pass output folder now live on state_t
+// (state.low_disk_msg / state.low_disk_last_t / state.pass_folder).
 
 // Returns bytes available to a non-privileged user on the filesystem
 // hosting `path`. Returns (uint64_t) -1 on error or when path is empty.
@@ -246,29 +242,29 @@ static uint64_t free_disk_bytes(const char *path)
     return (uint64_t) s.f_bavail * (uint64_t) s.f_frsize;
 }
 
-// Refresh g_low_disk_msg if the period has elapsed. Empty message
+// Refresh state->low_disk_msg if the period has elapsed. Empty message
 // means "above threshold" — render_rx_panel skips the row in that case.
-static void low_disk_refresh(double t_now)
+static void low_disk_refresh(state_t *state, double t_now)
 {
-    if ((t_now - g_low_disk_last_t) < LOW_DISK_PERIOD_S
-        && g_low_disk_last_t != 0.0) return;
-    g_low_disk_last_t = t_now;
-    const char *probe = g_pass_folder[0] ? g_pass_folder : ".";
+    if ((t_now - state->low_disk_last_t) < LOW_DISK_PERIOD_S
+        && state->low_disk_last_t != 0.0) return;
+    state->low_disk_last_t = t_now;
+    const char *probe = state->pass_folder[0] ? state->pass_folder : ".";
     uint64_t avail = free_disk_bytes(probe);
     if (avail == (uint64_t) -1) {
-        g_low_disk_msg[0] = '\0';
+        state->low_disk_msg[0] = '\0';
         return;
     }
     if (avail >= LOW_DISK_BYTES) {
-        g_low_disk_msg[0] = '\0';
+        state->low_disk_msg[0] = '\0';
         return;
     }
     double gb = (double) avail / 1.0e9;
     // Cap path width so the message fits in the 80-byte buffer: prefix
     // is ~26 chars ("LOW DISK: 12.34 GB free at "), leaving 50 for the
     // path. GCC -Wformat-truncation would otherwise flag the unbounded
-    // %s against a 255-byte g_pass_folder.
-    snprintf(g_low_disk_msg, sizeof g_low_disk_msg,
+    // %s against a 255-byte state->pass_folder.
+    snprintf(state->low_disk_msg, sizeof state->low_disk_msg,
              "LOW DISK: %.2f GB free at %.50s", gb, probe);
 }
 
@@ -1216,34 +1212,34 @@ static void cmd_dispatch(state_t *state)
 // Mirror the operator's ":" prompt to viewers. cmd-preview carries the
 // live buffer (debounced in the main loop); cmd-executed carries the
 // dispatched command + the resulting status string. Both helpers no-op
-// when g_ipc isn't open (e.g., --no-control).
+// when state->ipc isn't open (e.g., --no-control).
 static void cmd_broadcast_preview(state_t *state)
 {
-    if (!g_ipc) return;
+    if (!state->ipc) return;
     sso_event_t evt;
     sso_event_init(&evt, SSO_EVT_CMD_PREVIEW);
     snprintf(evt.from, sizeof evt.from, "%s",
-             g_operator_user ? g_operator_user : "?");
+             state->operator_user ? state->operator_user : "?");
     snprintf(evt.cmd_text, sizeof evt.cmd_text, "%s", state->cmd.buf);
     char buf[2048];
     if (sso_event_encode(&evt, buf, sizeof buf) == 0) {
-        sso_ipc_server_broadcast(g_ipc, buf);
+        sso_ipc_server_broadcast(state->ipc, buf);
     }
 }
 
 static void cmd_broadcast_executed(state_t *state, const char *executed_cmd)
 {
-    if (!g_ipc) return;
+    if (!state->ipc) return;
     sso_event_t evt;
     sso_event_init(&evt, SSO_EVT_CMD_EXECUTED);
     snprintf(evt.from, sizeof evt.from, "%s",
-             g_operator_user ? g_operator_user : "?");
+             state->operator_user ? state->operator_user : "?");
     snprintf(evt.cmd_text,   sizeof evt.cmd_text,   "%s",
              executed_cmd ? executed_cmd : "");
     snprintf(evt.cmd_status, sizeof evt.cmd_status, "%s", state->cmd.status);
     char buf[2048];
     if (sso_event_encode(&evt, buf, sizeof buf) == 0) {
-        sso_ipc_server_broadcast(g_ipc, buf);
+        sso_ipc_server_broadcast(state->ipc, buf);
     }
 }
 
@@ -1461,7 +1457,7 @@ static void cmd_render(state_t *state)
 // pass — created in main() once the AOS prediction is in, then
 // broadcast on every STATE event so b210_rx_tx and tx_frame_sdr
 // can drop their captures/logs in the same spot. Empty until set.
-static char g_pass_folder[256] = "";
+// (Now state.pass_folder.)
 // SIGUSR1 sets this — used by the force-claim takeover path to nudge
 // the operator-mode loop into a graceful exit. (Full in-place
 // demotion is a follow-up; for now SIGUSR1 = quit.)
@@ -1596,7 +1592,7 @@ static tx_log_entry_t g_tx_log[TX_LOG_SIZE];
 static size_t         g_tx_log_count = 0;
 
 // Persistent on-disk TX log. JSONL — one encoded sso_event_t per line.
-// Opened lazily on the first event after g_pass_folder is set, kept
+// Opened lazily on the first event after state->pass_folder is set, kept
 // open for the rest of the process, fflushed after every line so a
 // crash mid-pass doesn't lose the last command sent. Captures every
 // preview / commit / not-sent — the same events that drive the in-memory
@@ -1629,18 +1625,18 @@ static void tx_log_ts_from_event(const sso_event_t *evt,
 }
 
 // Append one event to <pass_folder>/tx.log as a JSON line. Opens the
-// file lazily; no-op when g_pass_folder isn't set yet (so events that
+// file lazily; no-op when state->pass_folder isn't set yet (so events that
 // arrive before pass-folder bring-up land in the in-memory ring but
 // aren't dropped silently — they just don't reach disk until the
 // folder exists). fflush after every write so a SIGKILL mid-pass
 // preserves the last command sent.
-static void tx_log_file_append(const sso_event_t *evt)
+static void tx_log_file_append(state_t *state, const sso_event_t *evt)
 {
     if (!evt) return;
     if (g_tx_log_fp == NULL) {
-        if (g_pass_folder[0] == '\0') return;
+        if (state->pass_folder[0] == '\0') return;
         char path[512];
-        snprintf(path, sizeof path, "%.500s/tx.log", g_pass_folder);
+        snprintf(path, sizeof path, "%.500s/tx.log", state->pass_folder);
         FILE *fp = fopen(path, "a");
         if (!fp) return;
         snprintf(g_tx_log_path, sizeof g_tx_log_path, "%s", path);
@@ -1657,14 +1653,14 @@ static void tx_log_file_append(const sso_event_t *evt)
 // PREVIEW entry (live cursor-style update). SENT promotes a trailing
 // PREVIEW to SENT, or appends a fresh entry. NOT_SENT appends with the
 // status string filled in for rendering.
-static void tx_log_push(const sso_event_t *evt)
+static void tx_log_push(state_t *state, const sso_event_t *evt)
 {
     if (!evt) return;
     if (evt->type != SSO_EVT_TX_COMMAND_PREVIEW
      && evt->type != SSO_EVT_TX_COMMAND_SENT
      && evt->type != SSO_EVT_TX_NOT_SENT) return;
 
-    tx_log_file_append(evt);
+    tx_log_file_append(state, evt);
 
     tx_log_entry_t entry;
     memset(&entry, 0, sizeof entry);
@@ -1848,7 +1844,7 @@ typedef struct {
 
 // Operator-side collector. Reads the live rx_session + g_ribbon globals
 // into the struct. On non-B210 builds, only have_session=0 is filled.
-static void rx_panel_collect_local(rx_panel_data_t *d)
+static void rx_panel_collect_local(state_t *state, rx_panel_data_t *d)
 {
     memset(d, 0, sizeof *d);
 #ifdef SSO_WITH_SDR
@@ -1922,7 +1918,7 @@ static void rx_panel_collect_local(rx_panel_data_t *d)
 #endif
     // Warning row is filled regardless of the B210 build — even without
     // an SDR the operator could be running short on disk for logs.
-    snprintf(d->warning, sizeof d->warning, "%s", g_low_disk_msg);
+    snprintf(d->warning, sizeof d->warning, "%s", state->low_disk_msg);
 #ifdef SSO_WITH_SDR
     // A lost SDR outranks the low-disk notice — show it instead so the
     // operator sees immediately that RX has stopped.
@@ -2120,10 +2116,10 @@ static void render_ribbon_vertical(const rx_panel_data_t *d,
 // Snapshot the operator's RX panel into the wire-side fields of an
 // event. Called for both STATE broadcasts and WELCOME replies so a
 // newly-connecting viewer sees the same panel state everyone else does.
-static void ipc_fill_rx_panel(sso_event_t *evt)
+static void ipc_fill_rx_panel(state_t *state, sso_event_t *evt)
 {
     rx_panel_data_t d;
-    rx_panel_collect_local(&d);
+    rx_panel_collect_local(state, &d);
     evt->rx_have_session = d.have_session;
     // Warning row is operator-wide (e.g. low disk), not gated on the
     // SDR — fill it before the have_session early-return.
@@ -2167,13 +2163,13 @@ static void ipc_broadcast_state(state_t *s,
                                   double downlink_freq,
                                   double doppler_delta_dl,
                                   double jul_utc) {
-    if (!g_ipc) return;
+    if (!s->ipc) return;
     sso_event_t evt;
     sso_event_init(&evt, SSO_EVT_STATE);
     snprintf(evt.from, sizeof(evt.from), "%s",
-             g_operator_user ? g_operator_user : "?");
+             s->operator_user ? s->operator_user : "?");
     snprintf(evt.operator_user, sizeof(evt.operator_user), "%s",
-             g_operator_user ? g_operator_user : "?");
+             s->operator_user ? s->operator_user : "?");
     evt.has_state = 1;
     if (s->prediction.satellite_ephem.name) {
         snprintf(evt.satellite, sizeof(evt.satellite), "%s",
@@ -2183,9 +2179,9 @@ static void ipc_broadcast_state(state_t *s,
     evt.el = el;
     evt.freq_hz = (long) downlink_freq;
     evt.doppler_hz = doppler_delta_dl;
-    if (g_pass_folder[0]) {
+    if (s->pass_folder[0]) {
         snprintf(evt.pass_folder, sizeof(evt.pass_folder), "%s",
-                 g_pass_folder);
+                 s->pass_folder);
     }
     if (s->prediction.tles_filename) {
         snprintf(evt.tle_path, sizeof(evt.tle_path), "%s",
@@ -2232,7 +2228,7 @@ static void ipc_broadcast_state(state_t *s,
     size_t n = 0;
     if (n < sizeof(entries) / sizeof(entries[0])) {
         snprintf(entries[n].user, sizeof(entries[n].user), "%s",
-                 g_operator_user ? g_operator_user : "?");
+                 s->operator_user ? s->operator_user : "?");
         snprintf(entries[n].role, sizeof(entries[n].role), "operator");
         entries[n].since[0] = '\0';
         n++;
@@ -2241,7 +2237,7 @@ static void ipc_broadcast_state(state_t *s,
     sso_client_id_t cid;
     char user[64], role[16], since[40];
     while (n < sizeof(entries) / sizeof(entries[0])
-           && sso_ipc_server_next_client(g_ipc, &it, &cid,
+           && sso_ipc_server_next_client(s->ipc, &it, &cid,
                                           user, sizeof(user),
                                           role, sizeof(role),
                                           since, sizeof(since)) == 0) {
@@ -2253,10 +2249,10 @@ static void ipc_broadcast_state(state_t *s,
         n++;
     }
     sso_event_set_roster(&evt, entries, n);
-    ipc_fill_rx_panel(&evt);
+    ipc_fill_rx_panel(s, &evt);
     char buf[4096];
     if (sso_event_encode(&evt, buf, sizeof(buf)) == 0) {
-        sso_ipc_server_broadcast(g_ipc, buf);
+        sso_ipc_server_broadcast(s->ipc, buf);
     }
 
     // Cache for WELCOME replies so a viewer doesn't have to wait for
@@ -2298,12 +2294,12 @@ static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
     sso_event_t welcome;
     sso_event_init(&welcome, SSO_EVT_WELCOME);
     snprintf(welcome.from, sizeof(welcome.from), "%s",
-             g_operator_user ? g_operator_user : "?");
+             state->operator_user ? state->operator_user : "?");
     snprintf(welcome.operator_user, sizeof(welcome.operator_user), "%s",
-             g_operator_user ? g_operator_user : "?");
-    if (g_pass_folder[0]) {
+             state->operator_user ? state->operator_user : "?");
+    if (state->pass_folder[0]) {
         snprintf(welcome.pass_folder, sizeof(welcome.pass_folder), "%s",
-                 g_pass_folder);
+                 state->pass_folder);
     }
     if (g_last_state_valid) {
         welcome.has_state   = 1;
@@ -2357,7 +2353,7 @@ static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
         sso_roster_entry_t entries[SSO_IPC_MAX_CLIENTS_FOR_ROSTER];
         size_t n = 0;
         snprintf(entries[n].user, sizeof(entries[n].user), "%s",
-                 g_operator_user ? g_operator_user : "?");
+                 state->operator_user ? state->operator_user : "?");
         snprintf(entries[n].role, sizeof(entries[n].role), "operator");
         entries[n].since[0] = '\0';
         n++;
@@ -2377,7 +2373,7 @@ static void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
             n++;
         }
         sso_event_set_roster(&welcome, entries, n);
-        ipc_fill_rx_panel(&welcome);
+        ipc_fill_rx_panel(state, &welcome);
     }
     char buf[4096];
     if (sso_event_encode(&welcome, buf, sizeof(buf)) == 0) {
@@ -2575,7 +2571,7 @@ static void tx_compose_summary(const tx_compose_t *c, char *out, size_t out_size
     snprintf(out, out_size, "%s", c->payload[0] ? c->payload : "(empty)");
 }
 
-static void tx_compose_fill_event(const tx_compose_t *c, sso_event_t *evt) {
+static void tx_compose_fill_event(state_t *state, const tx_compose_t *c, sso_event_t *evt) {
     snprintf(evt->tx_payload_kind, sizeof evt->tx_payload_kind, "ascii");
     snprintf(evt->tx_payload, sizeof evt->tx_payload, "%s", c->payload);
     // CSP defaults match cts_send -> FrontierSat OBC (CTS1 cmd handler).
@@ -2599,7 +2595,7 @@ static void tx_compose_fill_event(const tx_compose_t *c, sso_event_t *evt) {
     tx_compose_summary(c, summary, sizeof summary);
     snprintf(evt->ascii, sizeof evt->ascii, "%s", summary);
     snprintf(evt->from, sizeof evt->from, "%s",
-             g_operator_user ? g_operator_user : "?");
+             state->operator_user ? state->operator_user : "?");
 }
 
 static int tx_field_is_text(tx_field_t f) { return f == TXF_PAYLOAD; }
@@ -2861,7 +2857,7 @@ static void draw_box(WINDOW *w) {
     mvwaddch(w, h - 1, wd - 1, '+');
 }
 
-static void tx_compose_draw(WINDOW *w, const tx_compose_t *c) {
+static void tx_compose_draw(state_t *state, WINDOW *w, const tx_compose_t *c) {
     werase(w);
     draw_box(w);
     int width = getmaxx(w);
@@ -2871,7 +2867,7 @@ static void tx_compose_draw(WINDOW *w, const tx_compose_t *c) {
         payload_w = (int) sizeof c->payload - 1;
 
     mvwprintw(w, 0, 2, " TX compose (operator: %s)%s ",
-              g_operator_user ? g_operator_user : "?",
+              state->operator_user ? state->operator_user : "?",
               g_no_tx ? "  [--no-tx]" : "");
 #ifdef SSO_WITH_SDR
     mvwprintw(w, 1, 2,
@@ -2955,18 +2951,18 @@ static int tx_compose_validate(const tx_compose_t *c, char *err, size_t err_size
     return 0;
 }
 
-static void tx_compose_broadcast_preview(const tx_compose_t *c) {
-    if (!g_ipc) return;
+static void tx_compose_broadcast_preview(state_t *state, const tx_compose_t *c) {
+    if (!state->ipc) return;
     sso_event_t evt;
     sso_event_init(&evt, SSO_EVT_TX_COMMAND_PREVIEW);
-    tx_compose_fill_event(c, &evt);
+    tx_compose_fill_event(state, c, &evt);
     char buf[2048];
     if (sso_event_encode(&evt, buf, sizeof buf) == 0) {
-        sso_ipc_server_broadcast(g_ipc, buf);
+        sso_ipc_server_broadcast(state->ipc, buf);
     }
     // Mirror into our own ring buffer so the operator's TX log shows
     // the same draft line viewers are seeing.
-    tx_log_push(&evt);
+    tx_log_push(state, &evt);
 }
 
 static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, size_t err_size) {
@@ -3056,25 +3052,25 @@ static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, s
 #ifdef SSO_WITH_SDR
 // Emit a TX event locally: push into the operator's own TX log and
 // broadcast to viewers via the IPC server.
-static void emit_tx_event_local(sso_event_type_t type,
+static void emit_tx_event_local(state_t *state, sso_event_type_t type,
                                  const char *summary,
                                  const char *ack_status)
 {
     sso_event_t evt;
     sso_event_init(&evt, type);
     snprintf(evt.from, sizeof evt.from, "%s",
-             g_operator_user ? g_operator_user : "?");
+             state->operator_user ? state->operator_user : "?");
     if (summary && summary[0]) {
         snprintf(evt.ascii, sizeof evt.ascii, "%s", summary);
     }
     if (ack_status && ack_status[0]) {
         snprintf(evt.tx_not_sent_reason, sizeof evt.tx_not_sent_reason, "%s", ack_status);
     }
-    tx_log_push(&evt);
-    if (g_ipc) {
+    tx_log_push(state, &evt);
+    if (state->ipc) {
         char buf[2048];
         if (sso_event_encode(&evt, buf, sizeof buf) == 0) {
-            sso_ipc_server_broadcast(g_ipc, buf);
+            sso_ipc_server_broadcast(state->ipc, buf);
         }
     }
 }
@@ -3091,7 +3087,7 @@ static long ts_now_ns(void) {
 // once, and flip state->tx_compose_active so the main loop starts ticking
 // it. Idempotent: re-opening while already active is a no-op.
 static void tx_compose_open(state_t *state) {
-    if (!g_ipc) return;
+    if (!state->ipc) return;
     if (state->tx_compose_active) return;
     if (state->auto_tcmd_active) return;  // one modal at a time
     int h = 14, ww = 120;
@@ -3111,7 +3107,7 @@ static void tx_compose_open(state_t *state) {
         state->tx_compose.allow_tx = 0;
     }
 #endif
-    tx_compose_draw(state->tx_compose_win, &state->tx_compose);
+    tx_compose_draw(state, state->tx_compose_win, &state->tx_compose);
     state->tx_compose_last_edit_ns = ts_now_ns();
     state->tx_compose_active = 1;
 }
@@ -3197,7 +3193,7 @@ static int tx_compose_handle_key(state_t *state, int key) {
     }
     if (changed) {
         state->tx_compose_last_edit_ns = ts_now_ns();
-        tx_compose_draw(w, c);
+        tx_compose_draw(state, w, c);
     }
     return 1;
 }
@@ -3210,9 +3206,9 @@ static void tx_compose_pump(state_t *state) {
     tx_compose_t *c = &state->tx_compose;
     if (c->preview_dirty
         && (ts_now_ns() - state->tx_compose_last_edit_ns) >= g_tx_compose_debounce_ns) {
-        tx_compose_broadcast_preview(c);
+        tx_compose_broadcast_preview(state, c);
         c->preview_dirty = 0;
-        tx_compose_draw(state->tx_compose_win, c);
+        tx_compose_draw(state, state->tx_compose_win, c);
     }
 }
 
@@ -3383,7 +3379,7 @@ static void auto_tcmd_draw(state_t *state) {
     int width = getmaxx(w);
 
     mvwprintw(w, 0, 2, " Auto-TCMD (operator: %s)%s ",
-              g_operator_user ? g_operator_user : "?",
+              state->operator_user ? state->operator_user : "?",
               g_no_tx ? "  [--no-tx]" : "");
 
     mvwprintw(w, 1, 2, "File:    %.*s  (%d commands)",
@@ -3483,7 +3479,7 @@ static void auto_tcmd_draw(state_t *state) {
 // most one modal owns the screen at a time. Lazily loads the file if
 // --tc-file was passed and we haven't loaded yet.
 static void auto_tcmd_open(state_t *state) {
-    if (!g_ipc) return;
+    if (!state->ipc) return;
     if (state->tx_compose_active) return;
     if (state->auto_tcmd_active) return;
     if (state->auto_tcmd_file_path[0] == '\0') return;
@@ -4031,26 +4027,26 @@ static int find_nearby_pass_folder(const char *parent_dir,
 }
 
 // build /FrontierSat/Operations/<yyyymmdd>/<hhmmLT>/. Stashes the
-// result in g_pass_folder so ipc_broadcast_state can publish it on
+// result in state->pass_folder so ipc_broadcast_state can publish it on
 // every tick.
 static void setup_pass_folder(state_t *state, double jul_utc_now)
 {
-    // Handoff case: --pass-folder seeded g_pass_folder before we got
+    // Handoff case: --pass-folder seeded state->pass_folder before we got
     // here. Honour it — make sure the dir exists, refresh the
     // "current" symlink, and skip AOS-discovery entirely.
-    if (g_pass_folder[0]) {
-        if (sso_mkdir_p(g_pass_folder) != 0) {
+    if (state->pass_folder[0]) {
+        if (sso_mkdir_p(state->pass_folder) != 0) {
             fprintf(stderr,
                 "simple_sat_ops: mkdir -p %s failed: %s\n",
-                g_pass_folder, strerror(errno));
+                state->pass_folder, strerror(errno));
         }
-        update_operations_current_symlink(g_pass_folder);
+        update_operations_current_symlink(state->pass_folder);
         fprintf(stderr, "simple_sat_ops: using inherited pass folder %s\n",
-                g_pass_folder);
+                state->pass_folder);
         {
             char det[600];
             snprintf(det, sizeof det,
-                     "mode=inherited path=\"%.500s\"", g_pass_folder);
+                     "mode=inherited path=\"%.500s\"", state->pass_folder);
             sso_audit_event("pass-folder", det);
         }
         return;
@@ -4082,17 +4078,17 @@ static void setup_pass_folder(state_t *state, double jul_utc_now)
                 folder, strerror(errno));
             return;
         }
-        snprintf(g_pass_folder, sizeof g_pass_folder, "%s", folder);
+        snprintf(state->pass_folder, sizeof state->pass_folder, "%s", folder);
         // Skip update_operations_current_symlink — keep the
         // Operations/current pointer aimed at real passes, not bench
         // runs (avoids confusing operators who scrub recent activity
         // by looking at the symlink).
         fprintf(stderr,
-            "simple_sat_ops: --testing folder %s\n", g_pass_folder);
+            "simple_sat_ops: --testing folder %s\n", state->pass_folder);
         {
             char det[600];
             snprintf(det, sizeof det,
-                     "mode=testing path=\"%.500s\"", g_pass_folder);
+                     "mode=testing path=\"%.500s\"", state->pass_folder);
             sso_audit_event("pass-folder", det);
         }
         return;
@@ -4183,13 +4179,13 @@ static void setup_pass_folder(state_t *state, double jul_utc_now)
         }
     }
 
-    snprintf(g_pass_folder, sizeof g_pass_folder, "%s", folder);
+    snprintf(state->pass_folder, sizeof state->pass_folder, "%s", folder);
     update_operations_current_symlink(folder);
     fprintf(stderr, "simple_sat_ops: pass folder %s\n", folder);
     {
         char det[600];
         snprintf(det, sizeof det,
-                 "mode=aos path=\"%.500s\"", g_pass_folder);
+                 "mode=aos path=\"%.500s\"", state->pass_folder);
         sso_audit_event("pass-folder", det);
     }
 }
@@ -4213,7 +4209,7 @@ static void generate_pass_plot(state_t *state, const char *pass_folder,
     prediction_t pred = state->prediction;
 
     // Defensive: handoff case (setup_pass_folder used inherited
-    // g_pass_folder) leaves predicted_minutes_until_visible stale.
+    // state->pass_folder) leaves predicted_minutes_until_visible stale.
     // Re-run the search so aos_jul below is well defined.
     minutes_until_visible(&pred, jul_utc_now,
                           jul_utc_now + 180.0 / 1440.0, 1.0);
@@ -4403,13 +4399,13 @@ static int   g_saved_stderr_fd = -1;
 static char  g_stderr_log_path[320] = "";
 static off_t g_stderr_log_start_size = 0;
 
-static void tui_grab_stderr(void)
+static void tui_grab_stderr(state_t *state)
 {
     if (g_saved_stderr_fd != -1) return;   // already redirected
 
     char path[320];
-    if (g_pass_folder[0]) {
-        snprintf(path, sizeof path, "%.300s/sso_stderr.log", g_pass_folder);
+    if (state->pass_folder[0]) {
+        snprintf(path, sizeof path, "%.300s/sso_stderr.log", state->pass_folder);
     } else {
         // No pass folder (e.g. a viewer): we still must not corrupt the
         // screen, so swallow stderr rather than leave it on the tty.
@@ -4424,7 +4420,7 @@ static void tui_grab_stderr(void)
     // /dev/null sink leaves the path empty and is never reported on.
     g_stderr_log_path[0]    = '\0';
     g_stderr_log_start_size = 0;
-    if (g_pass_folder[0]) {
+    if (state->pass_folder[0]) {
         struct stat st;
         if (fstat(log_fd, &st) == 0) g_stderr_log_start_size = st.st_size;
         snprintf(g_stderr_log_path, sizeof g_stderr_log_path, "%s", path);
@@ -4568,7 +4564,7 @@ static void install_signal_handlers(void)
     sigaction(SIGTERM, &sq, NULL);
 }
 
-void init_window(void)
+void init_window(state_t *state)
 {
     // setlocale BEFORE initscr so ncurses knows the terminal can render
     // its alternate-character-set line glyphs (and UTF-8 elsewhere).
@@ -4596,7 +4592,7 @@ void init_window(void)
 
     // Now that ncurses owns the screen, divert stderr to the pass-folder
     // log so backend/library errors never paint over the panels.
-    tui_grab_stderr();
+    tui_grab_stderr(state);
 }
 
 // --- Reports -------------------------------------------------------
@@ -4908,16 +4904,16 @@ static void render_status_panel(const status_panel_t *p,
 // Build a comma-separated list of currently-connected viewer/external
 // clients. Skips anonymous (no-name) slots and is bounded by the
 // caller's buffer.
-static void operator_viewers_list(char *out, size_t out_size)
+static void operator_viewers_list(state_t *state, char *out, size_t out_size)
 {
     if (out_size == 0) return;
     out[0] = '\0';
-    if (!g_ipc) return;
+    if (!state->ipc) return;
     sso_ipc_iter_t it = {0};
     sso_client_id_t cid;
     char user[64], role[16], since[40];
     size_t written = 0;
-    while (sso_ipc_server_next_client(g_ipc, &it, &cid,
+    while (sso_ipc_server_next_client(state->ipc, &it, &cid,
                                        user, sizeof user,
                                        role, sizeof role,
                                        since, sizeof since) == 0) {
@@ -5335,12 +5331,12 @@ void report_status(state_t *state, int *print_row, int print_col)
     if (print_row == NULL) return;
 
     static char viewers[256];
-    operator_viewers_list(viewers, sizeof viewers);
+    operator_viewers_list(state, viewers, sizeof viewers);
 
     status_panel_t p;
     memset(&p, 0, sizeof p);
     p.control_mode  = state->control_mode;
-    p.operator_user = g_operator_user;
+    p.operator_user = state->operator_user;
     p.viewers       = viewers[0] ? viewers : "(none)";
 
     double display_dl_hz = state->doppler_downlink_frequency_hz;
@@ -5482,7 +5478,7 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
     if (evt->type == SSO_EVT_TX_COMMAND_PREVIEW
      || evt->type == SSO_EVT_TX_COMMAND_SENT
      || evt->type == SSO_EVT_TX_NOT_SENT) {
-        tx_log_push(evt);
+        tx_log_push(&g_viewer_state, evt);
         g_viewer_last_event = time(NULL);
         g_viewer_event_pending = 1;
         return;
@@ -5906,7 +5902,7 @@ static int run_viewer(const char *argv0)
         sso_ipc_client_send(cli, buf);
     }
 
-    init_window();
+    init_window(&g_viewer_state);
     int last_connected = -1;
     time_t last_render = 0;
     viewer_render(sso_ipc_client_is_connected(cli));
@@ -6107,7 +6103,7 @@ static void self_test_report(const state_t *state, FILE *out, int argc, char **a
             state->run_live_waterfall ? "on (--live-waterfall)" : "off");
 
     fprintf(out, "pass-folder-seed: %s\n",
-            g_pass_folder[0] ? g_pass_folder : "(auto)");
+            state->pass_folder[0] ? state->pass_folder : "(auto)");
 
     // Observer location. apply_args stored these in radians on the
     // ephem struct — convert back to degrees for the report.
@@ -6234,7 +6230,7 @@ int main(int argc, char **argv)
     }
 
     // Audit + operator IPC bring-up.
-    g_operator_user = sso_unix_user();
+    state.operator_user = sso_unix_user();
     sso_audit_start("simple_sat_ops",
                     state.control_mode ? "operator" : "standalone");
     // Record the exact command line so post-incident review can tie
@@ -6291,8 +6287,8 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
 
-        g_ipc = sso_ipc_server_open("simple_sat_ops");
-        if (g_ipc == NULL) {
+        state.ipc = sso_ipc_server_open("simple_sat_ops");
+        if (state.ipc == NULL) {
             // Probe said "no operator" yet bind still failed — most
             // likely a stale socket / pid file from a crashed
             // previous operator (or a vanishingly-rare race with
@@ -6306,14 +6302,14 @@ int main(int argc, char **argv)
             sso_audit_event("ipc-bind-failed", "");
             return EXIT_FAILURE;
         }
-        sso_ipc_server_on_event(g_ipc, ipc_on_event, &state);
+        sso_ipc_server_on_event(state.ipc, ipc_on_event, &state);
         struct sigaction sa;
         memset(&sa, 0, sizeof(sa));
         sa.sa_handler = on_sigusr1;
         sigemptyset(&sa.sa_mask);
         sigaction(SIGUSR1, &sa, NULL);
         fprintf(stderr, "simple_sat_ops: operator=%s ipc=on\n",
-                g_operator_user);
+                state.operator_user);
     }
 
     /* Parse TLE data */
@@ -6339,8 +6335,8 @@ int main(int argc, char **argv)
         double jul_now = Julian_Date(&utc, &tv);
         update_satellite_position(&state.prediction, jul_now);
         setup_pass_folder(&state, jul_now);
-        if (g_pass_folder[0]) {
-            generate_pass_plot(&state, g_pass_folder, jul_now);
+        if (state.pass_folder[0]) {
+            generate_pass_plot(&state, state.pass_folder, jul_now);
         }
     }
 
@@ -6566,13 +6562,13 @@ int main(int argc, char **argv)
                 .force_beacon      = 0,
                 .show_packet_headers = 0,
                 .csp_crc32         = 0,
-                .pass_folder       = g_pass_folder[0] ? g_pass_folder : NULL,
+                .pass_folder       = state.pass_folder[0] ? state.pass_folder : NULL,
                 .want_wav          = 1,
                 .tle_path          = state.prediction.tles_filename,
                 .sat_name          = state.prediction.satellite_ephem.tle.sat_name[0]
                                      ? state.prediction.satellite_ephem.tle.sat_name
                                      : NULL,
-                .session_dir       = g_pass_folder[0] ? g_pass_folder : NULL,
+                .session_dir       = state.pass_folder[0] ? state.pass_folder : NULL,
                 .lo_offset_hz      = state.rx_lo_offset_hz,
             };
             if (rx_session_open(&g_rx_session, &rxp, core) != 0) {
@@ -6606,7 +6602,7 @@ int main(int argc, char **argv)
         g_have_saved_termios = 1;
     }
 
-    init_window();
+    init_window(&state);
 
     // Catch a fatal device fault (or Ctrl-C) now that the screen is up,
     // so it restores the terminal instead of dumping a raw abort on it.
@@ -7018,9 +7014,9 @@ int main(int argc, char **argv)
             row++;
             // Refresh the low-disk warning lazily — statvfs every 30 s
             // is plenty given how slowly disk fills.
-            low_disk_refresh(t_now);
+            low_disk_refresh(&state, t_now);
             rx_panel_data_t rxd;
-            rx_panel_collect_local(&rxd);
+            rx_panel_collect_local(&state, &rxd);
             render_rx_panel(&rxd, &row, 50);
 
             clrtoeol();
@@ -7439,9 +7435,9 @@ int main(int argc, char **argv)
                 // that did NOT reach the air (rejected, dry-run, uhd-err)
                 // gets a not-sent note carrying the reason.
                 if (on_air) {
-                    emit_tx_event_local(SSO_EVT_TX_COMMAND_SENT, summary, NULL);
+                    emit_tx_event_local(&state, SSO_EVT_TX_COMMAND_SENT, summary, NULL);
                 } else {
-                    emit_tx_event_local(SSO_EVT_TX_NOT_SENT, summary, outcome);
+                    emit_tx_event_local(&state, SSO_EVT_TX_NOT_SENT, summary, outcome);
                 }
                 // Audit: the result of every queued TX burst, so post-
                 // incident review can see each tx-commit and whether it
@@ -7462,8 +7458,8 @@ int main(int argc, char **argv)
         // Always service the socket (cheap; accepts new viewers) but
         // throttle STATE broadcasts to 2 Hz so viewers don't get
         // hammered when the loop is running at UHD-chunk cadence.
-        if (g_ipc) {
-            sso_ipc_server_step(g_ipc, 0);
+        if (state.ipc) {
+            sso_ipc_server_step(state.ipc, 0);
             if ((t_now - t_last_ipc_broadcast) >= IPC_BROADCAST_PERIOD_S) {
                 ipc_broadcast_state(&state, current_az, current_el,
                                      current_downlink_frequency,
@@ -7529,9 +7525,9 @@ int main(int argc, char **argv)
     // Free any plan that survived (mid-pass exit / crash on a key
     // before the LOS branch had a chance to clear it).
     main_pursuit_clear_plan();
-    if (g_ipc) {
-        sso_ipc_server_close(g_ipc);
-        g_ipc = NULL;
+    if (state.ipc) {
+        sso_ipc_server_close(state.ipc);
+        state.ipc = NULL;
     }
     // Politely terminate the live raylib waterfall if we spawned one.
     // 5 s timeout via WNOHANG polling so the operator doesn't wait on
@@ -7996,11 +7992,11 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
                     return PARSE_ERROR;
                 }
                 state->n_options += 2;
-                // Pre-seed g_pass_folder; setup_pass_folder() then skips
+                // Pre-seed state->pass_folder; setup_pass_folder() then skips
                 // its AOS-driven auto-discovery and uses the inherited
                 // path (handoff case: new operator picks up the previous
                 // operator's pass folder).
-                snprintf(g_pass_folder, sizeof g_pass_folder, "%s", argv[t + 2]);
+                snprintf(state->pass_folder, sizeof state->pass_folder, "%s", argv[t + 2]);
                 ++t;
             }
             matched = 1;
@@ -8668,7 +8664,7 @@ static void scan_csv_open(state_t *state)
     if (gettimeofday(&tv, NULL) != 0 || gmtime_r(&tv.tv_sec, &utc) == NULL) {
         return;
     }
-    const char *dir = g_pass_folder[0] ? g_pass_folder : ".";
+    const char *dir = state->pass_folder[0] ? state->pass_folder : ".";
     int n = snprintf(state->scan.csv_path, sizeof state->scan.csv_path,
                      "%s/scan_sky_UT=%04d%02d%02dT%02d%02d%02dZ.csv",
                      dir,

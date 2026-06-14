@@ -185,6 +185,12 @@ typedef struct state
     int always_record;       // --always-record
     int testing_mode;        // --testing
 
+    const char       *operator_user;   // Unix user running the operator
+    sso_ipc_server_t *ipc;             // IPC fan-out server (operator side)
+    char   pass_folder[256];           // this pass's output folder; "" until set
+    char   low_disk_msg[80];           // non-empty -> low-disk warning to show
+    double low_disk_last_t;            // last low-disk probe (monotonic s)
+
     // Tracking
     int satellite_tracking;
     prediction_t prediction;
