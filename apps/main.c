@@ -861,13 +861,6 @@ int  point_to_stationary_target(state_t *state, double azimuth, double elevation
 static void scan_sky_start(state_t *state);
 static void scan_sky_stop(state_t *state, const char *reason);
 static void scan_sky_tick(state_t *state, double t_now);
-// g_rx_session is referenced here in cmd_dispatch but its definition
-// sits with the rest of the B210 globals further down. Forward-declare
-// it so the compiler doesn't reject the references; the symbol resolves
-// at link time to the static definition below.
-#ifdef SSO_WITH_SDR
-static rx_session_t *g_rx_session;
-#endif
 // Forward-decl the auto-tcmd progress snapshot: the STATE / WELCOME
 // builders (above the modal code) embed it so viewers can mirror the
 // run's <sent>/<total>. Defined with the rest of the modal helpers.
@@ -884,13 +877,6 @@ enum {
     RETARGET_BAD_TLE   = -3,   // elements present but failed validation
 };
 static int retarget_to_tle(state_t *state, const char *path);
-// File path of the satellite currently being tracked, so a repeat
-// :retarget on the same file is a no-op. Seeded from the startup TLE
-// path; updated on every successful retarget.
-static char g_target_tle_path[1024];
-// Stable backing store for satellite_ephem.name after a retarget (the
-// startup name points at argv / an apply_args buffer).
-static char g_target_name[64];
 
 // Dispatch the typed command. state may be touched by tracking-related
 // commands; nothing else needs it. Returns nothing -- result lands in
@@ -998,10 +984,10 @@ static void cmd_dispatch(state_t *state)
             double hz = (v < 1e6) ? v * 1e6 : v;   // accept MHz or Hz
             if (hz < 1e6 || hz > 6e9) {
                 cmd_set_status(state, "freq: %g out of [1 MHz, 6 GHz]", hz);
-            } else if (g_rx_session == NULL) {
+            } else if (state->rx_session == NULL) {
                 cmd_set_status(state, "freq: no RX session");
             } else {
-                rx_session_request_freq(g_rx_session, hz);
+                rx_session_request_freq(state->rx_session, hz);
                 cmd_set_status(state, "freq -> %.6f MHz", hz / 1e6);
             }
 #else
@@ -1022,7 +1008,7 @@ static void cmd_dispatch(state_t *state)
 #ifdef SSO_WITH_SDR
         if (arg1 == NULL) {
             cmd_set_status(state, "spectrum: usage `spectrum <seconds>` (1..600)");
-        } else if (g_rx_session == NULL) {
+        } else if (state->rx_session == NULL) {
             cmd_set_status(state, "spectrum: no RX session");
         } else {
             double duration_s = atof(arg1);
@@ -1040,7 +1026,7 @@ static void cmd_dispatch(state_t *state)
                     long n_samples = 0;
                     int  sample_rate = 0;
                     int  wav_active = 0;
-                    rx_session_wav_snapshot(g_rx_session,
+                    rx_session_wav_snapshot(state->rx_session,
                                             wav_path, sizeof wav_path,
                                             &n_samples, &sample_rate, &wav_active);
                     if (wav_path[0] == '\0' || sample_rate <= 0) {
@@ -1087,7 +1073,7 @@ static void cmd_dispatch(state_t *state)
                             char iq_path[512] = "";
                             long iq_pairs = 0;
                             int  iq_rate  = 0;
-                            rx_session_iq_snapshot(g_rx_session,
+                            rx_session_iq_snapshot(state->rx_session,
                                                    iq_path, sizeof iq_path,
                                                    &iq_pairs, &iq_rate);
                             if (iq_path[0] && iq_pairs > 0 && iq_rate > 0) {
@@ -1137,12 +1123,12 @@ static void cmd_dispatch(state_t *state)
             double khz = atof(arg1);
             if (khz < -45.0 || khz > 45.0) {
                 cmd_set_status(state, "lo_offset: %g kHz out of [-45, +45]", khz);
-            } else if (g_rx_session == NULL) {
+            } else if (state->rx_session == NULL) {
                 cmd_set_status(state, "lo_offset: no RX session");
             } else {
                 double new_offset_hz = khz * 1000.0;
                 state->rx_lo_offset_hz = new_offset_hz;
-                rx_session_set_lo_offset(g_rx_session,
+                rx_session_set_lo_offset(state->rx_session,
                                          state->nominal_downlink_frequency_hz,
                                          new_offset_hz);
                 cmd_set_status(state, "lo_offset -> %+.1f kHz (PLL glitching, "
@@ -1193,11 +1179,11 @@ static void cmd_dispatch(state_t *state)
             double g = atof(arg1);
             if (g < 0.0 || g > 76.0) {
                 cmd_set_status(state, "gain: %g dB out of [0, 76]", g);
-            } else if (g_rx_session == NULL) {
+            } else if (state->rx_session == NULL) {
                 cmd_set_status(state, "gain: no RX session");
             } else {
                 state->rx_gain_db = g;
-                rx_session_set_gain(g_rx_session, g);
+                rx_session_set_gain(state->rx_session, g);
                 cmd_set_status(state, "gain -> %.1f dB", g);
             }
 #else
@@ -1478,20 +1464,6 @@ static double monotonic_seconds(void)
     return (double) ts.tv_sec + (double) ts.tv_nsec * 1e-9;
 }
 
-// B210 ownership lives here now — simple_sat_ops is the single process
-// that opens the SDR. --without-b210 (or a non-WITH_USRP_B210 build)
-// leaves g_rx_session NULL and the loop falls through cleanly.
-static int  g_without_b210 = 0;
-#ifdef SSO_WITH_SDR
-// SDR backend selection. g_sdr_type defaults to AUTO (probe UHD, then
-// RTL-SDR). g_sdr_device is a backend-specific selector (RTL index;
-// for UHD prefer --uhd-args). g_uhd_args is a verbatim UHD device-args
-// passthrough; g_sdr_fpga forces an FPGA image for a B2xx clone.
-static sdr_backend_type_t g_sdr_type   = SDR_TYPE_AUTO;
-static char g_sdr_device[128] = "";
-static char g_uhd_args[256]   = "";
-static char g_sdr_fpga[512]   = "";
-#endif
 // Async wrapper around antenna_rotator's serial I/O. NULL if no rotator
 // (--without-rotator, or antenna_rotator_init failed). Spawned right
 // after antenna_rotator_init succeeds; joined on shutdown. While set, no
@@ -1529,11 +1501,6 @@ typedef struct {
 static pursuit_plan_t  g_pursuit_plan  = {0};
 static pursuit_track_t g_pursuit_track = {0};
 #ifdef SSO_WITH_SDR
-// rx_session owns the b210 core + the worker thread. main.c only
-// keeps a local handle long enough to open the device and hand it
-// over.
-static rx_session_t      *g_rx_session  = NULL;
-
 // Current UTC in milliseconds -- the queue-time clock for expanding an
 // "SSO+..." pseudo-command (see sso_pseudo.h). Captured fresh per send so each
 // transmission carries a current time.
@@ -1792,14 +1759,14 @@ static void rx_panel_collect_local(state_t *state, rx_panel_data_t *d)
 {
     memset(d, 0, sizeof *d);
 #ifdef SSO_WITH_SDR
-    d->have_session = (g_rx_session != NULL);
+    d->have_session = (state->rx_session != NULL);
     if (!d->have_session) return;
-    d->rec_active = rx_session_wav_active(g_rx_session);
+    d->rec_active = rx_session_wav_active(state->rx_session);
     snprintf(d->sdr_name, sizeof d->sdr_name, "%.31s",
-             rx_session_sdr_name(g_rx_session));
-    d->can_tx = rx_session_can_tx(g_rx_session);
+             rx_session_sdr_name(state->rx_session));
+    d->can_tx = rx_session_can_tx(state->rx_session);
     char last[sizeof d->last_frame_summary] = "";
-    rx_session_snapshot(g_rx_session,
+    rx_session_snapshot(state->rx_session,
                         &d->frames_total,
                         &d->peak_dbfs,
                         &d->rms_dbfs,
@@ -1810,12 +1777,12 @@ static void rx_panel_collect_local(state_t *state, rx_panel_data_t *d)
     // Hardware LO and captured bandwidth so the panel can show the
     // operator where the SDR is actually listening alongside the
     // Doppler-shifted carrier line.
-    d->rx_lo_hz        = rx_session_get_lo_freq_hz(g_rx_session);
-    d->rx_bandwidth_hz = rx_session_get_bandwidth_hz(g_rx_session);
-    d->frames_pcm = rx_session_pcm_frames(g_rx_session);
-    d->frames_vit = rx_session_viterbi_frames(g_rx_session);
+    d->rx_lo_hz        = rx_session_get_lo_freq_hz(state->rx_session);
+    d->rx_bandwidth_hz = rx_session_get_bandwidth_hz(state->rx_session);
+    d->frames_pcm = rx_session_pcm_frames(state->rx_session);
+    d->frames_vit = rx_session_viterbi_frames(state->rx_session);
     rx_packet_type_stats_t pts[RX_PT_COUNT];
-    rx_session_stats_snapshot(g_rx_session, pts, &d->age_s);
+    rx_session_stats_snapshot(state->rx_session, pts, &d->age_s);
     for (int s = 0; s < RX_PT_COUNT; ++s) {
         d->pt_count[s]       = pts[s].count;
         d->pt_payload_len[s] = pts[s].last_payload_len;
@@ -1866,7 +1833,7 @@ static void rx_panel_collect_local(state_t *state, rx_panel_data_t *d)
 #ifdef SSO_WITH_SDR
     // A lost SDR outranks the low-disk notice — show it instead so the
     // operator sees immediately that RX has stopped.
-    if (d->have_session && rx_session_device_lost(g_rx_session)) {
+    if (d->have_session && rx_session_device_lost(state->rx_session)) {
         snprintf(d->warning, sizeof d->warning,
                  "SDR DISCONNECTED - RX stopped (restart to resume RX)");
     }
@@ -2816,7 +2783,7 @@ static void tx_compose_draw(state_t *state, WINDOW *w, const tx_compose_t *c) {
 #ifdef SSO_WITH_SDR
     mvwprintw(w, 1, 2,
               "B210: %s",
-              g_rx_session ? "in-process (this binary)" : "(offline)");
+              state->rx_session ? "in-process (this binary)" : "(offline)");
 #else
     mvwprintw(w, 1, 2, "B210: (this build has no UHD)");
 #endif
@@ -2916,7 +2883,7 @@ static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, s
                  "TX disabled by --no-tx (preview still goes to viewers)");
         return -1;
     }
-    if (g_rx_session != NULL && !rx_session_can_tx(g_rx_session)) {
+    if (state->rx_session != NULL && !rx_session_can_tx(state->rx_session)) {
         snprintf(err, err_size,
                  "TX not supported by this SDR (RX-only backend)");
         return -1;
@@ -3047,7 +3014,7 @@ static void tx_compose_open(state_t *state) {
     // RX-only SDR (e.g. RTL-SDR): the burst can never reach the air, so
     // keep the allow-tx gate forced off. Compose + preview still work
     // (commit refuses with a clear message).
-    if (g_rx_session != NULL && !rx_session_can_tx(g_rx_session)) {
+    if (state->rx_session != NULL && !rx_session_can_tx(state->rx_session)) {
         state->tx_compose.allow_tx = 0;
     }
 #endif
@@ -5202,7 +5169,7 @@ static int retarget_read_first_tle(const char *path,
 static int retarget_to_tle(state_t *state, const char *path)
 {
     if (path == NULL || path[0] == '\0') return RETARGET_BAD_ARG;
-    if (retarget_same_file(path, g_target_tle_path)) return RETARGET_SAME;
+    if (retarget_same_file(path, state->target_tle_path)) return RETARGET_SAME;
 
     char name[64];
     char tle[139];
@@ -5215,12 +5182,12 @@ static int retarget_to_tle(state_t *state, const char *path)
     // place, so it must be called exactly once on these freshly
     // converted elements -- clear the global flags first so the
     // SGP4/SDP4 choice is made fresh for this object.
-    snprintf(g_target_name, sizeof g_target_name, "%s", name);
+    snprintf(state->target_name, sizeof state->target_name, "%s", name);
     Convert_Satellite_Data(tle, &state->prediction.satellite_ephem.tle);
     snprintf(state->prediction.satellite_ephem.tle.sat_name,
              sizeof state->prediction.satellite_ephem.tle.sat_name,
              "%s", name);
-    state->prediction.satellite_ephem.name = g_target_name;
+    state->prediction.satellite_ephem.name = state->target_name;
     ClearFlag(ALL_FLAGS);
     select_ephemeris(&state->prediction.satellite_ephem.tle);
 
@@ -5246,7 +5213,7 @@ static int retarget_to_tle(state_t *state, const char *path)
     state->antenna_rotator.flip_decision_made = 0;
     state->antenna_rotator.flip_half          = 0;
 
-    snprintf(g_target_tle_path, sizeof g_target_tle_path, "%s", path);
+    snprintf(state->target_tle_path, sizeof state->target_tle_path, "%s", path);
     return RETARGET_OK;
 }
 
@@ -6015,7 +5982,7 @@ static void self_test_report(const state_t *state, FILE *out, int argc, char **a
     fprintf(out, "doppler-rx: %s (software sw_nco on post-decim IQ; hardware LO fixed)\n",
             state->doppler_correction_enabled ? "enabled" : "disabled");
     fprintf(out, "doppler-tx: %s (hardware SDR LO retune per burst, f=carrier/(1-rr/c))\n",
-            (!sdr_compiled || g_without_b210)
+            (!sdr_compiled || state->without_b210)
                 ? "n/a (no SDR)"
                 : (state->doppler_correction_enabled ? "enabled" : "disabled"));
     fprintf(out, "uplink-nominal-mhz: %.6f\n",
@@ -6039,7 +6006,7 @@ static void self_test_report(const state_t *state, FILE *out, int argc, char **a
             state->antenna_rotator.device_filename,
             baud_str(state->antenna_rotator.serial_speed));
     fprintf(out, "sdr: %s\n",
-            (!sdr_compiled || g_without_b210)
+            (!sdr_compiled || state->without_b210)
                 ? "disabled (--without-b210 or build-time)"
                 : "enabled");
 
@@ -6272,7 +6239,7 @@ int main(int argc, char **argv)
 
     // Seed the retarget guard with the startup TLE so a `:retarget` on
     // the same file is correctly a no-op.
-    snprintf(g_target_tle_path, sizeof g_target_tle_path, "%s",
+    snprintf(state.target_tle_path, sizeof state.target_tle_path, "%s",
              state.prediction.tles_filename
                  ? state.prediction.tles_filename : "");
 
@@ -6415,7 +6382,7 @@ int main(int argc, char **argv)
     // UHD error so a dev host without a device can still run the UI.
     // rx_session takes ownership of the core; we drop our local handle
     // afterwards so main never touches UHD off-thread.
-    if (state.control_mode && !g_without_b210) {
+    if (state.control_mode && !state.without_b210) {
         // B210 RX rate doubled from the original 240 kHz / sps=5 to
         // 480 kHz / sps=10 (after the integer-5 decimation FIR). That
         // gives the modem_fsk clock-recovery loop the same oversampling
@@ -6473,12 +6440,12 @@ int main(int argc, char **argv)
             // clone overrides. --sdr-device routes to the UHD device
             // args when given (e.g. "serial=..."); --uhd-args takes
             // precedence and is passed verbatim.
-            .backend_type        = g_sdr_type,
-            .device_args         = g_sdr_device[0] ? g_sdr_device : "type=b200",
-            .uhd_args_override   = g_uhd_args[0] ? g_uhd_args : NULL,
-            .fpga_image_path     = g_sdr_fpga[0] ? g_sdr_fpga : NULL,
+            .backend_type        = state.sdr_type,
+            .device_args         = state.sdr_device[0] ? state.sdr_device : "type=b200",
+            .uhd_args_override   = state.uhd_args[0] ? state.uhd_args : NULL,
+            .fpga_image_path     = state.sdr_fpga[0] ? state.sdr_fpga : NULL,
             // RTL-SDR dongle index (UHD ignores it; for UHD use --uhd-args).
-            .device_index        = g_sdr_device[0] ? atoi(g_sdr_device) : 0,
+            .device_index        = state.sdr_device[0] ? atoi(state.sdr_device) : 0,
         };
         b210_rx_tx_core_t *core = NULL;
         if (b210_rx_tx_core_open(&cp, &core) != 0) {
@@ -6521,7 +6488,7 @@ int main(int argc, char **argv)
                 .session_dir       = state.pass_folder[0] ? state.pass_folder : NULL,
                 .lo_offset_hz      = state.rx_lo_offset_hz,
             };
-            if (rx_session_open(&g_rx_session, &rxp, core) != 0) {
+            if (rx_session_open(&state.rx_session, &rxp, core) != 0) {
                 fprintf(stderr,
                     "simple_sat_ops: rx_session_open failed — closing B210\n");
                 b210_rx_tx_core_close(core);
@@ -6532,8 +6499,8 @@ int main(int argc, char **argv)
             // before any pass logic gets a chance to gate them. The
             // per-pass start/stop block in the tracking loop checks
             // state.always_record and skips itself when this is on.
-            if (state.always_record && g_rx_session) {
-                rx_session_request_wav_start(g_rx_session);
+            if (state.always_record && state.rx_session) {
+                rx_session_request_wav_start(state.rx_session);
                 fprintf(stderr,
                     "simple_sat_ops: --always-record on — WAV/IQ "
                     "capture started, pass gating disabled\n");
@@ -6698,15 +6665,15 @@ int main(int argc, char **argv)
         //
         // --always-record disables this gate entirely: recording was
         // started once at rx_session_open and stays open until shutdown.
-        if (g_rx_session && !state.always_record) {
+        if (state.rx_session && !state.always_record) {
             double sec_to_aos =
                 state.prediction.predicted_minutes_until_visible * 60.0;
             int visible   = (state.prediction.satellite_ephem.elevation > 0.0);
             int in_preroll = (sec_to_aos > 0.0
                               && sec_to_aos <= RECORDING_PREROLL_S);
-            int active = rx_session_wav_active(g_rx_session);
+            int active = rx_session_wav_active(state.rx_session);
             if (!active && (visible || in_preroll)) {
-                rx_session_request_wav_start(g_rx_session);
+                rx_session_request_wav_start(state.rx_session);
                 t_recording_close_at = 0.0;
                 char det[64];
                 snprintf(det, sizeof det,
@@ -6721,7 +6688,7 @@ int main(int argc, char **argv)
                 } else if (t_recording_close_at == 0.0) {
                     t_recording_close_at = t_now + RECORDING_POSTROLL_S;
                 } else if (t_now >= t_recording_close_at) {
-                    rx_session_request_wav_stop(g_rx_session);
+                    rx_session_request_wav_stop(state.rx_session);
                     t_recording_close_at = 0.0;
                     sso_audit_event("rec-stop", "trigger=postroll-expired");
                 }
@@ -7187,12 +7154,12 @@ int main(int argc, char **argv)
         // grab the iq_burst bright-bin count so the renderer can pick
         // a character that distinguishes broadband packets from a CW
         // carrier at the same peak level.
-        if (g_rx_session && (t_now - g_ribbon_last_t) >= 1.0) {
+        if (state.rx_session && (t_now - g_ribbon_last_t) >= 1.0) {
             double peak = -90.0;
-            rx_session_snapshot(g_rx_session, NULL, &peak, NULL,
+            rx_session_snapshot(state.rx_session, NULL, &peak, NULL,
                                 NULL, NULL, 0);
             int burst_bins = 0;
-            rx_session_burst_snapshot(g_rx_session, &burst_bins, NULL);
+            rx_session_burst_snapshot(state.rx_session, &burst_bins, NULL);
             ribbon_push(peak, burst_bins);
             g_ribbon_last_t = t_now;
 
@@ -7204,7 +7171,7 @@ int main(int argc, char **argv)
             if (state.run_live_waterfall) {
                 char iq_path[512] = "";
                 int  iq_rate      = 0;
-                rx_session_iq_snapshot(g_rx_session,
+                rx_session_iq_snapshot(state.rx_session,
                                        iq_path, sizeof iq_path,
                                        NULL, &iq_rate);
                 if (iq_path[0]
@@ -7279,16 +7246,16 @@ int main(int argc, char **argv)
         // lived here previously fired every 1–10 seconds during a
         // pass and caused brief phase resets in the coherent demod
         // chain; this loop runs every tick at full precision.
-        if (g_rx_session && state.doppler_correction_enabled) {
+        if (state.rx_session && state.doppler_correction_enabled) {
             double offset = state.doppler_downlink_frequency_hz
                           - state.nominal_downlink_frequency_hz;
-            rx_session_set_doppler_offset(g_rx_session, offset);
+            rx_session_set_doppler_offset(state.rx_session, offset);
         }
-        if (g_rx_session) {
+        if (state.rx_session) {
             double doppler_offset =
                 state.doppler_downlink_frequency_hz
                 - state.nominal_downlink_frequency_hz;
-            rx_session_update_observer(g_rx_session,
+            rx_session_update_observer(state.rx_session,
                 state.antenna_rotator.target_azimuth,
                 state.antenna_rotator.target_elevation,
                 state.prediction.satellite_ephem.range_km,
@@ -7301,7 +7268,7 @@ int main(int argc, char **argv)
         //   1. --tx-dry-run:    synthesize "ok" without touching the
         //                       SDR. Auto-tcmd + compose still exercise
         //                       all their UI state on dev hosts.
-        //   2. g_rx_session up: real burst — submitted async to the
+        //   2. state.rx_session up: real burst — submitted async to the
         //                       worker, which pauses RX, transmits and
         //                       resumes RX (~1 s). The main loop keeps
         //                       running between submit and poll so the
@@ -7334,16 +7301,16 @@ int main(int argc, char **argv)
                          state.tx_request.summary);
                 outcome = "rejected: no HMAC key (see banner)";
                 finished = 1;
-            } else if (g_rx_session != NULL && !rx_session_can_tx(g_rx_session)) {
+            } else if (state.rx_session != NULL && !rx_session_can_tx(state.rx_session)) {
                 // RX-only backend (e.g. RTL-SDR): never reaches the air.
                 // Backstop for a stale queued burst that slipped past the
                 // compose / auto-tcmd gates.
                 snprintf(summary, sizeof summary, "%s", state.tx_request.summary);
                 outcome = "rejected: RX-only SDR";
                 finished = 1;
-            } else if (g_rx_session != NULL) {
+            } else if (state.rx_session != NULL) {
                 if (!state.tx_inflight) {
-                    if (rx_session_submit_burst(g_rx_session, &state.tx_request,
+                    if (rx_session_submit_burst(state.rx_session, &state.tx_request,
                                                  g_hmac_key, g_hmac_key_len) == 0) {
                         state.tx_inflight = 1;
                         // Stay pending; we'll poll on subsequent ticks.
@@ -7356,7 +7323,7 @@ int main(int argc, char **argv)
                     }
                 } else {
                     rx_burst_result_t br;
-                    int done = rx_session_poll_burst(g_rx_session, &br,
+                    int done = rx_session_poll_burst(state.rx_session, &br,
                                                       summary, sizeof summary);
                     if (done == 1) {
                         switch (br) {
@@ -7507,23 +7474,23 @@ int main(int argc, char **argv)
     char final_wav_path[512] = "";
     char final_iq_path[512]  = "";
     int  final_iq_rate       = 0;
-    if (g_rx_session) {
+    if (state.rx_session) {
         // Snapshot both sidecar paths before close so the full-pass
         // renderers can find the closed files on disk. Both paths
         // persist across wav_stop in rx_session.
-        rx_session_wav_snapshot(g_rx_session,
+        rx_session_wav_snapshot(state.rx_session,
                                 final_wav_path, sizeof final_wav_path,
                                 NULL, NULL, NULL);
-        rx_session_iq_snapshot(g_rx_session,
+        rx_session_iq_snapshot(state.rx_session,
                                final_iq_path, sizeof final_iq_path,
                                NULL, &final_iq_rate);
         // The worker owns the WAV writer and the B210 core. Closing
         // the session signals the worker to stop, joins it, then
         // tears down both. Any open WAV / .iq gets its header patched
         // (WAV) or its trailer flushed (IQ).
-        rx_session_request_wav_stop(g_rx_session);
-        rx_session_close(g_rx_session);
-        g_rx_session = NULL;
+        rx_session_request_wav_stop(state.rx_session);
+        rx_session_close(state.rx_session);
+        state.rx_session = NULL;
     }
 
     // Any in-flight `:spectrum N` worker is touching the same WAV / IQ
@@ -7756,7 +7723,7 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
         if (strcmp("--without-b210", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--without-b210",
                 "skip the USRP B210 (UI + rotator only)");
-            else { state->n_options++; g_without_b210 = 1; }
+            else { state->n_options++; state->without_b210 = 1; }
             matched = 1;
         }
 #ifdef SSO_WITH_SDR
@@ -7765,7 +7732,7 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
                 "SDR backend (default auto; RTL-SDR is RX-only)");
             else {
                 state->n_options++;
-                if (sdr_backend_type_from_string(arg + 11, &g_sdr_type) != 0) {
+                if (sdr_backend_type_from_string(arg + 11, &state->sdr_type) != 0) {
                     fprintf(stderr, "--sdr-type: unknown '%s' "
                             "(want uhd | rtlsdr | auto)\n", arg + 11);
                     return PARSE_ERROR;
@@ -7778,7 +7745,7 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
                 "backend device selector (RTL-SDR index; UHD use --uhd-args)");
             else {
                 state->n_options++;
-                snprintf(g_sdr_device, sizeof g_sdr_device, "%s", arg + 13);
+                snprintf(state->sdr_device, sizeof state->sdr_device, "%s", arg + 13);
             }
             matched = 1;
         }
@@ -7787,7 +7754,7 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
                 "UHD device-args verbatim; overrides detection");
             else {
                 state->n_options++;
-                snprintf(g_uhd_args, sizeof g_uhd_args, "%s", arg + 11);
+                snprintf(state->uhd_args, sizeof state->uhd_args, "%s", arg + 11);
             }
             matched = 1;
         }
@@ -7796,7 +7763,7 @@ static int apply_args(state_t *state, int argc, char **argv, double jul_utc, int
                 "force a UHD FPGA image (B2xx clone with non-stock bitstream)");
             else {
                 state->n_options++;
-                snprintf(g_sdr_fpga, sizeof g_sdr_fpga, "%s", arg + 11);
+                snprintf(state->sdr_fpga, sizeof state->sdr_fpga, "%s", arg + 11);
             }
             matched = 1;
         }

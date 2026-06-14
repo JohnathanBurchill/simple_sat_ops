@@ -23,6 +23,7 @@
 
 #include "antenna_rotator.h"
 #include "prediction.h"
+#include "sdr_backend.h"
 #include "sso_ipc.h"
 #include "telemetry.h"
 #include "tr_switch.h"
@@ -32,6 +33,11 @@
 #include <stdio.h>
 #include <termios.h>
 #include <time.h>
+
+// The RX session owns the SDR core + worker thread; state_t holds only an
+// opaque handle. Forward-declared here so this header stays free of
+// rx_session.h (which next_in_queue, a state.h consumer, never links).
+typedef struct rx_session rx_session_t;
 
 #define SCAN_MAX_TARGETS 512
 
@@ -239,6 +245,28 @@ typedef struct state
     // operator can A/B against the default-on UHD baseline.
     int rx_dc_offset_track;
     int rx_iq_balance_track;
+
+    // SDR backend selection + the live RX session. simple_sat_ops is the
+    // single process that opens the SDR; without_b210 (--without-b210, or a
+    // non-WITH_USRP_B210 build) leaves rx_session NULL and the loop falls
+    // through cleanly. sdr_type defaults to AUTO (probe UHD, then RTL-SDR);
+    // sdr_device is a backend-specific selector (RTL index; for UHD prefer
+    // uhd_args); uhd_args is a verbatim UHD device-args passthrough;
+    // sdr_fpga forces an FPGA image for a B2xx clone.
+    int                without_b210;
+    sdr_backend_type_t sdr_type;
+    char               sdr_device[128];
+    char               uhd_args[256];
+    char               sdr_fpga[512];
+    rx_session_t      *rx_session;
+
+    // Tracked-satellite identity. target_tle_path is the file the current
+    // satellite came from, so a repeat :retarget on the same file is a
+    // no-op; seeded from the startup TLE path, updated on each retarget.
+    // target_name is stable backing for satellite_ephem.name after a
+    // retarget (the startup name points at argv / an apply_args buffer).
+    char               target_tle_path[1024];
+    char               target_name[64];
 
     // Antenna rotator
     antenna_rotator_t antenna_rotator;
