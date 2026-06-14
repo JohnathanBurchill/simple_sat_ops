@@ -277,32 +277,11 @@ int main(int argc, char **argv)
         return status;
     }
 
-    /* Parse TLE data */
-    int tle_status = load_tle(&state.prediction);
+    // Load the TLE, select the ephemeris, and (in --control mode) set up the
+    // pass folder for the next pass. See control/pass_session.c.
+    int tle_status = pass_session_load_orbit(&state);
     if (tle_status) {
         return tle_status;
-    }
-    ClearFlag(ALL_FLAGS);
-    select_ephemeris(&state.prediction.satellite_ephem.tle);
-
-    // Seed the retarget guard with the startup TLE so a `:retarget` on
-    // the same file is correctly a no-op.
-    snprintf(state.target_tle_path, sizeof state.target_tle_path, "%s",
-             state.prediction.tles_filename
-                 ? state.prediction.tles_filename : "");
-
-    // With a fresh TLE loaded, find the upcoming pass and stand up
-    // /FrontierSat/Operations/<yyyymmdd>/<hhmmLT>/ for it before the
-    // tracking loop opens ncurses. Only on --control — the
-    // standalone-tracker / dev path leaves Operations/ alone.
-    if (state.control_mode) {
-        UTC_Calendar_Now(&utc, &tv);
-        double jul_now = Julian_Date(&utc, &tv);
-        update_satellite_position(&state.prediction, jul_now);
-        setup_pass_folder(&state, jul_now);
-        if (state.pass_folder[0]) {
-            generate_pass_plot(&state, state.pass_folder, jul_now);
-        }
     }
 
     // Hardware bring-up (rotator, T/R switch, SDR), each before ncurses

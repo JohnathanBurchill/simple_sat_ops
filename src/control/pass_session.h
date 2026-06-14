@@ -57,6 +57,12 @@ void setup_pass_folder(state_t *state, double jul_utc_now);
 // into `pass_folder` via gnuplot.
 void generate_pass_plot(state_t *state, const char *pass_folder, double jul_utc_now);
 
+// Startup: load the TLE, select the SGP4/SDP4 ephemeris, seed the retarget
+// guard with the loaded file, and (in --control mode) find the next pass and
+// stand up its pass folder + az/el plot. Returns 0 on success, or load_tle's
+// non-zero status on failure.
+int pass_session_load_orbit(state_t *state);
+
 #ifdef __cplusplus
 }
 #endif

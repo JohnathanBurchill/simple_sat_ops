@@ -580,3 +580,37 @@ void generate_pass_plot(state_t *state, const char *pass_folder,
                 flip_mode ? "flip" : "no flip");
     }
 }
+
+int pass_session_load_orbit(state_t *state)
+{
+    // Parse TLE data.
+    int tle_status = load_tle(&state->prediction);
+    if (tle_status) {
+        return tle_status;
+    }
+    ClearFlag(ALL_FLAGS);
+    select_ephemeris(&state->prediction.satellite_ephem.tle);
+
+    // Seed the retarget guard with the startup TLE so a `:retarget` on the
+    // same file is correctly a no-op.
+    snprintf(state->target_tle_path, sizeof state->target_tle_path, "%s",
+             state->prediction.tles_filename
+                 ? state->prediction.tles_filename : "");
+
+    // With a fresh TLE loaded, find the upcoming pass and stand up
+    // /FrontierSat/Operations/<yyyymmdd>/<hhmmLT>/ for it before the tracking
+    // loop opens ncurses. Only on --control — the standalone-tracker / dev
+    // path leaves Operations/ alone.
+    if (state->control_mode) {
+        struct tm utc;
+        struct timeval tv;
+        UTC_Calendar_Now(&utc, &tv);
+        double jul_now = Julian_Date(&utc, &tv);
+        update_satellite_position(&state->prediction, jul_now);
+        setup_pass_folder(state, jul_now);
+        if (state->pass_folder[0]) {
+            generate_pass_plot(state, state->pass_folder, jul_now);
+        }
+    }
+    return 0;
+}
