@@ -44,6 +44,16 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help);
 // SDR are opened), so the hardware lines report the live opened state.
 void self_test_report(const state_t *state, FILE *out, int argc, char **argv);
 
+// Resolve and load the HMAC keyfile into *state (default path if --hmac-keyfile
+// was not given). A missing or bad key only sets the display status; it is not
+// fatal here — the TX path refuses to key the PA when the key is absent.
+void cli_load_hmac_keyfile(state_t *state);
+
+// Lint the --tc-file agenda (if any) against the firmware telecommand set
+// before any PA-keying bring-up. Returns 0 to continue, EXIT_FAILURE on lint
+// errors unless --ignore-at-your-peril-all-tc-errors is set.
+int cli_tcmd_lint_gate(const state_t *state);
+
 #ifdef __cplusplus
 }
 #endif

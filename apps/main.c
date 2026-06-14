@@ -30,8 +30,6 @@
 #include "sso_audit.h"
 #include "sso_ipc.h"
 #include "frontiersat.h"
-#include "hmac_keyfile.h"
-#include "tcmd_lint.h"
 #include "sso_time.h"
 #include "sso_version.h"
 #include "panels.h"
@@ -209,66 +207,14 @@ int main(int argc, char **argv)
     state.sso_pass_tssent_ms = (sso_now_utc_ms() / 60000LL) * 60000LL;
 #endif
 
-    // Resolve + load the HMAC keyfile. The bytes feed every TX burst's
-    // AX100 frame (CTS1 firmware expects HMAC on every uplink), AND
-    // light the operator banner — "(N bytes ok)" means TX is armed,
-    // "(MISSING)" / "(BAD)" means the next TX request will be refused
-    // before keying the PA. If --hmac-keyfile= wasn't given, fall back
-    // to hmac_keyfile_default_path (shared first, per-user second).
-    if (state.hmac_keyfile_path[0] == '\0') {
-        if (hmac_keyfile_default_path(state.hmac_keyfile_path,
-                                      sizeof state.hmac_keyfile_path) != 0) {
-            state.hmac_keyfile_path[0] = '\0';
-            state.hmac_display_status  = HMAC_DISPLAY_MISSING;
-        }
-    }
-    if (state.hmac_keyfile_path[0] != '\0') {
-        struct stat st;
-        if (stat(state.hmac_keyfile_path, &st) != 0) {
-            state.hmac_display_status = HMAC_DISPLAY_MISSING;
-        } else {
-            ssize_t got = hmac_keyfile_load(state.hmac_keyfile_path,
-                                            state.hmac_key,
-                                            sizeof state.hmac_key);
-            if (got > 0) {
-                state.hmac_display_status = HMAC_DISPLAY_OK;
-                state.hmac_key_len        = (size_t) got;
-            } else {
-                state.hmac_display_status = HMAC_DISPLAY_BAD;
-                state.hmac_key_len        = 0;
-                memset(state.hmac_key, 0, sizeof state.hmac_key);
-            }
-        }
-    }
+    // Resolve + load the HMAC keyfile (feeds every TX burst's AX100 frame and
+    // lights the operator banner). See apps/cli_args.c.
+    cli_load_hmac_keyfile(&state);
 
-    // Telecommand-agenda lint gate. When a --tc-file was given, lint it
-    // against the firmware's telecommand set (names, argument counts,
-    // CTS1+...! framing, length limits) BEFORE bringing up anything that
-    // can key the PA. Lint errors mean a command would be rejected (or
-    // worse, mis-parsed) by the satellite, so refuse to start unless the
-    // operator explicitly accepts the risk. Warnings (e.g. a command not
-    // meant for routine flight operation) are printed but do not block.
-    if (state.auto_tcmd_file_path[0] != '\0') {
-        int tc_warns = 0;
-        int tc_errs = tcmd_lint_file(state.auto_tcmd_file_path, stderr, &tc_warns);
-        if (tc_errs > 0 && !state.ignore_tc_errors) {
-            fprintf(stderr,
-                "simple_sat_ops: %d error%s detected in the --tc-file content (%s).\n"
-                "Refusing to start. Fix the agenda, or re-run with\n"
-                "--ignore-at-your-peril-all-tc-errors to bypass this check.\n",
-                tc_errs, tc_errs == 1 ? "" : "s", state.auto_tcmd_file_path);
-            return EXIT_FAILURE;
-        }
-        if (tc_errs > 0) {
-            fprintf(stderr,
-                "simple_sat_ops: %d telecommand error%s in %s -- proceeding anyway "
-                "(--ignore-at-your-peril-all-tc-errors).\n",
-                tc_errs, tc_errs == 1 ? "" : "s", state.auto_tcmd_file_path);
-        } else if (tc_warns > 0) {
-            fprintf(stderr,
-                "simple_sat_ops: %d telecommand warning%s in %s (see above); proceeding.\n",
-                tc_warns, tc_warns == 1 ? "" : "s", state.auto_tcmd_file_path);
-        }
+    // Telecommand-agenda lint gate: refuse to start on a --tc-file with lint
+    // errors, unless --ignore-at-your-peril-all-tc-errors. See cli_args.c.
+    if ((status = cli_tcmd_lint_gate(&state)) != 0) {
+        return status;
     }
 
     // Audit-log the session + command line and, in --control mode, bind the
