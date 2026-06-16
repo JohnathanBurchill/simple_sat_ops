@@ -22,6 +22,7 @@
 #include "state.h"
 
 #include "auto_tcmd.h"       // auto_tcmd_progress
+#include "ipc_fill.h"        // ipc_fill_state_prediction
 #include "panels.h"          // rx_panel_collect_local, rx_panel_data_t
 #include "sso_audit.h"
 #include "sso_ipc.h"
@@ -94,10 +95,6 @@ void ipc_broadcast_state(state_t *s,
     snprintf(evt.operator_user, sizeof(evt.operator_user), "%s",
              s->operator_user ? s->operator_user : "?");
     evt.has_state = 1;
-    if (s->prediction.satellite_ephem.name) {
-        snprintf(evt.satellite, sizeof(evt.satellite), "%s",
-                 s->prediction.satellite_ephem.name);
-    }
     evt.az = az;
     evt.el = el;
     evt.freq_hz = (long) downlink_freq;
@@ -118,22 +115,10 @@ void ipc_broadcast_state(state_t *s,
     evt.has_rotator = s->have_antenna_rotator;
     evt.jul_utc   = jul_utc;
 
-    // Prediction snapshot — viewer renders these verbatim.
-    snprintf(evt.idesg, sizeof evt.idesg, "%s",
-             s->prediction.satellite_ephem.tle.idesg);
-    evt.epoch_min      = s->prediction.minutes_since_epoch;
-    evt.min_visible    = s->prediction.predicted_minutes_until_visible;
-    evt.min_above_0    = s->prediction.predicted_minutes_above_0_degrees;
-    evt.min_above_30   = s->prediction.predicted_minutes_above_30_degrees;
-    evt.max_el         = s->prediction.predicted_max_elevation;
-    evt.pred_az        = s->prediction.satellite_ephem.azimuth;
-    evt.pred_el        = s->prediction.satellite_ephem.elevation;
-    evt.alt_km         = s->prediction.satellite_ephem.altitude_km;
-    evt.lat_deg        = s->prediction.satellite_ephem.latitude;
-    evt.lon_deg        = s->prediction.satellite_ephem.longitude;
-    evt.speed_kms      = s->prediction.satellite_ephem.speed_km_s;
-    evt.range_km       = s->prediction.satellite_ephem.range_km;
-    evt.range_rate_kms = s->prediction.satellite_ephem.range_rate_km_s;
+    // Prediction snapshot (satellite name, idesg, pass timing, sky
+    // position, range) — viewer renders these verbatim. Shared with the
+    // headless --viewer-stream relay so both fill the fields identically.
+    ipc_fill_state_prediction(&s->prediction, &evt);
 
     // Auto-TCMD progress so viewers can follow the run without the modal.
     {

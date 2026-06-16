@@ -183,6 +183,7 @@ set(SSO_CORE_SOURCES
     src/ipc/sso_ipc_codec.c
     src/ipc/sso_ipc_server.c
     src/ipc/sso_ipc_client.c
+    src/ipc/ipc_fill.c
     src/ipc/sso_operator.c)
 function(target_link_sso_core target)
     target_sources(${target} PRIVATE ${SSO_CORE_SOURCES})
@@ -456,6 +457,18 @@ add_executable(sso_ipc_codec_selftest
 target_include_directories(sso_ipc_codec_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(sso_ipc_codec_selftest PRIVATE m)
 list(APPEND SSO_TARGETS sso_ipc_codec_selftest)
+
+# ipc_fill selftest. Pins the prediction -> STATE field mapping shared by
+# the operator broadcast and the --viewer-stream relay: a known
+# prediction_t fills the matching event fields, and the source / rotator
+# fields it deliberately leaves alone stay untouched. Links the fill TU +
+# the codec (to confirm the filled event encodes), no socket, no ncurses.
+add_executable(ipc_fill_selftest
+               unit_tests/ipc_fill_selftest.c
+               src/ipc/ipc_fill.c src/ipc/sso_ipc_codec.c)
+target_include_directories(ipc_fill_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(ipc_fill_selftest PRIVATE m)
+list(APPEND SSO_TARGETS ipc_fill_selftest)
 
 # Bandpass biquad selftest. Pins the RBJ-cookbook coefficients, peak
 # gain at f0, DC + Nyquist nulls, stopband attenuation, impulse-decay
