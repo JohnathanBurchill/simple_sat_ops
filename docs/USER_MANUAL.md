@@ -9,9 +9,8 @@ and talking to a satellite that only answers when you ask politely.*
 
 Version: 3 (working draft)
 
-Applies to `simple_sat_ops` and friends on branch `any-sdr`. This is a
-working draft and is not yet pinned to a commit; the commit and date
-will be filled in when it is finalized.
+Applies to `simple_sat_ops` and friends on branch `cleanup`, commit
+`4c9ecd3` (2026-06-16). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -227,7 +226,10 @@ Only **one** operator process can hold the hardware at a time.
 Other invocations are *viewers*: they connect to the operator's IPC
 socket and render the same state read-only. A viewer can force-claim
 the operator role; the running operator yields and the viewer
-re-execs itself as the new operator.
+re-execs itself as the new operator. A third mode, `--viewer-stream`,
+is a headless JSON feed for a remote viewer: it streams the same data
+to stdout, works even with no operator running (propagating the TLE
+itself), and never touches the hardware.
 
 ## How the downlink works: from photon to plaintext
 
@@ -789,8 +791,9 @@ execution times.
 ### Modes: operator vs. viewer
 
 ```text
-simple_sat_ops --control [<satellite>] [options]   # operator mode
-simple_sat_ops [options]                            # viewer mode (an operator must be running)
+simple_sat_ops --control [<satellite>] [options]        # operator mode
+simple_sat_ops [options]                                 # viewer mode (an operator must be running)
+simple_sat_ops --viewer-stream [<satellite>] [options]   # headless JSON stream (no operator required)
 ```
 
 **Operator (`--control`).** Opens the IPC socket
@@ -810,6 +813,21 @@ tracking. Press `c` then `y` inside the confirmation window to
 force-claim. The running operator yields, the socket disappears, and
 the viewer re-execs into `--control` with the same TLE and pass folder.
 
+**Stream (`--viewer-stream`).** A headless feed for a remote,
+machine-readable viewer (the iOS/iPadOS app over SSH). It writes
+newline-JSON to stdout, draws no terminal UI, opens no hardware, loads
+no signing key, and can neither transmit nor take control. With no
+operator running it grabs the latest TLE the same way `--control` does,
+propagates the satellite itself, and streams the prediction tagged
+`source:"tle-only"`. It watches the runtime directory for an operator's
+socket, so the moment a `--control` operator starts it relays that
+broadcast tagged `source:"operator"`, falling back to TLE-only when the
+operator drops.
+It runs whether or not an operator is up, and any number of streams can
+attach to one operator (each is just another read-only client).
+`--control` and `--viewer-stream` together are refused. The wire format
+is specified in [the viewer-stream JSON contract](VIEWER_STREAM_JSON.md).
+
 > **Drill (your first pass).** Find an operator already running, or
 > start one yourself, then open a second `simple_sat_ops` with no
 > flags. You are now a viewer: every panel updates and nothing you
@@ -827,8 +845,9 @@ the viewer re-execs into `--control` with the same TLE and pass folder.
 | Flag | Purpose |
 |------|---------|
 | `--control` | Operator mode (one allowed at a time). |
+| `--viewer-stream` | Headless newline-JSON stream to stdout for a remote viewer; no terminal UI, no hardware, no TX. TLE-only until an operator appears, then relays it. Refused together with `--control`. See [the JSON contract](VIEWER_STREAM_JSON.md). |
 | `--tle <path>` | Path to a 3-line TLE file. Default: `$HOME/.local/state/simple_sat_ops/active.tle`. Space form is tab-completable; `--tle=<path>` also works. |
-| `<satellite_id>` | Name prefix to match in the TLE. Optional with `--control` (auto-discovered from the TLE name). Ignored without `--control` - a viewer mirrors the operator's target. |
+| `<satellite_id>` | Name prefix to match in the TLE. Optional with `--control` or `--viewer-stream` (auto-discovered from the TLE name). Ignored by a plain viewer - it mirrors the operator's target. |
 | `--lat=<deg>` `--lon=<deg>` `--alt=<m>` | Observer override. Defaults to the Rothney Astrophysical Observatory (Priddis, SW of Calgary). |
 | `--rotator-device <path>` | Override the SPID tty. |
 | `--without-rotator` (alias `--without-hardware`) | Skip the SPID entirely. |

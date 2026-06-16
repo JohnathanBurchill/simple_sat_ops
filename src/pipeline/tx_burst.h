@@ -102,6 +102,17 @@ ssize_t tx_burst_build_frame(const uint8_t *payload, size_t payload_len,
                               const uint8_t *hmac_key, size_t hmac_key_len,
                               uint8_t *out_frame, size_t out_cap);
 
+#ifdef SSO_WITH_SDR
+struct state;
+typedef struct state state_t;
+
+// Service a pending state->tx_request from the main loop: dry-run / real
+// burst (async submit + poll) / reject-and-clear, then emit the SENT or
+// NOT_SENT event + the tx-result audit line. Leaves the slot pending while a
+// burst is still in flight so the next tick polls it.
+void tx_burst_service_request(state_t *state);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

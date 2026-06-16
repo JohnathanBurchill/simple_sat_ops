@@ -52,6 +52,8 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/src/ipc
     ${CMAKE_SOURCE_DIR}/src/db
     ${CMAKE_SOURCE_DIR}/src/cli
+    ${CMAKE_SOURCE_DIR}/src/ui
+    ${CMAKE_SOURCE_DIR}/src/control
     ${CMAKE_BINARY_DIR}/generated
 )
 
@@ -178,7 +180,11 @@ set(SSO_CORE_SOURCES
     src/ipc/sso_paths.c
     src/ipc/sso_audit.c
     src/ipc/sso_ipc_paths.c
-    src/ipc/sso_ipc.c
+    src/ipc/sso_dirwatch.c
+    src/ipc/sso_ipc_codec.c
+    src/ipc/sso_ipc_server.c
+    src/ipc/sso_ipc_client.c
+    src/ipc/ipc_fill.c
     src/ipc/sso_operator.c)
 function(target_link_sso_core target)
     target_sources(${target} PRIVATE ${SSO_CORE_SOURCES})
@@ -442,6 +448,28 @@ list(APPEND SSO_TARGETS beacon_cts1_selftest)
 add_executable(csp_selftest unit_tests/csp_selftest.c src/proto/csp.c)
 target_include_directories(csp_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS csp_selftest)
+
+# sso_ipc codec selftest. Round-trips the newline-JSON wire format every
+# operator/viewer link rides on (encode -> decode across event types,
+# escaping, the RX-panel + roster blocks, and the decoder's tolerance of
+# unknown / malformed input). Links only the codec TU — no socket.
+add_executable(sso_ipc_codec_selftest
+               unit_tests/sso_ipc_codec_selftest.c src/ipc/sso_ipc_codec.c)
+target_include_directories(sso_ipc_codec_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(sso_ipc_codec_selftest PRIVATE m)
+list(APPEND SSO_TARGETS sso_ipc_codec_selftest)
+
+# ipc_fill selftest. Pins the prediction -> STATE field mapping shared by
+# the operator broadcast and the --viewer-stream relay: a known
+# prediction_t fills the matching event fields, and the source / rotator
+# fields it deliberately leaves alone stay untouched. Links the fill TU +
+# the codec (to confirm the filled event encodes), no socket, no ncurses.
+add_executable(ipc_fill_selftest
+               unit_tests/ipc_fill_selftest.c
+               src/ipc/ipc_fill.c src/ipc/sso_ipc_codec.c)
+target_include_directories(ipc_fill_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(ipc_fill_selftest PRIVATE m)
+list(APPEND SSO_TARGETS ipc_fill_selftest)
 
 # Bandpass biquad selftest. Pins the RBJ-cookbook coefficients, peak
 # gain at f0, DC + Nyquist nulls, stopband attenuation, impulse-decay
@@ -823,7 +851,14 @@ endif()
 # linked directly; the UHD-dependent pieces sit behind WITH_USRP_B210.
 
 if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
-    add_executable(simple_sat_ops apps/main.c
+    add_executable(simple_sat_ops apps/main.c apps/cli_args.c
+                   src/ui/tui.c src/ui/spectrogram.c src/ui/panels.c
+                   src/ui/tx_compose.c src/ui/tx_log.c src/ui/viewer.c
+                   src/ui/auto_tcmd.c src/ui/cmd_line.c src/ui/input.c
+                   src/ui/live_waterfall.c
+                   src/control/pass_session.c src/control/scan_sky.c
+                   src/control/tracking.c src/control/operator_ipc.c
+                   src/control/hw_bringup.c
                    src/orbit/prediction.c src/orbit/oem.c
                    src/orbit/pursuit.c
                    src/hw/antenna_rotator.c

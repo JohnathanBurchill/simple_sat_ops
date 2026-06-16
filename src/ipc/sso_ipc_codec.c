@@ -1,29 +1,50 @@
-#define _GNU_SOURCE  // SO_PEERCRED / struct ucred on glibc
+// sso_ipc_codec.c — the sso_ipc wire codec: the tiny flat-object JSON
+// reader/writer and the event-type table + per-event encode/decode. Plus
+// the handful of low-level helpers shared with the server and client
+// transports (timestamp, socket non-block, one-time SIGPIPE ignore), kept
+// here because both transports already depend on this TU for the codec.
+//
+// Split out of the former monolithic sso_ipc.c. Wire format and the public
+// API are documented in sso_ipc.h.
+
+#define _GNU_SOURCE  // gmtime_r and friends on glibc
 #include "sso_ipc.h"
+#include "sso_ipc_internal.h"
 
-#include "sso_ipc_paths.h"
-#include "sso_paths.h"
-#include "sso_audit.h"
-
-#include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <signal.h>
+#include <fcntl.h>      // O_NONBLOCK (sso_ipc_set_nonblock)
+#include <signal.h>     // sigaction (sso_ipc_sigpipe_ignore_once)
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/un.h>
-#include <time.h>
-#include <unistd.h>
+#include <time.h>       // clock_gettime / gmtime_r (sso_ipc_iso_utc_now)
 
-#define SSO_IPC_MAX_CLIENTS 32
-#define SSO_IPC_READ_BUF    8192
-#define SSO_IPC_WRITE_BUF   32768
-#define SSO_IPC_LINE_MAX    8000
+// =============================================================
+// Shared low-level helpers (used by the server and client transports).
+// sso_ipc_iso_utc_now lives below with the JSON helpers (it formats the
+// event timestamp).
+
+int sso_ipc_set_nonblock(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0) return -1;
+    return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+// Ignore SIGPIPE process-wide the first time any IPC handle is opened.
+// Without this, writing to a viewer socket that has just been closed by
+// the peer kills the operator with the default SIGPIPE action — and
+// since simple_sat_ops is in raw curses mode, that leaves the terminal
+// in an unusable state. EPIPE is already handled by the write paths.
+void sso_ipc_sigpipe_ignore_once(void) {
+    static int done = 0;
+    if (done) return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGPIPE, &sa, NULL);
+    done = 1;
+}
 
 // =============================================================
 // JSON helpers (tiny, flat-object subset).
@@ -33,7 +54,7 @@
 // decoder scans for "key":value pairs at the top level and tolerates
 // extra/unknown fields for forward compatibility.
 
-static void iso_utc_now(char *out, size_t out_size) {
+void sso_ipc_iso_utc_now(char *out, size_t out_size) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     struct tm tm;
@@ -421,7 +442,7 @@ sso_event_type_t sso_event_type_from_name(const char *name) {
 void sso_event_init(sso_event_t *evt, sso_event_type_t type) {
     memset(evt, 0, sizeof(*evt));
     evt->type = type;
-    iso_utc_now(evt->ts, sizeof(evt->ts));
+    sso_ipc_iso_utc_now(evt->ts, sizeof(evt->ts));
 }
 
 int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
@@ -447,6 +468,9 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
     if (json_field_str(&p, end, &first, "pass_folder", evt->pass_folder) < 0) return -1;
     if (evt->has_state) {
         if (json_field_str(&p, end, &first, "sat", evt->satellite) < 0) return -1;
+        if (evt->source[0]) {
+            if (json_field_str(&p, end, &first, "source", evt->source) < 0) return -1;
+        }
         if (json_field_double(&p, end, &first, "az", evt->az) < 0) return -1;
         if (json_field_double(&p, end, &first, "el", evt->el) < 0) return -1;
         if (evt->freq_hz) {
@@ -668,6 +692,9 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
     if (json_get_string(line, "sat", evt->satellite, sizeof(evt->satellite)) > 0) {
         evt->has_state = 1;
     }
+    if (json_get_string(line, "source", evt->source, sizeof(evt->source)) > 0) {
+        evt->has_state = 1;
+    }
     if (json_get_double(line, "az", &evt->az) > 0) evt->has_state = 1;
     if (json_get_double(line, "el", &evt->el) > 0) evt->has_state = 1;
     long freq;
@@ -835,568 +862,3 @@ int sso_event_set_roster(sso_event_t *evt,
     *p = '\0';
     return 0;
 }
-
-// =============================================================
-// Server
-
-typedef struct {
-    int fd;
-    sso_client_id_t id;
-    char read_buf[SSO_IPC_READ_BUF];
-    size_t read_len;
-    char write_buf[SSO_IPC_WRITE_BUF];
-    size_t write_len;
-    int dead;
-    char user[64];
-    char role[16];
-    char since[40];
-    uid_t peer_uid;
-    int   peer_uid_valid;
-} sso_ipc_client_slot_t;
-
-struct sso_ipc_server {
-    int listen_fd;
-    char sock_path[256];
-    char pid_path[256];
-    sso_ipc_client_slot_t clients[SSO_IPC_MAX_CLIENTS];
-    sso_client_id_t next_id;
-    sso_ipc_on_event_fn on_event;
-    void *on_event_user;
-};
-
-static int set_nonblock(int fd) {
-    int fl = fcntl(fd, F_GETFL, 0);
-    if (fl < 0) return -1;
-    return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-}
-
-// Ignore SIGPIPE process-wide the first time any IPC handle is opened.
-// Without this, writing to a viewer socket that has just been closed by
-// the peer kills the operator with the default SIGPIPE action — and
-// since simple_sat_ops is in raw curses mode, that leaves the terminal
-// in an unusable state. EPIPE is already handled by the write paths.
-static void sigpipe_ignore_once(void) {
-    static int done = 0;
-    if (done) return;
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = SIG_IGN;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGPIPE, &sa, NULL);
-    done = 1;
-}
-
-static void slot_close(sso_ipc_client_slot_t *slot) {
-    if (slot->fd >= 0) close(slot->fd);
-    slot->fd = -1;
-    slot->dead = 0;
-    slot->read_len = 0;
-    slot->write_len = 0;
-    slot->user[0] = '\0';
-    slot->role[0] = '\0';
-    slot->since[0] = '\0';
-    slot->peer_uid = 0;
-    slot->peer_uid_valid = 0;
-}
-
-static void slot_capture_peer_uid(sso_ipc_client_slot_t *slot) {
-    slot->peer_uid_valid = 0;
-#if defined(__linux__) && defined(SO_PEERCRED)
-    struct ucred cred;
-    socklen_t len = sizeof(cred);
-    if (getsockopt(slot->fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0) {
-        slot->peer_uid = cred.uid;
-        slot->peer_uid_valid = 1;
-    }
-#else
-    uid_t uid;
-    gid_t gid;
-    if (getpeereid(slot->fd, &uid, &gid) == 0) {
-        slot->peer_uid = uid;
-        slot->peer_uid_valid = 1;
-    }
-#endif
-}
-
-sso_ipc_server_t *sso_ipc_server_open(const char *tool) {
-    if (!tool || !tool[0]) return NULL;
-    sigpipe_ignore_once();
-    if (sso_ipc_ensure_runtime_dir() != 0) return NULL;
-
-    sso_ipc_server_t *srv = calloc(1, sizeof(*srv));
-    if (!srv) return NULL;
-    srv->listen_fd = -1;
-    srv->next_id = 1;
-    for (size_t i = 0; i < SSO_IPC_MAX_CLIENTS; ++i) srv->clients[i].fd = -1;
-
-    if (sso_ipc_socket_path(srv->sock_path, sizeof(srv->sock_path), tool) != 0
-        || sso_ipc_pid_path(srv->pid_path, sizeof(srv->pid_path), tool) != 0) {
-        free(srv);
-        return NULL;
-    }
-
-    // Remove stale socket (best-effort).
-    unlink(srv->sock_path);
-
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        free(srv);
-        return NULL;
-    }
-    if (set_nonblock(fd) < 0) {
-        close(fd);
-        free(srv);
-        return NULL;
-    }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    // sun_path is 108 bytes on Linux. Our sock_path buffer is wider, so
-    // bound-check before copying — GCC's -Wformat-truncation flags an
-    // snprintf here otherwise, and the underlying ENAMETOOLONG is a
-    // real failure mode worth surfacing.
-    size_t sp_len = strlen(srv->sock_path);
-    if (sp_len >= sizeof(addr.sun_path)) {
-        errno = ENAMETOOLONG;
-        close(fd);
-        free(srv);
-        return NULL;
-    }
-    memcpy(addr.sun_path, srv->sock_path, sp_len + 1);
-
-    if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
-        close(fd);
-        free(srv);
-        return NULL;
-    }
-
-    chmod(srv->sock_path, 0660);
-
-    if (listen(fd, SSO_IPC_MAX_CLIENTS) < 0) {
-        close(fd);
-        unlink(srv->sock_path);
-        free(srv);
-        return NULL;
-    }
-
-    // Write pid file.
-    FILE *pf = fopen(srv->pid_path, "w");
-    if (pf) {
-        fprintf(pf, "%d\n", (int) getpid());
-        fclose(pf);
-        chmod(srv->pid_path, 0660);
-    }
-
-    srv->listen_fd = fd;
-    return srv;
-}
-
-void sso_ipc_server_close(sso_ipc_server_t *srv) {
-    if (!srv) return;
-    for (size_t i = 0; i < SSO_IPC_MAX_CLIENTS; ++i) slot_close(&srv->clients[i]);
-    if (srv->listen_fd >= 0) close(srv->listen_fd);
-    if (srv->sock_path[0]) unlink(srv->sock_path);
-    if (srv->pid_path[0]) unlink(srv->pid_path);
-    free(srv);
-}
-
-void sso_ipc_server_on_event(sso_ipc_server_t *srv,
-                              sso_ipc_on_event_fn fn, void *user) {
-    if (!srv) return;
-    srv->on_event = fn;
-    srv->on_event_user = user;
-}
-
-static sso_ipc_client_slot_t *server_alloc_slot(sso_ipc_server_t *srv) {
-    for (size_t i = 0; i < SSO_IPC_MAX_CLIENTS; ++i) {
-        if (srv->clients[i].fd < 0) return &srv->clients[i];
-    }
-    return NULL;
-}
-
-static void server_accept(sso_ipc_server_t *srv) {
-    for (;;) {
-        struct sockaddr_un peer;
-        socklen_t peerlen = sizeof(peer);
-        int cfd = accept(srv->listen_fd, (struct sockaddr *) &peer, &peerlen);
-        if (cfd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-            return;
-        }
-        sso_ipc_client_slot_t *slot = server_alloc_slot(srv);
-        if (!slot) {
-            close(cfd);
-            continue;
-        }
-        set_nonblock(cfd);
-        slot->fd = cfd;
-        slot->id = srv->next_id++;
-        slot->read_len = 0;
-        slot->write_len = 0;
-        slot->dead = 0;
-        slot->user[0] = '\0';
-        slot->role[0] = '\0';
-        iso_utc_now(slot->since, sizeof(slot->since));
-        slot_capture_peer_uid(slot);
-    }
-}
-
-static int slot_dispatch_line(sso_ipc_server_t *srv,
-                              sso_ipc_client_slot_t *slot,
-                              char *line) {
-    sso_event_t evt;
-    if (sso_event_decode(line, &evt) != 0) return 0;
-    // Special handling: capture hello's identity onto the slot so the
-    // server can build the roster + route handoff offers without the
-    // caller having to track it themselves.
-    if (evt.type == SSO_EVT_HELLO) {
-        if (evt.user[0]) snprintf(slot->user, sizeof(slot->user), "%s", evt.user);
-        if (evt.role[0]) snprintf(slot->role, sizeof(slot->role), "%s", evt.role);
-    }
-    if (srv->on_event) {
-        srv->on_event(srv, slot->id, &evt, srv->on_event_user);
-    }
-    return 0;
-}
-
-static void slot_drain_read(sso_ipc_server_t *srv,
-                             sso_ipc_client_slot_t *slot) {
-    for (;;) {
-        if (slot->read_len >= sizeof(slot->read_buf) - 1) {
-            // Line longer than buffer: drop the client.
-            slot->dead = 1;
-            return;
-        }
-        ssize_t n = read(slot->fd, slot->read_buf + slot->read_len,
-                         sizeof(slot->read_buf) - slot->read_len - 1);
-        if (n == 0) {
-            slot->dead = 1;
-            return;
-        }
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            slot->dead = 1;
-            return;
-        }
-        slot->read_len += (size_t) n;
-        slot->read_buf[slot->read_len] = '\0';
-        for (;;) {
-            char *nl = memchr(slot->read_buf, '\n', slot->read_len);
-            if (!nl) break;
-            *nl = '\0';
-            slot_dispatch_line(srv, slot, slot->read_buf);
-            size_t consumed = (size_t) (nl - slot->read_buf) + 1;
-            size_t remain = slot->read_len - consumed;
-            memmove(slot->read_buf, nl + 1, remain);
-            slot->read_len = remain;
-            slot->read_buf[slot->read_len] = '\0';
-        }
-    }
-}
-
-static void slot_drain_write(sso_ipc_client_slot_t *slot) {
-    while (slot->write_len > 0) {
-        ssize_t n = write(slot->fd, slot->write_buf, slot->write_len);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-            slot->dead = 1;
-            return;
-        }
-        if (n == 0) {
-            slot->dead = 1;
-            return;
-        }
-        size_t remain = slot->write_len - (size_t) n;
-        memmove(slot->write_buf, slot->write_buf + n, remain);
-        slot->write_len = remain;
-    }
-}
-
-static int slot_queue(sso_ipc_client_slot_t *slot, const char *line) {
-    size_t n = strlen(line);
-    if (slot->write_len + n > sizeof(slot->write_buf)) {
-        // Slow consumer overflow: drop the client (we'd lose synchrony).
-        slot->dead = 1;
-        return -1;
-    }
-    memcpy(slot->write_buf + slot->write_len, line, n);
-    slot->write_len += n;
-    return 0;
-}
-
-int sso_ipc_server_step(sso_ipc_server_t *srv, int timeout_ms) {
-    if (!srv || srv->listen_fd < 0) return -1;
-    struct pollfd pfds[1 + SSO_IPC_MAX_CLIENTS];
-    nfds_t nfds = 0;
-    pfds[nfds].fd = srv->listen_fd;
-    pfds[nfds].events = POLLIN;
-    nfds++;
-    int slot_indices[SSO_IPC_MAX_CLIENTS];
-    for (size_t i = 0; i < SSO_IPC_MAX_CLIENTS; ++i) {
-        if (srv->clients[i].fd < 0) continue;
-        pfds[nfds].fd = srv->clients[i].fd;
-        pfds[nfds].events = POLLIN | (srv->clients[i].write_len > 0 ? POLLOUT : 0);
-        slot_indices[nfds - 1] = (int) i;
-        nfds++;
-    }
-    int r = poll(pfds, nfds, timeout_ms);
-    if (r < 0) {
-        if (errno == EINTR) return 0;
-        return -1;
-    }
-    if (r == 0) return 0;
-    if (pfds[0].revents & POLLIN) server_accept(srv);
-    for (nfds_t i = 1; i < nfds; ++i) {
-        int idx = slot_indices[i - 1];
-        sso_ipc_client_slot_t *slot = &srv->clients[idx];
-        if (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            slot->dead = 1;
-        }
-        if (!slot->dead && (pfds[i].revents & POLLIN)) slot_drain_read(srv, slot);
-        if (!slot->dead && (pfds[i].revents & POLLOUT)) slot_drain_write(slot);
-    }
-    for (size_t i = 0; i < SSO_IPC_MAX_CLIENTS; ++i) {
-        if (srv->clients[i].fd >= 0 && srv->clients[i].dead) {
-            slot_close(&srv->clients[i]);
-        }
-    }
-    return 0;
-}
-
-int sso_ipc_server_broadcast(sso_ipc_server_t *srv, const char *line) {
-    if (!srv || !line) return -1;
-    for (size_t i = 0; i < SSO_IPC_MAX_CLIENTS; ++i) {
-        if (srv->clients[i].fd >= 0 && !srv->clients[i].dead) {
-            slot_queue(&srv->clients[i], line);
-            slot_drain_write(&srv->clients[i]);
-        }
-    }
-    return 0;
-}
-
-int sso_ipc_server_send(sso_ipc_server_t *srv, sso_client_id_t id,
-                         const char *line) {
-    if (!srv || !line) return -1;
-    for (size_t i = 0; i < SSO_IPC_MAX_CLIENTS; ++i) {
-        if (srv->clients[i].fd >= 0 && srv->clients[i].id == id) {
-            slot_queue(&srv->clients[i], line);
-            slot_drain_write(&srv->clients[i]);
-            return 0;
-        }
-    }
-    return -1;
-}
-
-size_t sso_ipc_server_client_count(const sso_ipc_server_t *srv) {
-    if (!srv) return 0;
-    size_t n = 0;
-    for (size_t i = 0; i < SSO_IPC_MAX_CLIENTS; ++i) {
-        if (srv->clients[i].fd >= 0 && !srv->clients[i].dead) n++;
-    }
-    return n;
-}
-
-int sso_ipc_server_next_client(const sso_ipc_server_t *srv,
-                                sso_ipc_iter_t *iter,
-                                sso_client_id_t *out_id,
-                                char *out_user, size_t out_user_size,
-                                char *out_role, size_t out_role_size,
-                                char *out_since, size_t out_since_size) {
-    if (!srv || !iter) return -1;
-    for (; iter->cursor < SSO_IPC_MAX_CLIENTS; ++iter->cursor) {
-        const sso_ipc_client_slot_t *s = &srv->clients[iter->cursor];
-        if (s->fd < 0 || s->dead) continue;
-        if (out_id) *out_id = s->id;
-        if (out_user && out_user_size) snprintf(out_user, out_user_size, "%s", s->user);
-        if (out_role && out_role_size) snprintf(out_role, out_role_size, "%s", s->role);
-        if (out_since && out_since_size) snprintf(out_since, out_since_size, "%s", s->since);
-        iter->cursor++;
-        return 0;
-    }
-    return -1;
-}
-
-int sso_ipc_server_peer_uid(const sso_ipc_server_t *srv,
-                             sso_client_id_t id, uid_t *out) {
-    if (!srv || !out) return -1;
-    for (size_t i = 0; i < SSO_IPC_MAX_CLIENTS; ++i) {
-        const sso_ipc_client_slot_t *s = &srv->clients[i];
-        if (s->fd < 0 || s->dead) continue;
-        if (s->id != id) continue;
-        if (!s->peer_uid_valid) return -1;
-        *out = s->peer_uid;
-        return 0;
-    }
-    return -1;
-}
-
-// =============================================================
-// Client
-
-struct sso_ipc_client {
-    int fd;
-    char tool[64];
-    char read_buf[SSO_IPC_READ_BUF];
-    size_t read_len;
-    char write_buf[SSO_IPC_WRITE_BUF];
-    size_t write_len;
-    sso_ipc_client_on_event_fn on_event;
-    void *on_event_user;
-    int connected;
-};
-
-sso_ipc_client_t *sso_ipc_client_connect(const char *tool) {
-    if (!tool || !tool[0]) return NULL;
-    sigpipe_ignore_once();
-    char path[256];
-    if (sso_ipc_socket_path(path, sizeof(path), tool) != 0) return NULL;
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return NULL;
-    if (set_nonblock(fd) < 0) {
-        close(fd);
-        return NULL;
-    }
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    size_t path_len = strlen(path);
-    if (path_len >= sizeof(addr.sun_path)) {
-        // Linux's sun_path is 108 bytes; our path buffer is 256. Reject
-        // overlong paths up front rather than letting snprintf silently
-        // truncate (and rather than letting GCC -Wformat-truncation
-        // complain about it).
-        errno = ENAMETOOLONG;
-        close(fd);
-        return NULL;
-    }
-    memcpy(addr.sun_path, path, path_len + 1);
-    if (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
-        if (errno != EINPROGRESS) {
-            close(fd);
-            return NULL;
-        }
-    }
-    sso_ipc_client_t *cli = calloc(1, sizeof(*cli));
-    if (!cli) {
-        close(fd);
-        return NULL;
-    }
-    cli->fd = fd;
-    snprintf(cli->tool, sizeof(cli->tool), "%s", tool);
-    cli->connected = 1;
-    return cli;
-}
-
-void sso_ipc_client_close(sso_ipc_client_t *cli) {
-    if (!cli) return;
-    if (cli->fd >= 0) close(cli->fd);
-    free(cli);
-}
-
-void sso_ipc_client_on_event(sso_ipc_client_t *cli,
-                              sso_ipc_client_on_event_fn fn, void *user) {
-    if (!cli) return;
-    cli->on_event = fn;
-    cli->on_event_user = user;
-}
-
-static int client_drain_read(sso_ipc_client_t *cli) {
-    for (;;) {
-        if (cli->read_len >= sizeof(cli->read_buf) - 1) {
-            cli->connected = 0;
-            return 1;
-        }
-        ssize_t n = read(cli->fd, cli->read_buf + cli->read_len,
-                         sizeof(cli->read_buf) - cli->read_len - 1);
-        if (n == 0) {
-            cli->connected = 0;
-            return 1;
-        }
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            cli->connected = 0;
-            return 1;
-        }
-        cli->read_len += (size_t) n;
-        cli->read_buf[cli->read_len] = '\0';
-        for (;;) {
-            char *nl = memchr(cli->read_buf, '\n', cli->read_len);
-            if (!nl) break;
-            *nl = '\0';
-            if (cli->on_event) {
-                sso_event_t evt;
-                if (sso_event_decode(cli->read_buf, &evt) == 0) {
-                    cli->on_event(cli, &evt, cli->on_event_user);
-                }
-            }
-            size_t consumed = (size_t) (nl - cli->read_buf) + 1;
-            size_t remain = cli->read_len - consumed;
-            memmove(cli->read_buf, nl + 1, remain);
-            cli->read_len = remain;
-            cli->read_buf[cli->read_len] = '\0';
-        }
-    }
-    return 0;
-}
-
-static void client_drain_write(sso_ipc_client_t *cli) {
-    while (cli->write_len > 0) {
-        ssize_t n = write(cli->fd, cli->write_buf, cli->write_len);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-            cli->connected = 0;
-            return;
-        }
-        if (n == 0) {
-            cli->connected = 0;
-            return;
-        }
-        size_t remain = cli->write_len - (size_t) n;
-        memmove(cli->write_buf, cli->write_buf + n, remain);
-        cli->write_len = remain;
-    }
-}
-
-int sso_ipc_client_step(sso_ipc_client_t *cli, int timeout_ms) {
-    if (!cli || cli->fd < 0 || !cli->connected) return 1;
-    struct pollfd pfd;
-    pfd.fd = cli->fd;
-    pfd.events = POLLIN | (cli->write_len > 0 ? POLLOUT : 0);
-    int r = poll(&pfd, 1, timeout_ms);
-    if (r < 0) {
-        if (errno == EINTR) return 0;
-        return -1;
-    }
-    if (r == 0) return 0;
-    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-        cli->connected = 0;
-        return 1;
-    }
-    if (pfd.revents & POLLIN) {
-        if (client_drain_read(cli)) return 1;
-    }
-    if (pfd.revents & POLLOUT) client_drain_write(cli);
-    return 0;
-}
-
-int sso_ipc_client_send(sso_ipc_client_t *cli, const char *line) {
-    if (!cli || !cli->connected || !line) return -1;
-    size_t n = strlen(line);
-    if (cli->write_len + n > sizeof(cli->write_buf)) {
-        cli->connected = 0;
-        return -1;
-    }
-    memcpy(cli->write_buf + cli->write_len, line, n);
-    cli->write_len += n;
-    client_drain_write(cli);
-    return 0;
-}
-
-int sso_ipc_client_is_connected(const sso_ipc_client_t *cli) {
-    return cli && cli->connected;
-}
-
-// (void) sso_audit symbol referenced to ensure the audit lib is part
-// of the link graph of consumers that pull sso_ipc.
-static __attribute__((unused)) const void *sso_ipc_audit_anchor = (const void *) sso_unix_user;
