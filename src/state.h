@@ -291,6 +291,7 @@ typedef struct state
     // Run mode + one-shot CLI flags (set once in apply_args / main).
     int control_mode;        // --control: this process is the operator
     int viewer_mode;         // bare invocation found a running operator
+    int viewer_stream;       // --viewer-stream: headless JSON stream to stdout
     int self_test;           // --self-test: print a report and exit
     int ignore_tc_errors;    // --ignore-...-all-tc-errors
     int tx_dry_run;          // --tx-dry-run

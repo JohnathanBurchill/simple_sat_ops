@@ -133,8 +133,9 @@ void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
     // Mode. apply_args has already set state->control_mode / state->viewer_mode
     // (the latter only via the auto-probe path, which --self-test
     // skips). Standalone is the default.
-    const char *mode = state->control_mode ? "operator (--control)"
-                     : state->viewer_mode  ? "viewer (auto-detected)"
+    const char *mode = state->control_mode  ? "operator (--control)"
+                     : state->viewer_stream ? "viewer-stream (headless JSON)"
+                     : state->viewer_mode   ? "viewer (auto-detected)"
                                        : "standalone";
     fprintf(out, "mode: %s\n", mode);
 
@@ -982,6 +983,12 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
             else { state->n_options++; state->control_mode = 1; }
             matched = 1;
         }
+        if (strcmp("--viewer-stream", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--viewer-stream",
+                "headless: stream satellite data as newline-JSON to stdout (no hardware)");
+            else { state->n_options++; state->viewer_stream = 1; }
+            matched = 1;
+        }
         if (strcmp("--self-test", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--self-test",
                 "print the settings simple_sat_ops would run with, then exit 0");
@@ -1042,6 +1049,16 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
     // positional was captured in the parse loop above (which correctly
     // skips space-form option values), so there is no second re-scan here.
 
+    // --control drives hardware; --viewer-stream must never touch it.
+    // Allowing both would bind the operator socket AND try to stream as a
+    // detached client from the same process — refuse the combination.
+    if (state->control_mode && state->viewer_stream) {
+        fprintf(stderr,
+            "simple_sat_ops: --control and --viewer-stream cannot be used "
+            "together (one operates the hardware, the other only streams).\n");
+        return PARSE_ERROR;
+    }
+
     // Any invocation without --control: the standalone tracker is being
     // phased out in favour of the operator+viewer split, so there is no
     // longer a "track this on my own" path. Probe for the running
@@ -1050,7 +1067,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
     // command line - a viewer mirrors whatever the operator is tracking,
     // so any positional is ignored here. --self-test skips the probe (a
     // side effect) so the config dump runs cleanly with no live operator.
-    if (!state->control_mode && !state->self_test) {
+    // --viewer-stream also skips it: it loads its own TLE and streams
+    // predictions even when no operator is running, so a missing operator
+    // is not an error — it just means TLE-only mode.
+    if (!state->control_mode && !state->self_test && !state->viewer_stream) {
         sso_ipc_client_t *probe = sso_ipc_client_connect("simple_sat_ops");
         if (probe == NULL) {
             fprintf(stderr,
@@ -1072,11 +1092,12 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
     state->prediction.observer_ephem.position_geodetic.alt =
         site_altitude / 1000.0;
 
-    // --control with no positional: auto-discover the newest TLE
-    // under /FrontierSat/TLEs/ and load it directly. setup_pass_folder
-    // pins this source file (under its original tle-YYYYMMDD.tle name)
-    // into the pass folder once AOS is known.
-    if (n_positional == 0 && state->control_mode) {
+    // --control (or --viewer-stream) with no positional: auto-discover the
+    // newest TLE under /FrontierSat/TLEs/ and load it directly. For
+    // --control, setup_pass_folder later pins this source file (under its
+    // original tle-YYYYMMDD.tle name) into the pass folder once AOS is
+    // known; --viewer-stream just propagates it for the stream.
+    if (n_positional == 0 && (state->control_mode || state->viewer_stream)) {
         if (state->prediction.tles_filename == NULL) {
             const char *tles_root = sso_tles_dir();
             static char src_tle[1024];

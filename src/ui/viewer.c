@@ -24,6 +24,9 @@
 #include "panels.h"
 #include "tui.h"
 #include "tx_log.h"
+#include "ipc_fill.h"        // ipc_fill_state_prediction
+#include "prediction.h"      // update_satellite_position, free_passes
+#include "tracking.h"        // update_doppler_shifted_frequencies
 #include "sso_audit.h"
 #include "sso_ipc.h"
 #include "sso_ipc_paths.h"
@@ -37,6 +40,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 // --- Viewer mode --------------------------------------------------
@@ -577,5 +581,171 @@ int run_viewer(const char *argv0)
     endwin();
     tui_release_stderr();
     sso_ipc_client_close(cli);
+    return 0;
+}
+
+// --- --viewer-stream: headless JSON stream ------------------------
+//
+// Two modes, auto-switching, writing newline-JSON to stdout (no ncurses,
+// no hardware):
+//   TLE-only — no operator running. Propagate the already-loaded TLE
+//     locally (SGP4) and emit STATE lines tagged source="tle-only" at
+//     ~1 Hz. Probe for an operator every 30 s.
+//   operator — an operator is up. Connect as an "external" client and
+//     relay its broadcast to stdout, re-tagging STATE/WELCOME with
+//     source="operator". On disconnect, fall back to TLE-only.
+// The source tag on every STATE line is how the reader tells which mode
+// produced the data. The TLE-only stream is continuous, so a live link is
+// always evident from the flowing lines.
+
+// STATE emit cadence in TLE-only mode (seconds).
+#define STREAM_TLE_PERIOD_S    1
+// Operator-probe cadence (the requested "watch once every 30 s").
+#define STREAM_PROBE_PERIOD_S  30
+
+static volatile sig_atomic_t g_stream_stop = 0;
+static void stream_on_signal(int sig) { (void) sig; g_stream_stop = 1; }
+
+// Write one already-encoded line (it ends in '\n') to stdout and flush.
+// A write error — typically the SSH reader closing our stdout — flags a
+// stop so the loop unwinds cleanly instead of spinning on a dead pipe.
+static void stream_emit(const char *line)
+{
+    fputs(line, stdout);
+    fflush(stdout);
+    if (ferror(stdout)) g_stream_stop = 1;
+}
+
+// Resolve the Unix user once, for the HELLO / operator_user field.
+static const char *stream_user(void)
+{
+    const char *me = getenv("USER");
+    if (!me || !me[0]) me = sso_unix_user();
+    return me ? me : "?";
+}
+
+// IPC callback for operator-relay mode: re-encode each operator event to
+// stdout, stamping STATE/WELCOME with source="operator" so the reader can
+// tell relayed data from the local TLE-only stream. Re-encoding (rather
+// than forwarding raw bytes) keeps both modes' STATE lines identically
+// shaped — the relay is built from the same tree as the operator, so the
+// codec round-trip drops nothing.
+static void stream_relay_on_event(sso_ipc_client_t *cli,
+                                  const sso_event_t *evt, void *user)
+{
+    (void) cli;
+    (void) user;
+    sso_event_t e = *evt;
+    if (e.type == SSO_EVT_STATE || e.type == SSO_EVT_WELCOME) {
+        snprintf(e.source, sizeof e.source, "operator");
+    }
+    char line[8192];
+    if (sso_event_encode(&e, line, sizeof line) == 0) {
+        stream_emit(line);
+    }
+}
+
+// Build + emit one TLE-only STATE line off the current prediction. No
+// rotator / radio / RX in this mode: az/el and has_rotator stay 0 and the
+// satellite's sky position rides pred_az/pred_el. freq carries the
+// Doppler-shifted downlink so the stream shows the same carrier the
+// operator would; in_pass reflects the live above-horizon geometry.
+static void stream_emit_tle_state(state_t *state, double jul_utc)
+{
+    sso_event_t evt;
+    sso_event_init(&evt, SSO_EVT_STATE);
+    evt.has_state = 1;
+    snprintf(evt.source, sizeof evt.source, "tle-only");
+    snprintf(evt.operator_user, sizeof evt.operator_user, "%s", stream_user());
+    if (state->prediction.tles_filename) {
+        snprintf(evt.tle_path, sizeof evt.tle_path, "%s",
+                 state->prediction.tles_filename);
+    }
+    ipc_fill_state_prediction(&state->prediction, &evt);
+    evt.jul_utc = jul_utc;
+    evt.freq_hz = (long) state->doppler_downlink_frequency_hz;
+    evt.in_pass = (state->prediction.satellite_ephem.elevation > 0.0);
+
+    char line[8192];
+    if (sso_event_encode(&evt, line, sizeof line) == 0) {
+        stream_emit(line);
+    }
+}
+
+// One pass through operator-relay mode: HELLO as an "external" client,
+// then forward the operator's broadcast until it drops or we're asked to
+// stop. Returns when the link is gone so the caller falls back to TLE-only.
+static void stream_relay_session(sso_ipc_client_t *cli)
+{
+    sso_ipc_client_on_event(cli, stream_relay_on_event, NULL);
+    sso_event_t hello;
+    sso_event_init(&hello, SSO_EVT_HELLO);
+    snprintf(hello.role, sizeof hello.role, "external");
+    snprintf(hello.user, sizeof hello.user, "%s", stream_user());
+    char buf[1024];
+    if (sso_event_encode(&hello, buf, sizeof buf) == 0) {
+        sso_ipc_client_send(cli, buf);
+    }
+    while (!g_stream_stop) {
+        int rc = sso_ipc_client_step(cli, 500);
+        if (rc != 0) break;  // 1 = operator gone, -1 = fatal
+    }
+}
+
+int run_viewer_stream(state_t *state)
+{
+    // A closed stdout (SSH reader gone) must surface as a write error we
+    // can act on, not a SIGPIPE that kills us mid-line — and we may stream
+    // for a while before ever connecting a client, so don't rely on the
+    // connect path to have ignored it. SIGTERM/SIGINT stop us cleanly.
+    signal(SIGPIPE, SIG_IGN);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = stream_on_signal;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
+
+    time_t last_emit  = 0;   // 0 => emit on the first TLE-only tick
+    time_t last_probe = 0;   // 0 => probe on the first iteration
+
+    while (!g_stream_stop) {
+        time_t now = time(NULL);
+
+        // Probe first so that, when an operator is already up, we go
+        // straight to relaying without emitting a stray TLE-only line.
+        if (now - last_probe >= STREAM_PROBE_PERIOD_S) {
+            last_probe = now;
+            sso_ipc_client_t *cli = sso_ipc_client_connect("simple_sat_ops");
+            if (cli != NULL) {
+                stream_relay_session(cli);
+                sso_ipc_client_close(cli);
+                cli = NULL;
+                // Operator dropped: resume TLE-only promptly, but hold off
+                // the next probe a full period so we don't hammer reconnect.
+                last_emit  = 0;
+                last_probe = time(NULL);
+                continue;
+            }
+        }
+
+        if (now - last_emit >= STREAM_TLE_PERIOD_S) {
+            struct tm utc;
+            struct timeval tv;
+            UTC_Calendar_Now(&utc, &tv);
+            double jul_utc = Julian_Date(&utc, &tv);
+            update_satellite_position(&state->prediction, jul_utc);
+            compute_predictions(state, jul_utc);
+            if (state->doppler_correction_enabled) {
+                update_doppler_shifted_frequencies(state,
+                    state->nominal_uplink_frequency_hz,
+                    state->nominal_downlink_frequency_hz);
+            }
+            stream_emit_tle_state(state, jul_utc);
+            last_emit = now;
+        }
+
+        // Idle a beat; a stop signal interrupts the sleep for prompt exit.
+        usleep(200 * 1000);
+    }
     return 0;
 }

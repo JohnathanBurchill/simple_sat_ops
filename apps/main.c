@@ -169,6 +169,28 @@ int main(int argc, char **argv)
         return run_viewer(argv[0]);
     }
 
+    // --viewer-stream: headless JSON stream for the remote viewer. Load the
+    // orbit (TLE + ephemeris) but open NO hardware, bind NO IPC server, and
+    // load NO HMAC key — it only ever reads the sky and writes JSON to
+    // stdout, propagating the TLE itself when no operator is up and relaying
+    // an operator's broadcast when one is. Returns BEFORE the HMAC keyfile
+    // load / lint gate / operator bring-up below so none of those run.
+    // --viewer-stream --self-test prints the dry-run config and exits 0.
+    if (state.viewer_stream) {
+        int s = pass_session_load_orbit(&state);
+        if (s == 0) {
+            if (state.self_test) {
+                self_test_report(&state, stdout, argc, argv);
+            } else {
+                s = run_viewer_stream(&state);
+            }
+        }
+        if (state.prediction.auto_sat) {
+            free_passes();
+        }
+        return s;
+    }
+
 #ifdef SSO_WITH_SDR
     // Pin the SSO+ @tssent dedup key for this session: the startup UTC,
     // truncated to the minute. Constant for the life of the process so the

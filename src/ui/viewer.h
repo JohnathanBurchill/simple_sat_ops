@@ -32,10 +32,21 @@
 extern "C" {
 #endif
 
+struct state;
+typedef struct state state_t;
+
 // Run the viewer event loop until the user quits or takes control (which
 // re-execs as the operator). argv0 is the path to re-exec on take-control.
 // Returns a process exit code.
 int run_viewer(const char *argv0);
+
+// Headless JSON stream (--viewer-stream): no ncurses, no hardware. Writes
+// newline-JSON to stdout. With no operator running it propagates the
+// already-loaded TLE itself and streams STATE lines tagged source="tle-only";
+// every 30 s it probes for an operator and, when one appears, relays the
+// operator's stream (re-tagged source="operator") until it drops, then falls
+// back to TLE-only. Caller loads the orbit first. Returns a process exit code.
+int run_viewer_stream(state_t *state);
 
 // Read the running operator's pid (from the IPC pidfile) into *out_pid.
 // Returns 0 on success, non-zero if no operator pidfile is present. Used by
