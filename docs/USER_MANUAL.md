@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on branch `cleanup`, commit
-`bc69863` (2026-06-16). This is a working draft.
+`4c9ecd3` (2026-06-16). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -819,9 +819,10 @@ newline-JSON to stdout, draws no terminal UI, opens no hardware, loads
 no signing key, and can neither transmit nor take control. With no
 operator running it grabs the latest TLE the same way `--control` does,
 propagates the satellite itself, and streams the prediction tagged
-`source:"tle-only"`. Every 30 seconds it watches for an operator and,
-when one appears, relays the operator's broadcast tagged
-`source:"operator"`, falling back to TLE-only when the operator drops.
+`source:"tle-only"`. It watches the runtime directory for an operator's
+socket, so the moment a `--control` operator starts it relays that
+broadcast tagged `source:"operator"`, falling back to TLE-only when the
+operator drops.
 It runs whether or not an operator is up, and any number of streams can
 attach to one operator (each is just another read-only client).
 `--control` and `--viewer-stream` together are refused. The wire format

@@ -180,6 +180,7 @@ set(SSO_CORE_SOURCES
     src/ipc/sso_paths.c
     src/ipc/sso_audit.c
     src/ipc/sso_ipc_paths.c
+    src/ipc/sso_dirwatch.c
     src/ipc/sso_ipc_codec.c
     src/ipc/sso_ipc_server.c
     src/ipc/sso_ipc_client.c

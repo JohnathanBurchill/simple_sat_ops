@@ -56,9 +56,10 @@ Over `--viewer-stream`, `source` is **always present** on `state`/`welcome`.
 Treat it as the authoritative mode flag and read it off each line.
 
 Transitions are seamless: with no operator you get `tle-only` lines; the
-producer probes for an operator **every 30 s** and, when one appears, switches
-to `operator` lines; when the operator drops it falls back to `tle-only`. No
-gap — the stream never goes silent during a handover beyond the normal tick.
+producer notices the **moment** a `--control` operator starts — it watches the
+runtime directory for the operator's socket — and switches to `operator` lines
+within a tick; when the operator drops it falls back to `tle-only`. No gap —
+the stream never goes silent during a handover beyond the normal tick.
 
 > The non-`state` event types (§5.3) only ever appear in `operator` mode, so
 > seeing one also implies an operator is connected.

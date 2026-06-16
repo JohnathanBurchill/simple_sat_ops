@@ -30,6 +30,7 @@
 #include "sso_audit.h"
 #include "sso_ipc.h"
 #include "sso_ipc_paths.h"
+#include "sso_dirwatch.h"
 #include "sso_operator.h"
 
 #include <errno.h>
@@ -600,8 +601,15 @@ int run_viewer(const char *argv0)
 
 // STATE emit cadence in TLE-only mode (seconds).
 #define STREAM_TLE_PERIOD_S    1
-// Operator-probe cadence (the requested "watch once every 30 s").
-#define STREAM_PROBE_PERIOD_S  30
+// Backstop operator-probe cadence (seconds). The runtime-dir watch is the
+// fast path — it wakes us the instant a --control operator binds its socket
+// — so this only covers the first attempt, a host with no watch backend,
+// and any change the watch happened to miss. A failed connect to a missing
+// socket returns immediately, so a short period is cheap.
+#define STREAM_PROBE_PERIOD_S  5
+// Idle wait between TLE-only ticks (milliseconds). We block here on the
+// runtime-dir watch so a newly-bound operator socket wakes us early.
+#define STREAM_IDLE_MS         200
 
 static volatile sig_atomic_t g_stream_stop = 0;
 static void stream_on_signal(int sig) { (void) sig; g_stream_stop = 1; }
@@ -692,6 +700,18 @@ static void stream_relay_session(sso_ipc_client_t *cli)
     }
 }
 
+// Try once to attach to a running operator and relay its broadcast until it
+// drops. Returns 1 if we connected (caller resumes TLE-only afterward), 0 if
+// no operator was reachable.
+static int stream_try_relay(void)
+{
+    sso_ipc_client_t *cli = sso_ipc_client_connect("simple_sat_ops");
+    if (cli == NULL) return 0;
+    stream_relay_session(cli);
+    sso_ipc_client_close(cli);
+    return 1;
+}
+
 int run_viewer_stream(state_t *state)
 {
     // A closed stdout (SSH reader gone) must surface as a write error we
@@ -705,23 +725,27 @@ int run_viewer_stream(state_t *state)
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT,  &sa, NULL);
 
+    // Watch the runtime dir so we connect the instant a --control operator
+    // binds its socket, instead of waiting out the backstop probe. The dir
+    // must exist to watch it; the operator would create it anyway, and on a
+    // shared ground station it's already present. A NULL watch (no inotify /
+    // kqueue backend) just means we lean on the periodic probe alone.
+    sso_ipc_ensure_runtime_dir();
+    sso_dirwatch_t *watch = sso_dirwatch_open(sso_ipc_runtime_dir());
+
     time_t last_emit  = 0;   // 0 => emit on the first TLE-only tick
     time_t last_probe = 0;   // 0 => probe on the first iteration
 
     while (!g_stream_stop) {
         time_t now = time(NULL);
 
-        // Probe first so that, when an operator is already up, we go
-        // straight to relaying without emitting a stray TLE-only line.
+        // Backstop probe — also the very first attempt, so that when an
+        // operator is already up we go straight to relaying without emitting
+        // a stray TLE-only line. The dir-watch below is the fast path.
         if (now - last_probe >= STREAM_PROBE_PERIOD_S) {
             last_probe = now;
-            sso_ipc_client_t *cli = sso_ipc_client_connect("simple_sat_ops");
-            if (cli != NULL) {
-                stream_relay_session(cli);
-                sso_ipc_client_close(cli);
-                cli = NULL;
-                // Operator dropped: resume TLE-only promptly, but hold off
-                // the next probe a full period so we don't hammer reconnect.
+            if (stream_try_relay()) {
+                // Operator dropped: resume TLE-only promptly.
                 last_emit  = 0;
                 last_probe = time(NULL);
                 continue;
@@ -744,8 +768,31 @@ int run_viewer_stream(state_t *state)
             last_emit = now;
         }
 
-        // Idle a beat; a stop signal interrupts the sleep for prompt exit.
-        usleep(200 * 1000);
+        // Idle a beat, but wake early if the runtime dir changes — a
+        // --control operator may have just bound its socket. A stop signal
+        // interrupts either wait for prompt exit. The watch can report
+        // unrelated changes (other tools' sockets, the operator's own
+        // teardown); a failed connect costs nothing, so we just re-check.
+        if (watch != NULL) {
+            int ev = sso_dirwatch_wait(watch, STREAM_IDLE_MS);
+            if (ev > 0) {
+                if (stream_try_relay()) {
+                    last_emit  = 0;
+                    last_probe = time(NULL);
+                    continue;
+                }
+            } else if (ev < 0) {
+                // The watch broke (not a signal). Drop it and fall back to
+                // the periodic probe so we don't busy-spin on the error.
+                sso_dirwatch_close(watch);
+                watch = NULL;
+                usleep(STREAM_IDLE_MS * 1000);
+            }
+        } else {
+            usleep(STREAM_IDLE_MS * 1000);
+        }
     }
+
+    sso_dirwatch_close(watch);
     return 0;
 }
