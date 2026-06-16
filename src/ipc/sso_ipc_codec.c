@@ -468,6 +468,9 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
     if (json_field_str(&p, end, &first, "pass_folder", evt->pass_folder) < 0) return -1;
     if (evt->has_state) {
         if (json_field_str(&p, end, &first, "sat", evt->satellite) < 0) return -1;
+        if (evt->source[0]) {
+            if (json_field_str(&p, end, &first, "source", evt->source) < 0) return -1;
+        }
         if (json_field_double(&p, end, &first, "az", evt->az) < 0) return -1;
         if (json_field_double(&p, end, &first, "el", evt->el) < 0) return -1;
         if (evt->freq_hz) {
@@ -687,6 +690,9 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
     json_get_string(line, "pass_folder", evt->pass_folder, sizeof(evt->pass_folder));
 
     if (json_get_string(line, "sat", evt->satellite, sizeof(evt->satellite)) > 0) {
+        evt->has_state = 1;
+    }
+    if (json_get_string(line, "source", evt->source, sizeof(evt->source)) > 0) {
         evt->has_state = 1;
     }
     if (json_get_double(line, "az", &evt->az) > 0) evt->has_state = 1;

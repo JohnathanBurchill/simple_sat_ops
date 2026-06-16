@@ -99,6 +99,7 @@ int main(void)
         sso_event_init(&e, SSO_EVT_STATE);
         e.has_state = 1;
         snprintf(e.satellite, sizeof e.satellite, "ISS (ZARYA)");
+        snprintf(e.source, sizeof e.source, "tle-only");
         e.az = 123.5; e.el = -4.25;
         e.freq_hz = 436150000; e.doppler_hz = -1234.5;
         snprintf(e.rx_status, sizeof e.rx_status, "LOCK");
@@ -118,6 +119,7 @@ int main(void)
         tap_ok(d.type == SSO_EVT_STATE, "STATE type preserved");
         tap_ok(d.has_state == 1, "STATE has_state inferred on decode");
         tap_ok(strcmp(d.satellite, "ISS (ZARYA)") == 0, "STATE satellite preserved");
+        tap_ok(strcmp(d.source, "tle-only") == 0, "STATE source preserved");
         tap_ok(deq(d.az, 123.5) && deq(d.el, -4.25), "STATE az/el preserved");
         tap_ok(d.freq_hz == 436150000, "STATE freq_hz preserved");
         tap_ok(deq(d.doppler_hz, -1234.5), "STATE doppler preserved");
@@ -132,6 +134,34 @@ int main(void)
         tap_ok(deq(d.lat_deg, 50.8688) && deq(d.lon_deg, -114.291)
                && deq(d.alt_km, 420.5) && deq(d.speed_kms, 7.66),
                "STATE observer doubles preserved");
+    }
+
+    // --- source field: present when set, omitted (not "source") when empty -
+    {
+        sso_event_t e;
+        sso_event_init(&e, SSO_EVT_STATE);
+        e.has_state = 1;
+        snprintf(e.satellite, sizeof e.satellite, "FRONTIERSAT");
+        snprintf(e.source, sizeof e.source, "operator");
+        sso_event_t d;
+        tap_ok(sso_event_encode(&e, line, sizeof line) == 0,
+               "encode STATE (source=operator) returns 0");
+        tap_ok(strstr(line, "\"source\":\"operator\"") != NULL,
+               "operator source emitted on the wire");
+        tap_ok(sso_event_decode(line, &d) == 0
+               && strcmp(d.source, "operator") == 0,
+               "operator source round-trips");
+
+        // Empty source: the encoder must not emit a "source" key at all.
+        sso_event_init(&e, SSO_EVT_STATE);
+        e.has_state = 1;
+        snprintf(e.satellite, sizeof e.satellite, "FRONTIERSAT");
+        tap_ok(sso_event_encode(&e, line, sizeof line) == 0,
+               "encode STATE (no source) returns 0");
+        tap_ok(strstr(line, "\"source\"") == NULL,
+               "empty source omitted from the wire");
+        tap_ok(sso_event_decode(line, &d) == 0 && d.source[0] == '\0',
+               "decoded source empty when absent");
     }
 
     // --- RX-panel mirror round-trip -----------------------------------
