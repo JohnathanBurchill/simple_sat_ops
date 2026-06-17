@@ -257,6 +257,87 @@ static void print_candidate(const fix_t *f)
             f->b.time_status);
 }
 
+// Age of the fix in hours (now - GNSS epoch), or -1 if the epoch won't convert.
+static double fix_age_hours(const bestxyz_t *b)
+{
+    int y, mo, d, h, mi; double s;
+    bestxyz_gps_to_utc(b->gps_week, b->gps_sow, BESTXYZ_DEFAULT_LEAP_SECONDS,
+                       &y, &mo, &d, &h, &mi, &s);
+    struct tm tm = {0};
+    tm.tm_year = y - 1900; tm.tm_mon = mo - 1; tm.tm_mday = d;
+    tm.tm_hour = h; tm.tm_min = mi; tm.tm_sec = (int)s;
+    time_t epoch = timegm(&tm);
+    if (epoch == (time_t)-1) return -1.0;
+    return difftime(time(NULL), epoch) / 3600.0;
+}
+
+// Score a usable fix against the upload rules of thumb (see USER_MANUAL.md,
+// "When a fix is good enough to upload"). Writes the shortfalls into reasons.
+// Returns 2 = recommended, 1 = usable with caution, 0 = not recommended.
+static int fix_recommendation(const fix_t *f, char *reasons, size_t rsz)
+{
+    reasons[0] = '\0';
+    int hard = 0, caution = 0;
+    #define NOTE(...) do { \
+        size_t _l = strlen(reasons); \
+        if (_l) snprintf(reasons + _l, rsz - _l, "; "); \
+        _l = strlen(reasons); \
+        snprintf(reasons + _l, rsz - _l, __VA_ARGS__); \
+    } while (0)
+
+    if (strcmp(f->b.pos_type, "SINGLE") != 0) { caution = 1; NOTE("type %s", f->b.pos_type); }
+
+    if (f->b.num_sol_sv < 4)      { hard = 1;    NOTE("only %d SV", f->b.num_sol_sv); }
+    else if (f->b.num_sol_sv < 6) { caution = 1; NOTE("%d SV (<6)", f->b.num_sol_sv); }
+
+    double smax = f->b.pos_sigma[0];
+    if (f->b.pos_sigma[1] > smax) smax = f->b.pos_sigma[1];
+    if (f->b.pos_sigma[2] > smax) smax = f->b.pos_sigma[2];
+    if (smax > 50.0)      { hard = 1;    NOTE("sigma %.0f m (>50)", smax); }
+    else if (smax > 25.0) { caution = 1; NOTE("sigma %.0f m (>25)", smax); }
+
+    // A fine-precision clock (FINESTEERING / FINE / FINEADJUSTING /
+    // FINEBACKUPSTEERING -- all the "FINE*" states) gives a trustworthy epoch.
+    // FREEWHEELING / COARSE* / SATTIME mean the time reference is coasting or
+    // only coarse, so the few-metre sigma understates the true along-track
+    // uncertainty (epoch error maps to ~7.5 km/s of along-track position).
+    if (strncmp(f->b.time_status, "FINE", 4) != 0) {
+        caution = 1; NOTE("%s clock", f->b.time_status);
+    }
+
+    double age = fix_age_hours(&f->b);
+    if (age >= 0.0) {
+        if (age > 504.0)      { hard = 1;    NOTE("%.0f h old (>504 h API window)", age); }
+        else if (age > 24.0)  { caution = 1; NOTE("%.0f h old (>24 h)", age); }
+        else if (age > 6.0)   { caution = 1; NOTE("%.1f h old (>6 h ideal)", age); }
+    }
+    #undef NOTE
+
+    if (hard) return 0;
+    if (caution) return 1;
+    return 2;
+}
+
+// Candidates collected for the --list view so they can be sorted newest-first.
+static fix_t *g_cands = NULL;
+static int    g_ncands = 0, g_capcands = 0;
+
+static void collect_candidate(const fix_t *f)
+{
+    if (g_ncands == g_capcands) {
+        int cap = g_capcands ? g_capcands * 2 : 64;
+        fix_t *t = realloc(g_cands, (size_t)cap * sizeof *t);
+        if (t == NULL) return;
+        g_cands = t; g_capcands = cap;
+    }
+    g_cands[g_ncands++] = *f;
+}
+
+static int cmp_cand_desc(const void *a, const void *b)
+{
+    return strcmp(((const fix_t *)b)->ts_received, ((const fix_t *)a)->ts_received);
+}
+
 static void write_opm(FILE *fp, const fix_t *f, const args_t *a)
 {
     int y, mo, d, h, mi; double s;
@@ -356,7 +437,7 @@ int main(int argc, char **argv)
                     for (int k = 0; k < f.n_ids; ++k) if (f.ids[k] == cfg.want_id) id_match = 1; } \
                 if (in_range && id_match && fix_is_usable(&f, &cfg)) { \
                     n_candidates++; \
-                    if (cfg.list) print_candidate(&f); \
+                    if (cfg.list) collect_candidate(&f); \
                     if (!have_best || strcmp(f.ts_received, best.ts_received) > 0) { best = f; have_best = 1; } \
                 } \
             } \
@@ -395,9 +476,26 @@ int main(int argc, char **argv)
     sqlite3_close(db);
 
     if (cfg.list) {
-        fprintf(stderr, "%d usable GNSS fix%s found.\n",
-                n_candidates, n_candidates == 1 ? "" : "es");
-        return have_best ? 0 : 1;
+        // Newest first, each scored against the upload rules of thumb.
+        qsort(g_cands, (size_t)g_ncands, sizeof *g_cands, cmp_cand_desc);
+        int n_rec = 0, n_caution = 0;
+        for (int i = 0; i < g_ncands; ++i) {
+            print_candidate(&g_cands[i]);
+            char reasons[160];
+            int v = fix_recommendation(&g_cands[i], reasons, sizeof reasons);
+            if (v == 2)      { fprintf(stderr, "      -> RECOMMENDED for upload\n"); n_rec++; }
+            else if (v == 1) { fprintf(stderr, "      -> usable with caution: %s\n", reasons); n_caution++; }
+            else             { fprintf(stderr, "      -> NOT recommended: %s\n", reasons); }
+        }
+        fprintf(stderr,
+                "\n%d usable fix%s: %d recommended, %d usable with caution.\n",
+                g_ncands, g_ncands == 1 ? "" : "es", n_rec, n_caution);
+        if (n_rec == 0 && g_ncands > 0)
+            fprintf(stderr,
+                    "No fix clears every rule of thumb; the newest "
+                    "\"usable with caution\" one is the best available.\n");
+        free(g_cands);
+        return g_ncands ? 0 : 1;
     }
 
     if (!have_best) {
