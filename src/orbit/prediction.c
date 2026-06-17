@@ -309,6 +309,14 @@ void minutes_until_visible(prediction_t *external_prediction, double jul_utc_sta
 // Returns the first match on prediction->satellite_ephem.name
 int load_tle(prediction_t *prediction)
 {
+    // A NULL name would crash the strlen/strncmp match below. Callers are
+    // expected to set one, but fail cleanly rather than segfault if not.
+    if (prediction->satellite_ephem.name == NULL) {
+        fprintf(stderr, "load_tle: no satellite name set for %s\n",
+                prediction->tles_filename ? prediction->tles_filename
+                                          : "(no TLE file)");
+        return -2;
+    }
     FILE *file = fopen(prediction->tles_filename, "r");
     if (file == NULL) {
         fprintf(stderr, "Error opening %s\n", prediction->tles_filename);

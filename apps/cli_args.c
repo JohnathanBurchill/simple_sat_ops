@@ -681,7 +681,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         }
         if (strcmp("--tle", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--tle <path>",
-                "path to a TLE file (default $HOME/.local/state/simple_sat_ops/active.tle)");
+                "path to a TLE file (default: newest *.tle under the FrontierSat TLEs dir)");
             else {
                 if (t + 2 >= argc) {
                     fprintf(stderr, "--tle: missing <path>\n");
@@ -1092,27 +1092,36 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
     state->prediction.observer_ephem.position_geodetic.alt =
         site_altitude / 1000.0;
 
-    // --control (or --viewer-stream) with no positional: auto-discover the
-    // newest TLE under /FrontierSat/TLEs/ and load it directly. For
-    // --control, setup_pass_folder later pins this source file (under its
-    // original tle-YYYYMMDD.tle name) into the pass folder once AOS is
-    // known; --viewer-stream just propagates it for the stream.
-    if (n_positional == 0 && (state->control_mode || state->viewer_stream)) {
-        if (state->prediction.tles_filename == NULL) {
-            const char *tles_root = sso_tles_dir();
-            static char src_tle[1024];
-            time_t src_mtime = 0;
-            if (find_newest_tle_recursive(tles_root, src_tle, sizeof src_tle,
-                                          &src_mtime) != 0) {
-                fprintf(stderr,
-                    "simple_sat_ops: --control wants a TLE under %s, "
-                    "but no *.tle was found there. Drop one in "
-                    "(or pass --tle=<path>).\n", tles_root);
-                return PARSE_ERROR;
-            }
-            fprintf(stderr, "simple_sat_ops: using TLE %s\n", src_tle);
-            state->prediction.tles_filename = tle_path_resolve(src_tle);
+    // Resolve the TLE file when it wasn't given with --tle: the ground
+    // station keeps its current elements under the FrontierSat TLEs dir, so
+    // load the newest *.tle there. This is the one default for every mode
+    // that gets here (--control, --viewer-stream, --self-test) — there is no
+    // ~/.local/state/active.tle fallback. For --control, setup_pass_folder
+    // later pins this source file (under its original tle-YYYYMMDD.tle name)
+    // into the pass folder once AOS is known; --viewer-stream just
+    // propagates it for the stream.
+    if (state->prediction.tles_filename == NULL) {
+        const char *tles_root = sso_tles_dir();
+        static char src_tle[1024];
+        time_t src_mtime = 0;
+        if (find_newest_tle_recursive(tles_root, src_tle, sizeof src_tle,
+                                      &src_mtime) != 0) {
+            fprintf(stderr,
+                "simple_sat_ops: no *.tle found under %s. Drop one in "
+                "(or pass --tle <path>).\n", tles_root);
+            return PARSE_ERROR;
         }
+        fprintf(stderr, "simple_sat_ops: using TLE %s\n", src_tle);
+        state->prediction.tles_filename = tle_path_resolve(src_tle);
+    }
+
+    // Resolve the satellite: an explicit name on the command line wins;
+    // otherwise track whatever the TLE's first name line names. Reading the
+    // name here (rather than leaving it NULL) is what keeps --self-test and
+    // the no-name forms from ever feeding a NULL into the TLE search.
+    if (positional != NULL) {
+        state->prediction.satellite_ephem.name = positional;
+    } else {
         static char sat_name[64];
         if (read_tle_name(state->prediction.tles_filename,
                           sat_name, sizeof sat_name) != 0) {
@@ -1124,22 +1133,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         }
         state->prediction.satellite_ephem.name = sat_name;
         fprintf(stderr, "simple_sat_ops: tracking '%s'\n", sat_name);
-    } else {
-        if (state->prediction.tles_filename == NULL) {
-            static char default_tle[1024];
-            if (tle_default_path(default_tle, sizeof(default_tle)) != 0) {
-                fprintf(stderr,
-                    "HOME unset or path too long; pass --tle=<path>\n");
-                return PARSE_ERROR;
-            }
-            state->prediction.tles_filename = tle_path_resolve(default_tle);
-        }
-        state->prediction.satellite_ephem.name = positional;
     }
 
-    // --self-test exits before TLE/pass-search anyway, and the bare
-    // form (no positional, no --control) leaves .name == NULL; skip
-    // the auto-pass search rather than feeding NULL to strcmp.
+    // An explicit "next" picks the soonest matching pass. The name is always
+    // set by the block above; the NULL guard is just belt-and-braces.
     if (state->prediction.satellite_ephem.name != NULL
         && strcmp(state->prediction.satellite_ephem.name, "next") == 0) {
         state->prediction.auto_sat = 1;
