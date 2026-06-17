@@ -9,8 +9,8 @@ and talking to a satellite that only answers when you ask politely.*
 
 Version: 3 (working draft)
 
-Applies to `simple_sat_ops` and friends on branch `cleanup`, commit
-`4c9ecd3` (2026-06-16). This is a working draft.
+Applies to `simple_sat_ops` and friends on branch `any-sdr`, commit
+`466521d` (2026-06-17). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -127,23 +127,27 @@ manual can go back on the shelf where it belongs.
     - [`tcmd_import`](#tcmd_import)
     - [`tcmd_browser`](#tcmd_browser)
     - [`tle_keps`](#tle_keps)
-12. [Bring-up and test tools](#bring-up-and-test-tools)
+    - [`gnss_reports`](#gnss_reports)
+12. [Uploading the orbit to the space safety database](#uploading-the-orbit-to-the-space-safety-database)
+    - [The workflow](#the-workflow)
+    - [When a fix is good enough to upload](#when-a-fix-is-good-enough-to-upload)
+13. [Bring-up and test tools](#bring-up-and-test-tools)
     - [`tx_frame_sdr`](#tx_frame_sdr)
     - [`b210_rx_capture` and `b210_gain_sweep`](#b210_rx_capture-and-b210_gain_sweep)
     - [`live_waterfall`](#live_waterfall)
     - [`uplink_test`](#uplink_test)
     - [`rx_decode`](#rx_decode)
     - [`lifetime`](#lifetime)
-13. [Unit tests](#unit-tests)
-14. [Architecture notes](#architecture-notes)
+14. [Unit tests](#unit-tests)
+15. [Architecture notes](#architecture-notes)
     - [IPC: one operator at a time](#ipc-one-operator-at-a-time)
     - [Worker threads](#worker-threads)
     - [TX safety gates](#tx-safety-gates)
     - [Pursuit planner internals](#pursuit-planner-internals)
-15. [File layout](#file-layout)
-16. [Troubleshooting](#troubleshooting)
-17. [A note on feel](#a-note-on-feel)
-18. [Glossary](#glossary)
+16. [File layout](#file-layout)
+17. [Troubleshooting](#troubleshooting)
+18. [A note on feel](#a-note-on-feel)
+19. [Glossary](#glossary)
 
 *Appendices:*
 
@@ -1814,6 +1818,130 @@ motion and eccentricity, not an SGP4 fit. Apogee and perigee are heights
 above the mean Earth radius (6371 km), matching common online TLE tools;
 the J2 precession term keeps the equatorial radius, as that formula
 expects.
+
+### `gnss_reports`
+
+Reassembles the satellite's GNSS telecommand responses out of the packet
+DB and checks each one. FrontierSat's NovAtel receiver answers a
+`gnss_send_cmd_ascii` telecommand with an ASCII log -- a `BESTXYZA`
+position/velocity solution, an `ITDETECTSTATUSA` interference report, a
+configuration dump, and so on -- wrapped by the firmware as `GNSS
+Response (N chars): ...`. A long log is split across several
+`tcmd_response` packets, so `gnss_reports` groups the fragments by their
+send time, stitches them back together in sequence order, drops the
+per-packet CRC trailer, and verifies the NovAtel CRC on the recovered
+log.
+
+It prints each response with its CRC verdict and a count-by-type tally.
+`--type=BESTXYZA` narrows to the position fixes, `--since` / `--until`
+restrict the time range (default: all), and `--full` prints the whole
+recovered log rather than a snippet.
+
+```sh
+gnss_reports --summary
+gnss_reports --type=BESTXYZA --full
+gnss_reports --since=7d
+```
+
+A `BESTXYZA` whose status reads `SOL_COMPUTED` is a real position fix;
+`INSUFFICIENT_OBS` means the receiver could not see enough satellites to
+solve. Those computed fixes are what feed the orbit upload below.
+
+## Uploading the orbit to the space safety database
+
+Operators whose objects share an orbit regime with the Starlink
+constellation upload their predicted trajectory to SpaceX's
+[Space Safety](https://docs.space-safety.starlink.com/) conjunction-
+screening service, so SpaceX can flag close approaches and manoeuvre a
+Starlink out of the way if one is predicted. FrontierSat does this from
+its own onboard GNSS fix.
+
+Two tools cooperate. `gnss_opm` (this project) reads a GNSS fix out of
+the packet DB and writes it as an **OPM** -- a single-epoch state vector
+with its uncertainty. `ssm`, the separate `space_safety_manager` tool,
+propagates that OPM forward, turns the uncertainty into the **OEM**
+covariance the API expects, and uploads it over the authenticated link.
+
+### The workflow
+
+```sh
+# See which fixes are good enough (newest first)
+gnss_opm --list
+
+# Write the best one as an OPM
+gnss_opm > frontiersat.opm
+
+# Preview the propagated OEM, then upload
+ssm propagate frontiersat.opm | less
+ssm --pretty upload-opm frontiersat.opm --type definitive
+```
+
+`gnss_opm` picks the newest fix that passes the rules below; `--id=<n>`
+forces a particular one, `--since` / `--until` restrict the search, and
+`--name` / `--hard-body-radius` set the object metadata. It writes the
+state in metres (ECEF) plus the receiver's per-axis 1-sigma; `ssm` then
+rotates that uncertainty into the orbit's radial / along-track /
+cross-track (RTN) frame and grows it over the propagation window, so the
+covariance reflects the real fix instead of a fixed guess.
+
+### When a fix is good enough to upload
+
+A trajectory upload is only as trustworthy as the fix behind it. Before
+you upload, the fix should clear every one of these. `gnss_opm` enforces
+the hard ones and prints the rest in the OPM header so you can check them
+at a glance.
+
+- **It is a computed solution.** The `BESTXYZA` status must be
+  `SOL_COMPUTED`. An `INSUFFICIENT_OBS` fix has no usable position --
+  never upload it. `gnss_opm` refuses it unless you pass
+  `--allow-insufficient`, which exists only for inspection.
+
+- **It is an autonomous fix.** The solution type is `SINGLE` -- a
+  standalone GNSS point solution. FrontierSat carries no differential or
+  RTK corrections, so `SINGLE` is the only type you should ever see;
+  treat anything else as suspect.
+
+- **Enough satellites.** Read the second number of the `N/M SV` field --
+  the satellites *used in the solution*. Four is the mathematical floor
+  for a 3-D fix and leaves no margin; require **at least 6**, and prefer
+  8 or more. (The good fixes on file used 11 and 17.) Below six, wait for
+  a better pass.
+
+- **The CRC checks.** The NovAtel CRC on the log must verify -- a
+  corrupted log can carry a plausible-looking but wrong state. `gnss_opm`
+  checks it and refuses a bad-CRC fix.
+
+- **The uncertainty is sane.** A healthy `SINGLE` fix reports a few
+  metres of 1-sigma per axis (the file fixes are about 2.4 m). Treat a
+  position sigma above ~25 m on any axis as a red flag even when the
+  status says `SOL_COMPUTED`, and do not upload it.
+
+- **The clock is steered.** `time_status = FINESTEERING` means the
+  receiver clock is disciplined to GPS and the epoch timestamp is
+  trustworthy. `FREEWHEELING` means it is coasting, so the epoch -- and
+  therefore the along-track position -- can drift. Prefer `FINESTEERING`;
+  upload a `FREEWHEELING` fix only with caution and replace it once a
+  steered one arrives. `gnss_opm` prints the clock status in the OPM
+  header.
+
+- **The fix is fresh.** The OEM is propagated forward from the fix with
+  no atmospheric drag, so error grows with the fix's age: the along-track
+  error is roughly the velocity uncertainty times the elapsed time (about
+  0.06 m/s, so ~0.6 km after 3 hours and ~5 km after a day) before
+  unmodelled drag adds more. **Upload within about 6 hours of the fix
+  epoch for definitive quality, and within 24 hours at the outside;**
+  past that, fetch a fresh fix rather than upload a stale one. The API
+  also requires the epoch to fall inside a 504-hour (21-day) window;
+  `ssm --epoch` can shift it for staging tests.
+
+- **One fix, ideally corroborated.** `gnss_opm` uses a single fix -- a
+  snapshot of position and Doppler velocity. If several recent fixes
+  agree within their sigmas, confidence is higher; if they disagree by
+  more than that, investigate before uploading.
+
+Use `--type hypothetical` for a what-if trajectory (a planned deployment
+state before launch, say) and `--type definitive` for a real
+GNSS-derived state once the satellite is flying.
 
 ## Bring-up and test tools
 
