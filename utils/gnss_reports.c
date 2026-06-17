@@ -131,6 +131,7 @@ typedef struct {
     const char *type;     // filter to one NovAtel log type, else all
     int         full;     // print the whole reassembled log, not just a snippet
     int         summary_only;
+    int         reverse;  // sort newest-first instead of oldest-first
 } args_t;
 
 #define OPTW 24
@@ -175,6 +176,11 @@ static int parse_args(args_t *a, int argc, char **argv, int help)
         if (strcmp(arg, "--summary") == 0 || help) {
             if (help) parse_help_line(OPTW, "--summary", "print only the count-by-type tally");
             else a->summary_only = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--reverse") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--reverse", "newest first (default: oldest first)");
+            else a->reverse = 1;
             matched = 1;
         }
         if ((strcmp(arg, "-V") == 0 || strcmp(arg, "--version") == 0) || help) {
@@ -302,10 +308,35 @@ static void analyze(const char *msg, int msglen,
     *log_end = star + 9;   // include '*' + 8 hex
 }
 
-// Process one reception: detect a GNSS response, verify the CRC, print it,
-// and update the tally. Returns 1 if it was a GNSS response, else 0.
+// Collected output blocks, sorted by reception time before printing (the DB
+// walk visits responses in ts_sent-key order, not chronological order).
+typedef struct { char ts[40]; char *block; } outmsg_t;
+static outmsg_t *g_msgs = NULL;
+static int       g_nmsgs = 0, g_capmsgs = 0;
+
+static void store_msg(const char *ts, const char *block)
+{
+    if (g_nmsgs == g_capmsgs) {
+        int cap = g_capmsgs ? g_capmsgs * 2 : 64;
+        outmsg_t *t = realloc(g_msgs, (size_t)cap * sizeof *t);
+        if (t == NULL) return;   // drop on OOM rather than crash
+        g_msgs = t; g_capmsgs = cap;
+    }
+    snprintf(g_msgs[g_nmsgs].ts, sizeof g_msgs[g_nmsgs].ts, "%s", ts);
+    g_msgs[g_nmsgs].block = strdup(block);
+    if (g_msgs[g_nmsgs].block) g_nmsgs++;
+}
+
+static int cmp_msg_asc(const void *a, const void *b)
+{
+    return strcmp(((const outmsg_t *)a)->ts, ((const outmsg_t *)b)->ts);
+}
+
+// Process one reception: detect a GNSS response, verify the CRC, update the
+// tally, and (unless --summary) collect a formatted block for sorted output.
+// Returns 1 if it was a GNSS response, else 0.
 static int process(const frag_t *frags, int n, const args_t *a,
-                   const char *since_iso, const char *until_iso, int *printed)
+                   const char *since_iso, const char *until_iso)
 {
     // Time filter on the earliest fragment (frags arrive sorted by ts_received).
     const char *ts = frags[0].ts_received;
@@ -351,7 +382,7 @@ static int process(const frag_t *frags, int n, const args_t *a,
     const char *bucket = corrupt ? "(corrupted)" : type;
     tally_add(bucket, have_crc, crc_ok);
 
-    if (a->summary_only) { (*printed)++; return 1; }
+    if (a->summary_only) return 1;
 
     // Build the id list.
     char ids[256]; int p = 0;
@@ -364,32 +395,44 @@ static int process(const frag_t *frags, int n, const args_t *a,
     for (int i = 0; i < 8; ++i) ts_sent |= (uint64_t)frags[0].tskey[i] << (8 * i);
     fmt_epoch_ms(ts_sent, tssent, sizeof tssent);
 
-    printf("[%s] ids %s  ts_sent=%s  %d frag%s\n",
-           ts, ids, tssent, n, n == 1 ? "" : "s");
+    // Format the whole block into a buffer so the caller can sort by ts before
+    // printing. APP guards against overflow (off never passes the buffer size).
+    char block[4096]; int off = 0;
+    #define APP(...) do { \
+        if (off < (int)sizeof block) { \
+            int _n = snprintf(block + off, sizeof block - off, __VA_ARGS__); \
+            if (_n > 0) off += _n; \
+            if (off >= (int)sizeof block) off = (int)sizeof block - 1; \
+        } \
+    } while (0)
+
+    APP("[%s] ids %s  ts_sent=%s  %d frag%s\n", ts, ids, tssent, n, n == 1 ? "" : "s");
     if (!have_crc)
-        printf("  %s  CRC (none -- incomplete or no log)\n", bucket);
+        APP("  %s  CRC (none -- incomplete or no log)\n", bucket);
     else if (crc_ok)
-        printf("  %s  CRC %08x OK\n", bucket, cr);
+        APP("  %s  CRC %08x OK\n", bucket, cr);
     else
-        printf("  %s  CRC read %08x calc %08x MISMATCH\n", bucket, cr, cc);
+        APP("  %s  CRC read %08x calc %08x MISMATCH\n", bucket, cr, cc);
 
     // For BESTXYZA, enrich with the position solution via the project parser.
     if (strcmp(type, "BESTXYZA") == 0) {
         bestxyz_t b; char err[96];
         if (bestxyz_parse(msg, &b, err, sizeof err) == 0)
-            printf("    %s wk%d  %s/%s  %d/%d SV\n",
-                   b.time_status, b.gps_week, b.pos_sol_status, b.pos_type,
-                   b.num_sol_sv, b.num_sv);
+            APP("    %s wk%d  %s/%s  %d/%d SV\n",
+                b.time_status, b.gps_week, b.pos_sol_status, b.pos_type,
+                b.num_sol_sv, b.num_sv);
     }
 
     // The recovered log itself.
     if (ls < le && le <= region) {
         int snip = le - ls;
-        if (a->full || snip <= 96) printf("    %.*s\n", snip, msg + ls);
-        else printf("    %.*s ...\n", 80, msg + ls);
+        if (a->full || snip <= 96) APP("    %.*s\n", snip, msg + ls);
+        else APP("    %.*s ...\n", 80, msg + ls);
     }
-    printf("\n");
-    (*printed)++;
+    APP("\n");
+    #undef APP
+
+    store_msg(ts, block);
     return 1;
 }
 
@@ -451,21 +494,15 @@ int main(int argc, char **argv)
     frag_t recv[260];
     int    nrecv = 0;
     unsigned char curkey[8];
-    int have_key = 0, last_seq = 0, printed = 0;
+    int have_key = 0, last_seq = 0;
 
     #define FLUSH() do { \
         if (nrecv > 0) { \
-            process(recv, nrecv, &cfg, since_iso, until_iso, &printed); \
+            process(recv, nrecv, &cfg, since_iso, until_iso); \
             for (int i = 0; i < nrecv; ++i) { free(recv[i].payload); } \
             nrecv = 0; \
         } \
     } while (0)
-
-    if (!cfg.summary_only)
-        printf("GNSS responses%s%s%s:\n\n",
-               (since_iso[0] || until_iso[0]) ? " (" : "",
-               since_iso[0] ? since_iso : (until_iso[0] ? ".." : ""),
-               (since_iso[0] || until_iso[0]) ? ")" : "");
 
     while (sqlite3_step(st) == SQLITE_ROW) {
         const unsigned char *pl = sqlite3_column_blob(st, 2);
@@ -499,6 +536,22 @@ int main(int argc, char **argv)
     sqlite3_finalize(st);
     sqlite3_close(db);
 
+    // Print the collected responses in chronological order (--reverse flips to
+    // newest first), then the tally.
+    if (!cfg.summary_only) {
+        qsort(g_msgs, (size_t)g_nmsgs, sizeof *g_msgs, cmp_msg_asc);
+        printf("GNSS responses%s%s%s:\n\n",
+               (since_iso[0] || until_iso[0]) ? " (" : "",
+               since_iso[0] ? since_iso : (until_iso[0] ? ".." : ""),
+               (since_iso[0] || until_iso[0]) ? ")" : "");
+        for (int k = 0; k < g_nmsgs; ++k) {
+            int idx = cfg.reverse ? (g_nmsgs - 1 - k) : k;
+            fputs(g_msgs[idx].block, stdout);
+            free(g_msgs[idx].block);
+        }
+        free(g_msgs);
+    }
+
     // Count-by-type tally.
     int grand = 0;
     printf("Count by type:\n");
@@ -512,7 +565,6 @@ int main(int argc, char **argv)
             printf("  %-18s %4d\n", e->name, e->total);
     }
     printf("  %-18s %4d\n", "TOTAL", grand);
-    (void)printed;
     return 0;
 }
 
