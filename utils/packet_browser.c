@@ -376,6 +376,10 @@ static void free_rows(row_t *arr, int n)
 
 // Fill *r from the current row of `stmt`, which must have selected
 // PACKET_SELECT_COLS. Allocates r->payload (NULL on alloc failure).
+// Drop the CSP CRC32 trailer the firmware leaves on the wire from the parsed
+// tcmd_response text (defined below, after the packet-geometry macros).
+static void trim_tcmd_crc_trailer(row_t *r);
+
 static void fill_row(sqlite3_stmt *stmt, row_t *r)
 {
     r->id          = sqlite3_column_int64(stmt, 0);
@@ -436,6 +440,8 @@ static void fill_row(sqlite3_stmt *stmt, row_t *r)
             r->payload_len = pln;
         }
     }
+
+    trim_tcmd_crc_trailer(r);
 }
 
 // Run the current filter against the DB and refresh `rows` / `n_rows`.
@@ -766,6 +772,54 @@ static void leave_group(void)
 #define TCMD_RESPONSE_PACKET_TYPE  0x04
 #define TCMD_RESPONSE_HEADER_SIZE  14    // type+ts_sent+code+dur+seq+max_seq
 #define TCMD_RESPONSE_MAX_DATA     186   // COMMS_TCMD_RESPONSE_..._PER_PACKET
+#define CSP_CRC32_TRAILER_BYTES    4     // firmware appends, ground leaves in
+
+// The firmware appends a 4-byte CSP CRC32 trailer to every downlink packet and
+// the ground leaves it in the stored payload. A tcmd_response fragment that
+// fills the whole 186-byte data field carries that trailer as 4 extra bytes,
+// which the decoder rendered into the parsed `data (N bytes): "..."` line as
+// trailing non-content junk. Drop those bytes from the displayed text. Only a
+// fragment whose data exceeds the 186-byte per-packet maximum can carry a
+// visible trailer, so "anything past 186" is unambiguously the CRC, never
+// real message bytes.
+static void trim_tcmd_crc_trailer(row_t *r)
+{
+    if (r->packet_type != TCMD_RESPONSE_PACKET_TYPE || r->payload == NULL)
+        return;
+    int data_len = r->payload_len - TCMD_RESPONSE_HEADER_SIZE;
+    if (data_len <= TCMD_RESPONSE_MAX_DATA) return;   // no room for a trailer
+
+    char *line = strstr(r->summary, "tcmd_response: data (");
+    if (line == NULL) return;
+    int shown = 0;
+    if (sscanf(line, "tcmd_response: data (%d bytes): \"", &shown) != 1) return;
+    char *content = strstr(line, "): \"");
+    if (content == NULL) return;
+    content += 4;   // step past `): "`
+
+    int trailer = shown - TCMD_RESPONSE_MAX_DATA;     // trailer bytes that got shown
+    if (trailer <= 0) return;
+    if (trailer > CSP_CRC32_TRAILER_BYTES) trailer = CSP_CRC32_TRAILER_BYTES;
+    if ((int)strlen(content) < shown) return;         // summary was truncated; leave it
+
+    // Rebuild into a scratch buffer so a change in the digit count of N can't
+    // corrupt the line, then copy back. content/`tail` are read from r->summary
+    // while we write to tmp, so the in-place copy at the end is safe.
+    char tmp[sizeof r->summary];
+    int prefix = (int)(line - r->summary);
+    const char *tail = content + shown;               // closing quote onward
+    int w = prefix;
+    if (prefix < 0 || prefix >= (int)sizeof tmp) return;
+    memcpy(tmp, r->summary, (size_t)prefix);
+    w += snprintf(tmp + w, sizeof tmp - w,
+                  "tcmd_response: data (%d bytes): \"", shown - trailer);
+    int keep = shown - trailer;
+    if (w + keep >= (int)sizeof tmp) return;
+    memcpy(tmp + w, content, (size_t)keep);
+    w += keep;
+    snprintf(tmp + w, sizeof tmp - w, "%s", tail);
+    memcpy(r->summary, tmp, sizeof r->summary);
+}
 
 // Downlink timing model, used to scope a reconstruction to ONE contiguous
 // download burst instead of every bulk_file chunk in the run. The firmware
