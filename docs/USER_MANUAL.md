@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on branch `any-sdr`, commit
-`466521d` (2026-06-17). This is a working draft.
+`33a912f` (2026-06-17). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -1916,13 +1916,25 @@ at a glance.
   position sigma above ~25 m on any axis as a red flag even when the
   status says `SOL_COMPUTED`, and do not upload it.
 
-- **The clock is steered.** `time_status = FINESTEERING` means the
-  receiver clock is disciplined to GPS and the epoch timestamp is
-  trustworthy. `FREEWHEELING` means it is coasting, so the epoch -- and
-  therefore the along-track position -- can drift. Prefer `FINESTEERING`;
-  upload a `FREEWHEELING` fix only with caution and replace it once a
-  steered one arrives. `gnss_opm` prints the clock status in the OPM
-  header.
+- **The clock keeps fine time.** `time_status` reports how well the
+  receiver's clock is locked to GPS time -- which sets how trustworthy the
+  fix's *epoch* is, not the geometry. The whole fine-precision family is
+  fine for upload: `FINESTEERING` (disciplined and steered), and equally
+  `FINE`, `FINEADJUSTING`, and `FINEBACKUPSTEERING` -- anything reported as
+  `FINE...`. What you do not want is `FREEWHEELING` (the clock is coasting
+  on its own oscillator; NovAtel's wording is "range bias cannot be
+  calculated"), `COARSE` / `COARSESTEERING` (only millisecond-level time),
+  or `SATTIME` (a startup state). The reason it matters: the satellite
+  moves at about 7.5 km/s, so an error in the epoch turns straight into
+  along-track position error -- roughly 7.5 m for every millisecond the
+  time tag is off. That error is *systematic* and is **not** captured by
+  the few-metre `r_ecef_sigma_m` the receiver reports (that sigma is the
+  formal solution covariance and assumes the time tag is good), so a
+  non-`FINE` fix makes the uploaded covariance optimistic in exactly the
+  along-track direction conjunction screening cares about. Prefer a
+  `FINE...` clock; upload a `FREEWHEELING` (or coarser) fix only with
+  caution -- and never paired with a stale one. `gnss_opm` prints the
+  clock status in the OPM header and flags a non-`FINE` clock in `--list`.
 
 - **The fix is fresh.** The OEM is propagated forward from the fix with
   no atmospheric drag, so error grows with the fix's age: the along-track
