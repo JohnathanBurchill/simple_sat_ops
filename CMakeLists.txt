@@ -567,6 +567,15 @@ if (OPENSSL_FOUND)
     target_link_sso_core(packet_query)
     list(APPEND SSO_TARGETS packet_query)
 
+    # Reassemble + CRC-check the GNSS telecommand responses (NovAtel logs).
+    add_executable(gnss_reports utils/gnss_reports.c src/orbit/bestxyz.c)
+    target_include_directories(gnss_reports PRIVATE ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(gnss_reports PRIVATE ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(gnss_reports PRIVATE ${OPENSSL_LIBRARIES} m)
+    target_link_packet_db(gnss_reports)
+    target_link_sso_core(gnss_reports)
+    list(APPEND SSO_TARGETS gnss_reports)
+
     # Backfill the sent_tcmd table from historical tx.log files.
     add_executable(tcmd_import utils/tcmd_import.c src/proto/agenda_line.c)
     target_include_directories(tcmd_import PRIVATE ${OPENSSL_INCLUDE_DIRS})

@@ -25,6 +25,7 @@
 #define SSO_BESTXYZ_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 // The GPS-UTC offset in whole seconds (GPS time runs ahead of UTC).
 // 18 since 2017-01-01; bump this if a new leap second is introduced.
@@ -70,5 +71,11 @@ int bestxyz_parse(const char *text, bestxyz_t *out, char *err, size_t errsz);
 void bestxyz_gps_to_utc(int gps_week, double gps_sow, int leap_seconds,
                         int *year, int *mon, int *day,
                         int *hh, int *mm, double *ss);
+
+// NovAtel CalculateBlockCRC32 (OEM7 manual): the 32-bit CRC every ASCII
+// NovAtel log carries after its '*'. Computed over the bytes between '#'
+// and '*' (both exclusive). Exposed so callers that handle other log
+// types (not just BESTXYZA) can verify the CRC from one implementation.
+uint32_t bestxyz_novatel_crc32(const unsigned char *buf, size_t len);
 
 #endif

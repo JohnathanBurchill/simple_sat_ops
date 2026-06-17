@@ -47,7 +47,7 @@ static uint32_t crc32_value(uint32_t v)
     return v;
 }
 
-static uint32_t novatel_crc32(const unsigned char *buf, size_t len)
+uint32_t bestxyz_novatel_crc32(const unsigned char *buf, size_t len)
 {
     uint32_t crc = 0;
     for (size_t k = 0; k < len; ++k) {
@@ -152,7 +152,7 @@ int bestxyz_parse(const char *text, bestxyz_t *out, char *err, size_t errsz)
     size_t mlen = json_unescape(name, (size_t) (raw_end - name), msg, sizeof msg);
 
     if (star) {
-        out->crc_calc = novatel_crc32((const unsigned char *) msg, mlen);
+        out->crc_calc = bestxyz_novatel_crc32((const unsigned char *) msg, mlen);
         out->crc_read = (unsigned) strtoul(star + 1, NULL, 16);
         out->crc_present = 1;
         out->crc_ok = (out->crc_calc == out->crc_read);
