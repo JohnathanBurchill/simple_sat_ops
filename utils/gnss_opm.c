@@ -251,9 +251,10 @@ static int fix_is_usable(const fix_t *f, const args_t *a)
 
 static void print_candidate(const fix_t *f)
 {
-    fprintf(stderr, "  %s  id %lld  %s/%s  %d/%d SV  CRC %s\n",
+    fprintf(stderr, "  %s  id %lld  %s/%s  %d/%d SV  CRC %s  clk %s\n",
             f->ts_received, f->ids[0], f->b.pos_sol_status, f->b.pos_type,
-            f->b.num_sol_sv, f->b.num_sv, f->crc_ok ? "ok" : "BAD");
+            f->b.num_sol_sv, f->b.num_sv, f->crc_ok ? "ok" : "BAD",
+            f->b.time_status);
 }
 
 static void write_opm(FILE *fp, const fix_t *f, const args_t *a)
