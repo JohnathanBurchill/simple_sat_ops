@@ -1,0 +1,420 @@
+/*
+
+    Simple Satellite Operations  utils/gnss_opm.c
+
+    Build an OPM (orbit parameter message) from the satellite's own GNSS fix
+    so the trajectory can be propagated and uploaded to the SpaceX Space
+    Safety conjunction-screening API.
+
+    FrontierSat's NovAtel receiver returns a BESTXYZA log (an Earth-fixed
+    position/velocity solution with per-axis 1-sigma uncertainties) in a
+    gnss_send_cmd_ascii telecommand response. This tool finds those responses
+    in the packet DB, reassembles the multi-packet ones, checks the NovAtel
+    CRC, picks the best valid fix, and writes the state vector -- with its
+    uncertainties -- in the OPM form the space_safety_manager (`ssm`) tool
+    reads. `ssm propagate` / `ssm upload-opm` then turns it into a CCSDS OEM
+    (growing the uncertainty into an RTN covariance over the window) and
+    uploads it. Read-only on the DB.
+
+    Examples:
+      gnss_opm                          # newest CRC-ok SOL_COMPUTED fix
+      gnss_opm --since=7d --list        # list candidate fixes, newest first
+      gnss_opm --id=17769 > frontiersat.opm
+      gnss_opm --name="FrontierSat (CTS-Sat-1)" --hard-body-radius=0.71
+
+    Copyright (C) 2026  Johnathan K Burchill
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
+#include "argparse.h"
+#include "beacon_cts1.h"
+#include "bestxyz.h"
+#include "packet_db.h"
+#include "sso_version.h"
+
+#include <ctype.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#ifndef WITH_SQLITE3
+int main(int argc, char **argv)
+{
+    if (sso_version_handle(argc, argv, "gnss_opm")) return 0;
+    (void)argc; (void)argv;
+    fprintf(stderr,
+            "gnss_opm: built without sqlite3 support. Install\n"
+            "libsqlite3-dev (or `brew install sqlite`) and rebuild.\n");
+    return 1;
+}
+#else
+
+#include <sqlite3.h>
+
+#define TCMD_TYPE     0x04
+#define TCMD_HDR      COMMS_TCMD_RESPONSE_HEADER_SIZE
+#define TCMD_MAXDATA  COMMS_TCMD_RESPONSE_PACKET_MAX_DATA_BYTES_PER_PACKET
+
+static int starts_with(const char *s, const char *p) { return strncmp(s, p, strlen(p)) == 0; }
+
+// Relative (90s|30m|24h|7d) or ISO-8601 spec -> ISO-8601 UTC. Mirrors
+// packet_query.c / gnss_reports.c. Returns 0 on success, -1 on a bad spec.
+static int parse_time_spec(const char *spec, char *out, size_t outn)
+{
+    if (spec == NULL || spec[0] == '\0') return -1;
+    size_t len = strlen(spec);
+    char unit = spec[len - 1];
+    if (unit == 's' || unit == 'm' || unit == 'h' || unit == 'd') {
+        char *endp = NULL;
+        long n = strtol(spec, &endp, 10);
+        if (endp == spec || endp != spec + len - 1 || n <= 0) return -1;
+        long sec = (unit == 's') ? n : (unit == 'm') ? n * 60
+                 : (unit == 'h') ? n * 3600 : n * 86400;
+        time_t cutoff = time(NULL) - sec;
+        struct tm utc; gmtime_r(&cutoff, &utc);
+        strftime(out, outn, "%Y-%m-%dT%H:%M:%SZ", &utc);
+        return 0;
+    }
+    if (len + 1 > outn) return -1;
+    memcpy(out, spec, len + 1);
+    return 0;
+}
+
+typedef struct {
+    long long      id;
+    char           ts_received[40];
+    unsigned char *payload;
+    int            payload_len;
+    unsigned char  tskey[8];
+    int            seq;
+} frag_t;
+
+typedef struct {
+    const char *db_path;
+    const char *since;
+    const char *until;
+    const char *name;
+    const char *object_id;
+    double      hard_body_radius;
+    long long   want_id;        // 0 = pick best
+    int         list;
+    int         allow_insufficient;
+} args_t;
+
+#define OPTW 26
+
+static int parse_args(args_t *a, int argc, char **argv, int help)
+{
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "show this help and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (starts_with(arg, "--db=") || help) {
+            if (help) parse_help_line(OPTW, "--db=<path>", "override default DB path ($SSO_PACKET_DB or the default)");
+            else a->db_path = arg + 5;
+            matched = 1;
+        }
+        if (starts_with(arg, "--since=") || help) {
+            if (help) parse_help_line(OPTW, "--since=<spec>", "24h | 7d | ISO-8601 (default: all)");
+            else a->since = arg + 8;
+            matched = 1;
+        }
+        if (starts_with(arg, "--until=") || help) {
+            if (help) parse_help_line(OPTW, "--until=<spec>", "same syntax as --since (default: now)");
+            else a->until = arg + 8;
+            matched = 1;
+        }
+        if (starts_with(arg, "--name=") || help) {
+            if (help) parse_help_line(OPTW, "--name=<s>", "OPM object name (default: FrontierSat)");
+            else a->name = arg + 7;
+            matched = 1;
+        }
+        if (starts_with(arg, "--object-id=") || help) {
+            if (help) parse_help_line(OPTW, "--object-id=<s>", "OPM object id (optional)");
+            else a->object_id = arg + 12;
+            matched = 1;
+        }
+        if (starts_with(arg, "--hard-body-radius=") || help) {
+            if (help) parse_help_line(OPTW, "--hard-body-radius=<m>", "hard-body radius in metres (default: 0.71)");
+            else a->hard_body_radius = atof(arg + 19);
+            matched = 1;
+        }
+        if (starts_with(arg, "--id=") || help) {
+            if (help) parse_help_line(OPTW, "--id=<n>", "use the GNSS fix containing packet id n");
+            else a->want_id = atoll(arg + 5);
+            matched = 1;
+        }
+        if (strcmp(arg, "--list") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--list", "list candidate fixes (newest first), write no OPM");
+            else a->list = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--allow-insufficient") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--allow-insufficient", "accept a fix that is not SOL_COMPUTED (NOT for upload)");
+            else a->allow_insufficient = 1;
+            matched = 1;
+        }
+        if ((strcmp(arg, "-V") == 0 || strcmp(arg, "--version") == 0) || help) {
+            if (help) parse_help_line(OPTW, "-V, --version", "print version and exit");
+            matched = 1;
+        }
+        if (!help && !matched) {
+            fprintf(stderr, "gnss_opm: unknown option '%s' (try --help)\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    return help ? PARSE_HELP : PARSE_OK;
+}
+
+// Reassemble one reception (fragments sorted by seq) into buf, capping each at
+// 186 bytes so the per-packet CSP CRC32 trailer is dropped. Returns length.
+static int reassemble(const frag_t *frags, int n, unsigned char *buf, int bufcap)
+{
+    int total = 0;
+    memset(buf, 0, (size_t)bufcap);
+    for (int i = 0; i < n; ++i) {
+        int dl = frags[i].payload_len - TCMD_HDR;
+        if (dl < 0) dl = 0;
+        if (dl > TCMD_MAXDATA) dl = TCMD_MAXDATA;
+        int off = (frags[i].seq - 1) * TCMD_MAXDATA;
+        if (off < 0 || off + dl > bufcap) continue;
+        memcpy(buf + off, frags[i].payload + TCMD_HDR, (size_t)dl);
+        if (off + dl > total) total = off + dl;
+    }
+    if (total >= bufcap) total = bufcap - 1;
+    buf[total] = '\0';
+    return total;
+}
+
+// One accepted GNSS fix.
+typedef struct {
+    bestxyz_t b;
+    char      ts_received[40];
+    long long ids[8];
+    int       n_ids;
+    int       crc_ok;
+} fix_t;
+
+// If the reassembled reception is a CRC-ok BESTXYZA, fill *out and return 1.
+static int parse_fix(const frag_t *frags, int n, fix_t *out)
+{
+    static unsigned char buf[65536];
+    int len = reassemble(frags, n, buf, sizeof buf);
+    char *msg = (char *)buf;
+    char *marker = strstr(msg, "GNSS Response (");
+    if (marker == NULL) return 0;
+
+    // Trim to the firmware-declared receiver length so trailer/padding can't
+    // confuse the parser.
+    int decl = 0;
+    char *colon = strstr(marker, "): ");
+    if (sscanf(marker, "GNSS Response (%d chars)", &decl) == 1 && colon && decl > 0) {
+        int end = (int)(colon + 3 - msg) + decl;
+        if (end < len) { len = end; msg[len] = '\0'; }
+    }
+    if (strstr(msg, "BESTXYZA") == NULL) return 0;
+
+    char err[96];
+    if (bestxyz_parse(msg, &out->b, err, sizeof err) != 0) return 0;
+    out->crc_ok = out->b.crc_present && out->b.crc_ok;
+    snprintf(out->ts_received, sizeof out->ts_received, "%s", frags[0].ts_received);
+    out->n_ids = 0;
+    for (int i = 0; i < n && i < 8; ++i) out->ids[out->n_ids++] = frags[i].id;
+    return 1;
+}
+
+static int fix_is_usable(const fix_t *f, const args_t *a)
+{
+    if (!f->crc_ok) return 0;
+    if (!a->allow_insufficient && strcmp(f->b.pos_sol_status, "SOL_COMPUTED") != 0) return 0;
+    return 1;
+}
+
+static void print_candidate(const fix_t *f)
+{
+    fprintf(stderr, "  %s  id %lld  %s/%s  %d/%d SV  CRC %s\n",
+            f->ts_received, f->ids[0], f->b.pos_sol_status, f->b.pos_type,
+            f->b.num_sol_sv, f->b.num_sv, f->crc_ok ? "ok" : "BAD");
+}
+
+static void write_opm(FILE *fp, const fix_t *f, const args_t *a)
+{
+    int y, mo, d, h, mi; double s;
+    bestxyz_gps_to_utc(f->b.gps_week, f->b.gps_sow, BESTXYZ_DEFAULT_LEAP_SECONDS,
+                       &y, &mo, &d, &h, &mi, &s);
+
+    fprintf(fp, "# OPM generated by simple_sat_ops gnss_opm\n");
+    fprintf(fp, "# GNSS fix: packet id %lld, BESTXYZA %s/%s, %d/%d SV, CRC %08x\n",
+            f->ids[0], f->b.pos_sol_status, f->b.pos_type,
+            f->b.num_sol_sv, f->b.num_sv, f->b.crc_read);
+    fprintf(fp, "# epoch from GPS week %d sow %.3f, leap=%d s; %s clock\n",
+            f->b.gps_week, f->b.gps_sow, BESTXYZ_DEFAULT_LEAP_SECONDS, f->b.time_status);
+    fprintf(fp, "# r_ecef_sigma_m / v_ecef_sigma_m_per_s are the receiver 1-sigma;\n");
+    fprintf(fp, "# ssm rotates them ECEF->RTN and grows them over the propagation window.\n");
+    fprintf(fp, "- name: %s\n", a->name);
+    if (a->object_id && a->object_id[0])
+        fprintf(fp, "  object_id: %s\n", a->object_id);
+    fprintf(fp, "  date: %04d-%02d-%02dT%02d:%02d:%09.6fZ\n", y, mo, d, h, mi, s);
+    fprintf(fp, "  r_ecef_m: [%.4f, %.4f, %.4f]\n",
+            f->b.pos[0], f->b.pos[1], f->b.pos[2]);
+    fprintf(fp, "  v_ecef_m_per_s: [%.4f, %.4f, %.4f]\n",
+            f->b.vel[0], f->b.vel[1], f->b.vel[2]);
+    fprintf(fp, "  r_ecef_sigma_m: [%.4f, %.4f, %.4f]\n",
+            f->b.pos_sigma[0], f->b.pos_sigma[1], f->b.pos_sigma[2]);
+    fprintf(fp, "  v_ecef_sigma_m_per_s: [%.6f, %.6f, %.6f]\n",
+            f->b.vel_sigma[0], f->b.vel_sigma[1], f->b.vel_sigma[2]);
+    fprintf(fp, "  hard_body_radius_m: %.3f\n", a->hard_body_radius);
+}
+
+int main(int argc, char **argv)
+{
+    if (sso_version_handle(argc, argv, "gnss_opm")) return 0;
+
+    args_t cfg = {0};
+    cfg.name = "FrontierSat";
+    cfg.hard_body_radius = 0.71;
+    switch (parse_args(&cfg, argc, argv, 0)) {
+        case PARSE_HELP:  return 0;
+        case PARSE_ERROR: return 1;
+        default: break;
+    }
+
+    char db_default[1024];
+    const char *db_path = cfg.db_path;
+    if (db_path == NULL) {
+        if (packet_db_default_path(db_default, sizeof db_default) != 0) {
+            fprintf(stderr, "gnss_opm: no DB path (set $SSO_PACKET_DB or pass --db=<path>)\n");
+            return 1;
+        }
+        db_path = db_default;
+    }
+
+    char since_iso[40] = {0}, until_iso[40] = {0};
+    if (cfg.since && parse_time_spec(cfg.since, since_iso, sizeof since_iso) != 0) {
+        fprintf(stderr, "gnss_opm: bad --since=%s\n", cfg.since); return 1;
+    }
+    if (cfg.until && parse_time_spec(cfg.until, until_iso, sizeof until_iso) != 0) {
+        fprintf(stderr, "gnss_opm: bad --until=%s\n", cfg.until); return 1;
+    }
+
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        fprintf(stderr, "gnss_opm: cannot open %s: %s\n",
+                db_path, db ? sqlite3_errmsg(db) : "open failed");
+        if (db) sqlite3_close(db);
+        return 1;
+    }
+
+    const char *sql =
+        "SELECT id, ts_received, payload FROM packet "
+        "WHERE packet_type=?1 AND length(payload) >= ?2 "
+        "ORDER BY substr(payload,2,8), ts_received, id";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "gnss_opm: query failed: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return 1;
+    }
+    sqlite3_bind_int(st, 1, TCMD_TYPE);
+    sqlite3_bind_int(st, 2, TCMD_HDR + 1);
+
+    frag_t recv[260];
+    int nrecv = 0;
+    unsigned char curkey[8];
+    int have_key = 0, last_seq = 0, n_candidates = 0;
+    fix_t best = {0};
+    int have_best = 0;
+
+    #define CONSIDER() do { \
+        if (nrecv > 0) { \
+            fix_t f = {0}; \
+            if (parse_fix(recv, nrecv, &f)) { \
+                int in_range = (!since_iso[0] || strcmp(f.ts_received, since_iso) >= 0) \
+                            && (!until_iso[0] || strcmp(f.ts_received, until_iso) <= 0); \
+                int id_match = 1; \
+                if (cfg.want_id) { id_match = 0; \
+                    for (int k = 0; k < f.n_ids; ++k) if (f.ids[k] == cfg.want_id) id_match = 1; } \
+                if (in_range && id_match && fix_is_usable(&f, &cfg)) { \
+                    n_candidates++; \
+                    if (cfg.list) print_candidate(&f); \
+                    if (!have_best || strcmp(f.ts_received, best.ts_received) > 0) { best = f; have_best = 1; } \
+                } \
+            } \
+            for (int i = 0; i < nrecv; ++i) { free(recv[i].payload); } \
+            nrecv = 0; \
+        } \
+    } while (0)
+
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *pl = sqlite3_column_blob(st, 2);
+        int pl_len = sqlite3_column_bytes(st, 2);
+        if (pl == NULL || pl_len < TCMD_HDR + 1) continue;
+        int seq = pl[12];
+        if (seq < 1) continue;
+        unsigned char key[8];
+        memcpy(key, pl + 1, 8);
+
+        int new_group = !have_key || memcmp(key, curkey, 8) != 0;
+        if (new_group) { CONSIDER(); memcpy(curkey, key, 8); have_key = 1; last_seq = 0; }
+        else if (seq <= last_seq) { CONSIDER(); }
+        if (nrecv >= (int)(sizeof recv / sizeof recv[0])) CONSIDER();
+
+        frag_t *fr = &recv[nrecv++];
+        fr->id = sqlite3_column_int64(st, 0);
+        snprintf(fr->ts_received, sizeof fr->ts_received, "%s",
+                 (const char *)sqlite3_column_text(st, 1));
+        memcpy(fr->tskey, key, 8);
+        fr->seq = seq;
+        fr->payload_len = pl_len;
+        fr->payload = malloc((size_t)pl_len);
+        if (fr->payload) memcpy(fr->payload, pl, (size_t)pl_len);
+        last_seq = seq;
+    }
+    CONSIDER();
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+
+    if (cfg.list) {
+        fprintf(stderr, "%d usable GNSS fix%s found.\n",
+                n_candidates, n_candidates == 1 ? "" : "es");
+        return have_best ? 0 : 1;
+    }
+
+    if (!have_best) {
+        fprintf(stderr,
+                "gnss_opm: no usable GNSS fix found%s.\n"
+                "Need a CRC-ok BESTXYZA%s. Try --list, a wider --since, or "
+                "--allow-insufficient (not for upload).\n",
+                cfg.want_id ? " for that --id" : "",
+                cfg.allow_insufficient ? "" : " with SOL_COMPUTED");
+        return 1;
+    }
+
+    fprintf(stderr,
+            "gnss_opm: using fix from %s (packet id %lld), %s/%s, %d/%d SV.\n",
+            best.ts_received, best.ids[0], best.b.pos_sol_status, best.b.pos_type,
+            best.b.num_sol_sv, best.b.num_sv);
+    write_opm(stdout, &best, &cfg);
+    return 0;
+}
+
+#endif

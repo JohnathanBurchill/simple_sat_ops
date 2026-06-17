@@ -576,6 +576,15 @@ if (OPENSSL_FOUND)
     target_link_sso_core(gnss_reports)
     list(APPEND SSO_TARGETS gnss_reports)
 
+    # Build an OPM from the satellite's GNSS fix for ssm to propagate + upload.
+    add_executable(gnss_opm utils/gnss_opm.c src/orbit/bestxyz.c)
+    target_include_directories(gnss_opm PRIVATE ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(gnss_opm PRIVATE ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(gnss_opm PRIVATE ${OPENSSL_LIBRARIES} m)
+    target_link_packet_db(gnss_opm)
+    target_link_sso_core(gnss_opm)
+    list(APPEND SSO_TARGETS gnss_opm)
+
     # Backfill the sent_tcmd table from historical tx.log files.
     add_executable(tcmd_import utils/tcmd_import.c src/proto/agenda_line.c)
     target_include_directories(tcmd_import PRIVATE ${OPENSSL_INCLUDE_DIRS})
