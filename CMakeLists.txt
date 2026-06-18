@@ -182,6 +182,7 @@ set(SSO_CORE_SOURCES
     src/ipc/sso_ipc_paths.c
     src/ipc/sso_dirwatch.c
     src/ipc/sso_ipc_codec.c
+    src/ipc/pass_schedule.c
     src/ipc/sso_ipc_server.c
     src/ipc/sso_ipc_client.c
     src/ipc/ipc_fill.c
@@ -466,6 +467,14 @@ add_executable(sso_ipc_codec_selftest
 target_include_directories(sso_ipc_codec_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(sso_ipc_codec_selftest PRIVATE m)
 list(APPEND SSO_TARGETS sso_ipc_codec_selftest)
+
+# pass_schedule codec selftest. Round-trips the {"t":"passes"} upcoming-passes
+# wire format the --viewer-stream relay emits and the standalone viewer reads.
+add_executable(pass_schedule_selftest
+               unit_tests/pass_schedule_selftest.c src/ipc/pass_schedule.c)
+target_include_directories(pass_schedule_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(pass_schedule_selftest PRIVATE m)
+list(APPEND SSO_TARGETS pass_schedule_selftest)
 
 # ipc_fill selftest. Pins the prediction -> STATE field mapping shared by
 # the operator broadcast and the --viewer-stream relay: a known

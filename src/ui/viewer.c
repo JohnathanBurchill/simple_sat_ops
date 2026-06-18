@@ -26,6 +26,7 @@
 #include "tx_log.h"
 #include "ipc_fill.h"        // ipc_fill_state_prediction
 #include "prediction.h"      // update_satellite_position, free_passes
+#include "pass_schedule.h"   // pass_schedule_t, pass_schedule_encode
 #include "tracking.h"        // update_doppler_shifted_frequencies
 #include "sso_audit.h"
 #include "sso_ipc.h"
@@ -680,6 +681,105 @@ static void stream_emit_tle_state(state_t *state, double jul_utc)
     }
 }
 
+// --- upcoming-passes schedule -------------------------------------
+//
+// Compute the next week of passes off the loaded TLE and ship them once per
+// session as a {"t":"passes"} line, so the standalone viewer can show a pass
+// list and fire local alerts with no live link. Independent of operator vs
+// tle-only mode (the relay always loads its own orbit), so it's emitted before
+// the main loop and refreshed periodically. Read-only: a copy of the
+// prediction is used so the relay's live state is never perturbed.
+
+// How far ahead to enumerate passes, and the refresh cadence for long-lived
+// tle-only streams (operator sessions are short and parked in the relay, so the
+// startup emit covers them).
+#define STREAM_PASSES_HORIZON_DAYS 7.0
+#define STREAM_PASSES_PERIOD_S     (6 * 3600)
+// Step (minutes) for the culmination walk that recovers peak az/time.
+#define STREAM_PASS_PEAK_STEP_MIN  0.1
+
+// sgp4sdp4 Julian Date (full JD) -> Unix seconds. Matches next_in_queue's
+// format_local_aos and the Date_Time epoch (JD 2440587.5 = 1970-01-01).
+static double jul_to_unix(double jul) { return (jul - 2440587.5) * 86400.0; }
+
+// Fill `out` with up to PASS_SCHED_MAX upcoming passes. Returns the count.
+static int build_pass_schedule(const state_t *state, double jul_now,
+                               pass_schedule_t *out)
+{
+    memset(out, 0, sizeof *out);
+
+    // Work on a copy so the relay's live prediction is never touched. The TLE
+    // was already converted (select_ephemeris ran in pass_session_load_orbit)
+    // and the deep-space flag is set globally, so we propagate as-is — exactly
+    // like stream_emit_tle_state does (we must NOT select_ephemeris again).
+    prediction_t pred;
+    memcpy(&pred, &state->prediction, sizeof pred);
+
+    const char *name = pred.oem
+        ? (pred.satellite_ephem.name ? pred.satellite_ephem.name : "")
+        : pred.satellite_ephem.tle.sat_name;
+    if (name == NULL || name[0] == '\0') return 0;   // nothing to schedule
+    snprintf(out->satellite, sizeof out->satellite, "%s", name);
+    if (!pred.oem) {
+        snprintf(out->idesg, sizeof out->idesg, "%s",
+                 pred.satellite_ephem.tle.idesg);
+        double jul_epoch = Julian_Date_of_Epoch(pred.satellite_ephem.tle.epoch);
+        out->tle_epoch_min = (jul_now - jul_epoch) * 1440.0;
+    }
+    out->generated_unix = jul_to_unix(jul_now);
+
+    double jul_stop = jul_now + STREAM_PASSES_HORIZON_DAYS;
+    double utc_offset_min = 0.0;
+    int n = 0;
+    while (n < PASS_SCHED_MAX &&
+           get_next_pass(&pred, jul_now + utc_offset_min / 1440.0, jul_stop, 1.0)) {
+        // Advance past this pass for the next search (mirrors find_passes):
+        // 60 min after this AOS clears the (sub-hour) pass.
+        utc_offset_min += pred.predicted_minutes_until_visible + 60.0;
+        if (pred.predicted_minutes_above_0_degrees <= 0.0) continue;
+        double aos_jul = pred.predicted_ascension_jul_utc;
+        double los_jul = pred.predicted_descent_jul_utc;
+        if (aos_jul <= 0.0 || los_jul <= aos_jul) continue;
+
+        // get_next_pass yields AOS/LOS + max elevation but not the azimuth or
+        // time at culmination; walk the pass to capture them.
+        double best_el = -90.0, best_az = 0.0, best_jul = aos_jul;
+        for (double j = aos_jul; j <= los_jul + 1e-9;
+             j += STREAM_PASS_PEAK_STEP_MIN / 1440.0) {
+            update_satellite_position(&pred, j);
+            double el = pred.satellite_ephem.elevation;
+            if (el > best_el) {
+                best_el  = el;
+                best_az  = pred.satellite_ephem.azimuth;
+                best_jul = j;
+            }
+        }
+
+        pass_t_wire *p = &out->passes[n++];
+        p->aos_unix    = jul_to_unix(aos_jul);
+        p->los_unix    = jul_to_unix(los_jul);
+        p->peak_unix   = jul_to_unix(best_jul);
+        p->peak_el_deg = best_el;
+        p->peak_az_deg = best_az;
+    }
+    out->count = n;
+    return n;
+}
+
+static void stream_emit_passes(state_t *state)
+{
+    struct tm utc;
+    struct timeval tv;
+    UTC_Calendar_Now(&utc, &tv);
+    double jul_now = Julian_Date(&utc, &tv);
+    pass_schedule_t sched;
+    if (build_pass_schedule(state, jul_now, &sched) <= 0) return;
+    char line[16384];
+    if (pass_schedule_encode(&sched, line, sizeof line) == 0) {
+        stream_emit(line);
+    }
+}
+
 // One pass through operator-relay mode: HELLO as an "external" client,
 // then forward the operator's broadcast until it drops or we're asked to
 // stop. Returns when the link is gone so the caller falls back to TLE-only.
@@ -736,8 +836,21 @@ int run_viewer_stream(state_t *state)
     time_t last_emit  = 0;   // 0 => emit on the first TLE-only tick
     time_t last_probe = 0;   // 0 => probe on the first iteration
 
+    // Ship the upcoming-passes schedule up front so every viewer (each SSH
+    // connection spawns its own stream) gets it near the start, in either
+    // mode — operator-relay mode parks inside stream_try_relay, so the loop's
+    // periodic refresh below only runs while we're in tle-only mode.
+    stream_emit_passes(state);
+    time_t last_passes = time(NULL);
+
     while (!g_stream_stop) {
         time_t now = time(NULL);
+
+        // Refresh the pass schedule periodically (long-lived tle-only streams).
+        if (now - last_passes >= STREAM_PASSES_PERIOD_S) {
+            stream_emit_passes(state);
+            last_passes = now;
+        }
 
         // Backstop probe — also the very first attempt, so that when an
         // operator is already up we go straight to relaying without emitting

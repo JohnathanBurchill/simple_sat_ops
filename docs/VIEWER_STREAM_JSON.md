@@ -178,6 +178,36 @@ doesn't need:
 | `yield-request` | force-claim in progress | `reason` |
 | `bye` | operator is shutting down | — |
 
+### 5.4 `passes` — upcoming-pass schedule
+
+A self-contained list of the next ~7 days of passes over the ground station,
+emitted **once near the start of every stream** (each SSH connection spawns its
+own producer) and refreshed every few hours on long-lived streams. Unlike the
+operator-relayed events, the producer computes this itself from its loaded TLE
+(SGP4 + the observer location), so it appears in **both** modes. It lets a
+read-only client show a pass list and schedule local alerts even when the link
+is down — cache the most recent one.
+
+It is **not** an `sso_event_t` (it would bloat that struct); it has its own
+codec, `src/ipc/pass_schedule.c`, kept in lockstep with the standalone viewer's
+vendored copy.
+
+| key | JSON type | meaning |
+|-----|-----------|---------|
+| `t` | string | `"passes"` |
+| `sat` | string | Satellite name |
+| `idesg` | string | International designator |
+| `gen` | number | When this schedule was computed, **Unix seconds UTC** (monotonic; advance = a newer schedule) |
+| `ep_min` | number | Minutes since the TLE epoch (staleness hint) |
+| `n` | integer | Number of passes in `p` |
+| `p` | array of numbers | `n` × 5 flat: `[aos, los, peak, peak_el_deg, peak_az_deg, …]` |
+
+Each pass is five consecutive numbers in `p`: `aos`/`los`/`peak` are **Unix
+seconds UTC** (acquisition, loss, and culmination time); `peak_el_deg` is the
+maximum elevation; `peak_az_deg` is the azimuth at culmination. Passes are
+sorted soonest-first. A decoder should keep only whole 5-tuples (ignore a
+trailing partial) and may cap at its own limit.
+
 ---
 
 ## 6. Parser rules
