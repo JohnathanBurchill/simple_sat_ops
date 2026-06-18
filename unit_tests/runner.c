@@ -394,6 +394,7 @@ int main(int argc, char **argv)
         "rs_selftest",
         "tle_csv_selftest",
         "bestxyz_selftest",
+        "shortarc_selftest",
         "antenna_rotator_selftest",
         "modem_iq_selftest",
         "ax100_selftest",

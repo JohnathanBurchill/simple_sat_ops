@@ -249,6 +249,14 @@ target_include_directories(bestxyz_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(bestxyz_selftest PRIVATE m)
 list(APPEND SSO_TARGETS bestxyz_selftest)
 
+# Short-arc least-squares orbit fit (src/orbit/shortarc.c): synthetic-arc
+# recovery + velocity-tightening, since real data has no closely-spaced fixes.
+add_executable(shortarc_selftest
+               unit_tests/shortarc_selftest.c src/orbit/shortarc.c)
+target_include_directories(shortarc_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(shortarc_selftest PRIVATE m)
+list(APPEND SSO_TARGETS shortarc_selftest)
+
 # Agenda-line self-test: the shared inline-comment rule (agenda_line.c)
 # that simple_sat_ops (transmit) and agenda_check (audit) both use to
 # split a telecommand from a trailing '#' comment. Pure POSIX.
@@ -577,7 +585,7 @@ if (OPENSSL_FOUND)
     list(APPEND SSO_TARGETS gnss_reports)
 
     # Build an OPM from the satellite's GNSS fix for ssm to propagate + upload.
-    add_executable(gnss_opm utils/gnss_opm.c src/orbit/bestxyz.c)
+    add_executable(gnss_opm utils/gnss_opm.c src/orbit/bestxyz.c src/orbit/shortarc.c)
     target_include_directories(gnss_opm PRIVATE ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(gnss_opm PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(gnss_opm PRIVATE ${OPENSSL_LIBRARIES} m)
