@@ -319,7 +319,7 @@ void beacon_print(FILE *fp, const char *ts,
 
     char rf_buf[8], time_buf[8], gnss_buf[8];
     fprintf(fp,
-            "%sbeacon: rf_switch=%s time_sync=%s gnss=%s\n",
+            "%sbeacon: rf_switch=%s time_sync=%s gnss_rx_mode=%s\n",
             prefix,
             rf_switch_mode_str(b.active_rf_switch_control_mode,
                                rf_buf, sizeof rf_buf),
