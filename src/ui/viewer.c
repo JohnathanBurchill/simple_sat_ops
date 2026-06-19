@@ -719,7 +719,10 @@ static int build_pass_schedule(const state_t *state, double jul_now,
         ? (pred.satellite_ephem.name ? pred.satellite_ephem.name : "")
         : pred.satellite_ephem.tle.sat_name;
     if (name == NULL || name[0] == '\0') return 0;   // nothing to schedule
-    snprintf(out->satellite, sizeof out->satellite, "%s", name);
+    // Bound the field width so -Wformat-truncation knows it fits: the source
+    // (tle.sat_name) is char[128], the wire field is char[64].
+    snprintf(out->satellite, sizeof out->satellite, "%.*s",
+             (int)(sizeof out->satellite - 1), name);
     if (!pred.oem) {
         snprintf(out->idesg, sizeof out->idesg, "%s",
                  pred.satellite_ephem.tle.idesg);
