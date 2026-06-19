@@ -502,6 +502,155 @@ static void test_run_deterministic_with_same_key(void)
     free(iq_b);
 }
 
+// ----------------------------------------------------------------
+//  d) Operator-facing summary formatting (tx_burst_summarize)
+// ----------------------------------------------------------------
+//
+// This is the exact text shown in the TX-log "command tx history",
+// written to tx.log, and mirrored to viewers. It has had two display
+// bugs: a mid-string truncation, and a one-past-the-end read that
+// printed a stale byte after the command. Both are display-only -- the
+// on-air frame is built from payload_len bytes regardless -- but a wrong
+// readout of what was sent is its own hazard, so pin the format here.
+
+static void test_summary_ascii_basic(void)
+{
+    const char *cmd = "CTS1+ping";
+    char out[256];
+    tx_burst_summarize((const uint8_t *) cmd, strlen(cmd), 0, out, sizeof out);
+    tap_okf(strcmp(out, "ascii:CTS1+ping") == 0,
+            "summary ascii: exact text (\"%s\")", out);
+}
+
+// Regression for the extra-character bug. The payload slot is a bare
+// memcpy of payload_len bytes and is NOT NUL-terminated, so the formatter
+// must stop exactly at the command end. Fill the whole buffer with a
+// sentinel 'Z' first; none of the tail may leak into the readout.
+// (Pre-fix the precision was payload_len+1, which printed one 'Z'.)
+static void test_summary_ascii_not_terminated(void)
+{
+    uint8_t buf[64];
+    memset(buf, 'Z', sizeof buf);          // no NUL anywhere
+    const char *cmd = "CTS1+ping";
+    size_t n = strlen(cmd);
+    memcpy(buf, cmd, n);                    // buf[n..] stay 'Z'
+    char out[256];
+    tx_burst_summarize(buf, n, 0, out, sizeof out);
+    tap_okf(strcmp(out, "ascii:CTS1+ping") == 0,
+            "summary ascii: stops at payload_len, no stale byte (\"%s\")", out);
+    tap_okf(strlen(out) == 6 + n,
+            "summary ascii: length is exactly 6 + payload_len (%zu == %zu)",
+            strlen(out), 6 + n);
+    tap_okf(strchr(out + 6, 'Z') == NULL,
+            "summary ascii: sentinel tail byte never printed");
+}
+
+// Companion with an exactly-sized heap buffer: the formatter must read
+// only [0..n) and produce the right text. (ASan won't fault on the bad
+// read here -- the over-read happens inside libc's snprintf, which ASan
+// doesn't instrument -- so the sentinel test above is the real guard;
+// this pins the exact-length contract and would fault under a guard-page
+// allocator.)
+static void test_summary_ascii_no_overread(void)
+{
+    const char *cmd = "hello-world";
+    size_t n = strlen(cmd);
+    uint8_t *exact = malloc(n);            // exactly n bytes; no [n] to read
+    memcpy(exact, cmd, n);
+    char out[256];
+    tx_burst_summarize(exact, n, 0, out, sizeof out);
+    tap_okf(strcmp(out, "ascii:hello-world") == 0,
+            "summary ascii: exact-sized payload, no over-read (\"%s\")", out);
+    free(exact);
+}
+
+static void test_summary_ascii_empty(void)
+{
+    char out[256];
+    tx_burst_summarize((const uint8_t *) "", 0, 0, out, sizeof out);
+    tap_okf(strcmp(out, "ascii:") == 0,
+            "summary ascii: empty payload -> \"ascii:\" (\"%s\")", out);
+}
+
+// Truncation (the first historical bug): a long command into a short
+// buffer must fill out[0..out_size) with a clean "ascii:"+payload prefix,
+// NUL-terminate, and never write past out_size.
+static void test_summary_ascii_truncation(void)
+{
+    char cmd[200];
+    memset(cmd, 'a', sizeof cmd - 1);
+    cmd[sizeof cmd - 1] = '\0';
+    enum { CAP = 20 };
+    char out[CAP + 4];
+    memset(out, '\1', sizeof out);
+    out[CAP] = (char) 0x7E;                 // guard byte just past the cap
+    tx_burst_summarize((const uint8_t *) cmd, strlen(cmd), 0, out, CAP);
+    tap_okf(out[CAP] == (char) 0x7E,
+            "summary trunc: nothing written past out_size");
+    tap_okf(strlen(out) == CAP - 1,
+            "summary trunc: fills exactly out_size-1 chars (%zu == %d)",
+            strlen(out), CAP - 1);
+    int clean_prefix = strncmp(out, "ascii:", 6) == 0;
+    for (size_t i = 6; i < strlen(out); ++i)
+        if (out[i] != 'a') clean_prefix = 0;
+    tap_okf(clean_prefix,
+            "summary trunc: clean \"ascii:\"+payload prefix (\"%s\")", out);
+}
+
+static void test_summary_hex_basic(void)
+{
+    const uint8_t bytes[] = { 0xDE, 0xAD, 0xBE, 0xEF };
+    char out[256];
+    tx_burst_summarize(bytes, sizeof bytes, 1, out, sizeof out);
+    tap_okf(strcmp(out, "hex:deadbeef") == 0,
+            "summary hex: 4 bytes -> \"hex:deadbeef\" (\"%s\")", out);
+}
+
+static void test_summary_hex_truncation(void)
+{
+    uint8_t bytes[20];
+    for (size_t i = 0; i < sizeof bytes; ++i) bytes[i] = (uint8_t) i;
+    char out[256];
+    tx_burst_summarize(bytes, sizeof bytes, 1, out, sizeof out);
+    tap_okf(strcmp(out, "hex:000102030405060708090a0b0c0d0e0f...") == 0,
+            "summary hex: >16 bytes shows first 16 then \"...\" (\"%s\")", out);
+}
+
+// Production wiring: tx_burst_run fills out_summary via tx_burst_summarize
+// before it ever touches the SDR. core=NULL returns TX_BURST_NO_CORE
+// *after* the summary is built, so we read exactly what the TX log would
+// show without keying anything. Plant a stale byte to lock the extra-
+// character regression at the real call site too.
+static void test_summary_run_path_no_stale_byte(void)
+{
+    tx_request_slot_t req;
+    make_request(&req, "CTS1+reset");        // memset-zeroes the slot first
+    size_t n = req.payload_len;
+    req.payload[n] = 'Z';                     // stale byte the readout must skip
+    char summary[256];
+    tx_burst_result_t rc = tx_burst_run(/*core=*/NULL, &req, 0.0,
+                                         NULL, 0, summary, sizeof summary);
+    tap_okf(rc == TX_BURST_NO_CORE,
+            "summary run-path: core=NULL returns NO_CORE after summarizing (rc=%d)",
+            (int) rc);
+    tap_okf(strcmp(summary, "ascii:CTS1+reset") == 0,
+            "summary run-path: TX-log text stops at payload_len (\"%s\")",
+            summary);
+}
+
+static void test_summary_run_path_sso_origin_suffix(void)
+{
+    // An expanded SSO+ pseudo-command tags the summary with its origin;
+    // verify the suffix is appended cleanly onto the ascii: text.
+    tx_request_slot_t req;
+    make_request(&req, "CTS1+xyz");
+    snprintf(req.sso_origin, sizeof req.sso_origin, "SSO+TIME");
+    char summary[256];
+    (void) tx_burst_run(NULL, &req, 0.0, NULL, 0, summary, sizeof summary);
+    tap_okf(strcmp(summary, "ascii:CTS1+xyz (replaced 'SSO+TIME')") == 0,
+            "summary run-path: SSO+ origin suffix appended (\"%s\")", summary);
+}
+
 int main(void)
 {
     // HMAC --- enabled by default in the simple_sat_ops TX path
@@ -520,6 +669,18 @@ int main(void)
     test_run_doppler_freq_reaches_b210();
     test_run_hmac_key_changes_iq();
     test_run_deterministic_with_same_key();
+
+    // Operator-facing summary text (TX-log "command tx history") ---
+    // two prior display bugs (truncation, one-past-the-end stale byte).
+    test_summary_ascii_basic();
+    test_summary_ascii_not_terminated();
+    test_summary_ascii_no_overread();
+    test_summary_ascii_empty();
+    test_summary_ascii_truncation();
+    test_summary_hex_basic();
+    test_summary_hex_truncation();
+    test_summary_run_path_no_stale_byte();
+    test_summary_run_path_sso_origin_suffix();
 
     capture_reset();
     return tap_done();

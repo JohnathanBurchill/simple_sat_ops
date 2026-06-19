@@ -70,6 +70,19 @@ tx_burst_result_t tx_burst_run(b210_rx_tx_core_t *core,
 // byte count on success, -1 on bad input.
 ssize_t tx_burst_parse_hex(const char *hex, uint8_t *out, size_t cap);
 
+// Format the one-line operator-facing description of a payload --
+// "ascii:<text>" (is_hex=0) or "hex:<bytes>" (is_hex=1, first 16 bytes
+// then "...") -- into out[0..out_size). This is the exact text shown in
+// the TX-log "command tx history", logged to tx.log, and mirrored to
+// viewers; tx_burst_run fills out_summary with it.
+//
+// IMPORTANT: `payload` need NOT be NUL-terminated. Exactly `n` bytes are
+// considered (the tx_request slot is a bare memcpy of payload_len bytes),
+// so the formatter must never read payload[n]. The result is always NUL-
+// terminated and truncated to fit out_size. Exposed for the selftest.
+void tx_burst_summarize(const uint8_t *payload, size_t n, int is_hex,
+                        char *out, size_t out_size);
+
 // Compute the Doppler-corrected TX carrier (Hz) for a flying satellite.
 // `nominal_carrier_hz` is the satellite's published RX frequency (e.g.
 // FRONTIERSAT_CARRIER_HZ = 436.150 MHz). `range_rate_km_s` is the

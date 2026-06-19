@@ -205,12 +205,21 @@ static int build_iq(const uint8_t *payload, size_t payload_len,
     return 0;
 }
 
-static void summarize(const uint8_t *payload, size_t n, int is_hex,
-                      char *out, size_t out_size)
+// Format the one-line "ascii:<text>" / "hex:<bytes>" description of a
+// payload for the UI / tx.log / viewer fan-out. Exposed (not static) so
+// the selftest can pin the formatting directly -- it has had two display
+// bugs (a mid-string truncation and a one-past-the-end stale byte).
+void tx_burst_summarize(const uint8_t *payload, size_t n, int is_hex,
+                        char *out, size_t out_size)
 {
     if (out_size == 0) return;
     if (!is_hex) {
-        size_t cap = n + 7;
+        // cap is the visible length: "ascii:" (6) + the n payload bytes.
+        // The precision below is cap - 6, so cap must be n + 6, not n + 7
+        // -- payload is not NUL-terminated (a bare memcpy of payload_len
+        // bytes), so an n+1 precision printed one stale byte past the
+        // command. The clamp keeps the whole string inside out_size.
+        size_t cap = n + 6;
         if (cap >= out_size) cap = out_size - 1;
         snprintf(out, out_size, "ascii:%.*s",
                  (int)(cap - 6), (const char *) payload);
@@ -235,8 +244,8 @@ tx_burst_result_t tx_burst_run(b210_rx_tx_core_t *core,
 {
     if (out_summary && summary_n) out_summary[0] = '\0';
     if (req == NULL) return TX_BURST_FRAME_BUILD_FAILED;
-    summarize(req->payload, req->payload_len, req->is_hex,
-               out_summary, summary_n);
+    tx_burst_summarize(req->payload, req->payload_len, req->is_hex,
+                       out_summary, summary_n);
     // Note the heritage of an expanded "SSO+..." pseudo-command on the same
     // summary that lands in tx.log / the viewer fan-out.
     if (req->sso_origin[0] && out_summary && summary_n) {
