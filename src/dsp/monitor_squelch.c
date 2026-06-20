@@ -24,6 +24,11 @@ void monitor_squelch_init(monitor_squelch_t *s,
     memset(s, 0, sizeof *s);
 
     double fs = p->rate_hz;
+    // rate_hz is a documented precondition (> 0). Without a positive rate the
+    // band math and smoothing constant are meaningless, so leave the squelch
+    // OFF (memset already set mode = MSQ_OFF) rather than build garbage.
+    if (!(fs > 0.0)) return;
+
     double sig_lo   = p->sig_lo_hz   > 0 ? p->sig_lo_hz   : 4500.0;
     double sig_hi   = p->sig_hi_hz   > 0 ? p->sig_hi_hz   : 5100.0;
     double noise_lo = p->noise_lo_hz > 0 ? p->noise_lo_hz : 8000.0;
@@ -39,7 +44,15 @@ void monitor_squelch_init(monitor_squelch_t *s,
                       : (p->carrier_lockout_s == 0.0 ? 1.5 : p->carrier_lockout_s);
     double release_s  = p->lockout_release_s > 0.0 ? p->lockout_release_s : 0.5;
 
-    if (noise_hi >= 0.5 * fs) noise_hi = 0.5 * fs - 1000.0;
+    // Keep every band edge below Nyquist and each high edge above its low
+    // edge, so a sample rate too low for the default bands (fs <= ~18 kHz,
+    // where the default noise_hi falls below noise_lo) can't hand biquad_bpf
+    // a negative bandwidth. All no-ops at the live 48 / 96 kHz rates.
+    double nyq = 0.5 * fs;
+    if (sig_hi   >= nyq) sig_hi   = nyq - 1000.0;
+    if (noise_hi >= nyq) noise_hi = nyq - 1000.0;
+    if (sig_hi   <= sig_lo)   sig_lo   = 0.5 * sig_hi;
+    if (noise_hi <= noise_lo) noise_lo = 0.5 * noise_hi;
 
     biquad_bpf(&s->sig1,   0.5 * (sig_lo + sig_hi),
                sig_hi - sig_lo, fs);
