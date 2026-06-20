@@ -485,7 +485,7 @@ int find_passes(prediction_t *external_prediction, double jul_utc_start, double 
         if (criteria->regex_ignore_case) {
             flags |= REG_ICASE;
         }
-        int res = regcomp(&pattern, criteria->regex, REG_EXTENDED);
+        int res = regcomp(&pattern, criteria->regex, flags);
         if (res) {
             fprintf(stderr, "Error compiling regex\n");
             return -6;
