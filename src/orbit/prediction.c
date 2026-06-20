@@ -21,6 +21,7 @@
 #include "prediction.h"
 #include "oem.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -549,7 +550,7 @@ int find_passes(prediction_t *external_prediction, double jul_utc_start, double 
 
         // Remove trailing whitespace
         int n = strlen(name);
-        while(n > 0 && isspace(name[n - 1])) {
+        while(n > 0 && isspace((unsigned char) name[n - 1])) {
             n--;
         }
         name[n] = '\0';

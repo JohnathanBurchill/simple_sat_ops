@@ -25,6 +25,7 @@
 #include "sso_audit.h"
 #include "sso_paths.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
