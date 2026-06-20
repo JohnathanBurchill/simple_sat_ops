@@ -134,7 +134,10 @@ int modem_iq_viterbi_to_bits(const int16_t *iq_pairs, size_t n_pairs,
         s2r += a * a - b * b;
         s2i += 2.0 * a * b;
     }
-    double bias_mf = atan2(-s2i, -s2r) / 2.0;
+    // atan2(0,0) is undefined; an all-zero / pure-DC window gives
+    // s2r==s2i==0, so take zero bias there instead of the libm corner case.
+    double bias_mf = (s2r == 0.0 && s2i == 0.0)
+                   ? 0.0 : atan2(-s2i, -s2r) / 2.0;
 
     // The MF-domain estimator has a small structural noise floor
     // (~0.005 rad on clean MSK) from the matched filter's transient

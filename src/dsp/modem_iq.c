@@ -211,8 +211,11 @@ int modem_iq_to_bits(const int16_t *iq_pairs, size_t n_pairs,
         s2i += 2.0 * a * b;
     }
     // avg(diff²) has phase 2·bias + π; flip sign (= rotate by π) so
-    // arg lands at 2·bias, then half to recover bias.
-    double bias = atan2(-s2i, -s2r) / 2.0;
+    // arg lands at 2·bias, then half to recover bias. atan2(0,0) is
+    // undefined, so an all-zero / pure-DC window (s2r==s2i==0) takes
+    // zero bias rather than depending on the libm corner case.
+    double bias = (s2r == 0.0 && s2i == 0.0)
+                ? 0.0 : atan2(-s2i, -s2r) / 2.0;
     double cb = cos(-bias), sb = sin(-bias);
 
     // Second pass: dphi with bias removed. Rotating (a + jb) by -bias
