@@ -54,6 +54,12 @@ struct sdr_uhd {
     double                  actual_freq;      // last read-back RX LO
     int                     stream_running;
 
+    // Consecutive recv / metadata error counters for the log-throttling in
+    // read_iq. Per-handle (not function-local static) so two open devices
+    // can't cross-contaminate each other's dead-link tally.
+    unsigned long           recv_err_run;
+    unsigned long           md_err_run;
+
     // Serializes access to the device handle (the UHD property tree) across
     // the RX worker and the TX-burst thread. The two streamers run
     // full-duplex -- RX recv and TX send touch their own streamer objects
@@ -306,11 +312,10 @@ static ssize_t uhd_read_iq(sdr_backend_t *be, int16_t *out, size_t cap_pairs)
     // A TX burst leaves the USB transport spewing LIBUSB_TRANSFER_OVERFLOW
     // on every recv (see the deferred B210 TX/RX overflow note). These
     // arrive thousands per second, so log only the first of a run plus a
-    // periodic count — both counters reset on the first clean recv, so
-    // each new storm logs its onset. Keeps the stderr log readable
-    // instead of megabytes of identical lines.
-    static unsigned long recv_err_run = 0;   // consecutive recv() errors
-    static unsigned long md_err_run   = 0;   // consecutive metadata errors
+    // periodic count — u->recv_err_run / u->md_err_run reset on the first
+    // clean recv, so each new storm logs its onset. Keeps the stderr log
+    // readable instead of megabytes of identical lines. Per-handle so two
+    // open devices keep separate tallies.
 
     void  *bufs[1] = { out };
     size_t n_recv = 0;
@@ -329,42 +334,42 @@ static ssize_t uhd_read_iq(sdr_backend_t *be, int16_t *out, size_t cap_pairs)
                                        &n_recv);
     pthread_mutex_unlock(&u->dev_mu);
     if (e != UHD_ERROR_NONE) {
-        if (recv_err_run == 0 || (recv_err_run % 2000) == 0) {
+        if (u->recv_err_run == 0 || (u->recv_err_run % 2000) == 0) {
             log_uhd(e, "rx_recv");
-            if (recv_err_run > 0)
+            if (u->recv_err_run > 0)
                 fprintf(stderr, "sdr_uhd: rx_recv: (%lu errors so far)\n",
-                        recv_err_run + 1);
+                        u->recv_err_run + 1);
         }
-        recv_err_run++;
+        u->recv_err_run++;
         // A long unbroken run of recv errors is a dead link (device
         // unplugged / transport gone), not a transient overflow — report
         // it FATAL (-1) so the worker parks and the UI can warn, rather
         // than spinning forever. A real overflow recovers within a few
         // recvs, so the counter resets long before this trips.
-        if (recv_err_run >= UHD_RX_DEAD_LINK_ERRORS) {
+        if (u->recv_err_run >= UHD_RX_DEAD_LINK_ERRORS) {
             fprintf(stderr,
                     "sdr_uhd: rx_recv: link dead after %lu consecutive "
-                    "errors — reporting device loss\n", recv_err_run);
+                    "errors — reporting device loss\n", u->recv_err_run);
             return -1;
         }
         return 0;
     }
-    recv_err_run = 0;
+    u->recv_err_run = 0;
     uhd_rx_metadata_error_code_t mderr = 0;
     if (uhd_rx_metadata_error_code(u->md, &mderr) == UHD_ERROR_NONE
         && mderr != UHD_RX_METADATA_ERROR_CODE_NONE) {
-        if (md_err_run == 0 || (md_err_run % 2000) == 0) {
+        if (u->md_err_run == 0 || (u->md_err_run % 2000) == 0) {
             char errbuf[128] = {0};
             (void)uhd_rx_metadata_strerror(u->md, errbuf, sizeof errbuf);
             fprintf(stderr, "sdr_uhd: RX metadata error %d: %s%s\n",
                     (int)mderr, errbuf[0] ? errbuf : "(no detail)",
-                    md_err_run > 0 ? " (repeating)" : "");
+                    u->md_err_run > 0 ? " (repeating)" : "");
         }
-        md_err_run++;
+        u->md_err_run++;
         // Overflow / late-packet are non-fatal — the samples we DID get
         // are already in the buffer; demod them rather than dropping.
     } else {
-        md_err_run = 0;
+        u->md_err_run = 0;
     }
     return (ssize_t)n_recv;
 }
