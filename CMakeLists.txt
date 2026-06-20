@@ -20,6 +20,12 @@
 cmake_minimum_required(VERSION 3.10)
 project(simple_sat_ops)
 
+# Standard install layout (CMAKE_INSTALL_BINDIR = bin, _DATADIR = share, ...),
+# all relative to CMAKE_INSTALL_PREFIX (defaults to /usr/local). Lets the
+# install targets honour a custom prefix and DESTDIR staging instead of
+# hardcoding /usr/local.
+include(GNUInstallDirs)
+
 # Emit compile_commands.json so clangd (LSP) gets exact per-file flags and
 # include paths. Symlink it into the source root once: `ln -sf
 # build/compile_commands.json compile_commands.json`. clangd prefers it over
@@ -162,13 +168,21 @@ if (WITH_USRP_B210)
 endif()
 
 option(WITH_RTL_SDR "Build the RTL-SDR RX-only backend (needs librtlsdr)" ON)
+# WITH_RTL_SDR is the user's request (cached). SSO_RTL_SDR_ENABLED is the
+# effective state after probing librtlsdr. Keeping them separate avoids
+# shadowing the cached option with a plain set() -- which would leave the
+# cache reading ON while the backend is off, and risks the cache winning on a
+# reconfigure. Everything that gates the backend reads the internal flag; the
+# cache stays ON so the backend auto-recovers if librtlsdr later appears.
+set(SSO_RTL_SDR_ENABLED OFF)
 if (WITH_RTL_SDR)
     pkg_check_modules(RTLSDR librtlsdr)
-    if (NOT RTLSDR_FOUND)
+    if (RTLSDR_FOUND)
+        set(SSO_RTL_SDR_ENABLED ON)
+    else()
         message(STATUS "librtlsdr not found; RTL-SDR backend disabled. "
                        "Install librtlsdr to enable it, or pass "
                        "-DWITH_RTL_SDR=OFF to silence this note.")
-        set(WITH_RTL_SDR OFF)
     endif()
 endif()
 
@@ -807,7 +821,7 @@ if (WITH_USRP_B210)
         target_link_directories(sdr_probe PRIVATE ${LIBUSB_LIBRARY_DIRS})
         target_link_libraries(sdr_probe PRIVATE ${LIBUSB_LIBRARIES})
     endif()
-    if (WITH_RTL_SDR)
+    if (SSO_RTL_SDR_ENABLED)
         target_compile_definitions(sdr_probe PRIVATE WITH_RTL_SDR)
         target_include_directories(sdr_probe PRIVATE ${RTLSDR_INCLUDE_DIRS})
         target_link_directories(sdr_probe PRIVATE ${RTLSDR_LIBRARY_DIRS})
@@ -923,7 +937,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
     # one backend is enabled. SSO_WITH_SDR gates the SDR-general code in
     # apps/main.c (which is now device-agnostic). Per-device backends
     # (sdr_uhd.c / sdr_rtlsdr.c) are added under their own option below.
-    if (WITH_USRP_B210 OR WITH_RTL_SDR)
+    if (WITH_USRP_B210 OR SSO_RTL_SDR_ENABLED)
         target_compile_definitions(simple_sat_ops PRIVATE SSO_WITH_SDR)
         target_sources(simple_sat_ops PRIVATE
                        src/hw/b210_rx_tx_core.c
@@ -946,7 +960,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
             target_link_libraries(simple_sat_ops PRIVATE ${LIBUSB_LIBRARIES})
         endif()
     endif()
-    if (WITH_RTL_SDR)
+    if (SSO_RTL_SDR_ENABLED)
         target_compile_definitions(simple_sat_ops PRIVATE WITH_RTL_SDR)
         target_sources(simple_sat_ops PRIVATE src/hw/sdr_rtlsdr.c)
         target_include_directories(simple_sat_ops PRIVATE ${RTLSDR_INCLUDE_DIRS})
@@ -962,12 +976,13 @@ endif()
 
 # ----- Install --------------------------------------------------------------
 #
-# Ground-machine deployment goes to /usr/local/bin (system-wide). The
-# operator-mode tools need to be on PATH for every account in sso-ops,
-# and /usr/local/bin is the canonical location. `make install` requires
-# sudo on most setups.
+# Ground-machine deployment goes to ${CMAKE_INSTALL_PREFIX}/bin (default
+# /usr/local/bin, system-wide). The operator-mode tools need to be on PATH
+# for every account in sso-ops, and /usr/local/bin is the canonical location.
+# `make install` requires sudo on most setups. Paths come from GNUInstallDirs
+# so a custom prefix / DESTDIR staging works.
 
-install(TARGETS ${SSO_TARGETS} DESTINATION /usr/local/bin)
+install(TARGETS ${SSO_TARGETS} DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # simple_sat_ops and the other uplink tools read the HMAC keyfile to sign
 # (and, with --hmac, verify) AX100 frames. Operators must be able to run
@@ -1000,7 +1015,7 @@ if (SSO_RUNNER_GROUP)
     foreach(_sso_t IN LISTS SSO_HMAC_TARGETS)
         if (TARGET ${_sso_t})
             install(CODE "
-                set(_sso_bin \"\$ENV{DESTDIR}/usr/local/bin/${_sso_t}\")
+                set(_sso_bin \"\$ENV{DESTDIR}${CMAKE_INSTALL_FULL_BINDIR}/${_sso_t}\")
                 execute_process(
                     COMMAND chgrp \"${SSO_RUNNER_GROUP}\" \"\${_sso_bin}\"
                     RESULT_VARIABLE _sso_chgrp_rc
@@ -1020,17 +1035,37 @@ if (SSO_RUNNER_GROUP)
     endforeach()
 endif()
 
-file(GLOB SSO_SCRIPTS
-    "${CMAKE_SOURCE_DIR}/scripts/*.sh"
-    "${CMAKE_SOURCE_DIR}/scripts/*.py")
-if (SSO_SCRIPTS)
-    install(PROGRAMS ${SSO_SCRIPTS} DESTINATION /usr/local/bin)
-endif()
+# Operator-facing helper scripts only, listed explicitly. A GLOB over
+# scripts/*.{sh,py} would also ship the dev/codegen/test scripts
+# (gen_tcmd_spec.py, lint_warnings.sh, self_test_smoke.sh, decode_regression.sh)
+# and the one-time root setup (sso_setup_root.sh) as operator binaries on
+# PATH. Add a new operator script here when you write one.
+set(SSO_OPERATOR_SCRIPTS
+    scripts/antenna_cam.sh
+    scripts/clean_tx_logs.sh
+    scripts/decode_passes.sh
+    scripts/fetch_tle.sh
+    scripts/gate_beacon_audio.sh
+    scripts/migrate_gnss_label.sh
+    scripts/nextpass.sh
+    scripts/noise_skymap.py
+    scripts/pcm2wav.sh
+    scripts/plot_sky_pass.py
+    scripts/plot_sky_pass.sh
+    scripts/rx_record.sh
+    scripts/satnogs_pull.sh
+    scripts/scan_iq.py
+    scripts/sso_admin.sh
+    scripts/stream_latest_iq.sh
+    scripts/upcoming_amateur_satellite_passes.sh
+    scripts/verify_uplink_frame.py)
+list(TRANSFORM SSO_OPERATOR_SCRIPTS PREPEND "${CMAKE_SOURCE_DIR}/")
+install(PROGRAMS ${SSO_OPERATOR_SCRIPTS} DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # Sysadmin examples — copied to /usr/local/share/sso/etc/ alongside the
 # binaries. Sysadmin then installs them into /etc/ during the one-time
 # ground-machine setup. See scripts/sso_setup_root.sh.
-install(DIRECTORY etc/ DESTINATION /usr/local/share/sso/etc
+install(DIRECTORY etc/ DESTINATION ${CMAKE_INSTALL_DATADIR}/sso/etc
         FILES_MATCHING
             PATTERN "*.conf"
             PATTERN "*.rules"
