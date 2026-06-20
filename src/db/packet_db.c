@@ -375,80 +375,96 @@ packet_db_t *packet_db_open(const char *path)
         return NULL;
     }
 
+    // Read the stored schema version so we run only the migration blocks
+    // newer than it. Every block below is idempotent, but the V3 DELETE and
+    // the V4 backfill UPDATE are full-table scans under a write lock -- on a
+    // fully-migrated DB they did real work (scan + lock) on every open,
+    // including every short-lived tool launch that contends with a live
+    // receiver. A new DB reports 0 and migrates once; thereafter the version
+    // matches and the ladder is skipped.
+    int user_version = 0;
+    {
+        sqlite3_stmt *uv = NULL;
+        if (sqlite3_prepare_v2(raw, "PRAGMA user_version;", -1, &uv, NULL)
+                == SQLITE_OK
+            && sqlite3_step(uv) == SQLITE_ROW) {
+            user_version = sqlite3_column_int(uv, 0);
+        }
+        sqlite3_finalize(uv);
+    }
+
     // V1 -> V2 migration: idempotent ALTER TABLE ADD COLUMNs. SQLite
     // returns "duplicate column name" when the column already exists;
     // those are caught and silently ignored so re-running is safe.
-    for (int i = 0; MIGRATION_V2_ALTERS[i] != NULL; i++) {
-        char *m_err = NULL;
-        if (sqlite3_exec(raw, MIGRATION_V2_ALTERS[i], NULL, NULL, &m_err)
-            != SQLITE_OK) {
-            int dup = (m_err != NULL
-                       && strstr(m_err, "duplicate column name") != NULL);
-            if (!dup) {
-                fprintf(stderr, "packet_db: migration step '%s' failed: "
-                        "%s\n", MIGRATION_V2_ALTERS[i],
-                        m_err ? m_err : "(unknown)");
+    if (user_version < 2) {
+        for (int i = 0; MIGRATION_V2_ALTERS[i] != NULL; i++) {
+            char *m_err = NULL;
+            if (sqlite3_exec(raw, MIGRATION_V2_ALTERS[i], NULL, NULL, &m_err)
+                != SQLITE_OK) {
+                int dup = (m_err != NULL
+                           && strstr(m_err, "duplicate column name") != NULL);
+                if (!dup) {
+                    fprintf(stderr, "packet_db: migration step '%s' failed: "
+                            "%s\n", MIGRATION_V2_ALTERS[i],
+                            m_err ? m_err : "(unknown)");
+                    sqlite3_free(m_err);
+                    sqlite3_close(raw);
+                    errno = EIO;
+                    return NULL;
+                }
                 sqlite3_free(m_err);
-                sqlite3_close(raw);
-                errno = EIO;
-                return NULL;
             }
-            sqlite3_free(m_err);
         }
-    }
-    if (sqlite3_exec(raw, "PRAGMA user_version = 2;", NULL, NULL, NULL)
-        != SQLITE_OK) {
-        // Non-fatal. The PRAGMA failure just means future opens re-run
-        // the (idempotent) migration, which is fine.
+        // Stamp the version so the next open skips this block. A failed
+        // stamp just means a future open re-runs the (idempotent) migration.
+        (void) sqlite3_exec(raw, "PRAGMA user_version = 2;", NULL, NULL, NULL);
     }
 
     // V2 -> V3: collapse same-payload/same-tool duplicates and lock in
     // the tighter UNIQUE so future re-runs don't re-create them. Both
     // steps are idempotent — DELETE on a deduped table removes nothing
     // and CREATE UNIQUE INDEX IF NOT EXISTS is a no-op.
-    for (int i = 0; MIGRATION_V3_STEPS[i] != NULL; i++) {
-        char *m_err = NULL;
-        if (sqlite3_exec(raw, MIGRATION_V3_STEPS[i], NULL, NULL, &m_err)
-            != SQLITE_OK) {
-            fprintf(stderr, "packet_db: migration step '%s' failed: "
-                    "%s\n", MIGRATION_V3_STEPS[i],
-                    m_err ? m_err : "(unknown)");
-            sqlite3_free(m_err);
-            sqlite3_close(raw);
-            errno = EIO;
-            return NULL;
-        }
-    }
-    if (sqlite3_exec(raw, "PRAGMA user_version = 3;", NULL, NULL, NULL)
-        != SQLITE_OK) {
-        // Non-fatal as above.
-    }
-
-    // V3 -> V4: add capture_origin column, backfill legacy rows to
-    // 'cts_ground', and widen the dedup index to include origin. The
-    // ALTER step's "duplicate column name" error is caught and
-    // ignored so a re-run is a no-op.
-    for (int i = 0; MIGRATION_V4_STEPS[i] != NULL; i++) {
-        char *m_err = NULL;
-        if (sqlite3_exec(raw, MIGRATION_V4_STEPS[i], NULL, NULL, &m_err)
-            != SQLITE_OK) {
-            int dup = (m_err != NULL
-                       && strstr(m_err, "duplicate column name") != NULL);
-            if (!dup) {
+    if (user_version < 3) {
+        for (int i = 0; MIGRATION_V3_STEPS[i] != NULL; i++) {
+            char *m_err = NULL;
+            if (sqlite3_exec(raw, MIGRATION_V3_STEPS[i], NULL, NULL, &m_err)
+                != SQLITE_OK) {
                 fprintf(stderr, "packet_db: migration step '%s' failed: "
-                        "%s\n", MIGRATION_V4_STEPS[i],
+                        "%s\n", MIGRATION_V3_STEPS[i],
                         m_err ? m_err : "(unknown)");
                 sqlite3_free(m_err);
                 sqlite3_close(raw);
                 errno = EIO;
                 return NULL;
             }
-            sqlite3_free(m_err);
         }
+        (void) sqlite3_exec(raw, "PRAGMA user_version = 3;", NULL, NULL, NULL);
     }
-    if (sqlite3_exec(raw, "PRAGMA user_version = 4;", NULL, NULL, NULL)
-        != SQLITE_OK) {
-        // Non-fatal as above.
+
+    // V3 -> V4: add capture_origin column, backfill legacy rows to
+    // 'cts_ground', and widen the dedup index to include origin. The
+    // ALTER step's "duplicate column name" error is caught and
+    // ignored so a re-run is a no-op.
+    if (user_version < 4) {
+        for (int i = 0; MIGRATION_V4_STEPS[i] != NULL; i++) {
+            char *m_err = NULL;
+            if (sqlite3_exec(raw, MIGRATION_V4_STEPS[i], NULL, NULL, &m_err)
+                != SQLITE_OK) {
+                int dup = (m_err != NULL
+                           && strstr(m_err, "duplicate column name") != NULL);
+                if (!dup) {
+                    fprintf(stderr, "packet_db: migration step '%s' failed: "
+                            "%s\n", MIGRATION_V4_STEPS[i],
+                            m_err ? m_err : "(unknown)");
+                    sqlite3_free(m_err);
+                    sqlite3_close(raw);
+                    errno = EIO;
+                    return NULL;
+                }
+                sqlite3_free(m_err);
+            }
+        }
+        (void) sqlite3_exec(raw, "PRAGMA user_version = 4;", NULL, NULL, NULL);
     }
 
     packet_db_t *db = (packet_db_t *)calloc(1, sizeof *db);
