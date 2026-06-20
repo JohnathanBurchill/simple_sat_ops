@@ -165,8 +165,6 @@ struct rx_session {
     modem_params_t mp;
     ax100_opts_t   opts;
     int            sync_max_ham;
-    int            use_hmac;
-    int            csp_crc32;
     int            force_beacon;
 
     // SDR LO offset (Hz) below the nominal carrier. Stored so the
@@ -417,13 +415,10 @@ int rx_session_open(rx_session_t **out, const rx_session_params_t *p,
 
     ax100_opts_defaults(&rxs->opts);
     rxs->opts.reed_solomon = p->use_rs;
-    if (p->use_hmac && p->hmac_key && p->hmac_key_len > 0) {
-        rxs->opts.hmac_key     = p->hmac_key;
-        rxs->opts.hmac_key_len = p->hmac_key_len;
-    }
+    // The downlink carries no HMAC (the AX100 downlink frame is
+    // authenticated by its CSP CRC32 trailer, not an HMAC), so the
+    // decoder never installs an HMAC key — see opts.hmac_key left NULL.
     rxs->sync_max_ham = p->sync_max_ham > 0 ? p->sync_max_ham : 4;
-    rxs->use_hmac     = p->use_hmac;
-    rxs->csp_crc32    = p->csp_crc32;
     rxs->force_beacon = p->force_beacon;
 
     decode_loop_set_show_headers(p->show_packet_headers);
@@ -1005,7 +1000,7 @@ static void try_decode_at_window(rx_session_t *rxs)
         size_t sync_off_local = 0;
         if (!try_decode_window(rxs->window, rxs->window_samples,
                                &rxs->mp, &rxs->opts,
-                               rxs->sync_max_ham, rxs->use_hmac,
+                               rxs->sync_max_ham, /*use_hmac=*/0,
                                /*allow_partial_rs=*/1,
                                inner_min_offset,
                                rxs->bits_scratch, rxs->bits_cap,
@@ -1057,7 +1052,7 @@ static void try_decode_iq_at_window(rx_session_t *rxs)
         size_t sync_off_local = 0;
         if (!try_decode_window_iq(rxs->iq_window, rxs->window_samples,
                                   &rxs->mp, &rxs->opts,
-                                  rxs->sync_max_ham, rxs->use_hmac,
+                                  rxs->sync_max_ham, /*use_hmac=*/0,
                                   /*allow_partial_rs=*/1,
                                   inner_min_offset,
                                   rxs->bits_scratch, rxs->bits_cap,
@@ -1073,7 +1068,11 @@ static void try_decode_iq_at_window(rx_session_t *rxs)
 
         int       crc_status   = -1;
         uint32_t  crc_computed = 0, crc_le = 0, crc_be = 0;
-        if (!rxs->use_hmac && rxs->csp_crc32 && plen >= 8) {
+        // Always validate the AX100 downlink's CSP CRC32 trailer. A match
+        // strips the 4 trailing bytes; a mismatch is recorded (crc_status=0)
+        // but the frame is still kept, so low-SNR / partly-corrupted
+        // telemetry stays visible rather than being silently dropped.
+        if (plen >= 8) {
             crc_computed = csp_crc32_zlib(rxs->packet, (size_t)(plen - 4));
             crc_le = (uint32_t) rxs->packet[plen - 4]
                    | ((uint32_t) rxs->packet[plen - 3] << 8)
@@ -1117,7 +1116,7 @@ static void try_decode_iq_at_window(rx_session_t *rxs)
         emit_frame(rxs->log_path[0] ? rxs->log_path : NULL,
                    /*quiet=*/1, ts,
                    rxs->packet, (size_t) plen,
-                   golay_errs, hmac_ok, rxs->use_hmac,
+                   golay_errs, hmac_ok, /*use_hmac=*/0,
                    rs_errs, used_golay_len,
                    crc_status, crc_computed, crc_le, crc_be,
                    rs_locs,
@@ -1189,7 +1188,7 @@ static void try_decode_viterbi_at_window(rx_session_t *rxs)
         size_t sync_off_local = 0;
         if (!try_decode_window_viterbi(rxs->iq_window, rxs->window_samples,
                                        &rxs->mp, &rxs->opts,
-                                       rxs->sync_max_ham, rxs->use_hmac,
+                                       rxs->sync_max_ham, /*use_hmac=*/0,
                                        /*allow_partial_rs=*/1,
                                        inner_min_offset,
                                        rxs->bits_scratch, rxs->bits_cap,

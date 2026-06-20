@@ -38,14 +38,10 @@ typedef struct {
     double window_s;            // default 1.5
     double slide_s;             // default 0.5
     int    sync_max_ham;        // default 4
-    int    use_hmac;
     int    use_rs;
     int    no_dc_block;         // 0 = DC block on (default)
     int    force_beacon;
     int    show_packet_headers;
-    int    csp_crc32;
-    const uint8_t *hmac_key;
-    size_t         hmac_key_len;
     const char    *db_path;
     int            no_db;
     const char    *pass_folder; // base dir for WAV / log; NULL = cwd
