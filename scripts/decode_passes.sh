@@ -118,7 +118,7 @@ satnogs_start_utc() {
 }
 
 # Validate WAV format. rx_replay expects 48 kHz mono s16, which is what
-# b210_rx_live writes by default. Returns "OK <rate>" if usable, or
+# simple_sat_ops writes by default. Returns "OK <rate>" if usable, or
 # "SKIP <reason>" otherwise.
 wav_check() {
     python3 - "$1" <<'PY' 2>/dev/null || echo "SKIP not_wav"

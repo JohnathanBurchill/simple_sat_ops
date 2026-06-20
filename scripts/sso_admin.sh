@@ -361,7 +361,7 @@ run_checks_as_self() {
     fi
 
     # 4. Tools on PATH
-    for tool in simple_sat_ops tx_frame_sdr b210_rx_live; do
+    for tool in simple_sat_ops tx_frame_sdr; do
         if command -v "$tool" >/dev/null 2>&1; then
             echo "PASS $tool on PATH ($(command -v "$tool"))"
         else
@@ -416,6 +416,13 @@ cmd_verify() {
     # Forward the checks into the target user's login shell. _color is
     # redefined to plain-text so output stays clean if the su pty isn't
     # a tty.
+    #
+    # SECURITY: this -c body runs in the target user's (often root's) shell.
+    # It MUST stay free of shell-variable interpolation -- never splice $name,
+    # $key, or any caller-controlled value into this string, or it becomes a
+    # privilege-escalation injection. It is variable-free today; if a check
+    # ever needs data, pass it via the environment or stdin, not by expanding
+    # it into this command.
     su - "$name" -c "$(declare -f run_checks_as_self)
 _color() { printf '%s' \"\$2\"; }
 run_checks_as_self" || rc=$?

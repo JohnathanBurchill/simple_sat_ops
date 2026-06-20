@@ -4,7 +4,7 @@
 # Offline post-pass scrubber: take a long wideband WAV (typically a
 # capture from rx_capture / b210_rx_capture) and produce a copy that's
 # silent everywhere the satellite wasn't transmitting. Same idea as
-# the live --monitor squelch in b210_rx_live, but as a one-shot ffmpeg
+# the live --monitor squelch in simple_sat_ops, but as a one-shot ffmpeg
 # pipeline so an existing recording can be cleaned up without re-running
 # the receiver.
 #
