@@ -231,18 +231,25 @@ void update_pass_predictions(prediction_t *external_prediction, double jul_utc_s
     double last_visible_jul = 0.0;
     double last_visible_az  = 0.0;
     while (current_elevation > -5.0) {
-        update_satellite_position(&prediction, jul_utc + pass_duration / 1440.0);
-        pass_duration += delta_t_minutes;
-        current_altitude = prediction.satellite_ephem.altitude_km;
+        // Propagate to this step's time and read elevation, altitude, and
+        // azimuth from that one sample. Reading the elevation gate from a
+        // different sample than the azimuth/time it's paired with put the
+        // AOS/LOS azimuths and the above-30-degrees count one step out of
+        // phase; keep them coherent.
+        double jul_now = jul_utc + pass_duration / 1440.0;
+        update_satellite_position(&prediction, jul_now);
+        current_elevation = prediction.satellite_ephem.elevation;
+        current_altitude  = prediction.satellite_ephem.altitude_km;
+        double current_azimuth = prediction.satellite_ephem.azimuth;
         if (current_elevation > 0.0) {
             minutes_above_0_degrees += delta_t_minutes;
             if (!ascended) {
                 ascended = 1;
-                external_prediction->predicted_ascension_jul_utc = jul_utc + pass_duration / 1440.0;
-                external_prediction->predicted_ascension_azimuth = prediction.satellite_ephem.azimuth;
+                external_prediction->predicted_ascension_jul_utc = jul_now;
+                external_prediction->predicted_ascension_azimuth = current_azimuth;
             }
-            last_visible_jul = jul_utc + pass_duration / 1440.0;
-            last_visible_az  = prediction.satellite_ephem.azimuth;
+            last_visible_jul = jul_now;
+            last_visible_az  = current_azimuth;
             if (max_altitude < current_altitude) {
                 max_altitude = current_altitude;
             }
@@ -250,10 +257,10 @@ void update_pass_predictions(prediction_t *external_prediction, double jul_utc_s
                 minutes_above_30_degrees += delta_t_minutes;
             }
         }
-        current_elevation = prediction.satellite_ephem.elevation;
         if (max_elevation < current_elevation) {
             max_elevation = current_elevation;
         }
+        pass_duration += delta_t_minutes;
     }
     external_prediction->predicted_pass_duration_minutes = pass_duration;
     external_prediction->predicted_minutes_above_0_degrees = minutes_above_0_degrees;
@@ -533,6 +540,7 @@ int find_passes(prediction_t *external_prediction, double jul_utc_start, double 
         // Calculate minutes away
         if (!Good_Elements(tle)) {
             fprintf(stderr, "Invalid TLE\n");
+            regfree(&pattern);
             fclose(file);
             return -3;
         }
