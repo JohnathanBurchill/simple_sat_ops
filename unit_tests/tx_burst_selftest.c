@@ -651,8 +651,75 @@ static void test_summary_run_path_sso_origin_suffix(void)
             "summary run-path: SSO+ origin suffix appended (\"%s\")", summary);
 }
 
+// Byte-exact known-good uplink frame, captured once from the pycsplink
+// reference encoder (CTS-SAT-1 ground library at
+// CTS_SAT_1_COMMUNICATIONS/pycsplink.py, the same encoder the flight
+// firmware is validated against), using reed_solomon_ccsds for the RS
+// parity. The round-trip tests above prove encode->decode is consistent
+// but cannot catch a bug shared by our encoder and decoder (a wrong
+// scrambler seed, say, would round-trip cleanly yet be wrong on the air);
+// this pins the actual on-air bytes against the external reference.
+//
+// To regenerate: feed the pycsplink AX100 encoder the CSP packet below
+// with reed_solomon=True, randomize=True (CCSDS scrambler), len_field=True
+// (Golay24), syncword=True (ASM 93 0b 51 de), prefill=32, tailfill=1,
+// hmac_key=None, crc=False -- i.e. exactly ax100_opts_defaults + RS on,
+// which is what tx_burst_build_frame emits for an unsigned frame.
+//   CSP v1 header: prio=2 src=9 dst=1 dport=7 sport=10 flags=0
+//   payload      : bytes 0x00..0x27 (40 bytes)
+// (RS parity itself is independently pinned to the same reference by
+// rs_selftest's known-vector; this is the whole-frame check.)
+static const uint8_t k_pycsplink_frame[] = {
+    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x93, 0x0b, 0x51, 0xde,
+    0xa8, 0x50, 0x4c, 0x6d, 0x59, 0xc4, 0xc0, 0x9a, 0x0c, 0x72, 0xbf, 0x8a,
+    0x29, 0x95, 0xaa, 0xaf, 0xbe, 0x4c, 0xc5, 0x56, 0x9a, 0x73, 0xc3, 0x22,
+    0xb3, 0xad, 0x2d, 0x1e, 0x05, 0xe7, 0x9f, 0x8c, 0xd4, 0xf0, 0xaa, 0xe2,
+    0x8d, 0x03, 0x9e, 0x14, 0x3b, 0xc3, 0x5a, 0x38, 0x7c, 0x01, 0x7c, 0xb2,
+    0x1c, 0x5b, 0x36, 0x32, 0x8c, 0x65, 0xe4, 0xa2, 0xeb, 0x3f, 0x4f, 0xb2,
+    0x10, 0xbf, 0x98, 0x63, 0x8b, 0xfa, 0xa2, 0x5b, 0x7d, 0x5d, 0xd6, 0x87,
+    0x78, 0x7e, 0xc2, 0x78, 0xe4, 0x74, 0x19, 0xaa,
+};
+
+static void test_known_vector_pycsplink(void)
+{
+    uint8_t payload[40];
+    for (int i = 0; i < (int) sizeof payload; ++i) payload[i] = (uint8_t) i;
+    csp_v1_header_t hdr = {
+        .prio = 2, .src = 9, .dst = 1, .dport = 7, .sport = 10, .flags = 0,
+    };
+    uint8_t frame[256];
+    ssize_t n = tx_burst_build_frame(payload, sizeof payload, &hdr,
+                                     /*hmac_key=*/NULL, /*hmac_key_len=*/0,
+                                     frame, sizeof frame);
+    tap_okf(n == (ssize_t) sizeof k_pycsplink_frame,
+            "known-vector: frame length %zd == %zu (pycsplink)",
+            n, sizeof k_pycsplink_frame);
+
+    int match = (n == (ssize_t) sizeof k_pycsplink_frame)
+                && memcmp(frame, k_pycsplink_frame, sizeof k_pycsplink_frame) == 0;
+    if (!match && n > 0) {
+        size_t lim = ((size_t) n < sizeof k_pycsplink_frame)
+                     ? (size_t) n : sizeof k_pycsplink_frame;
+        for (size_t i = 0; i < lim; ++i) {
+            if (frame[i] != k_pycsplink_frame[i]) {
+                fprintf(stderr, "# first diff at byte %zu: got 0x%02x want 0x%02x\n",
+                        i, frame[i], k_pycsplink_frame[i]);
+                break;
+            }
+        }
+    }
+    tap_okf(match,
+            "known-vector: tx_burst_build_frame matches the pycsplink "
+            "reference frame byte-for-byte");
+}
+
 int main(void)
 {
+    // Uplink encoding/framing pinned to the external pycsplink reference.
+    test_known_vector_pycsplink();
+
     // HMAC --- enabled by default in the simple_sat_ops TX path
     test_hmac_default_on();
     test_hmac_explicitly_disabled();
