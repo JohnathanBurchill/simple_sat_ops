@@ -589,6 +589,13 @@ void update_doppler_shifted_frequencies(state_t *state,
 // the two-step home's final leg.
 #define HOME_ECHO_TOLERANCE_DEG 2.0
 
+// MOTION_SETTLE_TOLERANCE_DEG: how little the reported azimuth/elevation must
+// change between two ticks to count the antenna as settled. An exact-zero
+// compare never fires -- sub-step feedback jitter leaves a fractional-degree
+// residual -- which would wedge antenna_is_moving at 1 and stall the aim and
+// scan-dwell loops that gate on it. Well below any real rotator step.
+#define MOTION_SETTLE_TOLERANCE_DEG 0.05
+
 // Per-tick antenna pointing. Detect motion-settle, drive the second leg of a
 // two-step home, advance an active sky scan, and -- when a pass is in range --
 // run the satellite-tracking / pursuit-plan aim loop (or release the rotator
@@ -608,8 +615,8 @@ void tracking_tick(state_t *state, double jul_utc, double t_now)
     double current_az = state->antenna_rotator.azimuth;
     double current_el = state->antenna_rotator.elevation;
         if (state->antenna_rotator.antenna_is_moving) {
-            if (fabs(current_az - last_az) == 0
-                && fabs(current_el - last_el) == 0) {
+            if (fabs(current_az - last_az) < MOTION_SETTLE_TOLERANCE_DEG
+                && fabs(current_el - last_el) < MOTION_SETTLE_TOLERANCE_DEG) {
                 state->antenna_rotator.antenna_is_moving = 0;
             }
             last_az = current_az;
