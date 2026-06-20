@@ -1,2 +1,2 @@
-iq_localpass   frames=1 sha256=c2cdd0c70c7f6ed5
-wav_satnogs    frames=1 sha256=31e428caea2a95b4
+iq_localpass   detected=1 csp_ok=1 rs=0/1 beacon=1 tcmd=0 log=0 bulk=0
+wav_satnogs    detected=1 csp_ok=1 rs=0/1 beacon=1 tcmd=0 log=0 bulk=0

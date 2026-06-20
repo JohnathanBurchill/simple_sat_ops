@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on branch `any-sdr`, commit
-`a30fade` (2026-06-19). This is a working draft.
+`8ea3243` (2026-06-19). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -142,6 +142,7 @@ manual can go back on the shelf where it belongs.
     - [How the code is validated: four layers](#how-the-code-is-validated-four-layers)
     - [Running the unit tests](#running-the-unit-tests)
     - [Catching what the compiler hides](#catching-what-the-compiler-hides)
+    - [Decode smoketest: known-good recordings](#decode-smoketest-known-good-recordings)
     - [Validation that runs on every pass](#validation-that-runs-on-every-pass)
     - [Every bug leaves a test behind](#every-bug-leaves-a-test-behind)
     - [What isn't covered](#what-isnt-covered)
@@ -2134,6 +2135,35 @@ It uses a separate `build-lint/` directory so it never disturbs your
 working build, and exits non-zero (dumping the offending warning) if
 anything would complain on the ground machine.
 
+### Decode smoketest: known-good recordings
+
+The unit selftests exercise the framing and DSP blocks in isolation, but
+they do not prove that a real recording still decodes once those blocks
+are wired together into `rx_replay`. `scripts/decode_regression.sh`
+closes that gap. It pushes two committed snippets through the live
+decoder - a 48 kHz mono WAV the way SatNOGS dumps it
+(`test/decode_regression/audio_snippet.wav`) and a 96 kHz headerless IQ
+capture from a local pass (`test/decode_regression/iq_snippet.iq`),
+each known to carry one beacon frame - and checks that the
+`rx_replay` decode summary still reports the same counts:
+
+```sh
+bash scripts/decode_regression.sh            # compare against the baseline
+bash scripts/decode_regression.sh --update   # re-pin after a known-good change
+```
+
+It pins the integer counts from the summary block - frames detected,
+valid CSP headers, Reed-Solomon corrected/uncorrectable, and the
+recognized-by-type breakdown - rather than a hash of the demodulated
+bytes. At the low SNR of these clips the beacon payloads are
+Reed-Solomon-uncorrectable, so the raw bytes wobble with sub-bit
+floating-point differences between machines while the counts hold steady;
+a count that moves is a real regression in the decode chain. Run it
+before and after any change to `modem`, `modem_fsk`, `decode_loop`, or
+`ax100`; it exits non-zero with a unified diff if anything drifts. The
+baseline lives in `scripts/decode_regression.expected`, and the
+fixtures' provenance is in `test/decode_regression/README.md`.
+
 ### Validation that runs on every pass
 
 Two of the four layers are not something you invoke - they run whether
@@ -2178,7 +2208,10 @@ validated by hand against the bench tools instead - `tx_frame_sdr
 --dump-iq` to inspect exactly what a frame would modulate to,
 `rx_replay` and `decode_inspector` to push recorded passes back through
 the decoder with different settings (see
-[Offline analysis tools](#offline-analysis-tools)). The orbital
+[Offline analysis tools](#offline-analysis-tools)). The downlink half
+is better off: the decode smoketest above pins the recorded-recording
+path, so a regression there is caught on the bench even though a live
+pass is not. The orbital
 propagator is the vendored sgp4sdp4, which traces to 2001 and has not
 been re-checked against the Vallado et al. 2006 revisions, so its
 accuracy claims are qualified accordingly. And coverage is deliberately

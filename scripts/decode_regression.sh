@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
 #
-# decode_regression.sh — pin the FSK + AX100 decode chain against the
-# small fixture snippets in test/decode_regression/. Run before and
-# after any refactor that touches modem_fsk / modem.c / decode_loop /
-# ax100; the decoded payload bytes must hash identically.
+# decode_regression.sh — smoketest the FSK + AX100 decode chain against
+# the small known-good fixture snippets in test/decode_regression/. Run
+# before and after any refactor that touches modem_fsk / modem.c /
+# decode_loop / ax100; each recording must still decode to the same
+# recognized-frame counts.
+#
+# We pin the integer counts from rx_replay's "decode summary" block
+# (frames detected, valid CSP headers, Reed-Solomon corrected/uncorrectable,
+# and the recognized-by-type breakdown) rather than a hash of the raw
+# demodulated bytes. At the low SNR of these clips the beacon payloads are
+# Reed-Solomon-uncorrectable, so the exact bytes wobble with sub-bit
+# floating-point differences between machines; the counts do not.
 #
 # Usage:
 #   scripts/decode_regression.sh                   compare against expected
@@ -37,11 +45,13 @@ FIXTURES=(
     "wav_satnogs  | wav | audio_snippet.wav"
 )
 
-# Run rx_replay on one fixture and emit a single result line
-#   <label> frames=<N> sha256=<first-16-hex-of-sha256>
-# We hash the decoded "[t=...]" payload lines + the "N frame(s)" footer.
-# rx_replay writes a sidecar .iq.burst.csv next to the input — we copy
-# the snippet to a tmpdir first so the repo stays clean.
+# Run rx_replay on one fixture and emit a single result line of the
+# stable counts from its "decode summary" block:
+#   <label> detected=<N> csp_ok=<N> rs=<corr>/<uncorr> beacon=<N> tcmd=<N> log=<N> bulk=<N>
+# A "?" in any field means the summary line was missing — rx_replay either
+# crashed or changed its output format, both of which should fail the test.
+# rx_replay writes a sidecar .iq.burst.csv next to the input, so we copy the
+# snippet to a tmpdir first to keep the repo clean.
 run_one() {
     local label="$1" kind="$2" filename="$3"
     local src="$FIXTURES_DIR/$filename"
@@ -65,21 +75,25 @@ run_one() {
     esac
 
     local out
-    out=$("$RX_REPLAY" "$path" "${args[@]}" 2>&1 \
-        | grep -E '^(\[t=|rx_replay: [0-9]+ frame)' \
-        | sort)
+    out="$("$RX_REPLAY" "$path" "${args[@]}" 2>&1)" || true
 
     rm -rf "$tmpdir"
 
-    local frames
-    frames=$(printf '%s\n' "$out" | grep -oE 'rx_replay: [0-9]+ frame' \
-        | grep -oE '[0-9]+' | head -1)
-    frames="${frames:-0}"
+    # Pull the stable integer counts out of rx_replay's decode summary.
+    # No pipes into head (SIGPIPE + pipefail would abort under set -e):
+    # each pattern matches one summary line; trim to the first match.
+    local detected csp_ok rs beacon tcmd logc bulk
+    detected=$(sed -n 's/.*detected (after position dedup): *\([0-9]*\).*/\1/p' <<<"$out")
+    csp_ok=$(sed -n 's/.*valid CSP header *: *\([0-9]*\).*/\1/p' <<<"$out")
+    rs=$(sed -n 's@.*RS corrected / uncorrectable *: *\([0-9]*\) / \([0-9]*\).*@\1/\2@p' <<<"$out")
+    detected=${detected%%$'\n'*}; csp_ok=${csp_ok%%$'\n'*}; rs=${rs%%$'\n'*}
+    read -r beacon tcmd logc bulk < <(sed -n \
+        's/.*recognized by type *: *beacon \([0-9]*\), tcmd_response \([0-9]*\), log \([0-9]*\), bulk_file \([0-9]*\).*/\1 \2 \3 \4/p' \
+        <<<"$out") || true
 
-    local hash
-    hash=$(printf '%s\n' "$out" | shasum -a 256 | cut -c1-16)
-
-    printf "%-14s frames=%s sha256=%s\n" "$label" "$frames" "$hash"
+    printf "%-14s detected=%s csp_ok=%s rs=%s beacon=%s tcmd=%s log=%s bulk=%s\n" \
+        "$label" "${detected:-?}" "${csp_ok:-?}" "${rs:-?}" \
+        "${beacon:-?}" "${tcmd:-?}" "${logc:-?}" "${bulk:-?}"
 }
 
 CURRENT="$(mktemp)"
