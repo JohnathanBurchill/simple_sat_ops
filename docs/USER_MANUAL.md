@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on branch `any-sdr`, commit
-`33a912f` (2026-06-17). This is a working draft.
+`a30fade` (2026-06-19). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -138,7 +138,13 @@ manual can go back on the shelf where it belongs.
     - [`uplink_test`](#uplink_test)
     - [`rx_decode`](#rx_decode)
     - [`lifetime`](#lifetime)
-14. [Unit tests](#unit-tests)
+14. [Testing and validation](#testing-and-validation)
+    - [How the code is validated: four layers](#how-the-code-is-validated-four-layers)
+    - [Running the unit tests](#running-the-unit-tests)
+    - [Catching what the compiler hides](#catching-what-the-compiler-hides)
+    - [Validation that runs on every pass](#validation-that-runs-on-every-pass)
+    - [Every bug leaves a test behind](#every-bug-leaves-a-test-behind)
+    - [What isn't covered](#what-isnt-covered)
 15. [Architecture notes](#architecture-notes)
     - [IPC: one operator at a time](#ipc-one-operator-at-a-time)
     - [Worker threads](#worker-threads)
@@ -760,7 +766,7 @@ review it, or take apart what it recorded.
 | Sanity-check a command list before you send it | [`agenda_check`](#agenda-review-agenda_check) |
 | Pull frames out of a recorded capture offline | [Offline analysis tools](#offline-analysis-tools) |
 | Bench bring-up, one-shot test transmits, IQ recording | [Bring-up and test tools](#bring-up-and-test-tools) |
-| Confirm the math still holds after a change | [Unit tests](#unit-tests) |
+| Confirm the math still holds after a change | [Testing and validation](#testing-and-validation) |
 
 Every tool accepts **`-V` / `--version`**, which prints its name and the
 git commit the build was made from (with a `-dirty` suffix if the working
@@ -2014,10 +2020,73 @@ decay rate, prints an estimated time on orbit. The repository
 README flags this as **inaccurate**. Treat the number as
 ballpark-only and don't make scheduling decisions from it.
 
-## Unit tests
+## Testing and validation
 
-Each `*_selftest.c` binary emits TAP (Test Anything Protocol). Run
-manually:
+There is no QA department and no continuous-integration cloud behind
+this code; there is one ground station, a handful of operators, and a
+spacecraft that does exactly what the last frame told it to. So the
+testing approach is not about chasing a coverage percentage. It is
+about pinning, permanently, the small set of behaviours that must never
+regress - that the bytes which go on the air are the bytes you typed
+and *only* those, that an over-long or malformed command is refused
+rather than quietly trimmed, that every uplink is signed, that the
+Doppler shift is applied. A bug in any of those is not a cosmetic
+defect; it is a wrong command to a satellite you cannot reach out and
+fix. The tests exist so those specific mistakes can be made exactly
+once.
+
+### How the code is validated: four layers
+
+Validation happens at four levels, each catching what the one above it
+cannot.
+
+**Unit selftests** cover the pure, deterministic cores - the parts of
+the code that take bytes in and produce bytes out with no hardware in
+the loop. There are 26 `*_selftest.c` binaries, and between them they
+exercise the whole signal chain on the bench: the DSP blocks (`modem`,
+`fir_decim`, `sw_nco`, `biquad`, `monitor_squelch`, `iq_burst`); the
+framing stack the link depends on (`rs` for Reed-Solomon,
+`golay24` indirectly, the CCSDS scrambler and `ax100` framing, `csp`,
+and the HMAC trailer via `ax100`); the orbit and pass math
+(`prediction`, `pursuit`, `shortarc`, `tle_csv`, `pass_schedule`,
+`bestxyz`); the command path (`tcmd_lint`, `sso_pseudo`, `agenda_line`,
+`tx_burst`); and the plumbing (`packet_db`, `sso_ipc_codec`,
+`ipc_fill`, `argparse`). The framing and command tests are the ones
+that stand between an operator's keystroke and the antenna, so they
+carry the most weight.
+
+**Build-time static analysis** catches the class of bug the everyday
+compiler does not. Apple's clang accepts `-Wformat-truncation` and then
+silently does nothing with it, so `snprintf`-truncation mistakes - a
+buffer one byte too small, a field that quietly loses its tail - sail
+through a Mac build and only surface on the Linux ground machine. The
+lint script rebuilds the whole tree under real GCC with those analyses
+turned into errors.
+
+**Runtime validation gates** run inside the live program, on real
+input, every time you operate. The telecommand linter checks the
+`--tc-file` agenda at startup and refuses to run on errors (see
+[Telecommand linting](#telecommand-linting)); the TX safety gates keep
+the transmitter inhibited until you clear them (see
+[TX safety gates](#tx-safety-gates)); and the framing layer itself
+refuses to build a frame whose pre-Reed-Solomon payload exceeds the
+223-byte block, returning an error rather than silently dropping bytes
+the way the reference Python implementation does. That last refusal is
+the hard backstop under the whole uplink: even if every check above it
+were bypassed, an over-long command cannot reach the air malformed - it
+is reported as not-sent.
+
+**Memory-safety instrumentation** is available on demand. The selftests
+build cleanly under AddressSanitizer and UndefinedBehaviorSanitizer;
+compiling one with `-fsanitize=address,undefined` turns a latent
+out-of-bounds read or signed overflow into an immediate, located abort.
+This is worth doing whenever a test touches buffer arithmetic.
+
+### Running the unit tests
+
+Each `*_selftest.c` binary emits TAP (Test Anything Protocol) - one
+`ok`/`not ok` line per assertion, a `1..N` plan at the end, and a
+non-zero exit on any failure. Run them straight from `build/`:
 
 ```sh
 build/rs_selftest
@@ -2034,25 +2103,89 @@ build/monitor_squelch_selftest
 build/iq_burst_selftest
 build/ax100_selftest
 build/tx_burst_selftest
+build/sso_pseudo_selftest
+build/tcmd_lint_selftest
 build/packet_db_selftest        # needs SQLite
 build/prediction_selftest       # needs sgp4sdp4
 build/pursuit_selftest          # no extra deps
 build/unit_test_runner          # optional ncurses aggregator
 ```
 
-`unit_test_runner` discovers every `*_selftest` binary under
-`build/` and renders a collapsible group view of the TAP output.
-Skipped if ncurses is absent.
+(That is a representative subset; the build produces all 26.)
+`unit_test_runner` discovers every `*_selftest` binary under `build/`
+and renders a collapsible group view of the TAP output, so a single
+launch runs the whole suite. It is skipped if ncurses is absent, in
+which case run the binaries directly - any harness that understands TAP
+(for example `prove`) will aggregate them.
 
-The lint script `scripts/lint_warnings.sh` runs the whole build
+### Catching what the compiler hides
+
+The lint script `scripts/lint_warnings.sh` rebuilds the whole tree
 under gcc-15 with `-Wformat-truncation=2 -Werror=format-truncation`
-to catch format-truncation bugs Apple clang misses. Run it on
-every nontrivial source change:
+(and the matching format-overflow analysis) to catch the truncation
+bugs Apple clang misses. Run it on every nontrivial source change:
 
 ```sh
 bash scripts/lint_warnings.sh           # full reconfigure + build
 bash scripts/lint_warnings.sh --quick   # reuse the build-lint cache
 ```
+
+It uses a separate `build-lint/` directory so it never disturbs your
+working build, and exits non-zero (dumping the offending warning) if
+anything would complain on the ground machine.
+
+### Validation that runs on every pass
+
+Two of the four layers are not something you invoke - they run whether
+you think about them or not, and they are what makes the uplink safe to
+operate. The startup telecommand lint reads your `--tc-file`, parses
+each line the same way the flight firmware does, and refuses to fully
+start if any line is malformed or over the radio length limit, unless
+you override with `--ignore-at-your-peril-all-tc-errors` (the name is
+the warning). The framing layer's 223-byte refusal then sits underneath
+the auto-telecommand and compose paths as a last line of defence. The
+practical consequence: a command that is too long, mistyped, or
+unsigned does not become a corrupted transmission - it becomes a
+visible "not sent" in the TX log, and the satellite hears nothing.
+
+### Every bug leaves a test behind
+
+The standing rule is that a bug worth fixing is worth a test that would
+have caught it, written so it fails on the old code and passes on the
+fix. The point is not the one bug; it is that the same mistake cannot
+return unnoticed.
+
+The TX command-history display is the worked example. It mis-rendered
+the transmitted command twice - once truncating it mid-string, once
+printing a stray extra character past its end - because the summary
+formatter assumed a terminator the payload buffer never carried. Both
+were display-only (the framing always used the real byte count, so
+nothing extra ever went on the air), but a wrong readout of what was
+just sent is its own hazard. The fix was a one-line correction; the
+durable part is that the formatter is now exercised directly by
+`tx_burst_selftest`, with cases for the truncation, the stray byte
+(a sentinel planted just past the command that must never appear in the
+output), empty and hex payloads, and the real send path. Those
+assertions were confirmed to fail on the pre-fix code before the fix
+landed - a test that cannot fail proves nothing.
+
+### What isn't covered
+
+The honest limits are worth stating. There is no automated
+hardware-in-the-loop test: the live RF path needs a B210 and a radio,
+so it cannot run on a build server, and the end-to-end uplink is
+validated by hand against the bench tools instead - `tx_frame_sdr
+--dump-iq` to inspect exactly what a frame would modulate to,
+`rx_replay` and `decode_inspector` to push recorded passes back through
+the decoder with different settings (see
+[Offline analysis tools](#offline-analysis-tools)). The orbital
+propagator is the vendored sgp4sdp4, which traces to 2001 and has not
+been re-checked against the Vallado et al. 2006 revisions, so its
+accuracy claims are qualified accordingly. And coverage is deliberately
+uneven: the framing, command, and orbit cores are tested hard because a
+mistake there is expensive, while the ncurses rendering and the
+hardware drivers - where a mistake is visible and recoverable in the
+moment - lean on the operator's eyes and a teammate in viewer mode.
 
 ## Architecture notes
 
