@@ -234,6 +234,10 @@ typedef struct auto_tcmd {
     char **commands;
     int    n_commands;
     char   file_path[256];
+    // Error count from re-linting the file on the last (re)load. The startup
+    // lint gate runs once; this catches a --tc-file edited after launch.
+    // Non-zero blocks the run (auto_tcmd_start) unless --ignore-...-tc-errors.
+    int    lint_errors;
 
     // Editable fields (text-edit semantics shared with TX compose).
     char power[12];

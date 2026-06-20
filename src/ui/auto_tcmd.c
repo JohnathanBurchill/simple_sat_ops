@@ -27,6 +27,7 @@
 #include "sso_audit.h"
 #include "sso_pseudo.h"
 #include "sso_time.h"
+#include "tcmd_lint.h"      // TCMD_RF_MAX_LEN, tcmd_lint_file
 
 #include <ctype.h>
 #include <math.h>
@@ -451,6 +452,22 @@ void auto_tcmd_open(state_t *state) {
     memset(&state->auto_tcmd, 0, sizeof state->auto_tcmd);
     state->auto_tcmd.commands   = cmds;
     state->auto_tcmd.n_commands = nc;
+
+    // Re-lint the freshly (re)loaded file. The startup gate ran once; if the
+    // operator edited --tc-file since launch, this is the only check before
+    // those commands can be keyed. Lint detail goes to /dev/null (printing to
+    // stderr would corrupt the ncurses screen) -- we keep the error count to
+    // gate the run in auto_tcmd_start and warn here, honouring the same
+    // --ignore-at-your-peril-all-tc-errors opt-out as startup.
+    {
+        FILE *devnull = fopen("/dev/null", "w");
+        if (devnull != NULL) {
+            int w = 0;
+            int e = tcmd_lint_file(state->auto_tcmd_file_path, devnull, &w);
+            state->auto_tcmd.lint_errors = (e > 0) ? e : 0;
+            fclose(devnull);
+        }
+    }
     snprintf(state->auto_tcmd.file_path, sizeof state->auto_tcmd.file_path,
              "%.*s", (int)(sizeof state->auto_tcmd.file_path - 1),
              state->auto_tcmd_file_path);
@@ -463,9 +480,19 @@ void auto_tcmd_open(state_t *state) {
     state->auto_tcmd.cursors[AUTO_F_REPEATS] = (int) strlen(state->auto_tcmd.repeats);
     state->auto_tcmd.cursors[AUTO_F_DELAY]   = (int) strlen(state->auto_tcmd.delay_s);
     state->auto_tcmd.state    = AUTO_STATE_SETUP;
-    snprintf(state->auto_tcmd.status_msg, sizeof state->auto_tcmd.status_msg,
-             "loaded %d command(s). Set fields, then Enter to start.",
-             nc);
+    if (state->auto_tcmd.lint_errors > 0 && !state->ignore_tc_errors) {
+        snprintf(state->auto_tcmd.status_msg, sizeof state->auto_tcmd.status_msg,
+                 "loaded %d command(s) but %d lint error(s) -- fix the file; "
+                 "run blocked", nc, state->auto_tcmd.lint_errors);
+    } else if (state->auto_tcmd.lint_errors > 0) {
+        snprintf(state->auto_tcmd.status_msg, sizeof state->auto_tcmd.status_msg,
+                 "loaded %d command(s); %d lint error(s) ignored. Enter to start.",
+                 nc, state->auto_tcmd.lint_errors);
+    } else {
+        snprintf(state->auto_tcmd.status_msg, sizeof state->auto_tcmd.status_msg,
+                 "loaded %d command(s). Set fields, then Enter to start.",
+                 nc);
+    }
 
     int h = 17, ww = 110;
     if (h > LINES) h = LINES;
@@ -506,6 +533,15 @@ static int auto_tcmd_start(state_t *state) {
     if (a->n_commands == 0) {
         snprintf(a->status_msg, sizeof a->status_msg,
                  "rejected: file has no commands");
+        return -1;
+    }
+    // A file edited after launch can introduce commands the satellite would
+    // reject or mis-parse. Re-lint on (re)load flagged them; refuse to run
+    // unless the operator started with --ignore-at-your-peril-all-tc-errors.
+    if (a->lint_errors > 0 && !state->ignore_tc_errors) {
+        snprintf(a->status_msg, sizeof a->status_msg,
+                 "rejected: %d lint error(s) in the file -- fix it and reopen",
+                 a->lint_errors);
         return -1;
     }
     if (!a->allow_tx) {
@@ -725,6 +761,22 @@ void auto_tcmd_tick(state_t *state) {
         return;
     }
     size_t n = strlen(wire);
+    // Never key a command longer than the RF link can carry. The Reed-Solomon
+    // block caps the on-air telecommand at TCMD_RF_MAX_LEN; the tx_request
+    // buffer is much larger, so the clamp below would silently truncate an
+    // over-long command into a corrupt frame rather than reject it. Reload
+    // lint catches over-long raw lines, but an SSO+ line only reaches its
+    // final length after expansion here, so this is the authoritative gate.
+    if (n > (size_t) TCMD_RF_MAX_LEN) {
+        snprintf(a->status_msg, sizeof a->status_msg,
+                 "skipped line %d: %zu chars over the %d-char RF limit",
+                 a->cmd_idx + 1, n, TCMD_RF_MAX_LEN);
+        a->cmd_idx++;
+        a->repeat_idx   = 0;
+        a->next_send_ns = now + (long)(a->delay_s_val * 1e9);
+        auto_tcmd_draw(state);
+        return;
+    }
     if (n > sizeof state->tx_request.payload) n = sizeof state->tx_request.payload;
     memcpy(state->tx_request.payload, wire, n);
     state->tx_request.payload_len  = n;
