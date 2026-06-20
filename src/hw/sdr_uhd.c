@@ -23,6 +23,7 @@
 #include "sdr_usb_detect.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +53,16 @@ struct sdr_uhd {
     int16_t                *drain_buf;        // scratch for the pre-TX RX drain
     double                  actual_freq;      // last read-back RX LO
     int                     stream_running;
+
+    // Serializes access to the device handle (the UHD property tree) across
+    // the RX worker and the TX-burst thread. The two streamers run
+    // full-duplex -- RX recv and TX send touch their own streamer objects
+    // and may overlap freely -- but the configuration calls (set_tx_freq /
+    // _gain / _rate / _subdev, set_rx_freq / _gain, get_time_now) all reach
+    // into the shared device handle, which UHD does not make thread-safe.
+    // Held briefly around recv and around each config call, but deliberately
+    // NOT across the TX send loop, so a burst never starves the RX transport.
+    pthread_mutex_t         dev_mu;
 };
 
 static int log_uhd(uhd_error e, const char *what)
@@ -142,6 +153,7 @@ static int uhd_open(sdr_backend_t *be, const sdr_open_params_t *p, sdr_caps_t *c
     }
     be->priv = u;
     u->tx_gain_cached = -1.0;
+    pthread_mutex_init(&u->dev_mu, NULL);
 
     char device_args[1024];
     uhd_resolve_device_args(p, device_args, sizeof device_args);
@@ -276,6 +288,7 @@ static void uhd_close(sdr_backend_t *be)
     if (u->stream    != NULL) uhd_rx_streamer_free(&u->stream);
     if (u->tx_stream != NULL) uhd_tx_streamer_free(&u->tx_stream);
     if (u->dev       != NULL) uhd_usrp_free(&u->dev);
+    pthread_mutex_destroy(&u->dev_mu);
     free(u->drain_buf);
     free(u);
     be->priv = NULL;
@@ -305,10 +318,16 @@ static ssize_t uhd_read_iq(sdr_backend_t *be, int16_t *out, size_t cap_pairs)
     // ready (every few ms), so the timeout only bites when the device
     // has stopped delivering — i.e. it was unplugged or the transport
     // wedged. A shorter timeout means we notice a dead link in ~1 s.
+    // Serialize against the TX thread's device-config calls. recv returns at
+    // chunk cadence (a few ms) while streaming, so a config call waits at
+    // most one chunk for the lock. The metadata read below touches u->md,
+    // which only this RX thread uses, so it stays outside the lock.
+    pthread_mutex_lock(&u->dev_mu);
     uhd_error e = uhd_rx_streamer_recv(u->stream, bufs, cap_pairs, &u->md,
                                        /*timeout=*/1.0,
                                        /*one_packet=*/false,
                                        &n_recv);
+    pthread_mutex_unlock(&u->dev_mu);
     if (e != UHD_ERROR_NONE) {
         if (recv_err_run == 0 || (recv_err_run % 2000) == 0) {
             log_uhd(e, "rx_recv");
@@ -362,12 +381,18 @@ static int uhd_set_freq(sdr_backend_t *be, double freq_hz)
         .args            = tune_args,
     };
     uhd_tune_result_t res = {0};
-    if (log_uhd(uhd_usrp_set_rx_freq(u->dev, &req, 0, &res), "set_rx_freq")) {
-        return -1;
+    // RX retune touches the shared device handle -- serialize against recv
+    // and the TX thread's config calls.
+    pthread_mutex_lock(&u->dev_mu);
+    int rc = log_uhd(uhd_usrp_set_rx_freq(u->dev, &req, 0, &res), "set_rx_freq")
+             ? -1 : 0;
+    if (rc == 0) {
+        double f = u->actual_freq;
+        if (uhd_usrp_get_rx_freq(u->dev, 0, &f) == UHD_ERROR_NONE)
+            u->actual_freq = f;
     }
-    double f = u->actual_freq;
-    if (uhd_usrp_get_rx_freq(u->dev, 0, &f) == UHD_ERROR_NONE) u->actual_freq = f;
-    return 0;
+    pthread_mutex_unlock(&u->dev_mu);
+    return rc;
 }
 
 static double uhd_get_actual_freq(sdr_backend_t *be)
@@ -380,10 +405,11 @@ static int uhd_set_gain(sdr_backend_t *be, double gain_db)
 {
     struct sdr_uhd *u = (struct sdr_uhd *)be->priv;
     if (u == NULL) return -1;
-    if (log_uhd(uhd_usrp_set_rx_gain(u->dev, gain_db, 0, ""), "set_rx_gain")) {
-        return -1;
-    }
-    return 0;
+    pthread_mutex_lock(&u->dev_mu);
+    int rc = log_uhd(uhd_usrp_set_rx_gain(u->dev, gain_db, 0, ""), "set_rx_gain")
+             ? -1 : 0;
+    pthread_mutex_unlock(&u->dev_mu);
+    return rc;
 }
 
 // --- TX burst (half-duplex) ----------------------------------------
@@ -488,8 +514,15 @@ static int uhd_tx_burst(sdr_backend_t *be, const sdr_tx_burst_params_t *p)
     if (u == NULL || p == NULL || p->iq == NULL || p->n_samps == 0) return -1;
 
     int rc = -1;
+    int locked = 0;
     // RX is NOT paused — it streams continuously on the worker thread.
     // We only bring the independent TX chain up, transmit, and drop it.
+    // Hold the device lock across the configuration calls below (subdev /
+    // rate / gain / time / freq) so they can't collide with the RX worker's
+    // recv; it is released before the send loop so the actual transmission
+    // overlaps RX as full-duplex.
+    pthread_mutex_lock(&u->dev_mu);
+    locked = 1;
     if (tx_power_up(u) != 0) goto resume;
     if (tx_streamer_lazy_build(u, p->tx_rate_hz) != 0) goto resume;
 
@@ -522,6 +555,12 @@ static int uhd_tx_burst(sdr_backend_t *be, const sdr_tx_burst_params_t *p)
         if (log_uhd(uhd_usrp_set_tx_freq(u->dev, &req, 0, &res),
                     "set_tx_freq")) goto resume;
     }
+
+    // Configuration is done. Drop the device lock so the send loop overlaps
+    // the RX worker's recv -- the two streamers are independent, and holding
+    // the lock across the whole burst would starve the RX transport.
+    pthread_mutex_unlock(&u->dev_mu);
+    locked = 0;
 
     uhd_tx_metadata_handle md = NULL;
     if (log_uhd(uhd_tx_metadata_make(&md, false, 0, 0.0, true, false),
@@ -582,7 +621,16 @@ resume:
     // feeding through to the TX/RX port — nothing on the antenna while in
     // RX. Done even if the TX leg failed. RX was never stopped, so there
     // is nothing to resume; it has been streaming throughout.
+    //
+    // tx_power_down touches the device handle, so it must run under the lock.
+    // The send loop dropped it; a config-phase failure jumps here still
+    // holding it. Re-acquire only if needed, then release once.
+    if (!locked) {
+        pthread_mutex_lock(&u->dev_mu);
+        locked = 1;
+    }
     tx_power_down(u);
+    pthread_mutex_unlock(&u->dev_mu);
     return rc;
 }
 
