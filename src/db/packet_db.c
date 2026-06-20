@@ -124,10 +124,15 @@ int packet_db_default_path(char *buf, size_t cap)
 
 static void sha1_digest(const void *data, size_t len, uint8_t out[PACKET_DB_SHA1_LEN])
 {
+    // Zero first so out is defined even if anything below fails -- this is on
+    // the dedup hot path, so a NULL ctx (allocation failure) must not deref.
+    memset(out, 0, PACKET_DB_SHA1_LEN);
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_sha1(), NULL);
-    EVP_DigestUpdate(ctx, data, len);
-    EVP_DigestFinal_ex(ctx, out, NULL);
+    if (ctx == NULL) return;
+    if (EVP_DigestInit_ex(ctx, EVP_sha1(), NULL) == 1
+        && EVP_DigestUpdate(ctx, data, len) == 1) {
+        EVP_DigestFinal_ex(ctx, out, NULL);
+    }
     EVP_MD_CTX_free(ctx);
 }
 
@@ -630,12 +635,16 @@ void packet_db_close(packet_db_t *db)
 static void tle_sha1(const char *line1, const char *line2,
                      uint8_t out[PACKET_DB_SHA1_LEN])
 {
+    // Zero first so out is defined on any failure path (NULL ctx, etc.).
+    memset(out, 0, PACKET_DB_SHA1_LEN);
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_sha1(), NULL);
-    EVP_DigestUpdate(ctx, line1, strlen(line1));
-    EVP_DigestUpdate(ctx, "\n", 1);
-    EVP_DigestUpdate(ctx, line2, strlen(line2));
-    EVP_DigestFinal_ex(ctx, out, NULL);
+    if (ctx == NULL) return;
+    if (EVP_DigestInit_ex(ctx, EVP_sha1(), NULL) == 1
+        && EVP_DigestUpdate(ctx, line1, strlen(line1)) == 1
+        && EVP_DigestUpdate(ctx, "\n", 1) == 1
+        && EVP_DigestUpdate(ctx, line2, strlen(line2)) == 1) {
+        EVP_DigestFinal_ex(ctx, out, NULL);
+    }
     EVP_MD_CTX_free(ctx);
 }
 
