@@ -229,6 +229,10 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
                      evt->rx_pt_summary[s]);
         }
         int rn = evt->rx_ribbon_n;
+        // Clamp both ends: rx_ribbon_n arrives from a peer broadcast, so a
+        // garbled negative value would otherwise become a huge size_t in the
+        // memcpy below and a negative ribbon[] index.
+        if (rn < 0) rn = 0;
         if (rn > RIBBON_LEN) rn = RIBBON_LEN;
         v->rx_panel.ribbon_n = rn;
         memcpy(v->rx_panel.ribbon, evt->rx_ribbon, (size_t) rn);
