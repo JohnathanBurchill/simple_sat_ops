@@ -335,8 +335,13 @@ packet_db_t *packet_db_open(const char *path)
 {
     if (path == NULL || path[0] == '\0') return NULL;
     sqlite3 *raw = NULL;
+    // FULLMUTEX -> serialized threading mode for this connection, so the live
+    // receiver can share one handle between the RX worker (packet inserts) and
+    // the TX thread (sent_tcmd inserts) without each call racing inside SQLite.
+    // Independent of the library-wide compile-time threading default.
     int rc = sqlite3_open_v2(path, &raw,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
+                             | SQLITE_OPEN_FULLMUTEX,
                              NULL);
     if (rc != SQLITE_OK) {
         if (raw != NULL) sqlite3_close(raw);
