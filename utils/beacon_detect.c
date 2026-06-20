@@ -42,11 +42,16 @@
 
 #include <errno.h>
 #include <math.h>
+#include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+
+// Populated by the C runtime; the environment to hand spawned children.
+extern char **environ;
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -627,15 +632,39 @@ int main(int argc, char **argv)
                 double t0 = t - render_half_s;
                 if (t0 < 0.0) t0 = 0.0;
                 double dur = 2.0 * render_half_s;
-                char cmd[1024];
-                snprintf(cmd, sizeof cmd,
-                         "ffmpeg -y -loglevel error -ss %.3f -t %.3f "
-                         "-i \"%s\" -lavfi "
-                         "\"showspectrumpic=s=1280x720:mode=combined:"
-                         "color=intensity:legend=1\" "
-                         "\"%s/beacon_%02zu_t%07.3fs.png\"",
-                         t0, dur, wav_path, render_dir, i, t);
-                int rc = system(cmd);
+                // Spawn ffmpeg with an explicit argv rather than a shell
+                // string: wav_path and render_dir come from argv, and a
+                // path containing a double-quote would otherwise break out
+                // of the quoting and inject arbitrary shell. posix_spawnp
+                // passes each argument through untouched.
+                char ss_buf[32], t_buf[32], out_buf[1024];
+                snprintf(ss_buf, sizeof ss_buf, "%.3f", t0);
+                snprintf(t_buf, sizeof t_buf, "%.3f", dur);
+                snprintf(out_buf, sizeof out_buf,
+                         "%s/beacon_%02zu_t%07.3fs.png", render_dir, i, t);
+                char *const argv[] = {
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-ss", ss_buf, "-t", t_buf,
+                    "-i", (char *)wav_path,
+                    "-lavfi",
+                    "showspectrumpic=s=1280x720:mode=combined:"
+                    "color=intensity:legend=1",
+                    out_buf,
+                    NULL
+                };
+                pid_t pid = 0;
+                int rc = -1;
+                int sp = posix_spawnp(&pid, "ffmpeg", NULL, NULL,
+                                      argv, environ);
+                if (sp != 0) {
+                    fprintf(stderr, "beacon_detect: spawn ffmpeg: %s\n",
+                            strerror(sp));
+                } else {
+                    int status = 0;
+                    if (waitpid(pid, &status, 0) == pid) {
+                        rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+                    }
+                }
                 if (!quiet) {
                     fprintf(stderr,
                             "  render #%02zu t=%.2fs → %s/beacon_%02zu_t%07.3fs.png  rc=%d\n",
