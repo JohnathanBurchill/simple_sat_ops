@@ -804,7 +804,13 @@ void rx_session_set_lo_offset(rx_session_t *rxs,
     // handoff (freq_req_pending) so we don't touch the UHD streamer
     // from this thread. The fm_lo_nco update is lock-free — same
     // pattern as set_doppler_offset above.
+    //
+    // lo_offset_hz is read by the worker in worker_update_snapshot, so
+    // assign it under mu. Held only for the assignment: the core call and
+    // request_freq below must run unlocked (request_freq takes mu itself).
+    pthread_mutex_lock(&rxs->mu);
     rxs->lo_offset_hz = new_lo_offset_hz;
+    pthread_mutex_unlock(&rxs->mu);
     b210_rx_tx_core_set_fm_lo_compensation(rxs->core, new_lo_offset_hz);
     rx_session_request_freq(rxs, nominal_freq_hz + new_lo_offset_hz);
 
@@ -843,10 +849,17 @@ int rx_session_can_tx(const rx_session_t *rxs)
 }
 
 // True once the RX pump has hit a fatal error (device unplugged /
-// transport dead). volatile int — a plain read is fine for a status poll.
+// transport dead). The worker sets device_lost under mu, so read it under
+// mu too -- one discipline for every concurrent access rather than leaning
+// on volatile, which gives no memory-ordering guarantee. (The close-path
+// read is post-join and stays lock-free.)
 int rx_session_device_lost(const rx_session_t *rxs)
 {
-    return (rxs != NULL) ? rxs->device_lost : 0;
+    if (rxs == NULL) return 0;
+    pthread_mutex_lock((pthread_mutex_t *) &rxs->mu);
+    int lost = rxs->device_lost;
+    pthread_mutex_unlock((pthread_mutex_t *) &rxs->mu);
+    return lost;
 }
 
 const char *rx_session_sdr_name(const rx_session_t *rxs)
@@ -884,9 +897,19 @@ rx_burst_result_t rx_session_request_burst_sync(
     while (!rxs->burst_complete && !rxs->stop_requested) {
         pthread_cond_wait(&rxs->cv, &rxs->mu);
     }
-    rx_burst_result_t res = rxs->burst_result;
-    if (out_summary && summary_n) {
-        snprintf(out_summary, summary_n, "%s", rxs->burst_summary);
+    rx_burst_result_t res;
+    if (rxs->burst_complete) {
+        res = rxs->burst_result;
+        if (out_summary && summary_n) {
+            snprintf(out_summary, summary_n, "%s", rxs->burst_summary);
+        }
+    } else {
+        // Woke on stop_requested before the burst ran. burst_result holds a
+        // stale/zero value, so report the abort explicitly.
+        res = RX_BURST_ABORTED;
+        if (out_summary && summary_n) {
+            snprintf(out_summary, summary_n, "aborted: session stopping");
+        }
     }
     pthread_mutex_unlock(&rxs->mu);
     return res;
@@ -1273,6 +1296,14 @@ static int worker_pump_once(rx_session_t *rxs)
     // iq_window feeds the shadow IQ + Viterbi decoders, both of which
     // are calibrated for carrier-at-DC. Source bytes come from the
     // decode-path tap (post-fm_lo_nco), not the raw .iq tap.
+    //
+    // The core derives the PCM count (n) and iq_decode_pairs from the same
+    // n_demod and clamps both identically, so iq_decode_pairs == n and the
+    // PCM and IQ windows advance in lockstep -- the absolute-sample label
+    // below (total_window_samples - window_samples) is valid for both. The
+    // min() is a guard: if a future change ever makes iq_decode_pairs < n
+    // the IQ window would lag the PCM one and that label would drift, so a
+    // separate IQ-window sample counter would be needed then.
     size_t pairs_to_use = iq_decode_pairs;
     if (pairs_to_use > (size_t) n) pairs_to_use = (size_t) n;
     for (ssize_t i = 0; i < n; i++) {
@@ -1370,11 +1401,13 @@ static void worker_update_snapshot(rx_session_t *rxs)
     // gives nominal back); the third is the Doppler shift. Updates
     // smoothly every tick at Hz precision instead of stepping in kHz
     // like the old hardware-retune scheme.
-    double freq = b210_rx_tx_core_actual_freq(rxs->core)
-                - rxs->lo_offset_hz
-                + b210_rx_tx_core_get_doppler_offset(rxs->core);
+    double core_freq = b210_rx_tx_core_actual_freq(rxs->core);
+    double doppler   = b210_rx_tx_core_get_doppler_offset(rxs->core);
     int wav_active = (rxs->wav.fp != NULL);
     pthread_mutex_lock(&rxs->mu);
+    // lo_offset_hz is written by the main thread under mu; read it here
+    // inside the lock and finish the carrier math.
+    double freq = core_freq - rxs->lo_offset_hz + doppler;
     rxs->snap_frames_total   = rxs->frames_total;
     rxs->snap_peak           = peak;
     rxs->snap_rms_sq         = rms_sq;

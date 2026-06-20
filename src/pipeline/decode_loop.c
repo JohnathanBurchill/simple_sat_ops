@@ -29,6 +29,7 @@
 
 #include <ctype.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,6 +60,14 @@ static const char  *g_db_source_run  = NULL;
 // it per-packet during backfill). NaN means "not known". Other
 // receivers never call the setter; they read NaN and the DB row gets
 // NULL in those columns.
+//
+// In the live receiver the setters run on the main thread while
+// decode_loop_record_packet reads them on the RX worker thread, so a
+// recorded packet could otherwise capture a half-updated frame (az from
+// one tick, el from the next, or a torn double). g_obs_mu serializes the
+// whole group: setters write under it, record_packet snapshots under it.
+// Uncontended (and free) in the single-threaded offline tools.
+static pthread_mutex_t g_obs_mu = PTHREAD_MUTEX_INITIALIZER;
 static double g_obs_az_deg            = (0.0 / 0.0);
 static double g_obs_el_deg            = (0.0 / 0.0);
 static double g_obs_range_km          = (0.0 / 0.0);
@@ -96,30 +105,38 @@ void decode_loop_set_observer(double az_deg, double el_deg,
                               double range_km, double range_rate_km_s,
                               double doppler_hz_offset)
 {
+    pthread_mutex_lock(&g_obs_mu);
     g_obs_az_deg            = az_deg;
     g_obs_el_deg            = el_deg;
     g_obs_range_km          = range_km;
     g_obs_range_rate_km_s   = range_rate_km_s;
     g_obs_doppler_hz_offset = doppler_hz_offset;
+    pthread_mutex_unlock(&g_obs_mu);
 }
 
 void decode_loop_set_tle_id(long long tle_id)
 {
+    pthread_mutex_lock(&g_obs_mu);
     g_obs_tle_id = tle_id;
+    pthread_mutex_unlock(&g_obs_mu);
 }
 
 void decode_loop_set_session_dir(const char *path)
 {
     // String is borrowed; caller keeps it alive (typically a static
     // buffer or argv pointer in the receiver's main()).
+    pthread_mutex_lock(&g_obs_mu);
     g_obs_session_dir = path;
+    pthread_mutex_unlock(&g_obs_mu);
 }
 
 void decode_loop_set_capture_origin(const char *origin)
 {
     // Borrowed pointer; caller must keep the string alive for the
     // process lifetime (typically argv or a static buffer).
+    pthread_mutex_lock(&g_obs_mu);
     g_obs_capture_origin = origin;
+    pthread_mutex_unlock(&g_obs_mu);
 }
 
 void decode_loop_set_show_headers(int on)
@@ -835,6 +852,19 @@ void decode_loop_record_packet(const char *ts,
         ts_for_db = ts_iso;
     }
 
+    // Snapshot the observer frame as one consistent group (see g_obs_mu) so
+    // the DB row can't mix az/el/range from different ticks.
+    pthread_mutex_lock(&g_obs_mu);
+    double      obs_az          = g_obs_az_deg;
+    double      obs_el          = g_obs_el_deg;
+    double      obs_range       = g_obs_range_km;
+    double      obs_range_rate  = g_obs_range_rate_km_s;
+    double      obs_doppler     = g_obs_doppler_hz_offset;
+    long long   obs_tle_id      = g_obs_tle_id;
+    const char *obs_session_dir = g_obs_session_dir;
+    const char *obs_capture_origin = g_obs_capture_origin;
+    pthread_mutex_unlock(&g_obs_mu);
+
     packet_db_record_t rec = {
         .ts_received      = ts_for_db,
         .satellite        = satellite,
@@ -860,14 +890,14 @@ void decode_loop_record_packet(const char *ts,
         // Observer-frame state pulled from the setters. NaN sentinels
         // (the initial value when no setter has been called) map to
         // NULL in the DB.
-        .az_deg            = g_obs_az_deg,
-        .el_deg            = g_obs_el_deg,
-        .range_km          = g_obs_range_km,
-        .range_rate_km_s   = g_obs_range_rate_km_s,
-        .doppler_hz_offset = g_obs_doppler_hz_offset,
-        .tle_id            = g_obs_tle_id,
-        .session_dir       = g_obs_session_dir,
-        .capture_origin    = g_obs_capture_origin,
+        .az_deg            = obs_az,
+        .el_deg            = obs_el,
+        .range_km          = obs_range,
+        .range_rate_km_s   = obs_range_rate,
+        .doppler_hz_offset = obs_doppler,
+        .tle_id            = obs_tle_id,
+        .session_dir       = obs_session_dir,
+        .capture_origin    = obs_capture_origin,
     };
     (void)packet_db_insert(g_packet_db, &rec);
 }

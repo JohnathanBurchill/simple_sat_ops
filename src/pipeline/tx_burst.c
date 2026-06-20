@@ -363,6 +363,9 @@ void tx_burst_service_request(state_t *state)
                         case RX_BURST_NO_CORE:            outcome = "rejected: no B210"; break;
                         case RX_BURST_FRAME_BUILD_FAILED: outcome = "rejected: frame build"; break;
                         case RX_BURST_UHD_ERROR:          outcome = "uhd-err"; break;
+                        // Only the sync submit path produces this; the async
+                        // poll here never does, but handle it for exhaustiveness.
+                        case RX_BURST_ABORTED:            outcome = "rejected: aborted"; break;
                     }
                     state->tx_inflight = 0;
                     finished = 1;

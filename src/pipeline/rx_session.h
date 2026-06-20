@@ -24,13 +24,16 @@ typedef struct b210_rx_tx_core b210_rx_tx_core_t;
 
 typedef struct rx_session rx_session_t;
 
-// Mirrors tx_burst.h's tx_burst_result_t so callers don't need that
-// header just to interpret the result.
+// Values 0..3 mirror tx_burst.h's tx_burst_result_t so the worker can cast
+// a tx_burst result straight across. RX_BURST_ABORTED is RX-only (never cast
+// from a tx_burst result): the sync submit path returns it when the session
+// is stopping before the burst ran, so the caller never reads a stale result.
 typedef enum {
     RX_BURST_OK = 0,
     RX_BURST_NO_CORE,
     RX_BURST_FRAME_BUILD_FAILED,
     RX_BURST_UHD_ERROR,
+    RX_BURST_ABORTED,
 } rx_burst_result_t;
 
 typedef struct {
