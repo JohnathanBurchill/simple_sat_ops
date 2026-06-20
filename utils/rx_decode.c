@@ -11,7 +11,7 @@
         WAV/RAW samples
           -> modem_pcm16_to_bits  (DC-block, phase search, ASM detect)
           -> modem_bits_to_bytes  (MSB-first byte pack, ASM-aligned)
-          -> ax100_unframe        (Golay24 len, descramble, HMAC verify)
+          -> ax100_unframe        (Golay24 len, descramble, RS correct)
           -> csp_v1_decode        (parse the 4-byte CSP header)
           -> print header + payload (hex + ASCII)
 
@@ -40,7 +40,6 @@
 #include "beacon_cts1.h"
 #include "csp.h"
 #include "decode_loop.h"
-#include "hmac_keyfile.h"
 #include "modem.h"
 #include "packet_db.h"
 #include "wav_read.h"
@@ -136,7 +135,6 @@ static size_t extract_channel_zero(int16_t *samples, size_t n, int channels)
 // the fields out into working locals so the (large) decode body is unchanged.
 typedef struct {
     const char *input_path;
-    const char *keyfile_path;
     int raw_mode;
     int raw_mode_explicit;
     int raw_rate;
@@ -144,7 +142,6 @@ typedef struct {
     int bit_rate;
     int invert;
     int sync_max_ham;
-    int use_hmac;
     int use_rs;
     int csp_crc32;
     int verbose;
@@ -211,21 +208,6 @@ static int parse_args(rxd_args_t *a, int argc, char **argv, int help)
             else a->use_rs = 0;
             matched = 1;
         }
-        if (strcmp(arg, "--hmac") == 0 || help) {
-            if (help) parse_help_line(OPTW, "--hmac", "enable HMAC verification (off by default)");
-            else a->use_hmac = 1;
-            matched = 1;
-        }
-        if (strcmp(arg, "--no-hmac") == 0 || help) {
-            if (help) parse_help_line(OPTW, "--no-hmac", "disable HMAC verification (the default)");
-            else a->use_hmac = 0;
-            matched = 1;
-        }
-        if (starts_with(arg, "--keyfile=") || help) {
-            if (help) parse_help_line(OPTW, "--keyfile=<path>", "HMAC keyfile (only relevant with --hmac)");
-            else a->keyfile_path = arg + 10;
-            matched = 1;
-        }
         if (starts_with(arg, "--bit-rate=") || help) {
             if (help) parse_help_line(OPTW, "--bit-rate=<bps>", "modem bit rate (default 9600)");
             else a->bit_rate = atoi(arg + 11);
@@ -274,12 +256,12 @@ static int parse_args(rxd_args_t *a, int argc, char **argv, int help)
             matched = 1;
         }
         if (strcmp(arg, "--csp-crc32") == 0 || help) {
-            if (help) parse_help_line(OPTW, "--csp-crc32", "validate + strip a trailing CSP zlib CRC32");
+            if (help) parse_help_line(OPTW, "--csp-crc32", "validate + strip the trailing CSP zlib CRC32 (the default)");
             else a->csp_crc32 = 1;
             matched = 1;
         }
         if (strcmp(arg, "--no-csp-crc32") == 0 || help) {
-            if (help) parse_help_line(OPTW, "--no-csp-crc32", "do not check a CSP CRC32 (the default)");
+            if (help) parse_help_line(OPTW, "--no-csp-crc32", "do not check the CSP CRC32 trailer");
             else a->csp_crc32 = 0;
             matched = 1;
         }
@@ -345,8 +327,8 @@ int main(int argc, char **argv)
         .raw_rate = 48000,
         .raw_channels = 2,
         .bit_rate = 9600,
-        .use_hmac = 0,   // AX100 downlink does not use HMAC; opt in with --hmac
         .use_rs = 1,     // default ON to match pycsplink uplink
+        .csp_crc32 = 1,  // validate the downlink CSP CRC32 trailer by default
         .allow_partial_rs = 1,  // rescue path on by default; --no-partial-rs disables
         .show_packet_headers = 1,  // forensic CLI: full headers by default
     };
@@ -361,7 +343,6 @@ int main(int argc, char **argv)
 
     // Copy parsed config into the working locals the decode body below uses.
     const char *input_path = cfg.input_path;
-    const char *keyfile_path = cfg.keyfile_path;
     int raw_mode = cfg.raw_mode;
     int raw_mode_explicit = cfg.raw_mode_explicit;
     int raw_rate = cfg.raw_rate;
@@ -369,7 +350,6 @@ int main(int argc, char **argv)
     int bit_rate = cfg.bit_rate;
     int invert = cfg.invert;
     int sync_max_ham = cfg.sync_max_ham;
-    int use_hmac = cfg.use_hmac;
     int use_rs = cfg.use_rs;
     int csp_crc32 = cfg.csp_crc32;
     int verbose = cfg.verbose;
@@ -493,36 +473,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // Load HMAC key now so we can use HMAC as a validation gate against
-    // false-positive sync matches.
-    uint8_t hmac_key[128];
-    ssize_t hmac_key_len = 0;
-    if (use_hmac) {
-        char default_path[512];
-        const char *path = keyfile_path;
-        if (path == NULL) {
-            if (hmac_keyfile_default_path(default_path, sizeof(default_path)) != 0) {
-                fprintf(stderr, "rx_decode: HOME is unset; pass --keyfile=<path>\n");
-                free(bits);
-                free(samples);
-                return 1;
-            }
-            path = default_path;
-        }
-        hmac_key_len = hmac_keyfile_load(path, hmac_key, sizeof(hmac_key));
-        if (hmac_key_len < 0) {
-            free(bits);
-            free(samples);
-            return 1;
-        }
-    }
-
+    // The AX100 downlink frame carries no HMAC — its integrity is the CSP
+    // CRC32 trailer, checked below — so the decoder never installs a key
+    // (opts.hmac_key stays NULL).
     ax100_opts_t opts;
     ax100_opts_defaults(&opts);
-    if (use_hmac) {
-        opts.hmac_key = hmac_key;
-        opts.hmac_key_len = (size_t)hmac_key_len;
-    }
     opts.reed_solomon = use_rs;
 
     // Preamble-anchored sync search: find the longest alternating run in
@@ -587,11 +542,10 @@ int main(int argc, char **argv)
                 best_altrun_len, preamble_anchor);
     }
 
-    // Multi-hypothesis sync: find the Nth sync match, try to decode;
-    // if HMAC fails (and HMAC is enabled as a gate), advance past it
-    // and try again. Without this gate, the first random 32-bit
-    // noise match in a ~10 s RX file gets accepted and produces
-    // garbage payload + golay length.
+    // Multi-hypothesis sync: find the Nth sync match and try to decode.
+    // A frame whose Golay length header is uncorrectable is treated as a
+    // false 32-bit noise match — advance past it and try the next match,
+    // rather than accept garbage payload + golay length.
     size_t n_bits = 0;
     size_t sync_off = 0;
     int polarity_used = -1;
@@ -650,12 +604,12 @@ int main(int argc, char **argv)
                                    &golay_errs, &hmac_ok,
                                    &rs_errs, &used_golay_len,
                                    rs_locs);
-        // Partial-RS rescue: when RS is on, HMAC is off, and the Golay
-        // length header decoded cleanly, retry with RS disabled to
-        // recover the descrambled (uncorrected) bytes. Lets the operator
-        // see corrupted-but-recognizable beacons when bit errors exceed
-        // RS's 16-byte budget. Mirrors decode_loop's allow_partial_rs.
-        if (packet_len < 0 && allow_partial_rs && use_rs && !use_hmac
+        // Partial-RS rescue: when RS is on and the Golay length header
+        // decoded cleanly, retry with RS disabled to recover the
+        // descrambled (uncorrected) bytes. Lets the operator see
+        // corrupted-but-recognizable beacons when bit errors exceed RS's
+        // 16-byte budget. Mirrors decode_loop's allow_partial_rs.
+        if (packet_len < 0 && allow_partial_rs && use_rs
             && golay_errs == 0) {
             ax100_opts_t partial = opts;
             partial.reed_solomon = 0;
@@ -689,24 +643,13 @@ int main(int argc, char **argv)
             min_offset = sync_off + 1;
             continue;
         }
-        // If HMAC is required and failed, this is likely a false match.
-        if (use_hmac && hmac_ok == 0) {
-            if (verbose) {
-                fprintf(stderr, "rx_decode: candidate #%d at bit %zu: HMAC mismatch "
-                        "(%zd-byte packet, golay_errs=%d), trying next\n",
-                        attempts, sync_off, packet_len, golay_errs);
-            }
-            min_offset = sync_off + 1;
-            continue;
-        }
         decoded = 1;
     }
 
     if (!decoded) {
         fprintf(stderr, "rx_decode: no valid AX100 frame found "
-                "(tried both polarities, sync-threshold=%d, %d candidate(s)%s)\n",
-                sync_max_ham, attempts,
-                use_hmac ? " HMAC-validated" : "");
+                "(tried both polarities, sync-threshold=%d, %d candidate(s))\n",
+                sync_max_ham, attempts);
         if (verbose || dump_bits > 0) {
             // For each phase, scan the full bit stream for:
             //   - longest alternating run (0xAA preamble detector)
@@ -926,28 +869,18 @@ int main(int argc, char **argv)
 
     if (verbose) {
         fprintf(stderr, "rx_decode: ASM at bit offset %zu, %zu bits after ASM, "
-                "polarity=%s, candidate #%d%s\n",
+                "polarity=%s, candidate #%d\n",
                 sync_off, n_bits, polarity_used ? "inverted" : "normal",
-                attempts, use_hmac ? " (HMAC-validated)" : "");
+                attempts);
         char rs_buf[32];
         if (rs_errs == -2)    snprintf(rs_buf, sizeof rs_buf, "UNCORRECTABLE");
         else if (rs_errs < 0) snprintf(rs_buf, sizeof rs_buf, "(off/failed)");
         else                  snprintf(rs_buf, sizeof rs_buf, "%d", rs_errs);
-        if (use_hmac) {
-            fprintf(stderr, "rx_decode: inner packet %zd bytes, golay errors=%d, "
-                    "hmac=%s, rs_corrected=%s, len_source=%s\n",
-                    packet_len, golay_errs,
-                    hmac_ok == 1 ? "ok" : hmac_ok == 0 ? "MISMATCH" : "(not checked)",
-                    rs_buf,
-                    used_golay_len == 1 ? "golay-header"
-                    : used_golay_len == 0 ? "brute-force" : "(n/a)");
-        } else {
-            fprintf(stderr, "rx_decode: inner packet %zd bytes, golay errors=%d, "
-                    "rs_corrected=%s, len_source=%s\n",
-                    packet_len, golay_errs, rs_buf,
-                    used_golay_len == 1 ? "golay-header"
-                    : used_golay_len == 0 ? "brute-force" : "(n/a)");
-        }
+        fprintf(stderr, "rx_decode: inner packet %zd bytes, golay errors=%d, "
+                "rs_corrected=%s, len_source=%s\n",
+                packet_len, golay_errs, rs_buf,
+                used_golay_len == 1 ? "golay-header"
+                : used_golay_len == 0 ? "brute-force" : "(n/a)");
     }
 
     if (packet_len < 4) {
@@ -956,11 +889,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // CSP v1 downlink: 4-byte zlib CRC trailer (libcsp CRC mode). Validate
-    // and strip when HMAC is off; uplink frames have a 32-byte SHA-256
-    // HMAC tag instead and that's the user's problem to interpret.
+    // CSP v1 downlink: 4-byte zlib CRC32 trailer (libcsp CRC mode).
+    // Validate and strip it; on by default since the downlink always
+    // carries it. A mismatch keeps the trailer in the payload so the
+    // operator can still inspect what was received.
     int crc_ok = -1;
-    if (!use_hmac && csp_crc32 && packet_len >= 8) {
+    if (csp_crc32 && packet_len >= 8) {
         uint32_t computed = csp_crc32_zlib(packet, (size_t)(packet_len - 4));
         uint32_t le = (uint32_t)packet[packet_len - 4]
                     | ((uint32_t)packet[packet_len - 3] << 8)
@@ -1006,7 +940,7 @@ int main(int argc, char **argv)
             fprintf(stdout, "%02x", payload[i]);
         }
         fputc('\n', stdout);
-        return (hmac_ok == 0) ? 2 : 0;
+        return 0;
     }
 
     char rs_summary[32];
@@ -1016,27 +950,17 @@ int main(int argc, char **argv)
     const char *len_src =
         used_golay_len == 1 ? "golay-header"
         : used_golay_len == 0 ? "brute-forced" : "(n/a)";
-    int hmac_bad = use_hmac && hmac_ok == 0;
     int rs_bad = rs_errs == -2;
-    int show_ax100 = show_packet_headers || hmac_bad || rs_bad;
+    int show_ax100 = show_packet_headers || rs_bad;
     if (show_ax100) {
-        if (use_hmac) {
-            fprintf(stdout, "AX100: golay_errors=%d  hmac=%s  rs=%s  len=%s\n",
-                    golay_errs,
-                    hmac_ok == 1 ? "ok"
-                    : hmac_ok == 0 ? "MISMATCH"
-                    : "(not checked)",
-                    rs_summary, len_src);
-        } else {
-            fprintf(stdout, "AX100: golay_errors=%d  rs=%s  len=%s\n",
-                    golay_errs, rs_summary, len_src);
-        }
+        fprintf(stdout, "AX100: golay_errors=%d  rs=%s  len=%s\n",
+                golay_errs, rs_summary, len_src);
     }
     // Per-byte error positions from the RS solver. Sorted so the operator
     // can see at a glance whether errors cluster late in the block (clock
     // drift) or scatter (channel noise). Last 32 indices are RS parity.
     if (show_packet_headers && rs_errs > 0) {
-        size_t on_wire_len = (size_t)packet_len + (use_hmac ? 4 : 0) + 32;
+        size_t on_wire_len = (size_t)packet_len + 32;
         int sorted[32];
         int n = rs_errs > 32 ? 32 : rs_errs;
         for (int i = 0; i < n; ++i) sorted[i] = rs_locs[i];
@@ -1140,5 +1064,5 @@ int main(int argc, char **argv)
                                   rs_errs, crc_ok);
     }
 
-    return (hmac_ok == 0) ? 2 : 0;
+    return 0;
 }

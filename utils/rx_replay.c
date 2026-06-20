@@ -39,7 +39,6 @@
 #include "ax100.h"
 #include "csp.h"
 #include "decode_loop.h"
-#include "hmac_keyfile.h"
 #include "iq_burst.h"
 #include "modem.h"
 #include "modem_fsk.h"
@@ -353,7 +352,6 @@ static int read_audio_sndfile(const char *path, int16_t **out_samples,
 typedef struct {
     const char *input_path;
     const char *log_path;
-    const char *keyfile_path;
     int raw_mode;
     int raw_mode_explicit;
     int raw_rate;
@@ -368,7 +366,6 @@ typedef struct {
     double window_s;
     double slide_s;
     int sync_max_ham;
-    int use_hmac;
     int use_rs;
     int no_dc_block;
     int csp_crc32;
@@ -540,16 +537,6 @@ static int parse_args(rxr_args_t *a, int argc, char **argv, int help)
             }
             matched = 1;
         }
-        if (strcmp(arg, "--hmac") == 0 || help) {
-            if (help) parse_help_line(OPTW, "--hmac", "enable HMAC verification (off by default)");
-            else a->use_hmac = 1;
-            matched = 1;
-        }
-        if (strcmp(arg, "--no-hmac") == 0 || help) {
-            if (help) parse_help_line(OPTW, "--no-hmac", "disable HMAC verification (the default)");
-            else a->use_hmac = 0;
-            matched = 1;
-        }
         if (strcmp(arg, "--reed-solomon") == 0 || help) {
             if (help) parse_help_line(OPTW, "--reed-solomon", "RS(255,223) decode (DEFAULT)");
             else a->use_rs = 1;
@@ -566,12 +553,12 @@ static int parse_args(rxr_args_t *a, int argc, char **argv, int help)
             matched = 1;
         }
         if (strcmp(arg, "--csp-crc32") == 0 || help) {
-            if (help) parse_help_line(OPTW, "--csp-crc32", "validate + strip a trailing CSP zlib CRC32");
+            if (help) parse_help_line(OPTW, "--csp-crc32", "validate + strip the trailing CSP zlib CRC32 (the default)");
             else a->csp_crc32 = 1;
             matched = 1;
         }
         if (strcmp(arg, "--no-csp-crc32") == 0 || help) {
-            if (help) parse_help_line(OPTW, "--no-csp-crc32", "do not check a CSP CRC32 (the default)");
+            if (help) parse_help_line(OPTW, "--no-csp-crc32", "do not check the CSP CRC32 trailer");
             else a->csp_crc32 = 0;
             matched = 1;
         }
@@ -588,11 +575,6 @@ static int parse_args(rxr_args_t *a, int argc, char **argv, int help)
         if (strcmp(arg, "--ui") == 0 || help) {
             if (help) parse_help_line(OPTW, "--ui", "curses panel display instead of streaming text");
             else a->use_tui = 1;
-            matched = 1;
-        }
-        if (starts_with(arg, "--keyfile=") || help) {
-            if (help) parse_help_line(OPTW, "--keyfile=<path>", "HMAC keyfile (default $HOME/" HMAC_KEYFILE_DEFAULT_RELPATH ")");
-            else a->keyfile_path = arg + 10;
             matched = 1;
         }
         if (starts_with(arg, "--log=") || help) {
@@ -725,7 +707,6 @@ typedef struct {
     int             samp_rate;
     int             sps;
     int             csp_crc32;
-    int             use_hmac;
     int             update_mode;
     int             have_start_utc;
     double          start_utc_seconds;
@@ -767,7 +748,10 @@ static int rx_emit_decoded(rx_emit_ctx_t *ctx,
 
     int crc_status = -1;
     uint32_t crc_computed = 0, crc_le = 0, crc_be = 0;
-    if (!ctx->use_hmac && ctx->csp_crc32 && plen >= 8) {
+    // Validate the AX100 downlink's CSP CRC32 trailer (on by default). A
+    // match strips the 4 trailing bytes; a mismatch is recorded but the
+    // frame is still emitted so weak telemetry stays visible.
+    if (ctx->csp_crc32 && plen >= 8) {
         crc_computed = csp_crc32_zlib(packet, (size_t)(plen - 4));
         crc_le = (uint32_t)packet[plen - 4]
                | ((uint32_t)packet[plen - 3] << 8)
@@ -841,7 +825,7 @@ static int rx_emit_decoded(rx_emit_ctx_t *ctx,
 
     emit_frame(ctx->log_path, ctx->quiet, ts,
                packet, (size_t)plen,
-               golay_errs, hmac_ok, ctx->use_hmac,
+               golay_errs, hmac_ok, /*use_hmac=*/0,
                rs_errs, used_golay_len,
                crc_status, crc_computed, crc_le, crc_be,
                rs_locs,
@@ -879,7 +863,7 @@ static int rx_emit_decoded(rx_emit_ctx_t *ctx,
     }
     if (ctx->use_tui) {
         rx_tui_observe_frame(ts, packet, (size_t)plen,
-                             golay_errs, hmac_ok, ctx->use_hmac,
+                             golay_errs, hmac_ok, /*use_hmac=*/0,
                              rs_errs, crc_status);
     }
     (*ctx->n_emitted_p)++;
@@ -901,6 +885,7 @@ int main(int argc, char **argv)
         .slide_s = 0.5,
         .sync_max_ham = 4,
         .use_rs = 1,
+        .csp_crc32 = 1,   // validate the downlink CSP CRC32 trailer by default
         .allow_partial_rs = 1,
         .burst_bins_threshold = 16,
         .burst_min_quiet = 5,
@@ -924,7 +909,6 @@ int main(int argc, char **argv)
     // Copy parsed config into the working locals the body below uses.
     const char *input_path = cfg.input_path;
     const char *log_path = cfg.log_path;
-    const char *keyfile_path = cfg.keyfile_path;
     int raw_mode = cfg.raw_mode;
     int raw_mode_explicit = cfg.raw_mode_explicit;
     // Auto-detected from a .ogg extension: a SatNOGS audio recording,
@@ -976,7 +960,6 @@ int main(int argc, char **argv)
     double window_s = cfg.window_s;
     double slide_s = cfg.slide_s;
     int sync_max_ham = cfg.sync_max_ham;
-    int use_hmac = cfg.use_hmac;
     int use_rs = cfg.use_rs;
     int no_dc_block = cfg.no_dc_block;
     int csp_crc32 = cfg.csp_crc32;
@@ -1200,36 +1183,16 @@ int main(int argc, char **argv)
     }
     int sps = samp_rate / bit_rate;
 
-    // HMAC key.
-    uint8_t hmac_key[128];
-    ssize_t hmac_key_len = 0;
-    if (use_hmac) {
-        char default_path[512];
-        const char *path = keyfile_path;
-        if (path == NULL) {
-            if (hmac_keyfile_default_path(default_path, sizeof default_path) != 0) {
-                fprintf(stderr, "rx_replay: HOME unset; pass --keyfile=<path>\n");
-                free(samples);
-                return 1;
-            }
-            path = default_path;
-        }
-        hmac_key_len = hmac_keyfile_load(path, hmac_key, sizeof hmac_key);
-        if (hmac_key_len < 0) { free(samples); return 1; }
-    }
-
     modem_params_t mp;
     modem_params_defaults(&mp);
     mp.samp_rate = samp_rate;
     mp.bit_rate = bit_rate;
     mp.rx_disable_dc_block = no_dc_block;
 
+    // The AX100 downlink carries no HMAC — its integrity is the CSP CRC32
+    // trailer checked per frame — so the decoder never installs a key.
     ax100_opts_t opts;
     ax100_opts_defaults(&opts);
-    if (use_hmac) {
-        opts.hmac_key = hmac_key;
-        opts.hmac_key_len = (size_t)hmac_key_len;
-    }
     opts.reed_solomon = use_rs;
 
     size_t window_samples = (size_t)(window_s * (double)samp_rate);
@@ -1548,10 +1511,10 @@ int main(int argc, char **argv)
         }
         snprintf(tui_header, sizeof tui_header,
                  "rx_replay | %s | rate=%dHz win=%.2fs slide=%.2fs "
-                 "rs=%s hmac=%s | dur=%.1fs",
+                 "rs=%s crc=%s | dur=%.1fs",
                  input_path, samp_rate, window_s, slide_s,
                  use_rs ? "on" : "off",
-                 use_hmac ? "on" : "off",
+                 csp_crc32 ? "on" : "off",
                  (double)n_frames / (double)samp_rate);
         rx_tui_set_header(tui_header);
         rx_tui_set_command_handler(rx_replay_cmd_handler, NULL);
@@ -1559,12 +1522,12 @@ int main(int argc, char **argv)
     } else {
         fprintf(stderr,
                 "rx_replay: %s  rate=%d Hz  channels=%d  bit_rate=%d  "
-                "window=%.2fs  slide=%.2fs  sync_thr=%d  rs=%s  hmac=%s  "
+                "window=%.2fs  slide=%.2fs  sync_thr=%d  rs=%s  crc=%s  "
                 "partial=%s  duration=%.3fs\n",
                 input_path, samp_rate, channels, bit_rate,
                 window_s, slide_s, sync_max_ham,
                 use_rs ? "on" : "off",
-                use_hmac ? "on" : "off",
+                csp_crc32 ? "on" : "off",
                 allow_partial_rs ? "on" : "off",
                 (double)n_frames / (double)samp_rate);
     }
@@ -1587,7 +1550,6 @@ int main(int argc, char **argv)
         .samp_rate = samp_rate,
         .sps = sps,
         .csp_crc32 = csp_crc32,
-        .use_hmac = use_hmac,
         .update_mode = update_mode,
         .have_start_utc = have_start_utc,
         .start_utc_seconds = start_utc_seconds,
@@ -1652,7 +1614,7 @@ int main(int argc, char **argv)
             if (iq_mode && pass1_use_viterbi) {
                 decoded = try_decode_window_viterbi(
                     win, window_samples, &mp, &opts,
-                    sync_max_ham, use_hmac, allow_partial_rs,
+                    sync_max_ham, /*use_hmac=*/0, allow_partial_rs,
                     inner_min_offset,
                     bits_scratch, bits_cap,
                     bytes_scratch, bytes_cap,
@@ -1663,7 +1625,7 @@ int main(int argc, char **argv)
             } else if (iq_mode && pass1_use_fsk) {
                 decoded = try_decode_window_fsk(
                     win, window_samples, &mp, &opts,
-                    sync_max_ham, use_hmac, allow_partial_rs,
+                    sync_max_ham, /*use_hmac=*/0, allow_partial_rs,
                     inner_min_offset,
                     bits_scratch, bits_cap,
                     bytes_scratch, bytes_cap,
@@ -1674,7 +1636,7 @@ int main(int argc, char **argv)
             } else if (iq_mode) {
                 decoded = try_decode_window_iq(
                     win, window_samples, &mp, &opts,
-                    sync_max_ham, use_hmac, allow_partial_rs,
+                    sync_max_ham, /*use_hmac=*/0, allow_partial_rs,
                     inner_min_offset,
                     bits_scratch, bits_cap,
                     bytes_scratch, bytes_cap,
@@ -1685,7 +1647,7 @@ int main(int argc, char **argv)
             } else {
                 decoded = try_decode_window(
                     win, window_samples, &mp, &opts,
-                    sync_max_ham, use_hmac, allow_partial_rs,
+                    sync_max_ham, /*use_hmac=*/0, allow_partial_rs,
                     inner_min_offset,
                     bits_scratch, bits_cap,
                     bytes_scratch, bytes_cap,
@@ -1783,7 +1745,7 @@ int main(int argc, char **argv)
                 // its 4-state trellis is wrong and finds zero syncs.
                 int dec2 = try_decode_window_fsk(
                     tw, tw_pairs, &mp, &opts,
-                    sync_max_ham, use_hmac, allow_partial_rs,
+                    sync_max_ham, /*use_hmac=*/0, allow_partial_rs,
                     0,
                     bits_scratch, bits_cap,
                     bytes_scratch, bytes_cap,
@@ -1889,7 +1851,7 @@ int main(int argc, char **argv)
                     size_t sync_off_a = 0;
                     int dec_a = try_decode_window_fsk(
                         mix_buf, tw_pairs, &mp, &opts,
-                        sync_max_ham, use_hmac, allow_partial_rs,
+                        sync_max_ham, /*use_hmac=*/0, allow_partial_rs,
                         0,
                         bits_scratch, bits_cap,
                         bytes_scratch, bytes_cap,
@@ -1962,10 +1924,6 @@ done:
     fprintf(stderr, "    valid CSP header             : %ld\n", st.csp_ok);
     fprintf(stderr, "    RS corrected / uncorrectable : %ld / %ld\n",
             st.rs_corrected, st.rs_uncorrectable);
-    if (use_hmac) {
-        fprintf(stderr, "    HMAC ok / bad                : %ld / %ld\n",
-                st.hmac_ok, st.hmac_bad);
-    }
     fprintf(stderr, "    recognized / unrecognized    : %ld / %ld\n",
             st.recognized, st.unrecognized);
     fprintf(stderr, "    recognized by type           : "
