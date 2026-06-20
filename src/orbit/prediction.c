@@ -395,7 +395,7 @@ static int append_pass(const char *name, double minutes_until_visible,
 {
     void *mem = realloc(passes, sizeof *passes * (n_passes + 1));
     if (mem == NULL) {
-        printf("Unable to allocate memory for the pass info.\n");
+        fprintf(stderr, "Unable to allocate memory for the pass info.\n");
         return -4;
     }
     passes = mem;
@@ -481,7 +481,6 @@ int find_passes(prediction_t *external_prediction, double jul_utc_start, double 
     int internal_number_checked = 0;
     regex_t pattern = {0};
     if (criteria->regex != NULL) {
-        printf("regex: '%s'\n", criteria->regex);
         int flags = REG_EXTENDED;
         if (criteria->regex_ignore_case) {
             flags |= REG_ICASE;
