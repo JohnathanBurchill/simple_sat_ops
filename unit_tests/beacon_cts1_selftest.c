@@ -276,7 +276,7 @@ static void test_beacon_print_block(void)
            "print: rf_switch mode");
     tap_ok(strstr(txt, "time_sync=GNSS_PPS") != NULL,
            "print: time_sync source");
-    tap_ok(strstr(txt, "gnss=FIREHOSE") != NULL,
+    tap_ok(strstr(txt, "gnss_rx_mode=FIREHOSE") != NULL,
            "print: gnss rx mode");
     tap_ok(strstr(txt, "reboot=SOFTWARE") != NULL,
            "print: reboot reason");
