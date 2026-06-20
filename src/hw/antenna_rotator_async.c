@@ -76,7 +76,10 @@ static void abs_deadline(double delay_s, struct timespec *out)
     long add_ns = (long)(delay_s * 1e9);
     out->tv_sec  += add_ns / 1000000000L;
     out->tv_nsec += add_ns % 1000000000L;
-    if (out->tv_nsec >= 1000000000L) {
+    // Normalize with while, not if: the canonical timespec carry that holds
+    // regardless of how large the added nanoseconds are, so tv_nsec can never
+    // be handed to pthread_cond_timedwait out of [0, 1e9) (EINVAL/busy-spin).
+    while (out->tv_nsec >= 1000000000L) {
         out->tv_sec  += 1;
         out->tv_nsec -= 1000000000L;
     }
