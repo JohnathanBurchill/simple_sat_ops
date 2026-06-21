@@ -436,13 +436,15 @@ static int kepler_propagate_eci(const double r0[3], const double v0[3],
     };
     double e = sqrt(e_vec[0]*e_vec[0] + e_vec[1]*e_vec[1] + e_vec[2]*e_vec[2]);
 
-    // Eccentric anomaly at t0
-    double cosE0 = (1.0 - r0m / a) / (e > 1e-20 ? e : 1e-20);
-    if (cosE0 >  1.0) cosE0 =  1.0;
-    if (cosE0 < -1.0) cosE0 = -1.0;
-    double E0 = acos(cosE0);
+    // Eccentric anomaly at t0 from sin/cos via atan2. Isolating cosE0 by
+    // dividing by e loses precision for near-circular orbits (e -> 0), but
+    // r·v = sqrt(mu*a)*e*sinE and 1 - r/a = e*cosE, so atan2 of those two
+    // (the common factor e cancels) gives a well-conditioned E0 with the
+    // correct quadrant -- no e floor, no acos clamp, no manual sign fix.
     double rdv = r0[0]*v0[0] + r0[1]*v0[1] + r0[2]*v0[2];
-    if (rdv < 0.0) E0 = -E0;
+    double sinE0_scaled = rdv / sqrt(mu * a);   // = e*sinE0
+    double cosE0_scaled = 1.0 - r0m / a;        // = e*cosE0
+    double E0 = atan2(sinE0_scaled, cosE0_scaled);
 
     double n = sqrt(mu / (a*a*a));
     double M0 = E0 - e * sin(E0);
