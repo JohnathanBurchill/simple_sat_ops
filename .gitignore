@@ -1,6 +1,8 @@
 build
 build-lint
-sgp4sdp4
+# sgp4sdp4/ (the vendored Kyriazis SGP4/SDP4 C port) is tracked so CI can
+# build it; only its local build dir is ignored.
+sgp4sdp4/build/
 satellites
 TODO.md
 plot.gp
