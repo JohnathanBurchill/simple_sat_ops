@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on branch `any-sdr`, commit
-`4c2c6b3` (2026-06-20). This is a working draft.
+`c970c7d` (2026-06-20). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -138,6 +138,7 @@ manual can go back on the shelf where it belongs.
     - [`uplink_test`](#uplink_test)
     - [`rx_decode`](#rx_decode)
     - [`lifetime`](#lifetime)
+    - [Amateur-band voice: `ham_listen` and `ham_speak`](#amateur-band-voice-ham_listen-and-ham_speak)
 14. [Testing and validation](#testing-and-validation)
     - [How the code is validated: four layers](#how-the-code-is-validated-four-layers)
     - [Running the unit tests](#running-the-unit-tests)
@@ -2029,6 +2030,62 @@ Toy orbit-decay estimator. Reads a TLE, extrapolates a B*-derived
 decay rate, prints an estimated time on orbit. The repository
 README flags this as **inaccurate**. Treat the number as
 ballpark-only and don't make scheduling decisions from it.
+
+### Amateur-band voice: `ham_listen` and `ham_speak`
+
+FrontierSat shares 436.15 MHz with the rest of the amateur community,
+and `simple_sat_ops` is not the only thing that might be on the air. Two
+small tools let you be a courteous neighbour around an ops session:
+listen first to make sure the frequency is clear, say out loud that
+you're about to start, run the pass, and afterward say you're done. The
+modulation is ordinary narrowband FM, the same as a handheld on UHF
+simplex, so anyone listening on a normal radio hears you and you hear
+them. Both use the system default sound device for the speakers and
+microphone.
+
+A typical session, start to finish:
+
+```sh
+ham_listen                       # is anyone using 436.15? listen, then Ctrl-C
+ham_speak --allow-tx             # "VA6RAO starting satellite ops, please stand by"
+simple_sat_ops --control next    # ... fly the pass ...
+ham_speak --allow-tx             # "VA6RAO finished, the frequency is yours, enjoy"
+```
+
+**`ham_listen`** tunes the SDR, FM-demodulates, and pipes the audio to
+your speakers until you press Ctrl-C. It runs on either backend (a
+receive-only RTL-SDR is fine for listening). Useful options:
+`--freq-mhz=<f>` (default 436.15), `--gain-db=<n>`, `--squelch=<level>`
+to mute below a carrier-strength threshold (default off - you hear the
+open-channel hiss), and `--deemphasis-hz=<hz>` for the audio
+high-frequency rolloff. A periodic `level` readout on the status line
+shows the received carrier strength so you can pick a squelch value.
+
+**`ham_speak`** records your voice from the microphone, and when you
+press Ctrl-C transmits the whole clip as one continuous FM burst. You
+speak first; it goes out a moment later (it is not a live, keyed-up
+PTT). Because it transmits, it is **TX-inhibited by default** - pass
+`--allow-tx` to actually key the radio. A receive-only SDR (RTL-SDR)
+can't transmit and is refused. Useful options: `--freq-mhz=<f>`,
+`--tx-level=<dB>` (TX gain, default 50), `--deviation-hz=<hz>` (default
+5000, standard NBFM), `--max-talk-s=<s>` (default 60), `--review` to
+play the recording back and confirm before transmitting, and
+`--dump-iq=<path>` to render the modulated IQ to a file instead of
+keying - a no-RF dry run that works without a transmit-capable radio
+(handy on a dev host).
+
+Etiquette and the rules:
+
+- **Identify by voice.** `ham_speak` sends no automatic station ID - say
+  your callsign as your licence requires, at the start and end.
+- **Don't key during a pass.** 436.15 MHz is the satellite's own carrier.
+  Use these tools *around* an ops session, not during one; check
+  `next_in_queue` if you're unsure when the next pass is. There is no
+  software interlock - this is on you.
+- **Pick the right frequency for a real chat.** 436.15 is the satellite
+  simplex carrier, fine for a brief "starting / finished" courtesy call.
+  For an actual conversation, move to an appropriate local simplex
+  frequency with `--freq-mhz=<f>`.
 
 ## Testing and validation
 

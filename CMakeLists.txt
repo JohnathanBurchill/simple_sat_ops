@@ -167,6 +167,14 @@ if (WITH_USRP_B210)
     pkg_check_modules(LIBUSB libusb-1.0)
 endif()
 
+# Amateur-band voice tools (ham_listen / ham_speak). They use the
+# vendored, self-contained miniaudio (external/miniaudio/miniaudio.h) for
+# live mic/speaker I/O, so there's no system audio library to probe --
+# the only hard requirement is an SDR backend (the b210_rx_tx_core
+# chain), so they live in the WITH_USRP_B210 block below. Off-switch
+# only; nothing to soft-gate.
+option(WITH_HAM_VOICE "Build the ham_listen / ham_speak voice tools" ON)
+
 option(WITH_RTL_SDR "Build the RTL-SDR RX-only backend (needs librtlsdr)" ON)
 # WITH_RTL_SDR is the user's request (cached). SSO_RTL_SDR_ENABLED is the
 # effective state after probing librtlsdr. Keeping them separate avoids
@@ -463,6 +471,20 @@ target_include_directories(sw_nco_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(sw_nco_selftest PRIVATE m)
 list(APPEND SSO_TARGETS sw_nco_selftest)
 
+# FM modulator + ramp selftest (src/dsp/fm_mod.c). Pure DSP, no UHD/audio.
+add_executable(fm_mod_selftest unit_tests/fm_mod_selftest.c
+               src/dsp/fm_mod.c)
+target_include_directories(fm_mod_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(fm_mod_selftest PRIVATE m)
+list(APPEND SSO_TARGETS fm_mod_selftest)
+
+# Linear upsampler selftest (src/dsp/resample.c). Pure DSP.
+add_executable(resample_selftest unit_tests/resample_selftest.c
+               src/dsp/resample.c)
+target_include_directories(resample_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(resample_selftest PRIVATE m)
+list(APPEND SSO_TARGETS resample_selftest)
+
 # CTS1 beacon parser selftest. Audits every byte offset, enum mapping,
 # and length-anchored sniff in beacon_cts1.c. The flight firmware is
 # pinned at sat-1-rc3; a silent regression here shows up as wrong
@@ -728,7 +750,7 @@ if (OPENSSL_FOUND)
                    src/proto/csp.c src/proto/ax100.c
                    src/proto/rs.c src/proto/golay24.c
                    src/proto/hmac_keyfile.c
-                   src/dsp/asm_search.c src/dsp/modem.c)
+                   src/dsp/asm_search.c src/dsp/modem.c src/dsp/fm_mod.c)
     target_include_directories(tx_burst_selftest PRIVATE
         ${UNIT_TESTS_INCLUDE} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(tx_burst_selftest PRIVATE
@@ -804,6 +826,66 @@ if (OPENSSL_FOUND)
         endif()
         target_link_sso_core(b210_gain_sweep)
         list(APPEND SSO_TARGETS b210_gain_sweep)
+
+        # Amateur-band voice courtesy tools. ham_listen pipes demodulated
+        # NBFM to the speakers; ham_speak records the mic and transmits it
+        # as one burst. Both drive the same b210_rx_tx_core chain as the
+        # operational receiver, plus the vendored miniaudio for live audio
+        # (mic/speaker) and (ham_speak) the shared FM modulator + upsampler.
+        if (WITH_HAM_VOICE)
+            # Common source set: the SDR chain (mirrors b210_gain_sweep) +
+            # the self-contained miniaudio TU + the audio wrapper.
+            set(HAM_COMMON_SRC
+                src/audio/audio_io.c src/audio/miniaudio_impl.c
+                src/hw/b210_rx_tx_core.c
+                src/hw/sdr_backend.c src/hw/sdr_uhd.c
+                src/hw/sdr_usb_detect.c src/hw/carrier_trim.c
+                src/dsp/fir_decim.c src/dsp/sw_nco.c src/dsp/iq_burst.c
+                src/dsp/asm_search.c src/dsp/modem.c)
+
+            add_executable(ham_listen utils/ham_listen.c ${HAM_COMMON_SRC})
+            add_executable(ham_speak  utils/ham_speak.c  ${HAM_COMMON_SRC}
+                           src/dsp/fm_mod.c src/dsp/resample.c)
+
+            foreach(ham_tgt ham_listen ham_speak)
+                target_compile_definitions(${ham_tgt} PRIVATE WITH_USRP_B210)
+                target_include_directories(${ham_tgt} PRIVATE
+                    ${UHD_INCLUDE_DIRS}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/external/miniaudio
+                    ${CMAKE_CURRENT_SOURCE_DIR}/src/audio)
+                target_link_directories(${ham_tgt} PRIVATE ${UHD_LIBRARY_DIRS})
+                target_link_libraries(${ham_tgt} PRIVATE ${UHD_LIBRARIES} m)
+                if (LIBUSB_FOUND)
+                    target_compile_definitions(${ham_tgt} PRIVATE HAVE_LIBUSB)
+                    target_include_directories(${ham_tgt} PRIVATE ${LIBUSB_INCLUDE_DIRS})
+                    target_link_directories(${ham_tgt} PRIVATE ${LIBUSB_LIBRARY_DIRS})
+                    target_link_libraries(${ham_tgt} PRIVATE ${LIBUSB_LIBRARIES})
+                endif()
+                if (SSO_RTL_SDR_ENABLED)
+                    # RX-only RTL-SDR support (ham_listen; ham_speak refuses
+                    # TX on it at runtime). The backend source is required
+                    # because sdr_backend.c's ops_for() references the RTL
+                    # ops vtable under WITH_RTL_SDR.
+                    target_compile_definitions(${ham_tgt} PRIVATE WITH_RTL_SDR)
+                    target_sources(${ham_tgt} PRIVATE
+                        ${CMAKE_CURRENT_SOURCE_DIR}/src/hw/sdr_rtlsdr.c)
+                    target_include_directories(${ham_tgt} PRIVATE ${RTLSDR_INCLUDE_DIRS})
+                    target_link_directories(${ham_tgt} PRIVATE ${RTLSDR_LIBRARY_DIRS})
+                    target_link_libraries(${ham_tgt} PRIVATE ${RTLSDR_LIBRARIES})
+                endif()
+                # miniaudio backends: CoreAudio frameworks on macOS, the
+                # dlopen'd ALSA/PulseAudio path needs libdl on Linux.
+                if (APPLE)
+                    target_link_libraries(${ham_tgt} PRIVATE
+                        "-framework CoreFoundation" "-framework CoreAudio"
+                        "-framework AudioToolbox")
+                else()
+                    target_link_libraries(${ham_tgt} PRIVATE ${CMAKE_DL_LIBS})
+                endif()
+                target_link_sso_core(${ham_tgt})
+                list(APPEND SSO_TARGETS ${ham_tgt})
+            endforeach()
+        endif()
 
         # Live B210 RX + TX is no longer a separate target — the
         # daemon was folded into simple_sat_ops (FLYUFLS), which now
@@ -958,7 +1040,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
                        src/hw/sdr_backend.c
                        src/hw/carrier_trim.c
                        src/dsp/fir_decim.c src/dsp/sw_nco.c
-                       src/dsp/iq_burst.c
+                       src/dsp/iq_burst.c src/dsp/fm_mod.c
                        src/pipeline/rx_session.c src/pipeline/tx_burst.c)
     endif()
     if (WITH_USRP_B210)

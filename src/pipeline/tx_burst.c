@@ -6,6 +6,7 @@
 #include "ax100.h"
 #include "b210_rx_tx_core.h"
 #include "csp.h"
+#include "fm_mod.h"
 #include "modem.h"
 
 #ifdef SSO_WITH_SDR
@@ -52,37 +53,6 @@ ssize_t tx_burst_parse_hex(const char *hex, uint8_t *out, size_t cap)
     }
     if (hi >= 0) return -1;
     return (ssize_t) n;
-}
-
-static void fm_modulate(const int16_t *pcm, size_t n_pcm,
-                         double dev_hz, double fs, int16_t *iq_out)
-{
-    static double phi = 0.0;
-    const double k = 2.0 * M_PI * dev_hz / fs;
-    const double inv = 1.0 / 32767.0;
-    for (size_t i = 0; i < n_pcm; i++) {
-        double x = (double) pcm[i] * inv;
-        phi += k * x;
-        if (phi >  M_PI) phi -= 2.0 * M_PI;
-        if (phi < -M_PI) phi += 2.0 * M_PI;
-        iq_out[2 * i + 0] = (int16_t) lround(cos(phi) * 22937.0);
-        iq_out[2 * i + 1] = (int16_t) lround(sin(phi) * 22937.0);
-    }
-}
-
-static void apply_ramp(int16_t *iq, size_t n_samps, size_t ramp_n)
-{
-    if (ramp_n == 0) return;
-    if (ramp_n > n_samps / 2) ramp_n = n_samps / 2;
-    for (size_t i = 0; i < ramp_n; i++) {
-        double env_in  = 0.5 * (1.0 - cos(M_PI * (double) i / (double) ramp_n));
-        double env_out = 0.5 * (1.0 + cos(M_PI * (double) i / (double) ramp_n));
-        iq[2 * i + 0] = (int16_t) lround((double) iq[2 * i + 0] * env_in);
-        iq[2 * i + 1] = (int16_t) lround((double) iq[2 * i + 1] * env_in);
-        size_t k = n_samps - ramp_n + i;
-        iq[2 * k + 0] = (int16_t) lround((double) iq[2 * k + 0] * env_out);
-        iq[2 * k + 1] = (int16_t) lround((double) iq[2 * k + 1] * env_out);
-    }
 }
 
 long tx_burst_doppler_freq_hz(double nominal_carrier_hz,
@@ -187,17 +157,22 @@ static int build_iq(const uint8_t *payload, size_t payload_len,
     int16_t *iq = calloc(n_iq_total * 2, sizeof(int16_t));
     if (iq == NULL) { free(preroll_pcm); free(pcm); return -1; }
 
+    // One phase accumulator for the whole concatenated waveform so the
+    // preroll and each repeat stay phase-continuous (the gaps between
+    // repeats are zeros, but the carrier phase still threads through).
+    fm_mod_t fm;
+    fm_mod_init(&fm);
     if (preroll_pcm) {
-        fm_modulate(preroll_pcm, preroll_samps, deviation_hz,
-                    (double) mp.samp_rate, iq);
+        fm_mod_block(&fm, preroll_pcm, preroll_samps, deviation_hz,
+                     (double) mp.samp_rate, iq);
     }
     for (int r = 0; r < repeat; r++) {
         size_t off = preroll_samps + (size_t) r * per_rep;
-        fm_modulate(pcm, n_pcm, deviation_hz, (double) mp.samp_rate,
-                    iq + off * 2);
+        fm_mod_block(&fm, pcm, n_pcm, deviation_hz, (double) mp.samp_rate,
+                     iq + off * 2);
         size_t burst_start = (r == 0) ? 0 : off;
         size_t burst_n     = (r == 0) ? (preroll_samps + n_pcm) : n_pcm;
-        apply_ramp(iq + burst_start * 2, burst_n, ramp_samps);
+        fm_apply_ramp(iq + burst_start * 2, burst_n, ramp_samps);
     }
 
     free(preroll_pcm); free(pcm);

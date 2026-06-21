@@ -244,6 +244,29 @@ frame should show up as two tones roughly 3 kHz apart.
 
 ---
 
+## Amateur-band voice courtesy (`ham_listen` / `ham_speak`)
+
+Be a good neighbour on 436.15 MHz around an ops session: listen for a
+clear frequency, announce you're starting, fly the pass, then announce
+you're done. Narrowband FM, like a UHF handheld; uses the system default
+speakers/mic.
+
+```sh
+ham_listen                    # live FM voice to the speakers, Ctrl-C to stop
+ham_speak --allow-tx          # record mic, Ctrl-C, then transmit it as one burst
+ham_speak --dump-iq=out.iq    # dry run: render the TX IQ to a file, no RF, no --allow-tx
+```
+
+`ham_speak` is TX-inhibited without `--allow-tx`, sends no automatic
+station ID (identify by voice with your callsign), and refuses to run on
+a receive-only SDR. Don't key 436.15 during a satellite pass; for an
+actual chat move to a suitable simplex frequency with `--freq-mhz=<f>`.
+Other flags: `--tx-level=<dB>` (default 50), `--deviation-hz=<hz>`
+(default 5000), `--max-talk-s=<s>` (default 60), `--review`. See
+`ham_listen --help` / `ham_speak --help`.
+
+---
+
 ## Troubleshooting
 
 **`Invalid TLE` errors on Celestrak files.** Confirmed handled as of
