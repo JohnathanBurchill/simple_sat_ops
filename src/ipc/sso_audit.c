@@ -1,6 +1,7 @@
 #include "sso_audit.h"
 
 #include "sso_paths.h"
+#include "sso_time.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -95,17 +96,6 @@ const char *sso_unix_user(void) {
     return buf;
 }
 
-static void iso_utc_from_ts(const struct timespec *ts,
-                            char *out, size_t out_size) {
-    struct tm tm;
-    gmtime_r(&ts->tv_sec, &tm);
-    snprintf(out, out_size,
-             "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec,
-             (long) (ts->tv_nsec / 1000000));
-}
-
 // Sanitize one free-form field: replace tabs and newlines with spaces
 // so they don't break the tab-separated record format.
 static void sanitize(char *s) {
@@ -126,7 +116,7 @@ static int append_line_at(const char *event, const char *detail,
     int fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0664);
     if (fd < 0) return -1;
     char tsbuf[64];
-    iso_utc_from_ts(ts, tsbuf, sizeof(tsbuf));
+    sso_iso_utc_from_ts(ts, tsbuf, sizeof(tsbuf));
     char user_buf[64];
     snprintf(user_buf, sizeof(user_buf), "%s", sso_unix_user());
     sanitize(user_buf);

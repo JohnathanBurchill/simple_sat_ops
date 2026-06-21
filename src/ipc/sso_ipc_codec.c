@@ -10,6 +10,7 @@
 #define _GNU_SOURCE  // gmtime_r and friends on glibc
 #include "sso_ipc.h"
 #include "sso_ipc_internal.h"
+#include "sso_time.h"
 
 #include <fcntl.h>      // O_NONBLOCK (sso_ipc_set_nonblock)
 #include <signal.h>     // sigaction (sso_ipc_sigpipe_ignore_once)
@@ -17,7 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>       // clock_gettime / gmtime_r (sso_ipc_iso_utc_now)
+#include <time.h>       // clock_gettime (sso_ipc_iso_utc_now)
 
 // =============================================================
 // Shared low-level helpers (used by the server and client transports).
@@ -57,13 +58,7 @@ void sso_ipc_sigpipe_ignore_once(void) {
 void sso_ipc_iso_utc_now(char *out, size_t out_size) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    struct tm tm;
-    gmtime_r(&ts.tv_sec, &tm);
-    snprintf(out, out_size,
-             "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec,
-             (long) (ts.tv_nsec / 1000000));
+    sso_iso_utc_from_ts(&ts, out, out_size);
 }
 
 static int json_append(char **p, char *end, const char *s) {

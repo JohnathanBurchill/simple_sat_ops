@@ -25,6 +25,7 @@
 #ifndef SSO_TIME_H
 #define SSO_TIME_H
 
+#include <stdio.h>
 #include <sys/time.h>
 #include <time.h>
 
@@ -59,6 +60,21 @@ static inline long long sso_now_utc_ms(void)
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (long long) tv.tv_sec * 1000LL + tv.tv_usec / 1000LL;
+}
+
+// Format a timestamp as "YYYY-MM-DDThh:mm:ss.mmmZ" (UTC, millisecond
+// precision) into out. Shared by the IPC codec's per-event timestamps and
+// the audit log so the two formats never drift.
+static inline void sso_iso_utc_from_ts(const struct timespec *ts,
+                                        char *out, size_t out_size)
+{
+    struct tm tm;
+    gmtime_r(&ts->tv_sec, &tm);
+    snprintf(out, out_size,
+             "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec,
+             (long) (ts->tv_nsec / 1000000));
 }
 
 #ifdef __cplusplus
