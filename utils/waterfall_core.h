@@ -53,6 +53,12 @@ typedef struct wf_opts {
 // texture for live recolouring.
 extern const uint8_t WF_VIRIDIS[256][3];
 
+// Shared radix-2 FFT primitives (also used by live_waterfall). wf_is_pow2
+// reports whether n is a power of two; wf_fft_forward does an in-place
+// forward DFT on the length-n (power-of-two) re/im arrays.
+int  wf_is_pow2(unsigned n);
+void wf_fft_forward(float *re, float *im, unsigned n);
+
 // Compute the spectrogram dB grid.
 // - iq: interleaved int16 I,Q pairs (length 2 * n_pairs samples).
 // - n_pairs: number of IQ pairs.

@@ -22,7 +22,7 @@
 // Iterative radix-2 FFT (in-place).
 // --------------------------------------------------------------------
 
-static int is_pow2(unsigned n) { return n > 0 && (n & (n - 1)) == 0; }
+int wf_is_pow2(unsigned n) { return n > 0 && (n & (n - 1)) == 0; }
 
 static void fft_bit_reverse(float *re, float *im, unsigned n)
 {
@@ -38,7 +38,7 @@ static void fft_bit_reverse(float *re, float *im, unsigned n)
     }
 }
 
-static void fft_forward(float *re, float *im, unsigned n)
+void wf_fft_forward(float *re, float *im, unsigned n)
 {
     fft_bit_reverse(re, im, n);
     for (unsigned len = 2; len <= n; len <<= 1) {
@@ -232,7 +232,7 @@ int wf_compute(const int16_t *iq, size_t n_pairs,
     }
     int N = opt->fft_size;
     int H = opt->hop;
-    if (!is_pow2((unsigned) N) || N < 16 || H <= 0 || H > N) {
+    if (!wf_is_pow2((unsigned) N) || N < 16 || H <= 0 || H > N) {
         fprintf(stderr, "waterfall_core: invalid fft/hop\n");
         return -1;
     }
@@ -271,7 +271,7 @@ int wf_compute(const int16_t *iq, size_t n_pairs,
             re[i] = I * w;
             im[i] = Q * w;
         }
-        fft_forward(re, im, (unsigned) N);
+        wf_fft_forward(re, im, (unsigned) N);
         // fftshift: output bin 0 = -Fs/2, bin N/2 = DC, bin N-1 = +Fs/2-bin.
         for (int k = 0; k < N; ++k) {
             int src = (k + N / 2) % N;

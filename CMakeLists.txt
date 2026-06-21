@@ -378,7 +378,7 @@ if (RAYLIB_FOUND)
     add_executable(live_waterfall utils/live_waterfall.c)
     target_include_directories(live_waterfall PRIVATE ${RAYLIB_INCLUDE_DIRS})
     target_link_directories(live_waterfall PRIVATE ${RAYLIB_LIBRARY_DIRS})
-    target_link_libraries(live_waterfall PRIVATE ${RAYLIB_LIBRARIES} m)
+    target_link_libraries(live_waterfall PRIVATE waterfall_core ${RAYLIB_LIBRARIES} m)
     # Homebrew's raylib.pc on macOS doesn't list the Cocoa / OpenGL /
     # IOKit frameworks the static lib pulls in (and the dylib variant
     # isn't always installed). Add them explicitly on Darwin; harmless
