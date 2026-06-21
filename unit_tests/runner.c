@@ -408,6 +408,7 @@ int main(int argc, char **argv)
         "iq_burst_selftest",
         "packet_db_selftest",
         "tx_burst_selftest",
+        "hmac_keyfile_selftest",
     };
     int n_names = (int)(sizeof names / sizeof names[0]);
     group_t groups[24];

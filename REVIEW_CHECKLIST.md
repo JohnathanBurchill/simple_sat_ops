@@ -267,8 +267,11 @@ confirmed memory-safety overrun in the live RX byte-parsing core.
 - [ ] `ax100.c:182,303` — `mac[4]`/`expected[4]` not zero-init (written before use;
   house style). `ax100.c:308` — `memcmp` not constant-time (non-issue in current
   use; matters only if reused for uplink auth).
-- [ ] `hmac_keyfile.c:136-144` — "non-uppercase-hex" message also rejects lowercase
-  (wording).
+- [x] `hmac_keyfile.c:136-144` — "non-uppercase-hex" message also rejects lowercase
+  (wording). Reworded to "non-hex or lowercase char ... (the key must be uppercase
+  0-9 A-F)". Same pass added `unit_tests/hmac_keyfile_selftest.c` (28 assertions:
+  permission-mode matrix + parser) and a `uplink_test --fix-permissions` repair
+  action (`setfacl -b` + chmod) via new `hmac_keyfile_fix_permissions`.
 
 ### Pipeline
 - [ ] `rx_session.c:719,1385` — `long` sample counts wrap on a long pass; WAV

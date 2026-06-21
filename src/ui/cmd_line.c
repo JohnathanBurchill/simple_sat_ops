@@ -351,7 +351,7 @@ static void cmd_dispatch(state_t *state)
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "h") == 0 || strcmp(cmd, "?") == 0) {
         cmd_set_status(state, "commands: help tx track stop home quit "
                        "retarget <tle-file> "
-                       "freq <MHz> lo_offset <±kHz> lo_bandwidth <kHz> "
+                       "freq <MHz> lo_offset <signed_kHz> lo_bandwidth <kHz> "
                        "gain <dB> rs on|off spectrum <sec>");
     } else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0
                || strcmp(cmd, "exit") == 0) {
@@ -567,7 +567,7 @@ static void cmd_dispatch(state_t *state)
         // case still keeps a 3 kHz margin to the post-decim band edge.
         if (arg1 == NULL) {
             cmd_set_status(state, "lo_offset: usage `lo_offset <signed_kHz>` "
-                           "(comfort range ±5..±40)");
+                           "(comfort range +/-5..+/-40)");
         } else {
 #ifdef SSO_WITH_SDR
             double khz = atof(arg1);

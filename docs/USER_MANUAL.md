@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on branch `any-sdr`, commit
-`8ea3243` (2026-06-19). This is a working draft.
+`4c2c6b3` (2026-06-20). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -676,12 +676,21 @@ warnings Apple clang misses. Output lives in `build-lint/`.
    knobs. It installs to `/usr/local/bin` with the other tools via
    `sudo make install`.
 
-3. **HMAC key.** Required for any on-air uplink. The operator UI
+3. **HMAC key.** Required for any on-air uplink (it signs every
+   transmitted frame; the downlink is checked separately by its CSP
+   CRC32, so a key problem never affects receiving). The operator UI
    loads the shared keyfile (`/FrontierSat/HMAC/frontiersat_hmac`),
    failing that `$HOME/.local/state/simple_sat_ops/frontiersat_hmac`,
-   failing that `--hmac-keyfile <path>` on the command line. The
-   operator banner shows `(N bytes ok)`, `(MISSING)`, or `(BAD)` so
-   you can confirm it loaded. The bytes never reach the UI.
+   failing that `--hmac-keyfile <path>` on the command line. The file
+   must be plain **uppercase** hex, no spaces or separators, one
+   optional trailing newline, and `chmod 0600` (personal) or `0640`
+   (the shared, group-`sso-ops`-readable copy) - any world bit or a
+   stray ACL is rejected. The operator banner shows `(N bytes ok)`,
+   `(MISSING)`, or `(BAD - see --self-test)` so you can confirm it loaded; the
+   bytes never reach the UI. If it shows `(BAD)` or `(MISSING)`, see
+   [the HMAC banner entry under Troubleshooting](#troubleshooting) -
+   `uplink_test --fix-permissions` repairs a permissions/ACL problem in
+   place.
 
 4. **Rotator calibration.** One-time per controller:
 
@@ -2428,18 +2437,54 @@ the controller off, the operator UI still starts; it just renders
 `?` on the rotator panel and the track loop won't drive the
 antenna.
 
-**`(BAD)` or `(MISSING)` on the HMAC banner**
+**`(BAD - see --self-test)` or `(MISSING)` on the HMAC banner (or `hmac: ... status=bad` in `--self-test`)**
 
-Uplink bursts won't make it into the satellite. Check the keyfile
-exists and has the expected length:
+The HMAC key signs every uplink, so a key problem means the next TX
+request is refused before the PA is keyed. It does *not* affect
+receiving - the downlink is verified by its CSP CRC32, not the HMAC -
+so you can keep tracking and decoding while you sort the key out.
+
+- **`(MISSING)`** - no keyfile was found at any of the three
+  locations. Create one (see the keyfile step under
+  [First-run setup](#first-run-setup)) or point the run at an
+  existing key with `--hmac-keyfile <path>`.
+- **`(BAD)`** - a keyfile was found but rejected. The exact reason is
+  printed once at startup, before the UI paints over it, so the
+  reliable way to read it is the dry run, which never takes the
+  screen:
+
+  ```sh
+  simple_sat_ops <tle> <satellite> --self-test
+  ```
+
+  Look for the `hmac_keyfile:` line in that output. The two common
+  causes:
+
+  - **Permissions or a stray ACL** - "`must be chmod 0600 or 0640 (got
+    0NNN)`". Repair it in place:
+
+    ```sh
+    uplink_test --fix-permissions          # default keyfile path
+    uplink_test --fix-permissions --keyfile=/FrontierSat/HMAC/frontiersat_hmac
+    ```
+
+    That strips any ACL (`setfacl -b`) - which can grant access the
+    plain mode bits don't show - and then `chmod`s to `0600`, or
+    `0640` for the shared keyfile. (Fixing the shared key under
+    `/FrontierSat` needs write permission on it, so run it as the
+    owner/admin.)
+  - **Malformed contents** - "`non-hex or lowercase char ...`",
+    "`... hex chars (must be even)`", or "`is empty`". The key must be
+    plain uppercase hex with no spaces or separators; recreate it per
+    the keyfile setup step.
+
+A quick existence-and-length check, independent of all the above:
 
 ```sh
 ls -la /FrontierSat/HMAC/frontiersat_hmac
 ls -la "$HOME/.local/state/simple_sat_ops/frontiersat_hmac"
 wc -c "$HOME/.local/state/simple_sat_ops/frontiersat_hmac"
 ```
-
-Or pass `--hmac-keyfile <path>` to override.
 
 **TX-inhibit messages**
 

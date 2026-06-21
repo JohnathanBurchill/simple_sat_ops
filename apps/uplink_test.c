@@ -49,6 +49,7 @@ typedef struct {
     const char *payload_ascii;
     const char *keyfile_path;
     const char *out_wav;
+    int fix_permissions;
     int use_hmac;
     int use_rs;
     int print_frame;
@@ -99,6 +100,11 @@ static int parse_args(uplink_args_t *a, int argc, char **argv, int help)
         if (starts_with(arg, "--keyfile=") || help) {
             if (help) parse_help_line(OPTW, "--keyfile=<path>", "HMAC keyfile (default: $HOME/" HMAC_KEYFILE_DEFAULT_RELPATH ")");
             else a->keyfile_path = arg + 10;
+            matched = 1;
+        }
+        if (strcmp(arg, "--fix-permissions") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--fix-permissions", "repair the keyfile (setfacl -b + chmod 0600/0640) then exit");
+            else a->fix_permissions = 1;
             matched = 1;
         }
         if (strcmp(arg, "--no-hmac") == 0 || help) {
@@ -250,6 +256,7 @@ int main(int argc, char **argv)
         .payload_ascii = NULL,
         .keyfile_path = NULL,
         .out_wav = NULL,
+        .fix_permissions = 0,
         .use_hmac = 1,
         .use_rs = 1,  // default ON to match pycsplink uplink
         .print_frame = 0,
@@ -289,6 +296,22 @@ int main(int argc, char **argv)
     mp.gauss_bt = cfg.gauss_bt;
     mp.gauss_symbol_span = cfg.gauss_symbol_span;
     mp.gain_db = cfg.gain_db;
+
+    // --fix-permissions is a standalone maintenance action: resolve the
+    // keyfile (honouring --keyfile=, else the default path), repair its
+    // access control, and exit without composing a frame.
+    if (cfg.fix_permissions) {
+        char default_path[512];
+        const char *path = keyfile_path;
+        if (path == NULL) {
+            if (hmac_keyfile_default_path(default_path, sizeof(default_path)) != 0) {
+                fprintf(stderr, "HOME is unset; pass --keyfile=<path>\n");
+                return 1;
+            }
+            path = default_path;
+        }
+        return hmac_keyfile_fix_permissions(path) == 0 ? 0 : 1;
+    }
 
     if ((payload_hex == NULL) == (payload_ascii == NULL)) {
         fprintf(stderr, "pass exactly one of --payload-hex or --payload-ascii\n");

@@ -307,6 +307,14 @@ add_executable(argparse_selftest
 target_include_directories(argparse_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS argparse_selftest)
 
+# hmac_keyfile self-test: the keyfile permission gate (exactly 0600 or
+# 0640, any world/group-write bit rejected) and the hex parser that
+# feeds every uplink burst's HMAC. Touches /tmp; no extra libs.
+add_executable(hmac_keyfile_selftest
+               unit_tests/hmac_keyfile_selftest.c src/proto/hmac_keyfile.c)
+target_include_directories(hmac_keyfile_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+list(APPEND SSO_TARGETS hmac_keyfile_selftest)
+
 # Curses test runner: walks the *_selftest binaries built above (and
 # any added later in this file), parses TAP from their stdout, and
 # renders a collapsible group view. Requires ncurses; if not present

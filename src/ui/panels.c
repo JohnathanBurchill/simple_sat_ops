@@ -634,7 +634,7 @@ void render_status_panel(const status_panel_t *p,
             tag = tag_buf;
             break;
         case HMAC_DISPLAY_MISSING: tag = "(MISSING)";      break;
-        case HMAC_DISPLAY_BAD:     tag = "(BAD — see log)"; break;
+        case HMAC_DISPLAY_BAD:     tag = "(BAD - see --self-test)"; break;
         case HMAC_DISPLAY_UNSET:
         default:                   tag = "(unset)";        break;
         }

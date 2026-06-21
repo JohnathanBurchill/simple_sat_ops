@@ -21,10 +21,14 @@
 #include "hmac_keyfile.h"
 
 #include <errno.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+
+extern char **environ;
 
 static int hex_value(char c)
 {
@@ -137,7 +141,8 @@ ssize_t hmac_keyfile_load(const char *path, uint8_t *out, size_t out_cap)
         int v = hex_value(buf[i]);
         if (v < 0) {
             fprintf(stderr,
-                    "hmac_keyfile: %s has non-uppercase-hex char 0x%02X at offset %zu\n",
+                    "hmac_keyfile: %s has a non-hex or lowercase char 0x%02X "
+                    "at offset %zu (the key must be uppercase 0-9 A-F)\n",
                     path, (unsigned char)buf[i], i);
             return -1;
         }
@@ -150,4 +155,82 @@ ssize_t hmac_keyfile_load(const char *path, uint8_t *out, size_t out_cap)
     }
 
     return (ssize_t)n_bytes;
+}
+
+// Runs `setfacl -b <path>` to strip every extended ACL entry. Spawned
+// directly (no shell) so a path with spaces or shell metacharacters is
+// safe. Returns 0 if setfacl ran and exited 0; -1 if it couldn't be
+// spawned (e.g. macOS, which has no setfacl) or exited non-zero.
+static int run_setfacl_b(const char *path)
+{
+    char *const argv[] = { "setfacl", "-b", (char *)path, NULL };
+    pid_t pid;
+    if (posix_spawnp(&pid, "setfacl", NULL, NULL, argv, environ) != 0) {
+        return -1;
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        return -1;
+    }
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+int hmac_keyfile_fix_permissions(const char *path)
+{
+    if (path == NULL) {
+        return -1;
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        fprintf(stderr, "hmac_keyfile: stat(%s): %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr,
+                "hmac_keyfile: %s is not a regular file; refusing to fix\n",
+                path);
+        return -1;
+    }
+
+    // The shared keyfile is group-readable (sso-ops); a personal one is
+    // owner-only. Either is a valid target for hmac_keyfile_load.
+    unsigned target = (strcmp(path, HMAC_KEYFILE_SHARED_PATH) == 0) ? 0640u
+                                                                    : 0600u;
+
+    // Strip ACLs first: with an extended ACL present the group mode bits
+    // show the ACL mask, not the real group entry, so the mode check can
+    // be fooled. Removing the ACL makes the plain mode bits govern again.
+    // Run it unconditionally (idempotent) even if the mode already looks
+    // valid. setfacl is Linux-only; warn and carry on where it's absent.
+    if (run_setfacl_b(path) != 0) {
+        fprintf(stderr,
+                "hmac_keyfile: warning: `setfacl -b %s` did not run "
+                "(setfacl not installed?); skipping ACL strip, "
+                "continuing to chmod\n",
+                path);
+    }
+
+    if (chmod(path, target) != 0) {
+        fprintf(stderr, "hmac_keyfile: chmod 0%03o %s: %s\n",
+                target, path, strerror(errno));
+        return -1;
+    }
+
+    // Confirm the file now passes the same gate hmac_keyfile_load applies.
+    if (stat(path, &st) != 0) {
+        fprintf(stderr, "hmac_keyfile: re-stat(%s): %s\n", path, strerror(errno));
+        return -1;
+    }
+    unsigned mode = st.st_mode & 0777;
+    if (mode != 0600 && mode != 0640) {
+        fprintf(stderr,
+                "hmac_keyfile: %s still at 0%03o after fix (an ACL or "
+                "mount option may be overriding the mode)\n",
+                path, mode);
+        return -1;
+    }
+
+    fprintf(stderr, "hmac_keyfile: %s permissions set to 0%03o\n", path, mode);
+    return 0;
 }

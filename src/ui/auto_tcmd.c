@@ -334,7 +334,7 @@ static void auto_tcmd_draw(state_t *state) {
                          a->repeats, 6,
                          !running_ro && a->focus == AUTO_F_REPEATS,
                          a->cursors[AUTO_F_REPEATS]);
-    mvwprintw(w, 4, 24, "per command (TCM1 N×, then TCM2 N×, ...)");
+    mvwprintw(w, 4, 24, "per command (TCM1 Nx, then TCM2 Nx, ...)");
     wclrtoeol(w);
 
     auto_draw_text_field(w, 5, 2, "Delay    ",
@@ -381,7 +381,7 @@ static void auto_tcmd_draw(state_t *state) {
 
     if (a->state == AUTO_STATE_RUNNING) {
         mvwprintw(w, 14, 2,
-                  "Running — s stops   Esc closes (and stops)");
+                  "Running - s stops   Esc closes (and stops)");
     } else {
         mvwprintw(w, 14, 2,
                   "Tab focus  Space toggle  Enter start  Esc cancel");
@@ -574,7 +574,7 @@ static int auto_tcmd_start(state_t *state) {
     a->next_send_ns  = a->start_ns;  // first send fires immediately
     a->state         = AUTO_STATE_RUNNING;
     snprintf(a->status_msg, sizeof a->status_msg,
-             "running: %d cmds × %d repeats, %.2f s delay",
+             "running: %d cmds x %d repeats, %.2f s delay",
              a->n_commands, repeats, delay);
     {
         char det[256];

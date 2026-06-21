@@ -57,4 +57,14 @@ ssize_t hmac_keyfile_load(const char *path, uint8_t *out, size_t out_cap);
 // readable. Returns 0 on success, -1 if neither location resolves.
 int hmac_keyfile_default_path(char *out_path, size_t out_cap);
 
+// Repairs `path` so hmac_keyfile_load will accept it. First strips any
+// POSIX ACL entries with `setfacl -b` (an ACL can grant access the
+// plain mode bits don't reveal, so removing it is part of the canonical
+// keyfile setup), then chmods the file to a valid mode: 0640 for the
+// shared keyfile (group sso-ops reads it), 0600 for a personal one.
+// Reports what it did to stderr. Returns 0 if the file ends up at a
+// valid mode, -1 on error. setfacl is Linux-only; on a host without it
+// the ACL strip is skipped (with a warning) and the chmod still runs.
+int hmac_keyfile_fix_permissions(const char *path);
+
 #endif // HMAC_KEYFILE_H

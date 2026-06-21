@@ -162,6 +162,12 @@ chmod 600 ~/.local/state/simple_sat_ops/frontiersat_hmac
 
 If your existing key is base64, convert once with `base64 -d | xxd -p -u`.
 
+If the key is rejected for its permissions (a stray ACL or a too-open
+mode), `uplink_test --fix-permissions` repairs it in place: it strips any
+ACL with `setfacl -b`, then `chmod`s to 0600 (or 0640 for the shared
+`/FrontierSat/HMAC/frontiersat_hmac`). Add `--keyfile=<path>` to target a
+non-default location.
+
 ### 2. IC-9700 one-time commissioning
 
 These never change session-to-session; do them at the front panel once:
