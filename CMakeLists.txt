@@ -1166,3 +1166,32 @@ install(DIRECTORY etc/ DESTINATION ${CMAKE_INSTALL_DATADIR}/sso/etc
             PATTERN "*.conf"
             PATTERN "*.rules"
             PATTERN "sso")
+
+# ----- ctest registration ---------------------------------------------------
+#
+# Until now the only way to run the suite was the interactive ncurses
+# unit_test_runner, which needs a terminal and a human at the keyboard.
+# That kept the tests out of any automated check. Register every
+# *_selftest target that actually got built (the set varies with which
+# optional libraries the host has) so `ctest` runs them unattended and
+# fails on the first non-zero exit:
+#
+#     cmake --build build --target selftests   # build them all
+#     ctest --test-dir build --output-on-failure
+#
+# This iterates SSO_TARGETS, so a newly added selftest is picked up with
+# no edit here. The `selftests` aggregate target lets CI build the whole
+# set without naming each one (and so without rotting when tests are
+# added). unit_test_runner is excluded by the _selftest$ name match.
+enable_testing()
+set(SSO_SELFTEST_TARGETS "")
+foreach(_sso_t IN LISTS SSO_TARGETS)
+    if (_sso_t MATCHES "_selftest$")
+        add_test(NAME ${_sso_t} COMMAND ${_sso_t})
+        set_tests_properties(${_sso_t} PROPERTIES TIMEOUT 120)
+        list(APPEND SSO_SELFTEST_TARGETS ${_sso_t})
+    endif()
+endforeach()
+if (SSO_SELFTEST_TARGETS)
+    add_custom_target(selftests DEPENDS ${SSO_SELFTEST_TARGETS})
+endif()
