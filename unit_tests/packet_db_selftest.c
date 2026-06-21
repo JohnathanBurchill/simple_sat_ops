@@ -55,6 +55,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 
 // Build a tmpfile path that we'll feed packet_db_open. mkstemp creates
 // + opens a placeholder; close + unlink it so packet_db_open's
@@ -490,6 +491,146 @@ static void test_close_null_safe(void)
     tap_ok(1, "close: NULL pointer no-op survives");
 }
 
+// ------------------------------------------------------------------
+// 12. Parallel writers. The DB advertises WAL + busy_timeout + INSERT OR
+//     IGNORE so several processes can write the same file at once without
+//     loss or duplicate rows. Nothing exercised that. Fork a handful of
+//     writers that contend on one DB: each hammers a SHARED record set
+//     (identical across children -> must dedup to one row each, however
+//     the inserts interleave) plus a per-child UNIQUE set (distinct
+//     payloads -> all must survive). The final row counts don't depend on
+//     the interleaving, so they're a deterministic oracle for "no lost
+//     write, no false dedup" under real contention.
+// ------------------------------------------------------------------
+#define PW_CHILDREN 4
+#define PW_SHARED   8
+#define PW_UNIQUE   16
+
+// Runs in a forked child: open an independent connection and insert.
+// Returns 0 on success, non-zero on any open/insert failure. No TAP here
+// (only the parent owns the TAP stream).
+static int parallel_child_work(const char *path, int child_idx)
+{
+    packet_db_t *db = packet_db_open(path);
+    if (db == NULL) {
+        return 1;
+    }
+    // Shared set: identical for every child, inserted twice each to pile
+    // on contention and exercise repeat-dedup. All collapse to PW_SHARED.
+    for (int rep = 0; rep < 2; ++rep) {
+        for (int k = 0; k < PW_SHARED; ++k) {
+            uint8_t pl[3] = { 0xAA, (uint8_t)k, 0x00 };
+            packet_db_record_t r = make_record(pl, sizeof pl, "pw-shared");
+            if (packet_db_insert(db, &r) != 0) {
+                packet_db_close(db);
+                return 2;
+            }
+        }
+    }
+    // Unique set: payload carries the child index, so no child's payloads
+    // collide with another's. All PW_CHILDREN*PW_UNIQUE must survive.
+    for (int j = 0; j < PW_UNIQUE; ++j) {
+        uint8_t pl[3] = { 0xBB, (uint8_t)child_idx, (uint8_t)j };
+        packet_db_record_t r = make_record(pl, sizeof pl, "pw-unique");
+        if (packet_db_insert(db, &r) != 0) {
+            packet_db_close(db);
+            return 3;
+        }
+    }
+    packet_db_close(db);
+    return 0;
+}
+
+typedef struct {
+    const char *path;
+    int idx;
+    int rc;
+} pw_thread_arg_t;
+
+static void *parallel_writer_thread(void *p)
+{
+    pw_thread_arg_t *a = (pw_thread_arg_t *)p;
+    a->rc = parallel_child_work(a->path, a->idx);
+    return NULL;
+}
+
+static void test_parallel_writers(void)
+{
+    char path[64];
+    if (make_tmp_db_path(path, sizeof path) != 0) {
+        tap_bail("mkstemp"); return;
+    }
+    // Create the schema once up front so the writers only contend on
+    // INSERTs (the property under test), not on first-time migration.
+    packet_db_t *seed = packet_db_open(path);
+    if (seed == NULL) {
+        tap_bail("seed open"); unlink(path); return;
+    }
+    packet_db_close(seed);
+
+    // Separate connections from separate threads contend on the WAL write
+    // lock exactly as separate processes do -- SQLite's locking is per
+    // connection, not per process -- so this drives the same busy_timeout +
+    // INSERT OR IGNORE path the multi-process claim relies on, without the
+    // fork()-without-exec abort sqlite triggers on macOS.
+    pthread_t th[PW_CHILDREN];
+    pw_thread_arg_t args[PW_CHILDREN];
+    int spawned = 0;
+    for (int c = 0; c < PW_CHILDREN; ++c) {
+        args[c].path = path;
+        args[c].idx  = c;
+        args[c].rc   = -1;
+        if (pthread_create(&th[c], NULL, parallel_writer_thread, &args[c]) != 0) {
+            break;
+        }
+        spawned++;
+    }
+    for (int i = 0; i < spawned; ++i) {
+        pthread_join(th[i], NULL);
+    }
+    tap_okf(spawned == PW_CHILDREN, "spawned %d concurrent writers (want %d)",
+            spawned, PW_CHILDREN);
+
+    int all_ok = 1, worst = 0;
+    for (int i = 0; i < spawned; ++i) {
+        if (args[i].rc != 0) {
+            all_ok = 0;
+            if (args[i].rc > worst) worst = args[i].rc;
+        }
+    }
+    tap_okf(all_ok,
+            "every concurrent insert returned success (busy_timeout absorbed "
+            "contention; worst rc=%d)", worst);
+
+    sqlite3 *raw = NULL;
+    int rc = sqlite3_open_v2(path, &raw, SQLITE_OPEN_READONLY, NULL);
+    if (rc != SQLITE_OK) {
+        tap_okf(0, "raw open after parallel writes (rc=%d)", rc);
+        unlink(path); return;
+    }
+    long shared = count_rows(raw,
+        "SELECT count(*) FROM packet WHERE source_tool='pw-shared';");
+    long uniq = count_rows(raw,
+        "SELECT count(*) FROM packet WHERE source_tool='pw-unique';");
+    long total = count_rows(raw, "SELECT count(*) FROM packet;");
+    sqlite3_close(raw);
+
+    tap_okf(shared == PW_SHARED,
+            "shared records deduped under contention: %ld rows (want %d)",
+            shared, PW_SHARED);
+    tap_okf(uniq == (long)PW_CHILDREN * PW_UNIQUE,
+            "every writer's unique records survived: %ld rows (want %d)",
+            uniq, PW_CHILDREN * PW_UNIQUE);
+    tap_okf(total == PW_SHARED + (long)PW_CHILDREN * PW_UNIQUE,
+            "total rows exact, no lost write: %ld (want %d)",
+            total, PW_SHARED + PW_CHILDREN * PW_UNIQUE);
+
+    unlink(path);
+    char side[80];
+    snprintf(side, sizeof side, "%s-wal", path); unlink(side);
+    snprintf(side, sizeof side, "%s-shm", path); unlink(side);
+}
+
 int main(void)
 {
     test_open_fresh_creates_schema();
@@ -503,5 +644,6 @@ int main(void)
     test_register_tle_idempotent();
     test_make_run_id();
     test_close_null_safe();
+    test_parallel_writers();
     return tap_done();
 }

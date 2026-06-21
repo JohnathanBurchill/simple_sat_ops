@@ -601,7 +601,7 @@ if (OPENSSL_FOUND AND SQLITE3_FOUND)
     target_link_directories(packet_db_selftest PRIVATE
         ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(packet_db_selftest PRIVATE
-        ${OPENSSL_LIBRARIES} m)
+        ${OPENSSL_LIBRARIES} m Threads::Threads)
     target_link_packet_db(packet_db_selftest)
     target_link_sso_core(packet_db_selftest)
     list(APPEND SSO_TARGETS packet_db_selftest)

@@ -356,6 +356,12 @@ packet_db_t *packet_db_open(const char *path)
         errno = EIO;
         return NULL;
     }
+    // Set the busy timeout BEFORE any locking statement. The WAL pragma,
+    // schema apply, and the migration blocks below all take the write lock;
+    // without a timeout in place a concurrent opener that hits the lock fails
+    // the open outright (returns NULL) instead of waiting. 5 s is generous
+    // for our single-row work but bounded enough to surface a real deadlock.
+    sqlite3_busy_timeout(raw, 5000);
     // WAL gives concurrent readers + one writer without the readers
     // blocking. Multiple receivers writing in parallel still serialise
     // on the single-writer rule, but that's fine at our packet rates.
@@ -367,13 +373,6 @@ packet_db_t *packet_db_open(const char *path)
         errno = EIO;
         return NULL;
     }
-    // busy_timeout: when a writer contends (another process running
-    // packet_browser / packet_query / rx_decode while a pass is being
-    // recorded), wait up to 5 s for the lock instead of immediately
-    // returning SQLITE_BUSY ("database is locked"). 5 s is generous
-    // for our single-row inserts but bounded enough to surface a real
-    // deadlock.
-    sqlite3_busy_timeout(raw, 5000);
     // synchronous=NORMAL is the standard WAL companion: durable across
     // process crashes (fsync at checkpoint), not across OS crashes.
     // Cuts per-insert latency without affecting our use case (post-
