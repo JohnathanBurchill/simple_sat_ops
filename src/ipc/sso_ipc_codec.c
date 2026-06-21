@@ -269,10 +269,9 @@ static int json_unescape_into(const char *src, size_t srclen,
     return 0;
 }
 
-static int json_get_field(const char *json, const char *key,
+static int json_get_field(const char *json, size_t json_len, const char *key,
                             int *was_string, const char **val_start,
                             const char **val_end) {
-    size_t json_len = strlen(json);
     const char *p = json;
     const char *end = json + json_len;
     json_skip_ws(&p, end);
@@ -315,11 +314,11 @@ static int json_get_field(const char *json, const char *key,
     return 0;
 }
 
-static int json_get_string(const char *json, const char *key,
+static int json_get_string(const char *json, size_t json_len, const char *key,
                             char *out, size_t out_size) {
     int is_str;
     const char *vs, *ve;
-    int r = json_get_field(json, key, &is_str, &vs, &ve);
+    int r = json_get_field(json, json_len, key, &is_str, &vs, &ve);
     if (r <= 0) return r;
     if (!is_str) return -1;
     if (json_unescape_into(vs, (size_t) (ve - vs), out, out_size) < 0)
@@ -327,10 +326,10 @@ static int json_get_string(const char *json, const char *key,
     return 1;
 }
 
-static int json_get_int(const char *json, const char *key, long *out) {
+static int json_get_int(const char *json, size_t json_len, const char *key, long *out) {
     int is_str;
     const char *vs, *ve;
-    int r = json_get_field(json, key, &is_str, &vs, &ve);
+    int r = json_get_field(json, json_len, key, &is_str, &vs, &ve);
     if (r <= 0) return r;
     char tmp[40];
     size_t n = (size_t) (ve - vs);
@@ -344,10 +343,10 @@ static int json_get_int(const char *json, const char *key, long *out) {
     return 1;
 }
 
-static int json_get_double(const char *json, const char *key, double *out) {
+static int json_get_double(const char *json, size_t json_len, const char *key, double *out) {
     int is_str;
     const char *vs, *ve;
-    int r = json_get_field(json, key, &is_str, &vs, &ve);
+    int r = json_get_field(json, json_len, key, &is_str, &vs, &ve);
     if (r <= 0) return r;
     char tmp[40];
     size_t n = (size_t) (ve - vs);
@@ -361,10 +360,10 @@ static int json_get_double(const char *json, const char *key, double *out) {
     return 1;
 }
 
-static int json_get_bool(const char *json, const char *key, int *out) {
+static int json_get_bool(const char *json, size_t json_len, const char *key, int *out) {
     int is_str;
     const char *vs, *ve;
-    int r = json_get_field(json, key, &is_str, &vs, &ve);
+    int r = json_get_field(json, json_len, key, &is_str, &vs, &ve);
     if (r <= 0) return r;
     size_t n = (size_t) (ve - vs);
     if (n == 4 && memcmp(vs, "true", 4) == 0) { *out = 1; return 1; }
@@ -374,11 +373,11 @@ static int json_get_bool(const char *json, const char *key, int *out) {
 
 // Copy the raw substring of the value (including quotes / braces /
 // brackets) for fields that are arrays or pre-serialised objects.
-static int json_get_raw(const char *json, const char *key,
+static int json_get_raw(const char *json, size_t json_len, const char *key,
                          char *out, size_t out_size) {
     int is_str;
     const char *vs, *ve;
-    int r = json_get_field(json, key, &is_str, &vs, &ve);
+    int r = json_get_field(json, json_len, key, &is_str, &vs, &ve);
     if (r <= 0) return r;
     // For raw extraction we want quotes/brackets included as found in
     // the original; json_get_field strips string quotes, so put them
@@ -672,131 +671,134 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
 int sso_event_decode(const char *line, sso_event_t *evt) {
     if (!line || !evt) return -1;
     memset(evt, 0, sizeof(*evt));
+    // Measure the line once and thread it through every json_get_* below.
+    // Each used to strlen the whole line, making decode O(fields x length).
+    size_t line_len = strlen(line);
     char t[32];
-    if (json_get_string(line, "t", t, sizeof(t)) <= 0) return -1;
+    if (json_get_string(line, line_len, "t", t, sizeof(t)) <= 0) return -1;
     evt->type = sso_event_type_from_name(t);
-    json_get_string(line, "ts", evt->ts, sizeof(evt->ts));
-    json_get_string(line, "from", evt->from, sizeof(evt->from));
-    json_get_string(line, "role", evt->role, sizeof(evt->role));
-    json_get_string(line, "user", evt->user, sizeof(evt->user));
-    json_get_string(line, "operator", evt->operator_user, sizeof(evt->operator_user));
-    json_get_string(line, "prev", evt->prev, sizeof(evt->prev));
-    json_get_string(line, "new", evt->new_user, sizeof(evt->new_user));
-    json_get_string(line, "by", evt->by, sizeof(evt->by));
-    json_get_string(line, "to", evt->to, sizeof(evt->to));
+    json_get_string(line, line_len, "ts", evt->ts, sizeof(evt->ts));
+    json_get_string(line, line_len, "from", evt->from, sizeof(evt->from));
+    json_get_string(line, line_len, "role", evt->role, sizeof(evt->role));
+    json_get_string(line, line_len, "user", evt->user, sizeof(evt->user));
+    json_get_string(line, line_len, "operator", evt->operator_user, sizeof(evt->operator_user));
+    json_get_string(line, line_len, "prev", evt->prev, sizeof(evt->prev));
+    json_get_string(line, line_len, "new", evt->new_user, sizeof(evt->new_user));
+    json_get_string(line, line_len, "by", evt->by, sizeof(evt->by));
+    json_get_string(line, line_len, "to", evt->to, sizeof(evt->to));
     int forced = 0;
-    if (json_get_bool(line, "forced", &forced) > 0) evt->forced = forced;
-    json_get_string(line, "reason", evt->reason, sizeof(evt->reason));
-    json_get_string(line, "pass_folder", evt->pass_folder, sizeof(evt->pass_folder));
+    if (json_get_bool(line, line_len, "forced", &forced) > 0) evt->forced = forced;
+    json_get_string(line, line_len, "reason", evt->reason, sizeof(evt->reason));
+    json_get_string(line, line_len, "pass_folder", evt->pass_folder, sizeof(evt->pass_folder));
 
-    if (json_get_string(line, "sat", evt->satellite, sizeof(evt->satellite)) > 0) {
+    if (json_get_string(line, line_len, "sat", evt->satellite, sizeof(evt->satellite)) > 0) {
         evt->has_state = 1;
     }
-    if (json_get_string(line, "source", evt->source, sizeof(evt->source)) > 0) {
+    if (json_get_string(line, line_len, "source", evt->source, sizeof(evt->source)) > 0) {
         evt->has_state = 1;
     }
-    if (json_get_double(line, "az", &evt->az) > 0) evt->has_state = 1;
-    if (json_get_double(line, "el", &evt->el) > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "az", &evt->az) > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "el", &evt->el) > 0) evt->has_state = 1;
     long freq;
-    if (json_get_int(line, "freq", &freq) > 0) {
+    if (json_get_int(line, line_len, "freq", &freq) > 0) {
         evt->freq_hz = freq;
         evt->has_state = 1;
     }
-    if (json_get_double(line, "doppler", &evt->doppler_hz) > 0) evt->has_state = 1;
-    if (json_get_string(line, "rx_status", evt->rx_status, sizeof(evt->rx_status)) > 0) evt->has_state = 1;
-    if (json_get_string(line, "tx_status", evt->tx_status, sizeof(evt->tx_status)) > 0) evt->has_state = 1;
-    if (json_get_string(line, "tle_path", evt->tle_path, sizeof(evt->tle_path)) > 0) evt->has_state = 1;
-    if (json_get_double(line, "target_az", &evt->target_az) > 0) evt->has_state = 1;
-    if (json_get_double(line, "target_el", &evt->target_el) > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "doppler", &evt->doppler_hz) > 0) evt->has_state = 1;
+    if (json_get_string(line, line_len, "rx_status", evt->rx_status, sizeof(evt->rx_status)) > 0) evt->has_state = 1;
+    if (json_get_string(line, line_len, "tx_status", evt->tx_status, sizeof(evt->tx_status)) > 0) evt->has_state = 1;
+    if (json_get_string(line, line_len, "tle_path", evt->tle_path, sizeof(evt->tle_path)) > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "target_az", &evt->target_az) > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "target_el", &evt->target_el) > 0) evt->has_state = 1;
     int flag = 0;
-    if (json_get_bool(line, "flip",     &flag) > 0) evt->flip = flag;
-    if (json_get_bool(line, "in_pass",  &flag) > 0) evt->in_pass = flag;
-    if (json_get_bool(line, "tracking", &flag) > 0) evt->tracking = flag;
-    if (json_get_double(line, "jul", &evt->jul_utc) > 0) evt->has_state = 1;
+    if (json_get_bool(line, line_len, "flip",     &flag) > 0) evt->flip = flag;
+    if (json_get_bool(line, line_len, "in_pass",  &flag) > 0) evt->in_pass = flag;
+    if (json_get_bool(line, line_len, "tracking", &flag) > 0) evt->tracking = flag;
+    if (json_get_double(line, line_len, "jul", &evt->jul_utc) > 0) evt->has_state = 1;
     int rotflag = 0;
-    if (json_get_bool(line, "has_rot", &rotflag) > 0) evt->has_rotator = rotflag;
-    if (json_get_string(line, "idesg", evt->idesg, sizeof evt->idesg) > 0)
+    if (json_get_bool(line, line_len, "has_rot", &rotflag) > 0) evt->has_rotator = rotflag;
+    if (json_get_string(line, line_len, "idesg", evt->idesg, sizeof evt->idesg) > 0)
         evt->has_state = 1;
-    if (json_get_double(line, "ep_min", &evt->epoch_min)    > 0) evt->has_state = 1;
-    if (json_get_double(line, "mv",     &evt->min_visible)  > 0) evt->has_state = 1;
-    if (json_get_double(line, "ma0",    &evt->min_above_0)  > 0) evt->has_state = 1;
-    if (json_get_double(line, "ma30",   &evt->min_above_30) > 0) evt->has_state = 1;
-    if (json_get_double(line, "max_el", &evt->max_el)       > 0) evt->has_state = 1;
-    if (json_get_double(line, "p_az",   &evt->pred_az)      > 0) evt->has_state = 1;
-    if (json_get_double(line, "p_el",   &evt->pred_el)      > 0) evt->has_state = 1;
-    if (json_get_double(line, "alt",    &evt->alt_km)       > 0) evt->has_state = 1;
-    if (json_get_double(line, "lat",    &evt->lat_deg)      > 0) evt->has_state = 1;
-    if (json_get_double(line, "lon",    &evt->lon_deg)      > 0) evt->has_state = 1;
-    if (json_get_double(line, "spd",    &evt->speed_kms)    > 0) evt->has_state = 1;
-    if (json_get_double(line, "rng",    &evt->range_km)     > 0) evt->has_state = 1;
-    if (json_get_double(line, "rrate",  &evt->range_rate_kms) > 0) evt->has_state = 1;
-    if (json_get_raw(line, "roster", evt->roster_json, sizeof(evt->roster_json)) > 0) {
+    if (json_get_double(line, line_len, "ep_min", &evt->epoch_min)    > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "mv",     &evt->min_visible)  > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "ma0",    &evt->min_above_0)  > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "ma30",   &evt->min_above_30) > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "max_el", &evt->max_el)       > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "p_az",   &evt->pred_az)      > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "p_el",   &evt->pred_el)      > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "alt",    &evt->alt_km)       > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "lat",    &evt->lat_deg)      > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "lon",    &evt->lon_deg)      > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "spd",    &evt->speed_kms)    > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "rng",    &evt->range_km)     > 0) evt->has_state = 1;
+    if (json_get_double(line, line_len, "rrate",  &evt->range_rate_kms) > 0) evt->has_state = 1;
+    if (json_get_raw(line, line_len, "roster", evt->roster_json, sizeof(evt->roster_json)) > 0) {
         evt->has_state = 1;
     }
     // Auto-TCMD progress mirror. Absent fields stay zeroed (memset at
     // top of decode), which is what tells the viewer "no run to show".
     int at_flag = 0;
-    if (json_get_bool(line, "at_on", &at_flag) > 0) evt->auto_tcmd_on = at_flag;
+    if (json_get_bool(line, line_len, "at_on", &at_flag) > 0) evt->auto_tcmd_on = at_flag;
     long at_int = 0;
-    if (json_get_int(line, "at_sent", &at_int) > 0) evt->auto_tcmd_sent  = (int) at_int;
-    if (json_get_int(line, "at_tot",  &at_int) > 0) evt->auto_tcmd_total = (int) at_int;
-    json_get_string(line, "at_st", evt->auto_tcmd_state, sizeof(evt->auto_tcmd_state));
+    if (json_get_int(line, line_len, "at_sent", &at_int) > 0) evt->auto_tcmd_sent  = (int) at_int;
+    if (json_get_int(line, line_len, "at_tot",  &at_int) > 0) evt->auto_tcmd_total = (int) at_int;
+    json_get_string(line, line_len, "at_st", evt->auto_tcmd_state, sizeof(evt->auto_tcmd_state));
 
-    json_get_double(line, "snr_db", &evt->snr_db);
-    json_get_int(line, "packets", &evt->packets);
-    json_get_string(line, "last_packet_ts", evt->last_packet_ts, sizeof(evt->last_packet_ts));
-    json_get_string(line, "last_packet_summary", evt->last_packet_summary, sizeof(evt->last_packet_summary));
-    json_get_string(line, "ascii", evt->ascii, sizeof(evt->ascii));
-    json_get_string(line, "tx_kind", evt->tx_payload_kind, sizeof(evt->tx_payload_kind));
-    json_get_string(line, "tx_pl", evt->tx_payload, sizeof(evt->tx_payload));
+    json_get_double(line, line_len, "snr_db", &evt->snr_db);
+    json_get_int(line, line_len, "packets", &evt->packets);
+    json_get_string(line, line_len, "last_packet_ts", evt->last_packet_ts, sizeof(evt->last_packet_ts));
+    json_get_string(line, line_len, "last_packet_summary", evt->last_packet_summary, sizeof(evt->last_packet_summary));
+    json_get_string(line, line_len, "ascii", evt->ascii, sizeof(evt->ascii));
+    json_get_string(line, line_len, "tx_kind", evt->tx_payload_kind, sizeof(evt->tx_payload_kind));
+    json_get_string(line, line_len, "tx_pl", evt->tx_payload, sizeof(evt->tx_payload));
     long tx_int = 0;
-    if (json_get_int(line, "tx_src",  &tx_int) > 0) evt->tx_csp_src   = (uint8_t) tx_int;
-    if (json_get_int(line, "tx_dst",  &tx_int) > 0) evt->tx_csp_dst   = (uint8_t) tx_int;
-    if (json_get_int(line, "tx_dp",   &tx_int) > 0) evt->tx_csp_dport = (uint8_t) tx_int;
-    if (json_get_int(line, "tx_sp",   &tx_int) > 0) evt->tx_csp_sport = (uint8_t) tx_int;
-    if (json_get_int(line, "tx_prio", &tx_int) > 0) evt->tx_csp_prio  = (uint8_t) tx_int;
-    if (json_get_int(line, "tx_freq", &tx_int) > 0) evt->tx_freq_hz   = tx_int;
-    json_get_double(line, "tx_gain", &evt->tx_gain_db);
+    if (json_get_int(line, line_len, "tx_src",  &tx_int) > 0) evt->tx_csp_src   = (uint8_t) tx_int;
+    if (json_get_int(line, line_len, "tx_dst",  &tx_int) > 0) evt->tx_csp_dst   = (uint8_t) tx_int;
+    if (json_get_int(line, line_len, "tx_dp",   &tx_int) > 0) evt->tx_csp_dport = (uint8_t) tx_int;
+    if (json_get_int(line, line_len, "tx_sp",   &tx_int) > 0) evt->tx_csp_sport = (uint8_t) tx_int;
+    if (json_get_int(line, line_len, "tx_prio", &tx_int) > 0) evt->tx_csp_prio  = (uint8_t) tx_int;
+    if (json_get_int(line, line_len, "tx_freq", &tx_int) > 0) evt->tx_freq_hz   = tx_int;
+    json_get_double(line, line_len, "tx_gain", &evt->tx_gain_db);
     int tx_flag = 0;
-    if (json_get_bool(line, "tx_allow", &tx_flag) > 0) evt->tx_allow_tx         = tx_flag;
-    if (json_get_bool(line, "tx_hp",    &tx_flag) > 0) evt->tx_allow_high_power = tx_flag;
-    if (json_get_bool(line, "tx_hf",    &tx_flag) > 0) evt->tx_allow_hf_tx      = tx_flag;
-    if (json_get_int(line, "tx_rep", &tx_int) > 0) evt->tx_repeat = (int) tx_int;
-    if (json_get_int(line, "tx_gap", &tx_int) > 0) evt->tx_gap_ms = (int) tx_int;
-    json_get_string(line, "tx_st", evt->tx_not_sent_reason, sizeof(evt->tx_not_sent_reason));
-    json_get_string(line, "cmd_text",   evt->cmd_text,   sizeof(evt->cmd_text));
-    json_get_string(line, "cmd_status", evt->cmd_status, sizeof(evt->cmd_status));
+    if (json_get_bool(line, line_len, "tx_allow", &tx_flag) > 0) evt->tx_allow_tx         = tx_flag;
+    if (json_get_bool(line, line_len, "tx_hp",    &tx_flag) > 0) evt->tx_allow_high_power = tx_flag;
+    if (json_get_bool(line, line_len, "tx_hf",    &tx_flag) > 0) evt->tx_allow_hf_tx      = tx_flag;
+    if (json_get_int(line, line_len, "tx_rep", &tx_int) > 0) evt->tx_repeat = (int) tx_int;
+    if (json_get_int(line, line_len, "tx_gap", &tx_int) > 0) evt->tx_gap_ms = (int) tx_int;
+    json_get_string(line, line_len, "tx_st", evt->tx_not_sent_reason, sizeof(evt->tx_not_sent_reason));
+    json_get_string(line, line_len, "cmd_text",   evt->cmd_text,   sizeof(evt->cmd_text));
+    json_get_string(line, line_len, "cmd_status", evt->cmd_status, sizeof(evt->cmd_status));
 
     // RX panel mirror. Absent fields stay zeroed (memset at top of decode).
     int rx_flag = 0;
-    if (json_get_bool(line, "rx_has", &rx_flag) > 0) evt->rx_have_session = rx_flag;
-    if (json_get_bool(line, "rx_rec", &rx_flag) > 0) evt->rx_rec_active   = rx_flag;
-    json_get_double(line, "rx_fhz", &evt->rx_freq_hz);
-    json_get_double(line, "rx_pk",  &evt->rx_peak_dbfs);
-    json_get_double(line, "rx_rm",  &evt->rx_rms_dbfs);
+    if (json_get_bool(line, line_len, "rx_has", &rx_flag) > 0) evt->rx_have_session = rx_flag;
+    if (json_get_bool(line, line_len, "rx_rec", &rx_flag) > 0) evt->rx_rec_active   = rx_flag;
+    json_get_double(line, line_len, "rx_fhz", &evt->rx_freq_hz);
+    json_get_double(line, line_len, "rx_pk",  &evt->rx_peak_dbfs);
+    json_get_double(line, line_len, "rx_rm",  &evt->rx_rms_dbfs);
     long rx_long = 0;
-    if (json_get_int(line, "rx_fr", &rx_long) > 0) evt->rx_frames_total = rx_long;
-    if (json_get_int(line, "rx_fr_pcm", &rx_long) > 0) evt->rx_frames_pcm = rx_long;
-    if (json_get_int(line, "rx_fr_vt", &rx_long) > 0) evt->rx_frames_vit = rx_long;
-    json_get_string(line, "rx_lf",
+    if (json_get_int(line, line_len, "rx_fr", &rx_long) > 0) evt->rx_frames_total = rx_long;
+    if (json_get_int(line, line_len, "rx_fr_pcm", &rx_long) > 0) evt->rx_frames_pcm = rx_long;
+    if (json_get_int(line, line_len, "rx_fr_vt", &rx_long) > 0) evt->rx_frames_vit = rx_long;
+    json_get_string(line, line_len, "rx_lf",
                     evt->rx_last_frame_summary,
                     sizeof(evt->rx_last_frame_summary));
     // rx_age may be absent (no frame yet) — leave -1 sentinel via the
     // memset, unless the field is present.
-    if (json_get_double(line, "rx_age", &evt->rx_age_s) <= 0) {
+    if (json_get_double(line, line_len, "rx_age", &evt->rx_age_s) <= 0) {
         evt->rx_age_s = -1.0;
     }
     for (int s = 0; s < SSO_RX_PT_SLOTS; ++s) {
         char key[16];
         snprintf(key, sizeof key, "rx_pt%d_c", s);
         long c = 0;
-        if (json_get_int(line, key, &c) > 0) evt->rx_pt_count[s] = c;
+        if (json_get_int(line, line_len, key, &c) > 0) evt->rx_pt_count[s] = c;
         snprintf(key, sizeof key, "rx_pt%d_l", s);
         long n = 0;
-        if (json_get_int(line, key, &n) > 0) evt->rx_pt_payload_len[s] = (int) n;
+        if (json_get_int(line, line_len, key, &n) > 0) evt->rx_pt_payload_len[s] = (int) n;
         snprintf(key, sizeof key, "rx_pt%d_p", s);
         char hex[SSO_RX_PT_PAYLOAD_MAX * 2 + 1] = {0};
-        if (json_get_string(line, key, hex, sizeof hex) > 0) {
+        if (json_get_string(line, line_len, key, hex, sizeof hex) > 0) {
             int hl = (int) strlen(hex);
             int bytes = hl / 2;
             if (bytes > SSO_RX_PT_PAYLOAD_MAX) bytes = SSO_RX_PT_PAYLOAD_MAX;
@@ -812,17 +814,17 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
             }
         }
         snprintf(key, sizeof key, "rx_pt%d_s", s);
-        json_get_string(line, key, evt->rx_pt_summary[s],
+        json_get_string(line, line_len, key, evt->rx_pt_summary[s],
                         sizeof evt->rx_pt_summary[s]);
     }
-    json_get_string(line, "rx_warn", evt->rx_warning, sizeof evt->rx_warning);
-    if (json_get_string(line, "rx_rb",
+    json_get_string(line, line_len, "rx_warn", evt->rx_warning, sizeof evt->rx_warning);
+    if (json_get_string(line, line_len, "rx_rb",
                         evt->rx_ribbon, sizeof evt->rx_ribbon) > 0) {
         evt->rx_ribbon_n = (int) strlen(evt->rx_ribbon);
         if (evt->rx_ribbon_n > SSO_RIBBON_MAX) evt->rx_ribbon_n = SSO_RIBBON_MAX;
     }
     char rb_hex[SSO_RIBBON_MAX * 2 + 1] = {0};
-    if (json_get_string(line, "rx_rb_p", rb_hex, sizeof rb_hex) > 0) {
+    if (json_get_string(line, line_len, "rx_rb_p", rb_hex, sizeof rb_hex) > 0) {
         int hn = (int) strlen(rb_hex) / 2;
         if (hn > SSO_RIBBON_MAX) hn = SSO_RIBBON_MAX;
         for (int i = 0; i < hn; ++i) {
