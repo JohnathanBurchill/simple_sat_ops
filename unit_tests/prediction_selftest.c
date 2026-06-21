@@ -2,21 +2,31 @@
 
     Simple Satellite Operations  unit_tests/prediction_selftest.c
 
-    Smoke tests for prediction.c:
+    Tests for prediction.c:
       - tle_default_path: HOME-relative path expansion.
       - load_tle: known-hit, known-miss, and TLE name-match behaviour
         against a synthetic 3-line TLE fixture.
-      - update_satellite_position: at TLE epoch, LEO ephemeris fields
-        land in physically plausible ranges.
+      - update_satellite_position (SGP4, near-Earth): the propagated
+        az/el/range/range-rate are cross-checked against an INDEPENDENT
+        topocentric oracle (see check_topocentric_oracle below), not just
+        range-banded. This is what catches a swapped observation_set field
+        mapping or a missing radians->degrees conversion.
+      - update_satellite_position (SDP4, deep-space): the deep-space branch
+        is exercised with a real HEO TLE (AO-40), asserting the propagator
+        actually took the SDP4 path and that the same oracle holds.
       - update_pass_predictions: populates ascension + descent fields
-        consistently (descent_jul > ascension_jul, azimuths in
-        [0, 360), elevation in (0, 90]).
+        consistently (descent_jul > ascension_jul, azimuths in [0, 360),
+        elevation in (0, 90]).
+      - find_passes / get_pass / number_of_passes / free_passes: the pass
+        list is module-level static state; this exercises the full search,
+        the soonest-first / latest-first sort, the get_pass bounds, and the
+        free_passes reset.
 
-    The pass-prediction test searches forward from TLE epoch for the
-    first AOS visible from RAO; if none turns up in a 24-hour window
-    the test reports SKIP rather than failing -- SGP4 propagation is
-    deterministic given the TLE but the existence of a visible pass
-    in any given day depends on the geometry, not on prediction.c.
+    Where the existence of a result depends on orbit-vs-observer geometry
+    rather than on prediction.c (e.g. "is there a visible pass in the next
+    24 h"), the test reports SKIP rather than failing -- SGP4 propagation
+    is deterministic given the TLE, but the geometry is not the unit under
+    test.
 
     Exit status: 0 = all tests passed, non-zero = failure.
 
@@ -49,13 +59,21 @@
 
 #define check(cond, what) tap_ok((cond), (what))
 
-// Known-good 3-line TLE: OSCAR 7 (AO-7), an active LEO at ~1450 km
-// altitude with a ~12.5 rev/day orbit. Frozen in here (not pulled
-// from TLEs/) so the test is reproducible across TLE refreshes.
+// Fixture file holds two real, checksum-valid 3-line TLEs, frozen here
+// (not pulled from TLEs/) so the test is reproducible across TLE refreshes:
+//
+//   OSCAR 7 (AO-7) -- an active LEO at ~1450 km, ~12.5 rev/day. Near-Earth,
+//                     so update_satellite_position takes the SGP4 branch.
+//   AO-40          -- a defunct HEO at ~1.27 rev/day (period ~19 h). Deep
+//                     space, so it takes the SDP4 branch. Lines lifted
+//                     verbatim from the vendored sgp4sdp4/amateur.txt.
 static const char *FIXTURE_TLE =
     "OSCAR 7 (AO-7)\n"
     "1 07530U 74089B   25043.01160017 -.00000030  00000+0  10217-3 0  9990\n"
-    "2 07530 101.9936  46.0237 0012129 347.8272  22.1887 12.53686098299338\n";
+    "2 07530 101.9936  46.0237 0012129 347.8272  22.1887 12.53686098299338\n"
+    "AO-40\n"
+    "1 26609U 00072B   01098.10193978 -.00000077  00000-0  00000+0 0   623\n"
+    "2 26609   5.2776 206.5794 8139221 247.7100  15.0295  1.26974654  2011\n";
 
 static char *write_fixture_tle(void)
 {
@@ -102,6 +120,101 @@ static void prep_propagator(prediction_t *pred)
 {
     ClearFlag(ALL_FLAGS);
     select_ephemeris(&pred->satellite_ephem.tle);
+}
+
+// ----------------------------------------------------- topocentric oracle
+
+// Independent cross-check of update_satellite_position's topocentric
+// outputs (azimuth / elevation / range / range-rate). The oracle:
+//   1. re-propagates the satellite to the same time via SGP4/SDP4 directly,
+//   2. reconstructs the observer ECI state via Calculate_User_PosVel,
+//   3. REIMPLEMENTS the SEZ topocentric projection + field extraction here,
+// then compares to what prediction.c reported. A regression in how
+// prediction.c maps observation_set -> ephemeris fields shows up at once:
+//   - an azimuth<->elevation swap (obs_set.x <-> .y),
+//   - a range<->range-rate swap (obs_set.z <-> .w),
+//   - a dropped Degrees() (radians reported as degrees, off by ~57x).
+// A range-only band check sees none of those.
+//
+// We MUST re-propagate rather than read pred->satellite_ephem.position
+// back: update_satellite_position reuses that field as scratch for the
+// observer position at its tail (the Calculate_User_PosVel call), so on
+// return it holds the observer's ECI position, not the satellite's. Re-
+// calling SGP4/SDP4 with the stored (already unit-converted) TLE at the
+// same minutes_since_epoch reproduces the exact state update used, since
+// the propagator is deterministic given select_ephemeris's one-time init
+// (the same reason the pass-finder can call it in a tight loop).
+//
+// Tolerances: range, range-rate and azimuth are untouched by atmospheric
+// refraction and match to rounding. Calculate_Obs ADDS a Meeus refraction
+// term to elevation when the apparent elevation is >= 0 (it peaks near
+// +0.5 deg at the horizon and shrinks fast with altitude) and reports the
+// true elevation below the horizon -- so the reported elevation sits in
+// [el_true, el_true + ~0.55]. A 0.7 deg window is still far tighter than a
+// swap (tens of deg) or a units error (57x), so it pins both field and unit.
+static void check_topocentric_oracle(prediction_t *pred,
+                                     double jul_utc, const char *tag)
+{
+    // Re-propagate to the exact time update_satellite_position just used
+    // (it stashed minutes_since_epoch); pick SGP4/SDP4 by the same flag.
+    double mse = pred->minutes_since_epoch;
+    vector_t sp = {0}, sv = {0};
+    if (isFlagSet(DEEP_SPACE_EPHEM_FLAG))
+        SDP4(mse, &pred->satellite_ephem.tle, &sp, &sv);
+    else
+        SGP4(mse, &pred->satellite_ephem.tle, &sp, &sv);
+    Convert_Sat_State(&sp, &sv);          // normalised -> km, km/s
+
+    // Observer ECI position+velocity, computed exactly as sgp4sdp4 does for
+    // prediction.c. Use a copy of the geodetic: Calculate_User_PosVel writes
+    // .theta (the local sidereal time) as a side effect.
+    geodetic_t obs = pred->observer_ephem.position_geodetic;
+    vector_t obs_pos = {0}, obs_vel = {0};
+    Calculate_User_PosVel(jul_utc, &obs, &obs_pos, &obs_vel);
+
+    // Slant-range vector (sat - observer) and the relative velocity.
+    vector_t rng = {0}, rgv = {0};
+    rng.x = sp.x - obs_pos.x; rng.y = sp.y - obs_pos.y; rng.z = sp.z - obs_pos.z;
+    rgv.x = sv.x - obs_vel.x; rgv.y = sv.y - obs_vel.y; rgv.z = sv.z - obs_vel.z;
+    double rmag = sqrt(rng.x * rng.x + rng.y * rng.y + rng.z * rng.z);
+
+    // SEZ (south / east / zenith) projection at the observer. Same algebra
+    // as sgp4sdp4's Calculate_Obs, reproduced so the azimuth quadrant
+    // convention matches exactly.
+    double sin_lat = sin(obs.lat), cos_lat = cos(obs.lat);
+    double sin_th  = sin(obs.theta), cos_th = cos(obs.theta);
+    double top_s = sin_lat * cos_th * rng.x + sin_lat * sin_th * rng.y - cos_lat * rng.z;
+    double top_e = -sin_th * rng.x + cos_th * rng.y;
+    double top_z = cos_lat * cos_th * rng.x + cos_lat * sin_th * rng.y + sin_lat * rng.z;
+
+    double azim = atan(-top_e / top_s);
+    if (top_s > 0.0) azim += M_PI;
+    if (azim < 0.0)  azim += 2.0 * M_PI;
+    double el_true = asin(top_z / rmag);            // geometric (no refraction)
+    double rr = (rng.x * rgv.x + rng.y * rgv.y + rng.z * rgv.z) / rmag;
+
+    double az_deg = azim * 180.0 / M_PI;
+    double el_deg = el_true * 180.0 / M_PI;
+
+    tap_okf(fabs(pred->satellite_ephem.range_km - rmag) < 1e-3,
+            "%s: range_km == |sat-obs| (got %.6f, oracle %.6f km)",
+            tag, pred->satellite_ephem.range_km, rmag);
+
+    tap_okf(fabs(pred->satellite_ephem.range_rate_km_s - rr) < 1e-4,
+            "%s: range_rate == d|range|/dt (got %.6f, oracle %.6f km/s)",
+            tag, pred->satellite_ephem.range_rate_km_s, rr);
+
+    // Compare azimuth on the circle so 359.9 vs 0.1 reads as ~0, not ~360.
+    double daz = fabs(pred->satellite_ephem.azimuth - az_deg);
+    if (daz > 180.0) daz = 360.0 - daz;
+    tap_okf(daz < 1e-3,
+            "%s: azimuth == SEZ projection (got %.4f, oracle %.4f deg)",
+            tag, pred->satellite_ephem.azimuth, az_deg);
+
+    double del = pred->satellite_ephem.elevation - el_deg;
+    tap_okf(del > -1e-3 && del < 0.7,
+            "%s: elevation == geometric (+refraction) (got %.4f, oracle %.4f deg)",
+            tag, pred->satellite_ephem.elevation, el_deg);
 }
 
 // ---------------------------------------------------------- tle_default_path
@@ -191,13 +304,14 @@ static void test_load_tle_bad_path(void)
 
 // ------------------------------------------------- update_satellite_position
 
-// Contract: at the TLE epoch the propagated state should land in the
-// physical ranges expected for a 1450 km LEO. The exact (az, el, range)
-// depend on the orbit and observer geometry and are NOT asserted here
-// -- this test guards against gross regressions in the SGP4 plumbing.
+// Near-Earth / SGP4 branch. At several times spanning ~3/4 of an orbit the
+// propagated state must (a) land in the physical bands for AO-7 and (b)
+// agree with the independent topocentric oracle. The oracle is the part
+// that pins the actual az/el/range/range-rate values; the bands just guard
+// against a wholly broken propagation (negative altitude, 60 km/s, etc.).
 static void test_update_satellite_position(const char *tles_path)
 {
-    fprintf(stderr, "update_satellite_position (LEO sanity):\n");
+    fprintf(stderr, "update_satellite_position (SGP4 / near-Earth):\n");
     prediction_t pred;
     char name[64];
     snprintf(name, sizeof name, "OSCAR 7");
@@ -207,7 +321,11 @@ static void test_update_satellite_position(const char *tles_path)
         return;
     }
     prep_propagator(&pred);
+    check(!isFlagSet(DEEP_SPACE_EPHEM_FLAG),
+          "AO-7 (~12.5 rev/day) selects the near-Earth SGP4 path");
+
     double jul_epoch = Julian_Date_of_Epoch(pred.satellite_ephem.tle.epoch);
+
     update_satellite_position(&pred, jul_epoch);
 
     // LEO at ~1450 km altitude orbits at ~7.0 km/s. Allow generous slack.
@@ -215,16 +333,54 @@ static void test_update_satellite_position(const char *tles_path)
           "speed_km_s in (6, 8.5) -- LEO range");
     check(pred.satellite_ephem.altitude_km > 1300.0 && pred.satellite_ephem.altitude_km < 1600.0,
           "altitude_km in (1300, 1600) for AO-7's apogee-ish band");
-    check(pred.satellite_ephem.azimuth >= 0.0 && pred.satellite_ephem.azimuth <= 360.0,
-          "azimuth in [0, 360]");
-    check(pred.satellite_ephem.elevation >= -90.0 && pred.satellite_ephem.elevation <= 90.0,
-          "elevation in [-90, 90]");
-    check(pred.satellite_ephem.range_km > 0.0 && pred.satellite_ephem.range_km < 20000.0,
-          "range_km in (0, 20000) km (observer-to-sat at LEO)");
     check(pred.satellite_ephem.latitude > -90.0 && pred.satellite_ephem.latitude < 90.0,
           "sub-satellite latitude in (-90, 90)");
     check(pred.satellite_ephem.longitude > -180.0 && pred.satellite_ephem.longitude < 360.0,
           "sub-satellite longitude in (-180, 360)");
+
+    // Independent topocentric cross-check at three points spanning the orbit
+    // (~4600 s period), so the oracle is exercised at distinct geometries.
+    check_topocentric_oracle(&pred, jul_epoch, "epoch");
+    update_satellite_position(&pred, jul_epoch + 23.0 / 1440.0);
+    check_topocentric_oracle(&pred, jul_epoch + 23.0 / 1440.0, "epoch+23min");
+    update_satellite_position(&pred, jul_epoch + 57.0 / 1440.0);
+    check_topocentric_oracle(&pred, jul_epoch + 57.0 / 1440.0, "epoch+57min");
+}
+
+// Deep-space / SDP4 branch. AO-40's ~19 h period puts it over the 225-min
+// threshold, so select_ephemeris must flag it deep-space and
+// update_satellite_position must route through SDP4. The same topocentric
+// oracle then confirms the field wiring is correct on this path too.
+static void test_update_satellite_position_deep_space(const char *tles_path)
+{
+    fprintf(stderr, "update_satellite_position (SDP4 / deep-space):\n");
+    prediction_t pred;
+    char name[64];
+    snprintf(name, sizeof name, "AO-40");
+    init_pred(&pred, tles_path, name);
+    if (load_tle(&pred) != 0) {
+        check(0, "load_tle preflight succeeded for AO-40");
+        return;
+    }
+    prep_propagator(&pred);
+    check(isFlagSet(DEEP_SPACE_EPHEM_FLAG),
+          "AO-40 (~1.27 rev/day) selects the deep-space SDP4 path");
+
+    double jul_epoch = Julian_Date_of_Epoch(pred.satellite_ephem.tle.epoch);
+    update_satellite_position(&pred, jul_epoch);
+
+    // AO-40 is a high-eccentricity orbit (perigee ~1000 km, apogee ~58000
+    // km). Don't pin altitude tightly -- just confirm it's a sane Earth
+    // orbit, not garbage.
+    check(pred.satellite_ephem.altitude_km > 500.0
+              && pred.satellite_ephem.altitude_km < 70000.0,
+          "altitude_km in (500, 70000) -- HEO range");
+    check(pred.satellite_ephem.speed_km_s > 0.5 && pred.satellite_ephem.speed_km_s < 12.0,
+          "speed_km_s in (0.5, 12) for an HEO");
+
+    check_topocentric_oracle(&pred, jul_epoch, "AO-40 epoch");
+    update_satellite_position(&pred, jul_epoch + 120.0 / 1440.0);
+    check_topocentric_oracle(&pred, jul_epoch + 120.0 / 1440.0, "AO-40 epoch+2h");
 }
 
 // -------------------------------------------------- update_pass_predictions
@@ -286,6 +442,101 @@ static void test_update_pass_predictions(const char *tles_path)
             pred.predicted_minutes_above_0_degrees);
 }
 
+// --------------------------------------- find_passes / get_pass / free_passes
+
+// Exercise the module-level static pass list end to end: the search, the
+// soonest-first and latest-first sorts, the get_pass index bounds, and the
+// free_passes reset. Whether a visible pass exists is geometry, not
+// prediction.c, so an empty result SKIPs the structural checks.
+static void test_pass_search_api(const char *tles_path)
+{
+    fprintf(stderr, "find_passes / get_pass / number_of_passes / free_passes:\n");
+
+    // Decode AO-7's epoch so the search window is deterministic.
+    prediction_t tmp;
+    char tmpname[64];
+    snprintf(tmpname, sizeof tmpname, "OSCAR 7");
+    init_pred(&tmp, tles_path, tmpname);
+    if (load_tle(&tmp) != 0) {
+        check(0, "preflight load_tle (for epoch) succeeded");
+        return;
+    }
+    double jul_start = Julian_Date_of_Epoch(tmp.satellite_ephem.tle.epoch);
+
+    prediction_t pred;
+    char name[64];
+    snprintf(name, sizeof name, "OSCAR 7");
+    init_pred(&pred, tles_path, name);
+
+    criteria_t crit = {0};
+    crit.min_altitude_km = 0.0;
+    crit.max_altitude_km = 100000.0;
+    crit.min_minutes     = 0.0;
+    crit.max_minutes     = 24.0 * 60.0;   // 24 h search window
+    crit.min_elevation   = 0.0;
+    crit.max_elevation   = 90.0;
+    crit.regex           = NULL;
+    crit.with_constellations = 1;          // irrelevant -- name_prefix wins
+    // Restrict the search to AO-7 (the fixture also holds AO-40).
+    crit.name_prefix     = "OSCAR 7";
+
+    free_passes();                          // start from a clean module state
+    int count = 0, checked = 0;
+    int rc = find_passes(&pred, jul_start, 1.0, &crit, &count, &checked, 0, 1 /*find_all*/);
+    check(rc == 0, "find_passes returns 0");
+    size_t n = number_of_passes();
+    fprintf(stderr, "    found %zu pass(es) (lines checked=%d, alt-passing=%d)\n",
+            n, count, checked);
+
+    if (n == 0) {
+        fprintf(stderr, "    no visible AO-7 pass in 24 h from epoch -- SKIP structural checks\n");
+        free_passes();
+        return;
+    }
+
+    // get_pass index bounds.
+    check(get_pass(0) != NULL, "get_pass(0) is non-NULL when passes exist");
+    check(get_pass(-1) == NULL, "get_pass(-1) is NULL");
+    check(get_pass((int)n) == NULL, "get_pass(n) is NULL (one past the end)");
+
+    // Soonest-first: minutes_away non-decreasing; per-pass fields sane.
+    int sorted = 1, fields_ok = 1, names_ok = 1;
+    double prev = -1e30;
+    for (size_t i = 0; i < n; i++) {
+        const pass_t *p = get_pass((int)i);
+        if (p == NULL) { fields_ok = 0; break; }
+        if (p->minutes_away < prev - 1e-6) sorted = 0;
+        prev = p->minutes_away;
+        if (!(p->max_elevation > 0.0 && p->max_elevation <= 90.0)) fields_ok = 0;
+        if (!(p->ascension_azimuth >= 0.0 && p->ascension_azimuth <= 360.0)) fields_ok = 0;
+        if (!(p->pass_duration > 0.0 && p->pass_duration < 120.0)) fields_ok = 0;
+        if (strncmp(p->name, "OSCAR 7", 7) != 0) names_ok = 0;
+    }
+    check(sorted, "passes sorted soonest-first (minutes_away non-decreasing)");
+    check(fields_ok, "every pass: max_el in (0,90], asc_az in [0,360], 0<dur<120 min");
+    check(names_ok, "every pass name starts with 'OSCAR 7'");
+
+    // Reverse order: same set, latest-first (minutes_away non-increasing).
+    free_passes();
+    rc = find_passes(&pred, jul_start, 1.0, &crit, &count, &checked, 1 /*reverse*/, 1);
+    check(rc == 0, "find_passes (reverse_order=1) returns 0");
+    size_t n_rev = number_of_passes();
+    check(n_rev == n, "reverse search finds the same number of passes");
+    int desc = 1;
+    prev = 1e30;
+    for (size_t i = 0; i < n_rev; i++) {
+        const pass_t *p = get_pass((int)i);
+        if (p == NULL || p->minutes_away > prev + 1e-6) { desc = 0; break; }
+        prev = p->minutes_away;
+    }
+    check(desc, "reverse passes sorted latest-first (minutes_away non-increasing)");
+
+    // free_passes resets the module-level list.
+    free_passes();
+    check(number_of_passes() == 0, "free_passes resets the count to 0");
+    check(get_pass(0) == NULL, "get_pass(0) is NULL after free_passes");
+}
+
 int main(void)
 {
     test_tle_default_path();
@@ -300,7 +551,9 @@ int main(void)
     test_load_tle_miss(tles_path);
     test_load_tle_bad_path();
     test_update_satellite_position(tles_path);
+    test_update_satellite_position_deep_space(tles_path);
     test_update_pass_predictions(tles_path);
+    test_pass_search_api(tles_path);
 
     unlink(tles_path);
     free(tles_path);
