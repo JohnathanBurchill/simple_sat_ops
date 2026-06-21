@@ -165,16 +165,41 @@ static void auto_tcmd_free_commands(char **commands, int n) {
     free(commands);
 }
 
+// Record an auto-tcmd lifecycle event (start / pause / resume / abort /
+// restart) in two places, because interrupting a run breaks the pass
+// operations plan and the operator needs an after-the-fact trail:
+//   1. /var/log/sso/runs.log via the shared audit log (sso_audit_event), and
+//   2. <pass_folder>/session.log, a plain timestamped line kept alongside
+//      tx.log in the pass's operation folder.
+// The session-log write is a no-op until the pass folder exists.
+static void auto_tcmd_log(state_t *state, const char *event, const char *detail) {
+    sso_audit_event(event, detail);
+    if (state->pass_folder[0] == '\0') return;
+    char path[512];
+    snprintf(path, sizeof path, "%.500s/session.log", state->pass_folder);
+    FILE *fp = fopen(path, "a");
+    if (!fp) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    char iso[40];
+    sso_iso_utc_from_ts(&ts, iso, sizeof iso);
+    fprintf(fp, "%s %s %s\n", iso, event, detail ? detail : "");
+    fclose(fp);
+}
+
 
 // --- Auto-TCMD modal helpers --------------------------------------
 
 static const char *auto_tcmd_state_label(auto_tcmd_state_t s) {
     switch (s) {
-        case AUTO_STATE_SETUP:     return "idle";
-        case AUTO_STATE_RUNNING:   return "running";
-        case AUTO_STATE_STOPPED:   return "stopped";
-        case AUTO_STATE_DONE:      return "done";
-        case AUTO_STATE_PASS_OVER: return "pass-over";
+        case AUTO_STATE_SETUP:        return "idle";
+        case AUTO_STATE_RUNNING:      return "running";
+        case AUTO_STATE_STOPPED:      return "stopped";
+        case AUTO_STATE_DONE:         return "done";
+        case AUTO_STATE_PASS_OVER:    return "pass-over";
+        case AUTO_STATE_PAUSE_PROMPT: return "interrupt?";
+        case AUTO_STATE_PAUSED:       return "paused";
+        case AUTO_STATE_RESUME_PROMPT:return "resume?";
     }
     return "?";
 }
@@ -321,7 +346,12 @@ static void auto_tcmd_draw(state_t *state) {
               a->n_commands);
     wclrtoeol(w);
 
-    int running_ro = (a->state == AUTO_STATE_RUNNING);
+    // Fields are read-only while the run is active or while a prompt /
+    // paused state owns the modal -- only the SETUP form is editable.
+    int running_ro = (a->state == AUTO_STATE_RUNNING
+                      || a->state == AUTO_STATE_PAUSE_PROMPT
+                      || a->state == AUTO_STATE_PAUSED
+                      || a->state == AUTO_STATE_RESUME_PROMPT);
 
     auto_draw_text_field(w, 3, 2, "TX power ",
                          a->power, 8,
@@ -381,7 +411,19 @@ static void auto_tcmd_draw(state_t *state) {
 
     if (a->state == AUTO_STATE_RUNNING) {
         mvwprintw(w, 14, 2,
-                  "Running - s stops   Esc closes (and stops)");
+                  "Running - s stops   Esc interrupts (pause/abort)");
+    } else if (a->state == AUTO_STATE_PAUSE_PROMPT) {
+        wattron(w, A_BOLD);
+        mvwprintw(w, 14, 2,
+                  "INTERRUPT:  P pause (resume later)   A abort   "
+                  "Esc keep running");
+        wattroff(w, A_BOLD);
+    } else if (a->state == AUTO_STATE_RESUME_PROMPT) {
+        wattron(w, A_BOLD);
+        mvwprintw(w, 14, 2,
+                  "PAUSED:  R resume from here   S start over   "
+                  "Esc keep paused");
+        wattroff(w, A_BOLD);
     } else {
         mvwprintw(w, 14, 2,
                   "Tab focus  Space toggle  Enter start  Esc cancel");
@@ -389,9 +431,9 @@ static void auto_tcmd_draw(state_t *state) {
     wclrtoeol(w);
 
     // Park the hardware cursor on the focused text field's cell. The
-    // toggle field has no cursor; running mode is read-only so we
-    // also skip cursor placement there.
-    if (a->state != AUTO_STATE_RUNNING) {
+    // toggle field has no cursor; read-only states (running / prompts /
+    // paused) skip cursor placement too.
+    if (!running_ro) {
         if (a->focus == AUTO_F_POWER) {
             int cur = a->cursors[AUTO_F_POWER];
             int vis = (cur > 7) ? 7 : cur;
@@ -409,16 +451,24 @@ static void auto_tcmd_draw(state_t *state) {
     wrefresh(w);
 }
 
-// Open the modal. Refuses if the TX compose modal is already up — at
-// most one modal owns the screen at a time. Lazily loads the file if
-// --tc-file was passed and we haven't loaded yet.
-void auto_tcmd_open(state_t *state) {
-    if (!state->ipc) return;
-    if (state->tx_compose_active) return;
-    if (state->auto_tcmd_active) return;
-    if (state->auto_tcmd_file_path[0] == '\0') return;
+// Create the modal window. Returns 1 on success, 0 if newwin failed.
+static int auto_tcmd_make_window(state_t *state) {
+    int h = 17, ww = 110;
+    if (h > LINES) h = LINES;
+    if (ww > COLS) ww = COLS;
+    if (ww < 60)  ww = (COLS < 60) ? COLS : 60;
+    state->auto_tcmd_win = newwin(h, ww, (LINES - h) / 2, (COLS - ww) / 2);
+    if (!state->auto_tcmd_win) return 0;
+    keypad(state->auto_tcmd_win, TRUE);
+    nodelay(state->auto_tcmd_win, TRUE);
+    return 1;
+}
 
-    // (Re)load on open — file may have been edited since last open.
+// (Re)load the --tc-file from scratch and reset the modal fields to a fresh
+// SETUP run. Frees any previously loaded commands. Returns 0 on success, -1
+// if there is no file path or the load fails.
+static int auto_tcmd_reload(state_t *state) {
+    if (state->auto_tcmd_file_path[0] == '\0') return -1;
     if (state->auto_tcmd.commands) {
         auto_tcmd_free_commands(state->auto_tcmd.commands, state->auto_tcmd.n_commands);
         state->auto_tcmd.commands = NULL;
@@ -427,7 +477,7 @@ void auto_tcmd_open(state_t *state) {
     char **cmds = NULL;
     int    nc   = 0;
     if (auto_tcmd_load_file(state->auto_tcmd_file_path, &cmds, &nc) != 0) {
-        return;  // silent — operator will notice via the absent modal
+        return -1;
     }
 
     memset(&state->auto_tcmd, 0, sizeof state->auto_tcmd);
@@ -474,20 +524,45 @@ void auto_tcmd_open(state_t *state) {
                  "loaded %d command(s). Set fields, then Enter to start.",
                  nc);
     }
+    return 0;
+}
 
-    int h = 17, ww = 110;
-    if (h > LINES) h = LINES;
-    if (ww > COLS) ww = COLS;
-    if (ww < 60)  ww = (COLS < 60) ? COLS : 60;
-    state->auto_tcmd_win = newwin(h, ww, (LINES - h) / 2, (COLS - ww) / 2);
-    if (!state->auto_tcmd_win) {
+// Open the modal. Refuses if the TX compose modal is already up — at
+// most one modal owns the screen at a time. A run parked by a previous
+// pause reopens straight into the resume/restart prompt; otherwise the
+// --tc-file is (re)loaded fresh.
+void auto_tcmd_open(state_t *state) {
+    if (!state->ipc) return;
+    if (state->tx_compose_active) return;
+    if (state->auto_tcmd_active) return;
+
+    // A run parked by a previous pause: reopen into the resume/restart
+    // prompt rather than reloading. The command list, position, interval
+    // and power were all preserved across the modal closing.
+    if (state->auto_tcmd.state == AUTO_STATE_PAUSED
+        && state->auto_tcmd.commands != NULL) {
+        state->auto_tcmd.state = AUTO_STATE_RESUME_PROMPT;
+        snprintf(state->auto_tcmd.status_msg, sizeof state->auto_tcmd.status_msg,
+                 "paused at cmd %d/%d, send %d/%d -- R resume, S start over, "
+                 "Esc keep paused",
+                 state->auto_tcmd.cmd_idx + 1, state->auto_tcmd.n_commands,
+                 state->auto_tcmd.repeat_idx, state->auto_tcmd.repeats_total);
+        if (!auto_tcmd_make_window(state)) return;
+        state->auto_tcmd_active = 1;
+        auto_tcmd_draw(state);
+        return;
+    }
+
+    if (state->auto_tcmd_file_path[0] == '\0') return;
+    if (auto_tcmd_reload(state) != 0) {
+        return;  // silent — operator will notice via the absent modal
+    }
+    if (!auto_tcmd_make_window(state)) {
         auto_tcmd_free_commands(state->auto_tcmd.commands, state->auto_tcmd.n_commands);
         state->auto_tcmd.commands = NULL;
         state->auto_tcmd.n_commands = 0;
         return;
     }
-    keypad(state->auto_tcmd_win, TRUE);
-    nodelay(state->auto_tcmd_win, TRUE);
     state->auto_tcmd_active = 1;
     auto_tcmd_draw(state);
 }
@@ -498,7 +573,11 @@ void auto_tcmd_close(state_t *state) {
         state->auto_tcmd_win = NULL;
     }
     state->auto_tcmd_active = 0;
-    if (state->auto_tcmd.commands) {
+    // Keep a paused run parked across the close so the operator can compose
+    // a one-off TX (or anything else) and then press 'A' to resume it. The
+    // command list stays allocated until the run is resumed or restarted.
+    if (state->auto_tcmd.state != AUTO_STATE_PAUSED
+        && state->auto_tcmd.commands) {
         auto_tcmd_free_commands(state->auto_tcmd.commands, state->auto_tcmd.n_commands);
         state->auto_tcmd.commands = NULL;
         state->auto_tcmd.n_commands = 0;
@@ -606,6 +685,81 @@ static void auto_tcmd_stop(state_t *state, const char *reason) {
     }
 }
 
+// 'P' from the interrupt prompt: park the run. Position, interval and power
+// all stay on state->auto_tcmd (and survive the modal closing), so the
+// operator can compose a one-off TX and later resume with 'A'. Logged
+// because an interrupted run departs from the pass operations plan.
+static void auto_tcmd_pause(state_t *state) {
+    auto_tcmd_t *a = &state->auto_tcmd;
+    a->pause_ns = ts_now_ns();
+    a->state    = AUTO_STATE_PAUSED;
+    snprintf(a->status_msg, sizeof a->status_msg,
+             "paused at cmd %d/%d -- press A to resume",
+             a->cmd_idx + 1, a->n_commands);
+    char det[256];
+    snprintf(det, sizeof det,
+             "cmd_idx=%d/%d repeat_idx=%d/%d sends_total=%d "
+             "power=%.20s delay_s=%.2f file=\"%.100s\"",
+             a->cmd_idx + 1, a->n_commands, a->repeat_idx, a->repeats_total,
+             a->sends_total, a->power, a->delay_s_val, a->file_path);
+    auto_tcmd_log(state, "auto-tcmd-pause", det);
+}
+
+// 'A' from the interrupt prompt: abort outright (no resume). The modal
+// stays open in STOPPED so the operator sees the final numbers.
+static void auto_tcmd_abort(state_t *state) {
+    auto_tcmd_t *a = &state->auto_tcmd;
+    a->state = AUTO_STATE_STOPPED;
+    snprintf(a->status_msg, sizeof a->status_msg,
+             "aborted at cmd %d/%d", a->cmd_idx + 1, a->n_commands);
+    char det[160];
+    snprintf(det, sizeof det, "cmd_idx=%d/%d sends_total=%d",
+             a->cmd_idx + 1, a->n_commands, a->sends_total);
+    auto_tcmd_log(state, "auto-tcmd-abort", det);
+}
+
+// 'R' from the resume prompt: continue from where it left off. Shift the
+// elapsed-time origin forward by the pause duration so the progress readout
+// stays honest, and fire the next send immediately.
+static void auto_tcmd_resume(state_t *state) {
+    auto_tcmd_t *a = &state->auto_tcmd;
+    long now = ts_now_ns();
+    if (a->pause_ns > 0 && now > a->pause_ns) {
+        a->start_ns += (now - a->pause_ns);
+    }
+    a->pause_ns     = 0;
+    a->next_send_ns = now;
+    a->state        = AUTO_STATE_RUNNING;
+    snprintf(a->status_msg, sizeof a->status_msg,
+             "resumed at cmd %d/%d", a->cmd_idx + 1, a->n_commands);
+    char det[160];
+    snprintf(det, sizeof det, "cmd_idx=%d/%d repeat_idx=%d/%d sends_total=%d",
+             a->cmd_idx + 1, a->n_commands, a->repeat_idx, a->repeats_total,
+             a->sends_total);
+    auto_tcmd_log(state, "auto-tcmd-resume", det);
+}
+
+// 'S' from the resume prompt: start the whole list over from the top,
+// keeping the interval / power / allow-tx the operator already set.
+static void auto_tcmd_restart(state_t *state) {
+    auto_tcmd_t *a = &state->auto_tcmd;
+    long now = ts_now_ns();
+    a->cmd_idx          = 0;
+    a->repeat_idx       = 0;
+    a->sends_total      = 0;
+    a->tx_seconds_spent = 0.0;
+    a->start_ns         = now;
+    a->next_send_ns     = now;
+    a->pause_ns         = 0;
+    a->state            = AUTO_STATE_RUNNING;
+    snprintf(a->status_msg, sizeof a->status_msg,
+             "restarted from the top (%d commands)", a->n_commands);
+    char det[160];
+    snprintf(det, sizeof det, "n_commands=%d repeats=%d",
+             a->n_commands, a->repeats_total);
+    auto_tcmd_log(state, "auto-tcmd-restart", det);
+}
+
 int auto_tcmd_handle_key(state_t *state, int key) {
     if (!state->auto_tcmd_active) return 0;
     if (key == ERR) return 1;
@@ -617,9 +771,59 @@ int auto_tcmd_handle_key(state_t *state, int key) {
         if (translated >= 0) {
             key = translated;
         } else {
-            return 0;  // Esc closes (and stops via close path below)
+            // Bare Esc -- meaning depends on the run state.
+            if (a->state == AUTO_STATE_RUNNING) {
+                // Don't let a stray Esc kill an active run; ask first.
+                a->state = AUTO_STATE_PAUSE_PROMPT;
+                snprintf(a->status_msg, sizeof a->status_msg,
+                         "interrupt the run?  P pause (resume later)   "
+                         "A abort   Esc keep running");
+                auto_tcmd_draw(state);
+                return 1;
+            }
+            if (a->state == AUTO_STATE_PAUSE_PROMPT) {
+                a->state = AUTO_STATE_RUNNING;   // cancel: keep running
+                snprintf(a->status_msg, sizeof a->status_msg, "running");
+                auto_tcmd_draw(state);
+                return 1;
+            }
+            if (a->state == AUTO_STATE_RESUME_PROMPT) {
+                a->state = AUTO_STATE_PAUSED;    // leave it parked
+                return 0;                        // close (stays parked)
+            }
+            return 0;  // SETUP / STOPPED / DONE / PASS_OVER -> close
         }
     }
+
+    // Interrupt prompt (Esc during a run): pause or abort.
+    if (a->state == AUTO_STATE_PAUSE_PROMPT) {
+        if (key == 'p' || key == 'P') {
+            auto_tcmd_pause(state);
+            return 0;   // close so the operator can compose / do other work
+        }
+        if (key == 'a' || key == 'A') {
+            auto_tcmd_abort(state);
+            auto_tcmd_draw(state);
+            return 1;
+        }
+        return 1;  // swallow everything else while prompting
+    }
+
+    // Resume prompt ('A' on a parked run): resume from here or start over.
+    if (a->state == AUTO_STATE_RESUME_PROMPT) {
+        if (key == 'r' || key == 'R') {
+            auto_tcmd_resume(state);
+            auto_tcmd_draw(state);
+            return 1;
+        }
+        if (key == 's' || key == 'S') {
+            auto_tcmd_restart(state);
+            auto_tcmd_draw(state);
+            return 1;
+        }
+        return 1;  // swallow everything else while prompting
+    }
+
     if (a->state == AUTO_STATE_RUNNING) {
         // Run mode: only stop / close commands are honoured. Field
         // edits are blocked so an operator can't change power mid-run.

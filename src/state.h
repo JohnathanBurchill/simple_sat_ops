@@ -226,6 +226,9 @@ typedef enum {
     AUTO_STATE_STOPPED,    // user stopped, file not exhausted
     AUTO_STATE_DONE,       // file exhausted
     AUTO_STATE_PASS_OVER,  // LOS hit while running
+    AUTO_STATE_PAUSE_PROMPT,   // Esc during a run: pause or abort?
+    AUTO_STATE_PAUSED,         // parked across the modal closing; 'A' resumes
+    AUTO_STATE_RESUME_PROMPT,  // 'A' on a parked run: resume or restart?
 } auto_tcmd_state_t;
 
 typedef struct auto_tcmd {
@@ -255,6 +258,7 @@ typedef struct auto_tcmd {
     double delay_s_val;    // parsed from delay_s at start
     long   next_send_ns;
     long   start_ns;       // wall-clock at run start, for elapsed TX time
+    long   pause_ns;       // ts_now_ns() when paused; shifts start_ns on resume
     int    sends_total;    // running tally — every queued burst
     // On-air seconds accumulated and total (AX100/9600/preroll math).
     double tx_seconds_spent;
