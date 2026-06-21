@@ -398,6 +398,7 @@ int main(int argc, char **argv)
         "antenna_rotator_selftest",
         "modem_iq_selftest",
         "ax100_selftest",
+        "golay24_selftest",
         "prediction_selftest",
         "sw_nco_selftest",
         "beacon_cts1_selftest",

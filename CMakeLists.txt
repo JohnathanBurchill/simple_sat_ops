@@ -502,6 +502,15 @@ add_executable(csp_selftest unit_tests/csp_selftest.c src/proto/csp.c)
 target_include_directories(csp_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS csp_selftest)
 
+# Golay(24,12) coder selftest. Pins the systematic layout and the
+# published weight enumerator / d_min=8 of the extended Golay code (an
+# external oracle for the generator matrix), then checks correction of
+# 1-3 bit errors and rejection of 4-bit errors at the radius boundary
+# ax100_selftest leaves untested.
+add_executable(golay24_selftest unit_tests/golay24_selftest.c src/proto/golay24.c)
+target_include_directories(golay24_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+list(APPEND SSO_TARGETS golay24_selftest)
+
 # sso_ipc codec selftest. Round-trips the newline-JSON wire format every
 # operator/viewer link rides on (encode -> decode across event types,
 # escaping, the RX-panel + roster blocks, and the decoder's tolerance of
