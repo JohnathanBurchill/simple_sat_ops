@@ -107,6 +107,39 @@ static const char *baud_str(int speed_const)
     }
 }
 
+// Parse the numeric tail of a "--opt=<value>" token (pass arg + prefix_len).
+// Unlike atoi/atof these reject an empty value and any trailing non-numeric
+// characters, so a fat-fingered "--rx-gain=3o" or "--verbose=" is an error
+// rather than a silent 3 / 0. Trailing ASCII blanks are tolerated. Returns
+// 0 on success, -1 on a malformed or out-of-range value.
+static int parse_arg_double(const char *s, double *out)
+{
+    if (s == NULL || *s == '\0') return -1;
+    errno = 0;
+    char *end = NULL;
+    double v = strtod(s, &end);
+    if (end == s) return -1;
+    while (*end == ' ' || *end == '\t') ++end;
+    if (*end != '\0') return -1;
+    if (errno == ERANGE) return -1;
+    *out = v;
+    return 0;
+}
+
+static int parse_arg_long(const char *s, long *out)
+{
+    if (s == NULL || *s == '\0') return -1;
+    errno = 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == s) return -1;
+    while (*end == ' ' || *end == '\t') ++end;
+    if (*end != '\0') return -1;
+    if (errno == ERANGE) return -1;
+    *out = v;
+    return 0;
+}
+
 static const char *sdr_type_str(sdr_backend_type_t t)
 {
     switch (t) {
@@ -470,11 +503,12 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
             if (help) parse_help_line(OPTW, "--verbose=<level>", "verbosity integer");
             else {
                 state->n_options++;
-                if (strlen(arg) < 11) {
+                long v;
+                if (parse_arg_long(arg + 10, &v) != 0) {
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                state->verbose_level = atoi(arg + 10);
+                state->verbose_level = (int) v;
             }
             matched = 1;
         }
@@ -621,7 +655,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "elevation ring spacing for --scan-sky (default 15, clamped [1,45])");
             else {
                 state->n_options++;
-                state->scan.step_deg = atof(arg + 12);
+                if (parse_arg_double(arg + 12, &state->scan.step_deg) != 0) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
                 if (state->scan.step_deg < 1.0)  state->scan.step_deg = 1.0;
                 if (state->scan.step_deg > 45.0) state->scan.step_deg = 45.0;
             }
@@ -638,10 +675,14 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "modulated 0xAA carrier before each TX burst (default 200, [0,5000])");
             else {
                 state->n_options++;
-                int v = atoi(arg + 16);
+                long v;
+                if (parse_arg_long(arg + 16, &v) != 0) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
                 if (v < 0)    v = 0;
                 if (v > 5000) v = 5000;
-                state->tx_preroll_ms = v;
+                state->tx_preroll_ms = (int) v;
             }
             matched = 1;
         }
@@ -767,11 +808,12 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "uplink nominal carrier, MHz (informational)");
             else {
                 state->n_options++;
-                if (strlen(arg) < 19) {
+                double mhz;
+                if (parse_arg_double(arg + 18, &mhz) != 0) {
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                state->nominal_uplink_frequency_hz = atof(arg + 18) * 1e6;
+                state->nominal_uplink_frequency_hz = mhz * 1e6;
             }
             matched = 1;
         }
@@ -780,11 +822,12 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "downlink / simplex carrier nominal, MHz (informational)");
             else {
                 state->n_options++;
-                if (strlen(arg) < 21) {
+                double mhz;
+                if (parse_arg_double(arg + 20, &mhz) != 0) {
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                state->nominal_downlink_frequency_hz = atof(arg + 20) * 1e6;
+                state->nominal_downlink_frequency_hz = mhz * 1e6;
             }
             matched = 1;
         }
@@ -800,7 +843,12 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
             else {
                 state->n_options++;
                 // Argument is kHz so an integer is easy to type; we store Hz.
-                state->rx_lo_offset_hz = atof(arg + 12) * 1000.0;
+                double khz;
+                if (parse_arg_double(arg + 12, &khz) != 0) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
+                state->rx_lo_offset_hz = khz * 1000.0;
             }
             matched = 1;
         }
@@ -809,7 +857,11 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "AD9361 RX gain at session open, dB (default 30, range [0,76])");
             else {
                 state->n_options++;
-                double g = atof(arg + 10);
+                double g;
+                if (parse_arg_double(arg + 10, &g) != 0) {
+                    fprintf(stderr, "Unable to parse %s\n", arg);
+                    return PARSE_ERROR;
+                }
                 // AD9361 RX gain range is 0-76 dB; UHD coerces values outside
                 // this and prints a warning, but we clip here so the value in
                 // state matches what the hardware will use.
@@ -851,11 +903,11 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "park on a fixed elevation");
             else {
                 state->n_options++;
-                if (strlen(arg) < 28) {
+                if (parse_arg_double(arg + 27,
+                        &state->antenna_rotator.target_elevation) != 0) {
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                state->antenna_rotator.target_elevation = atof(arg + 27);
                 if (state->antenna_rotator.target_elevation < 0.0) {
                     state->antenna_rotator.target_elevation = 0.0;
                 } else if (state->antenna_rotator.target_elevation
@@ -872,11 +924,11 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "park on a fixed azimuth");
             else {
                 state->n_options++;
-                if (strlen(arg) < 26) {
+                double az;
+                if (parse_arg_double(arg + 25, &az) != 0) {
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                double az = atof(arg + 25);
                 if (az < ANTENNA_ROTATOR_MINIMUM_AZIMUTH) {
                     az = ANTENNA_ROTATOR_MINIMUM_AZIMUTH;
                 } else if (az > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
@@ -893,11 +945,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
             if (help) parse_help_line(OPTW, "--lat=<deg>", "geodetic latitude (default RAO Priddis)");
             else {
                 state->n_options++;
-                if (strlen(arg) < 7) {
+                if (parse_arg_double(arg + 6, &site_latitude) != 0) {
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                site_latitude = atof(arg + 6);
             }
             matched = 1;
         }
@@ -905,11 +956,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
             if (help) parse_help_line(OPTW, "--lon=<deg>", "geodetic longitude, east positive");
             else {
                 state->n_options++;
-                if (strlen(arg) < 7) {
+                if (parse_arg_double(arg + 6, &site_longitude) != 0) {
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                site_longitude = atof(arg + 6);
             }
             matched = 1;
         }
@@ -917,11 +967,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
             if (help) parse_help_line(OPTW, "--alt=<m>", "altitude above ellipsoid, metres");
             else {
                 state->n_options++;
-                if (strlen(arg) < 7) {
+                if (parse_arg_double(arg + 6, &site_altitude) != 0) {
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                site_altitude = atof(arg + 6);
             }
             matched = 1;
         }
@@ -936,11 +985,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "minimum orbital altitude (default 0)");
             else {
                 state->n_options++;
-                if (strlen(arg) < 19) {
+                if (parse_arg_double(arg + 18, &min_altitude_km) != 0) {
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                min_altitude_km = atof(arg + 18);
             }
             matched = 1;
         }
@@ -949,11 +997,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "maximum orbital altitude (default 1000)");
             else {
                 state->n_options++;
-                if (strlen(arg) < 19) {
+                if (parse_arg_double(arg + 18, &max_altitude_km) != 0) {
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                max_altitude_km = atof(arg + 18);
             }
             matched = 1;
         }
@@ -962,11 +1009,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "minimum peak elevation (default 0)");
             else {
                 state->n_options++;
-                if (strlen(arg) < 17) {
+                if (parse_arg_double(arg + 16, &min_elevation) != 0) {
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                min_elevation = atof(arg + 16);
             }
             matched = 1;
         }
@@ -975,11 +1021,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "minimum minutes until AOS (default 1)");
             else {
                 state->n_options++;
-                if (strlen(arg) < 15) {
+                if (parse_arg_double(arg + 14, &min_minutes_away) != 0) {
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                min_minutes_away = atof(arg + 14);
             }
             matched = 1;
         }
@@ -988,11 +1033,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "maximum minutes until AOS (default 90)");
             else {
                 state->n_options++;
-                if (strlen(arg) < 15) {
+                if (parse_arg_double(arg + 14, &max_minutes_away) != 0) {
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                max_minutes_away = atof(arg + 14);
             }
             matched = 1;
         }
