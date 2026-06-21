@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on branch `any-sdr`, commit
-`c970c7d` (2026-06-20). This is a working draft.
+`2916636` (2026-06-21). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -161,6 +161,7 @@ manual can go back on the shelf where it belongs.
 
 - [Appendix A: What didn't stick - the FT-991A and IC-9700 radio path](#appendix-a-what-didnt-stick---the-ft-991a-and-ic-9700-radio-path)
 - [Appendix B: Trial and error - the git repository](#appendix-b-trial-and-error---the-git-repository)
+- [Appendix C: The test-suite audit and continuous integration](#appendix-c-the-test-suite-audit-and-continuous-integration)
 
 ---
 
@@ -2089,15 +2090,19 @@ Etiquette and the rules:
 
 ## Testing and validation
 
-There is no QA department and no continuous-integration cloud behind
-this code; there is one ground station, a handful of operators, and a
-spacecraft that does exactly what the last frame told it to. So the
-testing approach is not about chasing a coverage percentage. It is
-about pinning, permanently, the small set of behaviours that must never
-regress - that the bytes which go on the air are the bytes you typed
-and *only* those, that an over-long or malformed command is refused
-rather than quietly trimmed, that every uplink is signed, that the
-Doppler shift is applied. A bug in any of those is not a cosmetic
+There is no QA department behind this code; there is one ground
+station, a handful of operators, and a spacecraft that does exactly
+what the last frame told it to. A continuous-integration job now
+rebuilds the tree and runs the unit tests on every push - it arrived
+late, and the story of standing it up, together with an audit of
+whether the tests were even worth running, is in
+[Appendix C](#appendix-c-the-test-suite-audit-and-continuous-integration).
+But the testing approach was never about chasing a coverage percentage.
+It is about pinning, permanently, the small set of behaviours that must
+never regress - that the bytes which go on the air are the bytes you
+typed and *only* those, that an over-long or malformed command is
+refused rather than quietly trimmed, that every uplink is signed, that
+the Doppler shift is applied. A bug in any of those is not a cosmetic
 defect; it is a wrong command to a satellite you cannot reach out and
 fix. The tests exist so those specific mistakes can be made exactly
 once.
@@ -2109,12 +2114,12 @@ cannot.
 
 **Unit selftests** cover the pure, deterministic cores - the parts of
 the code that take bytes in and produce bytes out with no hardware in
-the loop. There are 26 `*_selftest.c` binaries, and between them they
+the loop. There are 31 `*_selftest.c` binaries, and between them they
 exercise the whole signal chain on the bench: the DSP blocks (`modem`,
 `fir_decim`, `sw_nco`, `biquad`, `monitor_squelch`, `iq_burst`); the
-framing stack the link depends on (`rs` for Reed-Solomon,
-`golay24` indirectly, the CCSDS scrambler and `ax100` framing, `csp`,
-and the HMAC trailer via `ax100`); the orbit and pass math
+framing stack the link depends on (`rs` for Reed-Solomon, `golay24`
+for the length-field code, the CCSDS scrambler and `ax100` framing,
+`csp`, and the HMAC trailer via `ax100`); the orbit and pass math
 (`prediction`, `pursuit`, `shortarc`, `tle_csv`, `pass_schedule`,
 `bestxyz`); the command path (`tcmd_lint`, `sso_pseudo`, `agenda_line`,
 `tx_burst`); and the plumbing (`packet_db`, `sso_ipc_codec`,
@@ -2178,12 +2183,20 @@ build/pursuit_selftest          # no extra deps
 build/unit_test_runner          # optional ncurses aggregator
 ```
 
-(That is a representative subset; the build produces all 26.)
+(That is a representative subset; the build produces all 31.)
 `unit_test_runner` discovers every `*_selftest` binary under `build/`
 and renders a collapsible group view of the TAP output, so a single
 launch runs the whole suite. It is skipped if ncurses is absent, in
 which case run the binaries directly - any harness that understands TAP
 (for example `prove`) will aggregate them.
+
+The same binaries are wired into CTest, so `ctest --test-dir build`
+runs the whole set and fails on the first non-zero exit. That is the
+exact command the continuous-integration job runs on every push; the
+registration is automatic, so a newly added `*_selftest` is picked up
+by both CTest and CI with no extra wiring. The narrative of how that
+job came to exist - and the audit that preceded it - is
+[Appendix C](#appendix-c-the-test-suite-audit-and-continuous-integration).
 
 ### Catching what the compiler hides
 
@@ -2909,3 +2922,154 @@ viewer per the drill in
 the map is here for the day you need to know why something changed,
 which on a system debugged one commit at a time is a day that comes
 often.
+
+---
+
+## Appendix C: The test-suite audit and continuous integration
+
+[Section 14](#testing-and-validation) describes what the tests check and
+how to run them. This appendix is the other half of the story: how we
+came to *trust* the tests, and how they came to run on their own. It is
+written for transparency - the suite was largely machine-written, and a
+suite you do not understand the weaknesses of is a suite you should not
+lean on.
+
+### The question: are machine-written C tests worth anything?
+
+Most of this code, and most of its tests, were written with an AI
+assistant. There is a widely repeated claim about that arrangement:
+that large language models write *plausible but meaningless* tests for C
+- assertions that read well, that pass, and that would never have caught
+the bug they purport to guard against. Tautological checks
+(`x == x` dressed up), round-trips that only prove a function is the
+inverse of itself, loose tolerances that swallow real errors, "golden"
+values copied out of the very code under test. A green suite full of
+those is worse than no suite, because it buys false confidence about a
+link to a satellite you cannot recall.
+
+Rather than argue the point, we audited it. The method had to be
+empirical, because reading a test and judging it "looks fine" is exactly
+the failure mode under suspicion.
+
+### How the audit was done: mutation testing
+
+The audit ran several independent reviewers in parallel, each taking a
+slice of the suite, and each held to one discipline: **mutation
+testing**. For a test to earn its place it is not enough that it passes;
+it must *fail* when the code it covers is deliberately broken. So for
+each block of behaviour the reviewer introduced a small, realistic bug
+into the source - flip a comparison, swap two struct fields, drop a
+byte, widen a window - rebuilt, and watched whether some assertion went
+red. A mutation that survives a green suite is a hole in the suite,
+named and located. A mutation that is caught is a test doing its job,
+proven rather than asserted.
+
+Around two dozen such mutations were injected across the framing, orbit,
+DSP, database, and command modules. All but a few were caught
+immediately. The headline finding was therefore the opposite of the
+claim: **the suite was, in the main, effective** - these were not
+decorative tests. But the survivors were not random, and they pointed at
+a specific, instructive weakness.
+
+### What the survivors had in common: symmetric bugs
+
+Every mutation that slipped through shared one shape. It was a
+*symmetric* error in a piece of code tested only by round-trip - encode
+then decode, write then read, frame then unframe. When both directions
+run the same code, a matching pair of mistakes cancels: the AX100
+scrambler with one wrong table byte still descrambles its own output;
+an HMAC with the wrong truncation still matches the trailer it just
+produced. The round-trip stays green while the bytes that would go on
+the air are wrong. A round-trip proves a function is consistent with
+itself; it cannot prove the function is *correct*. For anything that has
+to interoperate with the spacecraft, that gap matters, because the
+spacecraft does not run our encoder.
+
+The audit also turned up coverage simply missing rather than weak: the
+Golay length code was exercised only through the framing that wraps it,
+never directly; the rotator's two-step homing logic - which once wound
+the dish to 360 deg because it trusted the first status reply after a
+move - had no test for the echo it must reject; the packet database had
+never been hit by two writers at once, the way two replay jobs sharing
+one file would; and the orbit propagator's topocentric output was
+checked only for *plausible ranges*, not against an independent
+calculation, so a swap of azimuth for elevation or range for range-rate
+would have sat inside the bands.
+
+And above all of it: **there was no continuous integration.** The
+selftests existed, but nothing ran them unless an operator remembered
+to. The only aggregator was an interactive ncurses runner - useless on a
+build server. Tests that no one runs are tests that rot.
+
+### What got fixed
+
+Each finding became a concrete change, and each change was held to the
+same mutation standard before it was committed - shown to fail on the
+old or broken code first, the way the TX command-history fix was in
+[Section 14](#every-bug-leaves-a-test-behind). A test that cannot fail
+proves nothing.
+
+- **External oracles where round-trips were blind.** The CCSDS scrambler
+  is now checked against the randomizer sequence generated independently
+  from its shift-register polynomial (and the published CCSDS opening
+  bytes), all 255 bytes of it; a single wrong table byte now fails even
+  though the round-trip still passes. The HMAC trailer is pinned to
+  values computed separately with the `openssl` command line, for fixed
+  key/data pairs, with the derivation in a comment so anyone can redo
+  it; a wrong truncation or key step now fails even though determinism,
+  key-sensitivity, and the round-trip all still pass.
+- **The orbit propagator gained an independent oracle.** The prediction
+  selftest now re-propagates the satellite, rebuilds the observer
+  position, redoes the south-east-zenith projection by hand, and compares
+  azimuth/elevation/range/range-rate to what the code reported - on both
+  the near-Earth (SGP4) and deep-space (SDP4) branches - and exercises
+  the pass-search interface end to end. A field swap now reddens the
+  oracle on both branches.
+- **The missing direct tests were written:** Golay(24,12) on its own
+  (weight-enumerator and correction-radius checks against the code's
+  external definition), the rotator's status-echo rejection as a pure
+  predicate with its own test, and a parallel-writer test for the packet
+  database.
+- **The parallel-writer test found a real, latent bug.** With four
+  writers on one database file, one of the concurrent opens could fail
+  and silently lose its rows, because the busy-timeout was being set
+  *after* the WAL-mode pragma rather than before it. The fix was to set
+  the timeout first; the test now passes repeatably and would have
+  caught the original.
+
+### The continuous-integration job
+
+The orphaning was closed by wiring the selftests into CTest (see
+[Running the unit tests](#running-the-unit-tests)) and adding a GitHub
+Actions workflow, `.github/workflows/unit-tests.yml`, that runs them on
+every push and pull request to the development branch (`any-sdr`) and to
+`main`. The job is deliberately lean: it installs only the handful of
+libraries the selftests actually need (a toolchain, OpenSSL, SQLite,
+ncurses headers), turns the SDR and voice backends off at configure time
+so it never probes for UHD or ALSA on the runner, builds the aggregate
+`selftests` target, and runs `ctest`. New selftests are picked up
+automatically, so the workflow file itself rarely changes.
+
+One wrinkle is worth recording, because it will bite anyone who forks
+the build. The orbit math depends on the bundled `sgp4sdp4` library,
+which is a separate CMake project with no install rule and was
+originally kept out of version control. CI cannot build what is not
+committed, so the library - a small C port of the NORAD SGP4/SDP4
+models, carried with its original attribution and licensing intact - is
+now tracked in the repository, and the workflow builds and caches it
+before configuring the main tree. Only its local build directory is
+ignored.
+
+### What this appendix does not claim
+
+The audit raised the floor; it did not make the suite complete.
+Mutation testing samples; it does not enumerate every possible bug, and
+a reviewer can only mutate code they thought to look at. The
+limits in [What isn't covered](#what-isnt-covered) still stand - no
+hardware-in-the-loop on the build server, an orbit propagator whose
+absolute accuracy is unverified against modern references, and thin
+coverage of the UI and drivers by deliberate choice. What changed is
+narrower and worth stating plainly: the tests that exist have been shown
+to fail when the code they cover is broken, the ones that were blind to
+symmetric errors now have outside references, and the whole set runs on
+its own on every push. That is the claim, and no more than it.
