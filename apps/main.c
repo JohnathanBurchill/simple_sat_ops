@@ -136,18 +136,9 @@
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "simple_sat_ops")) return 0;
+    // state_t is zero-initialised; every non-zero default is set in one place,
+    // apply_args (run below), so there is no half-initialised window here.
     state_t state = {0};
-    state.prediction.predicted_max_elevation = -180.0;
-    // Seed the TX-compose "remembered" draft. state_t is zero-initialised,
-    // so set the first-open defaults explicitly: the CTS1 prefix and 80 dB.
-    snprintf(state.tx_last_payload, sizeof state.tx_last_payload, "CTS1+");
-    snprintf(state.tx_last_power,   sizeof state.tx_last_power,   "80.0");
-    // Non-zero TX-core defaults (state_t is zero-initialised). The Doppler
-    // carrier falls back to the bare nominal until SGP4 has a range rate;
-    // preroll matches the tx_burst_run fallback. Both may be overridden in
-    // apply_args (--tx-preroll-ms) / the per-tick Doppler refresh.
-    state.tx_freq_hz_doppler = (long) FRONTIERSAT_CARRIER_HZ;
-    state.tx_preroll_ms      = 200;
 
     struct tm utc;
     struct timeval tv;

@@ -374,8 +374,26 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
     double max_elevation = 90.0;
     int with_constellations = 0;
     char *positional = NULL;
+    // Set when a second bare (non-option) token appears. The authoritative
+    // "too many positionals" signal -- the old argc - n_options heuristic
+    // miscounts the moment any option's n_options bookkeeping is off by one.
+    int extra_positional = 0;
 
     if (!help) {
+        // Non-zero state defaults all live here, in one place, so a caller
+        // that runs apply_args can't get a half-initialised struct (these
+        // used to be split between here and main()). Set before the parse
+        // loop below, which overrides whatever the operator passed.
+        state->prediction.predicted_max_elevation = -180.0;
+        // Seed the TX-compose "remembered" draft: the CTS1 prefix and 80 dB.
+        snprintf(state->tx_last_payload, sizeof state->tx_last_payload, "CTS1+");
+        snprintf(state->tx_last_power,   sizeof state->tx_last_power,   "80.0");
+        // The Doppler carrier falls back to the bare nominal until SGP4 has a
+        // range rate; preroll matches the tx_burst_run fallback. Both may be
+        // overridden below (--tx-preroll-ms) or by the per-tick Doppler refresh.
+        state->tx_freq_hz_doppler = (long) FRONTIERSAT_CARRIER_HZ;
+        state->tx_preroll_ms      = 200;
+
         state->antenna_rotator.tracking_prep_time_minutes = TRACKING_PREP_TIME_MINUTES;
         state->satellite_tracking = 0;
 
@@ -435,6 +453,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
             if (help) parse_help_line(OPTW, "<satellite_id>",
                 "name prefix in the TLE, or `next` to auto-pick the next pass");
             else if (positional == NULL) positional = (char *) arg;
+            else extra_positional = 1;   // a second bare token -> too many
             matched = 1;
         }
         if (strcmp("--help", arg) == 0 || help) {
@@ -1038,8 +1057,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
     }
     if (help) return PARSE_OK;
 
-    int n_positional = argc - state->n_options - 1;  // -1 for argv[0]
-    if (n_positional > 1) {
+    if (extra_positional) {
         fprintf(stderr,
             "simple_sat_ops: too many positional arguments "
             "(expected at most one <satellite_id>)\n");
