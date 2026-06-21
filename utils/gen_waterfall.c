@@ -1666,6 +1666,14 @@ static int parse_args(gw_args_t *a, int argc, char **argv, int help)
             if (help) parse_help_line(OPTW, "--fft=<n>", "FFT length per frame, power of two (default 1024)");
             else {
                 if (rc < 0) { fprintf(stderr, "gen_waterfall: invalid number in '%s'\n", arg); return PARSE_ERROR; }
+                // Bound the FFT length so a fat-fingered --fft can't drive a
+                // huge allocation. build_waterfall further requires a
+                // power of two >= 16.
+                if (v < 16 || v > (1 << 20)) {
+                    fprintf(stderr, "gen_waterfall: --fft must be in "
+                            "[16, 1048576]\n");
+                    return PARSE_ERROR;
+                }
                 a->opt.fft_size = v;
             }
             matched = 1;

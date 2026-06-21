@@ -342,12 +342,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "beacon_gen: --out=<file.wav> is required\n");
         return 1;
     }
-    if (cfg.repeats < 1) {
-        fprintf(stderr, "beacon_gen: --repeats must be >= 1\n");
+    if (cfg.repeats < 1 || cfg.repeats > 100000) {
+        fprintf(stderr, "beacon_gen: --repeats must be in [1, 100000]\n");
         return 1;
     }
-    if (cfg.gap_seconds < 0) {
-        fprintf(stderr, "beacon_gen: --gap-seconds must be >= 0\n");
+    if (cfg.gap_seconds < 0 || cfg.gap_seconds > 3600) {
+        fprintf(stderr, "beacon_gen: --gap-seconds must be in [0, 3600]\n");
         return 1;
     }
     if (cfg.mp.samp_rate <= 0 || cfg.mp.bit_rate <= 0
@@ -355,6 +355,13 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "beacon_gen: samp_rate (%d) must be a positive multiple of "
                 "bit_rate (%d)\n", cfg.mp.samp_rate, cfg.mp.bit_rate);
+        return 1;
+    }
+    // Upper-bound the rate too: with the repeats / gap caps above this keeps
+    // total_cap (below) from overflowing into a tiny allocation. 100 MHz is
+    // well above any rate this tool would realistically generate.
+    if (cfg.mp.samp_rate > 100000000) {
+        fprintf(stderr, "beacon_gen: --samp-rate too high (max 100 MHz)\n");
         return 1;
     }
 
@@ -384,6 +391,15 @@ int main(int argc, char **argv)
     // the last burst, and the on-disk WAV mirrors a continuous "every
     // 20 s" downlink rather than ending mid-frame.
     size_t total_cap = (size_t)repeats * (per_beacon_samples + per_gap_samples);
+    // The input caps above keep this product well inside size_t; reject a
+    // request past a fixed ceiling rather than attempt an absurd allocation.
+    const size_t MAX_SAMPLES = 500000000;  // ~1 GB of int16
+    if (total_cap == 0 || total_cap > MAX_SAMPLES) {
+        fprintf(stderr, "beacon_gen: %zu samples requested (cap %zu) -- "
+                "lower --repeats / --gap-seconds / --samp-rate\n",
+                total_cap, MAX_SAMPLES);
+        return 1;
+    }
 
     int16_t *samples = (int16_t *)malloc(total_cap * sizeof(int16_t));
     if (samples == NULL) {

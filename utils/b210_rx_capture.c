@@ -320,11 +320,19 @@ int main(int argc, char **argv)
         fprintf(stderr, "b210_rx_capture: need --wav= or --raw-iq=\n");
         return 1;
     }
-    if (bw_hz < 0) bw_hz = rate;
     if (duration_s <= 0 || duration_s > 600.0) {
         fprintf(stderr, "b210_rx_capture: --duration-s must be in (0, 600]\n");
         return 1;
     }
+    // Validate the rate BEFORE it divides (the coercion check below) or sizes
+    // the capture buffer. A fat-fingered --rate=0 would divide by zero, and a
+    // negative/huge rate would make n_request nonsensical. 100 MHz is well
+    // above any B2xx rate.
+    if (rate <= 0.0 || rate > 100e6) {
+        fprintf(stderr, "b210_rx_capture: --rate must be in (0, 100e6] S/s\n");
+        return 1;
+    }
+    if (bw_hz < 0) bw_hz = rate;
 
     // Pre-allocate the full IQ buffer. At 250 kS/s × 30 s × 4 B/sample
     // = 30 MB. Plenty in RAM. The 600 s cap above bounds this at
