@@ -97,10 +97,10 @@ int sso_operator_publish(const sso_event_t *evt) {
     if (!evt) return -1;
     sso_ipc_client_t *cli = sso_ipc_client_connect("simple_sat_ops");
     if (!cli) return -1;
-    char buf[4096];
+    char buf[SSO_IPC_LINE_MAX];
     if (sso_event_encode(evt, buf, sizeof(buf)) != 0) {
         sso_ipc_client_close(cli);
-        return -1;
+        return -1;   // caller sees the failure; not a silent drop
     }
     int rc = sso_ipc_client_send(cli, buf);
     // Give the server a moment to drain.

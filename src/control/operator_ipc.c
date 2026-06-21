@@ -158,9 +158,12 @@ void ipc_broadcast_state(state_t *s,
     }
     sso_event_set_roster(&evt, entries, n);
     ipc_fill_rx_panel(s, &evt);
-    char buf[4096];
+    char buf[SSO_IPC_LINE_MAX];
     if (sso_event_encode(&evt, buf, sizeof(buf)) == 0) {
         sso_ipc_server_broadcast(s->ipc, buf);
+    } else {
+        fprintf(stderr, "operator_ipc: STATE encode overflow -- "
+                "dropped (roster too large?)\n");
     }
 
     // Cache for WELCOME replies so a viewer doesn't have to wait for
@@ -283,9 +286,12 @@ void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
         sso_event_set_roster(&welcome, entries, n);
         ipc_fill_rx_panel(state, &welcome);
     }
-    char buf[4096];
+    char buf[SSO_IPC_LINE_MAX];
     if (sso_event_encode(&welcome, buf, sizeof(buf)) == 0) {
         sso_ipc_server_send(srv, id, buf);
+    } else {
+        fprintf(stderr, "operator_ipc: WELCOME encode overflow -- "
+                "viewer gets no initial state\n");
     }
 }
 

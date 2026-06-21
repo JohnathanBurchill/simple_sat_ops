@@ -8,15 +8,16 @@
 
 #include <stddef.h>
 
+#include "sso_ipc.h"   // SSO_IPC_LINE_MAX (the shared encode / per-line cap)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 // Per-connection buffer sizes, shared by the server's client slots and the
-// client handle.
+// client handle. SSO_IPC_LINE_MAX (the per-line cap) is public, in sso_ipc.h.
 #define SSO_IPC_READ_BUF    8192
 #define SSO_IPC_WRITE_BUF   32768
-#define SSO_IPC_LINE_MAX    8000
 
 // Shared low-level helpers, defined in sso_ipc_codec.c (the common TU both
 // the server and the client already depend on for event encode/decode).

@@ -190,8 +190,16 @@ void sso_event_init(sso_event_t *evt, sso_event_type_t type);
 const char *sso_event_type_name(sso_event_type_t type);
 sso_event_type_t sso_event_type_from_name(const char *name);
 
+// Maximum encoded line length the transport carries (the server's per-client
+// read buffer is sized around this). Callers should size their sso_event_encode
+// output buffer to this one shared constant rather than hand-pick a size: a
+// roster-bearing STATE/WELCOME can approach it, and a smaller buffer makes
+// encode return -1 and the event drop. Anything that doesn't fit here would
+// be rejected by the reader on the far side regardless.
+#define SSO_IPC_LINE_MAX 8000
+
 // Encode an event to one newline-terminated JSON line. Returns 0 on
-// success, -1 on overflow.
+// success, -1 on overflow (buffer too small for the event).
 int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size);
 
 // Decode one JSON line (with or without trailing newline) into evt.
