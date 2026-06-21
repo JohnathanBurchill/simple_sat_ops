@@ -244,6 +244,7 @@ typedef struct {
     float   *re;                // FFT scratch
     float   *im;
     double  *row_accum;         // linear power per visible bin
+    float   *row_db;            // spec_w scratch for the dB-converted row
     int      row_accum_count;   // FFT frames integrated into row_accum
 
     // Sample accumulator (we may receive partial-frame chunks).
@@ -292,11 +293,12 @@ static int spec_init(spec_state_t *s, unsigned n_fft, int spec_w, int spec_h,
     s->re        = (float *)  calloc(N, sizeof(float));
     s->im        = (float *)  calloc(N, sizeof(float));
     s->row_accum = (double *) calloc((size_t) spec_w, sizeof(double));
+    s->row_db    = (float *)  calloc((size_t) spec_w, sizeof(float));
     s->frame_buf = (int16_t *)calloc((size_t) N * 2, sizeof(int16_t));
     s->rgb       = (uint8_t *)calloc((size_t) spec_w * (size_t) spec_h * 3, 1);
     s->row_time  = (time_t *) calloc((size_t) spec_h, sizeof(time_t));
     s->rgb_stride = spec_w * 3;
-    if (!s->win || !s->re || !s->im || !s->row_accum
+    if (!s->win || !s->re || !s->im || !s->row_accum || !s->row_db
         || !s->frame_buf || !s->rgb || !s->row_time) return -1;
     for (int k = 0; k < N; ++k) {
         s->win[k] = 0.5f * (1.0f - cosf(2.0f * (float) M_PI * (float) k
@@ -313,7 +315,7 @@ static int spec_init(spec_state_t *s, unsigned n_fft, int spec_w, int spec_h,
 static void spec_free(spec_state_t *s)
 {
     free(s->win); free(s->re); free(s->im);
-    free(s->row_accum); free(s->frame_buf); free(s->rgb);
+    free(s->row_accum); free(s->row_db); free(s->frame_buf); free(s->rgb);
     free(s->row_time);
 }
 
@@ -382,8 +384,10 @@ static void spec_commit_row(spec_state_t *s)
     if (s->row_accum_count == 0) return;
     int W = s->spec_w;
     int H = s->spec_h;
-    // Convert linear-power accumulator to dB.
-    float *row_db = (float *) alloca((size_t) W * sizeof(float));
+    // Convert linear-power accumulator to dB. row_db is a persistent
+    // spec_w buffer allocated once in spec_init -- an alloca here would be
+    // an unbounded, no-failure-path stack allocation scaling with window width.
+    float *row_db = s->row_db;
     float min_db = INFINITY, max_db = -INFINITY;
     for (int x = 0; x < W; ++x) {
         double p = s->row_accum[x] / (double) s->row_accum_count;
