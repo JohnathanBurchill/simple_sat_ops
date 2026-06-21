@@ -114,6 +114,11 @@ static double parse_duration_s(const char *spec)
     }
 }
 
+// Max fragments accumulated for one reception (also sizes fix_t.ids, so the
+// per-fix id list can hold every contributing fragment -- a smaller cap made
+// an --id= belonging to a later fragment silently fail to match).
+#define GNSS_FRAG_MAX 260
+
 typedef struct {
     long long      id;
     char           ts_received[40];
@@ -235,7 +240,7 @@ static int reassemble(const frag_t *frags, int n, unsigned char *buf, int bufcap
 typedef struct {
     bestxyz_t b;
     char      ts_received[40];
-    long long ids[8];
+    long long ids[GNSS_FRAG_MAX];
     int       n_ids;
     int       crc_ok;
     double    epoch_s;     // GNSS solution epoch, GPS seconds (week*604800 + sow)
@@ -266,7 +271,7 @@ static int parse_fix(const frag_t *frags, int n, fix_t *out)
     out->epoch_s = (double)out->b.gps_week * 604800.0 + out->b.gps_sow;
     snprintf(out->ts_received, sizeof out->ts_received, "%s", frags[0].ts_received);
     out->n_ids = 0;
-    for (int i = 0; i < n && i < 8; ++i) out->ids[out->n_ids++] = frags[i].id;
+    for (int i = 0; i < n && i < GNSS_FRAG_MAX; ++i) out->ids[out->n_ids++] = frags[i].id;
     return 1;
 }
 
@@ -456,7 +461,7 @@ int main(int argc, char **argv)
     sqlite3_bind_int(st, 1, TCMD_TYPE);
     sqlite3_bind_int(st, 2, TCMD_HDR + 1);
 
-    frag_t recv[260];
+    frag_t recv[GNSS_FRAG_MAX];
     int nrecv = 0;
     unsigned char curkey[8];
     int have_key = 0, last_seq = 0;
