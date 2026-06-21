@@ -20,6 +20,8 @@
 
 #include "modem.h"
 
+#include "asm_search.h"
+
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
@@ -207,54 +209,6 @@ int pcm16_write_wav(const char *path,
     return 0;
 }
 
-// AX100 attached sync marker. Must match AX100_ASM_* in ax100.h — duplicated
-// here so modem.c doesn't have to pull ax100.h (keeps it a pure DSP module).
-#define ASM_BIG_ENDIAN_U32  0x930B51DEu
-
-// find_u32_pattern (FIRST-match variant) lived here before
-// find_u32_pattern_best replaced it on every call site. Resurrect from
-// git if a future caller wants the "stop at first hit" behaviour.
-
-// Like find_u32_pattern but returns the LOWEST-HAMMING match in
-// [min_offset, end]. Ties broken by earliest position. *out_ham
-// receives the Hamming distance of the match (or 33 if none).
-// Used by the cross-phase modem to prefer good signal matches over
-// noise matches in earlier phases — at sync_max_ham >= 4 the bit
-// stream is sprinkled with random Hamming-4-or-5 noise hits, and
-// returning the first one (find_u32_pattern's behaviour) buries
-// the real Hamming-1 ASM behind a wall of noise advances.
-static size_t find_u32_pattern_best(const uint8_t *bits, size_t n_bits,
-                                    uint32_t needle, int max_ham,
-                                    size_t min_offset, int *out_ham)
-{
-    if (out_ham) *out_ham = 33;
-    if (n_bits < 32) return (size_t)-1;
-    size_t start = min_offset;
-    if (start > n_bits - 32) return (size_t)-1;
-    uint32_t window = 0;
-    for (size_t i = 0; i < 32; ++i) {
-        window = (window << 1) | (bits[start + i] & 1u);
-    }
-    int best_ham = 33;
-    size_t best_off = (size_t)-1;
-    int h = (int)__builtin_popcount(window ^ needle);
-    if (h <= max_ham) {
-        best_ham = h;
-        best_off = start;
-    }
-    for (size_t i = 32; i < n_bits - start; ++i) {
-        window = (window << 1) | (bits[start + i] & 1u);
-        h = (int)__builtin_popcount(window ^ needle);
-        if (h <= max_ham && h < best_ham) {
-            best_ham = h;
-            best_off = start + i - 31;
-            if (best_ham == 0) break;  // can't beat zero
-        }
-    }
-    if (out_ham && best_off != (size_t)-1) *out_ham = best_ham;
-    return best_off;
-}
-
 // Demod chain (independent of gr-satellites; equivalent in shape to its
 // fsk_demodulator):
 //
@@ -430,7 +384,7 @@ int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
             tmp_bits[i] = (uint8_t)bit;
         }
         int this_ham = 33;
-        size_t off = find_u32_pattern_best(tmp_bits, max_strobes,
+        size_t off = asm_find_best(tmp_bits, max_strobes,
                                            ASM_BIG_ENDIAN_U32, sync_max_ham,
                                            min_bit_offset, &this_ham);
         if (off != (size_t)-1) {

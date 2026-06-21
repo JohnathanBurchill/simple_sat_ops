@@ -12,45 +12,11 @@
 
 #include "modem_viterbi.h"
 
+#include "asm_search.h"
+
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-
-#define ASM_BIG_ENDIAN_U32 0x930B51DEu
-
-// Same lowest-Hamming ASM finder modem_iq.c uses. Duplicated here so
-// this translation unit stays independent of modem_iq.c.
-static size_t vit_find_asm_best(const uint8_t *bits, size_t n_bits,
-                                uint32_t needle, int max_ham,
-                                size_t min_offset, int *out_ham)
-{
-    if (out_ham) *out_ham = 33;
-    if (n_bits < 32) return (size_t) -1;
-    size_t start = min_offset;
-    if (start > n_bits - 32) return (size_t) -1;
-    uint32_t window = 0;
-    for (size_t i = 0; i < 32; ++i) {
-        window = (window << 1) | (bits[start + i] & 1u);
-    }
-    int best_ham = 33;
-    size_t best_off = (size_t) -1;
-    int h = (int) __builtin_popcount(window ^ needle);
-    if (h <= max_ham) {
-        best_ham = h;
-        best_off = start;
-    }
-    for (size_t i = 32; i < n_bits - start; ++i) {
-        window = (window << 1) | (bits[start + i] & 1u);
-        h = (int) __builtin_popcount(window ^ needle);
-        if (h <= max_ham && h < best_ham) {
-            best_ham = h;
-            best_off = start + i - 31;
-            if (best_ham == 0) break;
-        }
-    }
-    if (out_ham && best_off != (size_t) -1) *out_ham = best_ham;
-    return best_off;
-}
 
 int modem_iq_viterbi_to_bits(const int16_t *iq_pairs, size_t n_pairs,
                              const modem_params_t *p,
@@ -354,7 +320,7 @@ int modem_iq_viterbi_to_bits(const int16_t *iq_pairs, size_t n_pairs,
             tmp_bits[i] = b;
         }
         int this_ham = 33;
-        size_t off = vit_find_asm_best(tmp_bits, n_sym,
+        size_t off = asm_find_best(tmp_bits, n_sym,
                                        ASM_BIG_ENDIAN_U32, sync_max_ham,
                                        min_bit_offset, &this_ham);
         if (off != (size_t) -1) {

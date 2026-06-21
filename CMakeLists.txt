@@ -322,7 +322,7 @@ endif()
 
 # FM-audio preview tool: baseband WAV -> audible FM-modulated WAV
 add_executable(fm_preview utils/fm_preview.c utils/wav_read.c
-               src/dsp/modem.c)
+               src/dsp/asm_search.c src/dsp/modem.c)
 target_link_libraries(fm_preview PRIVATE m)
 list(APPEND SSO_TARGETS fm_preview)
 
@@ -398,7 +398,7 @@ if (RAYLIB_FOUND)
     # captures. Lets the operator mouse-draw time × freq boxes around
     # bursts they want to feed back into rx_replay --anchor-csv.
     set(DECODE_INSPECTOR_SRCS utils/decode_inspector.c utils/pdf_writer.c
-                          src/dsp/modem.c src/dsp/modem_fsk.c
+                          src/dsp/asm_search.c src/dsp/modem.c src/dsp/modem_fsk.c
                           src/dsp/modem_viterbi.c src/dsp/sw_nco.c
                           src/proto/golay24.c src/proto/rs.c
                           src/proto/csp.c)
@@ -431,7 +431,7 @@ endif()
 # and A/B-checks against modem_pcm16_to_bits on the FM-discriminated
 # equivalent.
 add_executable(modem_iq_selftest unit_tests/modem_iq_selftest.c
-               src/dsp/modem.c src/dsp/modem_fsk.c
+               src/dsp/asm_search.c src/dsp/modem.c src/dsp/modem_fsk.c
                src/dsp/modem_iq.c src/dsp/modem_viterbi.c)
 target_include_directories(modem_iq_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(modem_iq_selftest PRIVATE m)
@@ -442,7 +442,7 @@ list(APPEND SSO_TARGETS modem_iq_selftest)
 # frame. Same .c links as modem_iq_selftest since modem_fsk depends on
 # modem.h.
 add_executable(modem_fsk_selftest unit_tests/modem_fsk_selftest.c
-               src/dsp/modem.c src/dsp/modem_fsk.c)
+               src/dsp/asm_search.c src/dsp/modem.c src/dsp/modem_fsk.c)
 target_include_directories(modem_fsk_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(modem_fsk_selftest PRIVATE m)
 list(APPEND SSO_TARGETS modem_fsk_selftest)
@@ -569,7 +569,7 @@ if (OPENSSL_FOUND)
     # Uplink test tool: builds CSP + AX100 frame, optionally modulates to WAV
     add_executable(uplink_test apps/uplink_test.c
                    src/proto/csp.c src/proto/golay24.c src/proto/ax100.c
-                   src/proto/rs.c src/proto/hmac_keyfile.c src/dsp/modem.c)
+                   src/proto/rs.c src/proto/hmac_keyfile.c src/dsp/asm_search.c src/dsp/modem.c)
     target_include_directories(uplink_test PRIVATE ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(uplink_test PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(uplink_test PRIVATE ${OPENSSL_LIBRARIES} m)
@@ -577,7 +577,7 @@ if (OPENSSL_FOUND)
 
     # Offline AX100 frame decoder: WAV/RAW -> demod -> ax100_unframe -> CSP
     add_executable(rx_decode utils/rx_decode.c utils/wav_read.c
-                   src/dsp/modem.c src/dsp/modem_fsk.c
+                   src/dsp/asm_search.c src/dsp/modem.c src/dsp/modem_fsk.c
                    src/dsp/modem_iq.c src/dsp/modem_viterbi.c
                    src/proto/ax100.c src/proto/rs.c src/proto/golay24.c
                    src/proto/csp.c src/proto/hmac_keyfile.c
@@ -660,7 +660,7 @@ if (OPENSSL_FOUND)
     # Offline sliding-window decoder for WAV / raw S16_LE files.
     add_executable(rx_replay utils/rx_replay.c utils/wav_read.c
                    src/pipeline/decode_loop.c
-                   src/dsp/modem.c src/dsp/modem_fsk.c
+                   src/dsp/asm_search.c src/dsp/modem.c src/dsp/modem_fsk.c
                    src/dsp/modem_iq.c src/dsp/modem_viterbi.c
                    src/dsp/sw_nco.c src/dsp/iq_burst.c
                    src/proto/ax100.c src/proto/rs.c src/proto/golay24.c
@@ -715,7 +715,7 @@ if (OPENSSL_FOUND)
                    src/proto/csp.c src/proto/ax100.c
                    src/proto/rs.c src/proto/golay24.c
                    src/proto/hmac_keyfile.c
-                   src/dsp/modem.c)
+                   src/dsp/asm_search.c src/dsp/modem.c)
     target_include_directories(tx_burst_selftest PRIVATE
         ${UNIT_TESTS_INCLUDE} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(tx_burst_selftest PRIVATE
@@ -727,7 +727,7 @@ if (OPENSSL_FOUND)
     # CTS1 beacon WAV generator
     add_executable(beacon_gen utils/beacon_gen.c
                    src/proto/csp.c src/proto/golay24.c src/proto/ax100.c
-                   src/proto/rs.c src/proto/hmac_keyfile.c src/dsp/modem.c)
+                   src/proto/rs.c src/proto/hmac_keyfile.c src/dsp/asm_search.c src/dsp/modem.c)
     target_include_directories(beacon_gen PRIVATE ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(beacon_gen PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(beacon_gen PRIVATE ${OPENSSL_LIBRARIES} m)
@@ -737,7 +737,7 @@ if (OPENSSL_FOUND)
     if (WITH_USRP_B210)
         add_executable(tx_frame_sdr utils/tx_frame_sdr.c
                        src/proto/csp.c src/proto/golay24.c src/proto/ax100.c
-                       src/proto/rs.c src/proto/hmac_keyfile.c src/dsp/modem.c)
+                       src/proto/rs.c src/proto/hmac_keyfile.c src/dsp/asm_search.c src/dsp/modem.c)
         target_include_directories(tx_frame_sdr PRIVATE
             ${OPENSSL_INCLUDE_DIRS} ${UHD_INCLUDE_DIRS})
         target_link_directories(tx_frame_sdr PRIVATE
@@ -749,7 +749,7 @@ if (OPENSSL_FOUND)
 
         # B210 record-only RX capture.
         add_executable(b210_rx_capture utils/b210_rx_capture.c
-                       src/dsp/modem.c
+                       src/dsp/asm_search.c src/dsp/modem.c
                        src/dsp/sw_nco.c
                        src/hw/carrier_trim.c)
         target_include_directories(b210_rx_capture PRIVATE
@@ -773,7 +773,7 @@ if (OPENSSL_FOUND)
                        src/hw/carrier_trim.c
                        src/dsp/fir_decim.c src/dsp/sw_nco.c
                        src/dsp/iq_burst.c
-                       src/dsp/modem.c)
+                       src/dsp/asm_search.c src/dsp/modem.c)
         # WITH_USRP_B210 must be defined for this target too: sdr_backend.c's
         # ops_for() only returns the UHD ops under this macro.
         target_compile_definitions(b210_gain_sweep PRIVATE WITH_USRP_B210)
@@ -916,7 +916,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
                    src/hw/tr_switch.c
                    src/beacon/telemetry.c
                    src/pipeline/decode_loop.c
-                   src/dsp/modem.c src/dsp/modem_fsk.c
+                   src/dsp/asm_search.c src/dsp/modem.c src/dsp/modem_fsk.c
                    src/dsp/modem_iq.c src/dsp/modem_viterbi.c
                    src/proto/ax100.c src/proto/rs.c
                    src/proto/golay24.c src/proto/csp.c
