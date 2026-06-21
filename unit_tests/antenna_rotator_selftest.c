@@ -974,11 +974,48 @@ static void test_pass_simulation_flip_baseline(void)
                  "FIX: total az travel = 0 deg");
 }
 
+// The two-step home's final leg must NOT fire on the post-SET target echo
+// (a STATUS reading still sitting at the commanded mid waypoint), only on
+// real feedback that has unwound into the zone where the short path to the
+// target runs the same way as the unwind. This is the decision behind the old
+// "r winds to 360" bug. antenna_rotator_home_leg2_ready encodes it (and
+// tracking_tick calls it); tol here matches tracking.c HOME_ECHO_TOLERANCE_DEG.
+static void test_home_leg2_echo_rejection(void)
+{
+    fprintf(stderr, "home two-step leg-2 echo rejection:\n");
+    const double tol = 2.0;
+
+    // Geometry A: unwind negative (mid 170 -> final 0).
+    // The mid waypoint is itself in-zone here, so a reading at/near it tests
+    // the echo gate specifically, not the zone gate.
+    check(antenna_rotator_home_leg2_ready(170.0, 170.0, 0.0, tol) == 0,
+          "echo exactly at the mid waypoint does not fire leg 2");
+    check(antenna_rotator_home_leg2_ready(171.0, 170.0, 0.0, tol) == 0,
+          "reading within the echo tolerance of the mid does not fire");
+    check(antenna_rotator_home_leg2_ready(172.0, 170.0, 0.0, tol) == 0,
+          "reading exactly at the echo tolerance does not fire (strict >)");
+    check(antenna_rotator_home_leg2_ready(80.0, 170.0, 0.0, tol) == 1,
+          "real feedback unwound into the zone fires leg 2");
+    check(antenna_rotator_home_leg2_ready(250.0, 170.0, 0.0, tol) == 0,
+          "real feedback wound the wrong way (out of zone) does not fire");
+    check(antenna_rotator_home_leg2_ready(0.0, 170.0, 0.0, tol) == 1,
+          "reading at the final target (remaining 0) fires leg 2");
+
+    // Geometry B: unwind positive (mid 180 -> final 350), the mirror image.
+    check(antenna_rotator_home_leg2_ready(180.0, 180.0, 350.0, tol) == 0,
+          "echo at the mid waypoint (positive unwind) does not fire");
+    check(antenna_rotator_home_leg2_ready(270.0, 180.0, 350.0, tol) == 1,
+          "real feedback in the zone (positive unwind) fires leg 2");
+    check(antenna_rotator_home_leg2_ready(90.0, 180.0, 350.0, tol) == 0,
+          "real feedback wound the wrong way (positive unwind) does not fire");
+}
+
 int main(void)
 {
     test_wrap_to_pm180();
     test_accumulate_unwrapped();
     test_home_unwrapped_target();
+    test_home_leg2_echo_rejection();
     test_to_mech_coords_passthrough();
     test_to_mech_coords_flip_on_meridian();
     test_to_mech_coords_flip_off_meridian();

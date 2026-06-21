@@ -119,6 +119,14 @@ int antenna_rotator_point_to_target(antenna_rotator_t *antenna_rotator, double a
 double antenna_rotator_wrap_to_pm180(double delta_deg);
 double antenna_rotator_accumulate_unwrapped(double prev_unwrapped, double prediction_az);
 double antenna_rotator_home_unwrapped_target(double prev_unwrapped, double home_az_wrapped);
+// Decide whether the final leg of a two-step home should fire, given the
+// latest STATUS azimuth. Two things must hold: the reading must differ from
+// the commanded mid waypoint by more than echo_tol_deg (so it is real
+// feedback, not the post-SET target echo the Rot2Prog reports for a couple
+// of seconds), and it must be in the unwind zone (the short path from here to
+// final_az runs the same way as the unwind). Returns 1 to fire, 0 to wait.
+int antenna_rotator_home_leg2_ready(double current_az, double mid_az,
+                                    double final_az, double echo_tol_deg);
 int antenna_rotator_seed_from_status(antenna_rotator_t *antenna_rotator);
 int antenna_rotator_set_unwrapped(antenna_rotator_t *antenna_rotator, double az_unwrapped, double elevation);
 // Map a predicted sky direction (sat az/el, both in standard convention)

@@ -642,17 +642,14 @@ void tracking_tick(state_t *state, double jul_utc, double t_now)
         // a single pass winds < 360, so one mid waypoint suffices.)
         if (state->antenna_rotator.homing_in_progress
             && state->have_antenna_rotator) {
-            double final_az  = state->antenna_rotator.home_pending_final_az;
-            double mid_az    = state->antenna_rotator.target_azimuth_unwrapped;
-            double from_mid  = fabs(antenna_rotator_wrap_to_pm180(current_az - mid_az));
-            double unwind    = final_az - mid_az;   // sign = unwind direction
-            double remaining = antenna_rotator_wrap_to_pm180(final_az - current_az);
-            int in_zone = (remaining == 0.0)
-                       || ((remaining > 0.0) == (unwind > 0.0));
-            // from_mid > tol => the reading is real feedback, not the post-SET
-            // target echo. The two-step always starts out of the unwind zone
-            // (|prev| > 180), so the stale pre-SET reading can't fire early.
-            if (from_mid > HOME_ECHO_TOLERANCE_DEG && in_zone) {
+            double final_az = state->antenna_rotator.home_pending_final_az;
+            double mid_az   = state->antenna_rotator.target_azimuth_unwrapped;
+            // The two-step always starts out of the unwind zone (|prev| > 180),
+            // so the stale pre-SET reading can't fire the leg early; the
+            // post-SET target echo (a reading still at the mid waypoint) is
+            // rejected inside antenna_rotator_home_leg2_ready.
+            if (antenna_rotator_home_leg2_ready(current_az, mid_az, final_az,
+                                                HOME_ECHO_TOLERANCE_DEG)) {
                 int rc = main_rotator_submit_set(state, final_az, 0.0);
                 if (rc == ANTENNA_ROTATOR_OK) {
                     state->antenna_rotator.antenna_is_moving = 1;

@@ -230,6 +230,22 @@ double antenna_rotator_home_unwrapped_target(double prev, double home_wrapped)
     return best;
 }
 
+int antenna_rotator_home_leg2_ready(double current_az, double mid_az,
+                                    double final_az, double echo_tol_deg)
+{
+    // from_mid > tol => the reading is real feedback, not the post-SET
+    // target echo (which still equals the commanded mid waypoint).
+    double from_mid = fabs(antenna_rotator_wrap_to_pm180(current_az - mid_az));
+    // sign of unwind = the direction the antenna is unwinding.
+    double unwind = final_az - mid_az;
+    double remaining = antenna_rotator_wrap_to_pm180(final_az - current_az);
+    // in_zone: the short path from here to final runs the SAME way as the
+    // unwind, so issuing the target won't send it back around the long way.
+    int in_zone = (remaining == 0.0)
+               || ((remaining > 0.0) == (unwind > 0.0));
+    return (from_mid > echo_tol_deg && in_zone) ? 1 : 0;
+}
+
 int antenna_rotator_seed_from_status(antenna_rotator_t *antenna_rotator)
 {
     double az = 0.0, el = 0.0;
