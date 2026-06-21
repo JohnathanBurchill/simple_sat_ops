@@ -580,59 +580,29 @@ static int write_pdf_with_axes(const char *path,
     pdf_end_obj(&w);
     free(cs);
 
-    // Page object.
-    int page_id = pdf_begin_obj(&w);
+    // Page object. The Pages object is written immediately after, with no
+    // pdf_begin_obj call in between, so its object number is deterministically
+    // page_id + 1 -- reference it directly. (The old code wrote a "%PARENT%"
+    // placeholder and patched the page body in place afterwards, which would
+    // corrupt every following xref offset if the rewritten body ever exceeded
+    // the reserved span; it only worked because pages_id stayed a small number.)
+    int page_id  = pdf_begin_obj(&w);
+    int pages_id = page_id + 1;
     pdf_printf(&w,
-        "<< /Type /Page /Parent %%PARENT%% /MediaBox [0 0 %d %d] "
-        "/Resources << /Font << /F1 %d 0 R >> "
-        "/XObject << /Im1 %d 0 R /Im2 %d 0 R >> >> "
-        "/Contents %d 0 R >>",
-        W, H, font_id, spec_id, cb_id, cs_id);
-    pdf_end_obj(&w);
-
-    // Pages object.
-    int pages_id = pdf_begin_obj(&w);
-    pdf_printf(&w,
-        "<< /Type /Pages /Kids [%d 0 R] /Count 1 >>", page_id);
-    pdf_end_obj(&w);
-
-    // We needed the Page object's Parent to point at Pages, but Pages
-    // wasn't assigned until after. Patch via a second pass would be
-    // ugly; instead we substitute the placeholder string we left in
-    // the page's body. Simpler: just rewind, find "%PARENT%", and edit
-    // — but we used stream output. Take the easy way: rewrite the
-    // Page object now that pages_id is known.
-    // (Streamed approach: rebuild and store using the right ID below.)
-    // Patch: seek back to the page object's start and rewrite.
-    long save_off = (long) w.off;
-    if (fseek(w.fp, (long) w.obj_offsets[page_id], SEEK_SET) != 0) {
-        fclose(fp); return -1;
-    }
-    // Calculate the byte count of the original page body so we can
-    // overwrite it in place. The "%PARENT%" token is 8 bytes; the new
-    // "<n> 0 R" is up to 7 bytes — we pad with spaces if shorter.
-    char page_body[512];
-    int n = snprintf(page_body, sizeof page_body,
-        "%d 0 obj\n"
         "<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %d %d] "
         "/Resources << /Font << /F1 %d 0 R >> "
         "/XObject << /Im1 %d 0 R /Im2 %d 0 R >> >> "
-        "/Contents %d 0 R >>\nendobj\n",
-        page_id, pages_id, W, H, font_id, spec_id, cb_id, cs_id);
-    // The original write placed "%PARENT%" (8 chars) where pages_id will
-    // print; the new body is shorter or equal — pad with spaces to keep
-    // file layout intact for the xref.
-    long page_len_old = (long) w.obj_offsets[pages_id]
-                       - (long) w.obj_offsets[page_id];
-    if (n > 0 && n < page_len_old) {
-        memset(page_body + n, ' ', (size_t)(page_len_old - n - 1));
-        page_body[page_len_old - 1] = '\n';
-        fwrite(page_body, 1, (size_t) page_len_old, w.fp);
-    } else if (n > 0) {
-        fwrite(page_body, 1, (size_t) n, w.fp);
-    }
-    fseek(w.fp, save_off, SEEK_SET);
-    w.off = (size_t) save_off;
+        "/Contents %d 0 R >>",
+        pages_id, W, H, font_id, spec_id, cb_id, cs_id);
+    pdf_end_obj(&w);
+
+    // Pages object. Must land at pages_id (page_id + 1) for the /Parent
+    // reference above to resolve -- guard against the numbering drifting.
+    int pages_id_actual = pdf_begin_obj(&w);
+    if (pages_id_actual != pages_id) { fclose(fp); return -1; }
+    pdf_printf(&w,
+        "<< /Type /Pages /Kids [%d 0 R] /Count 1 >>", page_id);
+    pdf_end_obj(&w);
 
     // Catalog.
     int catalog_id = pdf_begin_obj(&w);
@@ -1670,20 +1640,22 @@ static int parse_args(gw_args_t *a, int argc, char **argv, int help)
         // Positionals first so the <...> arguments list above the --options.
         // main() decides which token is the rate vs the output PNG by the
         // input file extension; here they are captured generically.
+        // Capture into the first free positional slot. The !matched guards on
+        // the later blocks are essential: without them a single token sets
+        // pos1, then the next block sees pos1 != NULL and assigns the SAME
+        // token to pos2, and so on -- one filename filled all three slots and
+        // the real rate fell through as an "unknown option".
         if ((a->pos1 == NULL && (arg[0] != '-' || strcmp(arg, "-") == 0)) || help) {
             if (help) parse_help_line(OPTW, "<iq_path>", "raw int16 I,Q file, or a SatNOGS .ogg audio recording");
-            else a->pos1 = arg;
-            matched = 1;
+            else { a->pos1 = arg; matched = 1; }
         }
-        if ((a->pos1 != NULL && a->pos2 == NULL && (arg[0] != '-' || strcmp(arg, "-") == 0)) || help) {
+        if ((!matched && a->pos1 != NULL && a->pos2 == NULL && (arg[0] != '-' || strcmp(arg, "-") == 0)) || help) {
             if (help) parse_help_line(OPTW, "<sample_rate_hz>", "IQ sample rate in Hz (omit for .ogg; read from file)");
-            else a->pos2 = arg;
-            matched = 1;
+            else { a->pos2 = arg; matched = 1; }
         }
-        if ((a->pos2 != NULL && a->pos3 == NULL && (arg[0] != '-' || strcmp(arg, "-") == 0)) || help) {
+        if ((!matched && a->pos2 != NULL && a->pos3 == NULL && (arg[0] != '-' || strcmp(arg, "-") == 0)) || help) {
             if (help) parse_help_line(OPTW, "[<out_png>]", "output PNG path (positional; optional if --pdf= given)");
-            else a->pos3 = arg;
-            matched = 1;
+            else { a->pos3 = arg; matched = 1; }
         }
         if (strcmp(arg, "--help") == 0 || help) {
             if (help) parse_help_line(OPTW, "--help", "show this help and exit");
