@@ -825,7 +825,7 @@ static int rx_emit_decoded(rx_emit_ctx_t *ctx,
 
     emit_frame(ctx->log_path, ctx->quiet, ts,
                packet, (size_t)plen,
-               golay_errs, hmac_ok, /*use_hmac=*/0,
+               golay_errs, hmac_ok,
                rs_errs, used_golay_len,
                crc_status, crc_computed, crc_le, crc_be,
                rs_locs,
@@ -863,7 +863,7 @@ static int rx_emit_decoded(rx_emit_ctx_t *ctx,
     }
     if (ctx->use_tui) {
         rx_tui_observe_frame(ts, packet, (size_t)plen,
-                             golay_errs, hmac_ok, /*use_hmac=*/0,
+                             golay_errs, hmac_ok,
                              rs_errs, crc_status);
     }
     (*ctx->n_emitted_p)++;
@@ -1614,7 +1614,7 @@ int main(int argc, char **argv)
             if (iq_mode && pass1_use_viterbi) {
                 decoded = try_decode_window_viterbi(
                     win, window_samples, &mp, &opts,
-                    sync_max_ham, /*use_hmac=*/0, allow_partial_rs,
+                    sync_max_ham, allow_partial_rs,
                     inner_min_offset,
                     bits_scratch, bits_cap,
                     bytes_scratch, bytes_cap,
@@ -1625,7 +1625,7 @@ int main(int argc, char **argv)
             } else if (iq_mode && pass1_use_fsk) {
                 decoded = try_decode_window_fsk(
                     win, window_samples, &mp, &opts,
-                    sync_max_ham, /*use_hmac=*/0, allow_partial_rs,
+                    sync_max_ham, allow_partial_rs,
                     inner_min_offset,
                     bits_scratch, bits_cap,
                     bytes_scratch, bytes_cap,
@@ -1636,7 +1636,7 @@ int main(int argc, char **argv)
             } else if (iq_mode) {
                 decoded = try_decode_window_iq(
                     win, window_samples, &mp, &opts,
-                    sync_max_ham, /*use_hmac=*/0, allow_partial_rs,
+                    sync_max_ham, allow_partial_rs,
                     inner_min_offset,
                     bits_scratch, bits_cap,
                     bytes_scratch, bytes_cap,
@@ -1647,7 +1647,7 @@ int main(int argc, char **argv)
             } else {
                 decoded = try_decode_window(
                     win, window_samples, &mp, &opts,
-                    sync_max_ham, /*use_hmac=*/0, allow_partial_rs,
+                    sync_max_ham, allow_partial_rs,
                     inner_min_offset,
                     bits_scratch, bits_cap,
                     bytes_scratch, bytes_cap,
@@ -1745,7 +1745,7 @@ int main(int argc, char **argv)
                 // its 4-state trellis is wrong and finds zero syncs.
                 int dec2 = try_decode_window_fsk(
                     tw, tw_pairs, &mp, &opts,
-                    sync_max_ham, /*use_hmac=*/0, allow_partial_rs,
+                    sync_max_ham, allow_partial_rs,
                     0,
                     bits_scratch, bits_cap,
                     bytes_scratch, bytes_cap,
@@ -1851,7 +1851,7 @@ int main(int argc, char **argv)
                     size_t sync_off_a = 0;
                     int dec_a = try_decode_window_fsk(
                         mix_buf, tw_pairs, &mp, &opts,
-                        sync_max_ham, /*use_hmac=*/0, allow_partial_rs,
+                        sync_max_ham, allow_partial_rs,
                         0,
                         bits_scratch, bits_cap,
                         bytes_scratch, bytes_cap,

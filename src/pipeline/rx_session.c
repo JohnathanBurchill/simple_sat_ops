@@ -1023,7 +1023,7 @@ static void try_decode_at_window(rx_session_t *rxs)
         size_t sync_off_local = 0;
         if (!try_decode_window(rxs->window, rxs->window_samples,
                                &rxs->mp, &rxs->opts,
-                               rxs->sync_max_ham, /*use_hmac=*/0,
+                               rxs->sync_max_ham,
                                /*allow_partial_rs=*/1,
                                inner_min_offset,
                                rxs->bits_scratch, rxs->bits_cap,
@@ -1075,7 +1075,7 @@ static void try_decode_iq_at_window(rx_session_t *rxs)
         size_t sync_off_local = 0;
         if (!try_decode_window_iq(rxs->iq_window, rxs->window_samples,
                                   &rxs->mp, &rxs->opts,
-                                  rxs->sync_max_ham, /*use_hmac=*/0,
+                                  rxs->sync_max_ham,
                                   /*allow_partial_rs=*/1,
                                   inner_min_offset,
                                   rxs->bits_scratch, rxs->bits_cap,
@@ -1139,7 +1139,7 @@ static void try_decode_iq_at_window(rx_session_t *rxs)
         emit_frame(rxs->log_path[0] ? rxs->log_path : NULL,
                    /*quiet=*/1, ts,
                    rxs->packet, (size_t) plen,
-                   golay_errs, hmac_ok, /*use_hmac=*/0,
+                   golay_errs, hmac_ok,
                    rs_errs, used_golay_len,
                    crc_status, crc_computed, crc_le, crc_be,
                    rs_locs,
@@ -1211,7 +1211,7 @@ static void try_decode_viterbi_at_window(rx_session_t *rxs)
         size_t sync_off_local = 0;
         if (!try_decode_window_viterbi(rxs->iq_window, rxs->window_samples,
                                        &rxs->mp, &rxs->opts,
-                                       rxs->sync_max_ham, /*use_hmac=*/0,
+                                       rxs->sync_max_ham,
                                        /*allow_partial_rs=*/1,
                                        inner_min_offset,
                                        rxs->bits_scratch, rxs->bits_cap,

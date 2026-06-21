@@ -175,6 +175,9 @@ static const char SCHEMA_SQL[] =
     "  payload_sha1    BLOB NOT NULL,\n"
     "  golay_errs      INTEGER,\n"
     "  rs_errs         INTEGER,\n"
+    // hmac_ok: legacy. RX integrity is now the CSP CRC32 (crc_status), not
+    // HMAC, so new rows always store -1 ("not checked"). Kept so old rows
+    // and any future uplink-side use still have a column to read.
     "  hmac_ok         INTEGER,\n"
     "  crc_status      INTEGER,\n"
     "  source_tool     TEXT NOT NULL,\n"

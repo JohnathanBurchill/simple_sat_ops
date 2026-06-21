@@ -208,7 +208,7 @@ int decode_loop_try_command(const char *cmd, char *status_buf, size_t cap)
 int try_decode_window(const int16_t *samples, size_t n_samples,
                       const modem_params_t *mp,
                       const ax100_opts_t *opts,
-                      int sync_max_ham, int use_hmac,
+                      int sync_max_ham,
                       int allow_partial_rs,
                       size_t min_offset_in,
                       uint8_t *bits_scratch, size_t bits_cap,
@@ -268,7 +268,7 @@ int try_decode_window(const int16_t *samples, size_t n_samples,
             // HMAC mode (no integrity gate would mean we'd emit
             // garbage at every false sync hit) and never overrides a
             // good RS decode.
-            if (allow_partial_rs && !use_hmac && opts->reed_solomon
+            if (allow_partial_rs && opts->reed_solomon
                 && *out_golay_errs == 0) {
                 ax100_opts_t partial_opts = *opts;
                 partial_opts.reed_solomon = 0;
@@ -296,10 +296,6 @@ int try_decode_window(const int16_t *samples, size_t n_samples,
             min_offset = sync_off + 1;
             continue;
         }
-        if (use_hmac && *out_hmac_ok == 0) {
-            min_offset = sync_off + 1;
-            continue;
-        }
         *out_packet_len = plen;
         if (out_sync_off) *out_sync_off = sync_off;
         return 1;
@@ -310,7 +306,7 @@ int try_decode_window(const int16_t *samples, size_t n_samples,
 int try_decode_window_iq(const int16_t *iq_pairs, size_t n_pairs,
                          const modem_params_t *mp,
                          const ax100_opts_t *opts,
-                         int sync_max_ham, int use_hmac,
+                         int sync_max_ham,
                          int allow_partial_rs,
                          size_t min_offset_in,
                          uint8_t *bits_scratch, size_t bits_cap,
@@ -354,7 +350,7 @@ int try_decode_window_iq(const int16_t *iq_pairs, size_t n_pairs,
                                      out_rs_locs);
         (void) polarity_used;
         if (plen < 0) {
-            if (allow_partial_rs && !use_hmac && opts->reed_solomon
+            if (allow_partial_rs && opts->reed_solomon
                 && *out_golay_errs == 0) {
                 ax100_opts_t partial_opts = *opts;
                 partial_opts.reed_solomon = 0;
@@ -378,10 +374,6 @@ int try_decode_window_iq(const int16_t *iq_pairs, size_t n_pairs,
             min_offset = sync_off + 1;
             continue;
         }
-        if (use_hmac && *out_hmac_ok == 0) {
-            min_offset = sync_off + 1;
-            continue;
-        }
         *out_packet_len = plen;
         if (out_sync_off) *out_sync_off = sync_off;
         return 1;
@@ -392,7 +384,7 @@ int try_decode_window_iq(const int16_t *iq_pairs, size_t n_pairs,
 int try_decode_window_fsk(const int16_t *iq_pairs, size_t n_pairs,
                           const modem_params_t *mp,
                           const ax100_opts_t *opts,
-                          int sync_max_ham, int use_hmac,
+                          int sync_max_ham,
                           int allow_partial_rs,
                           size_t min_offset_in,
                           uint8_t *bits_scratch, size_t bits_cap,
@@ -436,7 +428,7 @@ int try_decode_window_fsk(const int16_t *iq_pairs, size_t n_pairs,
                                      out_rs_locs);
         (void) polarity_used;
         if (plen < 0) {
-            if (allow_partial_rs && !use_hmac && opts->reed_solomon
+            if (allow_partial_rs && opts->reed_solomon
                 && *out_golay_errs == 0) {
                 ax100_opts_t partial_opts = *opts;
                 partial_opts.reed_solomon = 0;
@@ -460,10 +452,6 @@ int try_decode_window_fsk(const int16_t *iq_pairs, size_t n_pairs,
             min_offset = sync_off + 1;
             continue;
         }
-        if (use_hmac && *out_hmac_ok == 0) {
-            min_offset = sync_off + 1;
-            continue;
-        }
         *out_packet_len = plen;
         if (out_sync_off) *out_sync_off = sync_off;
         return 1;
@@ -474,7 +462,7 @@ int try_decode_window_fsk(const int16_t *iq_pairs, size_t n_pairs,
 int try_decode_window_viterbi(const int16_t *iq_pairs, size_t n_pairs,
                               const modem_params_t *mp,
                               const ax100_opts_t *opts,
-                              int sync_max_ham, int use_hmac,
+                              int sync_max_ham,
                               int allow_partial_rs,
                               size_t min_offset_in,
                               uint8_t *bits_scratch, size_t bits_cap,
@@ -518,7 +506,7 @@ int try_decode_window_viterbi(const int16_t *iq_pairs, size_t n_pairs,
                                      out_rs_locs);
         (void) polarity_used;
         if (plen < 0) {
-            if (allow_partial_rs && !use_hmac && opts->reed_solomon
+            if (allow_partial_rs && opts->reed_solomon
                 && *out_golay_errs == 0) {
                 ax100_opts_t partial_opts = *opts;
                 partial_opts.reed_solomon = 0;
@@ -542,10 +530,6 @@ int try_decode_window_viterbi(const int16_t *iq_pairs, size_t n_pairs,
             min_offset = sync_off + 1;
             continue;
         }
-        if (use_hmac && *out_hmac_ok == 0) {
-            min_offset = sync_off + 1;
-            continue;
-        }
         *out_packet_len = plen;
         if (out_sync_off) *out_sync_off = sync_off;
         return 1;
@@ -555,7 +539,7 @@ int try_decode_window_viterbi(const int16_t *iq_pairs, size_t n_pairs,
 
 void emit_frame(const char *log_path, int quiet, const char *ts,
                 const uint8_t *packet, size_t packet_len,
-                int golay_errs, int hmac_ok, int use_hmac,
+                int golay_errs, int hmac_ok,
                 int rs_errs, int used_golay_len,
                 int crc_status,
                 uint32_t crc_computed, uint32_t crc_le, uint32_t crc_be,
@@ -579,10 +563,6 @@ void emit_frame(const char *log_path, int quiet, const char *ts,
     if (csp_ok) g_stats.csp_ok++;
     if (rs_errs == -2)     g_stats.rs_uncorrectable++;
     else if (rs_errs >= 0) g_stats.rs_corrected++;
-    if (use_hmac) {
-        if (hmac_ok == 1)      g_stats.hmac_ok++;
-        else if (hmac_ok == 0) g_stats.hmac_bad++;
-    }
 
     FILE *streams[2] = { quiet ? NULL : stdout, NULL };
     FILE *log_fp = NULL;
@@ -592,11 +572,10 @@ void emit_frame(const char *log_path, int quiet, const char *ts,
     }
 
     int show_headers = decode_loop_show_headers();
-    int hmac_bad = use_hmac && hmac_ok == 0;
     int rs_bad = rs_errs == -2;
     // Always-show framing line when something went wrong — operator needs
-    // the rs/hmac state even in terse mode. Otherwise gate on the toggle.
-    int show_ax100 = show_headers || hmac_bad || rs_bad;
+    // the rs state even in terse mode. Otherwise gate on the toggle.
+    int show_ax100 = show_headers || rs_bad;
 
     const char *len_src =
         used_golay_len == 1 ? "golay-header"
@@ -605,22 +584,16 @@ void emit_frame(const char *log_path, int quiet, const char *ts,
         FILE *fp = streams[s];
         if (fp == NULL) continue;
         if (show_ax100) {
-            if (use_hmac) {
-                fprintf(fp, "[%s] AX100: golay_errors=%d hmac=%s rs=%s len=%s "
-                        "len_bytes=%zu\n",
-                        ts, golay_errs,
-                        hmac_ok == 1 ? "ok" : hmac_ok == 0 ? "MISMATCH" : "(off)",
-                        rs_buf, len_src, packet_len);
-            } else {
-                fprintf(fp, "[%s] AX100: golay_errors=%d rs=%s len=%s "
-                        "len_bytes=%zu\n",
-                        ts, golay_errs, rs_buf, len_src, packet_len);
-            }
+            // RX validates integrity by the CSP CRC32, not HMAC, so the
+            // framing line carries no HMAC field.
+            fprintf(fp, "[%s] AX100: golay_errors=%d rs=%s len=%s "
+                    "len_bytes=%zu\n",
+                    ts, golay_errs, rs_buf, len_src, packet_len);
         }
         // Per-byte error positions from the RS solver. Forensic detail —
         // gated on the toggle since terse-mode operators don't care.
         if (show_headers && rs_errs > 0 && rs_locs != NULL) {
-            size_t on_wire_len = packet_len + (use_hmac ? 4 : 0) + 32;
+            size_t on_wire_len = packet_len + 32;
             int sorted[32];
             int n = rs_errs > 32 ? 32 : rs_errs;
             for (int i = 0; i < n; ++i) sorted[i] = rs_locs[i];

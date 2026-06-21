@@ -209,7 +209,6 @@ static struct {
     uint64_t beacon;
     uint64_t tcmd;
     uint64_t other;
-    uint64_t hmac_mismatch;
     uint64_t rs_uncorrectable;
     uint64_t crc_mismatch;
 } g_counters;
@@ -908,12 +907,11 @@ static void render(void)
     mvhline(rows - 1, 0, ' ', cols);
     char foot[300];
     snprintf(foot, sizeof foot,
-             " beacons=%llu  tcmd=%llu  other=%llu  uncorr=%llu  hmac_mismatch=%llu  crc_mismatch=%llu",
+             " beacons=%llu  tcmd=%llu  other=%llu  uncorr=%llu  crc_mismatch=%llu",
              (unsigned long long)g_counters.beacon,
              (unsigned long long)g_counters.tcmd,
              (unsigned long long)g_counters.other,
              (unsigned long long)g_counters.rs_uncorrectable,
-             (unsigned long long)g_counters.hmac_mismatch,
              (unsigned long long)g_counters.crc_mismatch);
     const char *kb = (g_cmd_fn != NULL) ? "  [^C] quit " : "  [q] quit ";
     int klen = (int)strlen(kb);
@@ -1030,18 +1028,20 @@ void rx_tui_observe_signal(double ratio_db, double thresh_db, int gate_open)
 
 void rx_tui_observe_frame(const char *ts,
                           const uint8_t *packet, size_t packet_len,
-                          int golay_errs, int hmac_ok, int use_hmac,
+                          int golay_errs, int hmac_ok,
                           int rs_errs,
                           int crc_status)
 {
     (void)golay_errs;
+    // RX integrity is the CSP CRC32, not HMAC, so hmac_ok (always "not
+    // checked" here) no longer drives any counter.
+    (void)hmac_ok;
     if (!g_init) return;
 
     g_counters.total++;
     clock_gettime(CLOCK_MONOTONIC, &g_last_frame_clock);
     g_have_any_frame = 1;
 
-    if (use_hmac && hmac_ok == 0) g_counters.hmac_mismatch++;
     if (rs_errs == -2) g_counters.rs_uncorrectable++;
     if (crc_status == 0) g_counters.crc_mismatch++;
 
@@ -1052,7 +1052,6 @@ void rx_tui_observe_frame(const char *ts,
     activity_bucket_t *act_b = activity_current();
     act_b->frames++;
     int frame_error = (rs_errs == -2)
-                   || (use_hmac && hmac_ok == 0)
                    || (crc_status == 0);
     if (frame_error) act_b->errors++;
 
@@ -1271,10 +1270,10 @@ void rx_tui_set_command_handler(rx_tui_command_fn fn, void *ctx) { (void)fn; (vo
 void rx_tui_set_history_path(const char *path) { (void)path; }
 void rx_tui_observe_frame(const char *ts, const uint8_t *packet,
                           size_t packet_len, int golay_errs, int hmac_ok,
-                          int use_hmac, int rs_errs, int crc_status)
+                          int rs_errs, int crc_status)
 {
     (void)ts; (void)packet; (void)packet_len; (void)golay_errs;
-    (void)hmac_ok; (void)use_hmac; (void)rs_errs; (void)crc_status;
+    (void)hmac_ok; (void)rs_errs; (void)crc_status;
 }
 int  rx_tui_tick(void) { return 0; }
 void rx_tui_observe_signal(double ratio_db, double thresh_db, int gate_open)

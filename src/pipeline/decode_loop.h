@@ -63,7 +63,7 @@
 int try_decode_window(const int16_t *samples, size_t n_samples,
                       const modem_params_t *mp,
                       const ax100_opts_t *opts,
-                      int sync_max_ham, int use_hmac,
+                      int sync_max_ham,
                       int allow_partial_rs,
                       size_t min_offset_in,
                       uint8_t *bits_scratch, size_t bits_cap,
@@ -83,7 +83,7 @@ int try_decode_window(const int16_t *samples, size_t n_samples,
 int try_decode_window_iq(const int16_t *iq_pairs, size_t n_pairs,
                          const modem_params_t *mp,
                          const ax100_opts_t *opts,
-                         int sync_max_ham, int use_hmac,
+                         int sync_max_ham,
                          int allow_partial_rs,
                          size_t min_offset_in,
                          uint8_t *bits_scratch, size_t bits_cap,
@@ -103,7 +103,7 @@ int try_decode_window_iq(const int16_t *iq_pairs, size_t n_pairs,
 int try_decode_window_fsk(const int16_t *iq_pairs, size_t n_pairs,
                           const modem_params_t *mp,
                           const ax100_opts_t *opts,
-                          int sync_max_ham, int use_hmac,
+                          int sync_max_ham,
                           int allow_partial_rs,
                           size_t min_offset_in,
                           uint8_t *bits_scratch, size_t bits_cap,
@@ -122,7 +122,7 @@ int try_decode_window_fsk(const int16_t *iq_pairs, size_t n_pairs,
 int try_decode_window_viterbi(const int16_t *iq_pairs, size_t n_pairs,
                               const modem_params_t *mp,
                               const ax100_opts_t *opts,
-                              int sync_max_ham, int use_hmac,
+                              int sync_max_ham,
                               int allow_partial_rs,
                               size_t min_offset_in,
                               uint8_t *bits_scratch, size_t bits_cap,
@@ -143,7 +143,7 @@ int try_decode_window_viterbi(const int16_t *iq_pairs, size_t n_pairs,
 // rs_locs (optional, NULL ok): pointer to the on-wire byte offsets of
 // the bytes RS corrected. When non-NULL and rs_errs > 0, an extra line
 //   `[ts] rs_locs: corrected=N of M on-wire bytes: a b c ...`
-// is emitted (M = packet_len + (use_hmac?4:0) + 32). The list helps the
+// is emitted (M = packet_len + 32, the RS-parity tail). The list helps the
 // operator distinguish tail-clustered errors (clock drift) from
 // scattered errors (channel noise).
 //
@@ -163,7 +163,7 @@ int try_decode_window_viterbi(const int16_t *iq_pairs, size_t n_pairs,
 // only (the TUI keeps its own length-based routing).
 void emit_frame(const char *log_path, int quiet, const char *ts,
                 const uint8_t *packet, size_t packet_len,
-                int golay_errs, int hmac_ok, int use_hmac,
+                int golay_errs, int hmac_ok,
                 int rs_errs, int used_golay_len,
                 int crc_status,
                 uint32_t crc_computed, uint32_t crc_le, uint32_t crc_be,

@@ -64,7 +64,7 @@ void rx_tui_set_status(const char *status);
 // whatever timestamp string emit_frame would receive.
 void rx_tui_observe_frame(const char *ts,
                           const uint8_t *packet, size_t packet_len,
-                          int golay_errs, int hmac_ok, int use_hmac,
+                          int golay_errs, int hmac_ok,
                           int rs_errs,
                           int crc_status);
 
