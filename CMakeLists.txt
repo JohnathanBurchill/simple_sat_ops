@@ -554,6 +554,14 @@ add_executable(ui_textfield_selftest
 target_include_directories(ui_textfield_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS ui_textfield_selftest)
 
+# Compact duration / age formatters for the predictions panel
+# ("next pass (in 1h 2m)" and "epoch age 3mo 5d"). Golden strings plus a
+# parse-back oracle and truncation-safety sweep. Pure C, no ncurses.
+add_executable(duration_fmt_selftest
+               unit_tests/duration_fmt_selftest.c src/ui/duration_fmt.c)
+target_include_directories(duration_fmt_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+list(APPEND SSO_TARGETS duration_fmt_selftest)
+
 # FIR decimator selftest. Audits constructor validation, accessors,
 # DC unity gain, passband transparency, anti-alias rejection (> 30 dB
 # in the would-alias stopband), decimation-ratio output count, and
@@ -1006,6 +1014,7 @@ endif()
 if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
     add_executable(simple_sat_ops apps/main.c apps/cli_args.c
                    src/ui/tui.c src/ui/spectrogram.c src/ui/panels.c
+                   src/ui/duration_fmt.c
                    src/ui/tx_compose.c src/ui/tx_log.c src/ui/viewer.c
                    src/ui/auto_tcmd.c src/ui/cmd_line.c src/ui/input.c
                    src/ui/ui_textfield.c

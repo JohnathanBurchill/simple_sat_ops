@@ -22,6 +22,7 @@
 #include "state.h"
 
 #include "antenna_rotator_async.h"
+#include "duration_fmt.h"
 #include "pass_session.h"
 #include "prediction.h"
 #include "sso_ipc.h"
@@ -249,10 +250,6 @@ void rx_panel_collect_local(state_t *state, rx_panel_data_t *d)
 #endif
 }
 
-// Defined further down (with the status panel); used here for the
-// "last frame T+" age too.
-static void format_duration_compact(double seconds, char *out, size_t n);
-
 // Render the RX panel from a snapshot. Compiles even without UHD —
 // the viewer feeds this from broadcast STATE so it can draw what the
 // operator sees.
@@ -462,8 +459,10 @@ void render_predictions_panel(state_t *state, double jul_utc,
     if (state->prediction.minutes_since_epoch / 1440.0 >= WARN_DAYS_SINCE_EPOCH) {
         attron(COLOR_PAIR(2));
     }
-    mvprintw(row++, col, "%15s   %0.1f days", "epoch age",
-             state->prediction.minutes_since_epoch / 1440.0);
+    char epoch_age[40];
+    format_age_compact(state->prediction.minutes_since_epoch * 60.0,
+                       epoch_age, sizeof epoch_age);
+    mvprintw(row++, col, "%15s   %s", "epoch age", epoch_age);
     if (state->prediction.minutes_since_epoch / 1440.0 >= WARN_DAYS_SINCE_EPOCH) {
         attroff(COLOR_PAIR(2));
     }
@@ -532,17 +531,16 @@ void render_predictions_panel(state_t *state, double jul_utc,
         char aos_hhmm[8];
         snprintf(aos_hhmm, sizeof aos_hhmm, "%02d:%02d",
                  aos_local.tm_hour, aos_local.tm_min);
+        char until[32];
+        format_duration_compact(minutes_until * 60.0, until, sizeof until);
         if (minutes_until < 1) {
             mvprintw(row++, col, "%15s   %s ", "next pass", aos_hhmm);
             attron(COLOR_PAIR(2));
-            printw("(in %.0fs)", floor(minutes_until * 60.0));
+            printw("(in %s)", until);
             attroff(COLOR_PAIR(2));
-        } else if (minutes_until < 10) {
-            mvprintw(row++, col, "%15s   %s (in %.1fm)", "next pass",
-                     aos_hhmm, minutes_until);
         } else {
-            mvprintw(row++, col, "%15s   %s (in %.0fm)", "next pass",
-                     aos_hhmm, minutes_until);
+            mvprintw(row++, col, "%15s   %s (in %s)", "next pass",
+                     aos_hhmm, until);
         }
         clrtoeol();
     } else {
@@ -602,48 +600,6 @@ void report_predictions(state_t *state, double jul_utc, int *print_row, int prin
 {
     compute_predictions(state, jul_utc);
     render_predictions_panel(state, jul_utc, print_row, print_col);
-}
-
-// Format a duration (seconds) as a compact "Dd Hh Mm Ss" string, emitting
-// only the parts that are needed: "2s", "1h 12s", "3d 4h", etc. Leading
-// zero units are dropped, and an interior zero unit is skipped (1h 0m 12s
-// -> "1h 12s"). A duration that rounds to zero renders as "0s". Seconds
-// are rounded to the nearest whole second.
-static void format_duration_compact(double seconds, char *out, size_t n)
-{
-    if (n == 0) return;
-    if (seconds < 0) seconds = 0;
-    long total = (long) (seconds + 0.5);
-    long days  =  total / 86400;
-    long hours = (total % 86400) / 3600;
-    long mins  = (total % 3600) / 60;
-    long secs  =  total % 60;
-
-    // snprintf returns the length it WOULD have written, so off can run past
-    // n on truncation (or wrap huge from a negative return). Clamp after each
-    // append so the next "n - off" can't underflow and out + off stays in
-    // bounds, independent of the off < n guards.
-    size_t off = 0;
-    if (days > 0) {
-        off += (size_t) snprintf(out + off, n - off, "%s%ldd",
-                                 off ? " " : "", days);
-        if (off >= n) off = n;
-    }
-    if (hours > 0 && off < n) {
-        off += (size_t) snprintf(out + off, n - off, "%s%ldh",
-                                 off ? " " : "", hours);
-        if (off >= n) off = n;
-    }
-    if (mins > 0 && off < n) {
-        off += (size_t) snprintf(out + off, n - off, "%s%ldm",
-                                 off ? " " : "", mins);
-        if (off >= n) off = n;
-    }
-    // Show seconds when nonzero, or when nothing else was emitted (so a
-    // sub-second / zero duration still prints "0s").
-    if ((secs > 0 || off == 0) && off < n) {
-        snprintf(out + off, n - off, "%s%lds", off ? " " : "", secs);
-    }
 }
 
 void render_status_panel(const status_panel_t *p,
