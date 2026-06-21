@@ -220,16 +220,21 @@ static void run_query(sqlite3 *db)
     build_resp_index(db);
 
     char sql[512];
+    // Clamp off after each append: a truncated snprintf returns the would-be
+    // length, leaving off past sizeof sql so the next "sizeof sql - off"
+    // (size_t) wraps huge and sql + off goes out of bounds.
     int off = snprintf(sql, sizeof sql,
         "SELECT id, ts_sent_ms, tsexec_ms, command_text, tx_freq_hz, "
         "tx_gain_db, source_tool, source_run, ts_transmitted "
         "FROM sent_tcmd WHERE 1=1");
+    if (off < 0 || off > (int) sizeof sql) off = (int) sizeof sql;
     char like_pattern[256];
     int have_like = (like_text[0] != '\0');
     if (have_like) {
         snprintf(like_pattern, sizeof like_pattern, "%%%s%%", like_text);
         off += snprintf(sql + off, sizeof sql - off,
                         " AND command_text LIKE ?1");
+        if (off > (int) sizeof sql) off = (int) sizeof sql;
     }
     snprintf(sql + off, sizeof sql - off,
              " ORDER BY ts_transmitted DESC LIMIT %d", MAX_ROWS);

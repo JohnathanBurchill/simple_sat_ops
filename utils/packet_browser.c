@@ -456,20 +456,26 @@ static void run_query(sqlite3 *db)
     sqlite3_int64 prev_id = (n_rows > 0) ? rows[sel].id : -1;
 
     char sql[1024];
+    // Clamp off after each append: snprintf returns the would-be length, so a
+    // truncated write leaves off past sizeof sql, and the next "sizeof sql -
+    // off" (size_t) would wrap huge and sql + off go out of bounds.
     int off = snprintf(sql, sizeof sql,
         PACKET_SELECT_COLS
         "FROM packet WHERE 1=1");
+    if (off < 0 || off > (int) sizeof sql) off = (int) sizeof sql;
     int n_params = 0;
     const char *param_text[4] = {0};
     char like_pattern[256];
     if (type_filter() != NULL) {
         off += snprintf(sql + off, sizeof sql - off,
                         " AND packet_type_name = ?%d", n_params + 1);
+        if (off > (int) sizeof sql) off = (int) sizeof sql;
         param_text[n_params++] = type_filter();
     }
     if (origin_filter() != NULL) {
         off += snprintf(sql + off, sizeof sql - off,
                         " AND capture_origin = ?%d", n_params + 1);
+        if (off > (int) sizeof sql) off = (int) sizeof sql;
         param_text[n_params++] = origin_filter();
     }
     if (hide_errors) {
@@ -479,11 +485,13 @@ static void run_query(sqlite3 *db)
         // boolean test is safe — no COALESCE needed.
         off += snprintf(sql + off, sizeof sql - off,
                         " AND NOT (rs_errs = -2 OR hmac_ok = 0 OR crc_status = 0)");
+        if (off > (int) sizeof sql) off = (int) sizeof sql;
     }
     if (like_text[0] != '\0') {
         snprintf(like_pattern, sizeof like_pattern, "%%%s%%", like_text);
         off += snprintf(sql + off, sizeof sql - off,
                         " AND decoded_summary LIKE ?%d", n_params + 1);
+        if (off > (int) sizeof sql) off = (int) sizeof sql;
         param_text[n_params++] = like_pattern;
     }
     snprintf(sql + off, sizeof sql - off,

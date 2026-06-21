@@ -384,11 +384,15 @@ static int process(const frag_t *frags, int n, const args_t *a,
 
     if (a->summary_only) return 1;
 
-    // Build the id list.
+    // Build the id list. Clamp p after each append (like APP below): a
+    // truncated snprintf returns the would-be length, which would push p past
+    // sizeof ids and make the next "sizeof ids - p" (size_t) wrap huge.
     char ids[256]; int p = 0;
-    for (int i = 0; i < n && p < (int)sizeof ids - 12; ++i)
+    for (int i = 0; i < n && p < (int)sizeof ids - 12; ++i) {
         p += snprintf(ids + p, sizeof ids - p, "%s%lld",
                       i ? "," : "", frags[i].id);
+        if (p > (int)sizeof ids) p = (int)sizeof ids;
+    }
 
     char tssent[40];
     uint64_t ts_sent = 0;

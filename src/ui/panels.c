@@ -578,18 +578,25 @@ static void format_duration_compact(double seconds, char *out, size_t n)
     long mins  = (total % 3600) / 60;
     long secs  =  total % 60;
 
+    // snprintf returns the length it WOULD have written, so off can run past
+    // n on truncation (or wrap huge from a negative return). Clamp after each
+    // append so the next "n - off" can't underflow and out + off stays in
+    // bounds, independent of the off < n guards.
     size_t off = 0;
     if (days > 0) {
         off += (size_t) snprintf(out + off, n - off, "%s%ldd",
                                  off ? " " : "", days);
+        if (off >= n) off = n;
     }
     if (hours > 0 && off < n) {
         off += (size_t) snprintf(out + off, n - off, "%s%ldh",
                                  off ? " " : "", hours);
+        if (off >= n) off = n;
     }
     if (mins > 0 && off < n) {
         off += (size_t) snprintf(out + off, n - off, "%s%ldm",
                                  off ? " " : "", mins);
+        if (off >= n) off = n;
     }
     // Show seconds when nonzero, or when nothing else was emitted (so a
     // sub-second / zero duration still prints "0s").
