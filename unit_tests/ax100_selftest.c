@@ -4,7 +4,12 @@
 
     Coverage:
       - ax100_opts_defaults populates the pycsplink-default profile.
-      - ax100_hmac is deterministic and key-sensitive.
+      - ax100_hmac is deterministic, key/data-sensitive, AND matches
+        byte-exact golden trailers computed independently with openssl
+        (an external oracle that a frame->unframe round trip cannot give).
+      - the CCSDS scrambler output is checked against the randomizer
+        sequence generated independently from the LFSR polynomial (and the
+        CCSDS-published opening bytes) -- not just round-tripped.
       - ax100_frame lays out preamble, ASM, Golay24 length, scrambled
         payload, postamble in the expected positions and lengths.
       - ax100_frame -> ax100_unframe round-trips every combination of
@@ -124,9 +129,101 @@ static void test_hmac_properties(void)
     check(rc == 0 && memcmp(mac_a, mac_d, 4) != 0,
           "data-sensitive: different data -> different MAC");
 
+    // Absolute golden trailers (external oracle). Computed independently
+    // with the openssl CLI, NOT by this code, so a symmetric bug in the
+    // construction -- wrong truncation, raw key instead of SHA1(key)[:16],
+    // wrong ipad/opad -- is caught; a frame->unframe round trip would not
+    // see it. Reproduce a trailer with (key, data) from below:
+    //   rkey=$(printf %s "$key" | openssl dgst -sha1 -binary | xxd -p -c256 | cut -c1-32)
+    //   printf %s "$data" | openssl dgst -sha1 -mac HMAC \
+    //       -macopt hexkey:$rkey -binary | xxd -p -c256 | cut -c1-8
+    static const uint8_t GOLDEN_K1_D1[4] = { 0xEE, 0xC8, 0x29, 0x56 };
+    static const uint8_t GOLDEN_K2_D1[4] = { 0x94, 0x90, 0xE8, 0xAE };
+    static const uint8_t GOLDEN_K1_D2[4] = { 0x17, 0x39, 0x78, 0x9A };
+    check(memcmp(mac_a, GOLDEN_K1_D1, 4) == 0,
+          "HMAC(key1,data1) == openssl golden EE C8 29 56");
+    check(memcmp(mac_c, GOLDEN_K2_D1, 4) == 0,
+          "HMAC(key2,data1) == openssl golden 94 90 E8 AE");
+    check(memcmp(mac_d, GOLDEN_K1_D2, 4) == 0,
+          "HMAC(key1,data2) == openssl golden 17 39 78 9A");
+
     // Bad args: NULL trailer.
     rc = ax100_hmac(key1, sizeof key1 - 1, data1, sizeof data1 - 1, NULL);
     check(rc == -1, "NULL out_trailer -> -1");
+}
+
+// ------------------------------------------- scrambler external oracle
+
+// Independently generate the CCSDS pseudo-randomizer sequence from the
+// generator definition -- an 8-bit LFSR with feedback mask 0xA9 (the
+// polynomial x^8 + x^7 + x^5 + x^3 + 1), seeded all-ones, output LSB-first
+// into MSB-first bytes. This is derived from the polynomial, NOT copied
+// from ax100.c's precomputed table, so it is a genuine external oracle: a
+// symmetric typo in that table survives a frame->unframe round trip (both
+// sides use the same wrong byte) but fails this comparison.
+static void ccsds_sequence(uint8_t *out, size_t n)
+{
+    uint8_t reg = 0xFFu;
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t b = 0;
+        for (int k = 0; k < 8; ++k) {
+            b = (uint8_t)((b << 1) | (reg & 1u));   // assemble MSB-first
+            uint8_t fb = 0;
+            for (int j = 0; j < 8; ++j)
+                if ((0xA9u >> j) & 1u) fb ^= (uint8_t)((reg >> j) & 1u);
+            reg = (uint8_t)((reg >> 1) | (fb << 7));
+        }
+        out[i] = b;
+    }
+}
+
+static void test_scrambler_known_sequence(void)
+{
+    fprintf(stderr, "ax100 scrambler vs independent CCSDS sequence:\n");
+
+    // CCSDS 131.0-B pseudo-randomizer opening bytes -- a third-party
+    // reference (the same values gr-satellites and libfec document). Pinned
+    // so a corrupted scrambler table is caught even if the LFSR oracle
+    // below were itself wrong.
+    static const uint8_t CCSDS_PUBLISHED_HEAD[16] = {
+        0xFF, 0x48, 0x0E, 0xC0, 0x9A, 0x0D, 0x70, 0xBC,
+        0x8E, 0x2C, 0x93, 0xAD, 0xA7, 0xB7, 0x46, 0xCE,
+    };
+    uint8_t seq[255];
+    ccsds_sequence(seq, sizeof seq);
+    check(memcmp(seq, CCSDS_PUBLISHED_HEAD, sizeof CCSDS_PUBLISHED_HEAD) == 0,
+          "LFSR oracle reproduces the CCSDS-published opening 16 bytes");
+
+    // Frame an all-zero payload with ONLY the scrambler on (no length, no
+    // sync, no pre/postamble): the on-wire bytes are then 0 ^ table[i],
+    // i.e. the scrambler sequence itself, exposed for direct comparison.
+    ax100_opts_t o;
+    ax100_opts_defaults(&o);
+    o.randomize = 1;
+    o.len_field = 0;
+    o.syncword  = 0;
+    o.prefill   = 0;
+    o.tailfill  = 0;
+
+    uint8_t zeros[255] = {0};
+    uint8_t frame[255];
+    ssize_t n = ax100_frame(zeros, sizeof zeros, &o, frame, sizeof frame);
+    check(n == (ssize_t)sizeof zeros, "framed 255 zero bytes -> 255 on-wire bytes");
+    check(n == (ssize_t)sizeof zeros && memcmp(frame, seq, sizeof zeros) == 0,
+          "scrambler output over zeros == independent CCSDS sequence (255 bytes)");
+    check(memcmp(frame, CCSDS_PUBLISHED_HEAD, sizeof CCSDS_PUBLISHED_HEAD) == 0,
+          "scrambler output head == CCSDS-published 16 bytes");
+
+    // Wrap-around: the table has 255 entries and indexing is i % 255, so
+    // on-wire byte 255 must repeat table[0], 256 -> table[1], and so on.
+    uint8_t zeros2[300] = {0};
+    uint8_t frame2[300];
+    ssize_t n2 = ax100_frame(zeros2, sizeof zeros2, &o, frame2, sizeof frame2);
+    check(n2 == (ssize_t)sizeof zeros2, "framed 300 zero bytes -> 300 on-wire bytes");
+    int wrap_ok = (n2 == (ssize_t)sizeof zeros2);
+    for (size_t i = 255; wrap_ok && i < sizeof zeros2; ++i)
+        if (frame2[i] != seq[i - 255]) wrap_ok = 0;
+    check(wrap_ok, "scrambler table wraps at 255 (byte 255 repeats table[0])");
 }
 
 // -------------------------------------------------- frame structure
@@ -537,6 +634,7 @@ int main(void)
 {
     test_opts_defaults();
     test_hmac_properties();
+    test_scrambler_known_sequence();
     test_frame_structure_plain();
     test_round_trip_permutations();
     test_golay_header_recovery();
