@@ -510,6 +510,11 @@ target_include_directories(biquad_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(biquad_selftest PRIVATE m)
 list(APPEND SSO_TARGETS biquad_selftest)
 
+add_executable(ui_textfield_selftest
+               unit_tests/ui_textfield_selftest.c src/ui/ui_textfield.c)
+target_include_directories(ui_textfield_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+list(APPEND SSO_TARGETS ui_textfield_selftest)
+
 # FIR decimator selftest. Audits constructor validation, accessors,
 # DC unity gain, passband transparency, anti-alias rejection (> 30 dB
 # in the would-alias stopband), decimation-ratio output count, and
@@ -904,6 +909,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
                    src/ui/tui.c src/ui/spectrogram.c src/ui/panels.c
                    src/ui/tx_compose.c src/ui/tx_log.c src/ui/viewer.c
                    src/ui/auto_tcmd.c src/ui/cmd_line.c src/ui/input.c
+                   src/ui/ui_textfield.c
                    src/ui/live_waterfall.c
                    src/control/pass_session.c src/control/scan_sky.c
                    src/control/tracking.c src/control/operator_ipc.c

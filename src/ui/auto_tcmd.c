@@ -28,6 +28,7 @@
 #include "sso_pseudo.h"
 #include "sso_time.h"
 #include "tcmd_lint.h"      // TCMD_RF_MAX_LEN, tcmd_lint_file
+#include "ui_textfield.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -223,75 +224,55 @@ static void auto_field_clamp_cursor(auto_tcmd_t *a, auto_tcmd_field_t f) {
     size_t cap = 0;
     char *buf = auto_field_buf(a, f, &cap);
     if (!buf) return;
-    int n = (int) strlen(buf);
-    if (a->cursors[f] < 0) a->cursors[f] = 0;
-    if (a->cursors[f] > n) a->cursors[f] = n;
+    ui_tf_clamp_cursor(buf, &a->cursors[f]);
 }
 
 static void auto_field_insert(auto_tcmd_t *a, int ch) {
     size_t cap = 0;
     char *buf = auto_field_buf(a, a->focus, &cap);
     if (!buf) return;
-    int n = (int) strlen(buf);
-    if (n + 1 >= (int) cap) return;
     if (!auto_field_char_ok(a->focus, ch)) return;
-    int cur = a->cursors[a->focus];
-    if (cur < 0) cur = 0;
-    if (cur > n) cur = n;
-    memmove(buf + cur + 1, buf + cur, (size_t)(n - cur + 1));
-    buf[cur] = (char) ch;
-    a->cursors[a->focus] = cur + 1;
+    ui_tf_insert(buf, cap, &a->cursors[a->focus], ch);
 }
 static void auto_field_backspace(auto_tcmd_t *a) {
     size_t cap = 0;
     char *buf = auto_field_buf(a, a->focus, &cap);
     if (!buf) return;
-    int n = (int) strlen(buf);
-    int cur = a->cursors[a->focus];
-    if (cur <= 0 || n == 0) return;
-    memmove(buf + cur - 1, buf + cur, (size_t)(n - cur + 1));
-    a->cursors[a->focus] = cur - 1;
+    ui_tf_backspace(buf, &a->cursors[a->focus]);
 }
 static void auto_field_delete(auto_tcmd_t *a) {
     size_t cap = 0;
     char *buf = auto_field_buf(a, a->focus, &cap);
     if (!buf) return;
-    int n = (int) strlen(buf);
-    int cur = a->cursors[a->focus];
-    if (cur >= n) return;
-    memmove(buf + cur, buf + cur + 1, (size_t)(n - cur));
+    ui_tf_delete(buf, &a->cursors[a->focus]);
 }
 static void auto_field_kill_to_end(auto_tcmd_t *a) {
     size_t cap = 0;
     char *buf = auto_field_buf(a, a->focus, &cap);
     if (!buf) return;
-    int n = (int) strlen(buf);
-    int cur = a->cursors[a->focus];
-    if (cur >= n) return;
-    buf[cur] = '\0';
+    ui_tf_kill_to_end(buf, &a->cursors[a->focus]);
 }
 static void auto_field_left(auto_tcmd_t *a) {
     size_t cap = 0;
     if (!auto_field_buf(a, a->focus, &cap)) return;
-    if (a->cursors[a->focus] > 0) a->cursors[a->focus]--;
+    ui_tf_left(&a->cursors[a->focus]);
 }
 static void auto_field_right(auto_tcmd_t *a) {
     size_t cap = 0;
     char *buf = auto_field_buf(a, a->focus, &cap);
     if (!buf) return;
-    int n = (int) strlen(buf);
-    if (a->cursors[a->focus] < n) a->cursors[a->focus]++;
+    ui_tf_right(buf, &a->cursors[a->focus]);
 }
 static void auto_field_home(auto_tcmd_t *a) {
     size_t cap = 0;
     if (!auto_field_buf(a, a->focus, &cap)) return;
-    a->cursors[a->focus] = 0;
+    ui_tf_home(&a->cursors[a->focus]);
 }
 static void auto_field_end(auto_tcmd_t *a) {
     size_t cap = 0;
     char *buf = auto_field_buf(a, a->focus, &cap);
     if (!buf) return;
-    a->cursors[a->focus] = (int) strlen(buf);
+    ui_tf_end(buf, &a->cursors[a->focus]);
 }
 static void auto_field_toggle(auto_tcmd_t *a) {
     if (a->focus == AUTO_F_ALLOW_TX) a->allow_tx = !a->allow_tx;

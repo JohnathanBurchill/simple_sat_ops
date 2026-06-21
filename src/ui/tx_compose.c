@@ -29,6 +29,7 @@
 #include "sso_time.h"
 #include "tcmd_lint.h"
 #include "tx_log.h"
+#include "ui_textfield.h"
 
 #include <math.h>
 #include <ncurses.h>
@@ -128,9 +129,14 @@ static void tx_field_clamp_cursor(tx_compose_t *c, tx_field_t f) {
     size_t cap = 0;
     char *buf = tx_field_buf(c, f, &cap);
     if (!buf) return;
-    int n = (int) strlen(buf);
-    if (c->cursors[f] < 0) c->cursors[f] = 0;
-    if (c->cursors[f] > n) c->cursors[f] = n;
+    ui_tf_clamp_cursor(buf, &c->cursors[f]);
+}
+
+// Mark an edit: refresh the preview and, on the payload field, cancel
+// history navigation so the next UP walks history fresh.
+static void tx_field_after_edit(tx_compose_t *c) {
+    c->preview_dirty = 1;
+    if (c->focus == TXF_PAYLOAD) c->history_idx = -1;
 }
 
 static void tx_field_insert(tx_compose_t *c, int ch) {
@@ -156,81 +162,58 @@ static void tx_field_insert(tx_compose_t *c, int ch) {
         accept = (ch >= '0' && ch <= '9') || ch == '.' || ch == '-';
     }
     if (!accept) return;
-    int cur = c->cursors[c->focus];
-    if (cur < 0) cur = 0;
-    if (cur > n) cur = n;
-    // Shift the tail (including the existing nul) right by one.
-    memmove(buf + cur + 1, buf + cur, (size_t)(n - cur + 1));
-    buf[cur] = (char) ch;
-    c->cursors[c->focus] = cur + 1;
-    c->preview_dirty = 1;
-    // Any edit cancels history navigation — the operator is now off
-    // the recalled string, the next UP should walk history fresh.
-    if (c->focus == TXF_PAYLOAD) c->history_idx = -1;
+    if (ui_tf_insert(buf, cap, &c->cursors[c->focus], ch))
+        tx_field_after_edit(c);
 }
 
 static void tx_field_backspace(tx_compose_t *c) {
     size_t cap = 0;
     char *buf = tx_field_buf(c, c->focus, &cap);
     if (!buf) return;
-    int n = (int) strlen(buf);
-    int cur = c->cursors[c->focus];
-    if (cur <= 0 || n == 0) return;
-    memmove(buf + cur - 1, buf + cur, (size_t)(n - cur + 1));
-    c->cursors[c->focus] = cur - 1;
-    c->preview_dirty = 1;
-    if (c->focus == TXF_PAYLOAD) c->history_idx = -1;
+    if (ui_tf_backspace(buf, &c->cursors[c->focus]))
+        tx_field_after_edit(c);
 }
 
 static void tx_field_delete(tx_compose_t *c) {
     size_t cap = 0;
     char *buf = tx_field_buf(c, c->focus, &cap);
     if (!buf) return;
-    int n = (int) strlen(buf);
-    int cur = c->cursors[c->focus];
-    if (cur >= n) return;
-    memmove(buf + cur, buf + cur + 1, (size_t)(n - cur));
-    c->preview_dirty = 1;
-    if (c->focus == TXF_PAYLOAD) c->history_idx = -1;
+    if (ui_tf_delete(buf, &c->cursors[c->focus]))
+        tx_field_after_edit(c);
 }
 
 static void tx_field_kill_to_end(tx_compose_t *c) {
     size_t cap = 0;
     char *buf = tx_field_buf(c, c->focus, &cap);
     if (!buf) return;
-    int n = (int) strlen(buf);
-    int cur = c->cursors[c->focus];
-    if (cur >= n) return;
-    buf[cur] = '\0';
-    c->preview_dirty = 1;
-    if (c->focus == TXF_PAYLOAD) c->history_idx = -1;
+    if (ui_tf_kill_to_end(buf, &c->cursors[c->focus]))
+        tx_field_after_edit(c);
 }
 
 static void tx_field_left(tx_compose_t *c) {
     size_t cap = 0;
     if (!tx_field_buf(c, c->focus, &cap)) return;
-    if (c->cursors[c->focus] > 0) c->cursors[c->focus]--;
+    ui_tf_left(&c->cursors[c->focus]);
 }
 
 static void tx_field_right(tx_compose_t *c) {
     size_t cap = 0;
     char *buf = tx_field_buf(c, c->focus, &cap);
     if (!buf) return;
-    int n = (int) strlen(buf);
-    if (c->cursors[c->focus] < n) c->cursors[c->focus]++;
+    ui_tf_right(buf, &c->cursors[c->focus]);
 }
 
 static void tx_field_home(tx_compose_t *c) {
     size_t cap = 0;
     if (!tx_field_buf(c, c->focus, &cap)) return;
-    c->cursors[c->focus] = 0;
+    ui_tf_home(&c->cursors[c->focus]);
 }
 
 static void tx_field_end(tx_compose_t *c) {
     size_t cap = 0;
     char *buf = tx_field_buf(c, c->focus, &cap);
     if (!buf) return;
-    c->cursors[c->focus] = (int) strlen(buf);
+    ui_tf_end(buf, &c->cursors[c->focus]);
 }
 
 // direction = -1 (UP, older) or +1 (DOWN, newer). No-op when focus
