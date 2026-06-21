@@ -39,6 +39,7 @@
 #include "argparse.h"
 #include "beacon_cts1.h"
 #include "bestxyz.h"
+#include "gnss_frag.h"
 #include "packet_db.h"
 #include "sso_version.h"
 
@@ -70,38 +71,6 @@ int main(int argc, char **argv)
 #define TCMD_HDR         COMMS_TCMD_RESPONSE_HEADER_SIZE
 #define TCMD_MAXDATA     COMMS_TCMD_RESPONSE_PACKET_MAX_DATA_BYTES_PER_PACKET
 
-static int starts_with(const char *s, const char *p)
-{
-    return strncmp(s, p, strlen(p)) == 0;
-}
-
-// Parse a "since/until" spec (90s|30m|24h|7d relative, or an ISO-8601 / partial
-// string passed through) into ISO-8601 UTC for lexicographic SQL comparison.
-// Mirrors packet_query.c's helper. Returns 0 on success, -1 on a bad spec.
-static int parse_time_spec(const char *spec, char *out, size_t outn)
-{
-    if (spec == NULL || spec[0] == '\0') return -1;
-    size_t len = strlen(spec);
-    char unit = spec[len - 1];
-    if (unit == 's' || unit == 'm' || unit == 'h' || unit == 'd') {
-        char *endp = NULL;
-        long n = strtol(spec, &endp, 10);
-        if (endp == spec || endp != spec + len - 1 || n <= 0) return -1;
-        long sec = (unit == 's') ? n
-                 : (unit == 'm') ? n * 60
-                 : (unit == 'h') ? n * 3600
-                 :                 n * 86400;
-        time_t cutoff = time(NULL) - sec;
-        struct tm utc;
-        gmtime_r(&cutoff, &utc);
-        strftime(out, outn, "%Y-%m-%dT%H:%M:%SZ", &utc);
-        return 0;
-    }
-    if (len + 1 > outn) return -1;
-    memcpy(out, spec, len + 1);
-    return 0;
-}
-
 // Format a unix-ms timestamp as ISO-8601 UTC with milliseconds.
 static void fmt_epoch_ms(uint64_t ms, char *out, size_t outn)
 {
@@ -112,17 +81,6 @@ static void fmt_epoch_ms(uint64_t ms, char *out, size_t outn)
     strftime(base, sizeof base, "%Y-%m-%dT%H:%M:%S", &utc);
     snprintf(out, outn, "%s.%03uZ", base, (unsigned)(ms % 1000));
 }
-
-// One stored tcmd_response fragment.
-typedef struct {
-    long long      id;
-    char           ts_received[40];
-    unsigned char *payload;
-    int            payload_len;
-    unsigned char  tskey[8];   // ts_sent bytes, the join key for one response
-    int            seq;
-    int            max_seq;
-} frag_t;
 
 typedef struct {
     const char *db_path;
@@ -148,22 +106,22 @@ static int parse_args(args_t *a, int argc, char **argv, int help)
             else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
             matched = 1;
         }
-        if (starts_with(arg, "--db=") || help) {
+        if (gnss_starts_with(arg, "--db=") || help) {
             if (help) parse_help_line(OPTW, "--db=<path>", "override default DB path ($SSO_PACKET_DB or the default)");
             else a->db_path = arg + 5;
             matched = 1;
         }
-        if (starts_with(arg, "--since=") || help) {
+        if (gnss_starts_with(arg, "--since=") || help) {
             if (help) parse_help_line(OPTW, "--since=<spec>", "24h | 7d | 30m | ISO-8601 (default: all)");
             else a->since = arg + 8;
             matched = 1;
         }
-        if (starts_with(arg, "--until=") || help) {
+        if (gnss_starts_with(arg, "--until=") || help) {
             if (help) parse_help_line(OPTW, "--until=<spec>", "same syntax as --since (default: now)");
             else a->until = arg + 8;
             matched = 1;
         }
-        if (starts_with(arg, "--type=") || help) {
+        if (gnss_starts_with(arg, "--type=") || help) {
             if (help) parse_help_line(OPTW, "--type=<log>", "filter to one NovAtel log, e.g. BESTXYZA");
             else a->type = arg + 7;
             matched = 1;
@@ -228,28 +186,6 @@ static int name_is_clean(const char *s)
     for (const char *p = s; *p; ++p)
         if (!isupper((unsigned char)*p) && !isdigit((unsigned char)*p)) return 0;
     return 1;
-}
-
-// Reassemble one reception (fragments with distinct seq, sorted by seq) into
-// `buf`, returning the reassembled length. Each fragment contributes at most
-// 186 bytes at offset (seq-1)*186, which drops the 4-byte CSP CRC32 trailer
-// that rides past the data on most packets.
-static int reassemble(const frag_t *frags, int n, unsigned char *buf, int bufcap)
-{
-    int total = 0;
-    memset(buf, 0, (size_t)bufcap);
-    for (int i = 0; i < n; ++i) {
-        int dl = frags[i].payload_len - TCMD_HDR;
-        if (dl < 0) dl = 0;
-        if (dl > TCMD_MAXDATA) dl = TCMD_MAXDATA;
-        int off = (frags[i].seq - 1) * TCMD_MAXDATA;
-        if (off < 0 || off + dl > bufcap) continue;
-        memcpy(buf + off, frags[i].payload + TCMD_HDR, (size_t)dl);
-        if (off + dl > total) total = off + dl;
-    }
-    if (total >= bufcap) total = bufcap - 1;
-    buf[total] = '\0';
-    return total;
 }
 
 static int all_hex(const char *p, int n)
@@ -335,7 +271,7 @@ static int cmp_msg_asc(const void *a, const void *b)
 // Process one reception: detect a GNSS response, verify the CRC, update the
 // tally, and (unless --summary) collect a formatted block for sorted output.
 // Returns 1 if it was a GNSS response, else 0.
-static int process(const frag_t *frags, int n, const args_t *a,
+static int process(const gnss_frag_t *frags, int n, const args_t *a,
                    const char *since_iso, const char *until_iso)
 {
     // Time filter on the earliest fragment (frags arrive sorted by ts_received).
@@ -344,7 +280,7 @@ static int process(const frag_t *frags, int n, const args_t *a,
     if (until_iso[0] && strcmp(ts, until_iso) > 0) return 0;
 
     static unsigned char buf[65536];
-    int len = reassemble(frags, n, buf, sizeof buf);
+    int len = gnss_reassemble(frags, n, buf, sizeof buf);
     char *msg = (char *)buf;
 
     char *marker = strstr(msg, "GNSS Response (");
@@ -463,10 +399,10 @@ int main(int argc, char **argv)
     }
 
     char since_iso[40] = {0}, until_iso[40] = {0};
-    if (cfg.since && parse_time_spec(cfg.since, since_iso, sizeof since_iso) != 0) {
+    if (cfg.since && gnss_parse_time_spec(cfg.since, since_iso, sizeof since_iso) != 0) {
         fprintf(stderr, "gnss_reports: bad --since=%s\n", cfg.since); return 1;
     }
-    if (cfg.until && parse_time_spec(cfg.until, until_iso, sizeof until_iso) != 0) {
+    if (cfg.until && gnss_parse_time_spec(cfg.until, until_iso, sizeof until_iso) != 0) {
         fprintf(stderr, "gnss_reports: bad --until=%s\n", cfg.until); return 1;
     }
 
@@ -495,7 +431,7 @@ int main(int argc, char **argv)
 
     // Group by ts_sent key; within a group, a new reception starts whenever
     // the sequence number does not advance (seq <= last seq seen).
-    frag_t recv[260];
+    gnss_frag_t recv[260];
     int    nrecv = 0;
     unsigned char curkey[8];
     int have_key = 0, last_seq = 0;
@@ -524,7 +460,7 @@ int main(int argc, char **argv)
 
         if (nrecv >= (int)(sizeof recv / sizeof recv[0])) FLUSH();
 
-        frag_t *f = &recv[nrecv++];
+        gnss_frag_t *f = &recv[nrecv++];
         f->id = sqlite3_column_int64(st, 0);
         snprintf(f->ts_received, sizeof f->ts_received, "%s",
                  (const char *)sqlite3_column_text(st, 1));

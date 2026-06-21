@@ -41,6 +41,7 @@
 #include "argparse.h"
 #include "beacon_cts1.h"
 #include "bestxyz.h"
+#include "gnss_frag.h"
 #include "packet_db.h"
 #include "shortarc.h"
 #include "sso_version.h"
@@ -71,31 +72,6 @@ int main(int argc, char **argv)
 #define TCMD_HDR      COMMS_TCMD_RESPONSE_HEADER_SIZE
 #define TCMD_MAXDATA  COMMS_TCMD_RESPONSE_PACKET_MAX_DATA_BYTES_PER_PACKET
 
-static int starts_with(const char *s, const char *p) { return strncmp(s, p, strlen(p)) == 0; }
-
-// Relative (90s|30m|24h|7d) or ISO-8601 spec -> ISO-8601 UTC. Mirrors
-// packet_query.c / gnss_reports.c. Returns 0 on success, -1 on a bad spec.
-static int parse_time_spec(const char *spec, char *out, size_t outn)
-{
-    if (spec == NULL || spec[0] == '\0') return -1;
-    size_t len = strlen(spec);
-    char unit = spec[len - 1];
-    if (unit == 's' || unit == 'm' || unit == 'h' || unit == 'd') {
-        char *endp = NULL;
-        long n = strtol(spec, &endp, 10);
-        if (endp == spec || endp != spec + len - 1 || n <= 0) return -1;
-        long sec = (unit == 's') ? n : (unit == 'm') ? n * 60
-                 : (unit == 'h') ? n * 3600 : n * 86400;
-        time_t cutoff = time(NULL) - sec;
-        struct tm utc; gmtime_r(&cutoff, &utc);
-        strftime(out, outn, "%Y-%m-%dT%H:%M:%SZ", &utc);
-        return 0;
-    }
-    if (len + 1 > outn) return -1;
-    memcpy(out, spec, len + 1);
-    return 0;
-}
-
 // Parse a duration spec (90s | 30m | 2h | 1d) into seconds. Returns <0 on error.
 static double parse_duration_s(const char *spec)
 {
@@ -118,15 +94,6 @@ static double parse_duration_s(const char *spec)
 // per-fix id list can hold every contributing fragment -- a smaller cap made
 // an --id= belonging to a later fragment silently fail to match).
 #define GNSS_FRAG_MAX 260
-
-typedef struct {
-    long long      id;
-    char           ts_received[40];
-    unsigned char *payload;
-    int            payload_len;
-    unsigned char  tskey[8];
-    int            seq;
-} frag_t;
 
 typedef struct {
     const char *db_path;
@@ -154,42 +121,42 @@ static int parse_args(args_t *a, int argc, char **argv, int help)
             else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
             matched = 1;
         }
-        if (starts_with(arg, "--db=") || help) {
+        if (gnss_starts_with(arg, "--db=") || help) {
             if (help) parse_help_line(OPTW, "--db=<path>", "override default DB path ($SSO_PACKET_DB or the default)");
             else a->db_path = arg + 5;
             matched = 1;
         }
-        if (starts_with(arg, "--since=") || help) {
+        if (gnss_starts_with(arg, "--since=") || help) {
             if (help) parse_help_line(OPTW, "--since=<spec>", "24h | 7d | ISO-8601 (default: all)");
             else a->since = arg + 8;
             matched = 1;
         }
-        if (starts_with(arg, "--until=") || help) {
+        if (gnss_starts_with(arg, "--until=") || help) {
             if (help) parse_help_line(OPTW, "--until=<spec>", "same syntax as --since (default: now)");
             else a->until = arg + 8;
             matched = 1;
         }
-        if (starts_with(arg, "--name=") || help) {
+        if (gnss_starts_with(arg, "--name=") || help) {
             if (help) parse_help_line(OPTW, "--name=<s>", "OPM object name (default: FrontierSat)");
             else a->name = arg + 7;
             matched = 1;
         }
-        if (starts_with(arg, "--object-id=") || help) {
+        if (gnss_starts_with(arg, "--object-id=") || help) {
             if (help) parse_help_line(OPTW, "--object-id=<s>", "OPM object id (optional)");
             else a->object_id = arg + 12;
             matched = 1;
         }
-        if (starts_with(arg, "--hard-body-radius=") || help) {
+        if (gnss_starts_with(arg, "--hard-body-radius=") || help) {
             if (help) parse_help_line(OPTW, "--hard-body-radius=<m>", "hard-body radius in metres (default: 0.71)");
             else a->hard_body_radius = atof(arg + 19);
             matched = 1;
         }
-        if (starts_with(arg, "--id=") || help) {
+        if (gnss_starts_with(arg, "--id=") || help) {
             if (help) parse_help_line(OPTW, "--id=<n>", "use the GNSS fix containing packet id n");
             else a->want_id = atoll(arg + 5);
             matched = 1;
         }
-        if (starts_with(arg, "--fit-window=") || help) {
+        if (gnss_starts_with(arg, "--fit-window=") || help) {
             if (help) parse_help_line(OPTW, "--fit-window=<dur>", "short-arc least-squares fit over fixes within <dur> (e.g. 30m) before the newest");
             else a->fit_window = arg + 13;
             matched = 1;
@@ -216,26 +183,6 @@ static int parse_args(args_t *a, int argc, char **argv, int help)
     return help ? PARSE_HELP : PARSE_OK;
 }
 
-// Reassemble one reception (fragments sorted by seq) into buf, capping each at
-// 186 bytes so the per-packet CSP CRC32 trailer is dropped. Returns length.
-static int reassemble(const frag_t *frags, int n, unsigned char *buf, int bufcap)
-{
-    int total = 0;
-    memset(buf, 0, (size_t)bufcap);
-    for (int i = 0; i < n; ++i) {
-        int dl = frags[i].payload_len - TCMD_HDR;
-        if (dl < 0) dl = 0;
-        if (dl > TCMD_MAXDATA) dl = TCMD_MAXDATA;
-        int off = (frags[i].seq - 1) * TCMD_MAXDATA;
-        if (off < 0 || off + dl > bufcap) continue;
-        memcpy(buf + off, frags[i].payload + TCMD_HDR, (size_t)dl);
-        if (off + dl > total) total = off + dl;
-    }
-    if (total >= bufcap) total = bufcap - 1;
-    buf[total] = '\0';
-    return total;
-}
-
 // One accepted GNSS fix.
 typedef struct {
     bestxyz_t b;
@@ -247,10 +194,10 @@ typedef struct {
 } fix_t;
 
 // If the reassembled reception is a CRC-ok BESTXYZA, fill *out and return 1.
-static int parse_fix(const frag_t *frags, int n, fix_t *out)
+static int parse_fix(const gnss_frag_t *frags, int n, fix_t *out)
 {
     static unsigned char buf[65536];
-    int len = reassemble(frags, n, buf, sizeof buf);
+    int len = gnss_reassemble(frags, n, buf, sizeof buf);
     char *msg = (char *)buf;
     char *marker = strstr(msg, "GNSS Response (");
     if (marker == NULL) return 0;
@@ -433,10 +380,10 @@ int main(int argc, char **argv)
     }
 
     char since_iso[40] = {0}, until_iso[40] = {0};
-    if (cfg.since && parse_time_spec(cfg.since, since_iso, sizeof since_iso) != 0) {
+    if (cfg.since && gnss_parse_time_spec(cfg.since, since_iso, sizeof since_iso) != 0) {
         fprintf(stderr, "gnss_opm: bad --since=%s\n", cfg.since); return 1;
     }
-    if (cfg.until && parse_time_spec(cfg.until, until_iso, sizeof until_iso) != 0) {
+    if (cfg.until && gnss_parse_time_spec(cfg.until, until_iso, sizeof until_iso) != 0) {
         fprintf(stderr, "gnss_opm: bad --until=%s\n", cfg.until); return 1;
     }
 
@@ -461,7 +408,7 @@ int main(int argc, char **argv)
     sqlite3_bind_int(st, 1, TCMD_TYPE);
     sqlite3_bind_int(st, 2, TCMD_HDR + 1);
 
-    frag_t recv[GNSS_FRAG_MAX];
+    gnss_frag_t recv[GNSS_FRAG_MAX];
     int nrecv = 0;
     unsigned char curkey[8];
     int have_key = 0, last_seq = 0;
@@ -497,7 +444,7 @@ int main(int argc, char **argv)
         else if (seq <= last_seq) { CONSIDER(); }
         if (nrecv >= (int)(sizeof recv / sizeof recv[0])) CONSIDER();
 
-        frag_t *fr = &recv[nrecv++];
+        gnss_frag_t *fr = &recv[nrecv++];
         fr->id = sqlite3_column_int64(st, 0);
         snprintf(fr->ts_received, sizeof fr->ts_received, "%s",
                  (const char *)sqlite3_column_text(st, 1));

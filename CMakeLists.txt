@@ -599,7 +599,7 @@ if (OPENSSL_FOUND)
     list(APPEND SSO_TARGETS packet_query)
 
     # Reassemble + CRC-check the GNSS telecommand responses (NovAtel logs).
-    add_executable(gnss_reports utils/gnss_reports.c src/orbit/bestxyz.c)
+    add_executable(gnss_reports utils/gnss_reports.c src/orbit/bestxyz.c src/proto/gnss_frag.c)
     target_include_directories(gnss_reports PRIVATE ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(gnss_reports PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(gnss_reports PRIVATE ${OPENSSL_LIBRARIES} m)
@@ -608,7 +608,7 @@ if (OPENSSL_FOUND)
     list(APPEND SSO_TARGETS gnss_reports)
 
     # Build an OPM from the satellite's GNSS fix for ssm to propagate + upload.
-    add_executable(gnss_opm utils/gnss_opm.c src/orbit/bestxyz.c src/orbit/shortarc.c)
+    add_executable(gnss_opm utils/gnss_opm.c src/orbit/bestxyz.c src/orbit/shortarc.c src/proto/gnss_frag.c)
     target_include_directories(gnss_opm PRIVATE ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(gnss_opm PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(gnss_opm PRIVATE ${OPENSSL_LIBRARIES} m)
