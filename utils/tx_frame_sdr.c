@@ -498,8 +498,18 @@ int main(int argc, char **argv)
                         "--bit-rate (%d)\n", mp.samp_rate, mp.bit_rate);
         return 1;
     }
+    // Upper bounds so a fat-fingered CLI value can't drive the sample-count
+    // math below into an overflow or an absurd allocation. 100 MHz is well
+    // above any real SDR rate; the repeat/gap caps keep n_iq_total bounded.
+    if (mp.samp_rate > 100000000) {
+        fprintf(stderr, "tx_frame_sdr: --tx-rate (%d) too high (max 100 MHz)\n",
+                mp.samp_rate);
+        return 1;
+    }
     if (repeat < 1) repeat = 1;
+    if (repeat > 100000) repeat = 100000;
     if (gap_ms < 0) gap_ms = 0;
+    if (gap_ms > 3600000) gap_ms = 3600000;   // cap at 1 hour
 
     // tx_frame_sdr is now offline-only — no operator gate. Audit so
     // the runs.log still records dump-iq / dry-run invocations.
@@ -555,8 +565,18 @@ int main(int argc, char **argv)
     ssize_t frame_len = ax100_frame(csp_packet, (size_t)csp_len, &opts, frame, sizeof frame);
     if (frame_len < 0) { fprintf(stderr, "ax100_frame failed\n"); return 1; }
 
+    // Ceiling on any single PCM/IQ allocation (samples). With the samp_rate /
+    // repeat / gap caps above, every count below stays well under size_t, so a
+    // count past this is a fat-fingered request -- reject it cleanly rather
+    // than attempt (or overflow into) an enormous allocation.
+    const size_t MAX_TX_SAMPLES = 500000000;  // ~2 GB of int16 IQ
     int sps = mp.samp_rate / mp.bit_rate;
     size_t n_pcm = (size_t)frame_len * 8u * (size_t)sps;
+    if (n_pcm > MAX_TX_SAMPLES) {
+        fprintf(stderr, "tx_frame_sdr: frame needs %zu PCM samples "
+                "(over the %zu cap) -- lower --tx-rate\n", n_pcm, MAX_TX_SAMPLES);
+        return 1;
+    }
     int16_t *pcm = (int16_t *)malloc(n_pcm * sizeof(int16_t));
     if (pcm == NULL) { fprintf(stderr, "tx_frame_sdr: out of memory for PCM\n"); return 1; }
     ssize_t got = modem_bytes_to_pcm16(frame, (size_t)frame_len, &mp, pcm, n_pcm);
@@ -639,6 +659,11 @@ int main(int argc, char **argv)
             joke_samps += (size_t)(JOKE_PATTERN[i].gap_after_units * (double)unit_samps);
         }
         n_iq_total = preroll_samps + joke_samps + postroll_samps;
+        if (n_iq_total > MAX_TX_SAMPLES) {
+            fprintf(stderr, "tx_frame_sdr: %zu IQ samples over the %zu cap\n",
+                    n_iq_total, MAX_TX_SAMPLES);
+            free(preroll_pcm); free(pcm); return 1;
+        }
         iq = (int16_t *)calloc(n_iq_total * 2, sizeof(int16_t));
         if (iq == NULL) {
             fprintf(stderr, "tx_frame_sdr: out of memory for %zu IQ samples\n", n_iq_total);
@@ -689,6 +714,12 @@ int main(int argc, char **argv)
         size_t gap_samps = (size_t)((double)mp.samp_rate * (double)gap_ms / 1000.0);
         size_t n_iq_per_rep = n_pcm + gap_samps;
         n_iq_total = preroll_samps + n_iq_per_rep * (size_t)repeat + postroll_samps;
+        if (n_iq_total > MAX_TX_SAMPLES) {
+            fprintf(stderr, "tx_frame_sdr: %zu IQ samples over the %zu cap "
+                    "-- lower --repeat / --gap-ms / --tx-rate\n",
+                    n_iq_total, MAX_TX_SAMPLES);
+            free(preroll_pcm); free(pcm); return 1;
+        }
         iq = (int16_t *)calloc(n_iq_total * 2, sizeof(int16_t));
         if (iq == NULL) {
             fprintf(stderr, "tx_frame_sdr: out of memory for %zu IQ samples\n", n_iq_total);
