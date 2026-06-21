@@ -1213,10 +1213,14 @@ static void apply_fir_complex(const float *in_iq, size_t n_pairs,
                 + (progress_hi - progress_lo) * frac;
         }
     }
-    // Zero the group-delay tail.
-    for (size_t i = n_pairs - (size_t) Mhalf; i < n_pairs; ++i) {
-        out_iq[i * 2 + 0] = 0.0f;
-        out_iq[i * 2 + 1] = 0.0f;
+    // Zero the group-delay tail. Guard the subtraction: for a tiny input
+    // (n_pairs <= Mhalf) it would underflow size_t to a huge start index.
+    // The loop condition happens to skip it today, but make the bound explicit.
+    if (n_pairs > (size_t) Mhalf) {
+        for (size_t i = n_pairs - (size_t) Mhalf; i < n_pairs; ++i) {
+            out_iq[i * 2 + 0] = 0.0f;
+            out_iq[i * 2 + 1] = 0.0f;
+        }
     }
     free(dl_i); free(dl_q);
 }
@@ -1679,7 +1683,17 @@ static int decmode_diag_grow(fsk_diag_t *d,
         uint8_t *nb  = realloc(d->bits,        strob_cap);
         uint8_t *nh  = realloc(d->asm_hamming, strob_cap);
         uint8_t *no  = realloc(*out_scratch_io, strob_cap);
-        if (!ns || !nt || !nb || !nh || !no) return -1;
+        if (!ns || !nt || !nb || !nh || !no) {
+            // Store back each realloc that succeeded so d-> never points at a
+            // block realloc already freed (dangling) and the new blocks are
+            // not leaked -- same discipline as the lpf branch above.
+            d->strobes     = ns ? ns : d->strobes;
+            d->strobe_t    = nt ? nt : d->strobe_t;
+            d->bits        = nb ? nb : d->bits;
+            d->asm_hamming = nh ? nh : d->asm_hamming;
+            if (no) *out_scratch_io = no;
+            return -1;
+        }
         d->strobes = ns; d->strobe_t = nt;
         d->bits = nb;   d->asm_hamming = nh;
         *out_scratch_io = no;
