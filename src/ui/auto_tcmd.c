@@ -697,8 +697,15 @@ void auto_tcmd_tick(state_t *state) {
     // ambiguity (elevation < 0 but next pass not yet predicted) is
     // not enough to abort; the running flag stays so a momentary
     // numerical wobble can't kill an active session.
+    //
+    // --testing runs are bench / characterisation work that isn't tied to
+    // a pass: the satellite is normally below the horizon the whole time,
+    // so this guard would otherwise abort the run before its first send
+    // (the manual compose path has no such guard, which is why it worked
+    // out of a pass and auto-tcmd didn't). Skip the guard entirely then.
     double el = state->prediction.satellite_ephem.elevation;
-    if (el < 0.0
+    if (!state->testing_mode
+        && el < 0.0
         && state->prediction.predicted_minutes_until_visible > 0.5) {
         a->state = AUTO_STATE_PASS_OVER;
         snprintf(a->status_msg, sizeof a->status_msg,
