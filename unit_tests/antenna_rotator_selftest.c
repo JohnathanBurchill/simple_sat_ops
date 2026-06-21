@@ -128,6 +128,54 @@ static void test_accumulate_unwrapped(void)
     check(monotone_ok, "eastward sweep 350 -> 15 unwraps to 350 -> 375");
 }
 
+// ------------------------------------------------------ pointing_error_deg
+
+// Contract: great-circle angle (deg, in [0, 180]) between two (az, el)
+// directions. Used for the operator/viewer "pointing error" readout.
+// Closed-form special cases (meridian, horizon, antipode) are exact
+// oracles; az wrap and argument symmetry are pinned; and one general pair
+// is cross-checked against an independent 3D-unit-vector dot-product oracle
+// so a swapped sin/cos or dropped term in the formula goes red.
+static void test_pointing_error(void)
+{
+    fprintf(stderr, "pointing_error_deg:\n");
+    CHECK_APPROX(antenna_rotator_pointing_error_deg(123.0, 45.0, 123.0, 45.0),
+                 0.0, "identical directions -> 0");
+    // Same azimuth: the separation is just the elevation difference.
+    CHECK_APPROX(antenna_rotator_pointing_error_deg(10.0, 20.0, 10.0, 50.0),
+                 30.0, "same az, el 20 vs 50 -> 30");
+    // On the horizon (el=0): the separation is the azimuth difference...
+    CHECK_APPROX(antenna_rotator_pointing_error_deg(0.0, 0.0, 90.0, 0.0),
+                 90.0, "horizon, az 0 vs 90 -> 90");
+    // ...with the azimuth wrap handled (350 vs 20 is 30, not 330).
+    CHECK_APPROX(antenna_rotator_pointing_error_deg(350.0, 0.0, 20.0, 0.0),
+                 30.0, "horizon az wrap 350 vs 20 -> 30");
+    // Zenith to nadir is the maximum separation, 180.
+    CHECK_APPROX(antenna_rotator_pointing_error_deg(0.0, 90.0, 180.0, -90.0),
+                 180.0, "zenith vs nadir -> 180");
+    // Symmetric in its arguments.
+    CHECK_APPROX(antenna_rotator_pointing_error_deg(33.0, 12.0, 200.0, 70.0),
+                 antenna_rotator_pointing_error_deg(200.0, 70.0, 33.0, 12.0),
+                 "symmetric in its arguments");
+    // General pair vs an independent 3D-unit-vector dot-product oracle.
+    {
+        double az1 = 40.0, el1 = 15.0, az2 = 110.0, el2 = 55.0;
+        double d2r = M_PI / 180.0;
+        double v1[3] = { cos(el1 * d2r) * cos(az1 * d2r),
+                         cos(el1 * d2r) * sin(az1 * d2r),
+                         sin(el1 * d2r) };
+        double v2[3] = { cos(el2 * d2r) * cos(az2 * d2r),
+                         cos(el2 * d2r) * sin(az2 * d2r),
+                         sin(el2 * d2r) };
+        double dot = v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2];
+        if (dot > 1.0)  dot = 1.0;
+        if (dot < -1.0) dot = -1.0;
+        double oracle = acos(dot) * 180.0 / M_PI;
+        CHECK_APPROX(antenna_rotator_pointing_error_deg(az1, el1, az2, el2),
+                     oracle, "general pair matches 3D-vector oracle");
+    }
+}
+
 // -------------------------------------------------- home_unwrapped_target
 
 // Contract: choose the in-range co-terminal of `home` closest to 0 so the
@@ -1014,6 +1062,7 @@ int main(void)
 {
     test_wrap_to_pm180();
     test_accumulate_unwrapped();
+    test_pointing_error();
     test_home_unwrapped_target();
     test_home_leg2_echo_rejection();
     test_to_mech_coords_passthrough();

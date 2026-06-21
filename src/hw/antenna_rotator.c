@@ -205,6 +205,18 @@ double antenna_rotator_accumulate_unwrapped(double prev, double pred_az)
     return prev + antenna_rotator_wrap_to_pm180(pred_az - prev);
 }
 
+double antenna_rotator_pointing_error_deg(double az_a_deg, double el_a_deg,
+                                          double az_b_deg, double el_b_deg)
+{
+    double el_a = el_a_deg * M_PI / 180.0;
+    double el_b = el_b_deg * M_PI / 180.0;
+    double daz  = (az_a_deg - az_b_deg) * M_PI / 180.0;
+    double cosang = sin(el_a) * sin(el_b) + cos(el_a) * cos(el_b) * cos(daz);
+    if (cosang > 1.0)  cosang = 1.0;
+    if (cosang < -1.0) cosang = -1.0;
+    return acos(cosang) * 180.0 / M_PI;
+}
+
 // Pick the in-range co-terminal of `home_wrapped` (typically 0) with the
 // smallest absolute value, tiebreaking toward `prev`. The aim is to leave the
 // antenna physically at the home azimuth with as little accumulated rotation

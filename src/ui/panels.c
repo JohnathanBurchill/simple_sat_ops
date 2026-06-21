@@ -469,19 +469,60 @@ void render_predictions_panel(state_t *state, double jul_utc,
     }
     clrtoeol();
 
-    if (state->in_pass) {
-        mvprintw(row++, col, "%15s   %s", "status", "** IN PASS **");
-        if (state->antenna_rotator.tracking) {
-            printw(" (TRACKING)");
-        } else {
-            attron(COLOR_PAIR(1));
-            printw(" (NOT tracking)");
-            attroff(COLOR_PAIR(1));
-        }
+    // "status" is the satellite's true geometry: is it above the local
+    // horizon right now? This used to key off state->in_pass, but that is
+    // really a rotator pre-position flag (set only when tracking is armed
+    // AND within tracking_prep_time_minutes of AOS), so it read "NOT in
+    // pass" with the satellite plainly overhead whenever tracking wasn't
+    // armed -- and disagreed with the viewer, which keys off elevation. The
+    // rotator's own state now lives on its own line below.
+    double live_el = state->prediction.satellite_ephem.elevation;
+    if (live_el > 0.0) {
+        attron(COLOR_PAIR(3));
+        mvprintw(row++, col, "%15s   ** SATELLITE UP ** (el %.1f deg)",
+                 "status", live_el);
+        attroff(COLOR_PAIR(3));
     } else {
-        mvprintw(row++, col, "%15s   %s", "status", "** NOT in pass **");
+        mvprintw(row++, col, "%15s   below horizon (el %.1f deg)",
+                 "status", live_el);
     }
     clrtoeol();
+
+    // Rotator state, decoupled from the satellite geometry above -- an
+    // explicit statement of whether the antenna is actually following the
+    // satellite, so the operator doesn't have to infer it from the raw
+    // az/el numbers. Only shown when a rotator is attached.
+    if (state->have_antenna_rotator) {
+        char rot[96];
+        int rot_color = 0;
+        if (state->antenna_rotator.homing_in_progress) {
+            snprintf(rot, sizeof rot, "resetting");
+            rot_color = 2;
+        } else if (state->antenna_rotator.tracking) {
+            // Pointing error: how far the antenna's actual position is from
+            // the commanded target, which the tracker keeps on the
+            // satellite. The viewer shows this same value.
+            double err = antenna_rotator_pointing_error_deg(
+                state->antenna_rotator.target_azimuth,
+                state->antenna_rotator.target_elevation,
+                state->antenna_rotator.azimuth,
+                state->antenna_rotator.elevation);
+            snprintf(rot, sizeof rot,
+                     "TRACKING satellite  (pointing error %.1f deg)", err);
+            rot_color = 3;
+        } else if (state->satellite_tracking) {
+            snprintf(rot, sizeof rot, "armed (will track at AOS)");
+            rot_color = 2;
+        } else if (state->antenna_rotator.fixed_target) {
+            snprintf(rot, sizeof rot, "fixed target (not tracking)");
+        } else {
+            snprintf(rot, sizeof rot, "not tracking");
+        }
+        if (rot_color) attron(COLOR_PAIR(rot_color));
+        mvprintw(row++, col, "%15s   %s", "rotator", rot);
+        if (rot_color) attroff(COLOR_PAIR(rot_color));
+        clrtoeol();
+    }
 
     if (state->prediction.predicted_minutes_until_visible > 0) {
         double minutes_until = state->prediction.predicted_minutes_until_visible;

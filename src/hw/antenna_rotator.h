@@ -118,6 +118,13 @@ int antenna_rotator_point_to_target(antenna_rotator_t *antenna_rotator, double a
 
 double antenna_rotator_wrap_to_pm180(double delta_deg);
 double antenna_rotator_accumulate_unwrapped(double prev_unwrapped, double prediction_az);
+// Great-circle angle (deg) between two (az, el) directions. Used to show the
+// antenna pointing error -- how far the rotator's actual position is from its
+// commanded target. Both pairs are in the same (mechanical) frame, so this
+// also reads correctly on flip passes. Azimuth wrap is handled (cos is
+// periodic). Result is in [0, 180].
+double antenna_rotator_pointing_error_deg(double az_a_deg, double el_a_deg,
+                                          double az_b_deg, double el_b_deg);
 double antenna_rotator_home_unwrapped_target(double prev_unwrapped, double home_az_wrapped);
 // Decide whether the final leg of a two-step home should fire, given the
 // latest STATUS azimuth. Two things must hold: the reading must differ from

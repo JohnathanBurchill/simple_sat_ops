@@ -169,6 +169,10 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
     s->antenna_rotator.target_azimuth              = evt->target_az;
     s->antenna_rotator.target_elevation            = evt->target_el;
     s->antenna_rotator.flip_mode_pass              = evt->flip;
+    // render_predictions_panel gates its rotator/tracking + pointing-error
+    // line on have_antenna_rotator, so mirror has_rotator into the viewer's
+    // reconstructed state or that line stays hidden for observers.
+    s->have_antenna_rotator                        = evt->has_rotator;
 
     v->has_rotator = evt->has_rotator;
     v->jul_utc     = evt->jul_utc;
