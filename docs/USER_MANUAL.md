@@ -2836,35 +2836,41 @@ published baseline. It is frozen at one reviewed merge,
 `1dd038a` (2026-05-02, "multi-radio: pluggable backends, FT-991A
 canonical, RX/TX tooling (#3)"), and it is deliberately a long way
 behind. The live ground station, everything this manual describes, is
-the **`iq-inspector`** branch. If you clone this repo and build
-`main`, you will get the radio-first design from
+the **`any-sdr`** branch (it grew out of `iq-inspector`, which the
+earlier drafts of this manual named - that branch is now an ancestor,
+not the working tip). If you clone this repo and build `main`, you will
+get the radio-first design from
 [Appendix A](#appendix-a-what-didnt-stick---the-ft-991a-and-ic-9700-radio-path),
 not the SDR system. Start with:
 
 ```sh
-git checkout iq-inspector
+git checkout any-sdr
 ```
 
 ### The active line
 
-The branch you want grew commit by commit into one long, *linear*
-chain: no merge commits and very little rebasing, just one small
-change after another. Read end to end it is the development history of
-the SDR ground station, in four eras. The ranges below are `git log`
-arguments you can paste directly.
+The branch you want grew commit by commit into one long, nearly
+*linear* chain: very little rebasing and, for most of its length, no
+merges - just one small change after another. (The one exception is the
+newest era, which folds the `cleanup` refactoring branch in through a
+single merge commit; everything else is a straight line.) Read end to
+end it is the development history of the SDR ground station, in six
+eras. The ranges below are `git log` arguments you can paste directly.
 
 | Era (branch) | Commit range | Dates | What it introduced |
 |--------------|--------------|-------|--------------------|
 | `multi-operator` | `1dd038a..afe29d4` (~107) | 05-02 to 05-15 | The B210 becomes the live RF path. SDR RX/TX chain, the `rx_session` decode loop, the shared packet database and `packet_browser`, the SatNOGS audio pull, and the SatNOGS-style IQ waterfall. Absorbs the `SDR`, `packet-browser`, and `satnogs-audio-pull` topic branches. |
 | `coherent-iq-demod` | `afe29d4..394b7c7` (~66) | 05-15 to 05-19 | A shadow IQ-domain demodulator running alongside the FM path for A/B sensitivity, coherent demod work, and a long run of format-truncation fixes. |
 | `live-graphics` | `394b7c7..00f6ba6` (~67) | 05-19 to 05-24 | raylib graphics: the `live_waterfall` real-time spectrogram and the `iq_annotator` waveform panel (phase and split-channel views), plus `--tx-dry-run`. |
-| `iq-inspector` (current) | `00f6ba6..0246372` (~66) | 05-24 to 05-28 | `decode_inspector` (the renamed `iq_annotator`): a staged decoder visualizer walking ASM, Golay, descrambler, Reed-Solomon, and CSP, with a Viterbi slicer and a `--live` mode. Then AD9361 tracking-loop defaults, the T/R switch driver (`14b8d23`), the B210 TX-LO-leak fix (`86c5c6d`, power the TX chain down between bursts), `agenda_check --tle`/`--prune-dups`, `next_in_queue --tle`, the async threading pass (TX, rotator, and audit log on worker threads), elevation jog keys, rotator slew-rate calibration with the pursuit planner, and the one-operator `--control` refusal. |
+| `iq-inspector` | `00f6ba6..92f428a` (~91) | 05-24 to 05-29 | `decode_inspector` (the renamed `iq_annotator`): a staged decoder visualizer walking ASM, Golay, descrambler, Reed-Solomon, and CSP, with a Viterbi slicer and a `--live` mode. Then AD9361 tracking-loop defaults, the T/R switch driver (`14b8d23`), the B210 TX-LO-leak fix (`86c5c6d`, power the TX chain down between bursts), `agenda_check --tle`/`--prune-dups`, `next_in_queue --tle`, the async threading pass (TX, rotator, and audit log on worker threads), elevation jog keys, rotator slew-rate calibration with the pursuit planner, the one-operator `--control` refusal, and the Mission Operations ICD docs. |
+| `cleanup` | `92f428a..6bf39b5` (~144) | 05-29 to 06-16 | The refactoring era - mostly `move`/`extract` commits paying down duplication: one shared ISO-UTC timestamp formatter, shared modal text-field editing across the two editors, one ASM finder across the four demods, shared GNSS fragment helpers, `live_waterfall` linked against `waterfall_core`. Plus hardening: validate numeric CLI options instead of silently accepting garbage, bound CLI-driven size math, and the first removal of dead RX-side HMAC plumbing. |
+| `any-sdr` (current) | `6bf39b5..9ef8406` (~71) | 06-16 to 06-21 | The SDR-only cutover and hardening. Drop HMAC from the live and offline decoders and always validate the downlink CSP CRC32 instead (`cfb4c1f`, `0206aa8`, `ebdad4b`); pin the uplink frame to the pycsplink reference (`e214aa7`); serialize UHD device access between the RX and TX threads and close the cross-thread races (`01b6116`, `3252f68`). Then the GNSS->OPM space-safety upload pipeline (`gnss_opm`, `gnss_reports`, short-arc OPM determination), the `ham_listen`/`ham_speak` amateur-band voice tools, the HMAC keyfile with a `--fix-permissions` repair, and the test-suite audit + continuous integration of [Appendix C](#appendix-c-the-test-suite-audit-and-continuous-integration). This era folds in `cleanup` via the one merge commit on the line. |
 
 To walk any era:
 
 ```sh
 git log --oneline 1dd038a..afe29d4          # the multi-operator era
-git log -p --reverse 00f6ba6..0246372 -- apps/main.c   # the current era, one file
+git log -p --reverse 6bf39b5..any-sdr -- apps/main.c   # the current era, one file
 ```
 
 ### How the commits are meant to be read
@@ -2887,8 +2893,8 @@ written down. When you want to know *why* a line is the way it is, the
 commit message that introduced it is usually the answer:
 
 ```sh
-git log -p -S'the string or symbol you are chasing' iq-inspector
-git bisect start iq-inspector 1dd038a       # good=baseline, find the change
+git log -p -S'the string or symbol you are chasing' any-sdr
+git bisect start any-sdr 1dd038a       # good=baseline, find the change
 ```
 
 `main` advances only by reviewed pull request, squash-merged, which is
@@ -2904,18 +2910,20 @@ is where you should be working.
 
 | Branch | Date | Status |
 |--------|------|--------|
-| `iq-inspector` | 2026-05-28 | **The live system.** Work here. |
-| `main` | 2026-05-02 | Published baseline; one reviewed merge behind by design. |
+| `any-sdr` | 2026-06-21 | **The live system.** Work here. |
+| `cleanup` | 2026-06-16 | The refactoring/code-sharing era; folded into `any-sdr` by the one merge on the active line. Its history is the "extract the shared helper" story. |
+| `iq-inspector` | 2026-05-29 | The decode-inspector era tip. Now an ancestor of `any-sdr`, not the working branch; earlier drafts of this manual pointed here. |
+| `main` | 2026-05-02 | Published baseline; far behind the active line by design (it advances only by reviewed PR, and has taken just one). |
 | `tr-switch` | 2026-05-26 | Bench branch for the T/R antenna switch. The driver was reimplemented on the active line at `14b8d23`; this tip is the parallel take. |
 | `live-spectrum` | 2026-05-11 | `rx_tui` ribbon and gridline experiments. Superseded by the operator UI panels. |
 | `parsing` | 2026-05-04 | `rx_decode`/`rx_replay` parsing and `--help` docs. Superseded by `decode_inspector`. |
-| `SDR`, `packet-browser`, `satnogs-audio-pull` | 2026-05 | Topic branches that were folded into the `multi-operator` era. Reachable from `iq-inspector`; kept for reference. |
+| `SDR`, `packet-browser`, `satnogs-audio-pull` | 2026-05 | Topic branches that were folded into the `multi-operator` era. Reachable from `any-sdr`; kept for reference. |
 | `tx-tone` | 2026-04-27 | The `--tx-power` control and high-power safety gate. Reached `main` via PR #3; this branch is the un-squashed history. Archived. |
 | `telemetry` | 2026-04-19 | Early telemetry stubs, pre-SDR. Origin-only. |
 | `rao` | 2025-02 | The original ground-station branch that ran on the RAO machine. The root of the Mac-versus-remote split. |
 | `mac`, `usb-direct` | 2025-02 | The Mac dev-host build fixes and the early USB-serial radio experiments. Fossils. |
 
-If you are new and reading this: check out `iq-inspector`, build it
+If you are new and reading this: check out `any-sdr`, build it
 per [Build and install](#build-and-install), and run a pass as a
 viewer per the drill in
 [Modes: operator vs. viewer](#modes-operator-vs-viewer). The rest of
