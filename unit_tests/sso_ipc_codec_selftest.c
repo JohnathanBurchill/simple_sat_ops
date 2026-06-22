@@ -64,7 +64,7 @@ int main(void)
     char line[8192];
 
     // --- Event type table ---------------------------------------------
-    for (int i = 0; i <= SSO_EVT_CMD_EXECUTED; ++i) {
+    for (int i = 0; i <= SSO_EVT_AUDIO; ++i) {
         sso_event_type_t t = (sso_event_type_t) i;
         const char *nm = sso_event_type_name(t);
         tap_okf(nm != NULL && sso_event_type_from_name(nm) == t,
@@ -281,6 +281,86 @@ int main(void)
         tap_ok(sso_event_decode(line, &d) == 0, "decode escaped string returns 0");
         tap_ok(strcmp(d.rx_status, tricky) == 0,
                "quote/backslash/newline/tab round-trip to exact bytes");
+    }
+
+    // --- Live-audio relay events --------------------------------------
+    // audio-ctl: viewer -> operator. enable is a bool that must survive even
+    // when false (json_field_bool always emits it); quality is optional.
+    {
+        sso_event_t e;
+        sso_event_init(&e, SSO_EVT_AUDIO_CTL);
+        e.audio_enable  = 1;
+        e.audio_quality = 0.35;
+
+        sso_event_t d;
+        tap_ok(sso_event_encode(&e, line, sizeof line) == 0, "encode audio-ctl returns 0");
+        tap_ok(strstr(line, "\"t\":\"audio-ctl\"") != NULL, "audio-ctl type name on the wire");
+        tap_ok(strstr(line, "\"enable\":true") != NULL, "audio-ctl enable=true on the wire");
+        tap_ok(sso_event_decode(line, &d) == 0, "decode audio-ctl returns 0");
+        tap_ok(d.type == SSO_EVT_AUDIO_CTL, "audio-ctl type preserved");
+        tap_ok(d.audio_enable == 1, "audio-ctl enable preserved");
+        tap_ok(deq(d.audio_quality, 0.35), "audio-ctl quality preserved");
+
+        sso_event_init(&e, SSO_EVT_AUDIO_CTL);
+        e.audio_enable = 0;
+        tap_ok(sso_event_encode(&e, line, sizeof line) == 0, "encode audio-ctl(disable) returns 0");
+        tap_ok(strstr(line, "\"enable\":false") != NULL, "audio-ctl enable=false on the wire");
+        tap_ok(sso_event_decode(line, &d) == 0 && d.audio_enable == 0,
+               "audio-ctl disable preserved");
+    }
+
+    // audio-status: operator -> viewer. state + sr/ch on "on"; reason on the
+    // failure states (reason rides the common field, emitted once near the top).
+    {
+        sso_event_t e;
+        sso_event_init(&e, SSO_EVT_AUDIO_STATUS);
+        snprintf(e.audio_state, sizeof e.audio_state, "on");
+        e.audio_sr = 96000; e.audio_ch = 1;
+
+        sso_event_t d;
+        tap_ok(sso_event_encode(&e, line, sizeof line) == 0, "encode audio-status returns 0");
+        tap_ok(sso_event_decode(line, &d) == 0, "decode audio-status returns 0");
+        tap_ok(d.type == SSO_EVT_AUDIO_STATUS, "audio-status type preserved");
+        tap_ok(strcmp(d.audio_state, "on") == 0, "audio-status state preserved");
+        tap_ok(d.audio_sr == 96000 && d.audio_ch == 1, "audio-status sr/ch preserved");
+
+        sso_event_init(&e, SSO_EVT_AUDIO_STATUS);
+        snprintf(e.audio_state, sizeof e.audio_state, "unavailable");
+        snprintf(e.reason, sizeof e.reason, "no operator");
+        tap_ok(sso_event_encode(&e, line, sizeof line) == 0, "encode audio-status(unavail) returns 0");
+        tap_ok(sso_event_decode(line, &d) == 0
+               && strcmp(d.audio_state, "unavailable") == 0
+               && strcmp(d.reason, "no operator") == 0,
+               "audio-status unavailable + reason preserved");
+    }
+
+    // audio frame: operator -> viewer. seq MUST be emitted even when 0 (the
+    // first frame), start/sr/ch ride only the start frame, data is base64.
+    {
+        sso_event_t e;
+        sso_event_init(&e, SSO_EVT_AUDIO);
+        e.audio_seq = 0; e.audio_start = 1; e.audio_sr = 96000; e.audio_ch = 1;
+        snprintf(e.audio_b64, sizeof e.audio_b64, "T2dnUwACAAAA");  // "OggS"-prefixed
+
+        sso_event_t d;
+        tap_ok(sso_event_encode(&e, line, sizeof line) == 0, "encode audio frame returns 0");
+        tap_ok(strstr(line, "\"seq\":0") != NULL, "audio seq=0 emitted (not dropped as zero)");
+        tap_ok(strstr(line, "\"start\":true") != NULL, "audio start emitted on the wire");
+        tap_ok(strstr(line, "\"data\":\"T2dnUwACAAAA\"") != NULL, "audio base64 data on the wire");
+        tap_ok(sso_event_decode(line, &d) == 0, "decode audio frame returns 0");
+        tap_ok(d.type == SSO_EVT_AUDIO, "audio type preserved");
+        tap_ok(d.audio_seq == 0 && d.audio_start == 1, "audio seq/start preserved");
+        tap_ok(d.audio_sr == 96000 && d.audio_ch == 1, "audio start-frame sr/ch preserved");
+        tap_ok(strcmp(d.audio_b64, "T2dnUwACAAAA") == 0, "audio base64 data round-trips");
+
+        sso_event_init(&e, SSO_EVT_AUDIO);
+        e.audio_seq = 42;
+        snprintf(e.audio_b64, sizeof e.audio_b64, "QUJD");
+        tap_ok(sso_event_encode(&e, line, sizeof line) == 0, "encode audio frame(2) returns 0");
+        tap_ok(strstr(line, "\"start\"") == NULL, "non-start audio frame omits start");
+        tap_ok(sso_event_decode(line, &d) == 0 && d.audio_seq == 42
+               && d.audio_start == 0 && strcmp(d.audio_b64, "QUJD") == 0,
+               "non-start audio frame round-trips");
     }
 
     // --- Decoder robustness -------------------------------------------

@@ -35,6 +35,7 @@
 #include "sso_operator.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <ncurses.h>
 #include <signal.h>
 #include <stdio.h>
@@ -641,6 +642,85 @@ static const char *stream_user(void)
     return me ? me : "?";
 }
 
+// --- inbound command channel (stdin) ------------------------------
+//
+// The relay reads newline-JSON commands from its own stdin (the remote
+// viewer, over SSH) — see §9 of docs/VIEWER_STREAM_JSON.md. Today the only
+// command is audio-ctl: in operator mode it is forwarded to the operator
+// over IPC (which owns the SDR); in tle-only mode there is no receiver, so
+// we answer audio-status "unavailable" locally. stdin is read non-blocking
+// so it never stalls the telemetry output.
+
+static int    g_stdin_ready    = 0;   // stdin set non-blocking OK
+static int    g_stdin_overflow = 0;   // discarding an over-long line
+static size_t g_stdin_len      = 0;
+static char   g_stdin_buf[SSO_IPC_LINE_MAX];
+
+static void stream_stdin_init(void)
+{
+    int fl = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (fl >= 0 && fcntl(STDIN_FILENO, F_SETFL, fl | O_NONBLOCK) == 0)
+        g_stdin_ready = 1;
+}
+
+// Act on one inbound command line. `cli` is the operator IPC client while
+// relaying, or NULL in tle-only mode.
+static void stream_handle_command(const char *line, sso_ipc_client_t *cli)
+{
+    sso_event_t evt;
+    if (sso_event_decode(line, &evt) != 0) return;
+    if (evt.type != SSO_EVT_AUDIO_CTL) return;   // ignore commands we don't model
+
+    if (cli != NULL) {
+        // Operator mode: forward the request to the operator verbatim.
+        char buf[SSO_IPC_LINE_MAX];
+        if (sso_event_encode(&evt, buf, sizeof buf) == 0)
+            sso_ipc_client_send(cli, buf);
+        return;
+    }
+    // tle-only mode: no operator, so no audio. Answer locally.
+    sso_event_t st;
+    sso_event_init(&st, SSO_EVT_AUDIO_STATUS);
+    if (evt.audio_enable) {
+        snprintf(st.audio_state, sizeof st.audio_state, "unavailable");
+        snprintf(st.reason, sizeof st.reason, "no operator");
+    } else {
+        snprintf(st.audio_state, sizeof st.audio_state, "off");
+    }
+    char buf[SSO_IPC_LINE_MAX];
+    if (sso_event_encode(&st, buf, sizeof buf) == 0) stream_emit(buf);
+}
+
+// Drain whatever is on stdin (non-blocking), splitting on '\n' and
+// dispatching each complete command line.
+static void stream_pump_stdin(sso_ipc_client_t *cli)
+{
+    if (!g_stdin_ready) return;
+    char chunk[1024];
+    for (;;) {
+        ssize_t r = read(STDIN_FILENO, chunk, sizeof chunk);
+        if (r == 0) { g_stdin_ready = 0; break; }  // EOF: stop reading stdin
+        if (r < 0)  break;                          // EAGAIN: nothing right now
+        for (ssize_t i = 0; i < r; ++i) {
+            char c = chunk[i];
+            if (c == '\n') {
+                if (!g_stdin_overflow && g_stdin_len > 0) {
+                    g_stdin_buf[g_stdin_len] = '\0';
+                    stream_handle_command(g_stdin_buf, cli);
+                }
+                g_stdin_len = 0;
+                g_stdin_overflow = 0;
+            } else if (g_stdin_overflow) {
+                // skip until the next newline
+            } else if (g_stdin_len + 1 < sizeof g_stdin_buf) {
+                g_stdin_buf[g_stdin_len++] = c;
+            } else {
+                g_stdin_overflow = 1;  // drop the over-long line
+            }
+        }
+    }
+}
+
 // IPC callback for operator-relay mode: re-encode each operator event to
 // stdout, stamping STATE/WELCOME with source="operator" so the reader can
 // tell relayed data from the local TLE-only stream. Re-encoding (rather
@@ -808,6 +888,9 @@ static void stream_relay_session(sso_ipc_client_t *cli)
     while (!g_stream_stop) {
         int rc = sso_ipc_client_step(cli, 500);
         if (rc != 0) break;  // 1 = operator gone, -1 = fatal
+        // Forward any audio-ctl (or future command) the viewer sent to the
+        // operator that owns the SDR.
+        stream_pump_stdin(cli);
     }
 }
 
@@ -844,6 +927,10 @@ int run_viewer_stream(state_t *state)
     sso_ipc_ensure_runtime_dir();
     sso_dirwatch_t *watch = sso_dirwatch_open(sso_ipc_runtime_dir());
 
+    // Read commands from the viewer over stdin (audio-ctl, §9). Non-blocking
+    // so it never stalls the telemetry stream.
+    stream_stdin_init();
+
     time_t last_emit  = 0;   // 0 => emit on the first TLE-only tick
     time_t last_probe = 0;   // 0 => probe on the first iteration
 
@@ -856,6 +943,9 @@ int run_viewer_stream(state_t *state)
 
     while (!g_stream_stop) {
         time_t now = time(NULL);
+
+        // Service inbound commands (tle-only mode: no operator to forward to).
+        stream_pump_stdin(NULL);
 
         // Refresh the pass schedule periodically (long-lived tle-only streams).
         if (now - last_passes >= STREAM_PASSES_PERIOD_S) {

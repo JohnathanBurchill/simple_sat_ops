@@ -1,12 +1,19 @@
 # `simple_sat_ops --viewer-stream` — JSON contract
 
-Reference for clients that read the headless telemetry stream (e.g. the
-iOS/iPadOS viewer over SSH). This is the wire format `simple_sat_ops
---viewer-stream` writes to **stdout**.
+Reference for clients that talk to the headless stream (e.g. the iOS/iPadOS
+viewer over SSH). It covers:
 
-Applies to: commit `2e7a084` (2026-06-16). The format is additive and
+- the **outbound telemetry** the producer writes to **stdout** (§1–§8); and
+- the **inbound command channel** the client writes to **stdin**, plus the
+  **live audio** path it unlocks (§9).
+
+This is the wire format `simple_sat_ops --viewer-stream` uses.
+
+Applies to: commit `0d134d2` (2026-06-22). The format is additive and
 forward-compatible — see [Parser rules](#parser-rules) — so a client built
-against this revision keeps working as fields are added.
+against an earlier revision keeps working as fields and event types are added.
+Audio and the inbound channel are purely additive: a client that never writes to
+stdin and ignores the audio events behaves exactly as a telemetry-only client.
 
 ---
 
@@ -19,26 +26,40 @@ simple_sat_ops --viewer-stream next       # auto-pick the next pass
 ```
 
 It opens **no hardware**, binds **no server**, loads **no signing key** — it
-only reads the sky and writes JSON. It runs whether or not a control operator
-is up. `--control` and `--viewer-stream` together are refused.
+only reads the sky, relays a running operator, and reads/writes JSON. It runs
+whether or not a control operator is up. `--control` and `--viewer-stream`
+together are refused.
 
-Typical remote use: `ssh ground-station simple_sat_ops --viewer-stream` and
-read the child process's stdout line by line.
+Typical remote use: `ssh ground-station simple_sat_ops --viewer-stream` and read
+the child process's stdout line by line. To use live audio (§9), also write
+command lines to that child's stdin.
+
+| flag | meaning |
+|------|---------|
+| `--no-audio` | Refuse all audio requests for this producer. Telemetry is unaffected. |
+
+Live audio additionally requires the ground station's build to include
+**libsndfile** (the same dependency `ham_listen` uses); without it audio
+requests are answered `"unavailable"`. Telemetry never depends on it.
 
 ---
 
-## 2. Framing
+## 2. Framing (both directions)
 
-- **One event per line**, terminated by `\n`. Parse line-by-line.
+- **One event per line**, terminated by `\n`, in **both** directions. Parse
+  line-by-line; write one complete line at a time.
 - Each line is a **flat JSON object**. There are no nested objects, with one
   exception: `roster` is a JSON **string** whose contents are a JSON array
   (parse it as a second step if you need it).
 - Every line carries:
   - `t` — event type (string, see [§5](#5-event-types)).
   - `ts` — ISO-8601 UTC timestamp, millisecond precision, e.g.
-    `"2026-06-16T15:36:57.511Z"`.
-- The stream is **continuous**: ~1 Hz in tle-only mode, ~2 Hz when relaying an
-  operator. A line arriving = the link is alive; no separate heartbeat event.
+    `"2026-06-16T15:36:57.511Z"`. (Outbound only; inbound commands need no `ts`.)
+- The outbound stream is **continuous**: ~1 Hz in tle-only mode, ~2 Hz when
+  relaying an operator. A line arriving = the link is alive; no separate
+  heartbeat event.
+- Lines longer than ~8 KB are rejected in both directions. Keep commands small;
+  audio frames are sized to stay well under the limit (§9.4).
 
 ---
 
@@ -61,8 +82,8 @@ runtime directory for the operator's socket — and switches to `operator` lines
 within a tick; when the operator drops it falls back to `tle-only`. No gap —
 the stream never goes silent during a handover beyond the normal tick.
 
-> The non-`state` event types (§5.3) only ever appear in `operator` mode, so
-> seeing one also implies an operator is connected.
+> The non-`state` event types (§5.3) and **live audio** (§9) only ever appear in
+> `operator` mode, so seeing one also implies an operator is connected.
 
 ---
 
@@ -177,6 +198,8 @@ doesn't need:
 | `operator-changed` | operator handover | `prev`, `new` |
 | `yield-request` | force-claim in progress | `reason` |
 | `bye` | operator is shutting down | — |
+| `audio-status` | live-audio lifecycle (§9.2) | `state`, `sr`, `ch`, `reason` |
+| `audio` | a chunk of the live Ogg/Vorbis audio (§9.3) | `seq`, `start`, `sr`, `ch`, `data` |
 
 ### 5.4 `passes` — upcoming-pass schedule
 
@@ -220,14 +243,16 @@ Build a tolerant decoder:
 - **Numbers use C `%.6g`.** Large magnitudes appear in scientific notation
   (e.g. `"jul":2.46121e+06`, `"ep_min":705080`). Your number parser must
   accept both fixed and exponent forms. `freq`, `rx_fr`, `at_*`, CSP fields,
-  and `packets` are integers; everything else numeric is a double.
+  `packets`, and the audio `seq`/`sr`/`ch` are integers; everything else numeric
+  is a double.
 - **Unknown `t` and unknown keys are fine.** Ignore event types you don't
   handle and keys you don't model — the format only grows.
 - **`roster` is a string.** Its value is a JSON array; parse it separately if
   needed.
 - **Strings are JSON-escaped** for `" \ \n \r \t`. Control characters that
   can't be represented decode lossily (to `?`) — don't rely on exotic bytes
-  surviving.
+  surviving. (The audio `data` field is base64, whose alphabet is never
+  escaped, but decode it through your normal string path anyway.)
 - **Don't assume a fixed key order.**
 
 ---
@@ -264,3 +289,232 @@ A minimal viewer needs only the `state` event:
 4. Liveness: if no line for, say, > 5 s, show "stale".
 5. Optionally surface `rx-*`, `tx-*`, `cmd-*`, and `roster` when in operator
    mode for a fuller view.
+6. Optionally offer "listen live" (§9): write `audio-ctl` to stdin, decode the
+   `audio` events, drive a play/stop button off `audio-status`.
+
+---
+
+## 9. Live audio + the inbound command channel
+
+For the first time the client can also **write** to the producer — newline-JSON
+commands on **stdin** — and the producer can stream the operator's demodulated
+**receiver audio** back as Ogg/Vorbis, carried as base64 inside ordinary JSON
+lines on the same stdout pipe. Everything here is opt-in: if you never write to
+stdin, no audio is ever produced.
+
+### 9.1 Where the audio comes from
+
+```
+  client (remote)                     simple_sat_ops --viewer-stream        simple_sat_ops --control
+  ──────────────                      ──────────────────────────────        ───────────────────────
+   reads stdout ◀── telemetry + base64 audio ── stdout                            (owns the one SDR;
+   writes stdin ──▶ audio-ctl                ──▶ stdin                              has the demod PCM)
+                       (over SSH)                  │  ▲
+                                         unix sock │  │ unix sock
+                                         audio-ctl ▼  │ audio / audio-status
+                                                operator IPC socket
+```
+
+- **The operator sources the audio**, not `--viewer-stream`. The station has
+  **one** SDR, owned by the `--control` operator; `--viewer-stream` still opens
+  no hardware and relays.
+- **Audio is only available in `operator` mode.** In `tle-only` mode there is no
+  receiver, so an enable request is answered `"unavailable"`.
+- **Each SSH connection is its own subscriber.** The operator runs a separate
+  encoder per listening viewer, so every client gets a complete, self-contained
+  Ogg stream that **begins with its own headers** — you never join mid-stream
+  missing them.
+
+### 9.2 Inbound command: `audio-ctl` (you → stdin)
+
+Same framing as the outbound stream (§2): one flat JSON object per line, `\n`
+terminated, no `ts` required. Unknown `t`/keys are ignored, so the channel can
+grow. A command is acted on within one producer tick (≤ ~500 ms).
+
+| key | JSON type | required | meaning |
+|-----|-----------|----------|---------|
+| `t` | string | yes | `"audio-ctl"` |
+| `enable` | bool | yes | `true` to start audio, `false` to stop |
+| `q` | number | no | VBR quality `0.0`–`1.0` (default `0.2`); honored on `enable:true`, clamped |
+
+```json
+{"t":"audio-ctl","enable":true}
+{"t":"audio-ctl","enable":true,"q":0.4}
+{"t":"audio-ctl","enable":false}
+```
+
+- `enable:true` in operator mode → you start receiving `audio` frames, preceded
+  by `audio-status:"on"`. Idempotent — re-enabling restarts the stream (fresh
+  `start:true` frame).
+- `enable:true` in tle-only mode → `audio-status:"unavailable"`. **Not
+  remembered**; re-send once `source` flips to `"operator"`.
+- `enable:false` → `audio-status:"off"`, no more `audio` frames. Always safe.
+
+### 9.3 Outbound: `audio-status` and `audio`
+
+**`audio-status`** — sent on every state change (always in reply to `audio-ctl`;
+also unsolicited when the operator stops sourcing audio or an error occurs):
+
+| key | JSON type | present | meaning |
+|-----|-----------|---------|---------|
+| `t` | string | always | `"audio-status"` |
+| `state` | string | always | `"on"` \| `"off"` \| `"unavailable"` \| `"error"` |
+| `sr` | integer | with `"on"` | Stream sample rate, Hz |
+| `ch` | integer | with `"on"` | Channel count (always `1` today) |
+| `reason` | string | when not obvious | Detail for `"unavailable"`/`"error"` (`"no operator"`, `"audio disabled"`, `"no audio support in this build"`, `"operator gone"`, `"encoder init failed"`) |
+
+`"unavailable"` is not an error — retry when an operator appears. On `"error"`
+tear down your decoder; you may re-request.
+
+**`audio`** — one chunk of the Ogg/Vorbis bitstream:
+
+| key | JSON type | present | meaning |
+|-----|-----------|---------|---------|
+| `t` | string | always | `"audio"` |
+| `seq` | integer | always | Per-stream frame counter from `0`, +1 each frame. Detects drops. |
+| `start` | bool | when true | `true` **only** on the first frame of a fresh stream — it carries the Ogg/Vorbis headers. Reset your decoder on it. Absent (=false) afterwards. |
+| `sr` | integer | with `start` | Sample-rate hint, Hz (authoritative value is in the Ogg headers) |
+| `ch` | integer | with `start` | Channel-count hint |
+| `data` | string | always | **base64** ([RFC 4648](https://www.rfc-editor.org/rfc/rfc4648), standard alphabet, `=` padding) of a contiguous slice of the Ogg bitstream |
+
+Base64-decode `data` and **concatenate in `seq` order** → exactly the bytes
+`ham_listen --ogg-stdout` would write; nothing is reframed. Frames arrive ≈ 4–10
+per second, variable size, each ≤ ~4 KB raw.
+
+### 9.4 Decoding
+
+The stream is **Ogg-encapsulated Vorbis**, mono, VBR. Any standard Vorbis
+decoder works (`libvorbisfile`, an `AudioToolbox`/`AVAudioFile` reader fed the
+bytes, `ffmpeg`, …).
+
+1. On `audio-status:"on"` (or the first `audio` frame with `start:true`), create
+   a fresh decoder; discard any previous one.
+2. For each `audio` frame, base64-decode `data` and feed the bytes to the
+   decoder **in `seq` order**.
+3. Play the PCM. The decoder learns the true rate/channels from the Ogg headers
+   (in the `start` frame); `sr`/`ch` are just pre-allocation hints — **don't
+   hardcode a rate**.
+4. On `audio-status:"off"`/`"error"`, flush and tear down the decoder.
+
+**Gaps & backpressure (important).** The audio path is **lossy under
+backpressure**: if your SSH reader stalls, the producer **drops** audio frames
+rather than blocking telemetry. You detect a drop as a **jump in `seq`**. On a
+gap, keep feeding subsequent bytes — Ogg is page-framed with checksums, so the
+Vorbis decoder **resyncs at the next page** (a brief glitch, surfaced as e.g.
+`OV_HOLE`; keep going). You do **not** wait for a new `start`; a new `start`
+only appears if the *operator* restarts its encoder. Drain stdin promptly so
+*you* aren't the slow consumer.
+
+**Handover / disconnect.** If the operator drops while you listen you get
+`audio-status:"error"`,`reason:"operator gone"` and `source` flips to
+`"tle-only"`. Tear down; re-send `audio-ctl enable:true` once an operator
+returns to get a new `start:true` stream.
+
+### 9.5 Bandwidth & latency
+
+Mono Vorbis VBR at the default quality is ~30–50 kbit/s; base64 adds ~33%, so
+plan for **~5–8 KB/s** per listening viewer (lower `q` for tight links).
+End-to-end latency is a few hundred ms — this is a monitoring path, not a
+low-latency one. Audio costs nothing until a viewer enables it.
+
+### 9.6 Worked transcript
+
+You write to stdin: `{"t":"audio-ctl","enable":true}`
+
+Producer stdout (telemetry lines elided as `…`):
+
+```json
+{"t":"state","ts":"2026-06-22T19:00:01.002Z","source":"operator","sat":"FRONTIERSAT",…}
+{"t":"audio-status","ts":"2026-06-22T19:00:01.210Z","state":"on","sr":96000,"ch":1}
+{"t":"audio","ts":"2026-06-22T19:00:01.250Z","seq":0,"start":true,"sr":96000,"ch":1,"data":"T2dnUwACAAAAAAAAAAA…"}
+{"t":"audio","ts":"2026-06-22T19:00:01.470Z","seq":1,"data":"AQAAAB1U…"}
+{"t":"audio","ts":"2026-06-22T19:00:01.690Z","seq":2,"data":"k4t9f3…"}
+…
+```
+
+You write: `{"t":"audio-ctl","enable":false}`
+
+```json
+{"t":"audio-status","ts":"2026-06-22T19:01:14.880Z","state":"off"}
+```
+
+(`T2dnUw==` decodes to `"OggS"` — the Ogg page-capture pattern — confirming the
+first frame begins a real Ogg stream.)
+
+---
+
+## 10. Internal architecture (informative — not part of the consumer contract)
+
+This documents the simple_sat_ops side so the two stay in sync; a consumer
+implementer can skip it.
+
+### 10.1 One audio frame's path
+
+```
+rx_session worker (operator)            operator main loop                  viewer-stream relay        client
+  demod PCM ─▶ PCM ring  ───────▶  drain ring ─▶ per-subscriber        ─▶  SSO_EVT_AUDIO over    ─▶  (this contract)
+                                    Ogg encoder ─▶ base64 ─▶ SSO_EVT_AUDIO     unix sock, re-encoded
+                                    targeted-send to that subscriber id         to stdout
+```
+
+### 10.2 New IPC events (`src/ipc/sso_ipc.h`, `sso_ipc_codec.c`)
+
+Three new `sso_event_type_t` values traverse **both** hops (operator↔relay,
+relay↔client) with identical shape; the relay re-encodes them like it already
+re-encodes `state`/`welcome`:
+
+| enum | wire `t` | direction | fields (`sso_event_t` → wire) |
+|------|----------|-----------|-------------------------------|
+| `SSO_EVT_AUDIO_CTL` | `audio-ctl` | client → relay (stdin) → operator (IPC) | `audio_enable`→`enable`, `audio_quality`→`q` |
+| `SSO_EVT_AUDIO_STATUS` | `audio-status` | operator → relay → client | `audio_state`→`state`, `audio_sr`→`sr`, `audio_ch`→`ch`, `reason` (reused) |
+| `SSO_EVT_AUDIO` | `audio` | operator → relay → client | `audio_seq`→`seq`, `audio_start`→`start`, `audio_sr`/`audio_ch`, `audio_b64`→`data` |
+
+`SSO_AUDIO_RAW_MAX = 4096` (raw Ogg bytes/frame) bounds the base64 field
+(`SSO_AUDIO_B64_MAX`) so a full `audio` line stays well under `SSO_IPC_LINE_MAX`
+(8000). The operator **targeted-sends** (`sso_ipc_server_send`) audio only to
+subscribed client ids; it never broadcasts it.
+
+### 10.3 Shared Ogg/Vorbis module (the de-duplication)
+
+The Ogg/Vorbis sink that lived inline in `utils/ham_listen.c` (the
+`ogg_sink_t` struct, the libsndfile virtual-IO callbacks, and the encoder
+setup) is factored into `src/audio/ogg_stream.{c,h}`, used by **both**
+`ham_listen` and the operator's audio pump:
+
+```c
+// HAVE_SNDFILE gates the whole module. The sink callback receives encoded
+// Ogg bytes, so the same encoder serves a pipe, a socket, or a base64 framer.
+// It mirrors write(2): return bytes consumed, or <0 to latch an error.
+typedef long (*ogg_stream_sink_fn)(const uint8_t *bytes, size_t n, void *user);
+
+ogg_stream_t *ogg_stream_open(int sample_rate, int channels,
+                              double vbr_quality,
+                              ogg_stream_sink_fn sink, void *user);
+int  ogg_stream_write(ogg_stream_t *s, const int16_t *pcm, size_t frames);
+unsigned long long ogg_stream_bytes(const ogg_stream_t *s);
+void ogg_stream_close(ogg_stream_t *s);   // flushes
+```
+
+`ham_listen` keeps its CW/BFO demod, squelch, de-emphasis, and CLI — those are
+tool-local, not streaming concerns. Its sink writes to `STDOUT_FILENO`; the
+operator's sink base64-encodes into an `SSO_EVT_AUDIO` and targeted-sends it.
+
+### 10.4 Operator & relay plumbing
+
+- `rx_session` gains a small lock-protected **PCM tap ring** the worker fills
+  after each pump (alongside the WAV append) and `rx_session_read_audio()` the
+  main loop drains. No subscriber → no cost.
+- The operator's `ipc_on_event` (`src/control/operator_ipc.c`) handles
+  `SSO_EVT_AUDIO_CTL`: ref-counts subscribers, creates/destroys that client's
+  `ogg_stream_t`, replies `SSO_EVT_AUDIO_STATUS`. A disconnecting subscriber is
+  dropped (encoder freed) on the next server step. Subscriber count is capped
+  (`SSO_AUDIO_MAX_SUBS`) to bound CPU on the single-threaded operator.
+- The operator main loop's **audio pump**: when ≥1 subscriber, drain the PCM
+  ring, feed each subscriber's encoder, base64 each emitted chunk into an
+  `SSO_EVT_AUDIO`, targeted-send.
+- `run_viewer_stream` (`src/ui/viewer.c`) adds non-blocking **stdin** reads in
+  both loops. A parsed `audio-ctl` is forwarded to the operator via
+  `sso_ipc_client_send` in operator mode, or answered locally with
+  `audio-status:"unavailable"` in tle-only mode. `stream_relay_on_event`
+  forwards `audio`/`audio-status` downstream automatically once the codec knows
+  the new types (no `source` re-tag — they are not `state`).

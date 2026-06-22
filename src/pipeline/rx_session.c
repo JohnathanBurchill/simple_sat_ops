@@ -273,6 +273,17 @@ struct rx_session {
     packet_db_t *db;
     char         db_run_id[24];
 
+    // Live-audio tap. When enabled, the worker copies each pump's PCM into
+    // this ring (under mu) alongside the WAV append; the operator main loop
+    // drains it with rx_session_read_audio and feeds the per-subscriber Ogg
+    // encoders. Off by default — zero cost when no viewer is listening.
+    int16_t *audio_ring;
+    size_t   audio_ring_cap;    // capacity in samples
+    size_t   audio_ring_head;   // next write index
+    size_t   audio_ring_count;  // samples currently buffered
+    int      audio_tap_on;
+    uint64_t audio_dropped;     // samples dropped on overflow (diagnostic)
+
     // --- Threading ---
     // The worker thread owns the RX side of `core`: it runs the UHD RX
     // pump + decode + wav writer continuously and never blocks on TX.
@@ -434,9 +445,13 @@ int rx_session_open(rx_session_t **out, const rx_session_params_t *p,
     rxs->bits_scratch     = malloc(rxs->bits_cap);
     rxs->bytes_cap        = rxs->bits_cap / 8 + 1;
     rxs->bytes_scratch    = malloc(rxs->bytes_cap);
+    // Live-audio ring: ~2 s at the post-decim rate, enough slack between
+    // the worker's pump cadence and the operator's audio-drain cadence.
+    rxs->audio_ring_cap   = (size_t) rxs->samp_rate * 2;
+    rxs->audio_ring       = malloc(rxs->audio_ring_cap * sizeof(int16_t));
     if (!rxs->pcm_chunk || !rxs->iq_chunk || !rxs->iq_decode_chunk
         || !rxs->window || !rxs->iq_window
-        || !rxs->bits_scratch || !rxs->bytes_scratch) {
+        || !rxs->bits_scratch || !rxs->bytes_scratch || !rxs->audio_ring) {
         rx_session_close(rxs);
         return -1;
     }
@@ -1004,6 +1019,7 @@ void rx_session_close(rx_session_t *rxs)
     free(rxs->iq_window);
     free(rxs->bits_scratch);
     free(rxs->bytes_scratch);
+    free(rxs->audio_ring);
     free(rxs);
 }
 
@@ -1246,6 +1262,69 @@ static void try_decode_viterbi_at_window(rx_session_t *rxs)
     }
 }
 
+// Push n PCM samples into the live-audio ring (caller is the worker; takes
+// mu for the copy since the operator main loop drains under the same lock).
+// On overflow the oldest samples are dropped — audio is best-effort and the
+// downstream Vorbis decoder resyncs at the next page.
+static void audio_ring_push(rx_session_t *rxs, const int16_t *pcm, size_t n)
+{
+    pthread_mutex_lock(&rxs->mu);
+    if (rxs->audio_tap_on && rxs->audio_ring && rxs->audio_ring_cap > 0
+        && n > 0) {
+        size_t cap = rxs->audio_ring_cap;
+        if (n > cap) {
+            // A single chunk larger than the whole ring: keep only its tail.
+            rxs->audio_dropped += (n - cap);
+            pcm += (n - cap);
+            n = cap;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            rxs->audio_ring[rxs->audio_ring_head] = pcm[i];
+            rxs->audio_ring_head = (rxs->audio_ring_head + 1) % cap;
+        }
+        if (rxs->audio_ring_count + n > cap) {
+            rxs->audio_dropped   += (rxs->audio_ring_count + n - cap);
+            rxs->audio_ring_count = cap;  // head wrapped over the old tail
+        } else {
+            rxs->audio_ring_count += n;
+        }
+    }
+    pthread_mutex_unlock(&rxs->mu);
+}
+
+void rx_session_set_audio_tap(rx_session_t *rxs, int on)
+{
+    if (rxs == NULL) return;
+    pthread_mutex_lock(&rxs->mu);
+    if (on && !rxs->audio_tap_on) {
+        // Start fresh so a new listener doesn't inherit stale buffered audio.
+        rxs->audio_ring_head  = 0;
+        rxs->audio_ring_count = 0;
+    }
+    rxs->audio_tap_on = on ? 1 : 0;
+    pthread_mutex_unlock(&rxs->mu);
+}
+
+size_t rx_session_read_audio(rx_session_t *rxs, int16_t *out, size_t max_samples)
+{
+    if (rxs == NULL || out == NULL || max_samples == 0) return 0;
+    pthread_mutex_lock(&rxs->mu);
+    size_t cap   = rxs->audio_ring_cap;
+    size_t take  = rxs->audio_ring_count < max_samples
+                 ? rxs->audio_ring_count : max_samples;
+    if (cap > 0 && take > 0) {
+        size_t tail = (rxs->audio_ring_head + cap - rxs->audio_ring_count) % cap;
+        for (size_t i = 0; i < take; ++i) {
+            out[i] = rxs->audio_ring[(tail + i) % cap];
+        }
+        rxs->audio_ring_count -= take;
+    } else {
+        take = 0;
+    }
+    pthread_mutex_unlock(&rxs->mu);
+    return take;
+}
+
 static int worker_pump_once(rx_session_t *rxs)
 {
     // Two IQ taps from the core: iq_chunk is raw post-Doppler IQ with
@@ -1267,6 +1346,8 @@ static int worker_pump_once(rx_session_t *rxs)
     if (n < 0) return -1;
     if (n == 0) return 0;
     if (rxs->wav.fp) wav_w_append(&rxs->wav, rxs->pcm_chunk, (size_t) n);
+    // Live-audio relay: copy PCM into the ring when a viewer is listening.
+    if (rxs->audio_tap_on) audio_ring_push(rxs, rxs->pcm_chunk, (size_t) n);
     if (rxs->iq_fp && iq_pairs > 0) {
         size_t want = iq_pairs * 2;  // int16 count
         if (fwrite(rxs->iq_chunk, sizeof(int16_t), want, rxs->iq_fp) == want) {

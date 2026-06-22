@@ -358,6 +358,7 @@ typedef struct state
     // uhd_args); uhd_args is a verbatim UHD device-args passthrough;
     // sdr_fpga forces an FPGA image for a B2xx clone.
     int                without_b210;
+    int                no_audio;   // --no-audio: refuse viewer live-audio requests
     sdr_backend_type_t sdr_type;
     char               sdr_device[128];
     char               uhd_args[256];

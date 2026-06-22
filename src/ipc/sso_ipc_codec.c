@@ -415,6 +415,9 @@ static const struct {
     { SSO_EVT_TX_NOT_SENT,       "tx-not-sent" },
     { SSO_EVT_CMD_PREVIEW,       "cmd-preview" },
     { SSO_EVT_CMD_EXECUTED,      "cmd-executed" },
+    { SSO_EVT_AUDIO_CTL,         "audio-ctl" },
+    { SSO_EVT_AUDIO_STATUS,      "audio-status" },
+    { SSO_EVT_AUDIO,             "audio" },
     { SSO_EVT_UNKNOWN,           NULL },
 };
 
@@ -658,6 +661,36 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
         if (json_field_str(&p, end, &first, "cmd_text",   evt->cmd_text)   < 0) return -1;
         if (json_field_str(&p, end, &first, "cmd_status", evt->cmd_status) < 0) return -1;
     }
+    // Live-audio relay events (reason, if set, is already emitted above).
+    if (evt->type == SSO_EVT_AUDIO_CTL) {
+        if (json_field_bool(&p, end, &first, "enable", evt->audio_enable ? 1 : 0) < 0) return -1;
+        if (evt->audio_quality > 0.0) {
+            if (json_field_double(&p, end, &first, "q", evt->audio_quality) < 0) return -1;
+        }
+    }
+    if (evt->type == SSO_EVT_AUDIO_STATUS) {
+        if (json_field_str(&p, end, &first, "state", evt->audio_state) < 0) return -1;
+        if (evt->audio_sr) {
+            if (json_field_int(&p, end, &first, "sr", evt->audio_sr) < 0) return -1;
+        }
+        if (evt->audio_ch) {
+            if (json_field_int(&p, end, &first, "ch", evt->audio_ch) < 0) return -1;
+        }
+    }
+    if (evt->type == SSO_EVT_AUDIO) {
+        // seq is always emitted (0 is valid — the first frame).
+        if (json_field_int(&p, end, &first, "seq", evt->audio_seq) < 0) return -1;
+        if (evt->audio_start) {
+            if (json_field_bool(&p, end, &first, "start", 1) < 0) return -1;
+            if (evt->audio_sr) {
+                if (json_field_int(&p, end, &first, "sr", evt->audio_sr) < 0) return -1;
+            }
+            if (evt->audio_ch) {
+                if (json_field_int(&p, end, &first, "ch", evt->audio_ch) < 0) return -1;
+            }
+        }
+        if (json_field_str(&p, end, &first, "data", evt->audio_b64) < 0) return -1;
+    }
     if (json_append(&p, end + 2, "}\n") < 0) return -1;
     *p = '\0';
     return 0;
@@ -763,6 +796,18 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
     json_get_string(line, line_len, "tx_st", evt->tx_not_sent_reason, sizeof(evt->tx_not_sent_reason));
     json_get_string(line, line_len, "cmd_text",   evt->cmd_text,   sizeof(evt->cmd_text));
     json_get_string(line, line_len, "cmd_status", evt->cmd_status, sizeof(evt->cmd_status));
+
+    // Live-audio relay fields (absent on other events; stay zeroed).
+    int au_flag = 0;
+    if (json_get_bool(line, line_len, "enable", &au_flag) > 0) evt->audio_enable = au_flag;
+    json_get_double(line, line_len, "q", &evt->audio_quality);
+    json_get_string(line, line_len, "state", evt->audio_state, sizeof(evt->audio_state));
+    long au_int = 0;
+    if (json_get_int(line, line_len, "seq", &au_int) > 0) evt->audio_seq = (int) au_int;
+    if (json_get_bool(line, line_len, "start", &au_flag) > 0) evt->audio_start = au_flag;
+    if (json_get_int(line, line_len, "sr", &au_int) > 0) evt->audio_sr = (int) au_int;
+    if (json_get_int(line, line_len, "ch", &au_int) > 0) evt->audio_ch = (int) au_int;
+    json_get_string(line, line_len, "data", evt->audio_b64, sizeof(evt->audio_b64));
 
     // RX panel mirror. Absent fields stay zeroed (memset at top of decode).
     int rx_flag = 0;

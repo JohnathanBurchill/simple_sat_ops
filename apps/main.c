@@ -27,6 +27,7 @@
 #include "prediction.h"
 #include "sso_audit.h"
 #include "sso_ipc.h"
+#include "operator_audio.h"
 #include "frontiersat.h"
 #include "sso_time.h"
 #include "sso_version.h"
@@ -561,6 +562,11 @@ int main(int argc, char **argv)
         // hammered when the loop is running at UHD-chunk cadence.
         if (state.ipc) {
             sso_ipc_server_step(state.ipc, 0);
+            // Live-audio relay: ship encoded RX audio to any subscribed
+            // viewer, then drop subscribers whose client has gone. Both are
+            // cheap no-ops when nobody is listening.
+            operator_audio_pump(&state);
+            operator_audio_prune(&state);
             if ((t_now - t_last_ipc_broadcast) >= IPC_BROADCAST_PERIOD_S) {
                 ipc_broadcast_state(&state, current_az, current_el,
                                      current_downlink_frequency,
@@ -598,10 +604,21 @@ int main(int argc, char **argv)
             // Exception: while the operator is typing in the ":" prompt,
             // drop to 20 ms so getch() echoes each keystroke promptly
             // (the 500 ms tick was capping input at ~2 chars/sec).
-            usleep((state.cmd.active || state.tx_compose_active || state.auto_tcmd_active)
-                   ? 20000 : UPDATE_INTERVAL_MICROSEC);
+            useconds_t nap = UPDATE_INTERVAL_MICROSEC;
+            if (state.cmd.active || state.tx_compose_active || state.auto_tcmd_active) {
+                nap = 20000;
+            } else if (operator_audio_active()) {
+                // A viewer is listening live — tick at 10 Hz so encoded
+                // audio flows with low latency instead of in 0.5 s gulps.
+                nap = 100000;
+            }
+            usleep(nap);
         }
     }
+
+    // Tear down live-audio encoders (and clear the RX tap) while the RX
+    // session is still open.
+    operator_audio_shutdown(&state);
 
     endwin();
     tui_release_stderr();

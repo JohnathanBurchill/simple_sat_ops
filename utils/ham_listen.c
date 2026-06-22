@@ -48,10 +48,7 @@
 #include "b210_rx_tx_core.h"
 #include "carrier_trim.h"
 #include "frontiersat.h"
-
-#ifdef HAVE_SNDFILE
-#include <sndfile.h>
-#endif
+#include "ogg_stream.h"
 
 #include <math.h>
 #include <signal.h>
@@ -197,43 +194,15 @@ static void format_byte_rate(double bps, char *buf, size_t n)
     else                   snprintf(buf, n, "%6.0f B/s",  bps);
 }
 
-#ifdef HAVE_SNDFILE
-// libsndfile virtual-I/O sink for --ogg-stdout: write each Ogg page straight
-// to stdout and keep a running byte count, so the status line can report the
-// stream rate (what the ssh link actually carries). Ogg write is forward-
-// only, so "seek" just tracks a logical offset — the pipe is never seeked.
-typedef struct {
-    sf_count_t         offset;   // logical write position (== bytes written)
-    unsigned long long total;    // total bytes written to stdout
-} ogg_sink_t;
-
-static sf_count_t ogg_vio_filelen(void *u) { return ((ogg_sink_t *) u)->offset; }
-static sf_count_t ogg_vio_tell   (void *u) { return ((ogg_sink_t *) u)->offset; }
-static sf_count_t ogg_vio_read(void *p, sf_count_t c, void *u)
-{ (void) p; (void) c; (void) u; return 0; }
-
-static sf_count_t ogg_vio_seek(sf_count_t off, int whence, void *u)
+// Ogg sink for --ogg-stdout: write each encoded page straight to stdout.
+// Mirrors write(2) — return the byte count, or -1 if the reader (e.g.
+// ffplay) went away, which latches the encoder error so the main loop
+// stops cleanly instead of spinning on a dead pipe.
+static long ogg_stdout_sink(const uint8_t *b, size_t n, void *user)
 {
-    ogg_sink_t *s = (ogg_sink_t *) u;
-    s->offset = (whence == SEEK_SET) ? off : s->offset + off;  // CUR/END: relative
-    return s->offset;
+    (void) user;
+    return (long) write(STDOUT_FILENO, b, n);
 }
-
-static sf_count_t ogg_vio_write(const void *p, sf_count_t c, void *u)
-{
-    ogg_sink_t *s = (ogg_sink_t *) u;
-    ssize_t w = write(STDOUT_FILENO, p, (size_t) c);
-    if (w < 0) {
-        // Reader (e.g. ffplay) went away: stop the main loop so it shuts down
-        // cleanly instead of spinning on a dead pipe.
-        g_stop = 1;
-        return 0;
-    }
-    s->offset += w;
-    s->total  += (unsigned long long) w;
-    return w;
-}
-#endif
 
 #include "sso_version.h"
 
@@ -322,35 +291,17 @@ int main(int argc, char *argv[])
     // monitored over ssh (`ssh rao ham_listen --ogg-stdout | ffplay -i -`).
     // Ogg is a streaming container, so it survives a non-seekable pipe.
     audio_play_t *play = NULL;
-#ifdef HAVE_SNDFILE
-    SNDFILE   *ogg      = NULL;
-    ogg_sink_t ogg_sink = {0};
-#endif
+    ogg_stream_t *ogg  = NULL;
     if (cfg.ogg_stdout) {
 #ifdef HAVE_SNDFILE
-        SF_INFO info = {0};
-        info.samplerate = audio_rate;
-        info.channels   = 1;
-        info.format     = SF_FORMAT_OGG | SF_FORMAT_VORBIS;
-        // Virtual I/O so we can count the bytes going to stdout; the callbacks
-        // write straight to the fd. libsndfile copies the struct, so the local
-        // can go out of scope, but ogg_sink must outlive the SNDFILE.
-        SF_VIRTUAL_IO vio = {
-            ogg_vio_filelen, ogg_vio_seek, ogg_vio_read,
-            ogg_vio_write,   ogg_vio_tell,
-        };
-        ogg = sf_open_virtual(&vio, SFM_WRITE, &info, &ogg_sink);
+        ogg = ogg_stream_open(audio_rate, 1, cfg.ogg_quality,
+                              ogg_stdout_sink, NULL);
         if (ogg == NULL) {
-            fprintf(stderr, "ham_listen: cannot open Ogg/Vorbis on stdout: %s\n",
-                    sf_strerror(NULL));
+            fprintf(stderr, "ham_listen: cannot open Ogg/Vorbis on stdout\n");
             free(pcm);
             b210_rx_tx_core_close(core);
             return 1;
         }
-        double q = cfg.ogg_quality;
-        if (q < 0.0) q = 0.0;
-        if (q > 1.0) q = 1.0;
-        sf_command(ogg, SFC_SET_VBR_ENCODING_QUALITY, &q, sizeof(q));
 #else
         fprintf(stderr, "ham_listen: --ogg-stdout needs libsndfile, which this build lacks.\n");
         free(pcm);
@@ -388,9 +339,7 @@ int main(int argc, char *argv[])
         cw_iq = (int16_t *) malloc(2 * max_chunk * sizeof(int16_t));
         if (cw_iq == NULL) {
             fprintf(stderr, "ham_listen: out of memory\n");
-#ifdef HAVE_SNDFILE
-            if (ogg) sf_close(ogg);
-#endif
+            ogg_stream_close(ogg);
             if (play) audio_play_close(play);
             free(pcm);
             b210_rx_tx_core_close(core);
@@ -462,13 +411,10 @@ int main(int argc, char *argv[])
             if (!open) memset(pcm, 0, (size_t) n * sizeof(int16_t));
         }
 
-#ifdef HAVE_SNDFILE
         if (cfg.ogg_stdout) {
-            sf_writef_short(ogg, pcm, n);
-            out_bytes = ogg_sink.total;   // authoritative encoded byte count
-        } else
-#endif
-        {
+            if (ogg_stream_write(ogg, pcm, (size_t) n) < 0) g_stop = 1;
+            out_bytes = ogg_stream_bytes(ogg);   // authoritative encoded byte count
+        } else {
             audio_play_write(play, pcm, (size_t) n);
             out_bytes += (unsigned long long) n * sizeof(int16_t);
         }
@@ -497,9 +443,7 @@ int main(int argc, char *argv[])
     // shell prompt.
     fputc('\n', stderr);
     fprintf(stderr, "ham_listen: stopping\n");
-#ifdef HAVE_SNDFILE
-    if (ogg) sf_close(ogg);
-#endif
+    ogg_stream_close(ogg);
     if (play) audio_play_close(play);
     free(cw_iq);
     free(pcm);

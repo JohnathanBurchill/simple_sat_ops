@@ -50,6 +50,7 @@ include_directories(
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/dsp
+    ${CMAKE_SOURCE_DIR}/src/audio
     ${CMAKE_SOURCE_DIR}/src/proto
     ${CMAKE_SOURCE_DIR}/src/beacon
     ${CMAKE_SOURCE_DIR}/src/orbit
@@ -204,6 +205,7 @@ set(SSO_CORE_SOURCES
     src/ipc/sso_ipc_paths.c
     src/ipc/sso_dirwatch.c
     src/ipc/sso_ipc_codec.c
+    src/ipc/sso_base64.c
     src/ipc/pass_schedule.c
     src/ipc/sso_ipc_server.c
     src/ipc/sso_ipc_client.c
@@ -520,6 +522,29 @@ add_executable(sso_ipc_codec_selftest
 target_include_directories(sso_ipc_codec_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(sso_ipc_codec_selftest PRIVATE m)
 list(APPEND SSO_TARGETS sso_ipc_codec_selftest)
+
+# base64 selftest. RFC 4648 golden vectors (external oracle) + round-trip +
+# malformed-input rejection for the codec that carries live audio on the wire.
+add_executable(base64_selftest
+               unit_tests/base64_selftest.c src/ipc/sso_base64.c)
+target_include_directories(base64_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+list(APPEND SSO_TARGETS base64_selftest)
+
+# Ogg/Vorbis streaming-encoder selftest. Pins the "OggS" magic and decodes
+# the encoder's own bytes back through libsndfile (round-trip oracle). Builds
+# without libsndfile too (exercises the stub paths); HAVE_SNDFILE turns on
+# the real encode + decode oracle.
+add_executable(ogg_stream_selftest
+               unit_tests/ogg_stream_selftest.c src/audio/ogg_stream.c)
+target_include_directories(ogg_stream_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(ogg_stream_selftest PRIVATE m)
+if (SNDFILE_FOUND)
+    target_compile_definitions(ogg_stream_selftest PRIVATE HAVE_SNDFILE)
+    target_include_directories(ogg_stream_selftest PRIVATE ${SNDFILE_INCLUDE_DIRS})
+    target_link_directories(ogg_stream_selftest PRIVATE ${SNDFILE_LIBRARY_DIRS})
+    target_link_libraries(ogg_stream_selftest PRIVATE ${SNDFILE_LIBRARIES})
+endif()
+list(APPEND SSO_TARGETS ogg_stream_selftest)
 
 # pass_schedule codec selftest. Round-trips the {"t":"passes"} upcoming-passes
 # wire format the --viewer-stream relay emits and the standalone viewer reads.
@@ -860,7 +885,8 @@ if (OPENSSL_FOUND)
                 src/dsp/fir_decim.c src/dsp/sw_nco.c src/dsp/iq_burst.c
                 src/dsp/asm_search.c src/dsp/modem.c)
 
-            add_executable(ham_listen utils/ham_listen.c ${HAM_COMMON_SRC})
+            add_executable(ham_listen utils/ham_listen.c
+                           src/audio/ogg_stream.c ${HAM_COMMON_SRC})
             add_executable(ham_speak  utils/ham_speak.c  ${HAM_COMMON_SRC}
                            src/dsp/fm_mod.c src/dsp/resample.c)
 
@@ -1033,6 +1059,8 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
                    src/ui/live_waterfall.c
                    src/control/pass_session.c src/control/scan_sky.c
                    src/control/tracking.c src/control/operator_ipc.c
+                   src/control/operator_audio.c
+                   src/audio/ogg_stream.c
                    src/control/hw_bringup.c
                    src/orbit/prediction.c src/orbit/oem.c
                    src/orbit/pursuit.c
@@ -1059,6 +1087,16 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
         ${NCURSES_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(simple_sat_ops PRIVATE
         ${SGP4SDP4_LIB} ${NCURSES_LIBRARIES} ${OPENSSL_LIBRARIES} m pthread)
+    # Live-audio relay to viewers (operator_audio.c + ogg_stream.c). The
+    # Ogg/Vorbis encode needs libsndfile; without it ogg_stream stubs out and
+    # the operator answers viewer audio requests "unavailable" (telemetry
+    # is unaffected).
+    if (SNDFILE_FOUND)
+        target_compile_definitions(simple_sat_ops PRIVATE HAVE_SNDFILE)
+        target_include_directories(simple_sat_ops PRIVATE ${SNDFILE_INCLUDE_DIRS})
+        target_link_directories(simple_sat_ops PRIVATE ${SNDFILE_LIBRARY_DIRS})
+        target_link_libraries(simple_sat_ops PRIVATE ${SNDFILE_LIBRARIES})
+    endif()
     # Shared SDR RX/TX chain + the dispatcher, compiled whenever at least
     # one backend is enabled. SSO_WITH_SDR gates the SDR-general code in
     # apps/main.c (which is now device-agnostic). Per-device backends

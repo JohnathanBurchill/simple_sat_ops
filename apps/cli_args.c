@@ -578,6 +578,12 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
             else { state->n_options++; state->without_b210 = 1; }
             matched = 1;
         }
+        if (strcmp("--no-audio", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--no-audio",
+                "refuse viewer live-audio (--viewer-stream) requests");
+            else { state->n_options++; state->no_audio = 1; }
+            matched = 1;
+        }
 #ifdef SSO_WITH_SDR
         if (strncmp("--sdr-type=", arg, 11) == 0 || help) {
             if (help) parse_help_line(OPTW, "--sdr-type=uhd|rtlsdr|auto",

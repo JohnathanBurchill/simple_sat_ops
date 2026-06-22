@@ -134,6 +134,17 @@ void rx_session_request_wav_stop(rx_session_t *rxs);
 // 1 when a WAV is currently being written, 0 otherwise. (Snapshot.)
 int  rx_session_wav_active(const rx_session_t *rxs);
 
+// Live-audio tap for the viewer relay. With it on, the worker copies each
+// pump's demodulated PCM into an internal ring; off (the default) it costs
+// nothing. Toggling on discards any stale buffered audio. The PCM is mono
+// int16 at rx_session_get_bandwidth_hz().
+void   rx_session_set_audio_tap(rx_session_t *rxs, int on);
+
+// Drain up to max_samples from the live-audio ring into out. Returns the
+// number of samples copied (0 if the tap is off or nothing is buffered).
+// Safe to call from the main thread; the worker fills the ring.
+size_t rx_session_read_audio(rx_session_t *rxs, int16_t *out, size_t max_samples);
+
 // Snapshot the live WAV's path, written-sample count, and sample rate
 // so an external worker can render a spectrogram off the bytes already
 // on disk. out_active reflects whether the writer is currently open.

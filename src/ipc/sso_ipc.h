@@ -42,6 +42,9 @@ typedef enum {
     SSO_EVT_TX_NOT_SENT,        // operator-local: command did NOT reach the air (rejected / uhd-err)
     SSO_EVT_CMD_PREVIEW,        // operator -> viewers: live ":" prompt buffer
     SSO_EVT_CMD_EXECUTED,       // operator -> viewers: dispatched cmd + result
+    SSO_EVT_AUDIO_CTL,          // viewer -> relay (stdin) -> operator: start/stop live audio
+    SSO_EVT_AUDIO_STATUS,       // operator -> relay -> viewer: live-audio lifecycle
+    SSO_EVT_AUDIO,              // operator -> relay -> viewer: a chunk of Ogg/Vorbis audio
 } sso_event_type_t;
 
 // Buffer size for telecommand text carried on the wire (the typed payload
@@ -184,6 +187,24 @@ typedef struct {
     char    rx_ribbon[SSO_RIBBON_MAX + 1];  // '.' / '-' chars per second + nul
     int8_t  rx_ribbon_peak[SSO_RIBBON_MAX]; // peak dBFS per second (parallel)
     char    rx_warning[80];                  // optional rx-panel warning row
+
+    // Live audio relay — see §9 of docs/VIEWER_STREAM_JSON.md.
+    //   audio-ctl    : viewer -> relay (stdin) -> operator (IPC)
+    //   audio-status : operator -> relay -> viewer (lifecycle)
+    //   audio        : operator -> relay -> viewer (one Ogg/Vorbis chunk)
+    // SSO_AUDIO_RAW_MAX bounds the raw Ogg bytes carried in one `audio`
+    // frame; SSO_AUDIO_B64_MAX is the base64 of that (+nul). Both keep the
+    // encoded line comfortably under SSO_IPC_LINE_MAX.
+#define SSO_AUDIO_RAW_MAX 4096
+#define SSO_AUDIO_B64_MAX (((SSO_AUDIO_RAW_MAX + 2) / 3) * 4 + 1)
+    int     audio_enable;     // audio-ctl: 1 = start, 0 = stop
+    double  audio_quality;    // audio-ctl: VBR quality 0..1 (0 = producer default)
+    char    audio_state[16];  // audio-status: "on"/"off"/"unavailable"/"error"
+    int     audio_seq;        // audio: per-stream frame counter (from 0)
+    int     audio_start;      // audio: 1 on the first frame of a fresh stream
+    int     audio_sr;         // audio/audio-status: sample rate, Hz
+    int     audio_ch;         // audio/audio-status: channel count
+    char    audio_b64[SSO_AUDIO_B64_MAX];  // audio: base64 of the Ogg chunk
 } sso_event_t;
 
 void sso_event_init(sso_event_t *evt, sso_event_type_t type);

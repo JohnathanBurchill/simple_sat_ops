@@ -21,6 +21,7 @@
 #include "operator_ipc.h"
 #include "state.h"
 
+#include "operator_audio.h"  // operator_audio_handle_ctl
 #include "auto_tcmd.h"       // auto_tcmd_progress
 #include "ipc_fill.h"        // ipc_fill_state_prediction
 #include "panels.h"          // rx_panel_collect_local, rx_panel_data_t
@@ -201,6 +202,13 @@ void ipc_broadcast_state(state_t *s,
 void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
                          const sso_event_t *evt, void *user) {
     state_t *state = (state_t *) user;
+    // Live-audio control from a viewer/relay: (un)subscribe and reply with
+    // an audio-status. Handled here so the relay's audio-ctl reaches the
+    // one process that owns the SDR.
+    if (evt->type == SSO_EVT_AUDIO_CTL) {
+        operator_audio_handle_ctl(state, id, evt);
+        return;
+    }
     if (evt->type != SSO_EVT_HELLO) return;
     sso_event_t welcome;
     sso_event_init(&welcome, SSO_EVT_WELCOME);
