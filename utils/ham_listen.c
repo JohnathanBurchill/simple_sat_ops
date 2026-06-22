@@ -13,6 +13,14 @@
     -> optional carrier squelch -> soundcard". Works on any compiled-in
     backend (UHD or RTL-SDR; both receive).
 
+    --ogg-stdout swaps the soundcard for an Ogg/Vorbis stream on stdout, so
+    a remote ground station can be monitored over ssh:
+
+        ssh rao ham_listen --ogg-stdout | ffplay -nodisp -i -
+
+    (needs libsndfile at build time; Ogg is a streaming container so it
+    survives the non-seekable ssh pipe.)
+
     Copyright (C) 2026  Johnathan K Burchill
 
     This program is free software: you can redistribute it and/or modify
@@ -34,6 +42,10 @@
 #include "b210_rx_tx_core.h"
 #include "carrier_trim.h"
 #include "frontiersat.h"
+
+#ifdef HAVE_SNDFILE
+#include <sndfile.h>
+#endif
 
 #include <math.h>
 #include <signal.h>
@@ -62,6 +74,8 @@ typedef struct {
     const char *uhd_args;
     const char *fpga_path;
     int         device_index;
+    int         ogg_stdout;   // encode Ogg/Vorbis to stdout instead of speakers
+    double      ogg_quality;  // Vorbis VBR quality 0..1 (only with --ogg-stdout)
 } hl_args_t;
 
 // Option column width: widest label below ("--fm-fullscale-hz=<hz>") + margin.
@@ -102,6 +116,16 @@ static int parse_args(hl_args_t *a, int argc, char **argv, int help)
         if (starts_with(arg, "--squelch=") || help) {
             if (help) parse_help_line(OPTW, "--squelch=<level>", "mute below this IQ magnitude (default 0 = off)");
             else a->squelch = atof(arg + 10);
+            matched = 1;
+        }
+        if (strcmp(arg, "--ogg-stdout") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--ogg-stdout", "encode Ogg/Vorbis to stdout (no speakers); pipe to ffplay");
+            else a->ogg_stdout = 1;
+            matched = 1;
+        }
+        if (starts_with(arg, "--ogg-quality=") || help) {
+            if (help) parse_help_line(OPTW, "--ogg-quality=<q>", "Vorbis VBR quality 0..1 for --ogg-stdout (default 0.4)");
+            else a->ogg_quality = atof(arg + 14);
             matched = 1;
         }
         if (starts_with(arg, "--antenna=") || help) {
@@ -163,6 +187,8 @@ int main(int argc, char *argv[])
         .uhd_args        = NULL,
         .fpga_path       = NULL,
         .device_index    = 0,
+        .ogg_stdout      = 0,
+        .ogg_quality     = 0.4,
     };
     switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
         case PARSE_HELP:  return 0;
@@ -219,17 +245,55 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    audio_play_t *play = audio_play_open(audio_rate, 1);
-    if (play == NULL) {
-        fprintf(stderr, "ham_listen: could not open the audio output device\n");
+    // Output sink: either the local soundcard, or — with --ogg-stdout — an
+    // Ogg/Vorbis stream on stdout, so a remote ground station can be
+    // monitored over ssh (`ssh rao ham_listen --ogg-stdout | ffplay -i -`).
+    // Ogg is a streaming container, so it survives a non-seekable pipe.
+    audio_play_t *play = NULL;
+#ifdef HAVE_SNDFILE
+    SNDFILE *ogg = NULL;
+#endif
+    if (cfg.ogg_stdout) {
+#ifdef HAVE_SNDFILE
+        SF_INFO info = {0};
+        info.samplerate = audio_rate;
+        info.channels   = 1;
+        info.format     = SF_FORMAT_OGG | SF_FORMAT_VORBIS;
+        // close_desc = 0: libsndfile must not close stdout out from under us;
+        // sf_close() below flushes the trailing Ogg pages, process exit closes
+        // the fd.
+        ogg = sf_open_fd(STDOUT_FILENO, SFM_WRITE, &info, 0);
+        if (ogg == NULL) {
+            fprintf(stderr, "ham_listen: cannot open Ogg/Vorbis on stdout: %s\n",
+                    sf_strerror(NULL));
+            free(pcm);
+            b210_rx_tx_core_close(core);
+            return 1;
+        }
+        double q = cfg.ogg_quality;
+        if (q < 0.0) q = 0.0;
+        if (q > 1.0) q = 1.0;
+        sf_command(ogg, SFC_SET_VBR_ENCODING_QUALITY, &q, sizeof(q));
+#else
+        fprintf(stderr, "ham_listen: --ogg-stdout needs libsndfile, which this build lacks.\n");
         free(pcm);
         b210_rx_tx_core_close(core);
         return 1;
+#endif
+    } else {
+        play = audio_play_open(audio_rate, 1);
+        if (play == NULL) {
+            fprintf(stderr, "ham_listen: could not open the audio output device\n");
+            free(pcm);
+            b210_rx_tx_core_close(core);
+            return 1;
+        }
     }
 
     fprintf(stderr,
-            "ham_listen: %s on %.4f MHz, %d Hz audio. Ctrl-C to stop.\n",
-            b210_rx_tx_core_sdr_name(core), cfg.freq_mhz, audio_rate);
+            "ham_listen: %s on %.4f MHz, %d Hz %s. Ctrl-C to stop.\n",
+            b210_rx_tx_core_sdr_name(core), cfg.freq_mhz, audio_rate,
+            cfg.ogg_stdout ? "Ogg/Vorbis -> stdout" : "audio");
 
     // One-pole de-emphasis / voice LPF coefficient.
     double deemph_a = (cfg.deemphasis_hz > 0.0)
@@ -267,7 +331,14 @@ int main(int argc, char *argv[])
             if (!open) memset(pcm, 0, (size_t) n * sizeof(int16_t));
         }
 
-        audio_play_write(play, pcm, (size_t) n);
+#ifdef HAVE_SNDFILE
+        if (cfg.ogg_stdout) {
+            sf_writef_short(ogg, pcm, n);
+        } else
+#endif
+        {
+            audio_play_write(play, pcm, (size_t) n);
+        }
 
         status_acc += n;
         if (status_acc >= audio_rate / 2) {
@@ -281,7 +352,10 @@ int main(int argc, char *argv[])
     }
 
     fprintf(stderr, "\nham_listen: stopping\n");
-    audio_play_close(play);
+#ifdef HAVE_SNDFILE
+    if (ogg) sf_close(ogg);
+#endif
+    if (play) audio_play_close(play);
     free(pcm);
     b210_rx_tx_core_close(core);
     return 0;

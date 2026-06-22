@@ -902,6 +902,18 @@ if (OPENSSL_FOUND)
                 target_link_sso_core(${ham_tgt})
                 list(APPEND SSO_TARGETS ${ham_tgt})
             endforeach()
+
+            # ham_listen's --ogg-stdout streams the demodulated voice as
+            # Ogg/Vorbis to stdout (for monitoring a remote ground station
+            # over ssh). libsndfile does the encoding; it's already an
+            # optional project dependency, so without it ham_listen still
+            # builds and --ogg-stdout reports the missing support.
+            if (SNDFILE_FOUND)
+                target_compile_definitions(ham_listen PRIVATE HAVE_SNDFILE)
+                target_include_directories(ham_listen PRIVATE ${SNDFILE_INCLUDE_DIRS})
+                target_link_directories(ham_listen PRIVATE ${SNDFILE_LIBRARY_DIRS})
+                target_link_libraries(ham_listen PRIVATE ${SNDFILE_LIBRARIES})
+            endif()
         endif()
 
         # Live B210 RX + TX is no longer a separate target — the
