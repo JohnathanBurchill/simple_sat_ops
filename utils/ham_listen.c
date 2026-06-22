@@ -223,7 +223,12 @@ static sf_count_t ogg_vio_write(const void *p, sf_count_t c, void *u)
 {
     ogg_sink_t *s = (ogg_sink_t *) u;
     ssize_t w = write(STDOUT_FILENO, p, (size_t) c);
-    if (w < 0) return 0;
+    if (w < 0) {
+        // Reader (e.g. ffplay) went away: stop the main loop so it shuts down
+        // cleanly instead of spinning on a dead pipe.
+        g_stop = 1;
+        return 0;
+    }
     s->offset += w;
     s->total  += (unsigned long long) w;
     return w;
@@ -259,6 +264,11 @@ int main(int argc, char *argv[])
 
     signal(SIGINT,  on_sigint);
     signal(SIGTERM, on_sigint);
+    // With --ogg-stdout piped to e.g. ffplay, Ctrl-C reaches both processes;
+    // if the reader exits first our next write gets EPIPE. Ignore SIGPIPE so
+    // that surfaces as a write error we can stop on cleanly (and print our
+    // closing newline) rather than the default action killing us mid-line.
+    signal(SIGPIPE, SIG_IGN);
 
     // Keep UHD's INFO banners off the operator's terminal (overwrite=0
     // leaves a deliberately-set debug level alone).
