@@ -19,7 +19,13 @@
         ssh rao ham_listen --ogg-stdout | ffplay -nodisp -i -
 
     (needs libsndfile at build time; Ogg is a streaming container so it
-    survives the non-seekable ssh pipe.)
+    survives the non-seekable ssh pipe.) The status line reports the stream
+    byte rate so you can see what the link is carrying.
+
+    --cw retunes the demodulator for a continuous-wave (Morse) signal: it
+    beats the carrier-at-DC IQ against a local oscillator (a poor-man's BFO)
+    so an on/off-keyed carrier becomes an audible tone. Handy for checking
+    the receive chain against a local CW station or code-practice beacon.
 
     Copyright (C) 2026  Johnathan K Burchill
 
@@ -76,6 +82,8 @@ typedef struct {
     int         device_index;
     int         ogg_stdout;   // encode Ogg/Vorbis to stdout instead of speakers
     double      ogg_quality;  // Vorbis VBR quality 0..1 (only with --ogg-stdout)
+    int         cw;           // CW (Morse) mode: BFO-beat the carrier to a tone
+    double      cw_pitch_hz;  // CW beat-note pitch in Hz (only with --cw)
 } hl_args_t;
 
 // Option column width: widest label below ("--fm-fullscale-hz=<hz>") + margin.
@@ -111,6 +119,16 @@ static int parse_args(hl_args_t *a, int argc, char **argv, int help)
         if (starts_with(arg, "--deemphasis-hz=") || help) {
             if (help) parse_help_line(OPTW, "--deemphasis-hz=<hz>", "audio de-emphasis/LPF corner (default 3000; 0 off)");
             else a->deemphasis_hz = atof(arg + 16);
+            matched = 1;
+        }
+        if (strcmp(arg, "--cw") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--cw", "CW (Morse) mode: beat the carrier to an audible tone");
+            else a->cw = 1;
+            matched = 1;
+        }
+        if (starts_with(arg, "--cw-pitch=") || help) {
+            if (help) parse_help_line(OPTW, "--cw-pitch=<hz>", "CW beat-note pitch for --cw (default 700)");
+            else a->cw_pitch_hz = atof(arg + 11);
             matched = 1;
         }
         if (starts_with(arg, "--squelch=") || help) {
@@ -170,6 +188,48 @@ static sdr_backend_type_t backend_from_str(const char *s)
     return SDR_TYPE_AUTO;
 }
 
+// Render a byte rate with a sensible unit, decimal (1 kB/s = 1000 B/s) since
+// it's reported as a link bandwidth, not a memory size.
+static void format_byte_rate(double bps, char *buf, size_t n)
+{
+    if      (bps >= 1.0e6) snprintf(buf, n, "%6.2f MB/s", bps / 1.0e6);
+    else if (bps >= 1.0e3) snprintf(buf, n, "%6.1f kB/s", bps / 1.0e3);
+    else                   snprintf(buf, n, "%6.0f B/s",  bps);
+}
+
+#ifdef HAVE_SNDFILE
+// libsndfile virtual-I/O sink for --ogg-stdout: write each Ogg page straight
+// to stdout and keep a running byte count, so the status line can report the
+// stream rate (what the ssh link actually carries). Ogg write is forward-
+// only, so "seek" just tracks a logical offset — the pipe is never seeked.
+typedef struct {
+    sf_count_t         offset;   // logical write position (== bytes written)
+    unsigned long long total;    // total bytes written to stdout
+} ogg_sink_t;
+
+static sf_count_t ogg_vio_filelen(void *u) { return ((ogg_sink_t *) u)->offset; }
+static sf_count_t ogg_vio_tell   (void *u) { return ((ogg_sink_t *) u)->offset; }
+static sf_count_t ogg_vio_read(void *p, sf_count_t c, void *u)
+{ (void) p; (void) c; (void) u; return 0; }
+
+static sf_count_t ogg_vio_seek(sf_count_t off, int whence, void *u)
+{
+    ogg_sink_t *s = (ogg_sink_t *) u;
+    s->offset = (whence == SEEK_SET) ? off : s->offset + off;  // CUR/END: relative
+    return s->offset;
+}
+
+static sf_count_t ogg_vio_write(const void *p, sf_count_t c, void *u)
+{
+    ogg_sink_t *s = (ogg_sink_t *) u;
+    ssize_t w = write(STDOUT_FILENO, p, (size_t) c);
+    if (w < 0) return 0;
+    s->offset += w;
+    s->total  += (unsigned long long) w;
+    return w;
+}
+#endif
+
 #include "sso_version.h"
 
 int main(int argc, char *argv[])
@@ -189,6 +249,8 @@ int main(int argc, char *argv[])
         .device_index    = 0,
         .ogg_stdout      = 0,
         .ogg_quality     = 0.4,
+        .cw              = 0,
+        .cw_pitch_hz     = 700.0,
     };
     switch (parse_args(&cfg, argc, argv, HELP_OFF)) {
         case PARSE_HELP:  return 0;
@@ -251,7 +313,8 @@ int main(int argc, char *argv[])
     // Ogg is a streaming container, so it survives a non-seekable pipe.
     audio_play_t *play = NULL;
 #ifdef HAVE_SNDFILE
-    SNDFILE *ogg = NULL;
+    SNDFILE   *ogg      = NULL;
+    ogg_sink_t ogg_sink = {0};
 #endif
     if (cfg.ogg_stdout) {
 #ifdef HAVE_SNDFILE
@@ -259,10 +322,14 @@ int main(int argc, char *argv[])
         info.samplerate = audio_rate;
         info.channels   = 1;
         info.format     = SF_FORMAT_OGG | SF_FORMAT_VORBIS;
-        // close_desc = 0: libsndfile must not close stdout out from under us;
-        // sf_close() below flushes the trailing Ogg pages, process exit closes
-        // the fd.
-        ogg = sf_open_fd(STDOUT_FILENO, SFM_WRITE, &info, 0);
+        // Virtual I/O so we can count the bytes going to stdout; the callbacks
+        // write straight to the fd. libsndfile copies the struct, so the local
+        // can go out of scope, but ogg_sink must outlive the SNDFILE.
+        SF_VIRTUAL_IO vio = {
+            ogg_vio_filelen, ogg_vio_seek, ogg_vio_read,
+            ogg_vio_write,   ogg_vio_tell,
+        };
+        ogg = sf_open_virtual(&vio, SFM_WRITE, &info, &ogg_sink);
         if (ogg == NULL) {
             fprintf(stderr, "ham_listen: cannot open Ogg/Vorbis on stdout: %s\n",
                     sf_strerror(NULL));
@@ -290,10 +357,36 @@ int main(int argc, char *argv[])
         }
     }
 
-    fprintf(stderr,
-            "ham_listen: %s on %.4f MHz, %d Hz %s. Ctrl-C to stop.\n",
-            b210_rx_tx_core_sdr_name(core), cfg.freq_mhz, audio_rate,
-            cfg.ogg_stdout ? "Ogg/Vorbis -> stdout" : "audio");
+    if (cfg.cw)
+        fprintf(stderr,
+                "ham_listen: %s on %.4f MHz, CW BFO %.0f Hz -> %s. Ctrl-C to stop.\n",
+                b210_rx_tx_core_sdr_name(core), cfg.freq_mhz, cfg.cw_pitch_hz,
+                cfg.ogg_stdout ? "Ogg/Vorbis stdout" : "audio");
+    else
+        fprintf(stderr,
+                "ham_listen: %s on %.4f MHz, %d Hz %s. Ctrl-C to stop.\n",
+                b210_rx_tx_core_sdr_name(core), cfg.freq_mhz, audio_rate,
+                cfg.ogg_stdout ? "Ogg/Vorbis -> stdout" : "audio");
+
+    // CW mode pulls the carrier-at-DC IQ tap and beats it against a local
+    // oscillator (a poor-man's BFO) to turn an on/off-keyed carrier into an
+    // audible tone. cw_iq holds one chunk of interleaved I,Q.
+    int16_t *cw_iq     = NULL;
+    double   bfo_phase = 0.0;
+    double   bfo_inc   = 2.0 * M_PI * cfg.cw_pitch_hz / (double) audio_rate;
+    if (cfg.cw) {
+        cw_iq = (int16_t *) malloc(2 * max_chunk * sizeof(int16_t));
+        if (cw_iq == NULL) {
+            fprintf(stderr, "ham_listen: out of memory\n");
+#ifdef HAVE_SNDFILE
+            if (ogg) sf_close(ogg);
+#endif
+            if (play) audio_play_close(play);
+            free(pcm);
+            b210_rx_tx_core_close(core);
+            return 1;
+        }
+    }
 
     // One-pole de-emphasis / voice LPF coefficient.
     double deemph_a = (cfg.deemphasis_hz > 0.0)
@@ -304,9 +397,37 @@ int main(int argc, char *argv[])
     long status_acc = 0;     // samples since last status line
     long hang_left  = 0;     // squelch hang, in samples
 
+    unsigned long long out_bytes  = 0;   // total bytes written to the sink
+    unsigned long long bytes_mark = 0;   // out_bytes at the last status line
+
     while (!g_stop) {
-        ssize_t n = b210_rx_tx_core_pump(core, pcm, max_chunk,
-                                         NULL, 0, NULL, NULL, 0, NULL);
+        ssize_t n;
+        if (cfg.cw) {
+            // Pull the carrier-at-DC IQ tap and beat it: pcm[k] is the real
+            // part of (I + jQ)·e^{jθ}, so a steady carrier becomes a clean
+            // tone at the BFO pitch and key-up gaps fall to noise. (The FM
+            // PCM the pump also fills is ignored — we overwrite it here.)
+            size_t npairs = 0;
+            n = b210_rx_tx_core_pump(core, pcm, max_chunk,
+                                     NULL, 0, NULL,
+                                     cw_iq, 2 * max_chunk, &npairs);
+            if (n > 0) {
+                for (size_t k = 0; k < npairs; ++k) {
+                    double I = (double) cw_iq[2 * k];
+                    double Q = (double) cw_iq[2 * k + 1];
+                    double a = I * cos(bfo_phase) - Q * sin(bfo_phase);
+                    if (a >  32767.0) a =  32767.0;
+                    if (a < -32768.0) a = -32768.0;
+                    pcm[k] = (int16_t) lround(a);
+                    bfo_phase += bfo_inc;
+                    if (bfo_phase >= 2.0 * M_PI) bfo_phase -= 2.0 * M_PI;
+                }
+                n = (ssize_t) npairs;
+            }
+        } else {
+            n = b210_rx_tx_core_pump(core, pcm, max_chunk,
+                                     NULL, 0, NULL, NULL, 0, NULL);
+        }
         if (n < 0) { fprintf(stderr, "\nham_listen: RX fatal error\n"); break; }
         if (n == 0) continue;
 
@@ -334,28 +455,43 @@ int main(int argc, char *argv[])
 #ifdef HAVE_SNDFILE
         if (cfg.ogg_stdout) {
             sf_writef_short(ogg, pcm, n);
+            out_bytes = ogg_sink.total;   // authoritative encoded byte count
         } else
 #endif
         {
             audio_play_write(play, pcm, (size_t) n);
+            out_bytes += (unsigned long long) n * sizeof(int16_t);
         }
 
         status_acc += n;
         if (status_acc >= audio_rate / 2) {
-            status_acc = 0;
-            fprintf(stderr, "\rlevel %6.0f   %s        ",
-                    mag, (cfg.squelch > 0.0)
+            // Bytes over the audio time since the last line: the SDR streams
+            // in real time, so audio-sample count is a clean wall-clock proxy.
+            double secs = (double) status_acc / (double) audio_rate;
+            double bps  = (secs > 0.0)
+                ? (double) (out_bytes - bytes_mark) / secs : 0.0;
+            bytes_mark  = out_bytes;
+            status_acc  = 0;
+            char rate_str[24];
+            format_byte_rate(bps, rate_str, sizeof rate_str);
+            fprintf(stderr, "\rlevel %6.0f   %s   %s        ",
+                    mag, rate_str, (cfg.squelch > 0.0)
                            ? (open ? "[open]" : "[squelched]")
                            : "");
             fflush(stderr);
         }
     }
 
-    fprintf(stderr, "\nham_listen: stopping\n");
+    // Newline on the way out: the status line is updated in place with '\r',
+    // so terminate it before printing the final message and returning to the
+    // shell prompt.
+    fputc('\n', stderr);
+    fprintf(stderr, "ham_listen: stopping\n");
 #ifdef HAVE_SNDFILE
     if (ogg) sf_close(ogg);
 #endif
     if (play) audio_play_close(play);
+    free(cw_iq);
     free(pcm);
     b210_rx_tx_core_close(core);
     return 0;
