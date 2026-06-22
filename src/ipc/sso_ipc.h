@@ -269,6 +269,15 @@ int sso_ipc_server_broadcast(sso_ipc_server_t *srv, const char *line);
 int sso_ipc_server_send(sso_ipc_server_t *srv, sso_client_id_t id,
                          const char *line);
 
+// Best-effort targeted send for loss-tolerant, high-rate traffic (live
+// audio). If the client's write buffer is full (a slow reader / stalled
+// link), the line is DROPPED and the client kept alive — unlike
+// sso_ipc_server_send, which drops the client on overflow to preserve
+// synchrony. The receiver's Ogg/Vorbis decoder resyncs at the next page.
+// Returns 0 sent, 1 dropped (buffer full), -1 no such client.
+int sso_ipc_server_send_lossy(sso_ipc_server_t *srv, sso_client_id_t id,
+                              const char *line);
+
 // Callback to receive parsed events from clients. Set once via
 // sso_ipc_server_on_event. NULL clears.
 typedef void (*sso_ipc_on_event_fn)(sso_ipc_server_t *srv,

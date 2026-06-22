@@ -104,10 +104,18 @@ static long audio_sub_sink(const uint8_t *bytes, size_t n, void *user)
             e.audio_ch    = s->ch;
             s->started    = 1;
         }
+        int is_start = e.audio_start;
         sso_base64_encode(bytes + off, chunk, e.audio_b64, sizeof e.audio_b64);
         char line[SSO_IPC_LINE_MAX];
         if (sso_event_encode(&e, line, sizeof line) == 0) {
-            sso_ipc_server_send(s->srv, s->id, line);
+            // The start frame carries the Ogg/Vorbis headers — without them
+            // the viewer can't decode anything, so send it reliably (the
+            // buffer is empty at subscribe time, so it won't overflow).
+            // Ongoing frames are best-effort: a stalled link drops a frame
+            // (the decoder resyncs at the next page) instead of the whole
+            // subscriber, so audio + telemetry both survive the hiccup.
+            if (is_start) sso_ipc_server_send(s->srv, s->id, line);
+            else          sso_ipc_server_send_lossy(s->srv, s->id, line);
         }
         off += chunk;
     } while (off < n);

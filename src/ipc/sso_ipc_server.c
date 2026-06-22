@@ -293,6 +293,21 @@ static int slot_queue(sso_ipc_client_slot_t *slot, const char *line) {
     return 0;
 }
 
+// Best-effort enqueue: on overflow DROP THE LINE and keep the client alive,
+// rather than killing it. For loss-tolerant high-rate traffic (live audio)
+// where a missed frame is fine — the Ogg/Vorbis decoder resyncs at the next
+// page — but a dropped connection would stop the stream and force a reconnect.
+// Returns 0 queued, 1 dropped (buffer full).
+static int slot_queue_lossy(sso_ipc_client_slot_t *slot, const char *line) {
+    size_t n = strlen(line);
+    if (slot->write_len + n > sizeof(slot->write_buf)) {
+        return 1;
+    }
+    memcpy(slot->write_buf + slot->write_len, line, n);
+    slot->write_len += n;
+    return 0;
+}
+
 int sso_ipc_server_step(sso_ipc_server_t *srv, int timeout_ms) {
     if (!srv || srv->listen_fd < 0) return -1;
     struct pollfd pfds[1 + SSO_IPC_MAX_CLIENTS];
@@ -351,6 +366,22 @@ int sso_ipc_server_send(sso_ipc_server_t *srv, sso_client_id_t id,
             slot_queue(&srv->clients[i], line);
             slot_drain_write(&srv->clients[i]);
             return 0;
+        }
+    }
+    return -1;
+}
+
+int sso_ipc_server_send_lossy(sso_ipc_server_t *srv, sso_client_id_t id,
+                              const char *line) {
+    if (!srv || !line) return -1;
+    for (size_t i = 0; i < SSO_IPC_MAX_CLIENTS; ++i) {
+        if (srv->clients[i].fd >= 0 && srv->clients[i].id == id) {
+            // Drain first (the socket may have caught up since last call) to
+            // free room, then best-effort enqueue, then push it out.
+            slot_drain_write(&srv->clients[i]);
+            int rc = slot_queue_lossy(&srv->clients[i], line);
+            slot_drain_write(&srv->clients[i]);
+            return rc;   // 0 sent, 1 dropped (full); client kept alive
         }
     }
     return -1;
