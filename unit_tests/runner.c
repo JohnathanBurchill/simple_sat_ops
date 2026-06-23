@@ -412,6 +412,7 @@ int main(int argc, char **argv)
         "hmac_keyfile_selftest",
         "fm_mod_selftest",
         "resample_selftest",
+        "gnss_frag_selftest",
     };
     int n_names = (int)(sizeof names / sizeof names[0]);
     group_t groups[24];

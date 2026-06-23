@@ -290,6 +290,14 @@ add_executable(agenda_line_selftest
 target_include_directories(agenda_line_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS agenda_line_selftest)
 
+# GNSS fragment reassembly self-test: the prefix test, since/until time-spec
+# parser, and multi-packet stitching that gnss_opm / gnss_reports share.
+# Pulls only the two header sizes from beacon_cts1.h; no extra link.
+add_executable(gnss_frag_selftest
+               unit_tests/gnss_frag_selftest.c src/proto/gnss_frag.c)
+target_include_directories(gnss_frag_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+list(APPEND SSO_TARGETS gnss_frag_selftest)
+
 # Telecommand-lint self-test: the firmware-derived agenda linter
 # (tcmd_lint.c + the generated tcmd_spec.c table) shared by agenda_check
 # and simple_sat_ops. Pure POSIX.
