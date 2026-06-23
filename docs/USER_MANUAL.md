@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on branch `any-sdr`, commit
-`2916636` (2026-06-21). This is a working draft.
+`c3b6552` (2026-06-23). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -509,6 +509,33 @@ telemetry, in the format the flight software defines. The parse lives
 in `src/proto/csp.c`; the result is written to the SQLite packet
 database (`src/db/packet_db.c`) and broadcast over the IPC bus to any
 attached viewers.
+
+### The last check: CSP CRC-32C
+
+RS corrects the bytes; the CRC tells you whether what came out is
+exactly what the satellite sent. The FrontierSat downlink runs CSP in
+**CRC mode**: after the CSP header and application bytes it appends a
+four-byte **CRC-32C (Castagnoli)** computed over the whole packet
+(header included) and written big-endian. This is *not* the zlib /
+IEEE 802.3 CRC-32 that the name "CRC32" often implies - the satellite's
+libcsp and the ground reference both use the Castagnoli polynomial
+(`0x1EDC6F41`), and computing the wrong one makes every clean frame
+look corrupt. The check lives next to the parse in `src/proto/csp.c`
+(`csp_crc32c`).
+
+The receiver validates the trailer by default (`--no-csp-crc32` on
+`rx_replay` / `rx_decode` turns it off). The outcome lands in the
+database's `crc_status` column and drives how a packet is shown:
+
+| `crc_status` | Meaning | What happens to the frame |
+|----|----|----|
+| `1` | CRC matched | the four trailer bytes are stripped; the packet is stored clean |
+| `0` | CRC mismatched | the trailer is **kept** in the payload and the frame is still stored, so weak or partly corrupted telemetry stays visible rather than vanishing - but `packet_browser` flags it as an error |
+| `-1` | not checked | validation was disabled, or the frame was too short to carry a trailer |
+
+The deliberate choice is never to drop a frame on a bad CRC: a marginal
+pass where RS only just held is exactly when you most want to see what
+got through, errors and all. The CRC is advisory metadata, not a gate.
 
 ### Watching it happen
 

@@ -256,7 +256,7 @@ static int parse_args(rxd_args_t *a, int argc, char **argv, int help)
             matched = 1;
         }
         if (strcmp(arg, "--csp-crc32") == 0 || help) {
-            if (help) parse_help_line(OPTW, "--csp-crc32", "validate + strip the trailing CSP zlib CRC32 (the default)");
+            if (help) parse_help_line(OPTW, "--csp-crc32", "validate + strip the trailing CSP CRC-32C (the default)");
             else a->csp_crc32 = 1;
             matched = 1;
         }
@@ -889,13 +889,13 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // CSP v1 downlink: 4-byte zlib CRC32 trailer (libcsp CRC mode).
+    // CSP v1 downlink: 4-byte CRC-32C trailer (libcsp CRC mode).
     // Validate and strip it; on by default since the downlink always
     // carries it. A mismatch keeps the trailer in the payload so the
     // operator can still inspect what was received.
     int crc_ok = -1;
     if (csp_crc32 && packet_len >= 8) {
-        uint32_t computed = csp_crc32_zlib(packet, (size_t)(packet_len - 4));
+        uint32_t computed = csp_crc32c(packet, (size_t)(packet_len - 4));
         uint32_t le = (uint32_t)packet[packet_len - 4]
                     | ((uint32_t)packet[packet_len - 3] << 8)
                     | ((uint32_t)packet[packet_len - 2] << 16)

@@ -1112,7 +1112,7 @@ static void try_decode_iq_at_window(rx_session_t *rxs)
         // but the frame is still kept, so low-SNR / partly-corrupted
         // telemetry stays visible rather than being silently dropped.
         if (plen >= 8) {
-            crc_computed = csp_crc32_zlib(rxs->packet, (size_t)(plen - 4));
+            crc_computed = csp_crc32c(rxs->packet, (size_t)(plen - 4));
             crc_le = (uint32_t) rxs->packet[plen - 4]
                    | ((uint32_t) rxs->packet[plen - 3] << 8)
                    | ((uint32_t) rxs->packet[plen - 2] << 16)

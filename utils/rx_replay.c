@@ -553,7 +553,7 @@ static int parse_args(rxr_args_t *a, int argc, char **argv, int help)
             matched = 1;
         }
         if (strcmp(arg, "--csp-crc32") == 0 || help) {
-            if (help) parse_help_line(OPTW, "--csp-crc32", "validate + strip the trailing CSP zlib CRC32 (the default)");
+            if (help) parse_help_line(OPTW, "--csp-crc32", "validate + strip the trailing CSP CRC-32C (the default)");
             else a->csp_crc32 = 1;
             matched = 1;
         }
@@ -732,7 +732,7 @@ typedef struct {
     int            *n_emitted_p;
 } rx_emit_ctx_t;
 
-// Post-decode pipeline: optional CSP zlib CRC32 trim, dedup by absolute
+// Post-decode pipeline: optional CSP CRC-32C trim, dedup by absolute
 // sample position, SGP4 observer state, emit_frame, --update DB writes,
 // TUI mirror, dedup ring update, and n_emitted bump. Used by both
 // pass-1 (slicer sliding window) and pass-2 (anchored Viterbi).
@@ -752,7 +752,7 @@ static int rx_emit_decoded(rx_emit_ctx_t *ctx,
     // match strips the 4 trailing bytes; a mismatch is recorded but the
     // frame is still emitted so weak telemetry stays visible.
     if (ctx->csp_crc32 && plen >= 8) {
-        crc_computed = csp_crc32_zlib(packet, (size_t)(plen - 4));
+        crc_computed = csp_crc32c(packet, (size_t)(plen - 4));
         crc_le = (uint32_t)packet[plen - 4]
                | ((uint32_t)packet[plen - 3] << 8)
                | ((uint32_t)packet[plen - 2] << 16)

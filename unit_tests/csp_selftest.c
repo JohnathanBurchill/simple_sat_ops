@@ -20,7 +20,8 @@
       - Out-of-range field values rejected (-1 return).
       - Buffer-too-small rejected (-1 return).
       - NULL pointers rejected for both encode and decode.
-      - csp_crc32_zlib matches IEEE 802.3 test vectors.
+      - csp_crc32c matches CRC-32C (Castagnoli) vectors, including a real
+        downlink beacon frame captured off-air.
 
     Exit status: 0 = all tests passed, non-zero = failure.
 
@@ -303,44 +304,57 @@ static void test_payload_passthrough(void)
 }
 
 // ------------------------------------------------------------------
-// 8. csp_crc32_zlib against IEEE 802.3 / zlib known vectors.
+// 8. csp_crc32c against CRC-32C (Castagnoli) known vectors + a real
+//    off-air beacon frame. The FrontierSat downlink (and libcsp's CRC
+//    mode, mirrored by the comms reference CTS_SAT_1_COMMUNICATIONS/
+//    pycsp.py CRCEngine) uses CRC-32C, NOT the zlib / IEEE 802.3 CRC-32.
 // ------------------------------------------------------------------
 
 static void test_crc32_known_vectors(void)
 {
-    // All values are the canonical CRC-32 (poly 0xEDB88320 reflected,
-    // init 0xFFFFFFFF, final XOR 0xFFFFFFFF). Reproducible with
-    // `python3 -c 'import zlib;print(hex(zlib.crc32(b"...")))'`.
+    // CRC-32C (poly 0x1EDC6F41 reflected = 0x82F63B78, init 0xFFFFFFFF,
+    // final XOR 0xFFFFFFFF, reflected in/out). The "123456789" value
+    // 0xE3069283 is the catalogued CRC-32/ISCSI check value — an oracle
+    // independent of this implementation.
     struct {
         const char *data;
         uint32_t    expected;
     } v[] = {
-        { "",                                              0x00000000u },
-        { "a",                                             0xe8b7be43u },
-        { "abc",                                           0x352441c2u },
-        { "123456789",                                     0xcbf43926u },
-        { "The quick brown fox jumps over the lazy dog",   0x414fa339u },
+        { "",          0x00000000u },
+        { "123456789", 0xe3069283u },
     };
     for (size_t i = 0; i < sizeof v / sizeof v[0]; ++i) {
-        uint32_t got = csp_crc32_zlib((const uint8_t *) v[i].data,
-                                      strlen(v[i].data));
+        uint32_t got = csp_crc32c((const uint8_t *) v[i].data,
+                                  strlen(v[i].data));
         tap_okf(got == v[i].expected,
-                "crc32(\"%s\") = 0x%08x (want 0x%08x)",
+                "crc32c(\"%s\") = 0x%08x (want 0x%08x)",
                 v[i].data, got, v[i].expected);
     }
 
-    // CRC of a 4-byte CSP header — useful regression check that the
-    // CRC computation is byte-stable across builds (it's called once
-    // per decoded frame on the link's CRC trailer path).
-    csp_v1_header_t h = { .prio = 2, .src = 10, .dst = 5,
-                          .dport = 20, .sport = 3, .flags = 0x09 };
-    uint8_t hdr[4];
-    csp_v1_encode(&h, NULL, 0, hdr, sizeof hdr);
-    uint32_t crc_header = csp_crc32_zlib(hdr, 4);
-    // Reference: python3 -c 'import zlib;print(hex(zlib.crc32(bytes([0x94,0x55,0x03,0x09]))))'
-    tap_okf(crc_header == 0x2be0aed3u,
-            "crc32 of 4-byte CSP header == 0x2be0aed3 (got 0x%08x)",
-            crc_header);
+    // Golden vector: a real beacon frame captured off-air (packet_db id
+    // 19903, beacon count=11041). This is the strongest test — it pins the
+    // polynomial, the byte range (the 4-byte CSP header IS covered), and the
+    // big-endian wire order all at once against data the satellite produced,
+    // fully independent of this code. The CRC is computed over the CSP header
+    // + 130-byte beacon body; the satellite's trailer was 0x4C844782 (BE).
+    static const uint8_t frame[] = {
+        0xC2, 0xA2, 0x8A, 0x00, 0x01, 0x43, 0x54, 0x53, 0x31, 0x01, 0x00, 0x56,
+        0xFD, 0x7B, 0x0D, 0xF1, 0x75, 0xAA, 0x05, 0x53, 0x1D, 0xBF, 0xF3, 0x9E,
+        0x01, 0x00, 0x00, 0x05, 0x01, 0x8A, 0x00, 0x00, 0x00, 0x21, 0x2B, 0x00,
+        0x00, 0x01, 0x02, 0x5F, 0x9D, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xFF, 0x7F, 0x36, 0x03, 0xC6, 0x0E, 0x00, 0x00, 0xA3, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x14, 0x05, 0x00, 0x00, 0x03, 0x02, 0x01, 0x02,
+        0x00, 0x00, 0x00, 0x02, 0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20, 0x66, 0x72,
+        0x6F, 0x6D, 0x20, 0x43, 0x61, 0x6C, 0x67, 0x61, 0x72, 0x79, 0x54, 0x6F,
+        0x53, 0x70, 0x61, 0x63, 0x65, 0x20, 0x46, 0x72, 0x6F, 0x6E, 0x74, 0x69,
+        0x65, 0x72, 0x53, 0x61, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x45, 0x4E,
+        0x44, 0x00,
+    };
+    uint32_t crc_frame = csp_crc32c(frame, sizeof frame);
+    tap_okf(crc_frame == 0x4C844782u,
+            "crc32c of off-air beacon frame == 0x4C844782 (got 0x%08x)",
+            crc_frame);
 }
 
 // ------------------------------------------------------------------

@@ -64,10 +64,11 @@ ssize_t csp_v1_encode(const csp_v1_header_t *hdr,
 // is non-NULL. Returns 0 on success, -1 on bad args.
 int csp_v1_decode(const uint8_t bytes[4], csp_v1_header_t *out_hdr);
 
-// Standard zlib / IEEE 802.3 CRC-32 (reflected polynomial, init 0xFFFFFFFF,
-// final XOR 0xFFFFFFFF). libcsp's downlink CRC-mode integrity trailer.
-// Returns the CRC; caller compares against the trailing 4 bytes of the
-// frame (try both big-endian and little-endian — observed in the wild).
-uint32_t csp_crc32_zlib(const uint8_t *data, size_t len);
+// CRC-32C (Castagnoli): polynomial 0x1EDC6F41, reflected, init 0xFFFFFFFF,
+// final XOR 0xFFFFFFFF. This is libcsp's downlink CRC-mode integrity trailer
+// (NOT the zlib / IEEE 802.3 CRC-32). Returns the CRC; caller compares against
+// the trailing 4 bytes of the frame (try both big-endian and little-endian —
+// the wire is big-endian but little-endian acceptance stays lenient).
+uint32_t csp_crc32c(const uint8_t *data, size_t len);
 
 #endif // CSP_H
