@@ -44,6 +44,7 @@
 #define _GNU_SOURCE
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <locale.h>
@@ -51,6 +52,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -217,9 +219,11 @@ static int run_one(group_t *g)
     return 0;
 }
 
-// Discover selftest binaries. We require them to live in the same
-// directory as the runner binary (typically build/), which is exactly
-// what CMake produces for add_executable. argv0_dir + name lookup.
+// Discover selftest binaries. They live in the same directory as the
+// runner binary (typically build/), which is exactly what CMake produces
+// for add_executable. We scan that directory for "*_selftest" executables
+// rather than keeping a hand-maintained list — a curated list silently
+// fell behind the suite (skipped 13 of 37 tests at one point).
 static int dir_of(const char *argv0, char *out, size_t out_cap)
 {
     if (argv0[0] == '/') {
@@ -248,6 +252,74 @@ static int add_group_if_exists(group_t *groups, int *n, int cap,
     return 1;
 }
 
+static int ends_with(const char *s, const char *suffix)
+{
+    size_t ls = strlen(s), lf = strlen(suffix);
+    return ls >= lf && strcmp(s + ls - lf, suffix) == 0;
+}
+
+static int cmp_names(const void *a, const void *b)
+{
+    return strcmp(*(const char *const *) a, *(const char *const *) b);
+}
+
+// Scan `dir` for executable regular files named "*_selftest" and build one
+// group per match, sorted by name for a stable display order. Returns a
+// malloc'd array (caller frees) via *out_groups, count via *out_n. Returns
+// 0 on success (including the no-tests-found case, n == 0) and -1 if the
+// directory can't be read or memory runs out.
+static int discover_selftests(const char *dir, group_t **out_groups, int *out_n)
+{
+    *out_groups = NULL;
+    *out_n = 0;
+
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+
+    char **names = NULL;
+    int n = 0, cap = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!ends_with(de->d_name, "_selftest")) continue;
+        char path[512];
+        snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        if (access(path, X_OK) != 0) continue;
+        if (n >= cap) {
+            int nc = cap ? cap * 2 : 32;
+            char **nb = (char **) realloc(names, (size_t) nc * sizeof *nb);
+            if (!nb) { for (int i = 0; i < n; ++i) free(names[i]);
+                       free(names); closedir(d); return -1; }
+            names = nb;
+            cap = nc;
+        }
+        names[n] = strdup(de->d_name);
+        if (!names[n]) { for (int i = 0; i < n; ++i) free(names[i]);
+                         free(names); closedir(d); return -1; }
+        ++n;
+    }
+    closedir(d);
+
+    if (n == 0) { free(names); return 0; }
+
+    qsort(names, (size_t) n, sizeof *names, cmp_names);
+
+    group_t *groups = (group_t *) calloc((size_t) n, sizeof *groups);
+    if (!groups) { for (int i = 0; i < n; ++i) free(names[i]);
+                   free(names); return -1; }
+    int ng = 0;
+    for (int i = 0; i < n; ++i) {
+        add_group_if_exists(groups, &ng, n, dir, names[i]);
+        free(names[i]);
+    }
+    free(names);
+
+    *out_groups = groups;
+    *out_n = ng;
+    return 0;
+}
+
 // Rendering ----------------------------------------------------------
 
 // One visible row in the scrollable list. Either a group header or
@@ -259,14 +331,33 @@ typedef struct {
     int        sub_idx;    // only when kind == ROW_SUB
 } row_t;
 
-static int build_rows(group_t *groups, int n_groups, row_t *rows, int cap)
+// Build the flat list of visible rows — one per group header, plus the
+// subtest lines of any expanded group — into a heap buffer that grows to
+// fit exactly, so the list can never silently truncate however large the
+// suite gets. *rows / *cap persist across calls (the caller frees *rows
+// once at exit). Returns the row count.
+static int build_rows(group_t *groups, int n_groups, row_t **rows, int *cap)
 {
+    int need = 0;
+    for (int gi = 0; gi < n_groups; ++gi) {
+        ++need;
+        if (groups[gi].expanded) need += groups[gi].n_lines;
+    }
+    if (need > *cap) {
+        int nc = *cap ? *cap : 64;
+        while (nc < need) nc *= 2;
+        row_t *nb = (row_t *) realloc(*rows, (size_t) nc * sizeof *nb);
+        if (nb) { *rows = nb; *cap = nc; }
+        // On the (vanishingly unlikely) realloc failure, keep the old
+        // smaller buffer; the n < *cap guards below truncate the display
+        // rather than overflow.
+    }
     int n = 0;
-    for (int gi = 0; gi < n_groups && n < cap; ++gi) {
-        rows[n++] = (row_t){ ROW_GROUP, gi, 0 };
+    for (int gi = 0; gi < n_groups && n < *cap; ++gi) {
+        (*rows)[n++] = (row_t){ ROW_GROUP, gi, 0 };
         if (groups[gi].expanded) {
-            for (int si = 0; si < groups[gi].n_lines && n < cap; ++si) {
-                rows[n++] = (row_t){ ROW_SUB, gi, si };
+            for (int si = 0; si < groups[gi].n_lines && n < *cap; ++si) {
+                (*rows)[n++] = (row_t){ ROW_SUB, gi, si };
             }
         }
     }
@@ -316,8 +407,8 @@ static void draw_row(int y, int width, const row_t *r, const group_t *groups,
     if (focused) attroff(A_REVERSE);
 }
 
-static void render(group_t *groups, int n_groups, int focus, int scroll_top,
-                   int color_ok, int color_fail)
+static void render(group_t *groups, int n_groups, const row_t *rows, int n_rows,
+                   int focus, int scroll_top, int color_ok, int color_fail)
 {
     erase();
     int H = LINES, W = COLS;
@@ -334,9 +425,7 @@ static void render(group_t *groups, int n_groups, int focus, int scroll_top,
              "Tests", "Pass", "Fail", "Status");
     mvhline(3, 0, ACS_HLINE, W);
 
-    // Body — scrollable list of rows.
-    row_t rows[2048];
-    int n_rows = build_rows(groups, n_groups, rows, 2048);
+    // Body — scrollable list of rows, built by the caller (see build_rows).
     int body_top = 4;
     int body_bot = H - 3;
     int body_h = body_bot - body_top + 1;
@@ -387,40 +476,15 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    // The set of selftest binaries we know about. Anything that's not
-    // present (missing libs, deliberately disabled in the build) is
-    // skipped at startup — we don't crash on missing optional pieces.
-    static const char *names[] = {
-        "rs_selftest",
-        "tle_csv_selftest",
-        "bestxyz_selftest",
-        "shortarc_selftest",
-        "antenna_rotator_selftest",
-        "modem_iq_selftest",
-        "ax100_selftest",
-        "golay24_selftest",
-        "prediction_selftest",
-        "sw_nco_selftest",
-        "beacon_cts1_selftest",
-        "csp_selftest",
-        "biquad_selftest",
-        "fir_decim_selftest",
-        "monitor_squelch_selftest",
-        "iq_burst_selftest",
-        "packet_db_selftest",
-        "tx_burst_selftest",
-        "hmac_keyfile_selftest",
-        "fm_mod_selftest",
-        "resample_selftest",
-        "gnss_frag_selftest",
-        "oem_selftest",
-        "asm_search_selftest",
-    };
-    int n_names = (int)(sizeof names / sizeof names[0]);
-    group_t groups[24];
+    // Discover every "*_selftest" executable next to the runner. Anything
+    // not present (missing libs, deliberately disabled in the build) simply
+    // isn't there to find, so we never crash on missing optional pieces —
+    // and a newly added test shows up with no edit here.
+    group_t *groups = NULL;
     int n_groups = 0;
-    for (int i = 0; i < n_names; ++i) {
-        add_group_if_exists(groups, &n_groups, 24, rdir, names[i]);
+    if (discover_selftests(rdir, &groups, &n_groups) != 0) {
+        fprintf(stderr, "runner: cannot scan %s for selftest binaries\n", rdir);
+        return 2;
     }
     if (n_groups == 0) {
         fprintf(stderr, "runner: no *_selftest binaries found next to %s\n",
@@ -461,11 +525,12 @@ int main(int argc, char **argv)
     int focus = 0;
     int scroll_top = 0;
     int running = 1;
+    row_t *rows = NULL;
+    int rows_cap = 0;
     while (running) {
-        render(groups, n_groups, focus, scroll_top, color_ok, color_fail);
-
-        row_t rows[2048];
-        int n_rows = build_rows(groups, n_groups, rows, 2048);
+        int n_rows = build_rows(groups, n_groups, &rows, &rows_cap);
+        render(groups, n_groups, rows, n_rows, focus, scroll_top,
+               color_ok, color_fail);
 
         int key = getch();
         switch (key) {
@@ -539,5 +604,7 @@ int main(int argc, char **argv)
         if (!ok) ++failed;
         free(groups[i].lines);
     }
+    free(rows);
+    free(groups);
     return failed;
 }
