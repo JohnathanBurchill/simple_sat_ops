@@ -413,6 +413,7 @@ int main(int argc, char **argv)
         "fm_mod_selftest",
         "resample_selftest",
         "gnss_frag_selftest",
+        "oem_selftest",
     };
     int n_names = (int)(sizeof names / sizeof names[0]);
     group_t groups[24];

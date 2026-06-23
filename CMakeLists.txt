@@ -282,6 +282,15 @@ target_include_directories(shortarc_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(shortarc_selftest PRIVATE m)
 list(APPEND SSO_TARGETS shortarc_selftest)
 
+# OEM (CCSDS Orbit Ephemeris Message) parser + sampler self-test: the text
+# parse (meta, ephemeris, Gregorian->Julian dates, error paths) and the
+# Hermite interpolation / two-body extrapolation in oem_sample_at.
+add_executable(oem_selftest
+               unit_tests/oem_selftest.c src/orbit/oem.c)
+target_include_directories(oem_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(oem_selftest PRIVATE m)
+list(APPEND SSO_TARGETS oem_selftest)
+
 # Agenda-line self-test: the shared inline-comment rule (agenda_line.c)
 # that simple_sat_ops (transmit) and agenda_check (audit) both use to
 # split a telecommand from a trailing '#' comment. Pure POSIX.
