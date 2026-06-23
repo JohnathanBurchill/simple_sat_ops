@@ -307,6 +307,15 @@ add_executable(gnss_frag_selftest
 target_include_directories(gnss_frag_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS gnss_frag_selftest)
 
+# ASM search self-test: asm_find_best(), the sliding-window Hamming-distance
+# scan every demodulator uses to lock onto the AX100 sync marker. Golden cases
+# pin the wire bit order and selection rule; a brute-force oracle backs a
+# randomized differential run. Pure DSP, no extra link.
+add_executable(asm_search_selftest
+               unit_tests/asm_search_selftest.c src/dsp/asm_search.c)
+target_include_directories(asm_search_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+list(APPEND SSO_TARGETS asm_search_selftest)
+
 # Telecommand-lint self-test: the firmware-derived agenda linter
 # (tcmd_lint.c + the generated tcmd_spec.c table) shared by agenda_check
 # and simple_sat_ops. Pure POSIX.

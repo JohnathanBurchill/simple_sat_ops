@@ -414,6 +414,7 @@ int main(int argc, char **argv)
         "resample_selftest",
         "gnss_frag_selftest",
         "oem_selftest",
+        "asm_search_selftest",
     };
     int n_names = (int)(sizeof names / sizeof names[0]);
     group_t groups[24];
