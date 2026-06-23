@@ -216,11 +216,15 @@ int main(void)
         e.tx_allow_tx = 1; e.tx_allow_high_power = 1; e.tx_allow_hf_tx = 0;
         e.tx_repeat = 3; e.tx_gap_ms = 100;
         snprintf(e.tx_not_sent_reason, sizeof e.tx_not_sent_reason, "rejected: no HMAC");
+        snprintf(e.tx_origin, sizeof e.tx_origin, "auto-cmd (file)");
 
         sso_event_t d;
         tap_ok(sso_event_encode(&e, line, sizeof line) == 0, "encode TX returns 0");
+        tap_ok(strstr(line, "\"tx_org\":\"auto-cmd (file)\"") != NULL,
+               "TX origin emitted on the wire");
         tap_ok(sso_event_decode(line, &d) == 0, "decode TX returns 0");
         tap_ok(d.type == SSO_EVT_TX_NOT_SENT, "TX type preserved");
+        tap_ok(strcmp(d.tx_origin, "auto-cmd (file)") == 0, "TX origin preserved");
         tap_ok(strcmp(d.ascii, "ascii:CTS1+ping") == 0, "TX ascii preserved");
         tap_ok(strcmp(d.tx_payload_kind, "ascii") == 0 && strcmp(d.tx_payload, "CTS1+ping") == 0,
                "TX payload kind/text preserved");
@@ -231,6 +235,14 @@ int main(void)
                "TX safety-gate flags preserved");
         tap_ok(d.tx_repeat == 3 && d.tx_gap_ms == 100, "TX repeat/gap preserved");
         tap_ok(strcmp(d.tx_not_sent_reason, "rejected: no HMAC") == 0, "TX not-sent reason preserved");
+
+        // Empty origin: the encoder must not emit a "tx_org" key at all
+        // (older operators / previews leave it blank).
+        e.tx_origin[0] = '\0';
+        tap_ok(sso_event_encode(&e, line, sizeof line) == 0, "encode TX (no origin) returns 0");
+        tap_ok(strstr(line, "\"tx_org\"") == NULL, "empty TX origin omitted from the wire");
+        tap_ok(sso_event_decode(line, &d) == 0 && d.tx_origin[0] == '\0',
+               "decoded TX origin empty when absent");
     }
 
     // --- Roster embed / round-trip / overflow -------------------------

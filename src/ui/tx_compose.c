@@ -447,6 +447,8 @@ static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, s
     state->tx_request.preroll_ms       = state->tx_preroll_ms;
     state->tx_request.allow_high_power = 0;
     state->tx_request.allow_hf_tx      = 0;
+    snprintf(state->tx_request.tx_source, sizeof state->tx_request.tx_source,
+             "manual send");
     if (pst == SSO_PSEUDO_OK) {
         // Heritage: stash the SSO+ origin so the on-air summary notes it, and
         // bake the same note into the queue-time summary the dry-run /
@@ -494,6 +496,10 @@ void emit_tx_event_local(state_t *state, sso_event_type_t type,
     sso_event_init(&evt, type);
     snprintf(evt.from, sizeof evt.from, "%s",
              state->operator_user ? state->operator_user : "?");
+    // Carry the originating command's source ("auto-cmd (file)" / "manual
+    // send") into the SENT / NOT_SENT event. The request slot still holds it
+    // here -- tx_burst_service_request clears pending only after this emit.
+    snprintf(evt.tx_origin, sizeof evt.tx_origin, "%s", state->tx_request.tx_source);
     if (summary && summary[0]) {
         snprintf(evt.ascii, sizeof evt.ascii, "%s", summary);
     }

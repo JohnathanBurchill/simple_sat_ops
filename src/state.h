@@ -276,6 +276,7 @@ typedef struct {
     char             ts[16];   // HH:MM:SS
     char             ascii[SSO_TX_TEXT_MAX];
     char             tx_not_sent_reason[24];
+    char             source[16];  // "auto-cmd (file)" | "manual send"; empty on previews
 } tx_log_entry_t;
 #define TX_LOG_SIZE 8
 

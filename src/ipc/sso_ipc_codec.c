@@ -656,6 +656,9 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
             if (json_field_int(&p, end, &first, "tx_gap", evt->tx_gap_ms) < 0) return -1;
         }
         if (json_field_str(&p, end, &first, "tx_st", evt->tx_not_sent_reason) < 0) return -1;
+        if (evt->tx_origin[0]) {
+            if (json_field_str(&p, end, &first, "tx_org", evt->tx_origin) < 0) return -1;
+        }
     }
     if (evt->type == SSO_EVT_CMD_PREVIEW || evt->type == SSO_EVT_CMD_EXECUTED) {
         if (json_field_str(&p, end, &first, "cmd_text",   evt->cmd_text)   < 0) return -1;
@@ -794,6 +797,7 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
     if (json_get_int(line, line_len, "tx_rep", &tx_int) > 0) evt->tx_repeat = (int) tx_int;
     if (json_get_int(line, line_len, "tx_gap", &tx_int) > 0) evt->tx_gap_ms = (int) tx_int;
     json_get_string(line, line_len, "tx_st", evt->tx_not_sent_reason, sizeof(evt->tx_not_sent_reason));
+    json_get_string(line, line_len, "tx_org", evt->tx_origin, sizeof(evt->tx_origin));
     json_get_string(line, line_len, "cmd_text",   evt->cmd_text,   sizeof(evt->cmd_text));
     json_get_string(line, line_len, "cmd_status", evt->cmd_status, sizeof(evt->cmd_status));
 

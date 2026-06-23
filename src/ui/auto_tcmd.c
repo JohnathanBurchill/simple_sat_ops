@@ -948,7 +948,10 @@ void auto_tcmd_tick(state_t *state) {
                  "skipped SSO+ line %d: %.120s", a->cmd_idx + 1, sso_err);
         a->cmd_idx++;
         a->repeat_idx   = 0;
-        a->next_send_ns = now + (long)(a->delay_s_val * 1e9);
+        // A skipped command keys nothing, so don't make the run idle the
+        // inter-send delay over it -- advance to the next command on the
+        // following tick. The delay paces actual transmissions, not no-ops.
+        a->next_send_ns = now;
         auto_tcmd_draw(state);
         return;
     }
@@ -965,7 +968,10 @@ void auto_tcmd_tick(state_t *state) {
                  a->cmd_idx + 1, n, TCMD_RF_MAX_LEN);
         a->cmd_idx++;
         a->repeat_idx   = 0;
-        a->next_send_ns = now + (long)(a->delay_s_val * 1e9);
+        // A skipped command keys nothing, so don't make the run idle the
+        // inter-send delay over it -- advance to the next command on the
+        // following tick. The delay paces actual transmissions, not no-ops.
+        a->next_send_ns = now;
         auto_tcmd_draw(state);
         return;
     }
@@ -986,6 +992,8 @@ void auto_tcmd_tick(state_t *state) {
     // is ticked), same way tx_compose_validate handles it before commit.
     state->tx_request.allow_high_power = 0;
     state->tx_request.allow_hf_tx      = 0;
+    snprintf(state->tx_request.tx_source, sizeof state->tx_request.tx_source,
+             "auto-cmd (file)");
     if (pst == SSO_PSEUDO_OK)
         snprintf(state->tx_request.sso_origin, sizeof state->tx_request.sso_origin, "%s", raw);
     else

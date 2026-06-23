@@ -136,13 +136,17 @@ void render_tx_log_panel(const state_t *state, int start_row, int col)
         // not-sent reason. Sized off SSO_TX_TEXT_MAX so it tracks the
         // command field — a fixed 256 here truncated the line once ascii
         // widened from 160 to 256.
-        char line[SSO_TX_TEXT_MAX + 64];
+        // Origin tag ("auto-cmd (file)" / "manual send") prefixes the
+        // command on sent / not-sent rows; previews carry no source.
+        char src[20] = "";
+        if (e->source[0]) snprintf(src, sizeof src, "[%s] ", e->source);
+        char line[SSO_TX_TEXT_MAX + 96];
         if (e->kind == SSO_EVT_TX_NOT_SENT && e->tx_not_sent_reason[0]) {
-            snprintf(line, sizeof line, "%s  %s %s  [%s]",
-                     e->ts, tag, e->ascii, e->tx_not_sent_reason);
+            snprintf(line, sizeof line, "%s  %s %s%s  [%s]",
+                     e->ts, tag, src, e->ascii, e->tx_not_sent_reason);
         } else {
-            snprintf(line, sizeof line, "%s  %s %s",
-                     e->ts, tag, e->ascii);
+            snprintf(line, sizeof line, "%s  %s %s%s",
+                     e->ts, tag, src, e->ascii);
         }
         attron(attr);
         mvprintw(row++, col, "%-*.*s", safe_w, safe_w, line);

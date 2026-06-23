@@ -151,6 +151,10 @@ typedef struct {
     int     tx_repeat;
     int     tx_gap_ms;
     char    tx_not_sent_reason[24];  // tx-not-sent only: "rejected: <reason>" | "uhd-err"
+    // Origin of a sent/not-sent command for the tx.log + TX panel:
+    // "auto-cmd (file)" or "manual send". Empty on previews and on
+    // events from older operators that didn't stamp it.
+    char    tx_origin[16];
 
     // cmd-preview / cmd-executed: mirror the operator's ":" prompt to
     // viewers. cmd_text is the live buffer being typed (preview) or the

@@ -87,7 +87,13 @@ void tx_log_push(state_t *state, const sso_event_t *evt)
      && evt->type != SSO_EVT_TX_COMMAND_SENT
      && evt->type != SSO_EVT_TX_NOT_SENT) return;
 
-    tx_log_file_append(state, evt);
+    // The on-disk tx.log is the record of what was actually keyed, so only
+    // sent / not-sent commands go to the file. PREVIEW (draft) lines still
+    // land in the in-memory ring below so the live TX panel shows the draft
+    // as the operator types -- they just don't pollute the persistent log.
+    if (evt->type != SSO_EVT_TX_COMMAND_PREVIEW) {
+        tx_log_file_append(state, evt);
+    }
 
     tx_log_entry_t entry;
     memset(&entry, 0, sizeof entry);
@@ -96,6 +102,7 @@ void tx_log_push(state_t *state, const sso_event_t *evt)
     snprintf(entry.ascii, sizeof entry.ascii, "%s", evt->ascii);
     snprintf(entry.tx_not_sent_reason, sizeof entry.tx_not_sent_reason, "%s",
              evt->tx_not_sent_reason);
+    snprintf(entry.source, sizeof entry.source, "%s", evt->tx_origin);
 
     if (evt->type == SSO_EVT_TX_COMMAND_PREVIEW
         && state->tx_log_count > 0

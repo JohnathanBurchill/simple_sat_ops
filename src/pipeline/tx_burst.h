@@ -42,6 +42,10 @@ typedef struct {
     // SSO+ text so the on-air summary can note the heritage:
     //   "ascii:<actual telecommand> (replaced 'SSO+...')"
     char     sso_origin[256];
+    // Where this command came from, for the tx.log + TX panel: "auto-cmd
+    // (file)" when queued by the auto-tcmd run, "manual send" when queued
+    // from the TX compose modal. Copied into the SENT / NOT_SENT event.
+    char     tx_source[16];
     // One-line "ascii:..." / "auto[i/n j/m]: <cmd>" description shown in
     // the UI, logged to tx.log, and mirrored to viewers. Holds a full RF
     // telecommand (215 chars) plus its short label; kept >= the IPC
