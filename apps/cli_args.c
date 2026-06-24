@@ -291,7 +291,7 @@ void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
 #endif
 
     fprintf(out, "live-waterfall: %s\n",
-            state->run_live_waterfall ? "on (--live-waterfall)" : "off");
+            state->ui.run_live_waterfall ? "on (--live-waterfall)" : "off");
 
     fprintf(out, "pass-folder-seed: %s\n",
             state->pass_folder[0] ? state->pass_folder : "(auto)");
@@ -635,7 +635,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         if (strcmp("--live-waterfall", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--live-waterfall",
                 "auto-launch the raylib live_waterfall viewer when recording starts");
-            else { state->n_options++; state->run_live_waterfall = 1; }
+            else { state->n_options++; state->ui.run_live_waterfall = 1; }
             matched = 1;
         }
         if (strcmp("--always-record", arg) == 0 || help) {

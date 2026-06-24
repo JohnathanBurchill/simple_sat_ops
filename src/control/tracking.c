@@ -522,7 +522,7 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
         state->rot.antenna_rotator.unwrapped_target_valid   = 1;
         state->rot.antenna_rotator.homing_in_progress       = 0;
         state->rot.antenna_rotator.home_pending_final_az    = 0.0;
-        cmd_set_status(state, "home: already at %.1f, %.1f deg -- no move",
+        cmd_set_status(&state->cmd, "home: already at %.1f, %.1f deg -- no move",
                        prev, state->rot.antenna_rotator.elevation);
         sso_audit_event("home", "already at target -- no move");
         return ANTENNA_ROTATOR_OK;
@@ -538,7 +538,7 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
                  prev, final_az, delta,
                  (fabs(delta) > 180.0) ? "two-step unwind" : "direct");
         sso_audit_event("home", det);
-        cmd_set_status(state, "home: %.1f -> %.1f, %+.1f deg %s (%s)",
+        cmd_set_status(&state->cmd, "home: %.1f -> %.1f, %+.1f deg %s (%s)",
                        prev, final_az, delta, delta < 0.0 ? "CCW" : "CW",
                        (fabs(delta) > 180.0) ? "unwind" : "direct");
     }

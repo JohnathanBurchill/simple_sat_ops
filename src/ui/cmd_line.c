@@ -58,25 +58,25 @@ static long cmd_now_ns(void)
     return (long) ts.tv_sec * 1000000000L + (long) ts.tv_nsec;
 }
 
-void cmd_enter(state_t *state)
+void cmd_enter(cmdline_t *cmd)
 {
-    state->cmd.active = 1;
-    state->cmd.buf[0] = '\0';
-    state->cmd.len = 0;
-    state->cmd.cursor = 0;
+    cmd->active = 1;
+    cmd->buf[0] = '\0';
+    cmd->len = 0;
+    cmd->cursor = 0;
     // Start a fresh history walk at the (empty) editing line.
-    state->cmd.hist_pos = state->cmd.history_count;
+    cmd->hist_pos = cmd->history_count;
     // Force an immediate preview broadcast so viewers see the ":" prompt
     // appear the moment the operator opens it.
-    state->cmd.dirty = 1;
-    state->cmd.last_edit_ns = 0;
+    cmd->dirty = 1;
+    cmd->last_edit_ns = 0;
 }
 
-void cmd_set_status(state_t *state, const char *fmt, ...)
+void cmd_set_status(cmdline_t *cmd, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(state->cmd.status, sizeof state->cmd.status, fmt, ap);
+    vsnprintf(cmd->status, sizeof cmd->status, fmt, ap);
     va_end(ap);
 }
 
@@ -338,61 +338,61 @@ static void cmd_dispatch(state_t *state)
     // Trim leading whitespace; an empty command is a no-op.
     char *p = buf;
     while (*p == ' ' || *p == '\t') ++p;
-    if (*p == '\0') { cmd_set_status(state, ""); return; }
+    if (*p == '\0') { cmd_set_status(&state->cmd, ""); return; }
 
     char *save = NULL;
     char *cmd  = strtok_r(p, " \t", &save);
     char *arg1 = strtok_r(NULL, " \t", &save);
 
     if (cmd == NULL) {
-        cmd_set_status(state, "");
+        cmd_set_status(&state->cmd, "");
         return;
     }
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "h") == 0 || strcmp(cmd, "?") == 0) {
-        cmd_set_status(state, "commands: help tx track stop home quit "
+        cmd_set_status(&state->cmd, "commands: help tx track stop home quit "
                        "retarget <tle-file> "
                        "freq <MHz> lo_offset <signed_kHz> lo_bandwidth <kHz> "
                        "gain <dB> rs on|off spectrum <sec>");
     } else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0
                || strcmp(cmd, "exit") == 0) {
         state->running = 0;
-        cmd_set_status(state, "quitting");
+        cmd_set_status(&state->cmd, "quitting");
     } else if (strcmp(cmd, "tx") == 0) {
         // Defer the modal until after we leave command-mode so the
         // bottom prompt doesn't bleed under the modal box.
-        cmd_set_status(state, "opening TX compose...");
+        cmd_set_status(&state->cmd, "opening TX compose...");
         state->cmd.active = 0;
         tx_compose_open(state);
     } else if (strcmp(cmd, "auto") == 0) {
         if (state->tx.auto_tcmd_file_path[0] == '\0') {
-            cmd_set_status(state, "auto: no --tc-file=<path> given on the cmdline");
+            cmd_set_status(&state->cmd, "auto: no --tc-file=<path> given on the cmdline");
         } else {
-            cmd_set_status(state, "opening auto-tcmd...");
+            cmd_set_status(&state->cmd, "opening auto-tcmd...");
             state->cmd.active = 0;
             auto_tcmd_open(state);
         }
     } else if (strcmp(cmd, "track") == 0) {
         start_tracking(state);
-        cmd_set_status(state, "tracking on");
+        cmd_set_status(&state->cmd, "tracking on");
         sso_audit_event("track-on",
             state->track.prediction.satellite_ephem.tle.sat_name[0]
                 ? state->track.prediction.satellite_ephem.tle.sat_name : "");
     } else if (strcmp(cmd, "stop") == 0) {
         stop_tracking(state);
-        cmd_set_status(state, "tracking stopped");
+        cmd_set_status(&state->cmd, "tracking stopped");
         sso_audit_event("track-off", "");
     } else if (strcmp(cmd, "home") == 0) {
         stop_tracking(state);
         point_to_stationary_target(state, 0.0, 0.0);
-        cmd_set_status(state, "home: az=0 el=0");
+        cmd_set_status(&state->cmd, "home: az=0 el=0");
         sso_audit_event("rotator-home", "az=0 el=0");
     } else if (strcmp(cmd, "retarget") == 0) {
         char expanded[1024];
         if (arg1 == NULL) {
-            cmd_set_status(state, "retarget: usage `retarget <tle-file>` "
+            cmd_set_status(&state->cmd, "retarget: usage `retarget <tle-file>` "
                            "(first satellite in the file is used)");
         } else if (cmd_expand(arg1, expanded, sizeof expanded) != 0) {
-            cmd_set_status(state, "retarget: path too long after expansion");
+            cmd_set_status(&state->cmd, "retarget: path too long after expansion");
         } else {
             int rc = retarget_to_tle(state, expanded);
             const char *name =
@@ -402,32 +402,32 @@ static void cmd_dispatch(state_t *state)
             switch (rc) {
             case RETARGET_OK:
                 if (mins > 0.0) {
-                    cmd_set_status(state, "retarget -> %s (AOS in %.1f min)",
+                    cmd_set_status(&state->cmd, "retarget -> %s (AOS in %.1f min)",
                                    name, mins);
                 } else {
-                    cmd_set_status(state, "retarget -> %s (in pass, %.0fs elapsed)",
+                    cmd_set_status(&state->cmd, "retarget -> %s (in pass, %.0fs elapsed)",
                                    name, -mins * 60.0);
                 }
                 sso_audit_event("retarget", name);
                 break;
             case RETARGET_SAME:
-                cmd_set_status(state, "retarget: already on %s (same file)", arg1);
+                cmd_set_status(&state->cmd, "retarget: already on %s (same file)", arg1);
                 break;
             case RETARGET_READ_ERR:
-                cmd_set_status(state, "retarget: cannot read a TLE from '%s'", arg1);
+                cmd_set_status(&state->cmd, "retarget: cannot read a TLE from '%s'", arg1);
                 break;
             case RETARGET_BAD_TLE:
-                cmd_set_status(state, "retarget: '%s' has invalid TLE elements",
+                cmd_set_status(&state->cmd, "retarget: '%s' has invalid TLE elements",
                                arg1);
                 break;
             default:
-                cmd_set_status(state, "retarget: bad argument");
+                cmd_set_status(&state->cmd, "retarget: bad argument");
                 break;
             }
         }
     } else if (strcmp(cmd, "freq") == 0) {
         if (arg1 == NULL) {
-            cmd_set_status(state, "freq: missing argument (MHz)");
+            cmd_set_status(&state->cmd, "freq: missing argument (MHz)");
         } else {
 #ifdef SSO_WITH_SDR
             // Accept an explicit unit suffix (k/M/G, optional trailing "Hz").
@@ -444,15 +444,15 @@ static void cmd_dispatch(state_t *state)
             else if (*endp == 'k' || *endp == 'K') hz = v * 1e3;
             else                                   hz = (v < 1e6) ? v * 1e6 : v;
             if (hz < 1e6 || hz > 6e9) {
-                cmd_set_status(state, "freq: '%s' out of [1 MHz, 6 GHz]", arg1);
+                cmd_set_status(&state->cmd, "freq: '%s' out of [1 MHz, 6 GHz]", arg1);
             } else if (state->sdr.rx_session == NULL) {
-                cmd_set_status(state, "freq: no RX session");
+                cmd_set_status(&state->cmd, "freq: no RX session");
             } else {
                 rx_session_request_freq(state->sdr.rx_session, hz);
-                cmd_set_status(state, "freq -> %.6f MHz", hz / 1e6);
+                cmd_set_status(&state->cmd, "freq -> %.6f MHz", hz / 1e6);
             }
 #else
-            cmd_set_status(state, "freq: this build has no USRP support");
+            cmd_set_status(&state->cmd, "freq: this build has no USRP support");
 #endif
         }
     } else if (strcmp(cmd, "rs") == 0) {
@@ -460,28 +460,28 @@ static void cmd_dispatch(state_t *state)
         // sets reed_solomon at open() time. Flag this clearly instead
         // of silently no-op'ing.
         if (arg1 == NULL) {
-            cmd_set_status(state, "rs: usage: rs on|off (not yet runtime-toggleable)");
+            cmd_set_status(&state->cmd, "rs: usage: rs on|off (not yet runtime-toggleable)");
         } else {
-            cmd_set_status(state, "rs %s: NOT YET WIRED -- rx_session_open params only",
+            cmd_set_status(&state->cmd, "rs %s: NOT YET WIRED -- rx_session_open params only",
                            arg1);
         }
     } else if (strcmp(cmd, "spectrum") == 0 || strcmp(cmd, "spec") == 0) {
 #ifdef SSO_WITH_SDR
         if (arg1 == NULL) {
-            cmd_set_status(state, "spectrum: usage `spectrum <seconds>` (1..600)");
+            cmd_set_status(&state->cmd, "spectrum: usage `spectrum <seconds>` (1..600)");
         } else if (state->sdr.rx_session == NULL) {
-            cmd_set_status(state, "spectrum: no RX session");
+            cmd_set_status(&state->cmd, "spectrum: no RX session");
         } else {
             double duration_s = atof(arg1);
             if (duration_s <= 0.0) {
-                cmd_set_status(state, "spectrum: invalid duration '%s'", arg1);
+                cmd_set_status(&state->cmd, "spectrum: invalid duration '%s'", arg1);
             } else {
                 if (duration_s > 600.0) duration_s = 600.0;
                 if (duration_s < 1.0)   duration_s = 1.0;
 
-                spectrum_job_reap(state);
-                if (state->spec_job.active) {
-                    cmd_set_status(state, "spectrum: a render is already in progress");
+                spectrum_job_reap(&state->ui);
+                if (state->ui.spec_job.active) {
+                    cmd_set_status(&state->cmd, "spectrum: a render is already in progress");
                 } else {
                     char wav_path[512];
                     int64_t n_samples = 0;
@@ -491,13 +491,13 @@ static void cmd_dispatch(state_t *state)
                                             wav_path, sizeof wav_path,
                                             &n_samples, &sample_rate, &wav_active);
                     if (wav_path[0] == '\0' || sample_rate <= 0) {
-                        cmd_set_status(state, "spectrum: no WAV (recording not started yet)");
+                        cmd_set_status(&state->cmd, "spectrum: no WAV (recording not started yet)");
                     } else {
                         long want  = (long)(duration_s * (double) sample_rate);
                         long start = (long)(n_samples - want);
                         if (start < 0) { start = 0; want = (long) n_samples; }
                         if (want <= 0) {
-                            cmd_set_status(state, "spectrum: no samples captured yet");
+                            cmd_set_status(&state->cmd, "spectrum: no samples captured yet");
                         } else {
                             // Filename: strip .wav and append a local-time stamp range.
                             char base[512];
@@ -517,15 +517,15 @@ static void cmd_dispatch(state_t *state)
                             strftime(ts_start, sizeof ts_start, "%Y-%m-%d_%H-%M-%S", &lt_start);
                             strftime(ts_end,   sizeof ts_end,   "%H-%M-%S",          &lt_end);
 
-                            memset(&state->spec_job, 0, sizeof state->spec_job);
-                            snprintf(state->spec_job.wav_in, sizeof state->spec_job.wav_in,
+                            memset(&state->ui.spec_job, 0, sizeof state->ui.spec_job);
+                            snprintf(state->ui.spec_job.wav_in, sizeof state->ui.spec_job.wav_in,
                                      "%s", wav_path);
-                            snprintf(state->spec_job.png_out, sizeof state->spec_job.png_out,
+                            snprintf(state->ui.spec_job.png_out, sizeof state->ui.spec_job.png_out,
                                      "%.480s_LOCAL_%s_to_%s.png",
                                      base, ts_start, ts_end);
-                            state->spec_job.sample_rate  = sample_rate;
-                            state->spec_job.start_sample = start;
-                            state->spec_job.n_samples    = want;
+                            state->ui.spec_job.sample_rate  = sample_rate;
+                            state->ui.spec_job.start_sample = start;
+                            state->ui.spec_job.n_samples    = want;
 
                             // Pair the WAV slice with an IQ slice if the
                             // sidecar exists — worker prefers IQ and only
@@ -542,24 +542,24 @@ static void cmd_dispatch(state_t *state)
                                 long start_p = (long)(iq_pairs - want_p);
                                 if (start_p < 0) { start_p = 0; want_p = (long) iq_pairs; }
                                 if (want_p > 0) {
-                                    snprintf(state->spec_job.iq_in,
-                                             sizeof state->spec_job.iq_in, "%s", iq_path);
-                                    state->spec_job.iq_sample_rate = iq_rate;
-                                    state->spec_job.iq_start_pair  = start_p;
-                                    state->spec_job.iq_pairs       = want_p;
+                                    snprintf(state->ui.spec_job.iq_in,
+                                             sizeof state->ui.spec_job.iq_in, "%s", iq_path);
+                                    state->ui.spec_job.iq_sample_rate = iq_rate;
+                                    state->ui.spec_job.iq_start_pair  = start_p;
+                                    state->ui.spec_job.iq_pairs       = want_p;
                                 }
                             }
 
-                            if (pthread_create(&state->spec_job.thr, NULL,
-                                               spectrum_worker, &state->spec_job) != 0) {
-                                cmd_set_status(state, "spectrum: pthread_create failed: %s",
+                            if (pthread_create(&state->ui.spec_job.thr, NULL,
+                                               spectrum_worker, &state->ui.spec_job) != 0) {
+                                cmd_set_status(&state->cmd, "spectrum: pthread_create failed: %s",
                                                strerror(errno));
                             } else {
-                                state->spec_job.active = 1;
-                                cmd_set_status(state, "spectrum: rendering %.1fs (%s) -> %s",
+                                state->ui.spec_job.active = 1;
+                                cmd_set_status(&state->cmd, "spectrum: rendering %.1fs (%s) -> %s",
                                                (double) want / (double) sample_rate,
-                                               state->spec_job.iq_in[0] ? "iq" : "wav",
-                                               state->spec_job.png_out);
+                                               state->ui.spec_job.iq_in[0] ? "iq" : "wav",
+                                               state->ui.spec_job.png_out);
                             }
                         }
                     }
@@ -567,7 +567,7 @@ static void cmd_dispatch(state_t *state)
             }
         }
 #else
-        cmd_set_status(state, "spectrum: this build has no USRP support");
+        cmd_set_status(&state->cmd, "spectrum: this build has no USRP support");
 #endif
     } else if (strcmp(cmd, "lo_offset") == 0) {
         // Move the hardware LO mid-pass to dodge a baseband artifact.
@@ -577,26 +577,26 @@ static void cmd_dispatch(state_t *state)
         // range ~±5..±40 kHz; clipped here to ±45 kHz so the worst
         // case still keeps a 3 kHz margin to the post-decim band edge.
         if (arg1 == NULL) {
-            cmd_set_status(state, "lo_offset: usage `lo_offset <signed_kHz>` "
+            cmd_set_status(&state->cmd, "lo_offset: usage `lo_offset <signed_kHz>` "
                            "(comfort range +/-5..+/-40)");
         } else {
 #ifdef SSO_WITH_SDR
             double khz = atof(arg1);
             if (khz < -45.0 || khz > 45.0) {
-                cmd_set_status(state, "lo_offset: %g kHz out of [-45, +45]", khz);
+                cmd_set_status(&state->cmd, "lo_offset: %g kHz out of [-45, +45]", khz);
             } else if (state->sdr.rx_session == NULL) {
-                cmd_set_status(state, "lo_offset: no RX session");
+                cmd_set_status(&state->cmd, "lo_offset: no RX session");
             } else {
                 double new_offset_hz = khz * 1000.0;
                 state->sdr.rx_lo_offset_hz = new_offset_hz;
                 rx_session_set_lo_offset(state->sdr.rx_session,
                                          state->track.nominal_downlink_frequency_hz,
                                          new_offset_hz);
-                cmd_set_status(state, "lo_offset -> %+.1f kHz (PLL glitching, "
+                cmd_set_status(&state->cmd, "lo_offset -> %+.1f kHz (PLL glitching, "
                                "decode resumes shortly)", khz);
             }
 #else
-            cmd_set_status(state, "lo_offset: this build has no USRP support");
+            cmd_set_status(&state->cmd, "lo_offset: this build has no USRP support");
 #endif
         }
     } else if (strcmp(cmd, "lo_bandwidth") == 0) {
@@ -606,23 +606,23 @@ static void cmd_dispatch(state_t *state)
         // "bandwidth N\n". Name mirrors :lo_offset so both LO-
         // relative knobs live in the same command family.
         if (arg1 == NULL) {
-            cmd_set_status(state, "lo_bandwidth: usage `lo_bandwidth <N>` (kHz)");
+            cmd_set_status(&state->cmd, "lo_bandwidth: usage `lo_bandwidth <N>` (kHz)");
         } else if (live_waterfall_stdin_fd() < 0) {
-            cmd_set_status(state, "lo_bandwidth: no live viewer running "
+            cmd_set_status(&state->cmd, "lo_bandwidth: no live viewer running "
                            "(launch with --live-waterfall)");
         } else {
             double n = atof(arg1);
             if (n <= 0.0 || n > 1000.0) {
-                cmd_set_status(state, "lo_bandwidth: %g out of (0, 1000] kHz", n);
+                cmd_set_status(&state->cmd, "lo_bandwidth: %g out of (0, 1000] kHz", n);
             } else {
                 char line[64];
                 int  ln = snprintf(line, sizeof line, "bandwidth %g\n", n);
                 ssize_t w = (ln > 0) ? write(live_waterfall_stdin_fd(),
                                              line, (size_t) ln) : -1;
                 if (w == ln) {
-                    cmd_set_status(state, "lo_bandwidth: -> %g kHz", n);
+                    cmd_set_status(&state->cmd, "lo_bandwidth: -> %g kHz", n);
                 } else {
-                    cmd_set_status(state, "lo_bandwidth: write failed: %s",
+                    cmd_set_status(&state->cmd, "lo_bandwidth: write failed: %s",
                                    strerror(errno));
                 }
             }
@@ -633,26 +633,26 @@ static void cmd_dispatch(state_t *state)
         // worker thread so we don't touch the UHD streamer from this
         // thread (same handoff as :lo_offset).
         if (arg1 == NULL) {
-            cmd_set_status(state, "gain: usage `gain <dB>` (range 0-76; current %.1f)",
+            cmd_set_status(&state->cmd, "gain: usage `gain <dB>` (range 0-76; current %.1f)",
                            state->sdr.rx_gain_db);
         } else {
 #ifdef SSO_WITH_SDR
             double g = atof(arg1);
             if (g < 0.0 || g > 76.0) {
-                cmd_set_status(state, "gain: %g dB out of [0, 76]", g);
+                cmd_set_status(&state->cmd, "gain: %g dB out of [0, 76]", g);
             } else if (state->sdr.rx_session == NULL) {
-                cmd_set_status(state, "gain: no RX session");
+                cmd_set_status(&state->cmd, "gain: no RX session");
             } else {
                 state->sdr.rx_gain_db = g;
                 rx_session_set_gain(state->sdr.rx_session, g);
-                cmd_set_status(state, "gain -> %.1f dB", g);
+                cmd_set_status(&state->cmd, "gain -> %.1f dB", g);
             }
 #else
-            cmd_set_status(state, "gain: this build has no USRP support");
+            cmd_set_status(&state->cmd, "gain: this build has no USRP support");
 #endif
         }
     } else {
-        cmd_set_status(state, "unknown command '%s' (try :help)", cmd);
+        cmd_set_status(&state->cmd, "unknown command '%s' (try :help)", cmd);
     }
 }
 
@@ -870,20 +870,20 @@ int cmd_handle_key(int key, state_t *state)
 // Cursor is drawn as a reverse-video block on the char at state->cmd.cursor
 // — or on a trailing space when the cursor is at end-of-line. The
 // surrounding text is plain so cursor position is unambiguous.
-void cmd_render(state_t *state)
+void cmd_render(cmdline_t *cmd)
 {
     int row = LINES - 1;
-    if (state->cmd.active) {
+    if (cmd->active) {
         move(row, 0);
         addch(':');
-        for (int i = 0; i < state->cmd.len; ++i) {
-            if (i == state->cmd.cursor) {
-                addch(((unsigned char) state->cmd.buf[i]) | A_REVERSE);
+        for (int i = 0; i < cmd->len; ++i) {
+            if (i == cmd->cursor) {
+                addch(((unsigned char) cmd->buf[i]) | A_REVERSE);
             } else {
-                addch((unsigned char) state->cmd.buf[i]);
+                addch((unsigned char) cmd->buf[i]);
             }
         }
-        if (state->cmd.cursor == state->cmd.len) {
+        if (cmd->cursor == cmd->len) {
             addch(' ' | A_REVERSE);
         }
         clrtoeol();
@@ -891,10 +891,10 @@ void cmd_render(state_t *state)
         // block highlights. The layered refresh below will curs_set(1)
         // when an editable context is active so the operator sees a
         // visible blinking cursor on top of the inverse block.
-        move(row, 1 + state->cmd.cursor);
+        move(row, 1 + cmd->cursor);
         return;
-    } else if (state->cmd.status[0]) {
-        mvprintw(row, 0, "%s", state->cmd.status);
+    } else if (cmd->status[0]) {
+        mvprintw(row, 0, "%s", cmd->status);
     } else {
         move(row, 0);
     }

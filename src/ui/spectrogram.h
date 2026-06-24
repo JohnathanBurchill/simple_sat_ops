@@ -27,6 +27,8 @@
 #ifndef UI_SPECTROGRAM_H
 #define UI_SPECTROGRAM_H
 
+#include "ui_state.h"    // ui_t
+
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -48,13 +50,13 @@ int generate_full_iq_waterfall(const char *iq_path, int rate_hz,
 int generate_full_spectrogram(const char *wav_path, char *png_out, size_t png_cap);
 
 // pthread entry for the `:spectrum N` render job. arg is a spectrum_job_t*
-// (state.spec_job); renders the IQ slice when present, else the WAV slice,
+// (state.ui.spec_job); renders the IQ slice when present, else the WAV slice,
 // and sets j->done before returning.
 void *spectrum_worker(void *arg);
 
 // Reap a finished spectrum job so the slot is free for the next request.
 // Called from cmd_dispatch (operator retry) and the shutdown path.
-void spectrum_job_reap(state_t *state);
+void spectrum_job_reap(ui_t *ui);
 
 #ifdef __cplusplus
 }

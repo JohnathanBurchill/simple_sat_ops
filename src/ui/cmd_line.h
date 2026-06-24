@@ -26,6 +26,8 @@
 #ifndef UI_CMD_LINE_H
 #define UI_CMD_LINE_H
 
+#include "ui_state.h"    // cmdline_t
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -34,14 +36,14 @@ struct state;
 typedef struct state state_t;
 
 // Enter command mode (show the ':' prompt; route keys through the handler).
-void cmd_enter(state_t *state);
+void cmd_enter(cmdline_t *cmd);
 
 // Feed a key to the active command line. Returns 0 when the line stays open,
 // non-zero once it has closed (executed or cancelled).
 int cmd_handle_key(int key, state_t *state);
 
 // Draw the prompt + status line at the bottom of the screen.
-void cmd_render(state_t *state);
+void cmd_render(cmdline_t *cmd);
 
 // Broadcast the live (debounced) command-line buffer to viewers.
 void cmd_broadcast_preview(state_t *state);
@@ -51,7 +53,7 @@ void cmd_pump(state_t *state);
 
 // Set the one-line status shown beneath the prompt (printf-style). Also
 // called from the tracking layer to report pointing/retarget outcomes.
-void cmd_set_status(state_t *state, const char *fmt, ...);
+void cmd_set_status(cmdline_t *cmd, const char *fmt, ...);
 
 #ifdef __cplusplus
 }

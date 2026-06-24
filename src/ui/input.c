@@ -54,7 +54,7 @@ void input_handle_keys(state_t *state, int *keyboard_unlocked)
     } else if (*keyboard_unlocked) {
         switch (key) {
             case ':':
-                cmd_enter(state);
+                cmd_enter(&state->cmd);
                 break;
             case 'q':
                 state->running = 0;

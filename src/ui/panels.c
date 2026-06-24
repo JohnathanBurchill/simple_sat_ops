@@ -55,13 +55,13 @@
 // second — the eye reads the timeline progressing even when the signal
 // is flat.
 
-void ribbon_push(state_t *state, double peak_dbfs, int bright_bins)
+void ribbon_push(ui_t *ui, double peak_dbfs, int bright_bins)
 {
-    state->ribbon_peak[state->ribbon_head]   = peak_dbfs;
-    state->ribbon_bright[state->ribbon_head] = bright_bins;
-    state->ribbon_head = (state->ribbon_head + 1) % RIBBON_LEN;
-    if (state->ribbon_count < RIBBON_LEN) state->ribbon_count++;
-    state->ribbon_push_count++;
+    ui->ribbon_peak[ui->ribbon_head]   = peak_dbfs;
+    ui->ribbon_bright[ui->ribbon_head] = bright_bins;
+    ui->ribbon_head = (ui->ribbon_head + 1) % RIBBON_LEN;
+    if (ui->ribbon_count < RIBBON_LEN) ui->ribbon_count++;
+    ui->ribbon_push_count++;
 }
 
 // Low-disk warning + the pass output folder now live on state_t
@@ -216,9 +216,9 @@ void rx_panel_collect_local(state_t *state, rx_panel_data_t *d)
     // ribbon_peak[i] is the peak dBFS that was pushed at that same
     // second, clamped into int8 — rendered alongside the marker so
     // the operator sees the signal level on every row.
-    int n = state->ribbon_count;
+    int n = state->ui.ribbon_count;
     if (n > (int) sizeof d->ribbon - 1) n = (int) sizeof d->ribbon - 1;
-    long P = state->ribbon_push_count;
+    long P = state->ui.ribbon_push_count;
     // Bright-bin thresholds for ribbon character selection. With
     // iq_burst's 10 dB / N=512 FFT, stationary noise lights ~30 bins
     // and a CW carrier adds ~5-6 more. A wideband packet burst lights
@@ -227,12 +227,12 @@ void rx_panel_collect_local(state_t *state, rx_panel_data_t *d)
     const int BRIGHT_HI = 80;   // broadband — '#'
     for (int i = 0; i < n; ++i) {
         long abs_t = P - (long) i;
-        int idx = (state->ribbon_head - 1 - i + RIBBON_LEN) % RIBBON_LEN;
-        int bright = state->ribbon_bright[idx];
+        int idx = (state->ui.ribbon_head - 1 - i + RIBBON_LEN) % RIBBON_LEN;
+        int bright = state->ui.ribbon_bright[idx];
         if (bright >= BRIGHT_HI)             d->ribbon[i] = '#';
         else if (abs_t > 0 && (abs_t % 20) == 0) d->ribbon[i] = '_';
         else                                 d->ribbon[i] = '.';
-        double dbfs = state->ribbon_peak[idx];
+        double dbfs = state->ui.ribbon_peak[idx];
         long lr = lround(dbfs);
         if (lr > 127)  lr = 127;
         if (lr < -127) lr = -127;

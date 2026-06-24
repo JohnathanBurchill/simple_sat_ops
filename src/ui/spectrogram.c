@@ -291,10 +291,10 @@ void *spectrum_worker(void *arg)
     return NULL;
 }
 
-void spectrum_job_reap(state_t *state)
+void spectrum_job_reap(ui_t *ui)
 {
-    if (state->spec_job.active && state->spec_job.done) {
-        pthread_join(state->spec_job.thr, NULL);
-        state->spec_job.active = 0;
+    if (ui->spec_job.active && ui->spec_job.done) {
+        pthread_join(ui->spec_job.thr, NULL);
+        ui->spec_job.active = 0;
     }
 }

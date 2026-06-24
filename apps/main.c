@@ -489,7 +489,7 @@ int main(int argc, char **argv)
         // row) bleed through and overwrite the modal.
         if (redraw_due || state.cmd.active || state.tx.tx_compose_active
             || state.tx.auto_tcmd_active) {
-            cmd_render(&state);
+            cmd_render(&state.cmd);
             refresh();
             int show_hw_cursor = 0;
             if (state.tx.tx_compose_active && state.tx.tx_compose_win) {
@@ -514,19 +514,19 @@ int main(int argc, char **argv)
         // grab the iq_burst bright-bin count so the renderer can pick
         // a character that distinguishes broadband packets from a CW
         // carrier at the same peak level.
-        if (state.sdr.rx_session && (t_now - state.ribbon_last_t) >= 1.0) {
+        if (state.sdr.rx_session && (t_now - state.ui.ribbon_last_t) >= 1.0) {
             double peak = -90.0;
             rx_session_snapshot(state.sdr.rx_session, NULL, &peak, NULL,
                                 NULL, NULL, 0);
             int burst_bins = 0;
             rx_session_burst_snapshot(state.sdr.rx_session, &burst_bins, NULL);
-            ribbon_push(&state, peak, burst_bins);
-            state.ribbon_last_t = t_now;
+            ribbon_push(&state.ui, peak, burst_bins);
+            state.ui.ribbon_last_t = t_now;
 
             // Live waterfall: (re)launch / reap the out-of-process viewer on
             // the same once-per-second cadence as the ribbon. See
             // ui/live_waterfall.c.
-            if (state.run_live_waterfall) {
+            if (state.ui.run_live_waterfall) {
                 live_waterfall_poll(state.sdr.rx_session);
             }
         }
@@ -594,11 +594,11 @@ int main(int argc, char **argv)
         // outcome (PNG path or ffmpeg error) in the command-line status.
         // The reap only joins the worker thread; status_msg is left
         // alone, so reading it after reap is safe.
-        if (state.spec_job.active && state.spec_job.done) {
-            if (state.spec_job.status_msg[0]) {
-                cmd_set_status(&state, "%s", state.spec_job.status_msg);
+        if (state.ui.spec_job.active && state.ui.spec_job.done) {
+            if (state.ui.spec_job.status_msg[0]) {
+                cmd_set_status(&state.cmd, "%s", state.ui.spec_job.status_msg);
             }
-            spectrum_job_reap(&state);
+            spectrum_job_reap(&state.ui);
         }
 
         if (state.running) {
@@ -675,11 +675,11 @@ int main(int argc, char **argv)
 
     // Any in-flight `:spectrum N` worker is touching the same WAV / IQ
     // — let it finish before we hand the file to the full-pass render.
-    if (state.spec_job.active) {
-        pthread_join(state.spec_job.thr, NULL);
-        state.spec_job.active = 0;
-        if (state.spec_job.status_msg[0]) {
-            fprintf(stderr, "simple_sat_ops: %s\n", state.spec_job.status_msg);
+    if (state.ui.spec_job.active) {
+        pthread_join(state.ui.spec_job.thr, NULL);
+        state.ui.spec_job.active = 0;
+        if (state.ui.spec_job.status_msg[0]) {
+            fprintf(stderr, "simple_sat_ops: %s\n", state.ui.spec_job.status_msg);
         }
     }
 
