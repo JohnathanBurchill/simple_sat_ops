@@ -311,7 +311,7 @@ static void tx_compose_draw(state_t *state, WINDOW *w, const tx_compose_t *c) {
 #ifdef SSO_WITH_SDR
     mvwprintw(w, 1, 2,
               "B210: %s",
-              state->rx_session ? "in-process (this binary)" : "(offline)");
+              state->sdr.rx_session ? "in-process (this binary)" : "(offline)");
 #else
     mvwprintw(w, 1, 2, "B210: (this build has no UHD)");
 #endif
@@ -411,7 +411,7 @@ static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, s
                  "TX disabled by --no-tx (preview still goes to viewers)");
         return -1;
     }
-    if (state->rx_session != NULL && !rx_session_can_tx(state->rx_session)) {
+    if (state->sdr.rx_session != NULL && !rx_session_can_tx(state->sdr.rx_session)) {
         snprintf(err, err_size,
                  "TX not supported by this SDR (RX-only backend)");
         return -1;
@@ -542,7 +542,7 @@ void tx_compose_open(state_t *state) {
     // RX-only SDR (e.g. RTL-SDR): the burst can never reach the air, so
     // keep the allow-tx gate forced off. Compose + preview still work
     // (commit refuses with a clear message).
-    if (state->rx_session != NULL && !rx_session_can_tx(state->rx_session)) {
+    if (state->sdr.rx_session != NULL && !rx_session_can_tx(state->sdr.rx_session)) {
         state->tx_compose.allow_tx = 0;
     }
 #endif

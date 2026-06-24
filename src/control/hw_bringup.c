@@ -190,7 +190,7 @@ void hw_sdr_open(state_t *state)
     // error so a dev host without a device can still run the UI. rx_session
     // takes ownership of the core; we drop our local handle afterwards so main
     // never touches UHD off-thread.
-    if (state->control_mode && !state->without_b210) {
+    if (state->control_mode && !state->sdr.without_b210) {
         // B210 RX rate doubled from the original 240 kHz / sps=5 to
         // 480 kHz / sps=10 (after the integer-5 decimation FIR). That
         // gives the modem_fsk clock-recovery loop the same oversampling
@@ -212,9 +212,9 @@ void hw_sdr_open(state_t *state)
             // -25 kHz keeps existing pipelines unchanged; operator can
             // shift to dodge fixed-pattern noise.
             .freq_hz         = state->nominal_downlink_frequency_hz
-                             + state->rx_lo_offset_hz,
+                             + state->sdr.rx_lo_offset_hz,
             .rate_hz         = 480000.0,
-            .gain_db         = state->rx_gain_db,
+            .gain_db         = state->sdr.rx_gain_db,
             .bw_hz           = -1.0,
             .fm_fullscale_hz = 25000.0,
             .rx_antenna      = "RX2",
@@ -240,20 +240,20 @@ void hw_sdr_open(state_t *state)
             // carrier lands at exactly DC for every downstream consumer
             // (.iq sidecar, live waterfall, shadow IQ decoder, FM
             // discriminator).
-            .rx_dc_offset_track  = state->rx_dc_offset_track,
-            .rx_iq_balance_track = state->rx_iq_balance_track,
-            .fm_lo_compensation_hz = state->rx_lo_offset_hz,
+            .rx_dc_offset_track  = state->sdr.rx_dc_offset_track,
+            .rx_iq_balance_track = state->sdr.rx_iq_balance_track,
+            .fm_lo_compensation_hz = state->sdr.rx_lo_offset_hz,
             .carrier_trim_hz       = carrier_trim_load_hz(),
             // SDR backend selection: type (default auto), and the UHD
             // clone overrides. --sdr-device routes to the UHD device
             // args when given (e.g. "serial=..."); --uhd-args takes
             // precedence and is passed verbatim.
-            .backend_type        = state->sdr_type,
-            .device_args         = state->sdr_device[0] ? state->sdr_device : "type=b200",
-            .uhd_args_override   = state->uhd_args[0] ? state->uhd_args : NULL,
-            .fpga_image_path     = state->sdr_fpga[0] ? state->sdr_fpga : NULL,
+            .backend_type        = state->sdr.sdr_type,
+            .device_args         = state->sdr.sdr_device[0] ? state->sdr.sdr_device : "type=b200",
+            .uhd_args_override   = state->sdr.uhd_args[0] ? state->sdr.uhd_args : NULL,
+            .fpga_image_path     = state->sdr.sdr_fpga[0] ? state->sdr.sdr_fpga : NULL,
             // RTL-SDR dongle index (UHD ignores it; for UHD use --uhd-args).
-            .device_index        = state->sdr_device[0] ? atoi(state->sdr_device) : 0,
+            .device_index        = state->sdr.sdr_device[0] ? atoi(state->sdr.sdr_device) : 0,
         };
         b210_rx_tx_core_t *core = NULL;
         if (b210_rx_tx_core_open(&cp, &core) != 0) {
@@ -274,7 +274,7 @@ void hw_sdr_open(state_t *state)
                     "freq_hz=%.0f rate_hz=%.0f lo_offset_hz=%.0f",
                     b210_rx_tx_core_actual_freq(core),
                     b210_rx_tx_core_actual_rate(core),
-                    state->rx_lo_offset_hz);
+                    state->sdr.rx_lo_offset_hz);
                 sso_audit_event("b210-open", det);
             }
             rx_session_params_t rxp = {
@@ -292,9 +292,9 @@ void hw_sdr_open(state_t *state)
                                      ? state->prediction.satellite_ephem.tle.sat_name
                                      : NULL,
                 .session_dir       = state->pass_folder[0] ? state->pass_folder : NULL,
-                .lo_offset_hz      = state->rx_lo_offset_hz,
+                .lo_offset_hz      = state->sdr.rx_lo_offset_hz,
             };
-            if (rx_session_open(&state->rx_session, &rxp, core) != 0) {
+            if (rx_session_open(&state->sdr.rx_session, &rxp, core) != 0) {
                 fprintf(stderr,
                     "simple_sat_ops: rx_session_open failed — closing B210\n");
                 b210_rx_tx_core_close(core);
@@ -304,11 +304,11 @@ void hw_sdr_open(state_t *state)
             // --always-record: start WAV + .iq + sidecars right now,
             // before any pass logic gets a chance to gate them. The
             // per-pass start/stop block in the tracking loop checks
-            // state->always_record and skips itself when this is on.
+            // state->sdr.always_record and skips itself when this is on.
             // Suppressed under --self-test: the dry run opens the SDR to
             // prove it comes up, but must never write capture files.
-            if (state->always_record && state->rx_session && !state->self_test) {
-                rx_session_request_wav_start(state->rx_session);
+            if (state->sdr.always_record && state->sdr.rx_session && !state->self_test) {
+                rx_session_request_wav_start(state->sdr.rx_session);
                 fprintf(stderr,
                     "simple_sat_ops: --always-record on — WAV/IQ "
                     "capture started, pass gating disabled\n");

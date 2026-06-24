@@ -53,7 +53,7 @@ typedef struct {
     const char    *sat_name;
     const char    *session_dir; // for packet_db (typically pass_folder)
     // LO offset (Hz) below the satellite's nominal carrier — what main
-    // also stored in state->rx_lo_offset_hz. The hardware LO is already
+    // also stored in state->sdr.rx_lo_offset_hz. The hardware LO is already
     // tuned to (nominal - this) when the core is handed off; rx_session
     // needs the same value so the snapshot can reconstruct the effective
     // (Doppler-shifted) carrier frequency for the operator panel.

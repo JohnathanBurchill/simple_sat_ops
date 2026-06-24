@@ -228,14 +228,14 @@ void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
     fprintf(out, "doppler-rx: %s (software sw_nco on post-decim IQ; hardware LO fixed)\n",
             state->doppler_correction_enabled ? "enabled" : "disabled");
     fprintf(out, "doppler-tx: %s (hardware SDR LO retune per burst, f=carrier/(1-rr/c))\n",
-            (!sdr_compiled || state->without_b210)
+            (!sdr_compiled || state->sdr.without_b210)
                 ? "n/a (no SDR)"
                 : (state->doppler_correction_enabled ? "enabled" : "disabled"));
     fprintf(out, "uplink-nominal-mhz: %.6f\n",
             state->nominal_uplink_frequency_hz / 1e6);
     fprintf(out, "downlink-nominal-mhz: %.6f\n",
             state->nominal_downlink_frequency_hz / 1e6);
-    fprintf(out, "rx-lo-offset-khz: %+.3f\n", state->rx_lo_offset_hz / 1000.0);
+    fprintf(out, "rx-lo-offset-khz: %+.3f\n", state->sdr.rx_lo_offset_hz / 1000.0);
 
     // TX safety / staging gates the operator might have set.
     fprintf(out, "tx-no-tx: %s\n", state->no_tx ? "on (--no-tx)" : "off");
@@ -269,17 +269,17 @@ void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
                 baud_str(state->rot.antenna_rotator.serial_speed));
     }
 
-    fprintf(out, "sdr-type: %s\n", sdr_type_str(state->sdr_type));
+    fprintf(out, "sdr-type: %s\n", sdr_type_str(state->sdr.sdr_type));
 #ifdef SSO_WITH_SDR
-    if (state->rx_session) {
+    if (state->sdr.rx_session) {
         double actual_freq_hz = 0.0;
-        rx_session_snapshot(state->rx_session, NULL, NULL, NULL,
+        rx_session_snapshot(state->sdr.rx_session, NULL, NULL, NULL,
                             &actual_freq_hz, NULL, 0);
         fprintf(out, "sdr: open (%s, tx=%s, rx-freq-mhz=%.6f)\n",
-                rx_session_sdr_name(state->rx_session),
-                rx_session_can_tx(state->rx_session) ? "yes" : "no (RX-only)",
+                rx_session_sdr_name(state->sdr.rx_session),
+                rx_session_can_tx(state->sdr.rx_session) ? "yes" : "no (RX-only)",
                 actual_freq_hz / 1e6);
-    } else if (state->without_b210) {
+    } else if (state->sdr.without_b210) {
         fprintf(out, "sdr: disabled (--without-b210)\n");
     } else if (!state->control_mode) {
         fprintf(out, "sdr: not opened (standalone; SDR opens only with --control)\n");
@@ -443,8 +443,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         // spurs — comfortable range is roughly ±5..±35 kHz: at least
         // 5 kHz to clear DC, and at most ~35 kHz so the ±10 kHz Doppler
         // swing stays inside the 48 kHz post-decim half-band.
-        state->rx_lo_offset_hz = -25000.0;
-        state->rx_gain_db      = 30.0;
+        state->sdr.rx_lo_offset_hz = -25000.0;
+        state->sdr.rx_gain_db      = 30.0;
         // AD9361 background tracking. The visible ~51 Hz comb of impulsive
         // spikes at mid-range gain is from the IQ-balance loop (discrete
         // phase-rotation steps applied to the captured IQ); the DC-offset
@@ -454,8 +454,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         // tracking on (otherwise the static DC bias rotates into a strong
         // +lo_offset_hz sinusoid via fm_lo_nco on the decode path, which
         // dominates the IQ time series).
-        state->rx_dc_offset_track  = 1;
-        state->rx_iq_balance_track = 0;
+        state->sdr.rx_dc_offset_track  = 1;
+        state->sdr.rx_iq_balance_track = 0;
 
         state->rot.run_with_antenna_rotator = 1;
         state->rot.antenna_rotator.device_filename = "/dev/ttyUSB0";
@@ -575,13 +575,13 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         if (strcmp("--without-b210", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--without-b210",
                 "skip the USRP B210 (UI + rotator only)");
-            else { state->n_options++; state->without_b210 = 1; }
+            else { state->n_options++; state->sdr.without_b210 = 1; }
             matched = 1;
         }
         if (strcmp("--no-audio", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--no-audio",
                 "refuse viewer live-audio (--viewer-stream) requests");
-            else { state->n_options++; state->no_audio = 1; }
+            else { state->n_options++; state->sdr.no_audio = 1; }
             matched = 1;
         }
 #ifdef SSO_WITH_SDR
@@ -590,7 +590,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "SDR backend (default auto; RTL-SDR is RX-only)");
             else {
                 state->n_options++;
-                if (sdr_backend_type_from_string(arg + 11, &state->sdr_type) != 0) {
+                if (sdr_backend_type_from_string(arg + 11, &state->sdr.sdr_type) != 0) {
                     fprintf(stderr, "--sdr-type: unknown '%s' "
                             "(want uhd | rtlsdr | auto)\n", arg + 11);
                     return PARSE_ERROR;
@@ -603,7 +603,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "backend device selector (RTL-SDR index; UHD use --uhd-args)");
             else {
                 state->n_options++;
-                snprintf(state->sdr_device, sizeof state->sdr_device, "%s", arg + 13);
+                snprintf(state->sdr.sdr_device, sizeof state->sdr.sdr_device, "%s", arg + 13);
             }
             matched = 1;
         }
@@ -612,7 +612,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "UHD device-args verbatim; overrides detection");
             else {
                 state->n_options++;
-                snprintf(state->uhd_args, sizeof state->uhd_args, "%s", arg + 11);
+                snprintf(state->sdr.uhd_args, sizeof state->sdr.uhd_args, "%s", arg + 11);
             }
             matched = 1;
         }
@@ -621,7 +621,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "force a UHD FPGA image (B2xx clone with non-stock bitstream)");
             else {
                 state->n_options++;
-                snprintf(state->sdr_fpga, sizeof state->sdr_fpga, "%s", arg + 11);
+                snprintf(state->sdr.sdr_fpga, sizeof state->sdr.sdr_fpga, "%s", arg + 11);
             }
             matched = 1;
         }
@@ -641,7 +641,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         if (strcmp("--always-record", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--always-record",
                 "record from B210 open until shutdown (skip per-pass start/stop)");
-            else { state->n_options++; state->always_record = 1; }
+            else { state->n_options++; state->sdr.always_record = 1; }
             matched = 1;
         }
         if (strcmp("--testing", arg) == 0 || help) {
@@ -854,7 +854,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                state->rx_lo_offset_hz = khz * 1000.0;
+                state->sdr.rx_lo_offset_hz = khz * 1000.0;
             }
             matched = 1;
         }
@@ -873,7 +873,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 // state matches what the hardware will use.
                 if (g < 0.0)       g = 0.0;
                 else if (g > 76.0) g = 76.0;
-                state->rx_gain_db = g;
+                state->sdr.rx_gain_db = g;
             }
             matched = 1;
         }
@@ -884,7 +884,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 // on|off|true|false|1|0
                 const char *v = arg + 18;
                 state->n_options++;
-                state->rx_dc_offset_track =
+                state->sdr.rx_dc_offset_track =
                     (strcmp(v, "on")   == 0
                      || strcmp(v, "true") == 0
                      || strcmp(v, "1")  == 0) ? 1 : 0;
@@ -897,7 +897,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
             else {
                 const char *v = arg + 18;
                 state->n_options++;
-                state->rx_iq_balance_track =
+                state->sdr.rx_iq_balance_track =
                     (strcmp(v, "on")   == 0
                      || strcmp(v, "true") == 0
                      || strcmp(v, "1")  == 0) ? 1 : 0;

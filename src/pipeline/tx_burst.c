@@ -308,16 +308,16 @@ void tx_burst_service_request(state_t *state)
                      state->tx_request.summary);
             outcome = "rejected: no HMAC key (see banner)";
             finished = 1;
-        } else if (state->rx_session != NULL && !rx_session_can_tx(state->rx_session)) {
+        } else if (state->sdr.rx_session != NULL && !rx_session_can_tx(state->sdr.rx_session)) {
             // RX-only backend (e.g. RTL-SDR): never reaches the air.
             // Backstop for a stale queued burst that slipped past the
             // compose / auto-tcmd gates.
             snprintf(summary, sizeof summary, "%s", state->tx_request.summary);
             outcome = "rejected: RX-only SDR";
             finished = 1;
-        } else if (state->rx_session != NULL) {
+        } else if (state->sdr.rx_session != NULL) {
             if (!state->tx_inflight) {
-                if (rx_session_submit_burst(state->rx_session, &state->tx_request,
+                if (rx_session_submit_burst(state->sdr.rx_session, &state->tx_request,
                                              state->hmac_key, state->hmac_key_len) == 0) {
                     state->tx_inflight = 1;
                     // Stay pending; we'll poll on subsequent ticks.
@@ -330,7 +330,7 @@ void tx_burst_service_request(state_t *state)
                 }
             } else {
                 rx_burst_result_t br;
-                int done = rx_session_poll_burst(state->rx_session, &br,
+                int done = rx_session_poll_burst(state->sdr.rx_session, &br,
                                                   summary, sizeof summary);
                 if (done == 1) {
                     switch (br) {

@@ -173,14 +173,14 @@ void rx_panel_collect_local(state_t *state, rx_panel_data_t *d)
 {
     memset(d, 0, sizeof *d);
 #ifdef SSO_WITH_SDR
-    d->have_session = (state->rx_session != NULL);
+    d->have_session = (state->sdr.rx_session != NULL);
     if (!d->have_session) return;
-    d->rec_active = rx_session_wav_active(state->rx_session);
+    d->rec_active = rx_session_wav_active(state->sdr.rx_session);
     snprintf(d->sdr_name, sizeof d->sdr_name, "%.31s",
-             rx_session_sdr_name(state->rx_session));
-    d->can_tx = rx_session_can_tx(state->rx_session);
+             rx_session_sdr_name(state->sdr.rx_session));
+    d->can_tx = rx_session_can_tx(state->sdr.rx_session);
     char last[sizeof d->last_frame_summary] = "";
-    rx_session_snapshot(state->rx_session,
+    rx_session_snapshot(state->sdr.rx_session,
                         &d->frames_total,
                         &d->peak_dbfs,
                         &d->rms_dbfs,
@@ -191,12 +191,12 @@ void rx_panel_collect_local(state_t *state, rx_panel_data_t *d)
     // Hardware LO and captured bandwidth so the panel can show the
     // operator where the SDR is actually listening alongside the
     // Doppler-shifted carrier line.
-    d->rx_lo_hz        = rx_session_get_lo_freq_hz(state->rx_session);
-    d->rx_bandwidth_hz = rx_session_get_bandwidth_hz(state->rx_session);
-    d->frames_pcm = rx_session_pcm_frames(state->rx_session);
-    d->frames_vit = rx_session_viterbi_frames(state->rx_session);
+    d->rx_lo_hz        = rx_session_get_lo_freq_hz(state->sdr.rx_session);
+    d->rx_bandwidth_hz = rx_session_get_bandwidth_hz(state->sdr.rx_session);
+    d->frames_pcm = rx_session_pcm_frames(state->sdr.rx_session);
+    d->frames_vit = rx_session_viterbi_frames(state->sdr.rx_session);
     rx_packet_type_stats_t pts[RX_PT_COUNT];
-    rx_session_stats_snapshot(state->rx_session, pts, &d->age_s);
+    rx_session_stats_snapshot(state->sdr.rx_session, pts, &d->age_s);
     for (int s = 0; s < RX_PT_COUNT; ++s) {
         d->pt_count[s]       = pts[s].count;
         d->pt_payload_len[s] = pts[s].last_payload_len;
@@ -247,7 +247,7 @@ void rx_panel_collect_local(state_t *state, rx_panel_data_t *d)
 #ifdef SSO_WITH_SDR
     // A lost SDR outranks the low-disk notice — show it instead so the
     // operator sees immediately that RX has stopped.
-    if (d->have_session && rx_session_device_lost(state->rx_session)) {
+    if (d->have_session && rx_session_device_lost(state->sdr.rx_session)) {
         snprintf(d->warning, sizeof d->warning,
                  "SDR DISCONNECTED - RX stopped (restart to resume RX)");
     }
@@ -293,7 +293,7 @@ void render_rx_panel(const rx_panel_data_t *d,
     // operator can see where the B210 is actually listening: LO ± half
     // the post-decimation bandwidth. The LO sits deliberately off the
     // nominal carrier to keep the signal away from DC after software
-    // Doppler tracking — see state.rx_lo_offset_hz.
+    // Doppler tracking — see state.sdr.rx_lo_offset_hz.
     if (d->rx_lo_hz > 0.0 && d->rx_bandwidth_hz > 0.0) {
         double half_bw_khz = d->rx_bandwidth_hz / 2000.0;
         mvprintw(row++, col, "%15s   %.6f MHz \xc2\xb1%.0f kHz", "LO",

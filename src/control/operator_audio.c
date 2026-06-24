@@ -134,7 +134,7 @@ static void drop_slot(int i)
 static void update_tap(state_t *state)
 {
 #ifdef SSO_WITH_SDR
-    if (state->rx_session) rx_session_set_audio_tap(state->rx_session, g_n > 0);
+    if (state->sdr.rx_session) rx_session_set_audio_tap(state->sdr.rx_session, g_n > 0);
 #else
     (void) state;
 #endif
@@ -154,17 +154,17 @@ void operator_audio_handle_ctl(state_t *state, sso_client_id_t id,
         return;
     }
 
-    if (state->no_audio) {
+    if (state->sdr.no_audio) {
         send_status(srv, id, "unavailable", "audio disabled", 0, 0);
         return;
     }
 
 #ifdef SSO_WITH_SDR
-    if (state->rx_session == NULL) {
+    if (state->sdr.rx_session == NULL) {
         send_status(srv, id, "unavailable", "no receiver", 0, 0);
         return;
     }
-    int sr = (int) lround(rx_session_get_bandwidth_hz(state->rx_session));
+    int sr = (int) lround(rx_session_get_bandwidth_hz(state->sdr.rx_session));
     if (sr <= 0) sr = 96000;
     int    ch = 1;
     double q  = (evt->audio_quality > 0.0) ? evt->audio_quality
@@ -210,10 +210,10 @@ void operator_audio_handle_ctl(state_t *state, sso_client_id_t id,
 void operator_audio_pump(state_t *state)
 {
 #ifdef SSO_WITH_SDR
-    if (g_n == 0 || state->rx_session == NULL) return;
+    if (g_n == 0 || state->sdr.rx_session == NULL) return;
     int16_t pcm[AUDIO_PUMP_BATCH];
     size_t got;
-    while ((got = rx_session_read_audio(state->rx_session, pcm,
+    while ((got = rx_session_read_audio(state->sdr.rx_session, pcm,
                                         AUDIO_PUMP_BATCH)) > 0) {
         for (int i = 0; i < SSO_AUDIO_MAX_SUBS; ++i) {
             if (!g_subs[i].in_use) continue;

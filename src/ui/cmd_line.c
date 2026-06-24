@@ -445,10 +445,10 @@ static void cmd_dispatch(state_t *state)
             else                                   hz = (v < 1e6) ? v * 1e6 : v;
             if (hz < 1e6 || hz > 6e9) {
                 cmd_set_status(state, "freq: '%s' out of [1 MHz, 6 GHz]", arg1);
-            } else if (state->rx_session == NULL) {
+            } else if (state->sdr.rx_session == NULL) {
                 cmd_set_status(state, "freq: no RX session");
             } else {
-                rx_session_request_freq(state->rx_session, hz);
+                rx_session_request_freq(state->sdr.rx_session, hz);
                 cmd_set_status(state, "freq -> %.6f MHz", hz / 1e6);
             }
 #else
@@ -469,7 +469,7 @@ static void cmd_dispatch(state_t *state)
 #ifdef SSO_WITH_SDR
         if (arg1 == NULL) {
             cmd_set_status(state, "spectrum: usage `spectrum <seconds>` (1..600)");
-        } else if (state->rx_session == NULL) {
+        } else if (state->sdr.rx_session == NULL) {
             cmd_set_status(state, "spectrum: no RX session");
         } else {
             double duration_s = atof(arg1);
@@ -487,7 +487,7 @@ static void cmd_dispatch(state_t *state)
                     int64_t n_samples = 0;
                     int  sample_rate = 0;
                     int  wav_active = 0;
-                    rx_session_wav_snapshot(state->rx_session,
+                    rx_session_wav_snapshot(state->sdr.rx_session,
                                             wav_path, sizeof wav_path,
                                             &n_samples, &sample_rate, &wav_active);
                     if (wav_path[0] == '\0' || sample_rate <= 0) {
@@ -534,7 +534,7 @@ static void cmd_dispatch(state_t *state)
                             char iq_path[512] = "";
                             int64_t iq_pairs = 0;
                             int  iq_rate  = 0;
-                            rx_session_iq_snapshot(state->rx_session,
+                            rx_session_iq_snapshot(state->sdr.rx_session,
                                                    iq_path, sizeof iq_path,
                                                    &iq_pairs, &iq_rate);
                             if (iq_path[0] && iq_pairs > 0 && iq_rate > 0) {
@@ -584,12 +584,12 @@ static void cmd_dispatch(state_t *state)
             double khz = atof(arg1);
             if (khz < -45.0 || khz > 45.0) {
                 cmd_set_status(state, "lo_offset: %g kHz out of [-45, +45]", khz);
-            } else if (state->rx_session == NULL) {
+            } else if (state->sdr.rx_session == NULL) {
                 cmd_set_status(state, "lo_offset: no RX session");
             } else {
                 double new_offset_hz = khz * 1000.0;
-                state->rx_lo_offset_hz = new_offset_hz;
-                rx_session_set_lo_offset(state->rx_session,
+                state->sdr.rx_lo_offset_hz = new_offset_hz;
+                rx_session_set_lo_offset(state->sdr.rx_session,
                                          state->nominal_downlink_frequency_hz,
                                          new_offset_hz);
                 cmd_set_status(state, "lo_offset -> %+.1f kHz (PLL glitching, "
@@ -629,22 +629,22 @@ static void cmd_dispatch(state_t *state)
         }
     } else if (strcmp(cmd, "gain") == 0) {
         // Change the AD9361 RX gain mid-pass. The current operating
-        // point lives in state->rx_gain_db; routed through the
+        // point lives in state->sdr.rx_gain_db; routed through the
         // worker thread so we don't touch the UHD streamer from this
         // thread (same handoff as :lo_offset).
         if (arg1 == NULL) {
             cmd_set_status(state, "gain: usage `gain <dB>` (range 0-76; current %.1f)",
-                           state->rx_gain_db);
+                           state->sdr.rx_gain_db);
         } else {
 #ifdef SSO_WITH_SDR
             double g = atof(arg1);
             if (g < 0.0 || g > 76.0) {
                 cmd_set_status(state, "gain: %g dB out of [0, 76]", g);
-            } else if (state->rx_session == NULL) {
+            } else if (state->sdr.rx_session == NULL) {
                 cmd_set_status(state, "gain: no RX session");
             } else {
-                state->rx_gain_db = g;
-                rx_session_set_gain(state->rx_session, g);
+                state->sdr.rx_gain_db = g;
+                rx_session_set_gain(state->sdr.rx_session, g);
                 cmd_set_status(state, "gain -> %.1f dB", g);
             }
 #else

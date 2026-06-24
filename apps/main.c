@@ -237,9 +237,9 @@ int main(int argc, char **argv)
     if (state.self_test) {
         self_test_report(&state, stdout, argc, argv);
 #ifdef SSO_WITH_SDR
-        if (state.rx_session) {
-            rx_session_close(state.rx_session);
-            state.rx_session = NULL;
+        if (state.sdr.rx_session) {
+            rx_session_close(state.sdr.rx_session);
+            state.sdr.rx_session = NULL;
         }
 #endif
         if (state.rot.rot_async != NULL) {
@@ -409,15 +409,15 @@ int main(int argc, char **argv)
         //
         // --always-record disables this gate entirely: recording was
         // started once at rx_session_open and stays open until shutdown.
-        if (state.rx_session && !state.always_record) {
+        if (state.sdr.rx_session && !state.sdr.always_record) {
             double sec_to_aos =
                 state.prediction.predicted_minutes_until_visible * 60.0;
             int visible   = (state.prediction.satellite_ephem.elevation > 0.0);
             int in_preroll = (sec_to_aos > 0.0
                               && sec_to_aos <= RECORDING_PREROLL_S);
-            int active = rx_session_wav_active(state.rx_session);
+            int active = rx_session_wav_active(state.sdr.rx_session);
             if (!active && (visible || in_preroll)) {
-                rx_session_request_wav_start(state.rx_session);
+                rx_session_request_wav_start(state.sdr.rx_session);
                 t_recording_close_at = 0.0;
                 char det[64];
                 snprintf(det, sizeof det,
@@ -432,7 +432,7 @@ int main(int argc, char **argv)
                 } else if (t_recording_close_at == 0.0) {
                     t_recording_close_at = t_now + RECORDING_POSTROLL_S;
                 } else if (t_now >= t_recording_close_at) {
-                    rx_session_request_wav_stop(state.rx_session);
+                    rx_session_request_wav_stop(state.sdr.rx_session);
                     t_recording_close_at = 0.0;
                     sso_audit_event("rec-stop", "trigger=postroll-expired");
                 }
@@ -514,12 +514,12 @@ int main(int argc, char **argv)
         // grab the iq_burst bright-bin count so the renderer can pick
         // a character that distinguishes broadband packets from a CW
         // carrier at the same peak level.
-        if (state.rx_session && (t_now - state.ribbon_last_t) >= 1.0) {
+        if (state.sdr.rx_session && (t_now - state.ribbon_last_t) >= 1.0) {
             double peak = -90.0;
-            rx_session_snapshot(state.rx_session, NULL, &peak, NULL,
+            rx_session_snapshot(state.sdr.rx_session, NULL, &peak, NULL,
                                 NULL, NULL, 0);
             int burst_bins = 0;
-            rx_session_burst_snapshot(state.rx_session, &burst_bins, NULL);
+            rx_session_burst_snapshot(state.sdr.rx_session, &burst_bins, NULL);
             ribbon_push(&state, peak, burst_bins);
             state.ribbon_last_t = t_now;
 
@@ -527,7 +527,7 @@ int main(int argc, char **argv)
             // the same once-per-second cadence as the ribbon. See
             // ui/live_waterfall.c.
             if (state.run_live_waterfall) {
-                live_waterfall_poll(state.rx_session);
+                live_waterfall_poll(state.sdr.rx_session);
             }
         }
         // Software Doppler tracking: the SDR LO stays fixed at the
@@ -538,16 +538,16 @@ int main(int argc, char **argv)
         // lived here previously fired every 1–10 seconds during a
         // pass and caused brief phase resets in the coherent demod
         // chain; this loop runs every tick at full precision.
-        if (state.rx_session && state.doppler_correction_enabled) {
+        if (state.sdr.rx_session && state.doppler_correction_enabled) {
             double offset = state.doppler_downlink_frequency_hz
                           - state.nominal_downlink_frequency_hz;
-            rx_session_set_doppler_offset(state.rx_session, offset);
+            rx_session_set_doppler_offset(state.sdr.rx_session, offset);
         }
-        if (state.rx_session) {
+        if (state.sdr.rx_session) {
             double doppler_offset =
                 state.doppler_downlink_frequency_hz
                 - state.nominal_downlink_frequency_hz;
-            rx_session_update_observer(state.rx_session,
+            rx_session_update_observer(state.sdr.rx_session,
                 state.rot.antenna_rotator.target_azimuth,
                 state.rot.antenna_rotator.target_elevation,
                 state.prediction.satellite_ephem.range_km,
@@ -654,23 +654,23 @@ int main(int argc, char **argv)
     char final_wav_path[512] = "";
     char final_iq_path[512]  = "";
     int  final_iq_rate       = 0;
-    if (state.rx_session) {
+    if (state.sdr.rx_session) {
         // Snapshot both sidecar paths before close so the full-pass
         // renderers can find the closed files on disk. Both paths
         // persist across wav_stop in rx_session.
-        rx_session_wav_snapshot(state.rx_session,
+        rx_session_wav_snapshot(state.sdr.rx_session,
                                 final_wav_path, sizeof final_wav_path,
                                 NULL, NULL, NULL);
-        rx_session_iq_snapshot(state.rx_session,
+        rx_session_iq_snapshot(state.sdr.rx_session,
                                final_iq_path, sizeof final_iq_path,
                                NULL, &final_iq_rate);
         // The worker owns the WAV writer and the B210 core. Closing
         // the session signals the worker to stop, joins it, then
         // tears down both. Any open WAV / .iq gets its header patched
         // (WAV) or its trailer flushed (IQ).
-        rx_session_request_wav_stop(state.rx_session);
-        rx_session_close(state.rx_session);
-        state.rx_session = NULL;
+        rx_session_request_wav_stop(state.sdr.rx_session);
+        rx_session_close(state.sdr.rx_session);
+        state.sdr.rx_session = NULL;
     }
 
     // Any in-flight `:spectrum N` worker is touching the same WAV / IQ
