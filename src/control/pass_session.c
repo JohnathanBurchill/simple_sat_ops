@@ -273,7 +273,7 @@ void setup_pass_folder(state_t *state, double jul_utc_now)
     // --testing: bench run, not a pass. Land the folder under the
     // sibling Testing/ tree using the CURRENT local time so we don't
     // need a TLE / prediction at all.
-    if (state->testing_mode) {
+    if (state->app.testing_mode) {
         time_t now = time(NULL);
         struct tm now_local;
         localtime_r(&now, &now_local);
@@ -618,7 +618,7 @@ int pass_session_load_orbit(state_t *state)
     // /FrontierSat/Operations/<yyyymmdd>/<hhmmLT>/ for it before the tracking
     // loop opens ncurses. Only on --control — the standalone-tracker / dev
     // path leaves Operations/ alone.
-    if (state->control_mode) {
+    if (state->app.control_mode) {
         struct tm utc;
         struct timeval tv;
         UTC_Calendar_Now(&utc, &tv);

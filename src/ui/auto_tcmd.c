@@ -907,7 +907,7 @@ void auto_tcmd_tick(state_t *state) {
     // (the manual compose path has no such guard, which is why it worked
     // out of a pass and auto-tcmd didn't). Skip the guard entirely then.
     double el = state->track.prediction.satellite_ephem.elevation;
-    if (!state->testing_mode
+    if (!state->app.testing_mode
         && el < 0.0
         && state->track.prediction.predicted_minutes_until_visible > 0.5) {
         a->state = AUTO_STATE_PASS_OVER;

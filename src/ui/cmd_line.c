@@ -355,7 +355,7 @@ static void cmd_dispatch(state_t *state)
                        "gain <dB> rs on|off spectrum <sec>");
     } else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0
                || strcmp(cmd, "exit") == 0) {
-        state->running = 0;
+        state->app.running = 0;
         cmd_set_status(&state->cmd, "quitting");
     } else if (strcmp(cmd, "tx") == 0) {
         // Defer the modal until after we leave command-mode so the

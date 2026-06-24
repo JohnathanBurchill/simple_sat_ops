@@ -750,7 +750,7 @@ void report_status(state_t *state, int *print_row, int print_col)
 
     status_panel_t p;
     memset(&p, 0, sizeof p);
-    p.control_mode  = state->control_mode;
+    p.control_mode  = state->app.control_mode;
     p.operator_user = state->op.operator_user;
     p.viewers       = viewers[0] ? viewers : "(none)";
 

@@ -50,7 +50,7 @@ int hw_rotator_open(state_t *state)
         // --self-test is a dry run: a missing rotator must not abort the
         // bring-up, so the configuration report still prints. Outside
         // --self-test this stays fatal.
-        if (!state->self_test) {
+        if (!state->app.self_test) {
             return EXIT_FAILURE;
         }
         fprintf(stderr,
@@ -65,7 +65,7 @@ int hw_rotator_open(state_t *state)
     if (antenna_rotator_async_open(&state->rot.rot_async,
                                     &state->rot.antenna_rotator, 0.5) != 0) {
         fprintf(stderr, "Error spawning antenna rotator worker\n");
-        if (!state->self_test) {
+        if (!state->app.self_test) {
             return EXIT_FAILURE;
         }
         fprintf(stderr,
@@ -190,7 +190,7 @@ void hw_sdr_open(state_t *state)
     // error so a dev host without a device can still run the UI. rx_session
     // takes ownership of the core; we drop our local handle afterwards so main
     // never touches UHD off-thread.
-    if (state->control_mode && !state->sdr.without_b210) {
+    if (state->app.control_mode && !state->sdr.without_b210) {
         // B210 RX rate doubled from the original 240 kHz / sps=5 to
         // 480 kHz / sps=10 (after the integer-5 decimation FIR). That
         // gives the modem_fsk clock-recovery loop the same oversampling
@@ -307,7 +307,7 @@ void hw_sdr_open(state_t *state)
             // state->sdr.always_record and skips itself when this is on.
             // Suppressed under --self-test: the dry run opens the SDR to
             // prove it comes up, but must never write capture files.
-            if (state->sdr.always_record && state->sdr.rx_session && !state->self_test) {
+            if (state->sdr.always_record && state->sdr.rx_session && !state->app.self_test) {
                 rx_session_request_wav_start(state->sdr.rx_session);
                 fprintf(stderr,
                     "simple_sat_ops: --always-record on — WAV/IQ "

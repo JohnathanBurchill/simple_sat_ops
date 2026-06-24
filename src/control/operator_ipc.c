@@ -308,7 +308,7 @@ int ipc_operator_startup(state_t *state, int argc, char **argv)
     // Audit + operator IPC bring-up.
     state->op.operator_user = sso_unix_user();
     sso_audit_start("simple_sat_ops",
-                    state->control_mode ? "operator" : "standalone");
+                    state->app.control_mode ? "operator" : "standalone");
     // Record the exact command line so post-incident review can tie
     // every operator action back to the flags the session was started
     // with (recording mode, --tx settings, TLE, etc.). One line, tab-
@@ -326,7 +326,7 @@ int ipc_operator_startup(state_t *state, int argc, char **argv)
         }
         sso_audit_event("argv", argv_buf);
     }
-    if (state->control_mode) {
+    if (state->app.control_mode) {
         // Refuse if another simple_sat_ops --control is already
         // bound — two operators driving the same SDR / rotator is
         // exactly the failure mode the IPC server existed to avoid.

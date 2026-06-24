@@ -157,7 +157,7 @@ int main(int argc, char **argv)
 
     // Bare invocation found a running operator — run as a read-only
     // viewer and skip the rest of the operator/standalone bring-up.
-    if (state.viewer_mode) {
+    if (state.app.viewer_mode) {
         return run_viewer(argv[0]);
     }
 
@@ -168,10 +168,10 @@ int main(int argc, char **argv)
     // an operator's broadcast when one is. Returns BEFORE the HMAC keyfile
     // load / lint gate / operator bring-up below so none of those run.
     // --viewer-stream --self-test prints the dry-run config and exits 0.
-    if (state.viewer_stream) {
+    if (state.app.viewer_stream) {
         int s = pass_session_load_orbit(&state);
         if (s == 0) {
-            if (state.self_test) {
+            if (state.app.self_test) {
                 self_test_report(&state, stdout, argc, argv);
             } else {
                 s = run_viewer_stream(&state);
@@ -196,7 +196,7 @@ int main(int argc, char **argv)
 
     // Telecommand-agenda lint gate: refuse to start on a --tc-file with lint
     // errors, unless --ignore-at-your-peril-all-tc-errors. See cli_args.c.
-    if ((status = cli_tcmd_lint_gate(&state)) != 0) {
+    if ((status = cli_tcmd_lint_gate(&state.tx)) != 0) {
         return status;
     }
 
@@ -234,7 +234,7 @@ int main(int argc, char **argv)
     // still BEFORE init_window, so ncurses has not taken the screen), tear
     // the bring-up back down, and exit. This is a true end-to-end dry run:
     // it confirms the session would come up without flying a pass.
-    if (state.self_test) {
+    if (state.app.self_test) {
         self_test_report(&state, stdout, argc, argv);
 #ifdef SSO_WITH_SDR
         if (state.sdr.rx_session) {
@@ -277,7 +277,7 @@ int main(int argc, char **argv)
     // it doesn't orphan when a device-loss abort skips normal teardown.
     tui_register_waterfall_pid(live_waterfall_pid_ref());
 
-    state.running = 1;
+    state.app.running = 1;
 
     double current_uplink_frequency = state.track.nominal_uplink_frequency_hz;
     double current_downlink_frequency = state.track.nominal_downlink_frequency_hz;
@@ -350,10 +350,10 @@ int main(int argc, char **argv)
     __attribute__((unused)) const double RECORDING_POSTROLL_S = 60.0;
     __attribute__((unused)) double t_recording_close_at = 0.0;
 
-    while (state.running) {
+    while (state.app.running) {
         // Ctrl-C / SIGTERM: leave the loop and run the normal teardown
         // (endwin, rotator home, device close) instead of dying raw.
-        if (tui_should_quit()) { state.running = 0; break; }
+        if (tui_should_quit()) { state.app.running = 0; break; }
         double t_now = monotonic_seconds();
         UTC_Calendar_Now(&utc, &tv);
         jul_utc = Julian_Date(&utc, &tv);
@@ -587,7 +587,7 @@ int main(int argc, char **argv)
         if (tui_yield_requested()) {
             sso_audit_event("yield-requested",
                             "SIGUSR1 (--force takeover) — exiting");
-            state.running = 0;
+            state.app.running = 0;
         }
 
         // Surface a finished spectrum render so the operator sees the
@@ -601,7 +601,7 @@ int main(int argc, char **argv)
             spectrum_job_reap(&state.ui);
         }
 
-        if (state.running) {
+        if (state.app.running) {
             // The B210 worker thread pumps UHD on its own pthread now,
             // so the main loop doesn't pace itself off the radio. Sleep
             // at the historical 2 Hz so rotator-STATUS polls don't ramp

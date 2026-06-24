@@ -57,7 +57,7 @@ void input_handle_keys(state_t *state, int *keyboard_unlocked)
                 cmd_enter(&state->cmd);
                 break;
             case 'q':
-                state->running = 0;
+                state->app.running = 0;
                 break;
             case 'T':
                 if (state->scan.mode) {

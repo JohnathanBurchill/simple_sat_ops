@@ -21,6 +21,7 @@
 #ifndef STATE_H
 #define STATE_H
 
+#include "app_state.h"
 #include "op_state.h"
 #include "rot_state.h"
 #include "sdr_state.h"
@@ -39,25 +40,17 @@
 #define MAX_TLE_LINE_LENGTH 128
 #define TRACKING_PREP_TIME_MINUTES 5.0
 
-// SDR-only state. The CAT-radio + ALSA-audio fields are gone; the B210
-// is now driven externally by b210_rx_tx / tx_frame_sdr, which talk
-// to simple_sat_ops over the sso_ipc socket for operator coordination.
-// What remains here is the satellite tracker, the rotator, and the
-// nominal/Doppler-shifted frequency outputs computed for display + IPC
-// broadcast.
+// The single shared context, now a composition of per-subsystem sub-structs
+// (each defined in its own <name>_state.h). A function takes a pointer to
+// just the part it needs — &state.rot, &state.tx, ... — instead of the whole
+// state_t, so its reach is bounded to that subsystem; only the orchestrators
+// (the main loop, apply_args, the colon-command dispatcher, the renderers)
+// still take state_t* because they genuinely coordinate across subsystems.
 typedef struct state
 {
-    // General
-    int n_options;
-    int running;
-    int verbose_level;
-
-    // Run mode + one-shot CLI flags (set once in apply_args / main).
-    int control_mode;        // --control: this process is the operator
-    int viewer_mode;         // bare invocation found a running operator
-    int viewer_stream;       // --viewer-stream: headless JSON stream to stdout
-    int self_test;           // --self-test: print a report and exit
-    int testing_mode;        // --testing
+    // Process run-mode flags (running, verbosity, --control / --self-test /
+    // ...). See app_state.h.
+    app_t app;
 
     // Operator: IPC fan-out server + user, last broadcast snapshot, pass
     // output folder, low-disk warning. See op_state.h.

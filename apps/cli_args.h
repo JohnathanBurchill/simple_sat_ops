@@ -55,7 +55,7 @@ void cli_load_hmac_keyfile(tx_t *tx);
 // Lint the --tc-file agenda (if any) against the firmware telecommand set
 // before any PA-keying bring-up. Returns 0 to continue, EXIT_FAILURE on lint
 // errors unless --ignore-at-your-peril-all-tc-errors is set.
-int cli_tcmd_lint_gate(const state_t *state);
+int cli_tcmd_lint_gate(const tx_t *tx);
 
 #ifdef __cplusplus
 }
