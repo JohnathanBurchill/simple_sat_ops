@@ -375,8 +375,8 @@ static void cmd_dispatch(state_t *state)
         start_tracking(state);
         cmd_set_status(state, "tracking on");
         sso_audit_event("track-on",
-            state->prediction.satellite_ephem.tle.sat_name[0]
-                ? state->prediction.satellite_ephem.tle.sat_name : "");
+            state->track.prediction.satellite_ephem.tle.sat_name[0]
+                ? state->track.prediction.satellite_ephem.tle.sat_name : "");
     } else if (strcmp(cmd, "stop") == 0) {
         stop_tracking(state);
         cmd_set_status(state, "tracking stopped");
@@ -396,9 +396,9 @@ static void cmd_dispatch(state_t *state)
         } else {
             int rc = retarget_to_tle(state, expanded);
             const char *name =
-                state->prediction.satellite_ephem.tle.sat_name;
+                state->track.prediction.satellite_ephem.tle.sat_name;
             double mins =
-                state->prediction.predicted_minutes_until_visible;
+                state->track.prediction.predicted_minutes_until_visible;
             switch (rc) {
             case RETARGET_OK:
                 if (mins > 0.0) {
@@ -590,7 +590,7 @@ static void cmd_dispatch(state_t *state)
                 double new_offset_hz = khz * 1000.0;
                 state->sdr.rx_lo_offset_hz = new_offset_hz;
                 rx_session_set_lo_offset(state->sdr.rx_session,
-                                         state->nominal_downlink_frequency_hz,
+                                         state->track.nominal_downlink_frequency_hz,
                                          new_offset_hz);
                 cmd_set_status(state, "lo_offset -> %+.1f kHz (PLL glitching, "
                                "decode resumes shortly)", khz);

@@ -195,11 +195,11 @@ void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
     // TLE — loaded by the time this prints, so report the satellite the
     // bring-up actually selected plus the file it came from.
     fprintf(out, "tle: %s (file=%s)\n",
-            state->prediction.satellite_ephem.tle.sat_name[0]
-                ? state->prediction.satellite_ephem.tle.sat_name
+            state->track.prediction.satellite_ephem.tle.sat_name[0]
+                ? state->track.prediction.satellite_ephem.tle.sat_name
                 : "(no satellite loaded)",
-            state->prediction.tles_filename
-                ? state->prediction.tles_filename
+            state->track.prediction.tles_filename
+                ? state->track.prediction.tles_filename
                 : "(none)");
 
     // HMAC --- the operator's banner-and-sign state. CTS1 firmware
@@ -214,7 +214,7 @@ void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
             state->hmac_key_len);
 
     // Doppler --- both the display correction and the TX-side burst
-    // staging key off state->doppler_correction_enabled. On by
+    // staging key off state->track.doppler_correction_enabled. On by
     // default; --no-doppler-correction clears it. Report RX and TX
     // separately so the operator can see where the correction is
     // applied: RX is software (sw_nco on post-decim IQ, no hardware
@@ -223,18 +223,18 @@ void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
     // hardware (b210_rx_tx_core_burst tunes the B210 LO to the
     // Doppler-corrected frequency for every burst).
     fprintf(out, "doppler-correction: %s\n",
-            state->doppler_correction_enabled ? "enabled (default)"
+            state->track.doppler_correction_enabled ? "enabled (default)"
                                               : "DISABLED (--no-doppler-correction)");
     fprintf(out, "doppler-rx: %s (software sw_nco on post-decim IQ; hardware LO fixed)\n",
-            state->doppler_correction_enabled ? "enabled" : "disabled");
+            state->track.doppler_correction_enabled ? "enabled" : "disabled");
     fprintf(out, "doppler-tx: %s (hardware SDR LO retune per burst, f=carrier/(1-rr/c))\n",
             (!sdr_compiled || state->sdr.without_b210)
                 ? "n/a (no SDR)"
-                : (state->doppler_correction_enabled ? "enabled" : "disabled"));
+                : (state->track.doppler_correction_enabled ? "enabled" : "disabled"));
     fprintf(out, "uplink-nominal-mhz: %.6f\n",
-            state->nominal_uplink_frequency_hz / 1e6);
+            state->track.nominal_uplink_frequency_hz / 1e6);
     fprintf(out, "downlink-nominal-mhz: %.6f\n",
-            state->nominal_downlink_frequency_hz / 1e6);
+            state->track.nominal_downlink_frequency_hz / 1e6);
     fprintf(out, "rx-lo-offset-khz: %+.3f\n", state->sdr.rx_lo_offset_hz / 1000.0);
 
     // TX safety / staging gates the operator might have set.
@@ -299,11 +299,11 @@ void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
     // Observer location. apply_args stored these in radians on the
     // ephem struct — convert back to degrees for the report.
     fprintf(out, "observer-lat-deg: %.6f\n",
-            state->prediction.observer_ephem.position_geodetic.lat * 180.0 / M_PI);
+            state->track.prediction.observer_ephem.position_geodetic.lat * 180.0 / M_PI);
     fprintf(out, "observer-lon-deg: %.6f\n",
-            state->prediction.observer_ephem.position_geodetic.lon * 180.0 / M_PI);
+            state->track.prediction.observer_ephem.position_geodetic.lon * 180.0 / M_PI);
     fprintf(out, "observer-alt-m: %.1f\n",
-            state->prediction.observer_ephem.position_geodetic.alt * 1000.0);
+            state->track.prediction.observer_ephem.position_geodetic.alt * 1000.0);
 
     fprintf(out, "self-test: ok\n");
     fflush(out);
@@ -417,7 +417,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         // that runs apply_args can't get a half-initialised struct (these
         // used to be split between here and main()). Set before the parse
         // loop below, which overrides whatever the operator passed.
-        state->prediction.predicted_max_elevation = -180.0;
+        state->track.prediction.predicted_max_elevation = -180.0;
         // Seed the TX-compose "remembered" draft: the CTS1 prefix and 80 dB.
         snprintf(state->tx_last_payload, sizeof state->tx_last_payload, "CTS1+");
         snprintf(state->tx_last_power,   sizeof state->tx_last_power,   "80.0");
@@ -428,13 +428,13 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         state->tx_preroll_ms      = 200;
 
         state->rot.antenna_rotator.tracking_prep_time_minutes = TRACKING_PREP_TIME_MINUTES;
-        state->satellite_tracking = 0;
+        state->track.satellite_tracking = 0;
 
-        state->nominal_uplink_frequency_hz = UPLINK_FREQ_MHZ * 1e6;
-        state->nominal_downlink_frequency_hz = DOWNLINK_FREQ_MHZ * 1e6;
-        state->doppler_uplink_frequency_hz = state->nominal_uplink_frequency_hz;
-        state->doppler_downlink_frequency_hz = state->nominal_downlink_frequency_hz;
-        state->doppler_correction_enabled = 1;
+        state->track.nominal_uplink_frequency_hz = UPLINK_FREQ_MHZ * 1e6;
+        state->track.nominal_downlink_frequency_hz = DOWNLINK_FREQ_MHZ * 1e6;
+        state->track.doppler_uplink_frequency_hz = state->track.nominal_uplink_frequency_hz;
+        state->track.doppler_downlink_frequency_hz = state->track.nominal_downlink_frequency_hz;
+        state->track.doppler_correction_enabled = 1;
         // SIGNED LO offset from the nominal carrier. Positive → LO ABOVE
         // nominal (signal lands at negative baseband). Negative → LO
         // BELOW nominal (signal at positive baseband). Default -25 kHz
@@ -754,7 +754,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                     return PARSE_ERROR;
                 }
                 state->n_options += 2;
-                state->prediction.tles_filename = tle_path_resolve(argv[t + 2]);
+                state->track.prediction.tles_filename = tle_path_resolve(argv[t + 2]);
                 ++t;
             }
             matched = 1;
@@ -819,7 +819,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                state->nominal_uplink_frequency_hz = mhz * 1e6;
+                state->track.nominal_uplink_frequency_hz = mhz * 1e6;
             }
             matched = 1;
         }
@@ -833,14 +833,14 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                state->nominal_downlink_frequency_hz = mhz * 1e6;
+                state->track.nominal_downlink_frequency_hz = mhz * 1e6;
             }
             matched = 1;
         }
         if (strcmp("--no-doppler-correction", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--no-doppler-correction",
                 "display nominal freqs without Doppler");
-            else { state->n_options++; state->doppler_correction_enabled = 0; }
+            else { state->n_options++; state->track.doppler_correction_enabled = 0; }
             matched = 1;
         }
         if (strncmp("--lo-offset=", arg, 12) == 0 || help) {
@@ -1153,11 +1153,11 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         return PARSE_OK;
     }
 
-    state->prediction.observer_ephem.position_geodetic.lat =
+    state->track.prediction.observer_ephem.position_geodetic.lat =
         site_latitude * M_PI / 180.0;
-    state->prediction.observer_ephem.position_geodetic.lon =
+    state->track.prediction.observer_ephem.position_geodetic.lon =
         site_longitude * M_PI / 180.0;
-    state->prediction.observer_ephem.position_geodetic.alt =
+    state->track.prediction.observer_ephem.position_geodetic.alt =
         site_altitude / 1000.0;
 
     // Resolve the TLE file when it wasn't given with --tle: the ground
@@ -1168,7 +1168,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
     // later pins this source file (under its original tle-YYYYMMDD.tle name)
     // into the pass folder once AOS is known; --viewer-stream just
     // propagates it for the stream.
-    if (state->prediction.tles_filename == NULL) {
+    if (state->track.prediction.tles_filename == NULL) {
         const char *tles_root = sso_tles_dir();
         static char src_tle[1024];
         time_t src_mtime = 0;
@@ -1180,7 +1180,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
             return PARSE_ERROR;
         }
         fprintf(stderr, "simple_sat_ops: using TLE %s\n", src_tle);
-        state->prediction.tles_filename = tle_path_resolve(src_tle);
+        state->track.prediction.tles_filename = tle_path_resolve(src_tle);
     }
 
     // Resolve the satellite: an explicit name on the command line wins;
@@ -1188,26 +1188,26 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
     // name here (rather than leaving it NULL) is what keeps --self-test and
     // the no-name forms from ever feeding a NULL into the TLE search.
     if (positional != NULL) {
-        state->prediction.satellite_ephem.name = positional;
+        state->track.prediction.satellite_ephem.name = positional;
     } else {
         static char sat_name[64];
-        if (read_tle_name(state->prediction.tles_filename,
+        if (read_tle_name(state->track.prediction.tles_filename,
                           sat_name, sizeof sat_name) != 0) {
             fprintf(stderr,
                 "simple_sat_ops: %s has no name line (2-line TLE?); "
                 "pass the satellite name explicitly\n",
-                state->prediction.tles_filename);
+                state->track.prediction.tles_filename);
             return PARSE_ERROR;
         }
-        state->prediction.satellite_ephem.name = sat_name;
+        state->track.prediction.satellite_ephem.name = sat_name;
         fprintf(stderr, "simple_sat_ops: tracking '%s'\n", sat_name);
     }
 
     // An explicit "next" picks the soonest matching pass. The name is always
     // set by the block above; the NULL guard is just belt-and-braces.
-    if (state->prediction.satellite_ephem.name != NULL
-        && strcmp(state->prediction.satellite_ephem.name, "next") == 0) {
-        state->prediction.auto_sat = 1;
+    if (state->track.prediction.satellite_ephem.name != NULL
+        && strcmp(state->track.prediction.satellite_ephem.name, "next") == 0) {
+        state->track.prediction.auto_sat = 1;
         criteria_t criteria = {
             .min_altitude_km = min_altitude_km,
             .max_altitude_km = max_altitude_km,
@@ -1220,13 +1220,13 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
             .with_constellations = with_constellations,
         };
         prediction_t prediction_tmp = {0};
-        prediction_tmp.tles_filename = state->prediction.tles_filename;
+        prediction_tmp.tles_filename = state->track.prediction.tles_filename;
         prediction_tmp.observer_ephem.position_geodetic.lat =
-            state->prediction.observer_ephem.position_geodetic.lat;
+            state->track.prediction.observer_ephem.position_geodetic.lat;
         prediction_tmp.observer_ephem.position_geodetic.lon =
-            state->prediction.observer_ephem.position_geodetic.lon;
+            state->track.prediction.observer_ephem.position_geodetic.lon;
         prediction_tmp.observer_ephem.position_geodetic.alt =
-            state->prediction.observer_ephem.position_geodetic.alt;
+            state->track.prediction.observer_ephem.position_geodetic.alt;
         find_passes(&prediction_tmp, jul_utc, 0.5, &criteria, NULL, NULL, 0, 0);
         const size_t n = number_of_passes();
         if (n == 0) {
@@ -1240,8 +1240,8 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         // whole run. ephemeres_t.name has no consistent owner (elsewhere it
         // points at argv or a static), so we don't free it here — it is
         // reclaimed at process exit.
-        state->prediction.satellite_ephem.name = strdup(p->name);
-        printf("Satellite: %s\n", state->prediction.satellite_ephem.name);
+        state->track.prediction.satellite_ephem.name = strdup(p->name);
+        printf("Satellite: %s\n", state->track.prediction.satellite_ephem.name);
     }
 
     return PARSE_OK;

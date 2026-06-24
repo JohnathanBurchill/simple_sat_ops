@@ -545,7 +545,7 @@ int main(int argc, char **argv)
     // --tle / --tle= wrote here in the old loop; carry it across so the
     // catalog-scan / explicit-TLE branches see it (the named form below
     // overwrites it when no --tle was given).
-    state.prediction.tles_filename = cfg.tles_filename;
+    state.track.prediction.tles_filename = cfg.tles_filename;
 
     if (trajectory_id != NULL && tle_explicit) {
         fprintf(stderr, "--tle= and --trajectory-id= are mutually exclusive\n");
@@ -592,7 +592,7 @@ int main(int argc, char **argv)
                 satellite_name, satellite_name);
             return EXIT_FAILURE;
         }
-        state.prediction.tles_filename = tle_path_resolve(named_tle);
+        state.track.prediction.tles_filename = tle_path_resolve(named_tle);
     } else if (n_positional == 2 || n_positional == 3) {
         // Catalog-scan form: <min_alt_km> <max_alt_km> [<satellite_name>].
         min_altitude_km = atof(positionals[0]);
@@ -610,13 +610,13 @@ int main(int argc, char **argv)
         max_minutes_away = 1440 * 14;  // two weeks for trajectory planning
     }
 
-    if (trajectory_id == NULL && state.prediction.tles_filename == NULL) {
+    if (trajectory_id == NULL && state.track.prediction.tles_filename == NULL) {
         static char default_tle[1024];
         if (tle_default_path(default_tle, sizeof(default_tle)) != 0) {
             fprintf(stderr, "HOME unset or path too long; pass --tle=<path>\n");
             return EXIT_FAILURE;
         }
-        state.prediction.tles_filename = tle_path_resolve(default_tle);
+        state.track.prediction.tles_filename = tle_path_resolve(default_tle);
     }
 
     // Load OEM if --trajectory-id was given. Table lives on the stack and
@@ -626,8 +626,8 @@ int main(int argc, char **argv)
         if (oem_load_from_ssm(trajectory_id, &oem) != 0) {
             return EXIT_FAILURE;
         }
-        state.prediction.oem = &oem;
-        state.prediction.satellite_ephem.name = oem.object_name[0]
+        state.track.prediction.oem = &oem;
+        state.track.prediction.satellite_ephem.name = oem.object_name[0]
                                               ? oem.object_name : (char *)"UNKNOWN";
         double window_min = (oem.stop_jul_utc - oem.start_jul_utc) * 1440.0;
         if (max_minutes_away > window_min) {
@@ -643,9 +643,9 @@ int main(int argc, char **argv)
     }
 
     /* Set up observer location */
-    state.prediction.observer_ephem.position_geodetic.lat = site_latitude * M_PI / 180.0;
-    state.prediction.observer_ephem.position_geodetic.lon = site_longitude * M_PI / 180.0;
-    state.prediction.observer_ephem.position_geodetic.alt = site_altitude / 1000.0;
+    state.track.prediction.observer_ephem.position_geodetic.lat = site_latitude * M_PI / 180.0;
+    state.track.prediction.observer_ephem.position_geodetic.lon = site_longitude * M_PI / 180.0;
+    state.track.prediction.observer_ephem.position_geodetic.alt = site_altitude / 1000.0;
 
     double jul_utc;
     if (t0_str != NULL) {
@@ -680,7 +680,7 @@ int main(int argc, char **argv)
                trajectory_id,
                oem.object_name[0] ? oem.object_name : "UNKNOWN");
     } else {
-        printf("Checking %s for upcoming ", state.prediction.tles_filename);
+        printf("Checking %s for upcoming ", state.track.prediction.tles_filename);
     }
     if (satellite_name != NULL) {
         printf("%s", satellite_name);
@@ -716,7 +716,7 @@ int main(int argc, char **argv)
     // TLE plus --list returns just one pass even though we have 7 days
     // of orbits to find passes in.
     int find_all = (list_all || satellite_name != NULL || trajectory_id != NULL) ? 1 : 0;
-    (void) find_passes(&state.prediction, jul_utc, 1.0, &criteria, &count, &number_checked, reverse, find_all);
+    (void) find_passes(&state.track.prediction, jul_utc, 1.0, &criteria, &count, &number_checked, reverse, find_all);
     const size_t n_passes = number_of_passes();
 
     // Satellite radio-info annotation. Only loaded if the user asked for
@@ -724,13 +724,13 @@ int main(int argc, char **argv)
     // file path from. Not applicable to the OEM / trajectory path.
     satellite_status_t *sat_info = NULL;
     int n_entries = 0;
-    if (show_radio_info && state.prediction.tles_filename != NULL) {
+    if (show_radio_info && state.track.prediction.tles_filename != NULL) {
         char radios_file[FILENAME_MAX];
-        const char *slash = strrchr(state.prediction.tles_filename, '/');
+        const char *slash = strrchr(state.track.prediction.tles_filename, '/');
         if (slash != NULL) {
-            int dir_len = (int)(slash - state.prediction.tles_filename);
+            int dir_len = (int)(slash - state.track.prediction.tles_filename);
             snprintf(radios_file, sizeof(radios_file),
-                     "%.*s/active_radios.txt", dir_len, state.prediction.tles_filename);
+                     "%.*s/active_radios.txt", dir_len, state.track.prediction.tles_filename);
         } else {
             snprintf(radios_file, sizeof(radios_file), "active_radios.txt");
         }

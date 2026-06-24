@@ -211,7 +211,7 @@ void hw_sdr_open(state_t *state)
             // negative → LO below (signal at positive baseband). Default
             // -25 kHz keeps existing pipelines unchanged; operator can
             // shift to dodge fixed-pattern noise.
-            .freq_hz         = state->nominal_downlink_frequency_hz
+            .freq_hz         = state->track.nominal_downlink_frequency_hz
                              + state->sdr.rx_lo_offset_hz,
             .rate_hz         = 480000.0,
             .gain_db         = state->sdr.rx_gain_db,
@@ -287,9 +287,9 @@ void hw_sdr_open(state_t *state)
                 .show_packet_headers = 0,
                 .pass_folder       = state->pass_folder[0] ? state->pass_folder : NULL,
                 .want_wav          = 1,
-                .tle_path          = state->prediction.tles_filename,
-                .sat_name          = state->prediction.satellite_ephem.tle.sat_name[0]
-                                     ? state->prediction.satellite_ephem.tle.sat_name
+                .tle_path          = state->track.prediction.tles_filename,
+                .sat_name          = state->track.prediction.satellite_ephem.tle.sat_name[0]
+                                     ? state->track.prediction.satellite_ephem.tle.sat_name
                                      : NULL,
                 .session_dir       = state->pass_folder[0] ? state->pass_folder : NULL,
                 .lo_offset_hz      = state->sdr.rx_lo_offset_hz,

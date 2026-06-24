@@ -168,7 +168,7 @@ void scan_sky_start(state_t *state)
     state->scan.dwell_start_s = 0.0;
     // Make sure no concurrent satellite-tracking logic competes for
     // the rotator.
-    state->satellite_tracking         = 0;
+    state->track.satellite_tracking         = 0;
     state->rot.antenna_rotator.tracking   = 0;
     state->rot.antenna_rotator.flip_mode_pass     = 0;
     state->rot.antenna_rotator.flip_decision_made = 0;

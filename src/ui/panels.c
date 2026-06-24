@@ -435,7 +435,7 @@ void render_ribbon_vertical(const rx_panel_data_t *d,
 }
 
 // Pure-render predictions panel — operator runs the SGP4 search
-// upstream, viewer fills state.prediction from broadcast. No SGP4
+// upstream, viewer fills state.track.prediction from broadcast. No SGP4
 // calls inside, no current-time reads, so both sides paint the same
 // thing for the same input state.
 void render_predictions_panel(state_t *state, double jul_utc,
@@ -457,29 +457,29 @@ void render_predictions_panel(state_t *state, double jul_utc,
 
     row++;
     mvprintw(row++, col, "%15s   %s (%s)", "satellite",
-             state->prediction.satellite_ephem.tle.sat_name,
-             state->prediction.satellite_ephem.tle.idesg);
+             state->track.prediction.satellite_ephem.tle.sat_name,
+             state->track.prediction.satellite_ephem.tle.idesg);
     clrtoeol();
-    if (state->prediction.minutes_since_epoch / 1440.0 >= WARN_DAYS_SINCE_EPOCH) {
+    if (state->track.prediction.minutes_since_epoch / 1440.0 >= WARN_DAYS_SINCE_EPOCH) {
         attron(COLOR_PAIR(2));
     }
     char epoch_age[40];
-    format_age_compact(state->prediction.minutes_since_epoch * 60.0,
+    format_age_compact(state->track.prediction.minutes_since_epoch * 60.0,
                        epoch_age, sizeof epoch_age);
     mvprintw(row++, col, "%15s   %s", "epoch age", epoch_age);
-    if (state->prediction.minutes_since_epoch / 1440.0 >= WARN_DAYS_SINCE_EPOCH) {
+    if (state->track.prediction.minutes_since_epoch / 1440.0 >= WARN_DAYS_SINCE_EPOCH) {
         attroff(COLOR_PAIR(2));
     }
     clrtoeol();
 
     // "status" is the satellite's true geometry: is it above the local
-    // horizon right now? This used to key off state->in_pass, but that is
+    // horizon right now? This used to key off state->track.in_pass, but that is
     // really a rotator pre-position flag (set only when tracking is armed
     // AND within tracking_prep_time_minutes of AOS), so it read "NOT in
     // pass" with the satellite plainly overhead whenever tracking wasn't
     // armed -- and disagreed with the viewer, which keys off elevation. The
     // rotator's own state now lives on its own line below.
-    double live_el = state->prediction.satellite_ephem.elevation;
+    double live_el = state->track.prediction.satellite_ephem.elevation;
     if (live_el > 0.0) {
         attron(COLOR_PAIR(3));
         mvprintw(row++, col, "%15s   ** SATELLITE UP ** (el %.1f deg)",
@@ -513,7 +513,7 @@ void render_predictions_panel(state_t *state, double jul_utc,
             snprintf(rot, sizeof rot,
                      "TRACKING satellite  (pointing error %.1f deg)", err);
             rot_color = 3;
-        } else if (state->satellite_tracking) {
+        } else if (state->track.satellite_tracking) {
             snprintf(rot, sizeof rot, "armed (will track at AOS)");
             rot_color = 2;
         } else if (state->rot.antenna_rotator.fixed_target) {
@@ -527,8 +527,8 @@ void render_predictions_panel(state_t *state, double jul_utc,
         clrtoeol();
     }
 
-    if (state->prediction.predicted_minutes_until_visible > 0) {
-        double minutes_until = state->prediction.predicted_minutes_until_visible;
+    if (state->track.prediction.predicted_minutes_until_visible > 0) {
+        double minutes_until = state->track.prediction.predicted_minutes_until_visible;
         time_t aos_t = time(NULL) + (time_t)(minutes_until * 60.0);
         struct tm aos_local;
         localtime_r(&aos_t, &aos_local);
@@ -550,59 +550,59 @@ void render_predictions_panel(state_t *state, double jul_utc,
     } else {
         mvprintw(row++, col, "%15s   ", "elapsed time");
         attron(COLOR_PAIR(3));
-        if (fabs(state->prediction.predicted_minutes_until_visible) < 1) {
+        if (fabs(state->track.prediction.predicted_minutes_until_visible) < 1) {
             printw("%.0f seconds",
-                   floor(-state->prediction.predicted_minutes_until_visible * 60.0));
+                   floor(-state->track.prediction.predicted_minutes_until_visible * 60.0));
         } else {
             printw("%.1f minutes",
-                   -state->prediction.predicted_minutes_until_visible);
+                   -state->track.prediction.predicted_minutes_until_visible);
         }
         attroff(COLOR_PAIR(3));
         clrtoeol();
     }
     mvprintw(row++, col, "%15s   %.1f minutes", "duration",
-             state->prediction.predicted_minutes_above_0_degrees);
+             state->track.prediction.predicted_minutes_above_0_degrees);
     clrtoeol();
     mvprintw(row++, col, "%15s   %.1f minutes", "el>30",
-             state->prediction.predicted_minutes_above_30_degrees);
+             state->track.prediction.predicted_minutes_above_30_degrees);
     clrtoeol();
     mvprintw(row++, col, "%15s   %.1f deg", "max elevation",
-             state->prediction.predicted_max_elevation);
+             state->track.prediction.predicted_max_elevation);
     clrtoeol();
 
     *print_row = row;
 }
 
 // SGP4 work that report_predictions used to do inline. Operator calls
-// this each tick so its state->prediction.predicted_* fields are
+// this each tick so its state->track.prediction.predicted_* fields are
 // fresh before render + broadcast.
-void compute_predictions(state_t *state, double jul_utc)
+void compute_predictions(track_t *track, double jul_utc)
 {
-    minutes_until_visible(&state->prediction, jul_utc,
+    minutes_until_visible(&track->prediction, jul_utc,
                           jul_utc + MAX_MINUTES_TO_PREDICT / 1440.0, 1.0);
-    if (fabs(state->prediction.predicted_minutes_until_visible) < 1) {
-        minutes_until_visible(&state->prediction, jul_utc,
+    if (fabs(track->prediction.predicted_minutes_until_visible) < 1) {
+        minutes_until_visible(&track->prediction, jul_utc,
                               jul_utc + 2.0 / 1440.0, 1. / 120.0);
-    } else if (fabs(state->prediction.predicted_minutes_until_visible) < 10) {
-        minutes_until_visible(&state->prediction, jul_utc,
+    } else if (fabs(track->prediction.predicted_minutes_until_visible) < 10) {
+        minutes_until_visible(&track->prediction, jul_utc,
                               jul_utc + 20.0 / 1440.0, 0.1);
     }
-    if (state->prediction.predicted_minutes_until_visible > 0) {
-        update_pass_predictions(&state->prediction,
-            jul_utc + state->prediction.predicted_minutes_until_visible / 1440.0,
+    if (track->prediction.predicted_minutes_until_visible > 0) {
+        update_pass_predictions(&track->prediction,
+            jul_utc + track->prediction.predicted_minutes_until_visible / 1440.0,
             0.1);
-    } else if (state->prediction.predicted_max_elevation == -180.0) {
+    } else if (track->prediction.predicted_max_elevation == -180.0) {
         // Started mid-pass: walk back to AOS so update_pass_predictions
         // captures the true max elevation rather than just the remainder.
-        update_pass_predictions(&state->prediction,
-            jul_utc + state->prediction.predicted_minutes_until_visible / 1440.0,
+        update_pass_predictions(&track->prediction,
+            jul_utc + track->prediction.predicted_minutes_until_visible / 1440.0,
             0.1);
     }
 }
 
 void report_predictions(state_t *state, double jul_utc, int *print_row, int print_col)
 {
-    compute_predictions(state, jul_utc);
+    compute_predictions(&state->track, jul_utc);
     render_predictions_panel(state, jul_utc, print_row, print_col);
 }
 
@@ -754,8 +754,8 @@ void report_status(state_t *state, int *print_row, int print_col)
     p.operator_user = state->operator_user;
     p.viewers       = viewers[0] ? viewers : "(none)";
 
-    double display_dl_hz = state->doppler_downlink_frequency_hz;
-    if (display_dl_hz == 0.0) display_dl_hz = state->nominal_downlink_frequency_hz;
+    double display_dl_hz = state->track.doppler_downlink_frequency_hz;
+    if (display_dl_hz == 0.0) display_dl_hz = state->track.nominal_downlink_frequency_hz;
     p.carrier_hz = display_dl_hz;
 
     p.hmac_path   = state->hmac_keyfile_path;
@@ -805,7 +805,7 @@ void report_status(state_t *state, int *print_row, int print_col)
     render_status_panel(&p, print_row, print_col);
 }
 
-void report_position(state_t *state, int *print_row, int print_col)
+void report_position(track_t *track, int *print_row, int print_col)
 {
     if (print_row == NULL) {
         return;
@@ -814,28 +814,28 @@ void report_position(state_t *state, int *print_row, int print_col)
     int col = print_col;
 
     mvprintw(row++, col, "%15s   %.2f deg", "azimuth",
-             state->prediction.satellite_ephem.azimuth);
+             track->prediction.satellite_ephem.azimuth);
     clrtoeol();
     mvprintw(row++, col, "%15s   %.2f deg", "elevation",
-             state->prediction.satellite_ephem.elevation);
+             track->prediction.satellite_ephem.elevation);
     clrtoeol();
     mvprintw(row++, col, "%15s   %.2f km", "altitude",
-             state->prediction.satellite_ephem.altitude_km);
+             track->prediction.satellite_ephem.altitude_km);
     clrtoeol();
     mvprintw(row++, col, "%15s   %.1f deg N", "latitude",
-             state->prediction.satellite_ephem.latitude);
+             track->prediction.satellite_ephem.latitude);
     clrtoeol();
     mvprintw(row++, col, "%15s   %.1f deg E", "longitude",
-             state->prediction.satellite_ephem.longitude);
+             track->prediction.satellite_ephem.longitude);
     clrtoeol();
     mvprintw(row++, col, "%15s   %.2f km/s", "speed",
-             state->prediction.satellite_ephem.speed_km_s);
+             track->prediction.satellite_ephem.speed_km_s);
     clrtoeol();
     mvprintw(row++, col, "%15s   %.1f km", "range",
-             state->prediction.satellite_ephem.range_km);
+             track->prediction.satellite_ephem.range_km);
     clrtoeol();
     mvprintw(row++, col, "%15s   %.2f km/s", "range rate",
-             state->prediction.satellite_ephem.range_rate_km_s);
+             track->prediction.satellite_ephem.range_rate_km_s);
     clrtoeol();
 
     *print_row = row;
@@ -920,7 +920,7 @@ void render_operator_screen(state_t *state, double jul_utc, double t_now,
     report_status(state, &row, col);
     row = 5;
     col = 50;
-    report_position(state, &row, col);
+    report_position(&state->track, &row, col);
     row++;
     // Refresh the low-disk warning lazily -- statvfs every 30 s is plenty
     // given how slowly disk fills.

@@ -28,6 +28,7 @@
 #define CONTROL_TRACKING_H
 
 #include "rot_state.h"
+#include "track_state.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,9 +68,9 @@ void start_tracking(state_t *state);
 void stop_tracking(state_t *state);
 int  point_to_stationary_target(state_t *state, double azimuth, double elevation);
 
-// Recompute the Doppler-shifted up/downlink frequencies on state from the
-// current range rate.
-void update_doppler_shifted_frequencies(state_t *state, double uplink_freq, double downlink_freq);
+// Recompute the Doppler-shifted up/downlink frequencies on the track state
+// from the current range rate.
+void update_doppler_shifted_frequencies(track_t *track, double uplink_freq, double downlink_freq);
 
 // Per-tick antenna pointing: motion-settle detection, the two-step home's
 // second leg, an active sky scan, and the satellite-tracking / pursuit aim

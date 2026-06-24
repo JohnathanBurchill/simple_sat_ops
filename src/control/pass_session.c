@@ -312,7 +312,7 @@ void setup_pass_folder(state_t *state, double jul_utc_now)
         }
         return;
     }
-    minutes_until_visible(&state->prediction, jul_utc_now,
+    minutes_until_visible(&state->track.prediction, jul_utc_now,
                           jul_utc_now + MAX_MINUTES_TO_PREDICT / 1440.0,
                           1.0);
     // minutes_until_visible sets predicted_minutes_until_visible and
@@ -320,7 +320,7 @@ void setup_pass_folder(state_t *state, double jul_utc_now)
     // values are minutes until AOS; negatives are minutes since AOS
     // when we started mid-pass — either way (now + N) lands on the
     // current pass's AOS, which is what we want for the folder name.
-    double minutes = state->prediction.predicted_minutes_until_visible;
+    double minutes = state->track.prediction.predicted_minutes_until_visible;
     if (minutes <= -9000.0) {
         fprintf(stderr,
                 "simple_sat_ops: no AOS in the next %d minutes — "
@@ -379,9 +379,9 @@ void setup_pass_folder(state_t *state, double jul_utc_now)
     // lookups, whoever shows up later) can find the exact ephemeris
     // that was being tracked, even if active.tle gets rewritten on
     // the next --control startup.
-    if (state->prediction.tles_filename
-        && state->prediction.tles_filename[0]) {
-        const char *src = state->prediction.tles_filename;
+    if (state->track.prediction.tles_filename
+        && state->track.prediction.tles_filename[0]) {
+        const char *src = state->track.prediction.tles_filename;
         const char *base = strrchr(src, '/');
         base = (base != NULL) ? base + 1 : src;
         char dst[512];
@@ -425,7 +425,7 @@ void generate_pass_plot(state_t *state, const char *pass_folder,
 
     // Work on a local copy: update_pass_predictions / update_satellite_position
     // both mutate the prediction's satellite_ephem and aggregate fields.
-    prediction_t pred = state->prediction;
+    prediction_t pred = state->track.prediction;
 
     // Defensive: handoff case (setup_pass_folder used inherited
     // state->pass_folder) leaves predicted_minutes_until_visible stale.
@@ -533,9 +533,9 @@ void generate_pass_plot(state_t *state, const char *pass_folder,
     }
 
     const char *sat_name =
-        (state->prediction.satellite_ephem.name
-         && state->prediction.satellite_ephem.name[0])
-            ? state->prediction.satellite_ephem.name : "satellite";
+        (state->track.prediction.satellite_ephem.name
+         && state->track.prediction.satellite_ephem.name[0])
+            ? state->track.prediction.satellite_ephem.name : "satellite";
 
     // Mirror scripts/plot_sky_pass.sh's polar style so both plots read
     // the same way (N up, E clockwise, zenith at centre). Solid darker
@@ -601,18 +601,18 @@ void generate_pass_plot(state_t *state, const char *pass_folder,
 int pass_session_load_orbit(state_t *state)
 {
     // Parse TLE data.
-    int tle_status = load_tle(&state->prediction);
+    int tle_status = load_tle(&state->track.prediction);
     if (tle_status) {
         return tle_status;
     }
     ClearFlag(ALL_FLAGS);
-    select_ephemeris(&state->prediction.satellite_ephem.tle);
+    select_ephemeris(&state->track.prediction.satellite_ephem.tle);
 
     // Seed the retarget guard with the startup TLE so a `:retarget` on the
     // same file is correctly a no-op.
-    snprintf(state->target_tle_path, sizeof state->target_tle_path, "%s",
-             state->prediction.tles_filename
-                 ? state->prediction.tles_filename : "");
+    snprintf(state->track.target_tle_path, sizeof state->track.target_tle_path, "%s",
+             state->track.prediction.tles_filename
+                 ? state->track.prediction.tles_filename : "");
 
     // With a fresh TLE loaded, find the upcoming pass and stand up
     // /FrontierSat/Operations/<yyyymmdd>/<hhmmLT>/ for it before the tracking
@@ -623,7 +623,7 @@ int pass_session_load_orbit(state_t *state)
         struct timeval tv;
         UTC_Calendar_Now(&utc, &tv);
         double jul_now = Julian_Date(&utc, &tv);
-        update_satellite_position(&state->prediction, jul_now);
+        update_satellite_position(&state->track.prediction, jul_now);
         setup_pass_folder(state, jul_now);
         if (state->pass_folder[0]) {
             generate_pass_plot(state, state->pass_folder, jul_now);

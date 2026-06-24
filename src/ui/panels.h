@@ -140,13 +140,13 @@ void render_tx_log_panel(const state_t *state, int start_row, int col);
 void render_predictions_panel(state_t *state, double jul_utc, int *print_row, int print_col);
 void render_status_panel(const status_panel_t *p, int *print_row, int print_col);
 
-// Operator-side: run the week-ahead pass search into state->prediction.
-void compute_predictions(state_t *state, double jul_utc);
+// Operator-side: run the week-ahead pass search into track->prediction.
+void compute_predictions(track_t *track, double jul_utc);
 
 // Operator report wrappers (compute + render).
 void report_predictions(state_t *state, double jul_utc, int *print_row, int print_col);
 void report_status(state_t *state, int *print_row, int print_col);
-void report_position(state_t *state, int *print_row, int print_col);
+void report_position(track_t *track, int *print_row, int print_col);
 
 // Paint the operator's whole-screen layout for one redraw tick (predictions /
 // status / position, low-disk refresh, RX panel, right-edge ribbon, TX log).

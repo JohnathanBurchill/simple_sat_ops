@@ -73,8 +73,8 @@ void input_handle_keys(state_t *state, int *keyboard_unlocked)
                         sso_audit_event("track-on", det);
                     } else {
                         sso_audit_event("track-on",
-                            state->prediction.satellite_ephem.tle.sat_name[0]
-                                ? state->prediction.satellite_ephem.tle.sat_name : "");
+                            state->track.prediction.satellite_ephem.tle.sat_name[0]
+                                ? state->track.prediction.satellite_ephem.tle.sat_name : "");
                     }
                 }
                 break;
@@ -89,7 +89,7 @@ void input_handle_keys(state_t *state, int *keyboard_unlocked)
                 point_to_stationary_target(state, 0.0, 0.0);
                 break;
             case '[':
-                state->satellite_tracking = 0;
+                state->track.satellite_tracking = 0;
                 state->rot.antenna_rotator.antenna_is_under_control = 0;
                 antenna_rotator_result = main_rotator_increase_azimuth(&state->rot, -5.0);
                 if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
@@ -98,7 +98,7 @@ void input_handle_keys(state_t *state, int *keyboard_unlocked)
                 flushinp();
                 break;
             case ']':
-                state->satellite_tracking = 0;
+                state->track.satellite_tracking = 0;
                 state->rot.antenna_rotator.antenna_is_under_control = 0;
                 antenna_rotator_result = main_rotator_increase_azimuth(&state->rot, 5.0);
                 if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
@@ -107,7 +107,7 @@ void input_handle_keys(state_t *state, int *keyboard_unlocked)
                 flushinp();
                 break;
             case '{':
-                state->satellite_tracking = 0;
+                state->track.satellite_tracking = 0;
                 state->rot.antenna_rotator.antenna_is_under_control = 0;
                 antenna_rotator_result = main_rotator_increase_azimuth(&state->rot, -1.0);
                 if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
@@ -116,7 +116,7 @@ void input_handle_keys(state_t *state, int *keyboard_unlocked)
                 flushinp();
                 break;
             case '}':
-                state->satellite_tracking = 0;
+                state->track.satellite_tracking = 0;
                 state->rot.antenna_rotator.antenna_is_under_control = 0;
                 antenna_rotator_result = main_rotator_increase_azimuth(&state->rot, 1.0);
                 if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
@@ -125,7 +125,7 @@ void input_handle_keys(state_t *state, int *keyboard_unlocked)
                 flushinp();
                 break;
             case ',':
-                state->satellite_tracking = 0;
+                state->track.satellite_tracking = 0;
                 state->rot.antenna_rotator.antenna_is_under_control = 0;
                 antenna_rotator_result = main_rotator_increase_elevation(&state->rot, -5.0);
                 if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
@@ -134,7 +134,7 @@ void input_handle_keys(state_t *state, int *keyboard_unlocked)
                 flushinp();
                 break;
             case '.':
-                state->satellite_tracking = 0;
+                state->track.satellite_tracking = 0;
                 state->rot.antenna_rotator.antenna_is_under_control = 0;
                 antenna_rotator_result = main_rotator_increase_elevation(&state->rot, 5.0);
                 if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
@@ -143,7 +143,7 @@ void input_handle_keys(state_t *state, int *keyboard_unlocked)
                 flushinp();
                 break;
             case '<':
-                state->satellite_tracking = 0;
+                state->track.satellite_tracking = 0;
                 state->rot.antenna_rotator.antenna_is_under_control = 0;
                 antenna_rotator_result = main_rotator_increase_elevation(&state->rot, -1.0);
                 if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
@@ -152,7 +152,7 @@ void input_handle_keys(state_t *state, int *keyboard_unlocked)
                 flushinp();
                 break;
             case '>':
-                state->satellite_tracking = 0;
+                state->track.satellite_tracking = 0;
                 state->rot.antenna_rotator.antenna_is_under_control = 0;
                 antenna_rotator_result = main_rotator_increase_elevation(&state->rot, 1.0);
                 if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {

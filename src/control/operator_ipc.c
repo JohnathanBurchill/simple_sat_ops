@@ -104,14 +104,14 @@ void ipc_broadcast_state(state_t *s,
         snprintf(evt.pass_folder, sizeof(evt.pass_folder), "%s",
                  s->pass_folder);
     }
-    if (s->prediction.tles_filename) {
+    if (s->track.prediction.tles_filename) {
         snprintf(evt.tle_path, sizeof(evt.tle_path), "%s",
-                 s->prediction.tles_filename);
+                 s->track.prediction.tles_filename);
     }
     evt.target_az = s->rot.antenna_rotator.target_azimuth;
     evt.target_el = s->rot.antenna_rotator.target_elevation;
     evt.flip      = s->rot.antenna_rotator.flip_mode_pass;
-    evt.in_pass   = s->in_pass;
+    evt.in_pass   = s->track.in_pass;
     evt.tracking  = s->rot.antenna_rotator.tracking;
     evt.has_rotator = s->rot.have_antenna_rotator;
     evt.jul_utc   = jul_utc;
@@ -119,7 +119,7 @@ void ipc_broadcast_state(state_t *s,
     // Prediction snapshot (satellite name, idesg, pass timing, sky
     // position, range) — viewer renders these verbatim. Shared with the
     // headless --viewer-stream relay so both fill the fields identically.
-    ipc_fill_state_prediction(&s->prediction, &evt);
+    ipc_fill_state_prediction(&s->track.prediction, &evt);
 
     // Auto-TCMD progress so viewers can follow the run without the modal.
     {

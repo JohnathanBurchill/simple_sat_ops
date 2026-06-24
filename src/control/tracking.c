@@ -146,7 +146,7 @@ static int pursuit_track_lookup(double jul, double *az, double *el, void *ctx)
 // pass window, run it through the existing flip mech-coord mapping (so
 // flip-mode passes get back-hemisphere mech_el up to 180), accumulate
 // unwrapped azimuth in time order. We work on a memcpy of
-// state->prediction so the live satellite_ephem.azimuth/elevation
+// state->track.prediction so the live satellite_ephem.azimuth/elevation
 // displayed in the UI is not perturbed. Returns 0 on success.
 static int pursuit_track_build(const state_t *state,
                                 double jul_aos, double jul_los,
@@ -174,7 +174,7 @@ static int pursuit_track_build(const state_t *state,
     out->n = n;
 
     prediction_t scratch;
-    memcpy(&scratch, &state->prediction, sizeof scratch);
+    memcpy(&scratch, &state->track.prediction, sizeof scratch);
 
     double prev = a0_unwrapped;
     double span = jul_los - jul_aos;
@@ -224,8 +224,8 @@ void main_pursuit_build_plan(state_t *state, double jul_now)
     if (!state->rot.have_antenna_rotator)           return;
     if (!state->rot.antenna_rotator.unwrapped_target_valid) return;
 
-    double aos = state->prediction.predicted_ascension_jul_utc;
-    double los = state->prediction.predicted_descent_jul_utc;
+    double aos = state->track.prediction.predicted_ascension_jul_utc;
+    double los = state->track.prediction.predicted_descent_jul_utc;
     if (aos <= 0.0 || los <= aos)               return;
     if (jul_now > aos) aos = jul_now;
     if (los - aos < 5.0 / 86400.0)              return;  // <5 s left
@@ -365,7 +365,7 @@ static int retarget_read_first_tle(const char *path,
 int retarget_to_tle(state_t *state, const char *path)
 {
     if (path == NULL || path[0] == '\0') return RETARGET_BAD_ARG;
-    if (retarget_same_file(path, state->target_tle_path)) return RETARGET_SAME;
+    if (retarget_same_file(path, state->track.target_tle_path)) return RETARGET_SAME;
 
     char name[64];
     char tle[139];
@@ -378,25 +378,25 @@ int retarget_to_tle(state_t *state, const char *path)
     // place, so it must be called exactly once on these freshly
     // converted elements -- clear the global flags first so the
     // SGP4/SDP4 choice is made fresh for this object.
-    snprintf(state->target_name, sizeof state->target_name, "%s", name);
-    Convert_Satellite_Data(tle, &state->prediction.satellite_ephem.tle);
-    snprintf(state->prediction.satellite_ephem.tle.sat_name,
-             sizeof state->prediction.satellite_ephem.tle.sat_name,
+    snprintf(state->track.target_name, sizeof state->track.target_name, "%s", name);
+    Convert_Satellite_Data(tle, &state->track.prediction.satellite_ephem.tle);
+    snprintf(state->track.prediction.satellite_ephem.tle.sat_name,
+             sizeof state->track.prediction.satellite_ephem.tle.sat_name,
              "%s", name);
-    state->prediction.satellite_ephem.name = state->target_name;
+    state->track.prediction.satellite_ephem.name = state->track.target_name;
     ClearFlag(ALL_FLAGS);
-    select_ephemeris(&state->prediction.satellite_ephem.tle);
+    select_ephemeris(&state->track.prediction.satellite_ephem.tle);
 
     // Recompute pass geometry for the new target. Reset max-elevation to
     // the sentinel so compute_predictions walks back to AOS when we're
     // already mid-pass (otherwise it would only see the pass remainder).
-    state->prediction.predicted_max_elevation = -180.0;
+    state->track.prediction.predicted_max_elevation = -180.0;
     struct tm utc;
     struct timeval tv;
     UTC_Calendar_Now(&utc, &tv);
     double jul_now = Julian_Date(&utc, &tv);
-    update_satellite_position(&state->prediction, jul_now);
-    compute_predictions(state, jul_now);
+    update_satellite_position(&state->track.prediction, jul_now);
+    compute_predictions(&state->track, jul_now);
 
     // Re-aim without homing: drop the old plan and clear the per-pass
     // latches. An active track (satellite_tracking set) re-derives the
@@ -409,7 +409,7 @@ int retarget_to_tle(state_t *state, const char *path)
     state->rot.antenna_rotator.flip_decision_made = 0;
     state->rot.antenna_rotator.flip_half          = 0;
 
-    snprintf(state->target_tle_path, sizeof state->target_tle_path, "%s", path);
+    snprintf(state->track.target_tle_path, sizeof state->track.target_tle_path, "%s", path);
     return RETARGET_OK;
 }
 
@@ -437,8 +437,8 @@ void start_tracking(state_t *state)
 {
     int antenna_rotator_result = 0;
 
-    state->satellite_tracking = 1;
-    state->doppler_correction_enabled = 1;
+    state->track.satellite_tracking = 1;
+    state->track.doppler_correction_enabled = 1;
     state->rot.antenna_rotator.antenna_is_under_control =
         state->rot.antenna_rotator.antenna_should_be_controlled;
     // Clear the flip latch so the next tracking-enable re-decides for
@@ -460,8 +460,8 @@ void start_tracking(state_t *state)
 
 void stop_tracking(state_t *state)
 {
-    state->satellite_tracking = 0;
-    state->doppler_correction_enabled = 1;
+    state->track.satellite_tracking = 0;
+    state->track.doppler_correction_enabled = 1;
     state->rot.antenna_rotator.antenna_is_under_control = 0;
     if (state->rot.run_with_antenna_rotator && state->rot.rot_async != NULL) {
         antenna_rotator_async_submit_stop(state->rot.rot_async);
@@ -484,7 +484,7 @@ void stop_tracking(state_t *state)
 
 int point_to_stationary_target(state_t *state, double azimuth, double elevation)
 {
-    state->satellite_tracking = 0;
+    state->track.satellite_tracking = 0;
     state->rot.antenna_rotator.antenna_is_under_control = 0;
     state->rot.antenna_rotator.flip_mode_pass = 0;
     state->rot.antenna_rotator.flip_decision_made = 0;
@@ -571,14 +571,14 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
 }
 
 
-void update_doppler_shifted_frequencies(state_t *state,
+void update_doppler_shifted_frequencies(track_t *track,
                                           double uplink_freq,
                                           double downlink_freq)
 {
     double doppler_factor = 1.0
-        - state->prediction.satellite_ephem.range_rate_km_s / 299792.458;
-    state->doppler_uplink_frequency_hz   = uplink_freq   * doppler_factor;
-    state->doppler_downlink_frequency_hz = downlink_freq * doppler_factor;
+        - track->prediction.satellite_ephem.range_rate_km_s / 299792.458;
+    track->doppler_uplink_frequency_hz   = uplink_freq   * doppler_factor;
+    track->doppler_downlink_frequency_hz = downlink_freq * doppler_factor;
 }
 
 
@@ -669,11 +669,11 @@ void tracking_tick(state_t *state, double jul_utc, double t_now)
         if (state->scan.active) {
             scan_sky_tick(state, t_now);
         }
-        if (state->satellite_tracking
-            && state->prediction.predicted_minutes_until_visible
+        if (state->track.satellite_tracking
+            && state->track.prediction.predicted_minutes_until_visible
                    < state->rot.antenna_rotator.tracking_prep_time_minutes) {
-            if (!state->in_pass) {
-                state->in_pass = 1;
+            if (!state->track.in_pass) {
+                state->track.in_pass = 1;
             }
             if (state->rot.antenna_rotator.antenna_should_be_controlled
                 && !state->rot.antenna_rotator.tracking) {
@@ -682,7 +682,7 @@ void tracking_tick(state_t *state, double jul_utc, double t_now)
                     state->rot.antenna_rotator.flip_mode_pass = 0;
                     state->rot.antenna_rotator.flip_half = 0;
                     if (ANTENNA_ROTATOR_MAXIMUM_ELEVATION > 90
-                        && state->prediction.predicted_max_elevation
+                        && state->track.prediction.predicted_max_elevation
                                >= ANTENNA_ROTATOR_FLIP_ELEVATION_THRESHOLD) {
                         state->rot.antenna_rotator.flip_mode_pass = 1;
                         // Prefer the prediction-derived AOS azimuth (the
@@ -691,17 +691,17 @@ void tracking_tick(state_t *state, double jul_utc, double t_now)
                         // live position if the pass walk didn't capture
                         // an ascension sample.
                         double aos_az_pred =
-                            state->prediction.predicted_ascension_azimuth;
+                            state->track.prediction.predicted_ascension_azimuth;
                         state->rot.antenna_rotator.flip_aos_az =
                             (aos_az_pred != 0.0)
                                 ? aos_az_pred
-                                : state->prediction.satellite_ephem.azimuth;
+                                : state->track.prediction.satellite_ephem.azimuth;
                         state->rot.antenna_rotator.flip_los_az =
-                            state->prediction.predicted_descent_azimuth;
+                            state->track.prediction.predicted_descent_azimuth;
                         state->rot.antenna_rotator.flip_aos_jul =
-                            state->prediction.predicted_ascension_jul_utc;
+                            state->track.prediction.predicted_ascension_jul_utc;
                         state->rot.antenna_rotator.flip_los_jul =
-                            state->prediction.predicted_descent_jul_utc;
+                            state->track.prediction.predicted_descent_jul_utc;
                     }
                     state->rot.antenna_rotator.flip_decision_made = 1;
                     state->rot.antenna_rotator.tracking = 1;
@@ -735,9 +735,9 @@ void tracking_tick(state_t *state, double jul_utc, double t_now)
                     }
                     if (!used_pursuit) {
                         double pred_az =
-                            state->prediction.satellite_ephem.azimuth;
+                            state->track.prediction.satellite_ephem.azimuth;
                         double pred_el =
-                            state->prediction.satellite_ephem.elevation;
+                            state->track.prediction.satellite_ephem.elevation;
                         double mech_az = pred_az;
                         double mech_el = pred_el;
                         int half = 0;
@@ -784,7 +784,7 @@ void tracking_tick(state_t *state, double jul_utc, double t_now)
                     // "only chase el while the sat is visible" rule.
                     if (used_pursuit
                         || state->rot.antenna_rotator.flip_mode_pass
-                        || state->prediction.satellite_ephem.elevation >= 0) {
+                        || state->track.prediction.satellite_ephem.elevation >= 0) {
                         delta_el = next_el
                                    - state->rot.antenna_rotator.target_elevation;
                     } else {
@@ -812,8 +812,8 @@ void tracking_tick(state_t *state, double jul_utc, double t_now)
 
             jul_idle_start = 0;
         } else {
-            if (state->in_pass) {
-                state->in_pass = 0;
+            if (state->track.in_pass) {
+                state->track.in_pass = 0;
                 jul_idle_start = jul_utc;
             }
             if (state->rot.antenna_rotator.tracking) {

@@ -21,9 +21,9 @@
 #ifndef STATE_H
 #define STATE_H
 
-#include "prediction.h"
 #include "rot_state.h"
 #include "sdr_state.h"
+#include "track_state.h"
 #include "sso_ipc.h"
 #include "telemetry.h"
 #include "trsw_state.h"
@@ -272,7 +272,6 @@ typedef struct state
     int n_options;
     int running;
     int verbose_level;
-    int in_pass;
 
     // Run mode + one-shot CLI flags (set once in apply_args / main).
     int control_mode;        // --control: this process is the operator
@@ -291,31 +290,12 @@ typedef struct state
     char   low_disk_msg[80];           // non-empty -> low-disk warning to show
     double low_disk_last_t;            // last low-disk probe (monotonic s)
 
-    // Tracking
-    int satellite_tracking;
-    prediction_t prediction;
-
-    // Nominal + Doppler-corrected frequencies (Hz). Computed each tick
-    // by main.c from the prediction's range-rate. simple_sat_ops no
-    // longer drives a radio directly — these are display-only and get
-    // published into the IPC state events for any subscriber
-    // (tx_frame_sdr can pick up the current uplink freq this way).
-    double nominal_uplink_frequency_hz;
-    double nominal_downlink_frequency_hz;
-    double doppler_uplink_frequency_hz;
-    double doppler_downlink_frequency_hz;
-    int doppler_correction_enabled;
+    // Orbit prediction + Doppler frequencies + tracked-satellite identity.
+    // See track_state.h.
+    track_t track;
 
     // SDR backend selection + the live RX session + RX config. See sdr_state.h.
     sdr_t sdr;
-
-    // Tracked-satellite identity. target_tle_path is the file the current
-    // satellite came from, so a repeat :retarget on the same file is a
-    // no-op; seeded from the startup TLE path, updated on each retarget.
-    // target_name is stable backing for satellite_ephem.name after a
-    // retarget (the startup name points at argv / an apply_args buffer).
-    char               target_tle_path[1024];
-    char               target_name[64];
 
     // HMAC keyfile resolved once at startup: path, parse status, and the
     // key bytes used to sign every TX burst's AX100 frame.

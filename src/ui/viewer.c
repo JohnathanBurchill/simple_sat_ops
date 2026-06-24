@@ -144,26 +144,26 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
     if (!evt->has_state) return;
 
     state_t *s = &v->state;
-    snprintf(s->prediction.satellite_ephem.tle.sat_name,
-             sizeof s->prediction.satellite_ephem.tle.sat_name, "%s",
+    snprintf(s->track.prediction.satellite_ephem.tle.sat_name,
+             sizeof s->track.prediction.satellite_ephem.tle.sat_name, "%s",
              evt->satellite);
-    snprintf(s->prediction.satellite_ephem.tle.idesg,
-             sizeof s->prediction.satellite_ephem.tle.idesg, "%s",
+    snprintf(s->track.prediction.satellite_ephem.tle.idesg,
+             sizeof s->track.prediction.satellite_ephem.tle.idesg, "%s",
              evt->idesg);
-    s->prediction.minutes_since_epoch              = evt->epoch_min;
-    s->prediction.predicted_minutes_until_visible  = evt->min_visible;
-    s->prediction.predicted_minutes_above_0_degrees  = evt->min_above_0;
-    s->prediction.predicted_minutes_above_30_degrees = evt->min_above_30;
-    s->prediction.predicted_max_elevation          = evt->max_el;
-    s->prediction.satellite_ephem.azimuth          = evt->pred_az;
-    s->prediction.satellite_ephem.elevation        = evt->pred_el;
-    s->prediction.satellite_ephem.altitude_km      = evt->alt_km;
-    s->prediction.satellite_ephem.latitude         = evt->lat_deg;
-    s->prediction.satellite_ephem.longitude        = evt->lon_deg;
-    s->prediction.satellite_ephem.speed_km_s       = evt->speed_kms;
-    s->prediction.satellite_ephem.range_km         = evt->range_km;
-    s->prediction.satellite_ephem.range_rate_km_s  = evt->range_rate_kms;
-    s->in_pass                                     = evt->in_pass;
+    s->track.prediction.minutes_since_epoch              = evt->epoch_min;
+    s->track.prediction.predicted_minutes_until_visible  = evt->min_visible;
+    s->track.prediction.predicted_minutes_above_0_degrees  = evt->min_above_0;
+    s->track.prediction.predicted_minutes_above_30_degrees = evt->min_above_30;
+    s->track.prediction.predicted_max_elevation          = evt->max_el;
+    s->track.prediction.satellite_ephem.azimuth          = evt->pred_az;
+    s->track.prediction.satellite_ephem.elevation        = evt->pred_el;
+    s->track.prediction.satellite_ephem.altitude_km      = evt->alt_km;
+    s->track.prediction.satellite_ephem.latitude         = evt->lat_deg;
+    s->track.prediction.satellite_ephem.longitude        = evt->lon_deg;
+    s->track.prediction.satellite_ephem.speed_km_s       = evt->speed_kms;
+    s->track.prediction.satellite_ephem.range_km         = evt->range_km;
+    s->track.prediction.satellite_ephem.range_rate_km_s  = evt->range_rate_kms;
+    s->track.in_pass                                     = evt->in_pass;
     s->rot.antenna_rotator.tracking                    = evt->tracking;
     s->rot.antenna_rotator.azimuth                     = evt->az;
     s->rot.antenna_rotator.elevation                   = evt->el;
@@ -437,7 +437,7 @@ static void viewer_render(viewer_t *v, int connected)
         }
 
         int prow = 5;
-        report_position(&v->state, &prow, 50);
+        report_position(&v->state.track, &prow, 50);
         // RX panel directly below position (matches the operator's layout).
         prow++;
         render_rx_panel(&v->rx_panel, &prow, 50);
@@ -754,14 +754,14 @@ static void stream_emit_tle_state(state_t *state, double jul_utc)
     evt.has_state = 1;
     snprintf(evt.source, sizeof evt.source, "tle-only");
     snprintf(evt.operator_user, sizeof evt.operator_user, "%s", stream_user());
-    if (state->prediction.tles_filename) {
+    if (state->track.prediction.tles_filename) {
         snprintf(evt.tle_path, sizeof evt.tle_path, "%s",
-                 state->prediction.tles_filename);
+                 state->track.prediction.tles_filename);
     }
-    ipc_fill_state_prediction(&state->prediction, &evt);
+    ipc_fill_state_prediction(&state->track.prediction, &evt);
     evt.jul_utc = jul_utc;
-    evt.freq_hz = (long) state->doppler_downlink_frequency_hz;
-    evt.in_pass = (state->prediction.satellite_ephem.elevation > 0.0);
+    evt.freq_hz = (long) state->track.doppler_downlink_frequency_hz;
+    evt.in_pass = (state->track.prediction.satellite_ephem.elevation > 0.0);
 
     char line[8192];
     if (sso_event_encode(&evt, line, sizeof line) == 0) {
@@ -801,7 +801,7 @@ static int build_pass_schedule(const state_t *state, double jul_now,
     // and the deep-space flag is set globally, so we propagate as-is — exactly
     // like stream_emit_tle_state does (we must NOT select_ephemeris again).
     prediction_t pred;
-    memcpy(&pred, &state->prediction, sizeof pred);
+    memcpy(&pred, &state->track.prediction, sizeof pred);
 
     const char *name = pred.oem
         ? (pred.satellite_ephem.name ? pred.satellite_ephem.name : "")
@@ -971,12 +971,12 @@ int run_viewer_stream(state_t *state)
             struct timeval tv;
             UTC_Calendar_Now(&utc, &tv);
             double jul_utc = Julian_Date(&utc, &tv);
-            update_satellite_position(&state->prediction, jul_utc);
-            compute_predictions(state, jul_utc);
-            if (state->doppler_correction_enabled) {
-                update_doppler_shifted_frequencies(state,
-                    state->nominal_uplink_frequency_hz,
-                    state->nominal_downlink_frequency_hz);
+            update_satellite_position(&state->track.prediction, jul_utc);
+            compute_predictions(&state->track, jul_utc);
+            if (state->track.doppler_correction_enabled) {
+                update_doppler_shifted_frequencies(&state->track,
+                    state->track.nominal_uplink_frequency_hz,
+                    state->track.nominal_downlink_frequency_hz);
             }
             stream_emit_tle_state(state, jul_utc);
             last_emit = now;

@@ -177,7 +177,7 @@ int main(int argc, char **argv)
                 s = run_viewer_stream(&state);
             }
         }
-        if (state.prediction.auto_sat) {
+        if (state.track.prediction.auto_sat) {
             free_passes();
         }
         return s;
@@ -258,7 +258,7 @@ int main(int argc, char **argv)
             sso_ipc_server_close(state.ipc);
             state.ipc = NULL;
         }
-        if (state.prediction.auto_sat) {
+        if (state.track.prediction.auto_sat) {
             free_passes();
         }
         return 0;
@@ -279,8 +279,8 @@ int main(int argc, char **argv)
 
     state.running = 1;
 
-    double current_uplink_frequency = state.nominal_uplink_frequency_hz;
-    double current_downlink_frequency = state.nominal_downlink_frequency_hz;
+    double current_uplink_frequency = state.track.nominal_uplink_frequency_hz;
+    double current_downlink_frequency = state.track.nominal_downlink_frequency_hz;
     double doppler_delta_uplink = 0.0;
     double doppler_delta_downlink = 0.0;
     double doppler_max_delta = DOPPLER_SHIFT_RESOLUTION_KHZ * 1000.0;
@@ -357,7 +357,7 @@ int main(int argc, char **argv)
         double t_now = monotonic_seconds();
         UTC_Calendar_Now(&utc, &tv);
         jul_utc = Julian_Date(&utc, &tv);
-        update_satellite_position(&state.prediction, jul_utc);
+        update_satellite_position(&state.track.prediction, jul_utc);
 
         // Drain whatever the T/R switch emitted since the last tick.
         // Non-blocking; the firmware beats every ~2.5 s so most ticks
@@ -367,16 +367,16 @@ int main(int argc, char **argv)
         }
 
         /* Calculate Doppler shift for the display + IPC publishing */
-        if (state.doppler_correction_enabled) {
-            update_doppler_shifted_frequencies(&state,
-                                                state.nominal_uplink_frequency_hz,
-                                                state.nominal_downlink_frequency_hz);
-            doppler_delta_uplink   = fabs(state.doppler_uplink_frequency_hz
+        if (state.track.doppler_correction_enabled) {
+            update_doppler_shifted_frequencies(&state.track,
+                                                state.track.nominal_uplink_frequency_hz,
+                                                state.track.nominal_downlink_frequency_hz);
+            doppler_delta_uplink   = fabs(state.track.doppler_uplink_frequency_hz
                                            - current_uplink_frequency);
-            doppler_delta_downlink = fabs(state.doppler_downlink_frequency_hz
+            doppler_delta_downlink = fabs(state.track.doppler_downlink_frequency_hz
                                            - current_downlink_frequency);
-            current_uplink_frequency   = state.doppler_uplink_frequency_hz;
-            current_downlink_frequency = state.doppler_downlink_frequency_hz;
+            current_uplink_frequency   = state.track.doppler_uplink_frequency_hz;
+            current_downlink_frequency = state.track.doppler_downlink_frequency_hz;
         }
 
 #ifdef SSO_WITH_SDR
@@ -386,14 +386,14 @@ int main(int argc, char **argv)
         // ground must transmit higher to compensate for redshift at
         // the moving receiver. Mirror of the RX-side correction,
         // applied to FRONTIERSAT_CARRIER_HZ (the actual TX carrier) —
-        // state.doppler_uplink_frequency_hz is computed from the 2 m
+        // state.track.doppler_uplink_frequency_hz is computed from the 2 m
         // amateur nominal and would give the wrong absolute frequency
         // here. Off when doppler_correction_enabled is false (e.g.
         // bench loopback) so RX and TX share one constant carrier.
         state.tx_freq_hz_doppler = tx_burst_doppler_freq_hz(
             FRONTIERSAT_CARRIER_HZ,
-            state.prediction.satellite_ephem.range_rate_km_s,
-            state.doppler_correction_enabled);
+            state.track.prediction.satellite_ephem.range_rate_km_s,
+            state.track.doppler_correction_enabled);
 #endif
 
 #ifdef SSO_WITH_SDR
@@ -403,7 +403,7 @@ int main(int argc, char **argv)
         // close 1 min after LOS. Each pass gets its own auto-named
         // file in the pass folder. Note: this deliberately keys off the
         // satellite geometry (elevation + time-until-AOS) rather than
-        // state.in_pass — the latter flips several minutes before AOS
+        // state.track.in_pass — the latter flips several minutes before AOS
         // (tracking_prep_time_minutes) so the rotator can pre-position,
         // which is far too early to start the WAV.
         //
@@ -411,8 +411,8 @@ int main(int argc, char **argv)
         // started once at rx_session_open and stays open until shutdown.
         if (state.sdr.rx_session && !state.sdr.always_record) {
             double sec_to_aos =
-                state.prediction.predicted_minutes_until_visible * 60.0;
-            int visible   = (state.prediction.satellite_ephem.elevation > 0.0);
+                state.track.prediction.predicted_minutes_until_visible * 60.0;
+            int visible   = (state.track.prediction.satellite_ephem.elevation > 0.0);
             int in_preroll = (sec_to_aos > 0.0
                               && sec_to_aos <= RECORDING_PREROLL_S);
             int active = rx_session_wav_active(state.sdr.rx_session);
@@ -424,7 +424,7 @@ int main(int argc, char **argv)
                     "trigger=%s sec_to_aos=%.1f el=%.1f",
                     visible ? "elevation" : "preroll",
                     sec_to_aos,
-                    state.prediction.satellite_ephem.elevation);
+                    state.track.prediction.satellite_ephem.elevation);
                 sso_audit_event("rec-start", det);
             } else if (active) {
                 if (visible) {
@@ -538,20 +538,20 @@ int main(int argc, char **argv)
         // lived here previously fired every 1–10 seconds during a
         // pass and caused brief phase resets in the coherent demod
         // chain; this loop runs every tick at full precision.
-        if (state.sdr.rx_session && state.doppler_correction_enabled) {
-            double offset = state.doppler_downlink_frequency_hz
-                          - state.nominal_downlink_frequency_hz;
+        if (state.sdr.rx_session && state.track.doppler_correction_enabled) {
+            double offset = state.track.doppler_downlink_frequency_hz
+                          - state.track.nominal_downlink_frequency_hz;
             rx_session_set_doppler_offset(state.sdr.rx_session, offset);
         }
         if (state.sdr.rx_session) {
             double doppler_offset =
-                state.doppler_downlink_frequency_hz
-                - state.nominal_downlink_frequency_hz;
+                state.track.doppler_downlink_frequency_hz
+                - state.track.nominal_downlink_frequency_hz;
             rx_session_update_observer(state.sdr.rx_session,
                 state.rot.antenna_rotator.target_azimuth,
                 state.rot.antenna_rotator.target_elevation,
-                state.prediction.satellite_ephem.range_km,
-                state.prediction.satellite_ephem.range_rate_km_s,
+                state.track.prediction.satellite_ephem.range_km,
+                state.track.prediction.satellite_ephem.range_rate_km_s,
                 doppler_offset);
         }
 
@@ -718,7 +718,7 @@ int main(int argc, char **argv)
     }
 #endif
 
-    if (state.prediction.auto_sat) {
+    if (state.track.prediction.auto_sat) {
         free_passes();
     }
 

@@ -906,10 +906,10 @@ void auto_tcmd_tick(state_t *state) {
     // so this guard would otherwise abort the run before its first send
     // (the manual compose path has no such guard, which is why it worked
     // out of a pass and auto-tcmd didn't). Skip the guard entirely then.
-    double el = state->prediction.satellite_ephem.elevation;
+    double el = state->track.prediction.satellite_ephem.elevation;
     if (!state->testing_mode
         && el < 0.0
-        && state->prediction.predicted_minutes_until_visible > 0.5) {
+        && state->track.prediction.predicted_minutes_until_visible > 0.5) {
         a->state = AUTO_STATE_PASS_OVER;
         snprintf(a->status_msg, sizeof a->status_msg,
                  "stopped: pass over (elevation %.1f deg)", el);
