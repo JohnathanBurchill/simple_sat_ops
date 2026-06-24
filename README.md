@@ -1,126 +1,125 @@
 # Simple Satellite Operations tools
 
-A set of tools dedicated to predicting and tracking satellite passes near a
-ground station, with pluggable radio backends (Yaesu FT-991A by default,
-ICOM IC-9700 as a secondary, USRP B210 stub) and a SPIG Rot2Prog antenna
-rotator controller.
+A set of tools for predicting and tracking satellite passes near a ground
+station, and for running a complete software-defined-radio link to a
+cubesat: receive, decode, transmit telecommands, and point the antenna —
+all from a single terminal program.
 
-The aim is twofold: 1) demonstrate reliable and fast operation through a
-simple terminal interface, and 2) learn by doing. The software suits needs;
-your mileage may vary. 
+The software was built for the University of Calgary
+[CalgaryToSpace](https://www.calgarytospace.ca) FrontierSat ground station,
+but nothing in it is mission-specific.
 
-Directly based on the [sgp4sdp4 library](https://github.com/KJ7LNW/sgp4sdp4)
-ported to C by Neoklis Kyriazis from other sources. Thank you
-[@KJ7LNW](https://github.com/KJ7LNW) for making this available on github.
+The aim is twofold: 1) demonstrate reliable, fast operation through a simple
+terminal interface, and 2) learn by doing. The software suits our needs;
+your mileage may vary.
 
-**CAUTION**: the original sgp4sdp4 COPYING file is dated 2001. We have not
-checked whether this version of sgp4sdp4 is still consistent with that
-recommended by [Valado et al.
-2006](https://celestrak.org/publications/AIAA/2006-6753/AIAA-2006-6753-Rev3.pdf).
-
-Thanks go to the University of Calgary [Rothney Astrophysical
-Observatory](https://science.ucalgary.ca/rothney-observatory) staff and the
-[CalgaryToSpace](https://www.calgarytospace.ca) RF communications lead (as of
-Feb 2025) for logistics and technical support while testing this software on
-the FrontierSat ground station equipment.
-
-Satellite radio data as of 4 March 2025 courtesy [JE9PEL](http://www.ne.jp/asahi/hamradio/je9pel/satslist.csv).
+> **History.** This project began as a CAT-controlled-radio tracker (Yaesu
+> FT-991A, ICOM IC-9700). That radio path has been **retired** — the RF
+> chain now runs entirely through the SDR. The full story is in the git
+> history; see Appendix B of [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md),
+> which is the comprehensive field guide to every tool here.
 
 ## simple_sat_ops
 
-Custom drivers control the SPIG Rot2Prog antenna rotator and the configured
-transceiver for satellite communications over UHF and VHF. The radio path
-is dispatched through a backend abstraction (`radio.c` →
-`radio_yaesu_cat.c` / `radio_icom_civ.c` / `radio_usrp_b210.c`), so the same
-binaries drive any of the supported rigs without forking the code.
-
-![A radio demo gif](demo/simple_sat_ops_demo_radio_only_20250217.gif)
-
-## Radios and TX safety
-
-Pick the radio with `--radio-type=yaesu-cat | icom-civ | usrp-b210` (default
-`yaesu-cat`). Pick the modulator audio input with `--mod-input=usb | acc |
-mic | ...` (default `acc`, which routes audio from the rear DATA jack on
-both Yaesu and ICOM rigs).
-
-Persistent device defaults live at:
-
-```
-~/.local/share/simple_sat_ops/radio_device
-~/.local/share/simple_sat_ops/radio_serial_speed
-```
-
-Set them once with the `radio_ctl` CLI:
+`simple_sat_ops` is the single live-RF program: an ncurses operator UI that
+predicts the pass, drives the SPID Rot2Prog antenna rotator, receives and
+decodes the downlink (AX100 → CSP), transmits telecommand bursts, and fans
+the whole pass out to read-only viewers over a local socket — one process,
+no separate daemon.
 
 ```bash
-radio_ctl --radio-type=yaesu-cat --radio-device=/dev/ttyUSB1 \
-          --radio-serial-speed=38400 --store-device --store-serial-speed identify
+# Pick a satellite by name prefix
+simple_sat_ops TLEs/amateur.tle "ISS (ZARYA)"
+
+# Let it pick the next visible pass that meets your criteria
+simple_sat_ops TLEs/amateur.tle next --min-elevation=10
+
+# With the antenna and SDR attached
+simple_sat_ops TLEs/amateur.tle next --with-hardware
 ```
 
-After that, plain `radio_ctl ...` / `tx_tone ...` / `simple_sat_ops ...`
-invocations pick the device and baud up automatically.
+Hardware is opt-in: `--with-rotator`, `--with-hardware`. Without those flags
+the UI runs as a tracking/viewer client. Pass `--without-b210` to skip the
+SDR entirely on a dev host.
 
-TX is **inhibited by default** on every binary so refactor work and bring-up
-runs can't accidentally key the PA. Three opt-in gates:
+![A demo without hardware](demo/simple_sat_ops_demo_no_hardware_20250127.gif)
 
-- `--allow-tx` — clears the inhibit. Without it the tool configures the
-  radio (frequency, mode, MOD source, power) but stops at PTT.
-- `--allow-high-power` — required for `--tx-power` above 10%.
-- `--allow-hf-tx` — required to PTT below 100 MHz.
+*Early demo — the tracking UI predates the SDR cutover, but the pass display
+is the same one in use today.*
 
-PTT-off is always passed through, even with the inhibit set; releasing TX
-is never blocked.
+## SDR backends
 
-For Yaesu FT-991A operators: see the front-panel one-time-setup checklist
-at the top of `radio_yaesu_cat.c` (Menus 031 / 033 / 071 / 072 are
-operator-set; 070 / 079 are pinned by CAT during `radio_uplink_prep`).
+The baseband SDR is chosen with `--sdr-type=uhd | rtlsdr | auto` (default
+`auto`: probe UHD, then RTL-SDR; first that opens wins).
 
-The ICOM IC-9700 (`icom-civ`) backend compiles and the basic CAT path
-works, but it is **untested at satellite-pass level** for FM voice
-repeater operation or low-baud data, and the radio appears unable to
-handle 9600 baud TX through any audio path tried. For operational
-satellite use the Yaesu FT-991A (default `--radio-type=yaesu-cat`) is
-the canonical radio.
+- **USRP B210** (`uhd`, needs `libuhd`) — full RX **and** TX.
+- **RTL-SDR** (`rtlsdr`, needs `librtlsdr`) — **RX-only**; every operator
+  command works except transmit.
 
-## next_in_queue
+Run **`sdr_probe`** before a pass to confirm what is attached and which FPGA
+image a B2xx clone will load. `--uhd-args=`, `--sdr-fpga=`, and
+`--sdr-device=` override device selection per run.
 
-Prints upcoming overpasses of satellites from a file of TLEs using a `sgp4sdp4`
-library.
+## TX safety
 
-![A demo without hardware gif](demo/simple_sat_ops_demo_no_hardware_20250127.gif)
+Transmit is **inhibited by default** so refactors and bring-up runs can't
+accidentally key the PA. Keying requires `--allow-tx` (or ticking the
+`allow-tx` box in the TX-compose / auto-command modals). Releasing TX is
+never blocked.
 
-## lifetime 
+## Other tools
 
-Estimates the lifetime of a satellite from a TLE. 
-
-**This is inaccurate** The calculation is a toy 'what if?'. In `sgp4sdp4`, orbit
-decay is apparently modelled empirically based on measurement of the rate of
-change of the mean anomaly and its rate of change. See the sgp4sdp4 source
-code and related references for details.
+| Tool | What it does |
+|------|--------------|
+| `next_in_queue` | Print upcoming overpasses from a file of TLEs (no hardware needed). |
+| `sdr_probe` | Report the attached SDR(s) and the RX/TX ports `simple_sat_ops` will use. |
+| `packet_browser` | ncurses explorer over the decoded-packet database; reconstructs and exports downlinked files. |
+| `tcmd_browser` | The inverse: browse transmitted telecommands and the responses they drew. |
+| `agenda_check` | Lint a telecommand agenda file against the flight firmware's command set. |
+| `decode_inspector` | Staged decoder visualizer (ASM → Golay → descrambler → Reed-Solomon → CSP); raylib. |
+| `live_waterfall` | Real-time spectrogram; raylib. |
+| `tle_keps` | Orbital-elements summary (apogee/perigee, period, sun-sync, LTAN/LTDN). |
+| `gnss_opm` / `gnss_reports` | Turn a downlinked GNSS fix into a CCSDS orbit message for space-safety upload. |
+| `ham_listen` / `ham_speak` | Amateur-band voice receive/transmit helpers. |
+| `lifetime` | Toy orbit-decay estimate (**inaccurate** — a "what if?" only). |
 
 # Installation
 
-We use ``cmake``:
+CMake, out-of-tree:
 
 ```bash
-mkdir build
-cd build
+mkdir -p build && cd build
 cmake ..
 make install
 ```
 
-This installs the binaries to ``$HOME/bin``. Adapt CMakeLists.txt to suit your needs.
+Binaries install to `$HOME/bin`. Which tools get built depends on which
+optional libraries are present; CMake auto-detects each via `pkg-config`.
 
-Use whatever build system you prefer, or use one-liners like this:
+Install the **`-dev`** packages so the headers and `.pc` files are present.
+
+Ubuntu/Debian:
 
 ```bash
-gcc -o simple_sat_ops main.c prediction.c radio.c antenna_rotator.c -lncurses -lsgp4sdp4
-gcc -o next_in_queue next_in_queue.c prediction.c -lsgp4sdp4
-gcc -o lifetime lifetime.c prediction.c -lsgp4sdp4
+sudo apt install build-essential cmake pkg-config \
+    libncurses-dev libssl-dev libsqlite3-dev \
+    libuhd-dev librtlsdr-dev libusb-1.0-0-dev libsndfile1-dev libraylib-dev
 ```
 
-The ```sgp4sdp4``` library needs to be compiled separately and installed in a
-suitable location.
+macOS (Homebrew):
+
+```bash
+brew install cmake pkg-config ncurses openssl sqlite uhd librtlsdr \
+    libusb libsndfile raylib
+```
+
+A Mac dev host with neither SDR library still builds the non-RF tools
+(`next_in_queue`, `tle_keps`, the unit tests, …); the SDR backends are soft
+and turn themselves off if their library is missing.
+
+The bundled [`sgp4sdp4`](https://github.com/KJ7LNW/sgp4sdp4) orbit library
+is a separate CMake project that must be built and installed first — see
+`sgp4sdp4/README.md`.
 
 ## Graphical tools over SSH (raylib OpenGL 2.1 rebuild)
 
@@ -166,3 +165,23 @@ the 2.1 build a custom prefix (`-DCMAKE_INSTALL_PREFIX=/opt/raylib-21`) and
 prefix the simple_sat_ops cmake with
 `PKG_CONFIG_PATH=/opt/raylib-21/lib/pkgconfig:$PKG_CONFIG_PATH`; at runtime
 set `LD_LIBRARY_PATH=/opt/raylib-21/lib`.
+
+# Credits
+
+Orbit propagation is the [sgp4sdp4 library](https://github.com/KJ7LNW/sgp4sdp4),
+ported to C by Neoklis Kyriazis from other sources. Thank you
+[@KJ7LNW](https://github.com/KJ7LNW) for making it available on GitHub.
+
+**CAUTION**: the original sgp4sdp4 COPYING file is dated 2001. We have not
+checked whether this version of sgp4sdp4 is still consistent with that
+recommended by [Vallado et al.
+2006](https://celestrak.org/publications/AIAA/2006-6753/AIAA-2006-6753-Rev3.pdf).
+
+Thanks to the University of Calgary [Rothney Astrophysical
+Observatory](https://science.ucalgary.ca/rothney-observatory) staff and the
+[CalgaryToSpace](https://www.calgarytospace.ca) RF communications lead (as of
+Feb 2025) for logistics and technical support while testing this software on
+the FrontierSat ground station equipment.
+
+Satellite radio data as of 4 March 2025 courtesy
+[JE9PEL](http://www.ne.jp/asahi/hamradio/je9pel/satslist.csv).

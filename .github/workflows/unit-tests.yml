@@ -21,9 +21,7 @@ name: unit-tests
 
 on:
   push:
-    branches: [any-sdr, main]
   pull_request:
-    branches: [any-sdr, main]
   workflow_dispatch: {}
 
 # A newer push to the same branch/PR cancels an in-flight run.
