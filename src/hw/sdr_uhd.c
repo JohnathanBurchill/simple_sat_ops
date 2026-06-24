@@ -111,6 +111,11 @@ static void uhd_resolve_device_args(const sdr_open_params_t *p,
     char        serial[128] = {0};
     int         have_serial = 0;
 
+    // Note: this serial scan reads the FIRST B2xx on the bus and ignores
+    // p->device_index — multi-B2xx selection is expected to go through
+    // --uhd-args (serial=...), which is handled verbatim above and never
+    // reaches here. The FPGA-map lookup is likewise skipped when --uhd-args
+    // is set (early return above), so a pinned serial isn't second-guessed.
     if (p->fpga_image_path != NULL && p->fpga_image_path[0]) {
         fpga = p->fpga_image_path;   // explicit override wins
     } else if (sdr_usb_b2xx_serial(serial, sizeof serial) == 0) {
@@ -173,8 +178,15 @@ static int uhd_open(sdr_backend_t *be, const sdr_open_params_t *p, sdr_caps_t *c
     u->tx_powered = 1;
 
     if (log_uhd(uhd_usrp_set_rx_rate(u->dev, p->rate_hz, 0), "set_rx_rate")) goto fail;
+    // The actual (coerced) rate feeds the decimation math downstream, so don't
+    // ignore the query: on failure fall back to the requested rate and warn,
+    // rather than letting a stale/garbage rate through.
     double rate = p->rate_hz;
-    (void)uhd_usrp_get_rx_rate(u->dev, 0, &rate);
+    if (uhd_usrp_get_rx_rate(u->dev, 0, &rate) != UHD_ERROR_NONE) {
+        fprintf(stderr, "sdr_uhd: get_rx_rate failed; assuming the requested "
+                        "%.0f S/s for the decimation math\n", p->rate_hz);
+        rate = p->rate_hz;
+    }
     if (p->rate_hz > 0.0 && fabs(rate - p->rate_hz) / p->rate_hz > 0.01) {
         fprintf(stderr, "sdr_uhd: requested %.0f S/s, got %.0f S/s "
                         "(device coerced)\n", p->rate_hz, rate);

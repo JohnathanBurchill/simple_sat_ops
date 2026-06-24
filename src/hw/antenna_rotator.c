@@ -159,7 +159,11 @@ int antenna_rotator_command(antenna_rotator_t *antenna_rotator, antenna_rotator_
         return ANTENNA_ROTATOR_BAD_RESPONSE;
     }
 
-    // All commands return the current position
+    // All commands return the current position. Note the asymmetry with the
+    // SET frame above: the command we send packs az/el as ASCII digit bytes
+    // ('0'..'9'), but the Rot2Prog STATUS reply packs each digit as a RAW byte
+    // value (0..9) — hence the plain integer arithmetic here, not ASCII
+    // de-shifting. The -360 removes the controller's +360 zero offset.
     if (azimuth != NULL) {
         *azimuth = (double)(response[1] * 100 + response[2] * 10 + response[3]) + (double)response[4] / 10.0 - 360.0;
     }

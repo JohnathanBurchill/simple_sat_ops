@@ -42,6 +42,7 @@ typedef enum sdr_backend_type {
     SDR_TYPE_AUTO = 0,
     SDR_TYPE_UHD,
     SDR_TYPE_RTLSDR,
+    SDR_TYPE__COUNT,   // sentinel: number of enum values; keep last
 } sdr_backend_type_t;
 
 // Device capabilities, filled by the backend's open(). Read-only to the

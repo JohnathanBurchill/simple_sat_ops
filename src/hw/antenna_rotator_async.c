@@ -67,8 +67,14 @@ static double now_mono_s(void)
     return (double) ts.tv_sec + (double) ts.tv_nsec / 1e9;
 }
 
-// Build an absolute CLOCK_REALTIME deadline `delay_s` from now, suitable
-// for pthread_cond_timedwait (which uses CLOCK_REALTIME by default).
+// Build an absolute CLOCK_REALTIME deadline `delay_s` from now, suitable for
+// pthread_cond_timedwait (which uses CLOCK_REALTIME by default).
+//
+// We deliberately do NOT switch the condvar to CLOCK_MONOTONIC via
+// pthread_condattr_setclock: that attribute isn't available on macOS, and the
+// waits here are short poll intervals, not long sleeps. The cost is that a
+// wall-clock step (NTP correction, manual clock set) can lengthen or shorten a
+// single wait by the step — harmless for a 2 Hz status poll.
 static void abs_deadline(double delay_s, struct timespec *out)
 {
     clock_gettime(CLOCK_REALTIME, out);

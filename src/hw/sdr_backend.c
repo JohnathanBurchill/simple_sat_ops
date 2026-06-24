@@ -60,12 +60,13 @@ int sdr_backend_open(sdr_backend_type_t type,
     *out = NULL;
 
     // Build the try-order: a single explicit type, or the auto-probe
-    // sequence (UHD first, then RTL-SDR).
-    sdr_backend_type_t order[2];
+    // sequence — every non-AUTO backend in enum order (UHD before RTL-SDR).
+    // Sized from the enum so adding a backend doesn't need a magic bump here.
+    sdr_backend_type_t order[SDR_TYPE__COUNT];
     int n = 0;
     if (type == SDR_TYPE_AUTO) {
-        order[n++] = SDR_TYPE_UHD;
-        order[n++] = SDR_TYPE_RTLSDR;
+        for (int t = SDR_TYPE_AUTO + 1; t < SDR_TYPE__COUNT; ++t)
+            order[n++] = (sdr_backend_type_t)t;
     } else {
         order[n++] = type;
     }

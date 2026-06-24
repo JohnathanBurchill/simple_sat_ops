@@ -230,6 +230,11 @@ rotator_calibrate_result_t rotator_calibrate_run(
     antenna_rotator_async_submit_set(async, AR_CAL_PARK_AZ, AR_CAL_PARK_EL);
     n_samples = collect_samples(async, AR_CAL_PARK_TIMEOUT_S,
                                  samples, AR_CAL_MAX_SAMPLES);
+    // 0 samples here means we never got a single status reply during the park
+    // window — reported as PARK_TIMEOUT. The label is slightly loose (it's
+    // really "no status from the rotator while parking", which a genuine
+    // timeout subsumes), but it's the closest existing code and park timing
+    // isn't otherwise used.
     if (n_samples == 0) return ROTATOR_CALIBRATE_PARK_TIMEOUT;
 
     // --- Leg 1: az sweep ---
