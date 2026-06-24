@@ -113,7 +113,7 @@ static void scan_csv_open(state_t *state)
     if (gettimeofday(&tv, NULL) != 0 || gmtime_r(&tv.tv_sec, &utc) == NULL) {
         return;
     }
-    const char *dir = state->pass_folder[0] ? state->pass_folder : ".";
+    const char *dir = state->op.pass_folder[0] ? state->op.pass_folder : ".";
     int n = snprintf(state->scan.csv_path, sizeof state->scan.csv_path,
                      "%s/scan_sky_UT=%04d%02d%02dT%02d%02d%02dZ.csv",
                      dir,

@@ -52,7 +52,7 @@ static void tx_log_ts_from_event(const sso_event_t *evt,
 }
 
 // Append one event to <pass_folder>/tx.log as a JSON line. Opens the
-// file lazily; no-op when state->pass_folder isn't set yet (so events that
+// file lazily; no-op when state->op.pass_folder isn't set yet (so events that
 // arrive before pass-folder bring-up land in the in-memory ring but
 // aren't dropped silently — they just don't reach disk until the
 // folder exists). fflush after every write so a SIGKILL mid-pass
@@ -61,9 +61,9 @@ static void tx_log_file_append(state_t *state, const sso_event_t *evt)
 {
     if (!evt) return;
     if (state->tx.tx_log_fp == NULL) {
-        if (state->pass_folder[0] == '\0') return;
+        if (state->op.pass_folder[0] == '\0') return;
         char path[512];
-        snprintf(path, sizeof path, "%.500s/tx.log", state->pass_folder);
+        snprintf(path, sizeof path, "%.500s/tx.log", state->op.pass_folder);
         FILE *fp = fopen(path, "a");
         if (!fp) return;
         snprintf(state->tx.tx_log_path, sizeof state->tx.tx_log_path, "%s", path);

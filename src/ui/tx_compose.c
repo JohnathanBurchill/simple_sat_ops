@@ -107,7 +107,7 @@ static void tx_compose_fill_event(state_t *state, const tx_compose_t *c, sso_eve
     tx_compose_summary(c, summary, sizeof summary);
     snprintf(evt->ascii, sizeof evt->ascii, "%s", summary);
     snprintf(evt->from, sizeof evt->from, "%s",
-             state->operator_user ? state->operator_user : "?");
+             state->op.operator_user ? state->op.operator_user : "?");
 }
 
 static int tx_field_is_text(tx_field_t f) { return f == TXF_PAYLOAD; }
@@ -306,7 +306,7 @@ static void tx_compose_draw(state_t *state, WINDOW *w, const tx_compose_t *c) {
         payload_w = (int) sizeof c->payload - 1;
 
     mvwprintw(w, 0, 2, " TX compose (operator: %s)%s ",
-              state->operator_user ? state->operator_user : "?",
+              state->op.operator_user ? state->op.operator_user : "?",
               state->tx.no_tx ? "  [--no-tx]" : "");
 #ifdef SSO_WITH_SDR
     mvwprintw(w, 1, 2,
@@ -391,13 +391,13 @@ static int tx_compose_validate(const tx_compose_t *c, char *err, size_t err_size
 }
 
 static void tx_compose_broadcast_preview(state_t *state, const tx_compose_t *c) {
-    if (!state->ipc) return;
+    if (!state->op.ipc) return;
     sso_event_t evt;
     sso_event_init(&evt, SSO_EVT_TX_COMMAND_PREVIEW);
     tx_compose_fill_event(state, c, &evt);
     char buf[2048];
     if (sso_event_encode(&evt, buf, sizeof buf) == 0) {
-        sso_ipc_server_broadcast(state->ipc, buf);
+        sso_ipc_server_broadcast(state->op.ipc, buf);
     }
     // Mirror into our own ring buffer so the operator's TX log shows
     // the same draft line viewers are seeing.
@@ -500,7 +500,7 @@ void emit_tx_event_local(state_t *state, sso_event_type_t type,
     sso_event_t evt;
     sso_event_init(&evt, type);
     snprintf(evt.from, sizeof evt.from, "%s",
-             state->operator_user ? state->operator_user : "?");
+             state->op.operator_user ? state->op.operator_user : "?");
     // Carry the originating command's source ("auto-cmd (file)" / "manual
     // send") into the SENT / NOT_SENT event. The request slot still holds it
     // here -- tx_burst_service_request clears pending only after this emit.
@@ -512,10 +512,10 @@ void emit_tx_event_local(state_t *state, sso_event_type_t type,
         snprintf(evt.tx_not_sent_reason, sizeof evt.tx_not_sent_reason, "%s", ack_status);
     }
     tx_log_push(state, &evt);
-    if (state->ipc) {
+    if (state->op.ipc) {
         char buf[2048];
         if (sso_event_encode(&evt, buf, sizeof buf) == 0) {
-            sso_ipc_server_broadcast(state->ipc, buf);
+            sso_ipc_server_broadcast(state->op.ipc, buf);
         }
     }
 }
@@ -526,7 +526,7 @@ void emit_tx_event_local(state_t *state, sso_event_type_t type,
 // once, and flip state->tx.tx_compose_active so the main loop starts ticking
 // it. Idempotent: re-opening while already active is a no-op.
 void tx_compose_open(state_t *state) {
-    if (!state->ipc) return;
+    if (!state->op.ipc) return;
     if (state->tx.tx_compose_active) return;
     if (state->tx.auto_tcmd_active) return;  // one modal at a time
     int h = 14, ww = 120;

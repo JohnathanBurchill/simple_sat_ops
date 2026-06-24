@@ -174,9 +174,9 @@ static void auto_tcmd_free_commands(char **commands, int n) {
 // The session-log write is a no-op until the pass folder exists.
 static void auto_tcmd_log(state_t *state, const char *event, const char *detail) {
     sso_audit_event(event, detail);
-    if (state->pass_folder[0] == '\0') return;
+    if (state->op.pass_folder[0] == '\0') return;
     char path[512];
-    snprintf(path, sizeof path, "%.500s/session.log", state->pass_folder);
+    snprintf(path, sizeof path, "%.500s/session.log", state->op.pass_folder);
     FILE *fp = fopen(path, "a");
     if (!fp) return;
     struct timespec ts;
@@ -338,7 +338,7 @@ static void auto_tcmd_draw(state_t *state) {
     int width = getmaxx(w);
 
     mvwprintw(w, 0, 2, " Auto-TCMD (operator: %s)%s ",
-              state->operator_user ? state->operator_user : "?",
+              state->op.operator_user ? state->op.operator_user : "?",
               state->tx.no_tx ? "  [--no-tx]" : "");
 
     mvwprintw(w, 1, 2, "File:    %.*s  (%d commands)",
@@ -532,7 +532,7 @@ static int auto_tcmd_reload(state_t *state) {
 // pause reopens straight into the resume/restart prompt; otherwise the
 // --tc-file is (re)loaded fresh.
 void auto_tcmd_open(state_t *state) {
-    if (!state->ipc) return;
+    if (!state->op.ipc) return;
     if (state->tx.tx_compose_active) return;
     if (state->tx.auto_tcmd_active) return;
 

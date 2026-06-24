@@ -56,8 +56,8 @@ static void tui_grab_stderr(state_t *state)
     if (g_saved_stderr_fd != -1) return;   // already redirected
 
     char path[320];
-    if (state->pass_folder[0]) {
-        snprintf(path, sizeof path, "%.300s/sso_stderr.log", state->pass_folder);
+    if (state->op.pass_folder[0]) {
+        snprintf(path, sizeof path, "%.300s/sso_stderr.log", state->op.pass_folder);
     } else {
         // No pass folder (e.g. a viewer): we still must not corrupt the
         // screen, so swallow stderr rather than leave it on the tty.
@@ -72,7 +72,7 @@ static void tui_grab_stderr(state_t *state)
     // /dev/null sink leaves the path empty and is never reported on.
     g_stderr_log_path[0]    = '\0';
     g_stderr_log_start_size = 0;
-    if (state->pass_folder[0]) {
+    if (state->op.pass_folder[0]) {
         struct stat st;
         if (fstat(log_fd, &st) == 0) g_stderr_log_start_size = st.st_size;
         snprintf(g_stderr_log_path, sizeof g_stderr_log_path, "%s", path);

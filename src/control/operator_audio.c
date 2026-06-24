@@ -143,7 +143,7 @@ static void update_tap(state_t *state)
 void operator_audio_handle_ctl(state_t *state, sso_client_id_t id,
                                const sso_event_t *evt)
 {
-    sso_ipc_server_t *srv = state->ipc;
+    sso_ipc_server_t *srv = state->op.ipc;
     if (!srv) return;
 
     if (!evt->audio_enable) {
@@ -217,7 +217,7 @@ void operator_audio_pump(state_t *state)
                                         AUDIO_PUMP_BATCH)) > 0) {
         for (int i = 0; i < SSO_AUDIO_MAX_SUBS; ++i) {
             if (!g_subs[i].in_use) continue;
-            g_subs[i].srv = state->ipc;
+            g_subs[i].srv = state->op.ipc;
             // The sink sends frames as bytes come out of the encoder.
             ogg_stream_write(g_subs[i].enc, pcm, got);
         }
@@ -230,12 +230,12 @@ void operator_audio_pump(state_t *state)
 
 void operator_audio_prune(state_t *state)
 {
-    if (g_n == 0 || state->ipc == NULL) return;
+    if (g_n == 0 || state->op.ipc == NULL) return;
     int alive[SSO_AUDIO_MAX_SUBS] = {0};
     sso_ipc_iter_t it = {0};
     sso_client_id_t cid;
     char u[64], r[16], sc[40];
-    while (sso_ipc_server_next_client(state->ipc, &it, &cid,
+    while (sso_ipc_server_next_client(state->op.ipc, &it, &cid,
                                       u, sizeof u, r, sizeof r,
                                       sc, sizeof sc) == 0) {
         int i = find_slot(cid);

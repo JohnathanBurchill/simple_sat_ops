@@ -94,7 +94,7 @@
 // (b210_rx_tx --control, tx_frame_sdr) verify the operator's Unix
 // user matches their own via this socket.
 // The IPC fan-out server and the operator's Unix user now live on
-// state_t (state.ipc / state.operator_user).
+// state_t (state.op.ipc / state.op.operator_user).
 
 // --self-test: after CLI parse + HMAC keyfile load, print the resolved
 // configuration to stdout and exit 0 — BEFORE opening the IPC socket,
@@ -254,9 +254,9 @@ int main(int argc, char **argv)
             tr_switch_disconnect(&state.trsw.tr_switch);
             state.trsw.have_tr_switch = 0;
         }
-        if (state.ipc) {
-            sso_ipc_server_close(state.ipc);
-            state.ipc = NULL;
+        if (state.op.ipc) {
+            sso_ipc_server_close(state.op.ipc);
+            state.op.ipc = NULL;
         }
         if (state.track.prediction.auto_sat) {
             free_passes();
@@ -565,8 +565,8 @@ int main(int argc, char **argv)
         // Always service the socket (cheap; accepts new viewers) but
         // throttle STATE broadcasts to 2 Hz so viewers don't get
         // hammered when the loop is running at UHD-chunk cadence.
-        if (state.ipc) {
-            sso_ipc_server_step(state.ipc, 0);
+        if (state.op.ipc) {
+            sso_ipc_server_step(state.op.ipc, 0);
             // Live-audio relay: ship encoded RX audio to any subscribed
             // viewer, then drop subscribers whose client has gone. Both are
             // cheap no-ops when nobody is listening.
@@ -644,9 +644,9 @@ int main(int argc, char **argv)
     // Free any plan that survived (mid-pass exit / crash on a key
     // before the LOS branch had a chance to clear it).
     main_pursuit_clear_plan(&state.rot);
-    if (state.ipc) {
-        sso_ipc_server_close(state.ipc);
-        state.ipc = NULL;
+    if (state.op.ipc) {
+        sso_ipc_server_close(state.op.ipc);
+        state.op.ipc = NULL;
     }
     // Politely terminate the live raylib waterfall if we spawned one.
     live_waterfall_shutdown();

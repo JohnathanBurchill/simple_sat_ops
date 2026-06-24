@@ -294,7 +294,7 @@ void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
             state->ui.run_live_waterfall ? "on (--live-waterfall)" : "off");
 
     fprintf(out, "pass-folder-seed: %s\n",
-            state->pass_folder[0] ? state->pass_folder : "(auto)");
+            state->op.pass_folder[0] ? state->op.pass_folder : "(auto)");
 
     // Observer location. apply_args stored these in radians on the
     // ephem struct — convert back to degrees for the report.
@@ -774,11 +774,11 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                     return PARSE_ERROR;
                 }
                 state->n_options += 2;
-                // Pre-seed state->pass_folder; setup_pass_folder() then skips
+                // Pre-seed state->op.pass_folder; setup_pass_folder() then skips
                 // its AOS-driven auto-discovery and uses the inherited
                 // path (handoff case: new operator picks up the previous
                 // operator's pass folder).
-                snprintf(state->pass_folder, sizeof state->pass_folder, "%s", argv[t + 2]);
+                snprintf(state->op.pass_folder, sizeof state->op.pass_folder, "%s", argv[t + 2]);
                 ++t;
             }
             matched = 1;

@@ -88,21 +88,21 @@ void ipc_broadcast_state(state_t *s,
                                   double downlink_freq,
                                   double doppler_delta_dl,
                                   double jul_utc) {
-    if (!s->ipc) return;
+    if (!s->op.ipc) return;
     sso_event_t evt;
     sso_event_init(&evt, SSO_EVT_STATE);
     snprintf(evt.from, sizeof(evt.from), "%s",
-             s->operator_user ? s->operator_user : "?");
+             s->op.operator_user ? s->op.operator_user : "?");
     snprintf(evt.operator_user, sizeof(evt.operator_user), "%s",
-             s->operator_user ? s->operator_user : "?");
+             s->op.operator_user ? s->op.operator_user : "?");
     evt.has_state = 1;
     evt.az = az;
     evt.el = el;
     evt.freq_hz = (long) downlink_freq;
     evt.doppler_hz = doppler_delta_dl;
-    if (s->pass_folder[0]) {
+    if (s->op.pass_folder[0]) {
         snprintf(evt.pass_folder, sizeof(evt.pass_folder), "%s",
-                 s->pass_folder);
+                 s->op.pass_folder);
     }
     if (s->track.prediction.tles_filename) {
         snprintf(evt.tle_path, sizeof(evt.tle_path), "%s",
@@ -137,7 +137,7 @@ void ipc_broadcast_state(state_t *s,
     size_t n = 0;
     if (n < sizeof(entries) / sizeof(entries[0])) {
         snprintf(entries[n].user, sizeof(entries[n].user), "%s",
-                 s->operator_user ? s->operator_user : "?");
+                 s->op.operator_user ? s->op.operator_user : "?");
         snprintf(entries[n].role, sizeof(entries[n].role), "operator");
         entries[n].since[0] = '\0';
         n++;
@@ -146,7 +146,7 @@ void ipc_broadcast_state(state_t *s,
     sso_client_id_t cid;
     char user[64], role[16], since[40];
     while (n < sizeof(entries) / sizeof(entries[0])
-           && sso_ipc_server_next_client(s->ipc, &it, &cid,
+           && sso_ipc_server_next_client(s->op.ipc, &it, &cid,
                                           user, sizeof(user),
                                           role, sizeof(role),
                                           since, sizeof(since)) == 0) {
@@ -161,7 +161,7 @@ void ipc_broadcast_state(state_t *s,
     ipc_fill_rx_panel(s, &evt);
     char buf[SSO_IPC_LINE_MAX];
     if (sso_event_encode(&evt, buf, sizeof(buf)) == 0) {
-        sso_ipc_server_broadcast(s->ipc, buf);
+        sso_ipc_server_broadcast(s->op.ipc, buf);
     } else {
         fprintf(stderr, "operator_ipc: STATE encode overflow -- "
                 "dropped (roster too large?)\n");
@@ -169,34 +169,34 @@ void ipc_broadcast_state(state_t *s,
 
     // Cache for WELCOME replies so a viewer doesn't have to wait for
     // the next periodic broadcast to see anything.
-    snprintf(s->last_state.sat, sizeof s->last_state.sat, "%s", evt.satellite);
-    snprintf(s->last_state.tle, sizeof s->last_state.tle, "%s", evt.tle_path);
-    s->last_state.az      = evt.az;
-    s->last_state.el      = evt.el;
-    s->last_state.freq_hz = evt.freq_hz;
-    s->last_state.doppler = evt.doppler_hz;
-    s->last_state.tgt_az  = evt.target_az;
-    s->last_state.tgt_el  = evt.target_el;
-    s->last_state.flip    = evt.flip;
-    s->last_state.in_pass = evt.in_pass;
-    s->last_state.tracking= evt.tracking;
-    s->last_state.has_rot = evt.has_rotator;
-    s->last_state.jul     = evt.jul_utc;
-    snprintf(s->last_state.idesg, sizeof s->last_state.idesg, "%s", evt.idesg);
-    s->last_state.epoch_min    = evt.epoch_min;
-    s->last_state.min_visible  = evt.min_visible;
-    s->last_state.min_above_0  = evt.min_above_0;
-    s->last_state.min_above_30 = evt.min_above_30;
-    s->last_state.max_el       = evt.max_el;
-    s->last_state.pred_az      = evt.pred_az;
-    s->last_state.pred_el      = evt.pred_el;
-    s->last_state.alt_km       = evt.alt_km;
-    s->last_state.lat_deg      = evt.lat_deg;
-    s->last_state.lon_deg      = evt.lon_deg;
-    s->last_state.speed_kms    = evt.speed_kms;
-    s->last_state.range_km     = evt.range_km;
-    s->last_state.rrate_kms    = evt.range_rate_kms;
-    s->last_state.valid   = 1;
+    snprintf(s->op.last_state.sat, sizeof s->op.last_state.sat, "%s", evt.satellite);
+    snprintf(s->op.last_state.tle, sizeof s->op.last_state.tle, "%s", evt.tle_path);
+    s->op.last_state.az      = evt.az;
+    s->op.last_state.el      = evt.el;
+    s->op.last_state.freq_hz = evt.freq_hz;
+    s->op.last_state.doppler = evt.doppler_hz;
+    s->op.last_state.tgt_az  = evt.target_az;
+    s->op.last_state.tgt_el  = evt.target_el;
+    s->op.last_state.flip    = evt.flip;
+    s->op.last_state.in_pass = evt.in_pass;
+    s->op.last_state.tracking= evt.tracking;
+    s->op.last_state.has_rot = evt.has_rotator;
+    s->op.last_state.jul     = evt.jul_utc;
+    snprintf(s->op.last_state.idesg, sizeof s->op.last_state.idesg, "%s", evt.idesg);
+    s->op.last_state.epoch_min    = evt.epoch_min;
+    s->op.last_state.min_visible  = evt.min_visible;
+    s->op.last_state.min_above_0  = evt.min_above_0;
+    s->op.last_state.min_above_30 = evt.min_above_30;
+    s->op.last_state.max_el       = evt.max_el;
+    s->op.last_state.pred_az      = evt.pred_az;
+    s->op.last_state.pred_el      = evt.pred_el;
+    s->op.last_state.alt_km       = evt.alt_km;
+    s->op.last_state.lat_deg      = evt.lat_deg;
+    s->op.last_state.lon_deg      = evt.lon_deg;
+    s->op.last_state.speed_kms    = evt.speed_kms;
+    s->op.last_state.range_km     = evt.range_km;
+    s->op.last_state.rrate_kms    = evt.range_rate_kms;
+    s->op.last_state.valid   = 1;
 }
 
 void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
@@ -213,46 +213,46 @@ void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
     sso_event_t welcome;
     sso_event_init(&welcome, SSO_EVT_WELCOME);
     snprintf(welcome.from, sizeof(welcome.from), "%s",
-             state->operator_user ? state->operator_user : "?");
+             state->op.operator_user ? state->op.operator_user : "?");
     snprintf(welcome.operator_user, sizeof(welcome.operator_user), "%s",
-             state->operator_user ? state->operator_user : "?");
-    if (state->pass_folder[0]) {
+             state->op.operator_user ? state->op.operator_user : "?");
+    if (state->op.pass_folder[0]) {
         snprintf(welcome.pass_folder, sizeof(welcome.pass_folder), "%s",
-                 state->pass_folder);
+                 state->op.pass_folder);
     }
-    if (state->last_state.valid) {
+    if (state->op.last_state.valid) {
         welcome.has_state   = 1;
         snprintf(welcome.satellite, sizeof welcome.satellite,
-                 "%s", state->last_state.sat);
+                 "%s", state->op.last_state.sat);
         snprintf(welcome.tle_path, sizeof welcome.tle_path,
-                 "%s", state->last_state.tle);
-        welcome.az          = state->last_state.az;
-        welcome.el          = state->last_state.el;
-        welcome.freq_hz     = state->last_state.freq_hz;
-        welcome.doppler_hz  = state->last_state.doppler;
-        welcome.target_az   = state->last_state.tgt_az;
-        welcome.target_el   = state->last_state.tgt_el;
-        welcome.flip        = state->last_state.flip;
-        welcome.in_pass     = state->last_state.in_pass;
-        welcome.tracking    = state->last_state.tracking;
-        welcome.has_rotator = state->last_state.has_rot;
-        welcome.jul_utc     = state->last_state.jul;
-        snprintf(welcome.idesg, sizeof welcome.idesg, "%s", state->last_state.idesg);
-        welcome.epoch_min      = state->last_state.epoch_min;
-        welcome.min_visible    = state->last_state.min_visible;
-        welcome.min_above_0    = state->last_state.min_above_0;
-        welcome.min_above_30   = state->last_state.min_above_30;
-        welcome.max_el         = state->last_state.max_el;
-        welcome.pred_az        = state->last_state.pred_az;
-        welcome.pred_el        = state->last_state.pred_el;
-        welcome.alt_km         = state->last_state.alt_km;
-        welcome.lat_deg        = state->last_state.lat_deg;
-        welcome.lon_deg        = state->last_state.lon_deg;
-        welcome.speed_kms      = state->last_state.speed_kms;
-        welcome.range_km       = state->last_state.range_km;
-        welcome.range_rate_kms = state->last_state.rrate_kms;
+                 "%s", state->op.last_state.tle);
+        welcome.az          = state->op.last_state.az;
+        welcome.el          = state->op.last_state.el;
+        welcome.freq_hz     = state->op.last_state.freq_hz;
+        welcome.doppler_hz  = state->op.last_state.doppler;
+        welcome.target_az   = state->op.last_state.tgt_az;
+        welcome.target_el   = state->op.last_state.tgt_el;
+        welcome.flip        = state->op.last_state.flip;
+        welcome.in_pass     = state->op.last_state.in_pass;
+        welcome.tracking    = state->op.last_state.tracking;
+        welcome.has_rotator = state->op.last_state.has_rot;
+        welcome.jul_utc     = state->op.last_state.jul;
+        snprintf(welcome.idesg, sizeof welcome.idesg, "%s", state->op.last_state.idesg);
+        welcome.epoch_min      = state->op.last_state.epoch_min;
+        welcome.min_visible    = state->op.last_state.min_visible;
+        welcome.min_above_0    = state->op.last_state.min_above_0;
+        welcome.min_above_30   = state->op.last_state.min_above_30;
+        welcome.max_el         = state->op.last_state.max_el;
+        welcome.pred_az        = state->op.last_state.pred_az;
+        welcome.pred_el        = state->op.last_state.pred_el;
+        welcome.alt_km         = state->op.last_state.alt_km;
+        welcome.lat_deg        = state->op.last_state.lat_deg;
+        welcome.lon_deg        = state->op.last_state.lon_deg;
+        welcome.speed_kms      = state->op.last_state.speed_kms;
+        welcome.range_km       = state->op.last_state.range_km;
+        welcome.range_rate_kms = state->op.last_state.rrate_kms;
         // Auto-TCMD progress reads the live modal state (like
-        // ipc_fill_rx_panel below) — no state->last_state.* cache needed.
+        // ipc_fill_rx_panel below) — no state->op.last_state.* cache needed.
         {
             int at_sent = 0, at_total = 0;
             const char *at_label = NULL;
@@ -272,7 +272,7 @@ void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
         sso_roster_entry_t entries[SSO_IPC_MAX_CLIENTS_FOR_ROSTER];
         size_t n = 0;
         snprintf(entries[n].user, sizeof(entries[n].user), "%s",
-                 state->operator_user ? state->operator_user : "?");
+                 state->op.operator_user ? state->op.operator_user : "?");
         snprintf(entries[n].role, sizeof(entries[n].role), "operator");
         entries[n].since[0] = '\0';
         n++;
@@ -306,7 +306,7 @@ void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
 int ipc_operator_startup(state_t *state, int argc, char **argv)
 {
     // Audit + operator IPC bring-up.
-    state->operator_user = sso_unix_user();
+    state->op.operator_user = sso_unix_user();
     sso_audit_start("simple_sat_ops",
                     state->control_mode ? "operator" : "standalone");
     // Record the exact command line so post-incident review can tie
@@ -363,8 +363,8 @@ int ipc_operator_startup(state_t *state, int argc, char **argv)
             return EXIT_FAILURE;
         }
 
-        state->ipc = sso_ipc_server_open("simple_sat_ops");
-        if (state->ipc == NULL) {
+        state->op.ipc = sso_ipc_server_open("simple_sat_ops");
+        if (state->op.ipc == NULL) {
             // Probe said "no operator" yet bind still failed — most
             // likely a stale socket / pid file from a crashed
             // previous operator (or a vanishingly-rare race with
@@ -378,10 +378,10 @@ int ipc_operator_startup(state_t *state, int argc, char **argv)
             sso_audit_event("ipc-bind-failed", "");
             return EXIT_FAILURE;
         }
-        sso_ipc_server_on_event(state->ipc, ipc_on_event, state);
+        sso_ipc_server_on_event(state->op.ipc, ipc_on_event, state);
         tui_install_yield_handler();
         fprintf(stderr, "simple_sat_ops: operator=%s ipc=on\n",
-                state->operator_user);
+                state->op.operator_user);
     }
     return 0;
 }

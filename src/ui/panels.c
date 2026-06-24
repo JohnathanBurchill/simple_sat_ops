@@ -65,7 +65,7 @@ void ribbon_push(ui_t *ui, double peak_dbfs, int bright_bins)
 }
 
 // Low-disk warning + the pass output folder now live on state_t
-// (state.low_disk_msg / state.low_disk_last_t / state.pass_folder).
+// (state.op.low_disk_msg / state.op.low_disk_last_t / state.op.pass_folder).
 
 // Returns bytes available to a non-privileged user on the filesystem
 // hosting `path`. Returns (uint64_t) -1 on error or when path is empty.
@@ -77,29 +77,29 @@ static uint64_t free_disk_bytes(const char *path)
     return (uint64_t) s.f_bavail * (uint64_t) s.f_frsize;
 }
 
-// Refresh state->low_disk_msg if the period has elapsed. Empty message
+// Refresh state->op.low_disk_msg if the period has elapsed. Empty message
 // means "above threshold" — render_rx_panel skips the row in that case.
-void low_disk_refresh(state_t *state, double t_now)
+void low_disk_refresh(op_t *op, double t_now)
 {
-    if ((t_now - state->low_disk_last_t) < LOW_DISK_PERIOD_S
-        && state->low_disk_last_t != 0.0) return;
-    state->low_disk_last_t = t_now;
-    const char *probe = state->pass_folder[0] ? state->pass_folder : ".";
+    if ((t_now - op->low_disk_last_t) < LOW_DISK_PERIOD_S
+        && op->low_disk_last_t != 0.0) return;
+    op->low_disk_last_t = t_now;
+    const char *probe = op->pass_folder[0] ? op->pass_folder : ".";
     uint64_t avail = free_disk_bytes(probe);
     if (avail == (uint64_t) -1) {
-        state->low_disk_msg[0] = '\0';
+        op->low_disk_msg[0] = '\0';
         return;
     }
     if (avail >= LOW_DISK_BYTES) {
-        state->low_disk_msg[0] = '\0';
+        op->low_disk_msg[0] = '\0';
         return;
     }
     double gb = (double) avail / 1.0e9;
     // Cap path width so the message fits in the 80-byte buffer: prefix
     // is ~26 chars ("LOW DISK: 12.34 GB free at "), leaving 50 for the
     // path. GCC -Wformat-truncation would otherwise flag the unbounded
-    // %s against a 255-byte state->pass_folder.
-    snprintf(state->low_disk_msg, sizeof state->low_disk_msg,
+    // %s against a 255-byte op->pass_folder.
+    snprintf(op->low_disk_msg, sizeof op->low_disk_msg,
              "LOW DISK: %.2f GB free at %.50s", gb, probe);
 }
 
@@ -243,7 +243,7 @@ void rx_panel_collect_local(state_t *state, rx_panel_data_t *d)
 #endif
     // Warning row is filled regardless of the B210 build — even without
     // an SDR the operator could be running short on disk for logs.
-    snprintf(d->warning, sizeof d->warning, "%s", state->low_disk_msg);
+    snprintf(d->warning, sizeof d->warning, "%s", state->op.low_disk_msg);
 #ifdef SSO_WITH_SDR
     // A lost SDR outranks the low-disk notice — show it instead so the
     // operator sees immediately that RX has stopped.
@@ -721,12 +721,12 @@ static void operator_viewers_list(state_t *state, char *out, size_t out_size)
 {
     if (out_size == 0) return;
     out[0] = '\0';
-    if (!state->ipc) return;
+    if (!state->op.ipc) return;
     sso_ipc_iter_t it = {0};
     sso_client_id_t cid;
     char user[64], role[16], since[40];
     size_t written = 0;
-    while (sso_ipc_server_next_client(state->ipc, &it, &cid,
+    while (sso_ipc_server_next_client(state->op.ipc, &it, &cid,
                                        user, sizeof user,
                                        role, sizeof role,
                                        since, sizeof since) == 0) {
@@ -751,7 +751,7 @@ void report_status(state_t *state, int *print_row, int print_col)
     status_panel_t p;
     memset(&p, 0, sizeof p);
     p.control_mode  = state->control_mode;
-    p.operator_user = state->operator_user;
+    p.operator_user = state->op.operator_user;
     p.viewers       = viewers[0] ? viewers : "(none)";
 
     double display_dl_hz = state->track.doppler_downlink_frequency_hz;
@@ -924,7 +924,7 @@ void render_operator_screen(state_t *state, double jul_utc, double t_now,
     row++;
     // Refresh the low-disk warning lazily -- statvfs every 30 s is plenty
     // given how slowly disk fills.
-    low_disk_refresh(state, t_now);
+    low_disk_refresh(&state->op, t_now);
     rx_panel_data_t rxd;
     rx_panel_collect_local(state, &rxd);
     render_rx_panel(&rxd, &row, 50);

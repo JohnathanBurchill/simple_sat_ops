@@ -285,13 +285,13 @@ void hw_sdr_open(state_t *state)
                 .use_rs            = 1,
                 .force_beacon      = 0,
                 .show_packet_headers = 0,
-                .pass_folder       = state->pass_folder[0] ? state->pass_folder : NULL,
+                .pass_folder       = state->op.pass_folder[0] ? state->op.pass_folder : NULL,
                 .want_wav          = 1,
                 .tle_path          = state->track.prediction.tles_filename,
                 .sat_name          = state->track.prediction.satellite_ephem.tle.sat_name[0]
                                      ? state->track.prediction.satellite_ephem.tle.sat_name
                                      : NULL,
-                .session_dir       = state->pass_folder[0] ? state->pass_folder : NULL,
+                .session_dir       = state->op.pass_folder[0] ? state->op.pass_folder : NULL,
                 .lo_offset_hz      = state->sdr.rx_lo_offset_hz,
             };
             if (rx_session_open(&state->sdr.rx_session, &rxp, core) != 0) {

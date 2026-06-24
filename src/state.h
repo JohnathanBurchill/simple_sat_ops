@@ -21,10 +21,10 @@
 #ifndef STATE_H
 #define STATE_H
 
+#include "op_state.h"
 #include "rot_state.h"
 #include "sdr_state.h"
 #include "track_state.h"
-#include "sso_ipc.h"
 #include "telemetry.h"
 #include "trsw_state.h"
 #include "tx_state.h"
@@ -35,41 +35,6 @@
 #include <stdio.h>
 #include <termios.h>
 #include <time.h>
-
-// Latest broadcast snapshot, kept so a newly-connecting viewer gets state
-// in its WELCOME response without waiting up to 500 ms for the next
-// periodic STATE broadcast. ipc_broadcast_state fills it after each send;
-// ipc_on_event reads it to seed a WELCOME.
-typedef struct last_state {
-    int    valid;
-    char   sat[64];
-    double az;
-    double el;
-    long   freq_hz;
-    double doppler;
-    char   tle[256];
-    double tgt_az;
-    double tgt_el;
-    int    flip;
-    int    in_pass;
-    int    tracking;
-    int    has_rot;
-    double jul;
-    char   idesg[9];
-    double epoch_min;
-    double min_visible;
-    double min_above_0;
-    double min_above_30;
-    double max_el;
-    double pred_az;
-    double pred_el;
-    double alt_km;
-    double lat_deg;
-    double lon_deg;
-    double speed_kms;
-    double range_km;
-    double rrate_kms;
-} last_state_t;
 
 #define MAX_TLE_LINE_LENGTH 128
 #define TRACKING_PREP_TIME_MINUTES 5.0
@@ -94,12 +59,9 @@ typedef struct state
     int self_test;           // --self-test: print a report and exit
     int testing_mode;        // --testing
 
-    const char       *operator_user;   // Unix user running the operator
-    sso_ipc_server_t *ipc;             // IPC fan-out server (operator side)
-    last_state_t      last_state;      // last broadcast snapshot (WELCOME seed)
-    char   pass_folder[256];           // this pass's output folder; "" until set
-    char   low_disk_msg[80];           // non-empty -> low-disk warning to show
-    double low_disk_last_t;            // last low-disk probe (monotonic s)
+    // Operator: IPC fan-out server + user, last broadcast snapshot, pass
+    // output folder, low-disk warning. See op_state.h.
+    op_t op;
 
     // Orbit prediction + Doppler frequencies + tracked-satellite identity.
     // See track_state.h.

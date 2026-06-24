@@ -128,7 +128,7 @@ typedef struct {
 
 // Per-tick data updaters (operator-side).
 void ribbon_push(ui_t *ui, double peak_dbfs, int bright_bins);
-void low_disk_refresh(state_t *state, double t_now);
+void low_disk_refresh(op_t *op, double t_now);
 
 // Snapshot the operator's live RX state into d for rendering / broadcast.
 void rx_panel_collect_local(state_t *state, rx_panel_data_t *d);

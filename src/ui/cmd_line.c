@@ -659,34 +659,34 @@ static void cmd_dispatch(state_t *state)
 // Mirror the operator's ":" prompt to viewers. cmd-preview carries the
 // live buffer (debounced in the main loop); cmd-executed carries the
 // dispatched command + the resulting status string. Both helpers no-op
-// when state->ipc isn't open (e.g., --no-control).
+// when state->op.ipc isn't open (e.g., --no-control).
 void cmd_broadcast_preview(state_t *state)
 {
-    if (!state->ipc) return;
+    if (!state->op.ipc) return;
     sso_event_t evt;
     sso_event_init(&evt, SSO_EVT_CMD_PREVIEW);
     snprintf(evt.from, sizeof evt.from, "%s",
-             state->operator_user ? state->operator_user : "?");
+             state->op.operator_user ? state->op.operator_user : "?");
     snprintf(evt.cmd_text, sizeof evt.cmd_text, "%s", state->cmd.buf);
     char buf[2048];
     if (sso_event_encode(&evt, buf, sizeof buf) == 0) {
-        sso_ipc_server_broadcast(state->ipc, buf);
+        sso_ipc_server_broadcast(state->op.ipc, buf);
     }
 }
 
 static void cmd_broadcast_executed(state_t *state, const char *executed_cmd)
 {
-    if (!state->ipc) return;
+    if (!state->op.ipc) return;
     sso_event_t evt;
     sso_event_init(&evt, SSO_EVT_CMD_EXECUTED);
     snprintf(evt.from, sizeof evt.from, "%s",
-             state->operator_user ? state->operator_user : "?");
+             state->op.operator_user ? state->op.operator_user : "?");
     snprintf(evt.cmd_text,   sizeof evt.cmd_text,   "%s",
              executed_cmd ? executed_cmd : "");
     snprintf(evt.cmd_status, sizeof evt.cmd_status, "%s", state->cmd.status);
     char buf[2048];
     if (sso_event_encode(&evt, buf, sizeof buf) == 0) {
-        sso_ipc_server_broadcast(state->ipc, buf);
+        sso_ipc_server_broadcast(state->op.ipc, buf);
     }
 }
 

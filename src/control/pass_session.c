@@ -246,26 +246,26 @@ static int find_nearby_pass_folder(const char *parent_dir,
 }
 
 // build /FrontierSat/Operations/<yyyymmdd>/<hhmmLT>/. Stashes the
-// result in state->pass_folder so ipc_broadcast_state can publish it on
+// result in state->op.pass_folder so ipc_broadcast_state can publish it on
 // every tick.
 void setup_pass_folder(state_t *state, double jul_utc_now)
 {
-    // Handoff case: --pass-folder seeded state->pass_folder before we got
+    // Handoff case: --pass-folder seeded state->op.pass_folder before we got
     // here. Honour it — make sure the dir exists, refresh the
     // "current" symlink, and skip AOS-discovery entirely.
-    if (state->pass_folder[0]) {
-        if (sso_mkdir_p(state->pass_folder) != 0) {
+    if (state->op.pass_folder[0]) {
+        if (sso_mkdir_p(state->op.pass_folder) != 0) {
             fprintf(stderr,
                 "simple_sat_ops: mkdir -p %s failed: %s\n",
-                state->pass_folder, strerror(errno));
+                state->op.pass_folder, strerror(errno));
         }
-        update_operations_current_symlink(state->pass_folder);
+        update_operations_current_symlink(state->op.pass_folder);
         fprintf(stderr, "simple_sat_ops: using inherited pass folder %s\n",
-                state->pass_folder);
+                state->op.pass_folder);
         {
             char det[600];
             snprintf(det, sizeof det,
-                     "mode=inherited path=\"%.500s\"", state->pass_folder);
+                     "mode=inherited path=\"%.500s\"", state->op.pass_folder);
             sso_audit_event("pass-folder", det);
         }
         return;
@@ -297,17 +297,17 @@ void setup_pass_folder(state_t *state, double jul_utc_now)
                 folder, strerror(errno));
             return;
         }
-        snprintf(state->pass_folder, sizeof state->pass_folder, "%s", folder);
+        snprintf(state->op.pass_folder, sizeof state->op.pass_folder, "%s", folder);
         // Skip update_operations_current_symlink — keep the
         // Operations/current pointer aimed at real passes, not bench
         // runs (avoids confusing operators who scrub recent activity
         // by looking at the symlink).
         fprintf(stderr,
-            "simple_sat_ops: --testing folder %s\n", state->pass_folder);
+            "simple_sat_ops: --testing folder %s\n", state->op.pass_folder);
         {
             char det[600];
             snprintf(det, sizeof det,
-                     "mode=testing path=\"%.500s\"", state->pass_folder);
+                     "mode=testing path=\"%.500s\"", state->op.pass_folder);
             sso_audit_event("pass-folder", det);
         }
         return;
@@ -398,13 +398,13 @@ void setup_pass_folder(state_t *state, double jul_utc_now)
         }
     }
 
-    snprintf(state->pass_folder, sizeof state->pass_folder, "%s", folder);
+    snprintf(state->op.pass_folder, sizeof state->op.pass_folder, "%s", folder);
     update_operations_current_symlink(folder);
     fprintf(stderr, "simple_sat_ops: pass folder %s\n", folder);
     {
         char det[600];
         snprintf(det, sizeof det,
-                 "mode=aos path=\"%.500s\"", state->pass_folder);
+                 "mode=aos path=\"%.500s\"", state->op.pass_folder);
         sso_audit_event("pass-folder", det);
     }
 }
@@ -428,7 +428,7 @@ void generate_pass_plot(state_t *state, const char *pass_folder,
     prediction_t pred = state->track.prediction;
 
     // Defensive: handoff case (setup_pass_folder used inherited
-    // state->pass_folder) leaves predicted_minutes_until_visible stale.
+    // state->op.pass_folder) leaves predicted_minutes_until_visible stale.
     // Re-run the search so aos_jul below is well defined.
     minutes_until_visible(&pred, jul_utc_now,
                           jul_utc_now + 180.0 / 1440.0, 1.0);
@@ -625,8 +625,8 @@ int pass_session_load_orbit(state_t *state)
         double jul_now = Julian_Date(&utc, &tv);
         update_satellite_position(&state->track.prediction, jul_now);
         setup_pass_folder(state, jul_now);
-        if (state->pass_folder[0]) {
-            generate_pass_plot(state, state->pass_folder, jul_now);
+        if (state->op.pass_folder[0]) {
+            generate_pass_plot(state, state->op.pass_folder, jul_now);
         }
     }
     return 0;

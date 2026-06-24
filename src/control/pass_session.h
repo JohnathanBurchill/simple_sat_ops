@@ -50,7 +50,7 @@ int find_newest_tle_recursive(const char *dir, char *out_path, size_t out_cap,
 int read_tle_name(const char *tle_path, char *out, size_t out_cap);
 
 // Create (or adopt) this pass's dated output folder, point
-// Operations/current at it, and stash the path in state->pass_folder.
+// Operations/current at it, and stash the path in state->op.pass_folder.
 void setup_pass_folder(state_t *state, double jul_utc_now);
 
 // Render the whole-pass az/el trajectory plot for the current prediction
