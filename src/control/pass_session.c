@@ -162,22 +162,38 @@ static time_t jul_to_unix(double jd)
 }
 
 // Refresh /FrontierSat/Operations/current so it points at `target`.
-// Atomic-ish: unlink the old link, symlink the new one. If the
-// symlink call fails we log and carry on — the pass folder itself is
-// still created and broadcast over IPC, the symlink is just a
-// convenience.
+// Atomically repoint the "current" symlink. If anything fails we log and
+// carry on — the pass folder itself is still created and broadcast over IPC,
+// the symlink is just a convenience.
 static void update_operations_current_symlink(const char *target)
 {
     const char *link = sso_operations_current_symlink();
     if (link == NULL || link[0] == '\0') return;
     // Make sure /FrontierSat/Operations/ exists for the symlink slot.
     sso_mkdir_p_for_file(link);
-    unlink(link);
-    if (symlink(target, link) != 0) {
+    // Create the new link under a temp name in the same directory, then
+    // rename() it onto the slot. rename() over an existing path is atomic, so
+    // a concurrent reader never catches the slot momentarily missing the way
+    // the old unlink-then-symlink sequence could.
+    char tmp[1100];
+    if ((size_t) snprintf(tmp, sizeof tmp, "%s.new", link) >= sizeof tmp) {
+        fprintf(stderr, "simple_sat_ops: symlink temp path too long for %s\n", link);
+        return;
+    }
+    unlink(tmp);  // clear any leftover from an interrupted previous swap
+    if (symlink(target, tmp) != 0) {
         fprintf(stderr,
                 "simple_sat_ops: symlink %s -> %s failed: %s "
                 "(non-fatal; pass folder still set)\n",
-                link, target, strerror(errno));
+                tmp, target, strerror(errno));
+        return;
+    }
+    if (rename(tmp, link) != 0) {
+        fprintf(stderr,
+                "simple_sat_ops: rename %s -> %s failed: %s "
+                "(non-fatal; pass folder still set)\n",
+                tmp, link, strerror(errno));
+        unlink(tmp);
     }
 }
 

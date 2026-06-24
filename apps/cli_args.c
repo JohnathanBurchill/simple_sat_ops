@@ -1235,6 +1235,11 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         }
 
         const pass_t *p = get_pass(0);
+        // Deliberate one-shot, process-lifetime allocation: the chosen name
+        // must outlive the pass list (freed just below) and persist for the
+        // whole run. ephemeres_t.name has no consistent owner (elsewhere it
+        // points at argv or a static), so we don't free it here — it is
+        // reclaimed at process exit.
         state->prediction.satellite_ephem.name = strdup(p->name);
         printf("Satellite: %s\n", state->prediction.satellite_ephem.name);
     }

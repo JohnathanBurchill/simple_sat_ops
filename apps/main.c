@@ -333,6 +333,11 @@ int main(int argc, char **argv)
     // prompt so each keystroke echoes immediately.
     double t_last_ipc_broadcast = 0.0;
     double t_last_redraw        = 0.0;
+    // These periods are UPPER BOUNDS, not fixed schedules: each gate is only
+    // tested once per loop nap (usleep at the loop tail), so the real cadence
+    // is min(this period, nap-bounded tick rate). At the default 2 Hz nap they
+    // coincide; while the operator types or audio streams, the nap shortens
+    // and the gates fire closer to these periods.
     const double IPC_BROADCAST_PERIOD_S = 0.5;   // 2 Hz
     const double REDRAW_PERIOD_S        = 0.5;   // 2 Hz
 

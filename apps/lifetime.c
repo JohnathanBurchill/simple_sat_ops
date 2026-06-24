@@ -22,6 +22,7 @@
 #include "prediction.h"
 #include "tle_csv.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -37,8 +38,19 @@ double lifetime(prediction_t *prediction, double jul_utc_start, double delta_t_m
     update_satellite_position(prediction, jul_utc);
     double years = 0.0;
 
+    // Sanitize the satellite name before it lands in a /tmp path: a name with
+    // '/' or '..' would otherwise escape the intended file. Keep alnum / . / -
+    // and map everything else to '_'.
+    char safe[64] = {0};
+    const char *nm = prediction->satellite_ephem.name ? prediction->satellite_ephem.name : "sat";
+    size_t j = 0;
+    for (size_t i = 0; nm[i] != '\0' && j + 1 < sizeof safe; ++i) {
+        unsigned char ch = (unsigned char) nm[i];
+        safe[j++] = (isalnum(ch) || ch == '.' || ch == '-') ? (char) ch : '_';
+    }
+    if (j == 0) safe[0] = '_';
     char filename[FILENAME_MAX] = {0};
-    snprintf(filename, FILENAME_MAX, "/tmp/lifetime_%s.dat", prediction->satellite_ephem.name);
+    snprintf(filename, FILENAME_MAX, "/tmp/lifetime_%s.dat", safe);
     FILE *file = fopen(filename, "w");
     if (file == NULL) {
         fprintf(stderr, "Unable to open %s for writing\n", filename);
