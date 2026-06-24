@@ -656,7 +656,9 @@ static void tle_sha1(const char *line1, const char *line2,
 //   col 18-19 epoch year (last two digits)
 //   col 20-31 epoch day-of-year + fractional day
 // All as ASCII text. Returns 0 on success, -1 if the line doesn't look
-// like a TLE.
+// like a TLE. The strlen >= 32 gate makes every fixed-offset read below
+// in-bounds, so there's no overflow risk; a malformed line that still passes
+// the gate is only a data-quality issue (garbage catalog/epoch), not unsafe.
 static int parse_tle_line1(const char *line1,
                            int *out_catalog,
                            int *out_epoch_year,
@@ -719,9 +721,19 @@ long long packet_db_register_tle(packet_db_t *db,
     sqlite3_bind_blob(s, 7, sha, sizeof sha, SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 8, ts_buf, -1, SQLITE_TRANSIENT);
 
-    if (sqlite3_step(s) != SQLITE_DONE) {
-        fprintf(stderr, "packet_db: register_tle failed: %s\n",
-                sqlite3_errmsg(db->db));
+    int step_rc = sqlite3_step(s);
+    if (step_rc != SQLITE_DONE) {
+        // Distinguish "the DB stayed contended past the busy_timeout" (a
+        // transient we just lost the race for) from a genuine failure
+        // (schema/constraint/IO). Both still return 0 = "no tle id", but the
+        // log shouldn't make a busy DB look like corruption.
+        if (step_rc == SQLITE_BUSY || step_rc == SQLITE_LOCKED) {
+            fprintf(stderr, "packet_db: register_tle skipped: database busy past "
+                    "the busy_timeout (%s)\n", sqlite3_errmsg(db->db));
+        } else {
+            fprintf(stderr, "packet_db: register_tle failed: %s\n",
+                    sqlite3_errmsg(db->db));
+        }
         return 0;
     }
     // INSERT OR IGNORE may have done nothing if a concurrent writer

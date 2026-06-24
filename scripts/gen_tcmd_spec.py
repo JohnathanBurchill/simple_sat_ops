@@ -103,15 +103,20 @@ def main():
                     help="output .c path (default: stdout)")
     args = ap.parse_args()
 
-    text = sys.stdin.read() if args.infile == "-" else open(args.infile).read()
+    if args.infile == "-":
+        text = sys.stdin.read()
+    else:
+        with open(args.infile, encoding="utf-8") as f:
+            text = f.read()
     records = parse(text)
     if not records:
         sys.exit("gen_tcmd_spec: no telecommand definitions found in input")
 
-    out = sys.stdout if args.out == "-" else open(args.out, "w")
-    emit(records, args.tag, out)
-    if out is not sys.stdout:
-        out.close()
+    if args.out == "-":
+        emit(records, args.tag, sys.stdout)
+    else:
+        with open(args.out, "w", encoding="utf-8") as out:
+            emit(records, args.tag, out)
     sys.stderr.write(f"gen_tcmd_spec: wrote {len(records)} telecommands "
                      f"(tag {args.tag})\n")
 

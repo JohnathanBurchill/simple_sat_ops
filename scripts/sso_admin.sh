@@ -301,7 +301,10 @@ cmd_add_operator() {
         if (( DRY_RUN )); then
             log "would append key to $auth"
         else
-            printf '%s\n' "$key" >> "$auth"
+            # umask 077 so that if this append CREATES authorized_keys it is
+            # born 600, not world-readable at the default umask until the
+            # chmod below lands (loose perms also make sshd ignore the file).
+            ( umask 077; printf '%s\n' "$key" >> "$auth" )
             chown "$name:$name" "$auth"
             chmod 600 "$auth"
         fi

@@ -32,15 +32,21 @@ include(GNUInstallDirs)
 # the hand-maintained compile_flags.txt fallback.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-#set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
+# Optimization/debug flags come from CMAKE_BUILD_TYPE so a release build is
+# possible (cmake -DCMAKE_BUILD_TYPE=Release). Only fall back to the historical
+# unoptimized + debug default when the caller picked no build type and set no
+# explicit -O, so existing `cmake ..` invocations keep building the same way.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_C_FLAGS MATCHES "-O")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
+endif()
 #set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g -fsanitize=address")
 
 # Catch buffer-truncation bugs on the dev host so they don't slip to
-# the RAO Linux build. clang and gcc both accept -Wformat-truncation;
-# unknown -W flags become a single warning and the build still proceeds,
-# so unconditional add is safe across host compilers.
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wformat-truncation -Wformat-overflow")
+# the RAO Linux build. These are GCC warnings; Apple clang doesn't implement
+# them and just emits one "unknown warning option" note (the build still
+# proceeds), so the real truncation check is scripts/lint_warnings.sh running
+# gcc. The =2 level makes GCC flag truncation even when the result might fit.
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wformat-truncation=2 -Wformat-overflow=2")
 
 # Sources live under src/<area>/. Every #include in the codebase is the
 # bare form `#include "foo.h"`, so we register every area as an include
