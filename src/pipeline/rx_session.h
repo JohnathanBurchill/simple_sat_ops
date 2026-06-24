@@ -154,7 +154,7 @@ size_t rx_session_read_audio(rx_session_t *rxs, int16_t *out, size_t max_samples
 // Any out-pointer may be NULL.
 void rx_session_wav_snapshot(const rx_session_t *rxs,
                              char     *out_path, size_t path_cap,
-                             long     *out_n_samples,
+                             int64_t  *out_n_samples,
                              int      *out_sample_rate,
                              int      *out_active);
 
@@ -163,7 +163,7 @@ void rx_session_wav_snapshot(const rx_session_t *rxs,
 // Same path-persistence semantics as wav_snapshot.
 void rx_session_iq_snapshot(const rx_session_t *rxs,
                             char *out_path, size_t path_cap,
-                            long *out_pairs,
+                            int64_t *out_pairs,
                             int  *out_sample_rate);
 
 // Frame count from the shadow PCM/FM-audio demod (modem.c run on the

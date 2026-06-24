@@ -68,11 +68,11 @@ static const char  *g_db_source_run  = NULL;
 // whole group: setters write under it, record_packet snapshots under it.
 // Uncontended (and free) in the single-threaded offline tools.
 static pthread_mutex_t g_obs_mu = PTHREAD_MUTEX_INITIALIZER;
-static double g_obs_az_deg            = (0.0 / 0.0);
-static double g_obs_el_deg            = (0.0 / 0.0);
-static double g_obs_range_km          = (0.0 / 0.0);
-static double g_obs_range_rate_km_s   = (0.0 / 0.0);
-static double g_obs_doppler_hz_offset = (0.0 / 0.0);
+static double g_obs_az_deg            = NAN;
+static double g_obs_el_deg            = NAN;
+static double g_obs_range_km          = NAN;
+static double g_obs_range_rate_km_s   = NAN;
+static double g_obs_doppler_hz_offset = NAN;
 static long long g_obs_tle_id         = 0;
 static const char *g_obs_session_dir  = NULL;
 // Provenance of the audio under decode. Set once at startup by the
@@ -85,7 +85,7 @@ static const char *g_obs_capture_origin = NULL;
 // ts_received (the legacy behaviour, kept so receivers that never
 // resolve a UT base — e.g. rx_decode on a stripped WAV — still
 // produce a sortable timestamp).
-static double g_audio_anchor_unix     = (0.0 / 0.0);
+static double g_audio_anchor_unix     = NAN;
 
 void decode_loop_set_audio_clock_anchor(double unix_seconds)
 {
@@ -786,7 +786,7 @@ void decode_loop_record_packet(const char *ts,
     // really sent it" semantics.
     char ts_iso[40];
     const char *ts_for_db = ts;
-    double offset_s = (0.0 / 0.0);  // NaN
+    double offset_s = NAN;
     if (ts != NULL && strncmp(ts, "t=", 2) == 0) {
         char *endp = NULL;
         double v = strtod(ts + 2, &endp);

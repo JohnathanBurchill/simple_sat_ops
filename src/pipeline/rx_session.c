@@ -68,8 +68,17 @@ static void wav_w_append(wav_w_t *w, const int16_t *s, size_t n)
 static void wav_w_close(wav_w_t *w)
 {
     if (w->fp == NULL) return;
-    uint32_t data_sz = (uint32_t)(w->n_samples * 2u);
-    uint32_t riff_sz = data_sz + 36u;
+    // The RIFF/data chunk sizes are 32-bit, so a WAV can describe at most
+    // ~4 GiB. At 96 kHz mono int16 that is ~6.2 hours of audio; a longer
+    // pass overruns the header fields. Compute in 64-bit and clamp to the
+    // maximum representable value rather than letting the size silently wrap
+    // to a tiny number (which would make players truncate playback). The
+    // captured audio is all on disk regardless; only the advertised size
+    // saturates.
+    uint64_t bytes = (uint64_t) w->n_samples * 2u;
+    uint32_t data_sz = (bytes > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t) bytes;
+    uint32_t riff_sz = (bytes + 36u > 0xFFFFFFFFu) ? 0xFFFFFFFFu
+                                                   : (uint32_t)(bytes + 36u);
     if (fseek(w->fp, 4,  SEEK_SET) == 0) (void) fwrite(&riff_sz, 4, 1, w->fp);
     if (fseek(w->fp, 40, SEEK_SET) == 0) (void) fwrite(&data_sz, 4, 1, w->fp);
     fclose(w->fp);
@@ -256,7 +265,6 @@ struct rx_session {
 
     // Frame counters + last-decoded summary.
     uint64_t frames_total;
-    unsigned frames_in_window;
     char     last_frame_ts[24];
     int      last_frame_len;
     // Per-type stats. Worker writes under mu so the main-thread
@@ -348,9 +356,9 @@ struct rx_session {
     uint8_t  snap_per_type_last_payload[RX_PT_COUNT][RX_LAST_PAYLOAD_MAX];
     char     snap_per_type_last_summary[RX_PT_COUNT][RX_LAST_SUMMARY_MAX];
     char     snap_wav_path[512];
-    long     snap_wav_n_samples;
+    int64_t  snap_wav_n_samples;
     char     snap_iq_path[512];
-    long     snap_iq_pairs;
+    int64_t  snap_iq_pairs;
     uint64_t snap_pcm_frames_total;
     uint64_t snap_vit_frames_total;
 
@@ -718,7 +726,7 @@ int rx_session_wav_active(const rx_session_t *rxs)
 
 void rx_session_wav_snapshot(const rx_session_t *rxs,
                              char     *out_path, size_t path_cap,
-                             long     *out_n_samples,
+                             int64_t  *out_n_samples,
                              int      *out_sample_rate,
                              int      *out_active)
 {
@@ -739,7 +747,7 @@ void rx_session_wav_snapshot(const rx_session_t *rxs,
 
 void rx_session_iq_snapshot(const rx_session_t *rxs,
                             char *out_path, size_t path_cap,
-                            long *out_pairs,
+                            int64_t *out_pairs,
                             int  *out_sample_rate)
 {
     if (out_path && path_cap)  out_path[0]       = '\0';
@@ -1162,7 +1170,6 @@ static void try_decode_iq_at_window(rx_session_t *rxs)
                    NULL, 0,
                    rxs->force_beacon);
         rxs->frames_total++;
-        if (rxs->frames_in_window < UINT_MAX) rxs->frames_in_window++;
         snprintf(rxs->last_frame_ts, sizeof rxs->last_frame_ts,
                  "%.*s", (int)(sizeof rxs->last_frame_ts - 1), ts);
         rxs->last_frame_len = (int) plen;
@@ -1496,8 +1503,8 @@ static void worker_update_snapshot(rx_session_t *rxs)
     rxs->snap_burst_bright_bins    = burst_bins;
     rxs->snap_burst_peak_excess_db = burst_excess;
     rxs->snap_wav_active     = wav_active;
-    rxs->snap_wav_n_samples  = (long) rxs->wav.n_samples;
-    rxs->snap_iq_pairs       = (long) rxs->iq_pairs_written;
+    rxs->snap_wav_n_samples  = (int64_t) rxs->wav.n_samples;
+    rxs->snap_iq_pairs       = (int64_t) rxs->iq_pairs_written;
     rxs->snap_pcm_frames_total = rxs->pcm_frames_total;
     rxs->snap_vit_frames_total = rxs->vit_frames_total;
     // Persist the last-known paths even after a close so that the

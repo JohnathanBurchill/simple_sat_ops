@@ -473,7 +473,7 @@ static void cmd_dispatch(state_t *state)
                     cmd_set_status(state, "spectrum: a render is already in progress");
                 } else {
                     char wav_path[512];
-                    long n_samples = 0;
+                    int64_t n_samples = 0;
                     int  sample_rate = 0;
                     int  wav_active = 0;
                     rx_session_wav_snapshot(state->rx_session,
@@ -483,8 +483,8 @@ static void cmd_dispatch(state_t *state)
                         cmd_set_status(state, "spectrum: no WAV (recording not started yet)");
                     } else {
                         long want  = (long)(duration_s * (double) sample_rate);
-                        long start = n_samples - want;
-                        if (start < 0) { start = 0; want = n_samples; }
+                        long start = (long)(n_samples - want);
+                        if (start < 0) { start = 0; want = (long) n_samples; }
                         if (want <= 0) {
                             cmd_set_status(state, "spectrum: no samples captured yet");
                         } else {
@@ -521,15 +521,15 @@ static void cmd_dispatch(state_t *state)
                             // falls back to the WAV+ffmpeg path when iq_in
                             // is empty.
                             char iq_path[512] = "";
-                            long iq_pairs = 0;
+                            int64_t iq_pairs = 0;
                             int  iq_rate  = 0;
                             rx_session_iq_snapshot(state->rx_session,
                                                    iq_path, sizeof iq_path,
                                                    &iq_pairs, &iq_rate);
                             if (iq_path[0] && iq_pairs > 0 && iq_rate > 0) {
                                 long want_p  = (long)(duration_s * (double) iq_rate);
-                                long start_p = iq_pairs - want_p;
-                                if (start_p < 0) { start_p = 0; want_p = iq_pairs; }
+                                long start_p = (long)(iq_pairs - want_p);
+                                if (start_p < 0) { start_p = 0; want_p = (long) iq_pairs; }
                                 if (want_p > 0) {
                                     snprintf(state->spec_job.iq_in,
                                              sizeof state->spec_job.iq_in, "%s", iq_path);
