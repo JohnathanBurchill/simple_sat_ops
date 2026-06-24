@@ -39,13 +39,13 @@ void input_handle_keys(state_t *state, int *keyboard_unlocked)
     int antenna_rotator_result = 0;
 
     int key = getch();
-    if (state->tx_compose_active) {
+    if (state->tx.tx_compose_active) {
         if (!tx_compose_handle_key(state, key)) {
-            tx_compose_close(state);
+            tx_compose_close(&state->tx);
         }
-    } else if (state->auto_tcmd_active) {
+    } else if (state->tx.auto_tcmd_active) {
         if (!auto_tcmd_handle_key(state, key)) {
-            auto_tcmd_close(state);
+            auto_tcmd_close(&state->tx);
         }
     } else if (state->cmd.active) {
         cmd_handle_key(key, state);

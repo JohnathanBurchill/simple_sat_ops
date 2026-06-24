@@ -60,20 +60,20 @@ static void tx_log_ts_from_event(const sso_event_t *evt,
 static void tx_log_file_append(state_t *state, const sso_event_t *evt)
 {
     if (!evt) return;
-    if (state->tx_log_fp == NULL) {
+    if (state->tx.tx_log_fp == NULL) {
         if (state->pass_folder[0] == '\0') return;
         char path[512];
         snprintf(path, sizeof path, "%.500s/tx.log", state->pass_folder);
         FILE *fp = fopen(path, "a");
         if (!fp) return;
-        snprintf(state->tx_log_path, sizeof state->tx_log_path, "%s", path);
-        state->tx_log_fp = fp;
+        snprintf(state->tx.tx_log_path, sizeof state->tx.tx_log_path, "%s", path);
+        state->tx.tx_log_fp = fp;
     }
     char buf[2048];
     if (sso_event_encode(evt, buf, sizeof buf) != 0) return;
     // sso_event_encode already terminates with "}\n" — don't add another.
-    fputs(buf, state->tx_log_fp);
-    fflush(state->tx_log_fp);
+    fputs(buf, state->tx.tx_log_fp);
+    fflush(state->tx.tx_log_fp);
 }
 
 // Push an event into the ring. PREVIEW events overwrite a trailing
@@ -105,23 +105,23 @@ void tx_log_push(state_t *state, const sso_event_t *evt)
     snprintf(entry.source, sizeof entry.source, "%s", evt->tx_origin);
 
     if (evt->type == SSO_EVT_TX_COMMAND_PREVIEW
-        && state->tx_log_count > 0
-        && state->tx_log[state->tx_log_count - 1].kind == SSO_EVT_TX_COMMAND_PREVIEW) {
-        state->tx_log[state->tx_log_count - 1] = entry;
+        && state->tx.tx_log_count > 0
+        && state->tx.tx_log[state->tx.tx_log_count - 1].kind == SSO_EVT_TX_COMMAND_PREVIEW) {
+        state->tx.tx_log[state->tx.tx_log_count - 1] = entry;
         return;
     }
     if (evt->type == SSO_EVT_TX_COMMAND_SENT
-        && state->tx_log_count > 0
-        && state->tx_log[state->tx_log_count - 1].kind == SSO_EVT_TX_COMMAND_PREVIEW) {
+        && state->tx.tx_log_count > 0
+        && state->tx.tx_log[state->tx.tx_log_count - 1].kind == SSO_EVT_TX_COMMAND_PREVIEW) {
         // Promote the trailing draft in-place.
-        state->tx_log[state->tx_log_count - 1] = entry;
+        state->tx.tx_log[state->tx.tx_log_count - 1] = entry;
         return;
     }
-    if (state->tx_log_count < TX_LOG_SIZE) {
-        state->tx_log[state->tx_log_count++] = entry;
+    if (state->tx.tx_log_count < TX_LOG_SIZE) {
+        state->tx.tx_log[state->tx.tx_log_count++] = entry;
     } else {
-        memmove(&state->tx_log[0], &state->tx_log[1],
-                sizeof(state->tx_log[0]) * (TX_LOG_SIZE - 1));
-        state->tx_log[TX_LOG_SIZE - 1] = entry;
+        memmove(&state->tx.tx_log[0], &state->tx.tx_log[1],
+                sizeof(state->tx.tx_log[0]) * (TX_LOG_SIZE - 1));
+        state->tx.tx_log[TX_LOG_SIZE - 1] = entry;
     }
 }

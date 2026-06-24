@@ -123,7 +123,7 @@ ssize_t tx_burst_build_frame(const uint8_t *payload, size_t payload_len,
 struct state;
 typedef struct state state_t;
 
-// Service a pending state->tx_request from the main loop: dry-run / real
+// Service a pending state->tx.tx_request from the main loop: dry-run / real
 // burst (async submit + poll) / reject-and-clear, then emit the SENT or
 // NOT_SENT event + the tx-result audit line. Leaves the slot pending while a
 // burst is still in flight so the next tick polls it.

@@ -47,24 +47,24 @@ static const long g_tx_compose_debounce_ns = 200000000L;
 
 static void tx_history_push(state_t *state, const char *payload) {
     if (payload == NULL || payload[0] == '\0') return;
-    if (state->tx_history_count > 0
-        && strcmp(state->tx_history[0], payload) == 0) {
+    if (state->tx.tx_history_count > 0
+        && strcmp(state->tx.tx_history[0], payload) == 0) {
         return;  // suppress trivial duplicates of the most-recent entry
     }
-    int keep = state->tx_history_count < TX_HISTORY_MAX - 1
-             ? state->tx_history_count : TX_HISTORY_MAX - 1;
+    int keep = state->tx.tx_history_count < TX_HISTORY_MAX - 1
+             ? state->tx.tx_history_count : TX_HISTORY_MAX - 1;
     for (int i = keep; i > 0; --i) {
-        memcpy(state->tx_history[i], state->tx_history[i - 1], sizeof state->tx_history[0]);
+        memcpy(state->tx.tx_history[i], state->tx.tx_history[i - 1], sizeof state->tx.tx_history[0]);
     }
-    snprintf(state->tx_history[0], sizeof state->tx_history[0], "%s", payload);
-    if (state->tx_history_count < TX_HISTORY_MAX) state->tx_history_count++;
+    snprintf(state->tx.tx_history[0], sizeof state->tx.tx_history[0], "%s", payload);
+    if (state->tx.tx_history_count < TX_HISTORY_MAX) state->tx.tx_history_count++;
 }
 
 static void tx_compose_init(state_t *state, tx_compose_t *c) {
     memset(c, 0, sizeof *c);
-    snprintf(c->payload, sizeof c->payload, "%s", state->tx_last_payload);
-    snprintf(c->power,   sizeof c->power,   "%s", state->tx_last_power);
-    c->allow_tx                = state->tx_last_allow_tx;
+    snprintf(c->payload, sizeof c->payload, "%s", state->tx.tx_last_payload);
+    snprintf(c->power,   sizeof c->power,   "%s", state->tx.tx_last_power);
+    c->allow_tx                = state->tx.tx_last_allow_tx;
     c->cursors[TXF_PAYLOAD]    = (int) strlen(c->payload);
     c->cursors[TXF_POWER]      = (int) strlen(c->power);
     c->history_idx             = -1;
@@ -73,9 +73,9 @@ static void tx_compose_init(state_t *state, tx_compose_t *c) {
 }
 
 static void tx_compose_remember(state_t *state, const tx_compose_t *c) {
-    snprintf(state->tx_last_payload, sizeof state->tx_last_payload, "%s", c->payload);
-    snprintf(state->tx_last_power,   sizeof state->tx_last_power,   "%s", c->power);
-    state->tx_last_allow_tx = c->allow_tx;
+    snprintf(state->tx.tx_last_payload, sizeof state->tx.tx_last_payload, "%s", c->payload);
+    snprintf(state->tx.tx_last_power,   sizeof state->tx.tx_last_power,   "%s", c->power);
+    state->tx.tx_last_allow_tx = c->allow_tx;
 }
 
 static void tx_compose_summary(const tx_compose_t *c, char *out, size_t out_size) {
@@ -93,7 +93,7 @@ static void tx_compose_fill_event(state_t *state, const tx_compose_t *c, sso_eve
     evt->tx_csp_sport = 16;
     evt->tx_csp_prio  = 2;
 #ifdef SSO_WITH_SDR
-    evt->tx_freq_hz   = state->tx_freq_hz_doppler;
+    evt->tx_freq_hz   = state->tx.tx_freq_hz_doppler;
 #else
     evt->tx_freq_hz   = (long) FRONTIERSAT_CARRIER_HZ;
 #endif
@@ -220,11 +220,11 @@ static void tx_field_end(tx_compose_t *c) {
 // is not on the payload field, when history is empty, or at the edge.
 static void tx_history_recall(state_t *state, tx_compose_t *c, int direction) {
     if (c->focus != TXF_PAYLOAD) return;
-    if (state->tx_history_count == 0) return;
+    if (state->tx.tx_history_count == 0) return;
     int step = (direction < 0) ? +1 : -1;
     int new_idx = c->history_idx + step;
     if (new_idx < -1) return;
-    if (new_idx >= state->tx_history_count) return;
+    if (new_idx >= state->tx.tx_history_count) return;
     if (c->history_idx == -1 && new_idx >= 0) {
         snprintf(c->history_saved_edit, sizeof c->history_saved_edit,
                  "%s", c->payload);
@@ -234,7 +234,7 @@ static void tx_history_recall(state_t *state, tx_compose_t *c, int direction) {
                  c->history_saved_edit);
     } else {
         snprintf(c->payload, sizeof c->payload, "%s",
-                 state->tx_history[new_idx]);
+                 state->tx.tx_history[new_idx]);
     }
     // Bulk-populate bypasses the per-keystroke clamp, so re-clamp to the
     // on-air limit here — the field should never show more than what could
@@ -307,7 +307,7 @@ static void tx_compose_draw(state_t *state, WINDOW *w, const tx_compose_t *c) {
 
     mvwprintw(w, 0, 2, " TX compose (operator: %s)%s ",
               state->operator_user ? state->operator_user : "?",
-              state->no_tx ? "  [--no-tx]" : "");
+              state->tx.no_tx ? "  [--no-tx]" : "");
 #ifdef SSO_WITH_SDR
     mvwprintw(w, 1, 2,
               "B210: %s",
@@ -406,7 +406,7 @@ static void tx_compose_broadcast_preview(state_t *state, const tx_compose_t *c) 
 
 static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, size_t err_size) {
 #ifdef SSO_WITH_SDR
-    if (state->no_tx) {
+    if (state->tx.no_tx) {
         snprintf(err, err_size,
                  "TX disabled by --no-tx (preview still goes to viewers)");
         return -1;
@@ -416,7 +416,7 @@ static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, s
                  "TX not supported by this SDR (RX-only backend)");
         return -1;
     }
-    if (state->tx_request.pending) {
+    if (state->tx.tx_request.pending) {
         snprintf(err, err_size, "previous burst still in flight");
         return -1;
     }
@@ -424,7 +424,7 @@ static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, s
     // concrete telecommand to transmit, with the clock captured now so the
     // embedded timestamp is current. A normal command passes through verbatim.
     sso_pseudo_ctx_t pc = { .now_ms    = sso_now_utc_ms(),
-                            .tssent_ms = state->sso_pass_tssent_ms };
+                            .tssent_ms = state->tx.sso_pass_tssent_ms };
     char wire[512];
     char sso_err[160];
     sso_pseudo_status_t pst =
@@ -438,35 +438,35 @@ static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, s
         snprintf(err, err_size, "empty payload");
         return -1;
     }
-    if (n > sizeof state->tx_request.payload) n = sizeof state->tx_request.payload;
-    memcpy(state->tx_request.payload, wire, n);
-    state->tx_request.payload_len  = n;
-    state->tx_request.is_hex       = 0;  // always ascii in the simplified modal
-    state->tx_request.csp_hdr      = (csp_v1_header_t){
+    if (n > sizeof state->tx.tx_request.payload) n = sizeof state->tx.tx_request.payload;
+    memcpy(state->tx.tx_request.payload, wire, n);
+    state->tx.tx_request.payload_len  = n;
+    state->tx.tx_request.is_hex       = 0;  // always ascii in the simplified modal
+    state->tx.tx_request.csp_hdr      = (csp_v1_header_t){
         .prio  = 2, .src = 10, .dst = 1, .dport = 7, .sport = 16, .flags = 0,
     };
-    state->tx_request.tx_freq_hz       = state->tx_freq_hz_doppler;
-    state->tx_request.tx_gain_db       = atof(c->power);
-    state->tx_request.repeat           = 1;
-    state->tx_request.gap_ms           = 200;
-    state->tx_request.preroll_ms       = state->tx_preroll_ms;
-    state->tx_request.allow_high_power = 0;
-    state->tx_request.allow_hf_tx      = 0;
-    snprintf(state->tx_request.tx_source, sizeof state->tx_request.tx_source,
+    state->tx.tx_request.tx_freq_hz       = state->tx.tx_freq_hz_doppler;
+    state->tx.tx_request.tx_gain_db       = atof(c->power);
+    state->tx.tx_request.repeat           = 1;
+    state->tx.tx_request.gap_ms           = 200;
+    state->tx.tx_request.preroll_ms       = state->tx.tx_preroll_ms;
+    state->tx.tx_request.allow_high_power = 0;
+    state->tx.tx_request.allow_hf_tx      = 0;
+    snprintf(state->tx.tx_request.tx_source, sizeof state->tx.tx_request.tx_source,
              "manual send");
     if (pst == SSO_PSEUDO_OK) {
         // Heritage: stash the SSO+ origin so the on-air summary notes it, and
         // bake the same note into the queue-time summary the dry-run /
         // rejected paths show.
-        snprintf(state->tx_request.sso_origin, sizeof state->tx_request.sso_origin,
+        snprintf(state->tx.tx_request.sso_origin, sizeof state->tx.tx_request.sso_origin,
                  "%s", c->payload);
-        snprintf(state->tx_request.summary, sizeof state->tx_request.summary,
+        snprintf(state->tx.tx_request.summary, sizeof state->tx.tx_request.summary,
                  "ascii:%.150s (replaced '%.80s')", wire, c->payload);
     } else {
-        state->tx_request.sso_origin[0] = '\0';
-        tx_compose_summary(c, state->tx_request.summary, sizeof state->tx_request.summary);
+        state->tx.tx_request.sso_origin[0] = '\0';
+        tx_compose_summary(c, state->tx.tx_request.summary, sizeof state->tx.tx_request.summary);
     }
-    state->tx_request.pending = 1;
+    state->tx.tx_request.pending = 1;
     {
         // Audit: TX commit — the moment the operator pressed Enter in
         // the compose modal and the burst was queued for the main loop
@@ -476,9 +476,9 @@ static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, s
         char det[512];
         snprintf(det, sizeof det,
                  "len=%zu freq_hz=%ld gain_db=%.1f payload=\"%.255s\"",
-                 state->tx_request.payload_len,
-                 (long) state->tx_request.tx_freq_hz,
-                 state->tx_request.tx_gain_db,
+                 state->tx.tx_request.payload_len,
+                 (long) state->tx.tx_request.tx_freq_hz,
+                 state->tx.tx_request.tx_gain_db,
                  c->payload);
         sso_audit_event("tx-commit", det);
     }
@@ -504,7 +504,7 @@ void emit_tx_event_local(state_t *state, sso_event_type_t type,
     // Carry the originating command's source ("auto-cmd (file)" / "manual
     // send") into the SENT / NOT_SENT event. The request slot still holds it
     // here -- tx_burst_service_request clears pending only after this emit.
-    snprintf(evt.tx_origin, sizeof evt.tx_origin, "%s", state->tx_request.tx_source);
+    snprintf(evt.tx_origin, sizeof evt.tx_origin, "%s", state->tx.tx_request.tx_source);
     if (summary && summary[0]) {
         snprintf(evt.ascii, sizeof evt.ascii, "%s", summary);
     }
@@ -523,43 +523,43 @@ void emit_tx_event_local(state_t *state, sso_event_type_t type,
 #endif
 
 // Open the modal — allocate the window, seed the compose state, draw
-// once, and flip state->tx_compose_active so the main loop starts ticking
+// once, and flip state->tx.tx_compose_active so the main loop starts ticking
 // it. Idempotent: re-opening while already active is a no-op.
 void tx_compose_open(state_t *state) {
     if (!state->ipc) return;
-    if (state->tx_compose_active) return;
-    if (state->auto_tcmd_active) return;  // one modal at a time
+    if (state->tx.tx_compose_active) return;
+    if (state->tx.auto_tcmd_active) return;  // one modal at a time
     int h = 14, ww = 120;
     if (h > LINES) h = LINES;
     if (ww > COLS) ww = COLS;
     if (ww < 60)  ww = (COLS < 60) ? COLS : 60;
-    state->tx_compose_win = newwin(h, ww, (LINES - h) / 2, (COLS - ww) / 2);
-    if (!state->tx_compose_win) return;
-    keypad(state->tx_compose_win, TRUE);
-    nodelay(state->tx_compose_win, TRUE);
-    tx_compose_init(state, &state->tx_compose);
+    state->tx.tx_compose_win = newwin(h, ww, (LINES - h) / 2, (COLS - ww) / 2);
+    if (!state->tx.tx_compose_win) return;
+    keypad(state->tx.tx_compose_win, TRUE);
+    nodelay(state->tx.tx_compose_win, TRUE);
+    tx_compose_init(state, &state->tx.tx_compose);
 #ifdef SSO_WITH_SDR
     // RX-only SDR (e.g. RTL-SDR): the burst can never reach the air, so
     // keep the allow-tx gate forced off. Compose + preview still work
     // (commit refuses with a clear message).
     if (state->sdr.rx_session != NULL && !rx_session_can_tx(state->sdr.rx_session)) {
-        state->tx_compose.allow_tx = 0;
+        state->tx.tx_compose.allow_tx = 0;
     }
 #endif
-    tx_compose_draw(state, state->tx_compose_win, &state->tx_compose);
-    state->tx_compose_last_edit_ns = ts_now_ns();
-    state->tx_compose_active = 1;
+    tx_compose_draw(state, state->tx.tx_compose_win, &state->tx.tx_compose);
+    state->tx.tx_compose_last_edit_ns = ts_now_ns();
+    state->tx.tx_compose_active = 1;
 }
 
 // Tear the modal down. Touchwin + refresh paints stdscr's cells back
 // into the area the modal occupied so the operator's normal panels
 // become visible again.
-void tx_compose_close(state_t *state) {
-    if (state->tx_compose_win) {
-        delwin(state->tx_compose_win);
-        state->tx_compose_win = NULL;
+void tx_compose_close(tx_t *tx) {
+    if (tx->tx_compose_win) {
+        delwin(tx->tx_compose_win);
+        tx->tx_compose_win = NULL;
     }
-    state->tx_compose_active = 0;
+    tx->tx_compose_active = 0;
     touchwin(stdscr);
     refresh();
 }
@@ -568,10 +568,10 @@ void tx_compose_close(state_t *state) {
 // Returns 1 to keep the modal open, 0 when the operator's Enter or
 // Esc closed it — the caller invokes tx_compose_close() in that case.
 int tx_compose_handle_key(state_t *state, int key) {
-    if (!state->tx_compose_active) return 0;
+    if (!state->tx.tx_compose_active) return 0;
     if (key == ERR) return 1;
-    tx_compose_t *c = &state->tx_compose;
-    WINDOW *w = state->tx_compose_win;
+    tx_compose_t *c = &state->tx.tx_compose;
+    WINDOW *w = state->tx.tx_compose_win;
     int changed = 1;
     // Esc may be a bare cancel OR the start of a CSI sequence (arrow
     // keys, Home/End, Delete) when keypad mode can't translate them.
@@ -631,7 +631,7 @@ int tx_compose_handle_key(state_t *state, int key) {
         changed = 0;
     }
     if (changed) {
-        state->tx_compose_last_edit_ns = ts_now_ns();
+        state->tx.tx_compose_last_edit_ns = ts_now_ns();
         tx_compose_draw(state, w, c);
     }
     return 1;
@@ -641,12 +641,12 @@ int tx_compose_handle_key(state_t *state, int key) {
 // re-renders if the broadcast fired (so the mirror line refreshes).
 // Called every main-loop iteration when active.
 void tx_compose_pump(state_t *state) {
-    if (!state->tx_compose_active) return;
-    tx_compose_t *c = &state->tx_compose;
+    if (!state->tx.tx_compose_active) return;
+    tx_compose_t *c = &state->tx.tx_compose;
     if (c->preview_dirty
-        && (ts_now_ns() - state->tx_compose_last_edit_ns) >= g_tx_compose_debounce_ns) {
+        && (ts_now_ns() - state->tx.tx_compose_last_edit_ns) >= g_tx_compose_debounce_ns) {
         tx_compose_broadcast_preview(state, c);
         c->preview_dirty = 0;
-        tx_compose_draw(state, state->tx_compose_win, c);
+        tx_compose_draw(state, state->tx.tx_compose_win, c);
     }
 }

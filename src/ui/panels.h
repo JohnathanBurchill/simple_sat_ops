@@ -136,7 +136,7 @@ void rx_panel_collect_local(state_t *state, rx_panel_data_t *d);
 // Pure renderers (operator + viewer).
 void render_rx_panel(const rx_panel_data_t *d, int *print_row, int print_col);
 void render_ribbon_vertical(const rx_panel_data_t *d, int top_row, int bot_row, int col);
-void render_tx_log_panel(const state_t *state, int start_row, int col);
+void render_tx_log_panel(const tx_t *tx, int start_row, int col);
 void render_predictions_panel(state_t *state, double jul_utc, int *print_row, int print_col);
 void render_status_panel(const status_panel_t *p, int *print_row, int print_col);
 

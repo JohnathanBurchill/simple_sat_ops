@@ -455,7 +455,7 @@ static void viewer_render(viewer_t *v, int connected)
 
         int tx_log_row = LINES - TX_LOG_SIZE - 2;
         if (tx_log_row >= 17) {
-            render_tx_log_panel(&v->state, tx_log_row, 1);
+            render_tx_log_panel(&v->state.tx, tx_log_row, 1);
         }
     }
 

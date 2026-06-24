@@ -45,7 +45,7 @@
 // CTS1+ telecommand. The operator picks TX power, how many times each
 // command should be sent, and the inter-send delay. Once started the
 // modal's tick runs alongside the main loop — non-blocking, like the
-// TX compose modal — and queues one state->tx_request per shot, advancing
+// TX compose modal — and queues one state->tx.tx_request per shot, advancing
 // through the file. Stops automatically when the satellite drops
 // below the horizon (LOS) so an unattended run can't keep TXing after
 // the pass. Every send goes through emit_tx_event_local, so the
@@ -63,7 +63,7 @@
 //               = 80 + payload
 //
 //   burst_s     = start_delay(0.5)            // UHD timed-start lead
-//                 + state->tx_preroll_ms/1000       // modulated 0xAA carrier
+//                 + state->tx.tx_preroll_ms/1000       // modulated 0xAA carrier
 //                 + frame_bytes * 8 / bit_rate // the frame itself
 //                 + postroll(0.050)
 //
@@ -74,7 +74,7 @@
 // delay are folded in by the caller, so this stays a per-send quantum.
 static double auto_tcmd_burst_seconds(state_t *state, size_t payload_len) {
     const double start_delay_s = 0.500;   // tx_burst.c start_delay_s
-    const double preroll_s     = (double) state->tx_preroll_ms * 1e-3;
+    const double preroll_s     = (double) state->tx.tx_preroll_ms * 1e-3;
     const double postroll_s    = 0.050;   // tx_burst.c postroll_ms
     const double bit_rate      = 9600.0;
     size_t frame_bytes = 80 + payload_len;
@@ -210,9 +210,9 @@ static const char *auto_tcmd_state_label(auto_tcmd_state_t s) {
 // is open and Enter has started it (running, or finished and still on
 // screen so viewers see the final tally). Returns 0 in setup or when
 // the modal is closed, which drops the fields from the wire entirely.
-int auto_tcmd_progress(state_t *state, int *sent, int *total, const char **label) {
-    const auto_tcmd_t *a = &state->auto_tcmd;
-    if (!state->auto_tcmd_active || a->state == AUTO_STATE_SETUP) return 0;
+int auto_tcmd_progress(tx_t *tx, int *sent, int *total, const char **label) {
+    const auto_tcmd_t *a = &tx->auto_tcmd;
+    if (!tx->auto_tcmd_active || a->state == AUTO_STATE_SETUP) return 0;
     *sent  = a->sends_total;
     *total = a->n_commands * a->repeats_total;
     *label = auto_tcmd_state_label(a->state);
@@ -330,16 +330,16 @@ static void auto_draw_text_field(WINDOW *w, int row, int col,
 }
 
 static void auto_tcmd_draw(state_t *state) {
-    if (!state->auto_tcmd_active || !state->auto_tcmd_win) return;
-    WINDOW *w = state->auto_tcmd_win;
-    auto_tcmd_t *a = &state->auto_tcmd;
+    if (!state->tx.auto_tcmd_active || !state->tx.auto_tcmd_win) return;
+    WINDOW *w = state->tx.auto_tcmd_win;
+    auto_tcmd_t *a = &state->tx.auto_tcmd;
     werase(w);
     draw_box(w);
     int width = getmaxx(w);
 
     mvwprintw(w, 0, 2, " Auto-TCMD (operator: %s)%s ",
               state->operator_user ? state->operator_user : "?",
-              state->no_tx ? "  [--no-tx]" : "");
+              state->tx.no_tx ? "  [--no-tx]" : "");
 
     mvwprintw(w, 1, 2, "File:    %.*s  (%d commands)",
               width - 28, a->file_path[0] ? a->file_path : "(none)",
@@ -457,10 +457,10 @@ static int auto_tcmd_make_window(state_t *state) {
     if (h > LINES) h = LINES;
     if (ww > COLS) ww = COLS;
     if (ww < 60)  ww = (COLS < 60) ? COLS : 60;
-    state->auto_tcmd_win = newwin(h, ww, (LINES - h) / 2, (COLS - ww) / 2);
-    if (!state->auto_tcmd_win) return 0;
-    keypad(state->auto_tcmd_win, TRUE);
-    nodelay(state->auto_tcmd_win, TRUE);
+    state->tx.auto_tcmd_win = newwin(h, ww, (LINES - h) / 2, (COLS - ww) / 2);
+    if (!state->tx.auto_tcmd_win) return 0;
+    keypad(state->tx.auto_tcmd_win, TRUE);
+    nodelay(state->tx.auto_tcmd_win, TRUE);
     return 1;
 }
 
@@ -468,21 +468,21 @@ static int auto_tcmd_make_window(state_t *state) {
 // SETUP run. Frees any previously loaded commands. Returns 0 on success, -1
 // if there is no file path or the load fails.
 static int auto_tcmd_reload(state_t *state) {
-    if (state->auto_tcmd_file_path[0] == '\0') return -1;
-    if (state->auto_tcmd.commands) {
-        auto_tcmd_free_commands(state->auto_tcmd.commands, state->auto_tcmd.n_commands);
-        state->auto_tcmd.commands = NULL;
-        state->auto_tcmd.n_commands = 0;
+    if (state->tx.auto_tcmd_file_path[0] == '\0') return -1;
+    if (state->tx.auto_tcmd.commands) {
+        auto_tcmd_free_commands(state->tx.auto_tcmd.commands, state->tx.auto_tcmd.n_commands);
+        state->tx.auto_tcmd.commands = NULL;
+        state->tx.auto_tcmd.n_commands = 0;
     }
     char **cmds = NULL;
     int    nc   = 0;
-    if (auto_tcmd_load_file(state->auto_tcmd_file_path, &cmds, &nc) != 0) {
+    if (auto_tcmd_load_file(state->tx.auto_tcmd_file_path, &cmds, &nc) != 0) {
         return -1;
     }
 
-    memset(&state->auto_tcmd, 0, sizeof state->auto_tcmd);
-    state->auto_tcmd.commands   = cmds;
-    state->auto_tcmd.n_commands = nc;
+    memset(&state->tx.auto_tcmd, 0, sizeof state->tx.auto_tcmd);
+    state->tx.auto_tcmd.commands   = cmds;
+    state->tx.auto_tcmd.n_commands = nc;
 
     // Re-lint the freshly (re)loaded file. The startup gate ran once; if the
     // operator edited --tc-file since launch, this is the only check before
@@ -494,33 +494,33 @@ static int auto_tcmd_reload(state_t *state) {
         FILE *devnull = fopen("/dev/null", "w");
         if (devnull != NULL) {
             int w = 0;
-            int e = tcmd_lint_file(state->auto_tcmd_file_path, devnull, &w);
-            state->auto_tcmd.lint_errors = (e > 0) ? e : 0;
+            int e = tcmd_lint_file(state->tx.auto_tcmd_file_path, devnull, &w);
+            state->tx.auto_tcmd.lint_errors = (e > 0) ? e : 0;
             fclose(devnull);
         }
     }
-    snprintf(state->auto_tcmd.file_path, sizeof state->auto_tcmd.file_path,
-             "%.*s", (int)(sizeof state->auto_tcmd.file_path - 1),
-             state->auto_tcmd_file_path);
-    snprintf(state->auto_tcmd.power,   sizeof state->auto_tcmd.power,   "80.0");
-    snprintf(state->auto_tcmd.repeats, sizeof state->auto_tcmd.repeats, "3");
-    snprintf(state->auto_tcmd.delay_s, sizeof state->auto_tcmd.delay_s, "2.0");
-    state->auto_tcmd.allow_tx = 0;
-    state->auto_tcmd.focus    = AUTO_F_POWER;
-    state->auto_tcmd.cursors[AUTO_F_POWER]   = (int) strlen(state->auto_tcmd.power);
-    state->auto_tcmd.cursors[AUTO_F_REPEATS] = (int) strlen(state->auto_tcmd.repeats);
-    state->auto_tcmd.cursors[AUTO_F_DELAY]   = (int) strlen(state->auto_tcmd.delay_s);
-    state->auto_tcmd.state    = AUTO_STATE_SETUP;
-    if (state->auto_tcmd.lint_errors > 0 && !state->ignore_tc_errors) {
-        snprintf(state->auto_tcmd.status_msg, sizeof state->auto_tcmd.status_msg,
+    snprintf(state->tx.auto_tcmd.file_path, sizeof state->tx.auto_tcmd.file_path,
+             "%.*s", (int)(sizeof state->tx.auto_tcmd.file_path - 1),
+             state->tx.auto_tcmd_file_path);
+    snprintf(state->tx.auto_tcmd.power,   sizeof state->tx.auto_tcmd.power,   "80.0");
+    snprintf(state->tx.auto_tcmd.repeats, sizeof state->tx.auto_tcmd.repeats, "3");
+    snprintf(state->tx.auto_tcmd.delay_s, sizeof state->tx.auto_tcmd.delay_s, "2.0");
+    state->tx.auto_tcmd.allow_tx = 0;
+    state->tx.auto_tcmd.focus    = AUTO_F_POWER;
+    state->tx.auto_tcmd.cursors[AUTO_F_POWER]   = (int) strlen(state->tx.auto_tcmd.power);
+    state->tx.auto_tcmd.cursors[AUTO_F_REPEATS] = (int) strlen(state->tx.auto_tcmd.repeats);
+    state->tx.auto_tcmd.cursors[AUTO_F_DELAY]   = (int) strlen(state->tx.auto_tcmd.delay_s);
+    state->tx.auto_tcmd.state    = AUTO_STATE_SETUP;
+    if (state->tx.auto_tcmd.lint_errors > 0 && !state->tx.ignore_tc_errors) {
+        snprintf(state->tx.auto_tcmd.status_msg, sizeof state->tx.auto_tcmd.status_msg,
                  "loaded %d command(s) but %d lint error(s) -- fix the file; "
-                 "run blocked", nc, state->auto_tcmd.lint_errors);
-    } else if (state->auto_tcmd.lint_errors > 0) {
-        snprintf(state->auto_tcmd.status_msg, sizeof state->auto_tcmd.status_msg,
+                 "run blocked", nc, state->tx.auto_tcmd.lint_errors);
+    } else if (state->tx.auto_tcmd.lint_errors > 0) {
+        snprintf(state->tx.auto_tcmd.status_msg, sizeof state->tx.auto_tcmd.status_msg,
                  "loaded %d command(s); %d lint error(s) ignored. Enter to start.",
-                 nc, state->auto_tcmd.lint_errors);
+                 nc, state->tx.auto_tcmd.lint_errors);
     } else {
-        snprintf(state->auto_tcmd.status_msg, sizeof state->auto_tcmd.status_msg,
+        snprintf(state->tx.auto_tcmd.status_msg, sizeof state->tx.auto_tcmd.status_msg,
                  "loaded %d command(s). Set fields, then Enter to start.",
                  nc);
     }
@@ -533,54 +533,54 @@ static int auto_tcmd_reload(state_t *state) {
 // --tc-file is (re)loaded fresh.
 void auto_tcmd_open(state_t *state) {
     if (!state->ipc) return;
-    if (state->tx_compose_active) return;
-    if (state->auto_tcmd_active) return;
+    if (state->tx.tx_compose_active) return;
+    if (state->tx.auto_tcmd_active) return;
 
     // A run parked by a previous pause: reopen into the resume/restart
     // prompt rather than reloading. The command list, position, interval
     // and power were all preserved across the modal closing.
-    if (state->auto_tcmd.state == AUTO_STATE_PAUSED
-        && state->auto_tcmd.commands != NULL) {
-        state->auto_tcmd.state = AUTO_STATE_RESUME_PROMPT;
-        snprintf(state->auto_tcmd.status_msg, sizeof state->auto_tcmd.status_msg,
+    if (state->tx.auto_tcmd.state == AUTO_STATE_PAUSED
+        && state->tx.auto_tcmd.commands != NULL) {
+        state->tx.auto_tcmd.state = AUTO_STATE_RESUME_PROMPT;
+        snprintf(state->tx.auto_tcmd.status_msg, sizeof state->tx.auto_tcmd.status_msg,
                  "paused at cmd %d/%d, send %d/%d -- R resume, S start over, "
                  "Esc keep paused",
-                 state->auto_tcmd.cmd_idx + 1, state->auto_tcmd.n_commands,
-                 state->auto_tcmd.repeat_idx, state->auto_tcmd.repeats_total);
+                 state->tx.auto_tcmd.cmd_idx + 1, state->tx.auto_tcmd.n_commands,
+                 state->tx.auto_tcmd.repeat_idx, state->tx.auto_tcmd.repeats_total);
         if (!auto_tcmd_make_window(state)) return;
-        state->auto_tcmd_active = 1;
+        state->tx.auto_tcmd_active = 1;
         auto_tcmd_draw(state);
         return;
     }
 
-    if (state->auto_tcmd_file_path[0] == '\0') return;
+    if (state->tx.auto_tcmd_file_path[0] == '\0') return;
     if (auto_tcmd_reload(state) != 0) {
         return;  // silent — operator will notice via the absent modal
     }
     if (!auto_tcmd_make_window(state)) {
-        auto_tcmd_free_commands(state->auto_tcmd.commands, state->auto_tcmd.n_commands);
-        state->auto_tcmd.commands = NULL;
-        state->auto_tcmd.n_commands = 0;
+        auto_tcmd_free_commands(state->tx.auto_tcmd.commands, state->tx.auto_tcmd.n_commands);
+        state->tx.auto_tcmd.commands = NULL;
+        state->tx.auto_tcmd.n_commands = 0;
         return;
     }
-    state->auto_tcmd_active = 1;
+    state->tx.auto_tcmd_active = 1;
     auto_tcmd_draw(state);
 }
 
-void auto_tcmd_close(state_t *state) {
-    if (state->auto_tcmd_win) {
-        delwin(state->auto_tcmd_win);
-        state->auto_tcmd_win = NULL;
+void auto_tcmd_close(tx_t *tx) {
+    if (tx->auto_tcmd_win) {
+        delwin(tx->auto_tcmd_win);
+        tx->auto_tcmd_win = NULL;
     }
-    state->auto_tcmd_active = 0;
+    tx->auto_tcmd_active = 0;
     // Keep a paused run parked across the close so the operator can compose
     // a one-off TX (or anything else) and then press 'A' to resume it. The
     // command list stays allocated until the run is resumed or restarted.
-    if (state->auto_tcmd.state != AUTO_STATE_PAUSED
-        && state->auto_tcmd.commands) {
-        auto_tcmd_free_commands(state->auto_tcmd.commands, state->auto_tcmd.n_commands);
-        state->auto_tcmd.commands = NULL;
-        state->auto_tcmd.n_commands = 0;
+    if (tx->auto_tcmd.state != AUTO_STATE_PAUSED
+        && tx->auto_tcmd.commands) {
+        auto_tcmd_free_commands(tx->auto_tcmd.commands, tx->auto_tcmd.n_commands);
+        tx->auto_tcmd.commands = NULL;
+        tx->auto_tcmd.n_commands = 0;
     }
     touchwin(stdscr);
     refresh();
@@ -589,7 +589,7 @@ void auto_tcmd_close(state_t *state) {
 // Validate the setup fields and move to RUNNING. Returns 0 on success,
 // fills status_msg + returns -1 on failure.
 static int auto_tcmd_start(state_t *state) {
-    auto_tcmd_t *a = &state->auto_tcmd;
+    auto_tcmd_t *a = &state->tx.auto_tcmd;
     if (a->n_commands == 0) {
         snprintf(a->status_msg, sizeof a->status_msg,
                  "rejected: file has no commands");
@@ -598,7 +598,7 @@ static int auto_tcmd_start(state_t *state) {
     // A file edited after launch can introduce commands the satellite would
     // reject or mis-parse. Re-lint on (re)load flagged them; refuse to run
     // unless the operator started with --ignore-at-your-peril-all-tc-errors.
-    if (a->lint_errors > 0 && !state->ignore_tc_errors) {
+    if (a->lint_errors > 0 && !state->tx.ignore_tc_errors) {
         snprintf(a->status_msg, sizeof a->status_msg,
                  "rejected: %d lint error(s) in the file -- fix it and reopen",
                  a->lint_errors);
@@ -670,7 +670,7 @@ static int auto_tcmd_start(state_t *state) {
 // Pause / cancel without closing the modal so the operator can see the
 // final progress numbers.
 static void auto_tcmd_stop(state_t *state, const char *reason) {
-    auto_tcmd_t *a = &state->auto_tcmd;
+    auto_tcmd_t *a = &state->tx.auto_tcmd;
     if (a->state != AUTO_STATE_RUNNING) return;
     a->state = AUTO_STATE_STOPPED;
     snprintf(a->status_msg, sizeof a->status_msg, "stopped: %s",
@@ -686,11 +686,11 @@ static void auto_tcmd_stop(state_t *state, const char *reason) {
 }
 
 // 'P' from the interrupt prompt: park the run. Position, interval and power
-// all stay on state->auto_tcmd (and survive the modal closing), so the
+// all stay on state->tx.auto_tcmd (and survive the modal closing), so the
 // operator can compose a one-off TX and later resume with 'A'. Logged
 // because an interrupted run departs from the pass operations plan.
 static void auto_tcmd_pause(state_t *state) {
-    auto_tcmd_t *a = &state->auto_tcmd;
+    auto_tcmd_t *a = &state->tx.auto_tcmd;
     a->pause_ns = ts_now_ns();
     a->state    = AUTO_STATE_PAUSED;
     snprintf(a->status_msg, sizeof a->status_msg,
@@ -708,7 +708,7 @@ static void auto_tcmd_pause(state_t *state) {
 // 'A' from the interrupt prompt: abort outright (no resume). The modal
 // stays open in STOPPED so the operator sees the final numbers.
 static void auto_tcmd_abort(state_t *state) {
-    auto_tcmd_t *a = &state->auto_tcmd;
+    auto_tcmd_t *a = &state->tx.auto_tcmd;
     a->state = AUTO_STATE_STOPPED;
     snprintf(a->status_msg, sizeof a->status_msg,
              "aborted at cmd %d/%d", a->cmd_idx + 1, a->n_commands);
@@ -722,7 +722,7 @@ static void auto_tcmd_abort(state_t *state) {
 // elapsed-time origin forward by the pause duration so the progress readout
 // stays honest, and fire the next send immediately.
 static void auto_tcmd_resume(state_t *state) {
-    auto_tcmd_t *a = &state->auto_tcmd;
+    auto_tcmd_t *a = &state->tx.auto_tcmd;
     long now = ts_now_ns();
     if (a->pause_ns > 0 && now > a->pause_ns) {
         a->start_ns += (now - a->pause_ns);
@@ -742,7 +742,7 @@ static void auto_tcmd_resume(state_t *state) {
 // 'S' from the resume prompt: start the whole list over from the top,
 // keeping the interval / power / allow-tx the operator already set.
 static void auto_tcmd_restart(state_t *state) {
-    auto_tcmd_t *a = &state->auto_tcmd;
+    auto_tcmd_t *a = &state->tx.auto_tcmd;
     long now = ts_now_ns();
     a->cmd_idx          = 0;
     a->repeat_idx       = 0;
@@ -761,13 +761,13 @@ static void auto_tcmd_restart(state_t *state) {
 }
 
 int auto_tcmd_handle_key(state_t *state, int key) {
-    if (!state->auto_tcmd_active) return 0;
+    if (!state->tx.auto_tcmd_active) return 0;
     if (key == ERR) return 1;
-    auto_tcmd_t *a = &state->auto_tcmd;
+    auto_tcmd_t *a = &state->tx.auto_tcmd;
     int changed = 1;
     // Esc-as-CSI same fallback the TX modal uses.
     if (key == 27) {
-        int translated = tx_drain_csi(state->auto_tcmd_win);
+        int translated = tx_drain_csi(state->tx.auto_tcmd_win);
         if (translated >= 0) {
             key = translated;
         } else {
@@ -872,15 +872,15 @@ int auto_tcmd_handle_key(state_t *state, int key) {
     return 1;
 }
 
-// Per-tick burst driver. When running, queues one state->tx_request when
+// Per-tick burst driver. When running, queues one state->tx.tx_request when
 // (a) the previous burst has cleared, and (b) the inter-send delay
 // has elapsed. Stops automatically on LOS so an unattended run won't
 // keep TXing after the pass. emit_tx_event_local fires from the main
 // loop's burst-handler the same way it does for the manual TX
 // compose path, so tx.log + viewer fanout capture every shot.
 void auto_tcmd_tick(state_t *state) {
-    if (!state->auto_tcmd_active) return;
-    auto_tcmd_t *a = &state->auto_tcmd;
+    if (!state->tx.auto_tcmd_active) return;
+    auto_tcmd_t *a = &state->tx.auto_tcmd;
     if (a->state != AUTO_STATE_RUNNING) return;
 
     // Elapsed wall-clock since the run started, capped at the estimate,
@@ -928,7 +928,7 @@ void auto_tcmd_tick(state_t *state) {
 #ifdef SSO_WITH_SDR
     long now = ts_now_ns();
     if (now < a->next_send_ns) return;
-    if (state->tx_request.pending)  return;  // prior burst still inflight
+    if (state->tx.tx_request.pending)  return;  // prior burst still inflight
 
     const char *raw = a->commands[a->cmd_idx];
     // Expand a simple_sat_ops-directed "SSO+..." line into the concrete
@@ -937,7 +937,7 @@ void auto_tcmd_tick(state_t *state) {
     // vetted SSO+ lines, so a failure here is defensive: skip the whole command
     // rather than key a half-built payload.
     sso_pseudo_ctx_t pc = { .now_ms    = sso_now_utc_ms(),
-                            .tssent_ms = state->sso_pass_tssent_ms };
+                            .tssent_ms = state->tx.sso_pass_tssent_ms };
     char wire[512];
     char sso_err[160];
     sso_pseudo_status_t pst =
@@ -974,40 +974,40 @@ void auto_tcmd_tick(state_t *state) {
         auto_tcmd_draw(state);
         return;
     }
-    if (n > sizeof state->tx_request.payload) n = sizeof state->tx_request.payload;
-    memcpy(state->tx_request.payload, wire, n);
-    state->tx_request.payload_len  = n;
-    state->tx_request.is_hex       = 0;
-    state->tx_request.csp_hdr      = (csp_v1_header_t){
+    if (n > sizeof state->tx.tx_request.payload) n = sizeof state->tx.tx_request.payload;
+    memcpy(state->tx.tx_request.payload, wire, n);
+    state->tx.tx_request.payload_len  = n;
+    state->tx.tx_request.is_hex       = 0;
+    state->tx.tx_request.csp_hdr      = (csp_v1_header_t){
         .prio  = 2, .src = 10, .dst = 1, .dport = 7, .sport = 16, .flags = 0,
     };
-    state->tx_request.tx_freq_hz       = state->tx_freq_hz_doppler;
-    state->tx_request.tx_gain_db       = atof(a->power);
-    state->tx_request.repeat           = 1;
-    state->tx_request.gap_ms           = 200;
-    state->tx_request.preroll_ms       = state->tx_preroll_ms;
-    // No state->tx_request.allow_tx field — the TX-inhibit gate is enforced
+    state->tx.tx_request.tx_freq_hz       = state->tx.tx_freq_hz_doppler;
+    state->tx.tx_request.tx_gain_db       = atof(a->power);
+    state->tx.tx_request.repeat           = 1;
+    state->tx.tx_request.gap_ms           = 200;
+    state->tx.tx_request.preroll_ms       = state->tx.tx_preroll_ms;
+    // No state->tx.tx_request.allow_tx field — the TX-inhibit gate is enforced
     // at auto_tcmd_start time (refuses to enter RUNNING unless allow_tx
     // is ticked), same way tx_compose_validate handles it before commit.
-    state->tx_request.allow_high_power = 0;
-    state->tx_request.allow_hf_tx      = 0;
-    snprintf(state->tx_request.tx_source, sizeof state->tx_request.tx_source,
+    state->tx.tx_request.allow_high_power = 0;
+    state->tx.tx_request.allow_hf_tx      = 0;
+    snprintf(state->tx.tx_request.tx_source, sizeof state->tx.tx_request.tx_source,
              "auto-cmd (file)");
     if (pst == SSO_PSEUDO_OK)
-        snprintf(state->tx_request.sso_origin, sizeof state->tx_request.sso_origin, "%s", raw);
+        snprintf(state->tx.tx_request.sso_origin, sizeof state->tx.tx_request.sso_origin, "%s", raw);
     else
-        state->tx_request.sso_origin[0] = '\0';
+        state->tx.tx_request.sso_origin[0] = '\0';
     {
-        int m = snprintf(state->tx_request.summary, sizeof state->tx_request.summary,
+        int m = snprintf(state->tx.tx_request.summary, sizeof state->tx.tx_request.summary,
                          "auto[%d/%d %d/%d]: %.190s",
                          a->cmd_idx + 1, a->n_commands,
                          a->repeat_idx + 1, a->repeats_total,
                          wire);
-        if (pst == SSO_PSEUDO_OK && m > 0 && (size_t) m < sizeof state->tx_request.summary)
-            snprintf(state->tx_request.summary + m, sizeof state->tx_request.summary - m,
+        if (pst == SSO_PSEUDO_OK && m > 0 && (size_t) m < sizeof state->tx.tx_request.summary)
+            snprintf(state->tx.tx_request.summary + m, sizeof state->tx.tx_request.summary - m,
                      " (replaced '%s')", raw);
     }
-    state->tx_request.pending = 1;
+    state->tx.tx_request.pending = 1;
     snprintf(a->last_sent, sizeof a->last_sent, "%.255s", wire);
     a->sends_total++;
 

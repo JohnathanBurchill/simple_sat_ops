@@ -364,7 +364,7 @@ static void cmd_dispatch(state_t *state)
         state->cmd.active = 0;
         tx_compose_open(state);
     } else if (strcmp(cmd, "auto") == 0) {
-        if (state->auto_tcmd_file_path[0] == '\0') {
+        if (state->tx.auto_tcmd_file_path[0] == '\0') {
             cmd_set_status(state, "auto: no --tc-file=<path> given on the cmdline");
         } else {
             cmd_set_status(state, "opening auto-tcmd...");

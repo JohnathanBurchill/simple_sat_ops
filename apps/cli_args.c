@@ -204,14 +204,14 @@ void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
 
     // HMAC --- the operator's banner-and-sign state. CTS1 firmware
     // expects every uplink to be HMAC-signed; the dispatcher refuses
-    // to key the PA if state->hmac_key_len == 0, so this line is the
+    // to key the PA if state->tx.hmac_key_len == 0, so this line is the
     // single most-important pre-flight check.
     fprintf(out,
             "hmac: %s (path=%s, status=%s, bytes=%zu)\n",
-            state->hmac_key_len > 0 ? "enabled (default)" : "DISABLED",
-            state->hmac_keyfile_path[0] ? state->hmac_keyfile_path : "(unresolved)",
-            hmac_status_str(state->hmac_display_status),
-            state->hmac_key_len);
+            state->tx.hmac_key_len > 0 ? "enabled (default)" : "DISABLED",
+            state->tx.hmac_keyfile_path[0] ? state->tx.hmac_keyfile_path : "(unresolved)",
+            hmac_status_str(state->tx.hmac_display_status),
+            state->tx.hmac_key_len);
 
     // Doppler --- both the display correction and the TX-side burst
     // staging key off state->track.doppler_correction_enabled. On by
@@ -238,10 +238,10 @@ void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
     fprintf(out, "rx-lo-offset-khz: %+.3f\n", state->sdr.rx_lo_offset_hz / 1000.0);
 
     // TX safety / staging gates the operator might have set.
-    fprintf(out, "tx-no-tx: %s\n", state->no_tx ? "on (--no-tx)" : "off");
-    fprintf(out, "tx-dry-run: %s\n", state->tx_dry_run ? "on (--tx-dry-run)" : "off");
+    fprintf(out, "tx-no-tx: %s\n", state->tx.no_tx ? "on (--no-tx)" : "off");
+    fprintf(out, "tx-dry-run: %s\n", state->tx.tx_dry_run ? "on (--tx-dry-run)" : "off");
     fprintf(out, "tx-auto-tcmd-file: %s\n",
-            state->auto_tcmd_file_path[0] ? state->auto_tcmd_file_path : "(none)");
+            state->tx.auto_tcmd_file_path[0] ? state->tx.auto_tcmd_file_path : "(none)");
 
     // Hardware — reported live: the rotator and SDR have already been
     // opened by the time --self-test prints this, so these lines show the
@@ -311,7 +311,7 @@ void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
 
 // --- startup wiring -----------------------------------------------
 
-void cli_load_hmac_keyfile(state_t *state)
+void cli_load_hmac_keyfile(tx_t *tx)
 {
     // Resolve + load the HMAC keyfile. The bytes feed every TX burst's
     // AX100 frame (CTS1 firmware expects HMAC on every uplink), AND
@@ -319,28 +319,28 @@ void cli_load_hmac_keyfile(state_t *state)
     // "(MISSING)" / "(BAD)" means the next TX request will be refused
     // before keying the PA. If --hmac-keyfile= wasn't given, fall back
     // to hmac_keyfile_default_path (shared first, per-user second).
-    if (state->hmac_keyfile_path[0] == '\0') {
-        if (hmac_keyfile_default_path(state->hmac_keyfile_path,
-                                      sizeof state->hmac_keyfile_path) != 0) {
-            state->hmac_keyfile_path[0] = '\0';
-            state->hmac_display_status  = HMAC_DISPLAY_MISSING;
+    if (tx->hmac_keyfile_path[0] == '\0') {
+        if (hmac_keyfile_default_path(tx->hmac_keyfile_path,
+                                      sizeof tx->hmac_keyfile_path) != 0) {
+            tx->hmac_keyfile_path[0] = '\0';
+            tx->hmac_display_status  = HMAC_DISPLAY_MISSING;
         }
     }
-    if (state->hmac_keyfile_path[0] != '\0') {
+    if (tx->hmac_keyfile_path[0] != '\0') {
         struct stat st;
-        if (stat(state->hmac_keyfile_path, &st) != 0) {
-            state->hmac_display_status = HMAC_DISPLAY_MISSING;
+        if (stat(tx->hmac_keyfile_path, &st) != 0) {
+            tx->hmac_display_status = HMAC_DISPLAY_MISSING;
         } else {
-            ssize_t got = hmac_keyfile_load(state->hmac_keyfile_path,
-                                            state->hmac_key,
-                                            sizeof state->hmac_key);
+            ssize_t got = hmac_keyfile_load(tx->hmac_keyfile_path,
+                                            tx->hmac_key,
+                                            sizeof tx->hmac_key);
             if (got > 0) {
-                state->hmac_display_status = HMAC_DISPLAY_OK;
-                state->hmac_key_len        = (size_t) got;
+                tx->hmac_display_status = HMAC_DISPLAY_OK;
+                tx->hmac_key_len        = (size_t) got;
             } else {
-                state->hmac_display_status = HMAC_DISPLAY_BAD;
-                state->hmac_key_len        = 0;
-                memset(state->hmac_key, 0, sizeof state->hmac_key);
+                tx->hmac_display_status = HMAC_DISPLAY_BAD;
+                tx->hmac_key_len        = 0;
+                memset(tx->hmac_key, 0, sizeof tx->hmac_key);
             }
         }
     }
@@ -355,28 +355,28 @@ int cli_tcmd_lint_gate(const state_t *state)
     // worse, mis-parsed) by the satellite, so refuse to start unless the
     // operator explicitly accepts the risk. Warnings (e.g. a command not
     // meant for routine flight operation) are printed but do not block.
-    if (state->auto_tcmd_file_path[0] == '\0') {
+    if (state->tx.auto_tcmd_file_path[0] == '\0') {
         return 0;
     }
     int tc_warns = 0;
-    int tc_errs = tcmd_lint_file(state->auto_tcmd_file_path, stderr, &tc_warns);
-    if (tc_errs > 0 && !state->ignore_tc_errors) {
+    int tc_errs = tcmd_lint_file(state->tx.auto_tcmd_file_path, stderr, &tc_warns);
+    if (tc_errs > 0 && !state->tx.ignore_tc_errors) {
         fprintf(stderr,
             "simple_sat_ops: %d error%s detected in the --tc-file content (%s).\n"
             "Refusing to start. Fix the agenda, or re-run with\n"
             "--ignore-at-your-peril-all-tc-errors to bypass this check.\n",
-            tc_errs, tc_errs == 1 ? "" : "s", state->auto_tcmd_file_path);
+            tc_errs, tc_errs == 1 ? "" : "s", state->tx.auto_tcmd_file_path);
         return EXIT_FAILURE;
     }
     if (tc_errs > 0) {
         fprintf(stderr,
             "simple_sat_ops: %d telecommand error%s in %s -- proceeding anyway "
             "(--ignore-at-your-peril-all-tc-errors).\n",
-            tc_errs, tc_errs == 1 ? "" : "s", state->auto_tcmd_file_path);
+            tc_errs, tc_errs == 1 ? "" : "s", state->tx.auto_tcmd_file_path);
     } else if (tc_warns > 0) {
         fprintf(stderr,
             "simple_sat_ops: %d telecommand warning%s in %s (see above); proceeding.\n",
-            tc_warns, tc_warns == 1 ? "" : "s", state->auto_tcmd_file_path);
+            tc_warns, tc_warns == 1 ? "" : "s", state->tx.auto_tcmd_file_path);
     }
     return 0;
 }
@@ -419,13 +419,13 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         // loop below, which overrides whatever the operator passed.
         state->track.prediction.predicted_max_elevation = -180.0;
         // Seed the TX-compose "remembered" draft: the CTS1 prefix and 80 dB.
-        snprintf(state->tx_last_payload, sizeof state->tx_last_payload, "CTS1+");
-        snprintf(state->tx_last_power,   sizeof state->tx_last_power,   "80.0");
+        snprintf(state->tx.tx_last_payload, sizeof state->tx.tx_last_payload, "CTS1+");
+        snprintf(state->tx.tx_last_power,   sizeof state->tx.tx_last_power,   "80.0");
         // The Doppler carrier falls back to the bare nominal until SGP4 has a
         // range rate; preroll matches the tx_burst_run fallback. Both may be
         // overridden below (--tx-preroll-ms) or by the per-tick Doppler refresh.
-        state->tx_freq_hz_doppler = (long) FRONTIERSAT_CARRIER_HZ;
-        state->tx_preroll_ms      = 200;
+        state->tx.tx_freq_hz_doppler = (long) FRONTIERSAT_CARRIER_HZ;
+        state->tx.tx_preroll_ms      = 200;
 
         state->rot.antenna_rotator.tracking_prep_time_minutes = TRACKING_PREP_TIME_MINUTES;
         state->track.satellite_tracking = 0;
@@ -629,7 +629,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         if (strcmp("--no-tx", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--no-tx",
                 "open the B210 for RX but block the TX compose modal from keying the PA");
-            else { state->n_options++; state->no_tx = 1; }
+            else { state->n_options++; state->tx.no_tx = 1; }
             matched = 1;
         }
         if (strcmp("--live-waterfall", arg) == 0 || help) {
@@ -673,7 +673,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         if (strcmp("--tx-dry-run", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--tx-dry-run",
                 "record every TX burst as not-sent instead of routing it through the SDR");
-            else { state->n_options++; state->tx_dry_run = 1; }
+            else { state->n_options++; state->tx.tx_dry_run = 1; }
             matched = 1;
         }
         if (strncmp("--tx-preroll-ms=", arg, 16) == 0 || help) {
@@ -688,7 +688,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 }
                 if (v < 0)    v = 0;
                 if (v > 5000) v = 5000;
-                state->tx_preroll_ms = (int) v;
+                state->tx.tx_preroll_ms = (int) v;
             }
             matched = 1;
         }
@@ -706,7 +706,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                     return PARSE_ERROR;
                 }
                 state->n_options += 2;
-                snprintf(state->auto_tcmd_file_path, sizeof state->auto_tcmd_file_path,
+                snprintf(state->tx.auto_tcmd_file_path, sizeof state->tx.auto_tcmd_file_path,
                          "%s", argv[t + 2]);
                 ++t;
             }
@@ -721,7 +721,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         if (strcmp("--ignore-at-your-peril-all-tc-errors", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--ignore-at-your-peril-all-tc-errors",
                 "start even if the --tc-file agenda has telecommand lint errors");
-            else { state->n_options++; state->ignore_tc_errors = 1; }
+            else { state->n_options++; state->tx.ignore_tc_errors = 1; }
             matched = 1;
         }
         if (strcmp("--hmac-keyfile", arg) == 0 || help) {
@@ -733,7 +733,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                     return PARSE_ERROR;
                 }
                 state->n_options += 2;
-                snprintf(state->hmac_keyfile_path, sizeof state->hmac_keyfile_path,
+                snprintf(state->tx.hmac_keyfile_path, sizeof state->tx.hmac_keyfile_path,
                          "%s", argv[t + 2]);
                 ++t;
             }

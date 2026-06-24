@@ -19,7 +19,7 @@
 */
 
 // The auto-tcmd modal ('A' / --tc-file): drive a file of ASCII telecommands
-// through the TX path automatically, queuing one state->tx_request per shot
+// through the TX path automatically, queuing one state->tx.tx_request per shot
 // and stopping at LOS. State lives on state_t.auto_tcmd; the modal is ticked
 // non-blocking alongside the main loop.
 
@@ -34,7 +34,7 @@ extern "C" {
 
 // Open / close the modal window.
 void auto_tcmd_open(state_t *state);
-void auto_tcmd_close(state_t *state);
+void auto_tcmd_close(tx_t *tx);
 
 // Feed a key to the open modal. Returns 0 when the modal consumed the key,
 // non-zero to let the caller handle it.
@@ -45,7 +45,7 @@ void auto_tcmd_tick(state_t *state);
 
 // Snapshot the run progress for the status line / IPC broadcast. Returns 1
 // when a run is active (fills sent/total/label), 0 otherwise.
-int auto_tcmd_progress(state_t *state, int *sent, int *total, const char **label);
+int auto_tcmd_progress(tx_t *tx, int *sent, int *total, const char **label);
 
 // 1 if the field is a text-entry field (the power / repeats / delay inputs),
 // as opposed to the allow-tx toggle. Drives whether a keystroke edits text.

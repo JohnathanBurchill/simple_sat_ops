@@ -4,7 +4,7 @@
 
     Coverage for src/proto/hmac_keyfile.c. This is the loader that reads
     the FrontierSat HMAC key off disk and hands the bytes to every
-    uplink burst (cli_args.c -> state->hmac_key -> tx_burst -> ax100).
+    uplink burst (cli_args.c -> state->tx.hmac_key -> tx_burst -> ax100).
     Its whole reason for existing is to refuse a key the operating
     system would let the wrong people read, so the headline coverage
     here is the permission-mode matrix: exactly 0600 or 0640 is

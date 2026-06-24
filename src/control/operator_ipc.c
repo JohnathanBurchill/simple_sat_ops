@@ -125,7 +125,7 @@ void ipc_broadcast_state(state_t *s,
     {
         int at_sent = 0, at_total = 0;
         const char *at_label = NULL;
-        if (auto_tcmd_progress(s, &at_sent, &at_total, &at_label)) {
+        if (auto_tcmd_progress(&s->tx, &at_sent, &at_total, &at_label)) {
             evt.auto_tcmd_on    = 1;
             evt.auto_tcmd_sent  = at_sent;
             evt.auto_tcmd_total = at_total;
@@ -256,7 +256,7 @@ void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
         {
             int at_sent = 0, at_total = 0;
             const char *at_label = NULL;
-            if (auto_tcmd_progress(state, &at_sent, &at_total, &at_label)) {
+            if (auto_tcmd_progress(&state->tx, &at_sent, &at_total, &at_label)) {
                 welcome.auto_tcmd_on    = 1;
                 welcome.auto_tcmd_sent  = at_sent;
                 welcome.auto_tcmd_total = at_total;

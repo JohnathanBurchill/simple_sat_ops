@@ -20,12 +20,13 @@
 
 // The interactive TX-compose modal ('t'): edit a telecommand payload, power
 // and the allow-tx gate, broadcast a debounced preview to viewers, and on
-// commit stage a burst into state->tx_request for the main loop to transmit.
+// commit stage a burst into state->tx.tx_request for the main loop to transmit.
 
 #ifndef UI_TX_COMPOSE_H
 #define UI_TX_COMPOSE_H
 
 #include "sso_ipc.h"     // sso_event_type_t
+#include "tx_state.h"    // tx_t
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,7 +37,7 @@ typedef struct state state_t;
 
 // Open / close the modal (allocate + draw / tear down the window).
 void tx_compose_open(state_t *state);
-void tx_compose_close(state_t *state);
+void tx_compose_close(tx_t *tx);
 
 // Feed a key to the open modal. Returns 0 when the modal consumed the key
 // (including closing on Esc/Enter), non-zero to let the caller handle it.

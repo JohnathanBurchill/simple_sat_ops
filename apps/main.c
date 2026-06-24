@@ -187,12 +187,12 @@ int main(int argc, char **argv)
     // Pin the SSO+ @tssent dedup key for this session: the startup UTC,
     // truncated to the minute. Constant for the life of the process so the
     // satellite runs an SSO+ time-sync once per pass. See sso_pseudo.h.
-    state.sso_pass_tssent_ms = (sso_now_utc_ms() / 60000LL) * 60000LL;
+    state.tx.sso_pass_tssent_ms = (sso_now_utc_ms() / 60000LL) * 60000LL;
 #endif
 
     // Resolve + load the HMAC keyfile (feeds every TX burst's AX100 frame and
     // lights the operator banner). See apps/cli_args.c.
-    cli_load_hmac_keyfile(&state);
+    cli_load_hmac_keyfile(&state.tx);
 
     // Telecommand-agenda lint gate: refuse to start on a --tc-file with lint
     // errors, unless --ignore-at-your-peril-all-tc-errors. See cli_args.c.
@@ -390,7 +390,7 @@ int main(int argc, char **argv)
         // amateur nominal and would give the wrong absolute frequency
         // here. Off when doppler_correction_enabled is false (e.g.
         // bench loopback) so RX and TX share one constant carrier.
-        state.tx_freq_hz_doppler = tx_burst_doppler_freq_hz(
+        state.tx.tx_freq_hz_doppler = tx_burst_doppler_freq_hz(
             FRONTIERSAT_CARRIER_HZ,
             state.track.prediction.satellite_ephem.range_rate_km_s,
             state.track.doppler_correction_enabled);
@@ -472,7 +472,7 @@ int main(int argc, char **argv)
         // Pump the modal's debounced preview broadcast before the
         // screen flush so the mirror line is current when we paint.
         tx_compose_pump(&state);
-        // Drive the auto-tcmd burst loop. Queues state.tx_request when
+        // Drive the auto-tcmd burst loop. Queues state.tx.tx_request when
         // it's time for the next send; the existing main-loop burst
         // handler below transmits and emits the SENT/NOT_SENT events.
         auto_tcmd_tick(&state);
@@ -487,21 +487,21 @@ int main(int argc, char **argv)
         // diff is otherwise free to skip "unchanged" modal cells, which
         // is what was letting panel updates (e.g. the antenna status
         // row) bleed through and overwrite the modal.
-        if (redraw_due || state.cmd.active || state.tx_compose_active
-            || state.auto_tcmd_active) {
+        if (redraw_due || state.cmd.active || state.tx.tx_compose_active
+            || state.tx.auto_tcmd_active) {
             cmd_render(&state);
             refresh();
             int show_hw_cursor = 0;
-            if (state.tx_compose_active && state.tx_compose_win) {
-                touchwin(state.tx_compose_win);
-                wrefresh(state.tx_compose_win);
-                tx_field_t f = state.tx_compose.focus;
+            if (state.tx.tx_compose_active && state.tx.tx_compose_win) {
+                touchwin(state.tx.tx_compose_win);
+                wrefresh(state.tx.tx_compose_win);
+                tx_field_t f = state.tx.tx_compose.focus;
                 show_hw_cursor = (f == TXF_PAYLOAD || f == TXF_POWER);
-            } else if (state.auto_tcmd_active && state.auto_tcmd_win) {
-                touchwin(state.auto_tcmd_win);
-                wrefresh(state.auto_tcmd_win);
-                show_hw_cursor = (state.auto_tcmd.state != AUTO_STATE_RUNNING)
-                              && auto_field_is_text(state.auto_tcmd.focus);
+            } else if (state.tx.auto_tcmd_active && state.tx.auto_tcmd_win) {
+                touchwin(state.tx.auto_tcmd_win);
+                wrefresh(state.tx.auto_tcmd_win);
+                show_hw_cursor = (state.tx.auto_tcmd.state != AUTO_STATE_RUNNING)
+                              && auto_field_is_text(state.tx.auto_tcmd.focus);
             } else if (state.cmd.active) {
                 show_hw_cursor = 1;
             }
@@ -610,7 +610,7 @@ int main(int argc, char **argv)
             // drop to 20 ms so getch() echoes each keystroke promptly
             // (the 500 ms tick was capping input at ~2 chars/sec).
             useconds_t nap = UPDATE_INTERVAL_MICROSEC;
-            if (state.cmd.active || state.tx_compose_active || state.auto_tcmd_active) {
+            if (state.cmd.active || state.tx.tx_compose_active || state.tx.auto_tcmd_active) {
                 nap = 20000;
             } else if (operator_audio_active()) {
                 // A viewer is listening live — tick at 10 Hz so encoded

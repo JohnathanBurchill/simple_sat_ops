@@ -106,7 +106,7 @@ void low_disk_refresh(state_t *state, double t_now)
 // Render the TX log at rows [start_row .. start_row + (TX_LOG_SIZE+1)).
 // Caller picks the column. Title line + one row per entry. Newest at
 // the bottom; PREVIEW lines render with A_BOLD, SENT/NOT_SENT with A_DIM.
-void render_tx_log_panel(const state_t *state, int start_row, int col)
+void render_tx_log_panel(const tx_t *tx, int start_row, int col)
 {
     int row = start_row;
     // Cap width so clrtoeol-equivalent padding doesn't wipe the
@@ -117,8 +117,8 @@ void render_tx_log_panel(const state_t *state, int start_row, int col)
 
     mvprintw(row++, col, "%-*.*s", safe_w, safe_w, "TX log");
 
-    for (size_t i = 0; i < state->tx_log_count; ++i) {
-        const tx_log_entry_t *e = &state->tx_log[i];
+    for (size_t i = 0; i < tx->tx_log_count; ++i) {
+        const tx_log_entry_t *e = &tx->tx_log[i];
         const char *tag = "sent>  ";
         int attr = A_DIM;
         if (e->kind == SSO_EVT_TX_COMMAND_PREVIEW) {
@@ -758,9 +758,9 @@ void report_status(state_t *state, int *print_row, int print_col)
     if (display_dl_hz == 0.0) display_dl_hz = state->track.nominal_downlink_frequency_hz;
     p.carrier_hz = display_dl_hz;
 
-    p.hmac_path   = state->hmac_keyfile_path;
-    p.hmac_status = state->hmac_display_status;
-    p.hmac_bytes  = (ssize_t) state->hmac_key_len;
+    p.hmac_path   = state->tx.hmac_keyfile_path;
+    p.hmac_status = state->tx.hmac_display_status;
+    p.hmac_bytes  = (ssize_t) state->tx.hmac_key_len;
 
     p.have_rotator = state->rot.have_antenna_rotator;
     if (state->rot.have_antenna_rotator) {
@@ -945,6 +945,6 @@ void render_operator_screen(state_t *state, double jul_utc, double t_now,
     // is tall enough to host it without colliding.
     int tx_log_row = LINES - TX_LOG_SIZE - 2;
     if (tx_log_row >= keyboard_info_row + 4) {
-        render_tx_log_panel(state, tx_log_row, 1);
+        render_tx_log_panel(&state->tx, tx_log_row, 1);
     }
 }

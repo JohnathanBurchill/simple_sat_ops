@@ -289,42 +289,42 @@ tx_burst_result_t tx_burst_run(b210_rx_tx_core_t *core,
 // the slot still pending so the next tick polls again.
 void tx_burst_service_request(state_t *state)
 {
-    if (state->tx_request.pending) {
+    if (state->tx.tx_request.pending) {
         char summary[SSO_TX_TEXT_MAX];
         const char *outcome = NULL;
         int  on_air = 0;
         int  finished = 0;        // emit the result + clear pending this tick
-        if (state->tx_dry_run) {
+        if (state->tx.tx_dry_run) {
             snprintf(summary, sizeof summary, "%s",
-                     state->tx_request.summary);
+                     state->tx.tx_request.summary);
             outcome = "dry-run";   // composed but deliberately not keyed
             finished = 1;
-        } else if (state->hmac_key_len == 0) {
+        } else if (state->tx.hmac_key_len == 0) {
             // CTS1 expects HMAC on every uplink. Without a valid
             // key the burst would go out unsigned and the satellite
             // would silently drop it. Refuse here so the operator
             // sees a clear error instead of letting it go out unsigned.
             snprintf(summary, sizeof summary, "%s",
-                     state->tx_request.summary);
+                     state->tx.tx_request.summary);
             outcome = "rejected: no HMAC key (see banner)";
             finished = 1;
         } else if (state->sdr.rx_session != NULL && !rx_session_can_tx(state->sdr.rx_session)) {
             // RX-only backend (e.g. RTL-SDR): never reaches the air.
             // Backstop for a stale queued burst that slipped past the
             // compose / auto-tcmd gates.
-            snprintf(summary, sizeof summary, "%s", state->tx_request.summary);
+            snprintf(summary, sizeof summary, "%s", state->tx.tx_request.summary);
             outcome = "rejected: RX-only SDR";
             finished = 1;
         } else if (state->sdr.rx_session != NULL) {
-            if (!state->tx_inflight) {
-                if (rx_session_submit_burst(state->sdr.rx_session, &state->tx_request,
-                                             state->hmac_key, state->hmac_key_len) == 0) {
-                    state->tx_inflight = 1;
+            if (!state->tx.tx_inflight) {
+                if (rx_session_submit_burst(state->sdr.rx_session, &state->tx.tx_request,
+                                             state->tx.hmac_key, state->tx.hmac_key_len) == 0) {
+                    state->tx.tx_inflight = 1;
                     // Stay pending; we'll poll on subsequent ticks.
                 } else {
                     // Worker refused (slot already busy or rxs error).
                     snprintf(summary, sizeof summary, "%s",
-                             state->tx_request.summary);
+                             state->tx.tx_request.summary);
                     outcome = "rejected: rx_session busy";
                     finished = 1;
                 }
@@ -342,7 +342,7 @@ void tx_burst_service_request(state_t *state)
                         // poll here never does, but handle it for exhaustiveness.
                         case RX_BURST_ABORTED:            outcome = "rejected: aborted"; break;
                     }
-                    state->tx_inflight = 0;
+                    state->tx.tx_inflight = 0;
                     finished = 1;
                 }
                 // else: still in flight; fall through and let the
@@ -350,7 +350,7 @@ void tx_burst_service_request(state_t *state)
             }
         } else {
             snprintf(summary, sizeof summary, "%s",
-                     state->tx_request.summary);
+                     state->tx.tx_request.summary);
             outcome = "rejected: no B210";
             finished = 1;
         }
@@ -376,7 +376,7 @@ void tx_burst_service_request(state_t *state)
                          outcome ? outcome : "?", on_air, summary);
                 sso_audit_event("tx-result", det);
             }
-            state->tx_request.pending = 0;
+            state->tx.tx_request.pending = 0;
         }
     }
 }
