@@ -835,11 +835,10 @@ int auto_tcmd_handle_key(state_t *state, int key) {
         return 1;
     }
     if (key == '\n' || key == '\r' || key == KEY_ENTER) {
-        if (auto_tcmd_start(state) == 0) {
-            auto_tcmd_draw(state);
-        } else {
-            auto_tcmd_draw(state);
-        }
+        // Redraw either way: auto_tcmd_start sets the status message on both
+        // success and rejection, and the modal stays open in both cases.
+        (void) auto_tcmd_start(state);
+        auto_tcmd_draw(state);
         return 1;
     } else if (key == '\t') {
         a->focus = (auto_tcmd_field_t) ((a->focus + 1) % AUTO_F_COUNT);

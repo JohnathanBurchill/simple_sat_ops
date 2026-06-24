@@ -430,10 +430,21 @@ static void cmd_dispatch(state_t *state)
             cmd_set_status(state, "freq: missing argument (MHz)");
         } else {
 #ifdef SSO_WITH_SDR
-            double v = atof(arg1);
-            double hz = (v < 1e6) ? v * 1e6 : v;   // accept MHz or Hz
+            // Accept an explicit unit suffix (k/M/G, optional trailing "Hz").
+            // With no suffix, fall back to the bare-number heuristic: < 1e6 is
+            // read as MHz, >= 1e6 as Hz. Unambiguous for the [1 MHz, 6 GHz]
+            // tuning range, and an explicit suffix removes the guesswork.
+            char *endp = NULL;
+            double v = strtod(arg1, &endp);
+            while (*endp == ' ') endp++;
+            double hz;
+            if (endp == arg1)                      hz = -1.0;  // not a number
+            else if (*endp == 'g' || *endp == 'G') hz = v * 1e9;
+            else if (*endp == 'm' || *endp == 'M') hz = v * 1e6;
+            else if (*endp == 'k' || *endp == 'K') hz = v * 1e3;
+            else                                   hz = (v < 1e6) ? v * 1e6 : v;
             if (hz < 1e6 || hz > 6e9) {
-                cmd_set_status(state, "freq: %g out of [1 MHz, 6 GHz]", hz);
+                cmd_set_status(state, "freq: '%s' out of [1 MHz, 6 GHz]", arg1);
             } else if (state->rx_session == NULL) {
                 cmd_set_status(state, "freq: no RX session");
             } else {

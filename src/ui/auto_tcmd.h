@@ -47,7 +47,8 @@ void auto_tcmd_tick(state_t *state);
 // when a run is active (fills sent/total/label), 0 otherwise.
 int auto_tcmd_progress(state_t *state, int *sent, int *total, const char **label);
 
-// 1 if the given modal field is a free-text field (the file-path field).
+// 1 if the field is a text-entry field (the power / repeats / delay inputs),
+// as opposed to the allow-tx toggle. Drives whether a keystroke edits text.
 int auto_field_is_text(auto_tcmd_field_t f);
 
 #ifdef __cplusplus

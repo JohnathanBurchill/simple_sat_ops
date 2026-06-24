@@ -236,6 +236,11 @@ static void tx_history_recall(state_t *state, tx_compose_t *c, int direction) {
         snprintf(c->payload, sizeof c->payload, "%s",
                  state->tx_history[new_idx]);
     }
+    // Bulk-populate bypasses the per-keystroke clamp, so re-clamp to the
+    // on-air limit here — the field should never show more than what could
+    // actually be committed, even momentarily.
+    if (strlen(c->payload) > (size_t) TCMD_RF_MAX_LEN)
+        c->payload[TCMD_RF_MAX_LEN] = '\0';
     c->cursors[TXF_PAYLOAD] = (int) strlen(c->payload);
     c->history_idx          = new_idx;
     c->preview_dirty        = 1;
