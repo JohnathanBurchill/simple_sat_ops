@@ -102,6 +102,13 @@ static int read_raw_pcm16(const char *path, int16_t **out_samples, size_t *out_n
     }
     rewind(f);
     size_t n = (size_t)sz / 2u;
+    if (n == 0) {
+        // Distinguish an empty file from a real read error: malloc(0) is
+        // implementation-defined and would otherwise surface as a generic -1.
+        fprintf(stderr, "rx_decode: %s is empty (no PCM samples)\n", path);
+        fclose(f);
+        return -1;
+    }
     int16_t *buf = (int16_t *)malloc(n * sizeof(int16_t));
     if (buf == NULL) {
         fclose(f);

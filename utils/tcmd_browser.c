@@ -197,6 +197,13 @@ static void build_resp_index(sqlite3 *db)
         for (int i = 0; i < 8; i++) v |= (uint64_t)pl[1 + i] << (8 * i);
         g_resp_ts[g_resp_ts_n++] = v;
     }
+    // If we stopped on the cap rather than running out of rows, the response
+    // counts shown for some commands will be undercounted — say so instead of
+    // silently truncating the index.
+    if (g_resp_ts_n == MAX_RESP_TS && sqlite3_step(st) == SQLITE_ROW) {
+        fprintf(stderr, "tcmd_browser: response index hit the %d-entry cap; "
+                "response counts may be undercounted.\n", MAX_RESP_TS);
+    }
     sqlite3_finalize(st);
     qsort(g_resp_ts, g_resp_ts_n, sizeof g_resp_ts[0], cmp_u64);
 }

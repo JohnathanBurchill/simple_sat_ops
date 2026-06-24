@@ -843,7 +843,9 @@ int main(int argc, char **argv)
                 audio[k - 1] = pcm;
             }
             // PCM peak as a fraction of full scale, rounded to nearest %.
-            int peak_pct = (peak_pcm * 100 + 16383) / 32767;
+            // The rounding bias is denominator/2; spell it out rather than
+            // hard-coding 16383 so it can't drift off by one.
+            int peak_pct = (peak_pcm * 100 + 32767 / 2) / 32767;
             // Inverse of k_scale: pcm-to-Hz at this rate.
             double peak_hz = (double)peak_pcm * fm_fullscale_hz / 32767.0;
             int squelched_pct = (int)((squelched * 100) / (n_audio > 0 ? n_audio : 1));

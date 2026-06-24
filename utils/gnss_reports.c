@@ -469,7 +469,10 @@ int main(int argc, char **argv)
         f->max_seq = pl[13];
         f->payload_len = pl_len;
         f->payload = malloc((size_t)pl_len);
+        // On OOM, zero the length so reassemble skips this fragment rather
+        // than dereferencing a NULL payload over pl_len bytes.
         if (f->payload) memcpy(f->payload, pl, (size_t)pl_len);
+        else            f->payload_len = 0;
         last_seq = seq;
     }
     FLUSH();

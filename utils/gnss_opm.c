@@ -452,7 +452,10 @@ int main(int argc, char **argv)
         fr->seq = seq;
         fr->payload_len = pl_len;
         fr->payload = malloc((size_t)pl_len);
+        // On OOM, zero the length so reassemble skips this fragment rather
+        // than dereferencing a NULL payload over pl_len bytes.
         if (fr->payload) memcpy(fr->payload, pl, (size_t)pl_len);
+        else             fr->payload_len = 0;
         last_seq = seq;
     }
     CONSIDER();

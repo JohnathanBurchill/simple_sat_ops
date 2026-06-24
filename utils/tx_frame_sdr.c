@@ -768,9 +768,13 @@ int main(int argc, char **argv)
         FILE *fp = fopen(dump_iq_path, "wb");
         if (fp == NULL) { perror("tx_frame_sdr: fopen --dump-iq"); free(iq); free(preroll_pcm); free(pcm); return 1; }
         size_t wrote = fwrite(iq, sizeof(int16_t) * 2, n_iq_total, fp);
-        fclose(fp);
-        if (wrote != n_iq_total) {
-            fprintf(stderr, "tx_frame_sdr: short write to %s\n", dump_iq_path);
+        // Check fclose too: buffered data can fail to flush at close, which a
+        // dropped return would hide and leave a silently-truncated IQ file.
+        int close_rc = fclose(fp);
+        if (wrote != n_iq_total || close_rc != 0) {
+            fprintf(stderr, "tx_frame_sdr: write to %s failed (wrote %zu/%zu%s)\n",
+                    dump_iq_path, wrote, n_iq_total,
+                    close_rc != 0 ? ", close error" : "");
             free(iq); free(preroll_pcm); free(pcm); return 1;
         }
         fprintf(stderr, "tx_frame_sdr: wrote %zu IQ samples to %s (sc16 interleaved)\n",

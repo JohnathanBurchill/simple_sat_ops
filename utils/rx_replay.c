@@ -281,6 +281,13 @@ static int read_raw_pcm16(const char *path, int16_t **out_samples, size_t *out_n
     }
     rewind(f);
     size_t n = (size_t)sz / 2u;
+    if (n == 0) {
+        // Distinguish an empty file from a real read error: malloc(0) is
+        // implementation-defined and would otherwise surface as a generic -1.
+        fprintf(stderr, "rx_replay: %s is empty (no PCM samples)\n", path);
+        fclose(f);
+        return -1;
+    }
     int16_t *buf = (int16_t *)malloc(n * sizeof(int16_t));
     if (buf == NULL) { fclose(f); return -1; }
     if (fread(buf, sizeof(int16_t), n, f) != n) {
@@ -783,9 +790,9 @@ static int rx_emit_decoded(rx_emit_ctx_t *ctx,
     double t_sec = (double)asm_abs_sample / (double)ctx->samp_rate;
     snprintf(ts, sizeof ts, "t=%.3fs", t_sec);
 
-    double az_deg = (0.0/0.0), el_deg = (0.0/0.0);
-    double range_km = (0.0/0.0), range_rate_km_s = (0.0/0.0);
-    double doppler_hz = (0.0/0.0);
+    double az_deg = NAN, el_deg = NAN;
+    double range_km = NAN, range_rate_km_s = NAN;
+    double doppler_hz = NAN;
 #ifdef WITH_SGP4SDP4
     if (ctx->have_pred && ctx->have_start_utc && ctx->pred != NULL) {
         double abs_t = ctx->start_utc_seconds + t_sec;
@@ -815,8 +822,8 @@ static int rx_emit_decoded(rx_emit_ctx_t *ctx,
                 "rx_replay: implausible geometry (az=%.2f "
                 "el=%.2f range=%.1f rate=%.3f) — dropping\n",
                 az_deg, el_deg, range_km, range_rate_km_s);
-            az_deg = el_deg = range_km = (0.0/0.0);
-            range_rate_km_s = doppler_hz = (0.0/0.0);
+            az_deg = el_deg = range_km = NAN;
+            range_rate_km_s = doppler_hz = NAN;
         }
     }
 #endif
@@ -1441,7 +1448,7 @@ int main(int argc, char **argv)
     // record_packet "no anchor — fall back to wall clock."
     decode_loop_set_audio_clock_anchor(have_start_utc
                                        ? start_utc_seconds
-                                       : (0.0 / 0.0));
+                                       : NAN);
 
     // Session dir — explicit flag wins, else dirname of input file.
     static char session_dir_buf[1024];
