@@ -64,12 +64,12 @@ void input_handle_keys(state_t *state, int *keyboard_unlocked)
                     scan_sky_start(state);
                 } else {
                     start_tracking(state);
-                    if (state->antenna_rotator.fixed_target) {
+                    if (state->rot.antenna_rotator.fixed_target) {
                         char det[128];
                         snprintf(det, sizeof det,
                             "mode=fixed-target az=%.1f el=%.1f",
-                            state->antenna_rotator.target_azimuth,
-                            state->antenna_rotator.target_elevation);
+                            state->rot.antenna_rotator.target_azimuth,
+                            state->rot.antenna_rotator.target_elevation);
                         sso_audit_event("track-on", det);
                     } else {
                         sso_audit_event("track-on",
@@ -90,81 +90,73 @@ void input_handle_keys(state_t *state, int *keyboard_unlocked)
                 break;
             case '[':
                 state->satellite_tracking = 0;
-                state->antenna_rotator.antenna_is_under_control = 0;
-                antenna_rotator_result = main_rotator_increase_azimuth(
-                    state, -5.0);
+                state->rot.antenna_rotator.antenna_is_under_control = 0;
+                antenna_rotator_result = main_rotator_increase_azimuth(&state->rot, -5.0);
                 if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                    state->antenna_rotator.antenna_is_moving = 1;
+                    state->rot.antenna_rotator.antenna_is_moving = 1;
                 }
                 flushinp();
                 break;
             case ']':
                 state->satellite_tracking = 0;
-                state->antenna_rotator.antenna_is_under_control = 0;
-                antenna_rotator_result = main_rotator_increase_azimuth(
-                    state, 5.0);
+                state->rot.antenna_rotator.antenna_is_under_control = 0;
+                antenna_rotator_result = main_rotator_increase_azimuth(&state->rot, 5.0);
                 if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                    state->antenna_rotator.antenna_is_moving = 1;
+                    state->rot.antenna_rotator.antenna_is_moving = 1;
                 }
                 flushinp();
                 break;
             case '{':
                 state->satellite_tracking = 0;
-                state->antenna_rotator.antenna_is_under_control = 0;
-                antenna_rotator_result = main_rotator_increase_azimuth(
-                    state, -1.0);
+                state->rot.antenna_rotator.antenna_is_under_control = 0;
+                antenna_rotator_result = main_rotator_increase_azimuth(&state->rot, -1.0);
                 if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                    state->antenna_rotator.antenna_is_moving = 1;
+                    state->rot.antenna_rotator.antenna_is_moving = 1;
                 }
                 flushinp();
                 break;
             case '}':
                 state->satellite_tracking = 0;
-                state->antenna_rotator.antenna_is_under_control = 0;
-                antenna_rotator_result = main_rotator_increase_azimuth(
-                    state, 1.0);
+                state->rot.antenna_rotator.antenna_is_under_control = 0;
+                antenna_rotator_result = main_rotator_increase_azimuth(&state->rot, 1.0);
                 if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                    state->antenna_rotator.antenna_is_moving = 1;
+                    state->rot.antenna_rotator.antenna_is_moving = 1;
                 }
                 flushinp();
                 break;
             case ',':
                 state->satellite_tracking = 0;
-                state->antenna_rotator.antenna_is_under_control = 0;
-                antenna_rotator_result = main_rotator_increase_elevation(
-                    state, -5.0);
+                state->rot.antenna_rotator.antenna_is_under_control = 0;
+                antenna_rotator_result = main_rotator_increase_elevation(&state->rot, -5.0);
                 if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                    state->antenna_rotator.antenna_is_moving = 1;
+                    state->rot.antenna_rotator.antenna_is_moving = 1;
                 }
                 flushinp();
                 break;
             case '.':
                 state->satellite_tracking = 0;
-                state->antenna_rotator.antenna_is_under_control = 0;
-                antenna_rotator_result = main_rotator_increase_elevation(
-                    state, 5.0);
+                state->rot.antenna_rotator.antenna_is_under_control = 0;
+                antenna_rotator_result = main_rotator_increase_elevation(&state->rot, 5.0);
                 if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                    state->antenna_rotator.antenna_is_moving = 1;
+                    state->rot.antenna_rotator.antenna_is_moving = 1;
                 }
                 flushinp();
                 break;
             case '<':
                 state->satellite_tracking = 0;
-                state->antenna_rotator.antenna_is_under_control = 0;
-                antenna_rotator_result = main_rotator_increase_elevation(
-                    state, -1.0);
+                state->rot.antenna_rotator.antenna_is_under_control = 0;
+                antenna_rotator_result = main_rotator_increase_elevation(&state->rot, -1.0);
                 if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                    state->antenna_rotator.antenna_is_moving = 1;
+                    state->rot.antenna_rotator.antenna_is_moving = 1;
                 }
                 flushinp();
                 break;
             case '>':
                 state->satellite_tracking = 0;
-                state->antenna_rotator.antenna_is_under_control = 0;
-                antenna_rotator_result = main_rotator_increase_elevation(
-                    state, 1.0);
+                state->rot.antenna_rotator.antenna_is_under_control = 0;
+                antenna_rotator_result = main_rotator_increase_elevation(&state->rot, 1.0);
                 if (antenna_rotator_result == ANTENNA_ROTATOR_OK) {
-                    state->antenna_rotator.antenna_is_moving = 1;
+                    state->rot.antenna_rotator.antenna_is_moving = 1;
                 }
                 flushinp();
                 break;

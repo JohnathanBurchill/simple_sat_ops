@@ -27,6 +27,7 @@
 #ifndef CONTROL_HW_BRINGUP_H
 #define CONTROL_HW_BRINGUP_H
 
+#include "rot_state.h"
 #include "trsw_state.h"
 
 #ifdef __cplusplus
@@ -47,13 +48,13 @@ int hw_rotator_open(state_t *state);
 // --calibrate-rotator: drive the antenna across known arcs to measure deg/s
 // on each axis, save the rates, close the rotator, and return the process
 // exit code (0 on success, 1 otherwise). Call only when
-// state->calibrate_rotator is set; main() returns this value directly.
-int hw_rotator_calibrate(state_t *state);
+// rot->calibrate_rotator is set; main() returns this value directly.
+int hw_rotator_calibrate(rot_t *rot);
 
-// Load the saved rotator slew rates into state->pursuit_az_dps/el_dps for the
+// Load the saved rotator slew rates into rot->pursuit_az_dps/el_dps for the
 // lead-aim planner. Missing/invalid calibration leaves the planner disabled
 // and prints a hint. No-op when the rotator isn't open.
-void hw_pursuit_rates_load(state_t *state);
+void hw_pursuit_rates_load(rot_t *rot);
 
 // Auto-probe the T/R antenna switch. Absent or inaccessible hardware is a
 // one-line warning, not an error. No-op when --without-tr-switch was passed.

@@ -21,9 +21,8 @@
 #ifndef STATE_H
 #define STATE_H
 
-#include "antenna_rotator.h"
 #include "prediction.h"
-#include "pursuit.h"
+#include "rot_state.h"
 #include "sdr_backend.h"
 #include "sso_ipc.h"
 #include "telemetry.h"
@@ -40,23 +39,6 @@
 // opaque handle. Forward-declared here so this header stays free of
 // rx_session.h (which next_in_queue, a state.h consumer, never links).
 typedef struct rx_session rx_session_t;
-
-// Likewise the async rotator wrapper: state_t keeps an opaque handle, so
-// this header stays free of antenna_rotator_async.h.
-typedef struct antenna_rotator_async antenna_rotator_async_t;
-
-// Pre-sampled mech-frame satellite trajectory backing the pursuit
-// planner's sat_sample_fn_t callback. Sampled once at plan-build time so
-// the planner's iterations see a consistent, order-independent function
-// without ever mutating prediction.satellite_ephem on the side. Owned
-// alongside pursuit_plan; both live for the current tracking session and
-// are freed together at LOS / 's' / shutdown.
-typedef struct {
-    double *t_jul;
-    double *az_unwrapped;
-    double *el;
-    size_t  n;
-} pursuit_track_t;
 
 // HMAC keyfile status, resolved once at startup so the operator banner can
 // show "(N bytes ok)" / "(missing)" / "(bad)". The CTS1 flight firmware
@@ -394,33 +376,8 @@ typedef struct state
     // Spectrogram render job (:spectrum N). Single slot.
     spectrum_job_t spec_job;
 
-    // Antenna rotator
-    antenna_rotator_t antenna_rotator;
-    int run_with_antenna_rotator;
-    int have_antenna_rotator;
-
-    // Async wrapper around antenna_rotator's serial I/O. NULL if no rotator
-    // (--without-rotator, or antenna_rotator_init failed). Spawned right
-    // after antenna_rotator_init succeeds; joined on shutdown. While set, no
-    // other thread touches antenna_rotator's serial FD.
-    antenna_rotator_async_t *rot_async;
-    // --calibrate-rotator runs the calibration routine after opening the
-    // rotator and exits without entering the UI; --confirm-rotator-calibrate
-    // is the safety interlock so the physical motion is always deliberate.
-    int calibrate_rotator;
-    int confirm_rotator_calibrate;
-    // Rotator slew rates loaded from disk at startup (deg/s). Either both
-    // > 0 (calibration present, pursuit planner can run) or both 0
-    // (calibration absent, the track loop falls back to "aim where the
-    // satellite is now"). without_rotator_pursuit (--without-rotator-pursuit)
-    // disables the planner without removing the calibration files.
-    double pursuit_az_dps;
-    double pursuit_el_dps;
-    int    without_rotator_pursuit;
-    // Pursuit planner outputs for the current tracking session, freed
-    // together at LOS / 's' / shutdown (see pursuit_track_t above).
-    pursuit_plan_t  pursuit_plan;
-    pursuit_track_t pursuit_track;
+    // Antenna rotator + pursuit planner. See rot_state.h.
+    rot_t rot;
 
     // T/R antenna switch (USB-CDC). See trsw_state.h.
     trsw_t trsw;

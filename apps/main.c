@@ -220,10 +220,10 @@ int main(int argc, char **argv)
         return status;
     }
     // --calibrate-rotator runs the one-shot rate measurement and exits.
-    if (state.calibrate_rotator) {
-        return hw_rotator_calibrate(&state);
+    if (state.rot.calibrate_rotator) {
+        return hw_rotator_calibrate(&state.rot);
     }
-    hw_pursuit_rates_load(&state);
+    hw_pursuit_rates_load(&state.rot);
     hw_tr_switch_open(&state.trsw);
     hw_sdr_open(&state);
 
@@ -242,13 +242,13 @@ int main(int argc, char **argv)
             state.rx_session = NULL;
         }
 #endif
-        if (state.rot_async != NULL) {
-            antenna_rotator_async_close(state.rot_async);
-            state.rot_async = NULL;
+        if (state.rot.rot_async != NULL) {
+            antenna_rotator_async_close(state.rot.rot_async);
+            state.rot.rot_async = NULL;
         }
-        if (state.have_antenna_rotator) {
-            antenna_rotator_disconnect(&state.antenna_rotator);
-            state.have_antenna_rotator = 0;
+        if (state.rot.have_antenna_rotator) {
+            antenna_rotator_disconnect(&state.rot.antenna_rotator);
+            state.rot.have_antenna_rotator = 0;
         }
         if (state.trsw.have_tr_switch) {
             tr_switch_disconnect(&state.trsw.tr_switch);
@@ -287,10 +287,10 @@ int main(int argc, char **argv)
     (void) doppler_delta_uplink;  // tracked for display symmetry / future IPC
     (void) doppler_max_delta;     // threshold for any future on-display retune
 
-    state.antenna_rotator.antenna_should_be_controlled =
-        state.run_with_antenna_rotator && state.have_antenna_rotator;
-    state.antenna_rotator.antenna_is_under_control =
-        state.antenna_rotator.antenna_should_be_controlled;
+    state.rot.antenna_rotator.antenna_should_be_controlled =
+        state.rot.run_with_antenna_rotator && state.rot.have_antenna_rotator;
+    state.rot.antenna_rotator.antenna_is_under_control =
+        state.rot.antenna_rotator.antenna_should_be_controlled;
 
     int keyboard_unlocked = 1;
     int keyboard_info_row = 20;
@@ -443,8 +443,8 @@ int main(int argc, char **argv)
         // Snapshot the rotator position for the IPC broadcast below, then run
         // the per-tick antenna pointing (settle detect, two-step home, scan,
         // satellite-tracking / pursuit aim). See control/tracking.c.
-        current_az = state.antenna_rotator.azimuth;
-        current_el = state.antenna_rotator.elevation;
+        current_az = state.rot.antenna_rotator.azimuth;
+        current_el = state.rot.antenna_rotator.elevation;
         tracking_tick(&state, jul_utc, t_now);
 
         int redraw_due = (t_now - t_last_redraw) >= REDRAW_PERIOD_S;
@@ -463,7 +463,7 @@ int main(int argc, char **argv)
             mvprintw(keyboard_info_row, 3, "%s : %-8s", "Keyboard",
                      keyboard_unlocked ? "unlocked" : "LOCKED");
             mvprintw(keyboard_info_row + 2, 0, "%-18s",
-                     state.antenna_rotator.antenna_is_moving
+                     state.rot.antenna_rotator.antenna_is_moving
                          ? "Antenna moving"
                          : "Antenna stationary");
             t_last_redraw = t_now;
@@ -548,8 +548,8 @@ int main(int argc, char **argv)
                 state.doppler_downlink_frequency_hz
                 - state.nominal_downlink_frequency_hz;
             rx_session_update_observer(state.rx_session,
-                state.antenna_rotator.target_azimuth,
-                state.antenna_rotator.target_elevation,
+                state.rot.antenna_rotator.target_azimuth,
+                state.rot.antenna_rotator.target_elevation,
                 state.prediction.satellite_ephem.range_km,
                 state.prediction.satellite_ephem.range_rate_km_s,
                 doppler_offset);
@@ -633,17 +633,17 @@ int main(int argc, char **argv)
     }
     // Join the rotator worker before closing the serial FD — otherwise a
     // mid-read in the worker would see EBADF and corrupt the snapshot.
-    if (state.rot_async != NULL) {
-        antenna_rotator_async_close(state.rot_async);
-        state.rot_async = NULL;
+    if (state.rot.rot_async != NULL) {
+        antenna_rotator_async_close(state.rot.rot_async);
+        state.rot.rot_async = NULL;
     }
-    if (state.have_antenna_rotator) {
-        antenna_rotator_disconnect(&state.antenna_rotator);
-        state.have_antenna_rotator = 0;
+    if (state.rot.have_antenna_rotator) {
+        antenna_rotator_disconnect(&state.rot.antenna_rotator);
+        state.rot.have_antenna_rotator = 0;
     }
     // Free any plan that survived (mid-pass exit / crash on a key
     // before the LOS branch had a chance to clear it).
-    main_pursuit_clear_plan(&state);
+    main_pursuit_clear_plan(&state.rot);
     if (state.ipc) {
         sso_ipc_server_close(state.ipc);
         state.ipc = NULL;

@@ -40,11 +40,11 @@
 
 int hw_rotator_open(state_t *state)
 {
-    if (!state->run_with_antenna_rotator) {
+    if (!state->rot.run_with_antenna_rotator) {
         return 0;
     }
-    state->antenna_rotator.is_required = 1;
-    int antenna_rotator_result = antenna_rotator_init(&state->antenna_rotator);
+    state->rot.antenna_rotator.is_required = 1;
+    int antenna_rotator_result = antenna_rotator_init(&state->rot.antenna_rotator);
     if (antenna_rotator_result != ANTENNA_ROTATOR_OK) {
         fprintf(stderr, "Error initializing antenna rotator\n");
         // --self-test is a dry run: a missing rotator must not abort the
@@ -57,20 +57,20 @@ int hw_rotator_open(state_t *state)
                 "--self-test: continuing without the rotator (dry run)\n");
         return 0;
     }
-    state->have_antenna_rotator = 1;
+    state->rot.have_antenna_rotator = 1;
     // Spawn the async worker. From here on, every serial roundtrip happens on
     // the worker thread; the main loop only reads the snapshot via
     // main_rotator_refresh_targets_from_snapshot() and posts SETs via
     // main_rotator_submit_set().
-    if (antenna_rotator_async_open(&state->rot_async,
-                                    &state->antenna_rotator, 0.5) != 0) {
+    if (antenna_rotator_async_open(&state->rot.rot_async,
+                                    &state->rot.antenna_rotator, 0.5) != 0) {
         fprintf(stderr, "Error spawning antenna rotator worker\n");
         if (!state->self_test) {
             return EXIT_FAILURE;
         }
         fprintf(stderr,
                 "--self-test: rotator worker unavailable (dry run)\n");
-        state->have_antenna_rotator = 0;
+        state->rot.have_antenna_rotator = 0;
         return 0;
     }
     // Adopt whatever extended position the SPID is already at so the unwrapped
@@ -84,36 +84,36 @@ int hw_rotator_open(state_t *state)
     // --rotator-target-elevation: those user-specified targets would be
     // silently clobbered before T ever fired. Snapshot them and restore after
     // seeding.
-    double sav_az    = state->antenna_rotator.target_azimuth;
-    double sav_el    = state->antenna_rotator.target_elevation;
-    double sav_az_uw = state->antenna_rotator.target_azimuth_unwrapped;
-    int    sav_uw_ok = state->antenna_rotator.unwrapped_target_valid;
-    if (antenna_rotator_async_wait_first_status(state->rot_async, 1500) != 0
-        || main_rotator_refresh_targets_from_snapshot(state) != 0) {
+    double sav_az    = state->rot.antenna_rotator.target_azimuth;
+    double sav_el    = state->rot.antenna_rotator.target_elevation;
+    double sav_az_uw = state->rot.antenna_rotator.target_azimuth_unwrapped;
+    int    sav_uw_ok = state->rot.antenna_rotator.unwrapped_target_valid;
+    if (antenna_rotator_async_wait_first_status(state->rot.rot_async, 1500) != 0
+        || main_rotator_refresh_targets_from_snapshot(&state->rot) != 0) {
         fprintf(stderr, "Warning: could not read SPID position; "
                         "check that the Rot2ProG is in 'A' mode\n");
     }
-    if (state->antenna_rotator.fixed_target) {
-        state->antenna_rotator.target_azimuth            = sav_az;
-        state->antenna_rotator.target_elevation          = sav_el;
-        state->antenna_rotator.target_azimuth_unwrapped  = sav_az_uw;
-        state->antenna_rotator.unwrapped_target_valid    = sav_uw_ok;
+    if (state->rot.antenna_rotator.fixed_target) {
+        state->rot.antenna_rotator.target_azimuth            = sav_az;
+        state->rot.antenna_rotator.target_elevation          = sav_el;
+        state->rot.antenna_rotator.target_azimuth_unwrapped  = sav_az_uw;
+        state->rot.antenna_rotator.unwrapped_target_valid    = sav_uw_ok;
     }
     return 0;
 }
 
-int hw_rotator_calibrate(state_t *state)
+int hw_rotator_calibrate(rot_t *rot)
 {
     // --calibrate-rotator: drive the antenna across known arcs to measure
     // deg/s on each axis, save the result to disk, and exit without entering
     // the operator UI. Requires the safety interlock so a stray flag in a
     // script can't move hardware.
-    if (!state->have_antenna_rotator) {
+    if (!rot->have_antenna_rotator) {
         fprintf(stderr, "--calibrate-rotator: no rotator open "
                         "(was --without-rotator passed?)\n");
         return EXIT_FAILURE;
     }
-    if (!state->confirm_rotator_calibrate) {
+    if (!rot->confirm_rotator_calibrate) {
         fprintf(stderr,
                 "--calibrate-rotator will physically move the antenna.\n"
                 "Confirm the mast area is clear, then re-run with\n"
@@ -122,7 +122,7 @@ int hw_rotator_calibrate(state_t *state)
     }
     double az_dps = 0.0, el_dps = 0.0;
     rotator_calibrate_result_t cres = rotator_calibrate_run(
-        state->rot_async, &az_dps, &el_dps, stderr);
+        rot->rot_async, &az_dps, &el_dps, stderr);
     fprintf(stderr, "calibrate: result = %s\n",
             rotator_calibrate_result_name(cres));
     if (cres == ROTATOR_CALIBRATE_OK) {
@@ -132,29 +132,29 @@ int hw_rotator_calibrate(state_t *state)
     }
     // Shutdown cleanly — the operator UI never started, but the rotator FD and
     // worker are open.
-    if (state->rot_async != NULL) {
-        antenna_rotator_async_close(state->rot_async);
-        state->rot_async = NULL;
+    if (rot->rot_async != NULL) {
+        antenna_rotator_async_close(rot->rot_async);
+        rot->rot_async = NULL;
     }
-    if (state->have_antenna_rotator) {
-        antenna_rotator_disconnect(&state->antenna_rotator);
-        state->have_antenna_rotator = 0;
+    if (rot->have_antenna_rotator) {
+        antenna_rotator_disconnect(&rot->antenna_rotator);
+        rot->have_antenna_rotator = 0;
     }
     return (cres == ROTATOR_CALIBRATE_OK) ? 0 : 1;
 }
 
-void hw_pursuit_rates_load(state_t *state)
+void hw_pursuit_rates_load(rot_t *rot)
 {
     // Normal startup: load saved rotator rates from the calibration file.
     // Missing or malformed file -> pursuit planner stays disabled.
-    if (!state->have_antenna_rotator) {
+    if (!rot->have_antenna_rotator) {
         return;
     }
-    if (pursuit_load_rotator_rates(&state->pursuit_az_dps,
-                                    &state->pursuit_el_dps) == 0) {
+    if (pursuit_load_rotator_rates(&rot->pursuit_az_dps,
+                                    &rot->pursuit_el_dps) == 0) {
         fprintf(stderr,
                 "pursuit: loaded slew rates az=%.3f deg/s el=%.3f deg/s\n",
-                state->pursuit_az_dps, state->pursuit_el_dps);
+                rot->pursuit_az_dps, rot->pursuit_el_dps);
     } else {
         fprintf(stderr,
                 "pursuit: no calibration on disk; run "

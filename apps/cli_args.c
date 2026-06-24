@@ -247,26 +247,26 @@ void self_test_report(const state_t *state, FILE *out, int argc, char **argv)
     // opened by the time --self-test prints this, so these lines show the
     // real opened state (device, current position, slew rates, SDR
     // backend, TX capability), not just the requested intent.
-    if (state->have_antenna_rotator) {
+    if (state->rot.have_antenna_rotator) {
         double az = 0.0, el = 0.0;
         int ok = 0, stale_ms = 0, inflight = 0;
-        if (state->rot_async) {
-            antenna_rotator_async_snapshot(state->rot_async, &az, &el,
+        if (state->rot.rot_async) {
+            antenna_rotator_async_snapshot(state->rot.rot_async, &az, &el,
                                            &ok, &stale_ms, &inflight);
         }
         fprintf(out,
                 "rotator: open (device=%s, baud=%s, az=%.1f el=%.1f, "
                 "slew az=%.3f el=%.3f deg/s)\n",
-                state->antenna_rotator.device_filename,
-                baud_str(state->antenna_rotator.serial_speed),
-                az, el, state->pursuit_az_dps, state->pursuit_el_dps);
+                state->rot.antenna_rotator.device_filename,
+                baud_str(state->rot.antenna_rotator.serial_speed),
+                az, el, state->rot.pursuit_az_dps, state->rot.pursuit_el_dps);
     } else {
         fprintf(out, "rotator: %s (device=%s, baud=%s)\n",
-                state->run_with_antenna_rotator
+                state->rot.run_with_antenna_rotator
                     ? "enabled but not opened (no controller?)"
                     : "disabled (--without-rotator)",
-                state->antenna_rotator.device_filename,
-                baud_str(state->antenna_rotator.serial_speed));
+                state->rot.antenna_rotator.device_filename,
+                baud_str(state->rot.antenna_rotator.serial_speed));
     }
 
     fprintf(out, "sdr-type: %s\n", sdr_type_str(state->sdr_type));
@@ -427,7 +427,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         state->tx_freq_hz_doppler = (long) FRONTIERSAT_CARRIER_HZ;
         state->tx_preroll_ms      = 200;
 
-        state->antenna_rotator.tracking_prep_time_minutes = TRACKING_PREP_TIME_MINUTES;
+        state->rot.antenna_rotator.tracking_prep_time_minutes = TRACKING_PREP_TIME_MINUTES;
         state->satellite_tracking = 0;
 
         state->nominal_uplink_frequency_hz = UPLINK_FREQ_MHZ * 1e6;
@@ -457,10 +457,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         state->rx_dc_offset_track  = 1;
         state->rx_iq_balance_track = 0;
 
-        state->run_with_antenna_rotator = 1;
-        state->antenna_rotator.device_filename = "/dev/ttyUSB0";
-        state->antenna_rotator.serial_speed = B600;
-        state->antenna_rotator.fixed_target = 0;
+        state->rot.run_with_antenna_rotator = 1;
+        state->rot.antenna_rotator.device_filename = "/dev/ttyUSB0";
+        state->rot.antenna_rotator.serial_speed = B600;
+        state->rot.antenna_rotator.fixed_target = 0;
 
         // T/R antenna switch: auto-probe /dev/ttyACM0. Failure is a
         // one-line warning, not an error.
@@ -521,7 +521,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 // silent no-ops so existing scripts and muscle memory
                 // keep working.
                 state->n_options++;
-                state->run_with_antenna_rotator = 1;
+                state->rot.run_with_antenna_rotator = 1;
             }
             matched = 1;
         }
@@ -531,26 +531,26 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 "skip the SPID Rot2Prog (--without-hardware synonym)");
             else {
                 state->n_options++;
-                state->run_with_antenna_rotator = 0;
+                state->rot.run_with_antenna_rotator = 0;
             }
             matched = 1;
         }
         if (strcmp("--calibrate-rotator", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--calibrate-rotator",
                 "measure rotator slew rates then exit (needs --confirm-rotator-calibrate)");
-            else { state->n_options++; state->calibrate_rotator = 1; }
+            else { state->n_options++; state->rot.calibrate_rotator = 1; }
             matched = 1;
         }
         if (strcmp("--confirm-rotator-calibrate", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--confirm-rotator-calibrate",
                 "safety interlock for --calibrate-rotator (antenna moves)");
-            else { state->n_options++; state->confirm_rotator_calibrate = 1; }
+            else { state->n_options++; state->rot.confirm_rotator_calibrate = 1; }
             matched = 1;
         }
         if (strcmp("--without-rotator-pursuit", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--without-rotator-pursuit",
                 "disable the pursuit / lead-aim planner even if calibrated");
-            else { state->n_options++; state->without_rotator_pursuit = 1; }
+            else { state->n_options++; state->rot.without_rotator_pursuit = 1; }
             matched = 1;
         }
         if (strcmp("--without-tr-switch", arg) == 0 || help) {
@@ -798,7 +798,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                     return PARSE_ERROR;
                 }
                 state->n_options += 2;
-                state->antenna_rotator.device_filename = argv[t + 2];
+                state->rot.antenna_rotator.device_filename = argv[t + 2];
                 ++t;
             }
             matched = 1;
@@ -910,18 +910,18 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
             else {
                 state->n_options++;
                 if (parse_arg_double(arg + 27,
-                        &state->antenna_rotator.target_elevation) != 0) {
+                        &state->rot.antenna_rotator.target_elevation) != 0) {
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                if (state->antenna_rotator.target_elevation < 0.0) {
-                    state->antenna_rotator.target_elevation = 0.0;
-                } else if (state->antenna_rotator.target_elevation
+                if (state->rot.antenna_rotator.target_elevation < 0.0) {
+                    state->rot.antenna_rotator.target_elevation = 0.0;
+                } else if (state->rot.antenna_rotator.target_elevation
                            > ANTENNA_ROTATOR_MAXIMUM_ELEVATION) {
-                    state->antenna_rotator.target_elevation =
+                    state->rot.antenna_rotator.target_elevation =
                         ANTENNA_ROTATOR_MAXIMUM_ELEVATION;
                 }
-                state->antenna_rotator.fixed_target = 1;
+                state->rot.antenna_rotator.fixed_target = 1;
             }
             matched = 1;
         }
@@ -940,10 +940,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                 } else if (az > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
                     az = ANTENNA_ROTATOR_MAXIMUM_AZIMUTH;
                 }
-                state->antenna_rotator.target_azimuth = az;
-                state->antenna_rotator.target_azimuth_unwrapped = az;
-                state->antenna_rotator.unwrapped_target_valid = 1;
-                state->antenna_rotator.fixed_target = 1;
+                state->rot.antenna_rotator.target_azimuth = az;
+                state->rot.antenna_rotator.target_azimuth_unwrapped = az;
+                state->rot.antenna_rotator.unwrapped_target_valid = 1;
+                state->rot.antenna_rotator.fixed_target = 1;
             }
             matched = 1;
         }

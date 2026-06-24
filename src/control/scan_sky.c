@@ -169,10 +169,10 @@ void scan_sky_start(state_t *state)
     // Make sure no concurrent satellite-tracking logic competes for
     // the rotator.
     state->satellite_tracking         = 0;
-    state->antenna_rotator.tracking   = 0;
-    state->antenna_rotator.flip_mode_pass     = 0;
-    state->antenna_rotator.flip_decision_made = 0;
-    state->antenna_rotator.flip_half  = 0;
+    state->rot.antenna_rotator.tracking   = 0;
+    state->rot.antenna_rotator.flip_mode_pass     = 0;
+    state->rot.antenna_rotator.flip_decision_made = 0;
+    state->rot.antenna_rotator.flip_half  = 0;
     // Command the first target via point_to_stationary_target so the
     // two-step homing handles wraparound shortest-path correctly.
     point_to_stationary_target(state,
@@ -192,8 +192,8 @@ void scan_sky_stop(state_t *state, const char *reason)
 {
     if (!state->scan.active) return;
     scan_csv_log(state, NAN, NAN,
-                 state->antenna_rotator.azimuth,
-                 state->antenna_rotator.elevation,
+                 state->rot.antenna_rotator.azimuth,
+                 state->rot.antenna_rotator.elevation,
                  reason ? reason : "stop");
     scan_csv_close(state);
     int done_idx = state->scan.idx;
@@ -220,13 +220,13 @@ void scan_sky_tick(state_t *state, double t_now)
         return;
     }
     // Wait for the rotator to settle before dwelling.
-    if (state->antenna_rotator.antenna_is_moving) return;
+    if (state->rot.antenna_rotator.antenna_is_moving) return;
     if (state->scan.dwell_start_s <= 0.0) {
         state->scan.dwell_start_s = t_now;
         const scan_target_t *t = &state->scan.targets[state->scan.idx];
         scan_csv_log(state, t->az_deg, t->el_deg,
-                     state->antenna_rotator.azimuth,
-                     state->antenna_rotator.elevation,
+                     state->rot.antenna_rotator.azimuth,
+                     state->rot.antenna_rotator.elevation,
                      "arrived");
         return;
     }

@@ -108,12 +108,12 @@ void ipc_broadcast_state(state_t *s,
         snprintf(evt.tle_path, sizeof(evt.tle_path), "%s",
                  s->prediction.tles_filename);
     }
-    evt.target_az = s->antenna_rotator.target_azimuth;
-    evt.target_el = s->antenna_rotator.target_elevation;
-    evt.flip      = s->antenna_rotator.flip_mode_pass;
+    evt.target_az = s->rot.antenna_rotator.target_azimuth;
+    evt.target_el = s->rot.antenna_rotator.target_elevation;
+    evt.flip      = s->rot.antenna_rotator.flip_mode_pass;
     evt.in_pass   = s->in_pass;
-    evt.tracking  = s->antenna_rotator.tracking;
-    evt.has_rotator = s->have_antenna_rotator;
+    evt.tracking  = s->rot.antenna_rotator.tracking;
+    evt.has_rotator = s->rot.have_antenna_rotator;
     evt.jul_utc   = jul_utc;
 
     // Prediction snapshot (satellite name, idesg, pass timing, sky

@@ -495,28 +495,28 @@ void render_predictions_panel(state_t *state, double jul_utc,
     // explicit statement of whether the antenna is actually following the
     // satellite, so the operator doesn't have to infer it from the raw
     // az/el numbers. Only shown when a rotator is attached.
-    if (state->have_antenna_rotator) {
+    if (state->rot.have_antenna_rotator) {
         char rot[96];
         int rot_color = 0;
-        if (state->antenna_rotator.homing_in_progress) {
+        if (state->rot.antenna_rotator.homing_in_progress) {
             snprintf(rot, sizeof rot, "resetting");
             rot_color = 2;
-        } else if (state->antenna_rotator.tracking) {
+        } else if (state->rot.antenna_rotator.tracking) {
             // Pointing error: how far the antenna's actual position is from
             // the commanded target, which the tracker keeps on the
             // satellite. The viewer shows this same value.
             double err = antenna_rotator_pointing_error_deg(
-                state->antenna_rotator.target_azimuth,
-                state->antenna_rotator.target_elevation,
-                state->antenna_rotator.azimuth,
-                state->antenna_rotator.elevation);
+                state->rot.antenna_rotator.target_azimuth,
+                state->rot.antenna_rotator.target_elevation,
+                state->rot.antenna_rotator.azimuth,
+                state->rot.antenna_rotator.elevation);
             snprintf(rot, sizeof rot,
                      "TRACKING satellite  (pointing error %.1f deg)", err);
             rot_color = 3;
         } else if (state->satellite_tracking) {
             snprintf(rot, sizeof rot, "armed (will track at AOS)");
             rot_color = 2;
-        } else if (state->antenna_rotator.fixed_target) {
+        } else if (state->rot.antenna_rotator.fixed_target) {
             snprintf(rot, sizeof rot, "fixed target (not tracking)");
         } else {
             snprintf(rot, sizeof rot, "not tracking");
@@ -762,31 +762,31 @@ void report_status(state_t *state, int *print_row, int print_col)
     p.hmac_status = state->hmac_display_status;
     p.hmac_bytes  = (ssize_t) state->hmac_key_len;
 
-    p.have_rotator = state->have_antenna_rotator;
-    if (state->have_antenna_rotator) {
+    p.have_rotator = state->rot.have_antenna_rotator;
+    if (state->rot.have_antenna_rotator) {
         // The serial roundtrip moved to a worker thread (see
         // src/hw/antenna_rotator_async.c); we just read the latest
         // snapshot here. No more 5-10 ms per redraw on the main loop,
         // and no 500 ms VTIME hang if the cable is unplugged.
-        double azimuth = state->antenna_rotator.azimuth;
-        double elevation = state->antenna_rotator.elevation;
+        double azimuth = state->rot.antenna_rotator.azimuth;
+        double elevation = state->rot.antenna_rotator.elevation;
         int    rot_ok = 0;
         int    rot_stale_ms = 0;
-        if (state->rot_async != NULL) {
-            antenna_rotator_async_snapshot(state->rot_async,
+        if (state->rot.rot_async != NULL) {
+            antenna_rotator_async_snapshot(state->rot.rot_async,
                                             &azimuth, &elevation,
                                             &rot_ok, &rot_stale_ms, NULL);
             // Cache the snapshot back into state so other code (the
             // antenna_is_moving heuristic, IPC broadcast, etc.) reads a
             // single consistent value across the tick.
-            state->antenna_rotator.azimuth   = azimuth;
-            state->antenna_rotator.elevation = elevation;
+            state->rot.antenna_rotator.azimuth   = azimuth;
+            state->rot.antenna_rotator.elevation = elevation;
         }
         p.current_az = azimuth;
         p.current_el = elevation;
-        p.target_az  = state->antenna_rotator.target_azimuth;
-        p.target_el  = state->antenna_rotator.target_elevation;
-        p.flip       = state->antenna_rotator.flip_mode_pass;
+        p.target_az  = state->rot.antenna_rotator.target_azimuth;
+        p.target_el  = state->rot.antenna_rotator.target_elevation;
+        p.flip       = state->rot.antenna_rotator.flip_mode_pass;
     }
 
     // T/R switch block — operator-only (this process owns the serial

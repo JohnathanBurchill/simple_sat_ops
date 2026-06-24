@@ -164,16 +164,16 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
     s->prediction.satellite_ephem.range_km         = evt->range_km;
     s->prediction.satellite_ephem.range_rate_km_s  = evt->range_rate_kms;
     s->in_pass                                     = evt->in_pass;
-    s->antenna_rotator.tracking                    = evt->tracking;
-    s->antenna_rotator.azimuth                     = evt->az;
-    s->antenna_rotator.elevation                   = evt->el;
-    s->antenna_rotator.target_azimuth              = evt->target_az;
-    s->antenna_rotator.target_elevation            = evt->target_el;
-    s->antenna_rotator.flip_mode_pass              = evt->flip;
+    s->rot.antenna_rotator.tracking                    = evt->tracking;
+    s->rot.antenna_rotator.azimuth                     = evt->az;
+    s->rot.antenna_rotator.elevation                   = evt->el;
+    s->rot.antenna_rotator.target_azimuth              = evt->target_az;
+    s->rot.antenna_rotator.target_elevation            = evt->target_el;
+    s->rot.antenna_rotator.flip_mode_pass              = evt->flip;
     // render_predictions_panel gates its rotator/tracking + pointing-error
     // line on have_antenna_rotator, so mirror has_rotator into the viewer's
     // reconstructed state or that line stays hidden for observers.
-    s->have_antenna_rotator                        = evt->has_rotator;
+    s->rot.have_antenna_rotator                        = evt->has_rotator;
 
     v->has_rotator = evt->has_rotator;
     v->jul_utc     = evt->jul_utc;
@@ -414,11 +414,11 @@ static void viewer_render(viewer_t *v, int connected)
         sp.viewers       = viewers[0] ? viewers : "(none)";
         sp.carrier_hz    = v->carrier_hz;
         sp.have_rotator  = v->has_rotator;
-        sp.current_az    = v->state.antenna_rotator.azimuth;
-        sp.current_el    = v->state.antenna_rotator.elevation;
-        sp.target_az     = v->state.antenna_rotator.target_azimuth;
-        sp.target_el     = v->state.antenna_rotator.target_elevation;
-        sp.flip          = v->state.antenna_rotator.flip_mode_pass;
+        sp.current_az    = v->state.rot.antenna_rotator.azimuth;
+        sp.current_el    = v->state.rot.antenna_rotator.elevation;
+        sp.target_az     = v->state.rot.antenna_rotator.target_azimuth;
+        sp.target_el     = v->state.rot.antenna_rotator.target_elevation;
+        sp.flip          = v->state.rot.antenna_rotator.flip_mode_pass;
         render_status_panel(&sp, &srow, col);
 
         // Auto-tcmd run progress, mirrored from the operator's modal.

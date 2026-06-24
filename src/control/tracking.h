@@ -27,6 +27,8 @@
 #ifndef CONTROL_TRACKING_H
 #define CONTROL_TRACKING_H
 
+#include "rot_state.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -50,14 +52,14 @@ enum {
 };
 
 // Rotator-set primitives (bounds-checked; post via the async worker).
-int main_rotator_submit_set(state_t *state, double az_unwrapped, double elevation);
-int main_rotator_increase_azimuth(state_t *state, double delta);
-int main_rotator_increase_elevation(state_t *state, double delta);
+int main_rotator_submit_set(rot_t *rot, double az_unwrapped, double elevation);
+int main_rotator_increase_azimuth(rot_t *rot, double delta);
+int main_rotator_increase_elevation(rot_t *rot, double delta);
 // Refresh the rotator's current/target snapshot from the async worker.
-int main_rotator_refresh_targets_from_snapshot(state_t *state);
+int main_rotator_refresh_targets_from_snapshot(rot_t *rot);
 
 // Whole-pass pursuit planner.
-void main_pursuit_clear_plan(state_t *state);
+void main_pursuit_clear_plan(rot_t *rot);
 void main_pursuit_build_plan(state_t *state, double jul_now);
 
 // Tracking state transitions.
