@@ -175,11 +175,15 @@ ssize_t ax100_frame(const uint8_t *packet, size_t packet_len,
             return -1;
         }
     }
-    memcpy(inner, packet, packet_len);
+    // packet may legitimately be NULL when packet_len == 0 (an empty CSP
+    // packet); memcpy(dst, NULL, 0) is undefined behaviour, so guard it.
+    if (packet_len > 0) {
+        memcpy(inner, packet, packet_len);
+    }
     inner_len = packet_len;
 
     if (opts->hmac_key != NULL) {
-        uint8_t mac[4];
+        uint8_t mac[4] = {0};
         if (ax100_hmac(opts->hmac_key, opts->hmac_key_len,
                        inner, inner_len, mac) != 0) {
             return -1;
@@ -201,6 +205,11 @@ ssize_t ax100_frame(const uint8_t *packet, size_t packet_len,
     }
 
     // CCSDS scrambler: XOR each byte with the table, wrapping the table.
+    // The table is 255 bytes, so this wraps with period 255, NOT the 256 of a
+    // textbook CCSDS randomizer. That is correct only because the peer
+    // (pycsplink) uses the identical 255-entry table; the two would diverge
+    // once a frame exceeded 255 payload bytes — which can't happen here (RS
+    // caps inner_len at 255, and the no-RS path is bounded by the Golay field).
     if (opts->randomize) {
         for (size_t i = 0; i < inner_len; ++i) {
             inner[i] ^= CCSDS_SCRAMBLER_TABLE[i % sizeof(CCSDS_SCRAMBLER_TABLE)];
@@ -300,11 +309,15 @@ static ssize_t ax100_try_length(const uint8_t *scrambled, size_t on_wire_len,
     size_t packet_len = data_len;
     if (opts->hmac_key != NULL) {
         if (data_len < 4) return -1;
-        uint8_t expected[4];
+        uint8_t expected[4] = {0};
         if (ax100_hmac(opts->hmac_key, opts->hmac_key_len,
                        inner, data_len - 4, expected) != 0) {
             return -1;
         }
+        // Not a constant-time compare. Fine here: this is a receive-side
+        // integrity check on already-public downlink, not a secret-dependent
+        // auth gate. If this code is ever reused to authenticate uplink, swap
+        // in a constant-time comparison to avoid a timing side channel.
         int match = (memcmp(expected, inner + data_len - 4, 4) == 0);
         if (out_hmac_ok) *out_hmac_ok = match ? 1 : 0;
         if (!match) return -1;
