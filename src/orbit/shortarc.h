@@ -37,6 +37,11 @@
 #ifndef SSO_SHORTARC_H
 #define SSO_SHORTARC_H
 
+// Maximum observations a single fit uses. The fit's stack arrays are sized to
+// this; shortarc_fit() caps n here (and warns) rather than reading past them.
+// Callers with more fixes should pre-thin to the span that matters.
+#define SHORTARC_MAX_OBS 64
+
 // One GNSS observation. Distances are metres, velocities metres/second, all
 // in the Earth-fixed (ITRF) frame. dt is the observation time relative to the
 // fit epoch in seconds (negative for fixes before the epoch). The sigmas are

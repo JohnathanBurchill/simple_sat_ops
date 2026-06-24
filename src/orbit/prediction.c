@@ -149,6 +149,12 @@ int tle_default_path(char *out_path, size_t out_cap)
     return 0;
 }
 
+// sgp4sdp4 packs a TLE as two fixed-width 69-char lines concatenated with no
+// separator, NUL-terminated; Convert_Satellite_Data reads it at fixed offsets.
+// TLE_TWO_LINE_BUF holds both lines plus the terminator.
+#define TLE_LINE_CHARS   69
+#define TLE_TWO_LINE_BUF (2 * TLE_LINE_CHARS + 1)
+
 static pass_t *passes = NULL;
 static size_t n_passes = 0;
 
@@ -304,6 +310,11 @@ void minutes_until_visible(prediction_t *external_prediction, double jul_utc_sta
             elevation = prediction.satellite_ephem.elevation;
         }
     }
+    // Sign convention: a satellite already above the horizon makes the loop
+    // above walk BACKWARD to find when it rose, so jul_utc < jul_utc_start and
+    // the result is NEGATIVE — minutes *since* AOS. A positive value is the
+    // wait until the next AOS. The -9999.0 sentinel (far from any real value)
+    // means "didn't rise within the search window".
     if (jul_utc > 0 && jul_utc < jul_utc_stop) {
         external_prediction->predicted_minutes_until_visible = (jul_utc - jul_utc_start) * 1440.0;
     } else {
@@ -331,8 +342,7 @@ int load_tle(prediction_t *prediction)
         return -1;
     }
 
-    // sgp4sdp4 expects two 69-char TLE lines joined by \n, NUL-terminated
-    char tle[139] = {0};
+    char tle[TLE_TWO_LINE_BUF] = {0};
     char name[128] = {0};
     char line1[80] = {0};
     char line2[80] = {0};
@@ -348,11 +358,11 @@ int load_tle(prediction_t *prediction)
             }
             size_t l1 = strlen(line1);
             size_t l2 = strlen(line2);
-            if (l1 > 69) l1 = 69;
-            if (l2 > 69) l2 = 69;
+            if (l1 > TLE_LINE_CHARS) l1 = TLE_LINE_CHARS;
+            if (l2 > TLE_LINE_CHARS) l2 = TLE_LINE_CHARS;
             memset(tle, 0, sizeof(tle));
             memcpy(tle, line1, l1);
-            memcpy(tle + 69, line2, l2);
+            memcpy(tle + TLE_LINE_CHARS, line2, l2);
             snprintf(prediction->satellite_ephem.tle.sat_name, sizeof(prediction->satellite_ephem.tle.sat_name), "%s", name);
             found_satellite = 1;
             break;
@@ -411,7 +421,6 @@ static int append_pass(const char *name, double minutes_until_visible,
     memset(&passes[n_passes - 1], 0, sizeof *passes);
     pass_t *p = &passes[n_passes - 1];
     (void)strncpy(p->name, name, sizeof(p->name) - 1);
-    (void)strncpy(p->tle,  name, sizeof(p->tle)  - 1);
     p->minutes_away        = minutes_until_visible;
     p->pass_duration       = prediction->predicted_pass_duration_minutes;
     p->ascension_jul_utc   = prediction->predicted_ascension_jul_utc;
@@ -424,6 +433,12 @@ static int append_pass(const char *name, double minutes_until_visible,
 // Returns the first match on prediction->satellite_ephem.name
 int find_passes(prediction_t *external_prediction, double jul_utc_start, double delta_t_minutes, criteria_t *criteria, int *count, int *number_checked, int reverse_order, int find_all)
 {
+    // The pass list is module-static and grows via append_pass. Reset it on
+    // entry so a second find_passes call doesn't stack onto the previous
+    // call's results (the old behaviour leaked across repeated searches).
+    // Callers still own a final free_passes() when they're done reading.
+    free_passes();
+
     // OEM trajectory path: single satellite, no file loop, no regex /
     // constellation filtering (the operator chose this specific trajectory).
     if (external_prediction->oem != NULL) {
@@ -475,8 +490,7 @@ int find_passes(prediction_t *external_prediction, double jul_utc_start, double 
         return -1;
     }
     
-    // sgp4sdp4 expects two 69-char TLE lines joined by \n, NUL-terminated
-    char tle[160] = {0};
+    char tle[TLE_TWO_LINE_BUF] = {0};
     char name[128] = {0};
     char line1[80] = {0};
     char line2[80] = {0};
@@ -533,11 +547,11 @@ int find_passes(prediction_t *external_prediction, double jul_utc_start, double 
         }
         size_t l1 = strlen(line1);
         size_t l2 = strlen(line2);
-        if (l1 > 69) l1 = 69;
-        if (l2 > 69) l2 = 69;
+        if (l1 > TLE_LINE_CHARS) l1 = TLE_LINE_CHARS;
+        if (l2 > TLE_LINE_CHARS) l2 = TLE_LINE_CHARS;
         memset(tle, 0, sizeof(tle));
         memcpy(tle, line1, l1);
-        memcpy(tle + 69, line2, l2);
+        memcpy(tle + TLE_LINE_CHARS, line2, l2);
         // Calculate minutes away
         if (!Good_Elements(tle)) {
             fprintf(stderr, "Invalid TLE\n");

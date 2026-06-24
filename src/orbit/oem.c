@@ -279,8 +279,9 @@ int oem_load_from_ssm(const char *trajectory_id, oem_table_t *out)
     if (trajectory_id == NULL || out == NULL) return -1;
     // Shell-quote the id paranoidly (single quotes + escape any ' in id).
     // IDs from `ssm trajectories` are UUIDs so in practice no escaping is
-    // needed, but treat it as untrusted.
-    size_t cmd_cap = strlen(trajectory_id) * 2 + 64;
+    // needed, but treat it as untrusted. Each ' expands to 4 bytes ('\''),
+    // so size for the all-quotes worst case to avoid a spurious bail-out.
+    size_t cmd_cap = strlen(trajectory_id) * 4 + 64;
     char *cmd = (char *)malloc(cmd_cap);
     if (cmd == NULL) return -1;
     size_t off = 0;
@@ -421,7 +422,6 @@ static int kepler_propagate_eci(const double r0[3], const double v0[3],
         r0[2]*v0[0] - r0[0]*v0[2],
         r0[0]*v0[1] - r0[1]*v0[0]
     };
-    (void)h;
 
     // Eccentricity vector e_vec = (v × h)/μ - r/|r|
     double vxh[3] = {

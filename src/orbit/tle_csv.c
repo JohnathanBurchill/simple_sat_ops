@@ -240,6 +240,11 @@ static void format_decexp(double v, char *out8)
     char sign = (v < 0) ? '-' : ' ';
     double a = fabs(v);
     int exp = 0;
+    // The |exp| > 20 guards are infinite-loop backstops for absurd inputs;
+    // they can leave `a` un-normalised, but that never reaches the output: any
+    // value that hits them lands outside [-9, 9] and the exp-range clamps below
+    // override the mantissa (saturate to 99999+9, or emit zero). Real BSTAR /
+    // mean-motion-derivative values normalise in a handful of steps.
     while (a < 0.1)  { a *= 10.0;  exp--; if (exp < -20) break; }
     while (a >= 1.0) { a /= 10.0;  exp++; if (exp >  20) break; }
     int mantissa = (int) lround(a * 100000.0);

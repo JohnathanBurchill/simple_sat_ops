@@ -26,6 +26,7 @@
 #include "shortarc.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 // Earth constants -- identical to space_safety_manager's propagate.c so the
@@ -139,8 +140,13 @@ int shortarc_fit(const shortarc_obs_t *obs, int n, shortarc_fit_t *out)
     if (obs == NULL || n < 1) return -1;
 
     // Observations and per-axis inverse-variance weights in km, km/s.
-    double y[64][6], w[64][6], dt[64];
-    if (n > 64) n = 64;
+    double y[SHORTARC_MAX_OBS][6], w[SHORTARC_MAX_OBS][6], dt[SHORTARC_MAX_OBS];
+    if (n > SHORTARC_MAX_OBS) {
+        fprintf(stderr,
+                "shortarc_fit: %d observations exceeds the %d-obs cap; "
+                "using the first %d.\n", n, SHORTARC_MAX_OBS, SHORTARC_MAX_OBS);
+        n = SHORTARC_MAX_OBS;
+    }
     for (int i = 0; i < n; i++) {
         dt[i] = obs[i].dt;
         for (int k = 0; k < 3; k++) {
@@ -237,6 +243,10 @@ int shortarc_fit(const shortarc_obs_t *obs, int n, shortarc_fit_t *out)
     for (int k = 0; k < 3; k++) { out->pos[k] = x[k] * 1000.0; out->vel[k] = x[k + 3] * 1000.0; }
     for (int i = 0; i < 6; i++)
         for (int j = 0; j < 6; j++) out->cov[i][j] = Ninv[i][j] * scale * 1.0e6;
+    // pos_rms is a literal root-mean-square of the position residuals over n
+    // observations (a per-fix diagnostic). It deliberately divides by n, not
+    // by the dof = 6n-6 used for the reduced chi-square above: that statistic
+    // scales the formal covariance, this one reports the typical position miss.
     out->pos_rms = sqrt(sumsq / n) * 1000.0;
     out->n_obs = n;
     out->iterations = iter;

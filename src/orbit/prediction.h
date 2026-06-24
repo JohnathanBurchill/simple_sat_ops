@@ -48,7 +48,6 @@ typedef struct pass
     double ascension_azimuth;
     double pass_duration;
     char name[26];
-    char tle[160];
 } pass_t;
 
 // Forward decl: when non-NULL on prediction_t, state comes from a
@@ -87,6 +86,11 @@ typedef struct prediction
 void update_satellite_position(prediction_t *state, double jul_utc);
 void update_pass_predictions(prediction_t *external_state, double jul_utc_start, double delta_t_minutes);
 void minutes_until_visible(prediction_t *external_state, double jul_utc_start, double jul_utc_stop, double delta_t_minutes);
+// Loads the named satellite's TLE into state->satellite_ephem.tle. The
+// elements are left in raw (pre-conversion) units: the caller MUST call
+// sgp4sdp4's select_ephemeris() on the tle exactly once before propagating,
+// and never twice — select_ephemeris() rewrites the element units in place,
+// so a second call corrupts them (a real hazard in multi-satellite loops).
 int load_tle(prediction_t *state);
 // Fills out_path with "$HOME/.local/state/simple_sat_ops/active.tle".
 // Returns 0 on success, -1 if $HOME is unset or the buffer is too small.
