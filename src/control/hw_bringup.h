@@ -27,6 +27,8 @@
 #ifndef CONTROL_HW_BRINGUP_H
 #define CONTROL_HW_BRINGUP_H
 
+#include "trsw_state.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -55,7 +57,7 @@ void hw_pursuit_rates_load(state_t *state);
 
 // Auto-probe the T/R antenna switch. Absent or inaccessible hardware is a
 // one-line warning, not an error. No-op when --without-tr-switch was passed.
-void hw_tr_switch_open(state_t *state);
+void hw_tr_switch_open(trsw_t *trsw);
 
 // Open the SDR (B2xx via UHD, or RTL-SDR) and hand the core to rx_session for
 // the RX + decode chain. Operator (--control) mode only, and soft-fail: any

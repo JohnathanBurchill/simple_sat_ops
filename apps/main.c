@@ -224,7 +224,7 @@ int main(int argc, char **argv)
         return hw_rotator_calibrate(&state);
     }
     hw_pursuit_rates_load(&state);
-    hw_tr_switch_open(&state);
+    hw_tr_switch_open(&state.trsw);
     hw_sdr_open(&state);
 
     // --self-test: the full bring-up has now run — TLE load, pass-folder
@@ -250,9 +250,9 @@ int main(int argc, char **argv)
             antenna_rotator_disconnect(&state.antenna_rotator);
             state.have_antenna_rotator = 0;
         }
-        if (state.have_tr_switch) {
-            tr_switch_disconnect(&state.tr_switch);
-            state.have_tr_switch = 0;
+        if (state.trsw.have_tr_switch) {
+            tr_switch_disconnect(&state.trsw.tr_switch);
+            state.trsw.have_tr_switch = 0;
         }
         if (state.ipc) {
             sso_ipc_server_close(state.ipc);
@@ -362,8 +362,8 @@ int main(int argc, char **argv)
         // Drain whatever the T/R switch emitted since the last tick.
         // Non-blocking; the firmware beats every ~2.5 s so most ticks
         // read zero bytes.
-        if (state.have_tr_switch) {
-            tr_switch_pump(&state.tr_switch, t_now);
+        if (state.trsw.have_tr_switch) {
+            tr_switch_pump(&state.trsw.tr_switch, t_now);
         }
 
         /* Calculate Doppler shift for the display + IPC publishing */
@@ -627,9 +627,9 @@ int main(int argc, char **argv)
 
     endwin();
     tui_release_stderr();
-    if (state.have_tr_switch) {
-        tr_switch_disconnect(&state.tr_switch);
-        state.have_tr_switch = 0;
+    if (state.trsw.have_tr_switch) {
+        tr_switch_disconnect(&state.trsw.tr_switch);
+        state.trsw.have_tr_switch = 0;
     }
     // Join the rotator worker before closing the serial FD — otherwise a
     // mid-read in the worker would see EBADF and corrupt the snapshot.

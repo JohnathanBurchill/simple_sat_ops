@@ -163,23 +163,23 @@ void hw_pursuit_rates_load(state_t *state)
     }
 }
 
-void hw_tr_switch_open(state_t *state)
+void hw_tr_switch_open(trsw_t *trsw)
 {
     // T/R antenna switch — auto-probe before ncurses takes the screen, so a
     // "not connected" warning lands on the terminal. Absent or inaccessible
     // hardware is non-fatal; the UI panel reads "not connected" and the
     // program runs normally.
-    if (!state->run_with_tr_switch) {
+    if (!trsw->run_with_tr_switch) {
         return;
     }
-    if (tr_switch_init(&state->tr_switch) == 0) {
-        state->have_tr_switch = 1;
+    if (tr_switch_init(&trsw->tr_switch) == 0) {
+        trsw->have_tr_switch = 1;
     } else {
         fprintf(stderr,
                 "T/R switch: could not open %s (skipping; "
                 "pass --without-tr-switch to silence)\n",
-                state->tr_switch.device_filename
-                    ? state->tr_switch.device_filename : "?");
+                trsw->tr_switch.device_filename
+                    ? trsw->tr_switch.device_filename : "?");
     }
 }
 

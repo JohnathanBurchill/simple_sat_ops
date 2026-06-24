@@ -464,10 +464,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
 
         // T/R antenna switch: auto-probe /dev/ttyACM0. Failure is a
         // one-line warning, not an error.
-        state->run_with_tr_switch = 1;
-        state->have_tr_switch     = 0;
-        state->tr_switch.device_filename = "/dev/ttyACM0";
-        state->tr_switch.serial_speed    = B115200;
+        state->trsw.run_with_tr_switch = 1;
+        state->trsw.have_tr_switch     = 0;
+        state->trsw.tr_switch.device_filename = "/dev/ttyACM0";
+        state->trsw.tr_switch.serial_speed    = B115200;
     }
 
     int ntokens = help ? 1 : argc - 1;
@@ -556,7 +556,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         if (strcmp("--without-tr-switch", arg) == 0 || help) {
             if (help) parse_help_line(OPTW, "--without-tr-switch",
                 "skip the T/R switch probe entirely");
-            else { state->n_options++; state->run_with_tr_switch = 0; }
+            else { state->n_options++; state->trsw.run_with_tr_switch = 0; }
             matched = 1;
         }
         if (strncmp("--tr-switch-device=", arg, 19) == 0 || help) {
@@ -568,7 +568,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
                     fprintf(stderr, "Unable to parse %s\n", arg);
                     return PARSE_ERROR;
                 }
-                state->tr_switch.device_filename = arg + 19;
+                state->trsw.tr_switch.device_filename = arg + 19;
             }
             matched = 1;
         }

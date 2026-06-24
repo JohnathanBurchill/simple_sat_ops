@@ -792,13 +792,13 @@ void report_status(state_t *state, int *print_row, int print_col)
     // T/R switch block — operator-only (this process owns the serial
     // link). The viewer never sets tr_show, so its panel skips it.
     p.tr_show = 1;
-    p.tr_connected = state->have_tr_switch;
-    if (state->have_tr_switch) {
-        p.tr_device        = state->tr_switch.device_filename;
-        p.tr_state         = state->tr_switch.state_str;
-        p.tr_mode          = state->tr_switch.mode_str;
-        p.tr_last_tx_ago_s = state->tr_switch.last_tx_ago_s;
-        p.tr_stale         = tr_switch_is_stale(&state->tr_switch,
+    p.tr_connected = state->trsw.have_tr_switch;
+    if (state->trsw.have_tr_switch) {
+        p.tr_device        = state->trsw.tr_switch.device_filename;
+        p.tr_state         = state->trsw.tr_switch.state_str;
+        p.tr_mode          = state->trsw.tr_switch.mode_str;
+        p.tr_last_tx_ago_s = state->trsw.tr_switch.last_tx_ago_s;
+        p.tr_stale         = tr_switch_is_stale(&state->trsw.tr_switch,
                                                 monotonic_seconds());
     }
 

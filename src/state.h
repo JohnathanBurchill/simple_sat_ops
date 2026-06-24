@@ -27,7 +27,7 @@
 #include "sdr_backend.h"
 #include "sso_ipc.h"
 #include "telemetry.h"
-#include "tr_switch.h"
+#include "trsw_state.h"
 #include "tx_burst.h"
 
 #include <pthread.h>
@@ -422,12 +422,8 @@ typedef struct state
     pursuit_plan_t  pursuit_plan;
     pursuit_track_t pursuit_track;
 
-    // T/R antenna switch (USB-CDC, default /dev/ttyACM0).
-    // run_with_tr_switch defaults to 1: auto-probe the device on start.
-    // Absent hardware is a one-line warning, not an error.
-    tr_switch_t tr_switch;
-    int run_with_tr_switch;
-    int have_tr_switch;
+    // T/R antenna switch (USB-CDC). See trsw_state.h.
+    trsw_t trsw;
 
     // Telemetry overlay (still rendered alongside the prediction).
     telemetry_t telemetry;
