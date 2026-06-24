@@ -17,10 +17,13 @@ extern "C" {
 // Absolute path of the FrontierSat data root.
 // Resolution order:
 //   1. $FRONTIERSAT_ROOT if set and non-empty.
-//   2. /FrontierSat if it exists and is a directory.
-//   3. $HOME/FrontierSat (dev-host fallback, may not yet exist).
-// Returned pointer is valid until the next call. Not thread-safe; first
-// caller wins for the process lifetime in practice.
+//   2. otherwise /FrontierSat — the well-known shared tree. (The older
+//      "/FrontierSat if present, else $HOME/FrontierSat" fallback was removed
+//      so every host resolves identically; point a dev host elsewhere with
+//      FRONTIERSAT_ROOT. A warning is printed once if the root is missing.)
+// The result is cached on the first call. Resolution is NOT thread-safe, so
+// call this once at startup (before spawning the audit / RX worker threads)
+// to fix the cache; reads are safe thereafter.
 const char *sso_frontiersat_root(void);
 
 // Convenience wrappers for the standard subdirs. Each returns an

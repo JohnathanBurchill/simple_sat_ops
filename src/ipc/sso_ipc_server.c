@@ -189,7 +189,15 @@ static void server_accept(sso_ipc_server_t *srv) {
         socklen_t peerlen = sizeof(peer);
         int cfd = accept(srv->listen_fd, (struct sockaddr *) &peer, &peerlen);
         if (cfd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;  // backlog drained
+            // Transient per-connection errors: the next queued connection may
+            // still be acceptable, so keep draining the backlog.
+            if (errno == EINTR || errno == ECONNABORTED) continue;
+            // Out of file descriptors: the listener stays armed, so log it
+            // (don't spin) and retry on the next poll cycle.
+            if (errno == EMFILE || errno == ENFILE)
+                fprintf(stderr, "sso_ipc: accept: out of file descriptors (%s)\n",
+                        strerror(errno));
             return;
         }
         sso_ipc_client_slot_t *slot = server_alloc_slot(srv);

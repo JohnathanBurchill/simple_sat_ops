@@ -10,7 +10,6 @@
 #include "sso_ipc_internal.h"
 
 #include "sso_ipc_paths.h"
-#include "sso_audit.h"   // sso_unix_user (audit link anchor at end of file)
 
 #include <errno.h>
 #include <poll.h>
@@ -188,7 +187,3 @@ int sso_ipc_client_send(sso_ipc_client_t *cli, const char *line) {
 int sso_ipc_client_is_connected(const sso_ipc_client_t *cli) {
     return cli && cli->connected;
 }
-
-// (void) sso_audit symbol referenced to ensure the audit lib is part
-// of the link graph of consumers that pull sso_ipc.
-static __attribute__((unused)) const void *sso_ipc_audit_anchor = (const void *) sso_unix_user;

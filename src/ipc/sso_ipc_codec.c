@@ -247,7 +247,11 @@ static int json_unescape_into(const char *src, size_t srclen,
                 case 'r':  m = '\r'; break;
                 case 't':  m = '\t'; break;
                 case 'u':
-                    // Hex escape — represent as '?' for our purposes.
+                    // Hex escape — represent as '?' for our purposes. i points
+                    // at the 'u'; the four hex digits are at i+1..i+4, so they
+                    // are all in range exactly when i+4 < srclen. A truncated
+                    // \u at the very end (< 4 digits) falls through and its
+                    // stray chars are copied literally rather than over-skipped.
                     if (i + 4 < srclen) i += 4;
                     m = '?';
                     break;
