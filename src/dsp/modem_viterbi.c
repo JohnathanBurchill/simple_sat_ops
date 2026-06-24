@@ -36,7 +36,7 @@ int modem_iq_viterbi_to_bits(const int16_t *iq_pairs, size_t n_pairs,
         return -1;
     }
     int sps = p->samp_rate / p->bit_rate;
-    if (sps <= 1 || n_pairs < (size_t) sps * 32u) return -1;
+    if (sps <= 1 || n_pairs < (size_t) sps * (size_t) 32) return -1;
 
     // 1. AGC on the complex baseband.
     double sum_sq = 0.0;

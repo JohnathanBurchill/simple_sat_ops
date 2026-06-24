@@ -22,6 +22,18 @@
 
 void biquad_bpf(biquad_t *bq, double f0, double bw_hz, double fs)
 {
+    // Degenerate inputs (non-positive bandwidth or sample rate, or NaN)
+    // would make Q = f0/bw_hz infinite or negative. The low-Q floor below
+    // only guards the wide-band end, so without this guard the coefficients
+    // collapse to a SILENT all-stop filter (b0 = b2 = 0) that kills the
+    // signal. Fall back to a unity passthrough instead, so a misconfigured
+    // band leaves the signal observable rather than dead.
+    if (!(bw_hz > 0.0) || !(fs > 0.0)) {
+        bq->b0 = 1.0; bq->b1 = 0.0; bq->b2 = 0.0;
+        bq->a1 = 0.0; bq->a2 = 0.0;
+        bq->z1 = bq->z2 = 0.0;
+        return;
+    }
     double w0    = 2.0 * M_PI * f0 / fs;
     double cw    = cos(w0);
     double sw    = sin(w0);

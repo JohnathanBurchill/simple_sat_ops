@@ -387,6 +387,37 @@ static void test_cascade_deepens_stopband(void)
             db1, db2, db1 - db2);
 }
 
+// ------------------------------------------------------------------
+// 12. Degenerate bandwidth falls back to a passthrough, not all-stop.
+// ------------------------------------------------------------------
+
+static void test_degenerate_bandwidth_passthrough(void)
+{
+    // bw_hz <= 0 makes Q = f0/bw infinite (bw=0) or negative (bw<0). The
+    // low-Q floor only catches the wide end, so the un-guarded coefficients
+    // collapse to b0=b2=0 — a silent all-stop that kills the signal. The
+    // guard must instead leave a unity passthrough (b0=1, the rest 0).
+    const double bws[] = { 0.0, -100.0 };
+    for (int i = 0; i < 2; ++i) {
+        biquad_t bq;
+        bq.z1 = 3.0; bq.z2 = -4.0;  // garbage the guard must also clear
+        biquad_bpf(&bq, 1200.0, bws[i], 48000.0);
+        tap_okf(bq.b0 == 1.0 && bq.b1 == 0.0 && bq.b2 == 0.0
+                && bq.a1 == 0.0 && bq.a2 == 0.0 && bq.z1 == 0.0 && bq.z2 == 0.0,
+                "bw=%.0f: passthrough coeffs (b0=%.3g b2=%.3g)",
+                bws[i], bq.b0, bq.b2);
+        // And it actually passes a sample through unchanged.
+        double y = biquad_step(&bq, 0.75);
+        tap_okf(fabs(y - 0.75) < 1e-12,
+                "bw=%.0f: step passes input through (got %.6g)", bws[i], y);
+    }
+    // A non-positive sample rate is guarded the same way.
+    biquad_t bq;
+    biquad_bpf(&bq, 1200.0, 600.0, 0.0);
+    tap_okf(bq.b0 == 1.0 && bq.b2 == 0.0,
+            "fs=0: passthrough coeffs (b0=%.3g)", bq.b0);
+}
+
 int main(void)
 {
     test_init_zeros_delay_line();
@@ -400,5 +431,6 @@ int main(void)
     test_stability_under_noise();
     test_q_floor();
     test_cascade_deepens_stopband();
+    test_degenerate_bandwidth_passthrough();
     return tap_done();
 }

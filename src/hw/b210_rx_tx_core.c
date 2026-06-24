@@ -412,6 +412,12 @@ void b210_rx_tx_core_set_fm_lo_compensation(b210_rx_tx_core_t *c,
     refresh_fm_lo_nco(c);
 }
 
+// Display-only meters. These read fields the pump thread writes without a
+// lock, so a caller can observe a torn double or a peak/rms pair from
+// adjacent pumps. That is intentional: the values drive a level meter, a
+// stale or half-updated reading is cosmetic, and locking here would stall
+// the pump for a UI poll. Do NOT reuse these for anything that needs a
+// coherent snapshot.
 int b210_rx_tx_core_iq_levels(const b210_rx_tx_core_t *c,
                            double *peak_env_out, double *rms_sq_out)
 {
@@ -421,6 +427,7 @@ int b210_rx_tx_core_iq_levels(const b210_rx_tx_core_t *c,
     return 0;
 }
 
+// Display-only, unsynchronised read — see b210_rx_tx_core_iq_levels above.
 int b210_rx_tx_core_burst_snapshot(const b210_rx_tx_core_t *c,
                                    int *out_bright_bins,
                                    double *out_peak_excess_db)

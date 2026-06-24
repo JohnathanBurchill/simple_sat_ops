@@ -156,10 +156,11 @@ static void process_frame(iq_burst_t *b)
     }
     fft_forward(b->re, b->im, N);
 
-    // Power in dB per bin. The constant 1e-6 floor avoids log(0)
-    // when a bin lands on numerical zero. Absolute calibration is
-    // not needed here — we only ever compare bin power to its own
-    // running floor.
+    // Power in dB per bin. `p` is a sum of squared int16-scale FFT bins,
+    // so any non-zero bin has p >= 1; the 1e-6 term is far below that and
+    // only does one thing — keep log10 finite when a bin is *exactly* zero.
+    // It is not a calibrated noise floor: absolute level is irrelevant here
+    // because we only ever compare a bin to its own running floor below.
     int bright = 0;
     float peak_excess = -INFINITY;
     for (unsigned k = 0; k < N; ++k) {

@@ -2,17 +2,16 @@
 
    Simple Satellite Operations  b210_rx_tx_core.h
 
-   USRP B210 RX core: UHD streamer + FM-discriminator demod, packaged
-   so a binary just pumps demoded PCM and asks for retunes when the
-   orbit math says the carrier moved.
+   Device-agnostic RX/TX core: pulls raw IQ from a pluggable SDR backend
+   (UHD B2xx or RTL-SDR), runs FIR decimation + software Doppler/carrier
+   NCOs + an FM-discriminator demod, and asks for retunes when the orbit
+   math says the carrier moved. The "b210" in the name is historical — the
+   core owns no device and talks only to the sdr_backend vtable.
 
-   Used by utils/b210_rx_tx.c. Designed so simple_sat_ops can pull
-   it in later without the live binary's CLI / decode-loop scaffolding
-   coming along for the ride.
-
-   FM demod is the same per-sample atan2 discriminator as
-   utils/b210_rx_capture.c — phase reference (prev_I, prev_Q) is held
-   inside the core across pump calls so chunk boundaries don't pop.
+   Pulled into simple_sat_ops via the rx_session / tx_burst modules. The
+   FM demod is a per-sample atan2 discriminator whose phase reference
+   (prev_I, prev_Q) is held inside the core across pump calls so chunk
+   boundaries don't pop.
 
    Copyright (C) 2026  Johnathan K Burchill
 

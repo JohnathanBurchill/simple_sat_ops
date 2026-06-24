@@ -43,6 +43,7 @@ void modem_params_defaults(modem_params_t *p)
     p->gauss_bt = 0.0;
     p->gauss_symbol_span = 4;
     p->rx_disable_dc_block = 0;
+    p->fsk_iq_lpf_hz = 0.0;  // 0 = built-in default / $FSK_IQ_LPF_HZ override
 }
 
 ssize_t modem_bytes_to_pcm16(const uint8_t *frame, size_t frame_len,
@@ -249,7 +250,7 @@ int modem_pcm16_to_bits(const int16_t *samples, size_t n_samples,
         return -1;
     }
     int sps = p->samp_rate / p->bit_rate;
-    if (sps <= 1 || n_samples < (size_t)sps * 32u) {
+    if (sps <= 1 || n_samples < (size_t)sps * (size_t)32) {
         return -1;
     }
 

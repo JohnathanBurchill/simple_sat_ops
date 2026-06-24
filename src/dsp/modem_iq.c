@@ -40,7 +40,7 @@ int modem_iq_to_bits(const int16_t *iq_pairs, size_t n_pairs,
         return -1;
     }
     int sps = p->samp_rate / p->bit_rate;
-    if (sps <= 1 || n_pairs < (size_t) sps * 32u) return -1;
+    if (sps <= 1 || n_pairs < (size_t) sps * (size_t) 32) return -1;
 
     // 1. Complex DC-block. 1-pole IIR HPF (α=0.995, ~76 Hz at 96 kHz)
     //    on I and Q separately. Removes the SDR's static DC bias which
@@ -121,15 +121,7 @@ int modem_iq_to_bits(const int16_t *iq_pairs, size_t n_pairs,
 #undef IQ_I
 #undef IQ_Q
 
-    // 3. Differential phase: y[k] = arg(z[k] * conj(z[k-1])). The first
-    //    output is at index 1; index 0 is undefined (no prev). Use atan2
-    //    so the result lies in [-π, π].
-    //
-    //    For ideal continuous-phase FSK at modulation index h, the
-    //    per-sample phase advance is ±πh/sps and integrates to ±πh per
-    //    symbol. At h=0.5 (MSK) a perfectly-strobed symbol differential
-    //    is ±π/2 — well separated from 0.
-    // 3. Symbol-rate differential phase at every sample position:
+    // 4. Symbol-rate differential phase at every sample position:
     //    dphi[i] = arg(z_mf[i+sps] · conj(z_mf[i]))
     //
     //    For MSK h=0.5 this is ±π/2 inside a symbol, with a smooth

@@ -49,6 +49,11 @@ typedef struct modem_params {
     // discriminator output), set this to 1 to slice the raw samples
     // directly. Default 0 (DC-block enabled).
     int rx_disable_dc_block;
+    // IQ-chain (modem_fsk) low-pass cutoff in Hz. 0 = use the built-in
+    // default (12 kHz, or the $FSK_IQ_LPF_HZ override for offline sweeps).
+    // Surfaced here so the cutoff is a visible parameter rather than a knob
+    // buried in a DSP leaf. Unused by the PCM/Viterbi chains.
+    double fsk_iq_lpf_hz;
 } modem_params_t;
 
 // Initializes p to the FrontierSat defaults (9600 bps at 48 kHz,

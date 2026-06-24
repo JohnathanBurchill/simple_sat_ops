@@ -46,6 +46,13 @@ void sw_nco_apply(sw_nco_t *nco, int16_t *iq_inout, size_t n_pairs)
 
     const double dphi = -2.0 * M_PI * f / nco->sample_rate_hz;
     double phase = nco->phase_rad;
+    // Deliberately a fresh cos/sin per sample rather than a multiplicative
+    // phasor recurrence (c *= e^{j·dphi}). A recurrence is cheaper but drifts
+    // in magnitude and would need renormalisation at points that depend on
+    // the chunk size — which would break the byte-for-byte equality between a
+    // single apply() and the same data split into chunks that the live decode
+    // and sw_nco_selftest both rely on. Evaluating per sample makes each
+    // output a pure function of its absolute phase, independent of chunking.
     for (size_t i = 0; i < n_pairs; ++i) {
         double cp = cos(phase);
         double sp = sin(phase);

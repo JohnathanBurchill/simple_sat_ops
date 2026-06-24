@@ -64,23 +64,28 @@ static void fsk_build_iq_lpf(double fc_hz, double fs, float out[FSK_IQ_LPF_LEN])
     }
 }
 
-// Read the LPF cutoff from $FSK_IQ_LPF_HZ if set, otherwise the
-// default 12 kHz that empirically gave the cleanest decodes on the
-// 2026-05-15 RAO capture (low-Doppler bursts at TCA). Cached after
-// first lookup.
-static double fsk_iq_lpf_cutoff_hz(void)
+// Resolve the IQ-chain LPF cutoff in Hz. Precedence:
+//   1. param_hz, when a caller set modem_params_t.fsk_iq_lpf_hz > 0;
+//   2. the $FSK_IQ_LPF_HZ environment override (offline sweeps), cached;
+//   3. the default 12 kHz that empirically gave the cleanest decodes on the
+//      2026-05-15 RAO capture (low-Doppler bursts at TCA).
+// An out-of-range param or env value falls back to the 12 kHz default.
+static double fsk_iq_lpf_cutoff_hz(double param_hz)
 {
-    static double cached = -1.0;
-    if (cached < 0.0) {
+    if (param_hz > 0.0)
+        return (param_hz >= 1000.0 && param_hz <= 22000.0) ? param_hz : 12000.0;
+
+    static double env_cached = -1.0;
+    if (env_cached < 0.0) {
         const char *env = getenv("FSK_IQ_LPF_HZ");
         if (env != NULL && *env != '\0') {
-            cached = atof(env);
-            if (cached < 1000.0 || cached > 22000.0) cached = 12000.0;
+            env_cached = atof(env);
+            if (env_cached < 1000.0 || env_cached > 22000.0) env_cached = 12000.0;
         } else {
-            cached = 12000.0;
+            env_cached = 12000.0;
         }
     }
-    return cached;
+    return env_cached;
 }
 
 
@@ -95,13 +100,13 @@ static double fsk_iq_lpf_cutoff_hz(void)
 // Stage 1: IQ low-pass filter (Hamming-windowed sinc, valid-only
 // convolution). Outputs n_pairs - FSK_IQ_LPF_LEN + 1 samples.
 static size_t fsk_stage_lpf(const int16_t *iq_pairs, size_t n_pairs,
-                            int samp_rate,
+                            int samp_rate, double lpf_cutoff_hz,
                             float *out_i_lpf, float *out_q_lpf)
 {
     if (n_pairs < (size_t) FSK_IQ_LPF_LEN + 2u) return 0;
 
     float kernel[FSK_IQ_LPF_LEN];
-    fsk_build_iq_lpf(fsk_iq_lpf_cutoff_hz(), (double) samp_rate, kernel);
+    fsk_build_iq_lpf(lpf_cutoff_hz, (double) samp_rate, kernel);
 
     size_t lpf_n = n_pairs - (size_t) FSK_IQ_LPF_LEN + 1u;
     for (size_t i = 0; i < lpf_n; ++i) {
@@ -334,7 +339,7 @@ int modem_fsk_iq_to_bits_diag(const int16_t *iq_pairs, size_t n_pairs,
         return -1;
     }
     int sps = p->samp_rate / p->bit_rate;
-    if (sps <= 1 || n_pairs < (size_t) sps * 32u) return -1;
+    if (sps <= 1 || n_pairs < (size_t) sps * (size_t) 32) return -1;
     if (n_pairs < (size_t) FSK_IQ_LPF_LEN + 2u) return -1;
 
     if (diag != NULL) {
@@ -356,6 +361,7 @@ int modem_fsk_iq_to_bits_diag(const int16_t *iq_pairs, size_t n_pairs,
         return -1;
     }
     size_t lpf_n = fsk_stage_lpf(iq_pairs, n_pairs, p->samp_rate,
+                                 fsk_iq_lpf_cutoff_hz(p->fsk_iq_lpf_hz),
                                  I_lpf, Q_lpf);
     if (diag != NULL) {
         diag->n_pairs_lpf = lpf_n;
