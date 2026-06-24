@@ -172,7 +172,7 @@ confirmed memory-safety overrun in the live RX byte-parsing core.
 
 ## §C — Cross-cutting (each = one refactor commit, fixes a class)
 
-- [ ] **X1 — Duplication.** Same logic copy-pasted across files; consolidate each:
+- [ ] **X1 — Duplication.** (Remaining sub-items tracked in #23.) Same logic copy-pasted across files; consolidate each:
   - [~] ASM-finder + M&M timing + boxcar matched filter copied ×4/×3 across
     `modem.c`/`modem_iq.c`/`modem_viterbi.c`/`modem_fsk.c`. ASM finder DONE →
     shared `src/dsp/asm_search` (e01debd, byte-identical, also folds the 4×
@@ -214,7 +214,7 @@ confirmed memory-safety overrun in the live RX byte-parsing core.
   after each write at: `panels.c:583-597`, `packet_browser.c:454-490`,
   `tcmd_browser.c:234`, `gnss_reports.c:389`. (Verified not currently reachable,
   but fix the pattern.)
-- [ ] **X4 — `state_t` god-object** `state.h:283-480`: no single init, defaults
+- [ ] **X4 — `state_t` god-object** (tracked in #24) `state.h:283-480`: no single init, defaults
   split `main.c:139` / `cli_args.c:378-420` (see S21). Group into per-subsystem
   sub-structs with their own init/teardown (rotator/scan already are; tx/modal/
   ipc are not).
@@ -228,7 +228,7 @@ confirmed memory-safety overrun in the live RX byte-parsing core.
 
 ## §D — Long tail (LOW / NIT)
 
-### DSP
+### DSP — #25
 - [ ] `modem*.c` — `(size_t)sps * 32u` computed in 32-bit before widening; use
   `(size_t)sps * (size_t)32`.
 - [ ] `b210_rx_tx_core.c:308-333,424-432` — display snapshots read unsynchronized
@@ -246,7 +246,7 @@ confirmed memory-safety overrun in the live RX byte-parsing core.
 - [ ] `b210_rx_tx_core.h` banner still says "USRP B210 RX core" vs device-agnostic
   `.c`; reconcile. `ASM_BIG_ENDIAN_U32` magic `#define`d in 4 files → shared header.
 
-### SDR / hardware
+### SDR / hardware — #26
 - [ ] `antenna_rotator_async.c:72-104` — `cond_timedwait` on CLOCK_REALTIME (wall
   jumps); note the dependency (CLOCK_MONOTONIC attr unavailable on macOS).
 - [ ] `sdr_usb_detect.c:40-56` / `sdr_uhd.c:99,158-159` — first-B2xx serial scan
@@ -259,7 +259,7 @@ confirmed memory-safety overrun in the live RX byte-parsing core.
 - [ ] `rotator_calibrate.c:233` — park-leg 0-samples mislabeled `PARK_TIMEOUT`
   (cosmetic).
 
-### Protocol
+### Protocol — #27
 - [ ] `ax100.c:178` — `memcpy(inner, NULL, 0)` when `packet_len==0` (UB); guard.
 - [ ] `ax100.c:206,279` — 255-byte scrambler `i % 255` only valid because peer
   matches; add a comment (diverges from a true 256-period randomizer if
@@ -273,7 +273,7 @@ confirmed memory-safety overrun in the live RX byte-parsing core.
   permission-mode matrix + parser) and a `uplink_test --fix-permissions` repair
   action (`setfacl -b` + chmod) via new `hmac_keyfile_fix_permissions`.
 
-### Pipeline
+### Pipeline — #28
 - [ ] `rx_session.c:719,1385` — `long` sample counts wrap on a long pass; WAV
   `data_sz` (uint32) caps ~6.2 h @ 96 kHz. Widen to int64; document the WAV limit.
 - [ ] `rx_session.c:259,1126` — `frames_in_window` written, never read (dead).
@@ -281,7 +281,7 @@ confirmed memory-safety overrun in the live RX byte-parsing core.
   `static double phi`; thread it through a caller-owned var.
 - [ ] `decode_loop.c:62-79` — NaN sentinels via `0.0/0.0`; use `NAN`.
 
-### IPC
+### IPC — #29
 - [ ] `sso_ipc_codec.c:256` — `\u` unescape `i+4 < srclen` should be `<=`
   (under-consumes one at buffer end; cosmetic).
 - [ ] `sso_ipc_server.c:191-194` — `accept()` collapses all non-EAGAIN errors into
@@ -294,7 +294,7 @@ confirmed memory-safety overrun in the live RX byte-parsing core.
 - [ ] `sso_audit.c`/`sso_paths.c`/`sso_ipc_paths.c` — missing GPL header + `/* */`
   vs `//` style.
 
-### UI
+### UI — #30
 - [ ] `tx_compose.c:143-150` — history/recall can momentarily exceed 215 in the
   field (validate catches at commit); re-clamp on populate.
 - [ ] `cmd_line.c:434` — `(v < 1e6) ? v*1e6 : v` MHz/Hz heuristic is brittle
@@ -303,7 +303,7 @@ confirmed memory-safety overrun in the live RX byte-parsing core.
 - [ ] `auto_tcmd.h:50-51` stale `auto_field_is_text` doc; `auto_tcmd.c:616-621`
   identical if/else bodies → collapse.
 
-### Orbit
+### Orbit — #31
 - [ ] `prediction.c:651` — `find_passes` appends to the module-static list without
   clearing; document the precondition or `free_passes()` on entry. `:300-302`
   `minutes_until_visible` returns negative for already-visible (name vs sign).
@@ -319,7 +319,7 @@ confirmed memory-safety overrun in the live RX byte-parsing core.
 - [ ] Document in `prediction.h`: "load_tle leaves raw units; caller must
   `select_ephemeris` exactly once" (non-idempotent).
 
-### Control / apps
+### Control / apps — #32
 - [ ] `cli_args.c:1170`/`next_in_queue.c` — `strdup(p->name)` never freed (lifetime
   leak; ownership of `satellite_ephem.name` is inconsistent).
 - [ ] `main.c:341-345` — comment/CLAUDE.md say redraw "10 Hz" but it's 2 Hz.
@@ -333,7 +333,7 @@ confirmed memory-safety overrun in the live RX byte-parsing core.
 - [ ] Path-buffer sizes hand-tuned across apps (`[1024]`/`[256]`/`[512]`/`[1100]`) →
   shared `#define` (truncation checks are present/correct).
 
-### DB / build
+### DB / build — #33
 - [ ] `packet_db.c:690-704` — `register_tle` returns 0 for both real error and
   post-timeout `SQLITE_BUSY`; distinguish. `:633-643` `parse_tle_line1` trusts
   fixed offsets after a weak gate (no overflow; data-quality only).
@@ -343,7 +343,7 @@ confirmed memory-safety overrun in the live RX byte-parsing core.
   `-Wformat-truncation` without `=N` is a clang no-op. `gen_tcmd_spec.py:106,111`
   — `open()` without `with`/encoding.
 
-### Utils (decode/waterfall, packet/offline)
+### Utils (decode/waterfall, packet/offline) — #34
 - [ ] `gen_waterfall.c:751-1109` — ~360-line dead `#if 0 build_waterfall_legacy`
   block (has `const`-cast-away UB if revived); delete.
 - [ ] `b210_rx_capture.c:838` — `peak_pct` round constant off by one (diagnostic).
