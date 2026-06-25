@@ -1705,6 +1705,29 @@ deliberate reflash, an end-of-life passivation, a recovery move that
 looks destructive because it is - which is exactly why the gate is a
 gate and not a wall. (We are, of course, mostly joking. Mostly.)
 
+**Testing it - on the ground, never on the satellite.** The whole gate
+is a static text check, so it is exercised entirely on the dev host with
+temp files standing in for an agenda - no radio, no spacecraft. CI does
+this on every push: `unit_tests/tcmd_lint_selftest.c` writes throwaway
+agendas (a clean one, one that arms `default_tcmd_agenda.txt`, one with a
+parse error, one with both) through the *real* linter and the *real*
+gate decision (`tcmd_lint_gate_decision`, the same function
+`simple_sat_ops` startup and the `A` modal call), and asserts every
+override combination - including the one that matters most: passing
+`--ignore-at-your-peril-all-tc-errors` alone does **not** let a brick
+command through. The override only opens its own gate.
+
+You can also rehearse the real binary end to end, safely, **when the
+satellite is well outside any pass window**. Point `simple_sat_ops` at a
+test `--tc-file` and launch: a `danger:` line refuses startup before the
+UI even opens, and adding `--ignore-at-your-peril-dangerous-tcmds` lets
+it proceed into the run so you can watch the auto-telecommand flow. With
+no spacecraft in view, the LOS guard and the [TX safety
+gates](#tx-safety-gates) mean nothing is keyed regardless - so it is a
+free dress rehearsal of the exact path you would fly, with zero risk to
+the bird. (Do it during a pass and you would be transmitting for real;
+don't.)
+
 To regenerate the command table after a firmware change, see the header
 of `scripts/gen_tcmd_spec.py`; to add an entry to the brick-risk
 blacklist, see `tcmd_dangerous_substrings[]` in `src/proto/tcmd_lint.c`.

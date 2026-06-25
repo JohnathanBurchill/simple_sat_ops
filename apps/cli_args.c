@@ -363,11 +363,14 @@ int cli_tcmd_lint_gate(const tx_t *tx)
     int tc_errs = tcmd_lint_file(tx->auto_tcmd_file_path, stderr,
                                  &tc_warns, &tc_dangers);
 
-    // Brick-risk blacklist first: these are well-formed commands the
-    // satellite would run, so they outrank a parse error. They need their
-    // own override -- accepting parse errors must not also wave a brick
-    // command through.
-    if (tc_dangers > 0 && !tx->ignore_dangerous_tcmds) {
+    // The block/proceed policy lives in one shared, unit-tested function so
+    // this gate, the auto-tcmd modal, and CI can never drift apart. Brick risk
+    // outranks a parse error and has its own override, so accepting parse
+    // errors never also waves a brick command through.
+    tcmd_gate_decision_t decision =
+        tcmd_lint_gate_decision(tc_errs, tc_dangers,
+                                tx->ignore_tc_errors, tx->ignore_dangerous_tcmds);
+    if (decision == TCMD_GATE_BLOCK_DANGER) {
         fprintf(stderr,
             "simple_sat_ops: %d dangerous telecommand%s detected in %s (see the\n"
             "'danger:' line%s above). These are valid commands that can brick the\n"
@@ -377,7 +380,7 @@ int cli_tcmd_lint_gate(const tx_t *tx)
             tc_dangers == 1 ? "" : "s");
         return EXIT_FAILURE;
     }
-    if (tc_errs > 0 && !tx->ignore_tc_errors) {
+    if (decision == TCMD_GATE_BLOCK_ERROR) {
         fprintf(stderr,
             "simple_sat_ops: %d error%s detected in the --tc-file content (%s).\n"
             "Refusing to start. Fix the agenda, or re-run with\n"

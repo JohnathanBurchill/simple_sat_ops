@@ -78,6 +78,17 @@ static void expect_danger(const char *cmd, const char *needle)
             cmd, needle, (int) got, msg);
 }
 
+// Assert the gate decision for a set of counts + override flags.
+static void expect_gate(int errors, int dangers, int allow_err, int allow_dng,
+                        tcmd_gate_decision_t want)
+{
+    tcmd_gate_decision_t got =
+        tcmd_lint_gate_decision(errors, dangers, allow_err, allow_dng);
+    tap_okf(got == want,
+            "gate(err=%d danger=%d allow_err=%d allow_danger=%d) = %d want %d",
+            errors, dangers, allow_err, allow_dng, (int) got, (int) want);
+}
+
 static void test_valid_commands(void)
 {
     fprintf(stderr, "tcmd_lint: valid commands pass\n");
@@ -329,6 +340,68 @@ static void test_dangerous_blacklist(void)
             errors, dangers);
 }
 
+static void test_gate_decision(void)
+{
+    fprintf(stderr, "tcmd_lint: startup/auto-run gate policy (overrides + separation)\n");
+
+    // Clean agenda proceeds whatever the flags.
+    expect_gate(0, 0, 0, 0, TCMD_GATE_PROCEED);
+    expect_gate(0, 0, 1, 1, TCMD_GATE_PROCEED);
+
+    // A parse error blocks until the parse-error override -- and the DANGER
+    // override is the wrong key for it.
+    expect_gate(1, 0, 0, 0, TCMD_GATE_BLOCK_ERROR);
+    expect_gate(1, 0, 0, 1, TCMD_GATE_BLOCK_ERROR);
+    expect_gate(1, 0, 1, 0, TCMD_GATE_PROCEED);
+
+    // A brick risk blocks until the DANGER override -- and the parse-error
+    // override is the wrong key for it. This separation is the whole point:
+    // accepting a typo must never also accept a boot-loop.
+    expect_gate(0, 1, 0, 0, TCMD_GATE_BLOCK_DANGER);
+    expect_gate(0, 1, 1, 0, TCMD_GATE_BLOCK_DANGER);
+    expect_gate(0, 1, 0, 1, TCMD_GATE_PROCEED);
+
+    // Both present: danger is reported first; clearing one still blocks on the
+    // other; only clearing both proceeds.
+    expect_gate(1, 1, 0, 0, TCMD_GATE_BLOCK_DANGER);
+    expect_gate(1, 1, 1, 0, TCMD_GATE_BLOCK_DANGER);
+    expect_gate(1, 1, 0, 1, TCMD_GATE_BLOCK_ERROR);
+    expect_gate(1, 1, 1, 1, TCMD_GATE_PROCEED);
+
+    // End-to-end on the ground: a real temp agenda -> the real linter -> the
+    // gate, exactly the path simple_sat_ops runs at startup, but with a temp
+    // file standing in for the operator's --tc-file. No radio, no satellite,
+    // no pass. This is the mock the gate is meant to be exercised through.
+    char path[] = "/tmp/sso_tcmd_gate_selftest_XXXXXX";
+    int fd = mkstemp(path);
+    tap_ok(fd >= 0, "mkstemp gate agenda");
+    if (fd < 0) return;
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(path); tap_ok(0, "fdopen gate agenda"); return; }
+    fputs("CTS1+hello_world()!\n", f);                                // clean
+    fputs("CTS1+fs_write_file_str(default_tcmd_agenda.txt,x)!\n", f); // danger
+    fputs("CTS1+hello_world(1)!\n", f);                               // parse error
+    fclose(f);
+
+    int warns = -1, dangers = -1;
+    FILE *out = fopen("/dev/null", "w");
+    int errors = tcmd_lint_file(path, out ? out : stderr, &warns, &dangers);
+    if (out) fclose(out);
+    unlink(path);
+    tap_okf(errors == 1 && dangers == 1,
+            "file lints to 1 error + 1 danger (got err=%d danger=%d)", errors, dangers);
+
+    // Default start is refused by the brick risk.
+    expect_gate(errors, dangers, 0, 0, TCMD_GATE_BLOCK_DANGER);
+    // The headline safety property: the parse-error override ALONE does not let
+    // the brick command through.
+    expect_gate(errors, dangers, 1, 0, TCMD_GATE_BLOCK_DANGER);
+    // Overriding only the danger reveals the still-blocking parse error.
+    expect_gate(errors, dangers, 0, 1, TCMD_GATE_BLOCK_ERROR);
+    // Both overrides: the operator has explicitly accepted both -> proceed.
+    expect_gate(errors, dangers, 1, 1, TCMD_GATE_PROCEED);
+}
+
 static void test_spec_table(void)
 {
     fprintf(stderr, "tcmd_spec: generated table sanity\n");
@@ -356,6 +429,7 @@ int main(void)
     test_arg_types();
     test_arg_types_consistent();
     test_dangerous_blacklist();
+    test_gate_decision();
     test_file_level();
     test_spec_table();
     return tap_done();

@@ -389,6 +389,17 @@ tcmd_lint_severity_t tcmd_lint_command(const char *cmd, char *msg, size_t msg_ca
     return worst;
 }
 
+tcmd_gate_decision_t tcmd_lint_gate_decision(int errors, int dangers,
+                                             int allow_errors, int allow_dangers)
+{
+    // Order matters: a brick risk outranks a parse error, and the two
+    // overrides are independent. So a file with a dangerous command and ONLY
+    // the parse-error override still blocks here.
+    if (dangers > 0 && !allow_dangers) return TCMD_GATE_BLOCK_DANGER;
+    if (errors  > 0 && !allow_errors)  return TCMD_GATE_BLOCK_ERROR;
+    return TCMD_GATE_PROCEED;
+}
+
 int tcmd_lint_file(const char *path, FILE *out, int *warn_count, int *danger_count)
 {
     FILE *f = fopen(path, "r");

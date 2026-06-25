@@ -63,6 +63,24 @@ typedef enum {
 // without it the ceiling would be 219.
 #define TCMD_RF_MAX_LEN 215
 
+// The startup / auto-run gate decision, factored out as a pure function so the
+// real gate (cli_tcmd_lint_gate), the auto-telecommand modal, and the unit
+// tests all share one policy. Given the lint counts for an agenda and the
+// operator's two override flags, it says whether to start and, if not, why.
+typedef enum {
+    TCMD_GATE_PROCEED      = 0,  // safe to start
+    TCMD_GATE_BLOCK_DANGER = 1,  // a brick-risk command, not overridden
+    TCMD_GATE_BLOCK_ERROR  = 2,  // a parse error, not overridden
+} tcmd_gate_decision_t;
+
+// Decide whether an agenda with `errors` parse errors and `dangers` brick-risk
+// findings may start. Brick risk is checked first and has its OWN override
+// (allow_dangers), kept separate from the parse-error override (allow_errors)
+// so that accepting a typo never also accepts a boot-loop. Pure: no I/O, no
+// globals -- trivially testable without a satellite or any hardware.
+tcmd_gate_decision_t tcmd_lint_gate_decision(int errors, int dangers,
+                                             int allow_errors, int allow_dangers);
+
 // Lint one telecommand string -- a single "CTS1+name(args)...!" line with any
 // inline '# comment' already removed and surrounding whitespace trimmed.
 // Every problem found is appended (semicolon-separated) to `msg` (pass NULL/0

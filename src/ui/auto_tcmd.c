@@ -665,20 +665,22 @@ static int auto_tcmd_start(state_t *state) {
                  "rejected: file has no commands");
         return -1;
     }
-    // A file edited after launch can introduce a brick-risk command (one
-    // that arms the boot-time agenda). Re-lint on (re)load flagged it; refuse
-    // to run unless the operator started with
-    // --ignore-at-your-peril-dangerous-tcmds.
-    if (a->lint_dangers > 0 && !state->tx.ignore_dangerous_tcmds) {
+    // A file edited after launch can introduce a brick-risk command (one that
+    // arms the boot-time agenda) or one the satellite would reject. Re-lint on
+    // (re)load flagged them; the same shared, unit-tested policy the startup
+    // gate uses decides whether to run, so the two can't disagree -- and the
+    // brick-risk override is separate from the parse-error one.
+    tcmd_gate_decision_t decision =
+        tcmd_lint_gate_decision(a->lint_errors, a->lint_dangers,
+                                state->tx.ignore_tc_errors,
+                                state->tx.ignore_dangerous_tcmds);
+    if (decision == TCMD_GATE_BLOCK_DANGER) {
         snprintf(a->status_msg, sizeof a->status_msg,
                  "rejected: %d command(s) can brick the satellite -- fix it and reopen",
                  a->lint_dangers);
         return -1;
     }
-    // A file edited after launch can introduce commands the satellite would
-    // reject or mis-parse. Re-lint on (re)load flagged them; refuse to run
-    // unless the operator started with --ignore-at-your-peril-all-tc-errors.
-    if (a->lint_errors > 0 && !state->tx.ignore_tc_errors) {
+    if (decision == TCMD_GATE_BLOCK_ERROR) {
         snprintf(a->status_msg, sizeof a->status_msg,
                  "rejected: %d lint error(s) in the file -- fix it and reopen",
                  a->lint_errors);
