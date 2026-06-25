@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`0aced5c` (2026-06-25). This is a working draft.
+`280335a` (2026-06-25). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -28,15 +28,29 @@ kilograms of aluminum at a fast-moving point in the sky, coaxing a
 coherent frame out of a hiss of thermal noise, and the small thrill of
 sending a command that the spacecraft actually answers.
 
-The most important thing to understand is that none of this is hard.
-A pass lasts a few minutes. The hardware is forgiving. The software
-refuses, by default, to do anything that could hurt the radio, the
-rotator, or the link: the transmitter starts inhibited, the rotator
+The most important thing to understand is that *running a pass* is not
+hard. A pass lasts a few minutes. The hardware is forgiving. The
+software refuses, by default, to do anything that could hurt the radio,
+the rotator, or the link: the transmitter starts inhibited, the rotator
 moves only when you tell it to, and only one operator can touch the
 hardware at a time. A beginner sitting in viewer mode cannot break
-anything, no matter which keys they lean on. The skill is almost all
-understanding and only a little practice, and this manual is mostly
-about the understanding.
+anything, no matter which keys they lean on, and an operator flying a
+*vetted* telecommand file - one a qualified person has already reviewed -
+will have to try hard to do any harm. That is exactly the job
+`simple_sat_ops` is built for, and the skill it asks for is almost all
+understanding and only a little practice.
+
+There is one real exception, and it belongs up front: the software
+protects the *ground station*, not the *spacecraft*. It cannot tell a
+sensible command sequence from a structurally valid but operationally
+disastrous one. *Composing* a telecommand file - choosing which commands
+go out, in what order, with which arguments - is an
+intermediate-to-advanced activity, and a poorly chosen sequence can
+brick the satellite for good. So the rule that keeps newcomers safe is a
+simple one: fly files that other people wrote and vetted, and learn to
+write your own only once you understand the whole chain. The manual is
+honest about how a brick happens where it belongs (see [Populating a
+`--tc-file`](#populating-a---tc-file-for-auto-commanding)).
 
 Every part of the ground station lies to you in its own small,
 well-understood way, and the job is mostly knowing how. The SPID rotator will
@@ -1274,11 +1288,86 @@ list above remains the source of truth for what each command does.
 
 #### Populating a `--tc-file` for auto-commanding
 
-*(To be written.)* This subsection will cover turning the documented
-commands into a `--tc-file` for the `A` auto-telecommand modal: the
-per-line `CTS1+...@tssent=...@tsexec=...!` format, how to set the
-execution times, and how to lint and dry-run the list with
-[`agenda_check`](#agenda-review-agenda_check) before a pass.
+This is the authoring side of telecommanding, and it is a different
+skill from operating. Operating a pass means flying a file someone has
+already vetted; *writing* that file means deciding what the spacecraft
+will be told to do, and the ground software does not - cannot - check
+your intent. Treat it as an intermediate-to-advanced activity: do it
+alongside someone who knows the spacecraft until you know it too.
+
+**The line format.** One telecommand per line, the same string the `t`
+compose modal would send, with optional `@`-prefixed metadata before the
+closing `!`:
+
+```
+CTS1+function_name(arg1,arg2)@tssent=<unix_ms>@tsexec=<unix_ms>@resp_fname=<file>!
+```
+
+| Field | Meaning |
+|-------|---------|
+| `function_name(...)` | The command and its arguments, exactly as the firmware command list documents them - name (case-sensitive), argument order, and types. See [Finding telecommands and their arguments](#finding-telecommands-and-their-arguments). |
+| `@tsexec=<unix_ms>` | When the satellite should *execute* the command (on-board clock). The `A` loop holds each command until this time arrives, so this is how you schedule a sequence across a pass. Omit it to run on receipt. |
+| `@tssent=<unix_ms>` | The send-time / dedup key. The firmware can drop a command whose `@tssent` it has already seen, so a stable value makes a command run once even if the burst is retransmitted (see the [`SSO+`](#simple_sat_ops-directed-commands-sso) clock-sync note). |
+| `@resp_fname=<file>` | Optional name for the on-board response file the command writes, when it produces one. |
+
+Blank lines and comments are stripped per the rules in the [`A` modal
+section](#auto-telecommand-modal-a).
+
+**Schedule, then check.** Set `@tsexec=` values that fall inside the
+pass window (use [`next_in_queue`](#pass-scheduling-next_in_queue) for
+the AOS/LOS times), leave room between commands for each burst and its
+reply, then run the file through
+[`agenda_check`](#agenda-review-agenda_check) *before* the pass. It
+converts every `@tssent`/`@tsexec` to readable time so you can eyeball
+the order, flags duplicate lines, and lints every command against the
+firmware command set; with `--tle` it even prepends the sub-satellite
+point at each execution time. Fix every `ERROR>` and read every
+`warning:` before you fly the file. `simple_sat_ops` runs the same lint
+at startup and refuses to start on an error.
+
+> **Safety - it is possible to brick the satellite.** The linter checks
+> *structure*, not *intent*. A command can be perfectly well-formed -
+> right name, right arguments, passes the lint, starts the UI without a
+> murmur - and still be the wrong thing to send. To help you tell them
+> apart, every command carries a *readiness level* taken from the
+> firmware, and the linter prints a `warning:` for anything that is not
+> routine flight operation:
+>
+> | Readiness | Meaning |
+> |-----------|---------|
+> | `operation` | Normal flight operation. The only level meant for routine use. |
+> | `recovery/expert` | Flight-safe but expert-only. |
+> | `flight-testing` | Flight-safe but disruptive (e.g. a flash test). |
+> | `ground-only` | Umbilical / ground use only - not for a flying spacecraft. |
+> | `high-risk/unsafe` | High risk; can do permanent harm. |
+>
+> Here is how a *valid* file bricks the spacecraft. Suppose a file,
+> meaning to test booting from the satellite's second firmware bank,
+> schedules:
+>
+> ```
+> CTS1+stm32_internal_flash_set_active_flash_bank(2)@tsexec=...!
+> CTS1+eps_system_reset()@tsexec=...!
+> ```
+>
+> Both lines lint clean - the names and argument counts are right - so
+> all the ground tells you is two `warning:` lines (`high-risk/unsafe`
+> and `recovery/expert`), and nothing refuses to run. But if bank 2 was
+> never programmed with a valid image, the reset hands control to an
+> empty bank: the processor boots nothing, the command receiver never
+> comes up, and no telecommand can fix it because nothing on the
+> spacecraft is left listening for one. The satellite is bricked. The
+> same shape of mistake hides behind the other flash and filesystem
+> commands - `stm32_internal_flash_bank_erase`,
+> `flash_force_corrupt_filesystem`, `fs_format_storage` - and behind any
+> destructive command scheduled ahead of the one that would have undone
+> it.
+>
+> The protections are real but bounded: the lint warnings, the readiness
+> levels, the `agenda_check` dry run, and a second qualified reader. The
+> rule is the dull one - never fly a file you do not fully understand,
+> and have someone who knows the spacecraft vet anything that carries a
+> warning.
 
 ### Rotator calibration (`--calibrate-rotator`)
 
