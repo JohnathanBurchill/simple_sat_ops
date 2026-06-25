@@ -606,38 +606,15 @@ int main(int argc, char **argv)
         uint8_t *bytes = (uint8_t *)malloc(max_bytes);
         if (bytes == NULL) break;
         size_t n_bytes = modem_bits_to_bytes(bits, n_bits, bytes);
-        packet_len = ax100_unframe(bytes, n_bytes, &opts,
-                                   packet, sizeof(packet),
-                                   &golay_errs, &hmac_ok,
-                                   &rs_errs, &used_golay_len,
-                                   rs_locs);
-        // Partial-RS rescue: when RS is on and the Golay length header
-        // decoded cleanly, retry with RS disabled to recover the
-        // descrambled (uncorrected) bytes. Lets the operator see
-        // corrupted-but-recognizable beacons when bit errors exceed RS's
-        // 16-byte budget. Mirrors decode_loop's allow_partial_rs.
-        if (packet_len < 0 && allow_partial_rs && use_rs
-            && golay_errs == 0) {
-            ax100_opts_t partial = opts;
-            partial.reed_solomon = 0;
-            int p_golay = 0, p_hmac = -1, p_rs = -1, p_lensrc = -1;
-            ssize_t pp = ax100_unframe(bytes, n_bytes, &partial,
-                                       packet, sizeof(packet),
-                                       &p_golay, &p_hmac,
-                                       &p_rs, &p_lensrc,
-                                       NULL);
-            // pp is the descrambled byte count INCLUDING the original
-            // 32-byte RS parity tail (RS isn't running to strip it).
-            // Strip those 32 bytes here so the apparent packet length
-            // matches what RS-on would have produced.
-            if (pp > 32) {
-                packet_len = pp - 32;
-                golay_errs = p_golay;
-                hmac_ok = -1;
-                rs_errs = -2;  // UNCORRECTABLE marker
-                used_golay_len = p_lensrc;
-            }
-        }
+        // Unframe + partial-RS rescue, shared with decode_loop's
+        // try_decode_window* variants (opts.reed_solomon == use_rs here, so
+        // allow_partial_rs gates the rescue exactly as before).
+        packet_len = ax100_unframe_with_rescue(bytes, n_bytes, &opts,
+                                               allow_partial_rs,
+                                               packet, sizeof(packet),
+                                               &golay_errs, &hmac_ok,
+                                               &rs_errs, &used_golay_len,
+                                               rs_locs);
         free(bytes);
         if (packet_len < 0) {
             // Unframing failed outright (golay uncorrectable or length

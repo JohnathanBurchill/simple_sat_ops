@@ -36,6 +36,25 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+// Unframe one descrambled candidate (n_bytes of demod output, already
+// converted from bits) into `packet`, applying the partial-RS rescue. The
+// primary ax100_unframe runs first; if it fails but the Golay length header
+// decoded cleanly and allow_partial_rs is set (and RS was on, and not HMAC
+// mode), it retries with RS disabled, strips the 32-byte RS parity tail, and
+// returns the descrambled-but-uncorrected bytes marked rs_errs == -2 so the
+// operator still sees a corrupted-but-readable frame. Returns the packet
+// length (>= 0) or -1 if nothing usable came out. The golay/hmac/rs/golay-len
+// out-params and rs_locs follow ax100_unframe's contract (see below). This is
+// the one place the rescue rule lives; every try_decode_window* variant and
+// rx_decode's offline loop call it.
+ssize_t ax100_unframe_with_rescue(const uint8_t *bytes, size_t n_bytes,
+                                  const ax100_opts_t *opts,
+                                  int allow_partial_rs,
+                                  uint8_t *packet, size_t packet_cap,
+                                  int *golay_errs, int *hmac_ok,
+                                  int *rs_errs, int *used_golay_len,
+                                  int *rs_locs);
+
 // Multi-hypothesis sync search on a single window of mono int16 samples.
 // Same logic as rx_decode.c's main decode loop — try sync, on failure
 // advance min_offset past the bad match and try again. With HMAC enabled,

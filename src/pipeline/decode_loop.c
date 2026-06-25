@@ -205,6 +205,49 @@ int decode_loop_try_command(const char *cmd, char *status_buf, size_t cap)
     return 1;
 }
 
+ssize_t ax100_unframe_with_rescue(const uint8_t *bytes, size_t n_bytes,
+                                  const ax100_opts_t *opts,
+                                  int allow_partial_rs,
+                                  uint8_t *packet, size_t packet_cap,
+                                  int *golay_errs, int *hmac_ok,
+                                  int *rs_errs, int *used_golay_len,
+                                  int *rs_locs)
+{
+    ssize_t plen = ax100_unframe(bytes, n_bytes, opts, packet, packet_cap,
+                                 golay_errs, hmac_ok, rs_errs,
+                                 used_golay_len, rs_locs);
+    if (plen >= 0) return plen;
+
+    // Partial-decode rescue: RS(255,223) gives up past 16 byte errors, but
+    // for a long burst on a marginal link the descrambled bytes are still
+    // mostly readable. When the Golay length header decoded perfectly
+    // (errs == 0) we trust the sync was real; retry with RS disabled to
+    // recover the uncorrected payload, mark it rs=-2 (UNCORRECTABLE), and
+    // hand it up so the operator sees "Happy birthday..." with a few flipped
+    // bytes instead of nothing at all. Off in HMAC mode (no integrity gate
+    // would mean emitting garbage at every false sync hit) and never
+    // overrides a good RS decode.
+    if (allow_partial_rs && opts->reed_solomon && *golay_errs == 0) {
+        ax100_opts_t partial_opts = *opts;
+        partial_opts.reed_solomon = 0;
+        int p_golay = 0, p_hmac = -1, p_rs = -1, p_lensrc = -1;
+        ssize_t pp = ax100_unframe(bytes, n_bytes, &partial_opts,
+                                   packet, packet_cap,
+                                   &p_golay, &p_hmac, &p_rs, &p_lensrc, NULL);
+        // Strip the trailing 32-byte RS parity (it's noise to the operator
+        // and would push the apparent length up by 32 vs. the as-transmitted
+        // packet). Anything <= 32 would underflow; treat as no usable bytes.
+        if (pp > 32) {
+            *golay_errs = p_golay;
+            *hmac_ok = -1;
+            *rs_errs = -2;
+            *used_golay_len = p_lensrc;
+            return pp - 32;
+        }
+    }
+    return -1;
+}
+
 int try_decode_window(const int16_t *samples, size_t n_samples,
                       const modem_params_t *mp,
                       const ax100_opts_t *opts,
@@ -250,49 +293,14 @@ int try_decode_window(const int16_t *samples, size_t n_samples,
         }
         size_t n_bytes = modem_bits_to_bytes(bits_scratch, n_bits,
                                              bytes_scratch);
-        ssize_t plen = ax100_unframe(bytes_scratch, n_bytes, opts,
-                                     packet, packet_cap,
-                                     out_golay_errs, out_hmac_ok,
-                                     out_rs_errs, out_used_golay_len,
-                                     out_rs_locs);
+        ssize_t plen = ax100_unframe_with_rescue(bytes_scratch, n_bytes, opts,
+                                                 allow_partial_rs,
+                                                 packet, packet_cap,
+                                                 out_golay_errs, out_hmac_ok,
+                                                 out_rs_errs, out_used_golay_len,
+                                                 out_rs_locs);
         (void)polarity_used;
         if (plen < 0) {
-            // Partial-decode rescue: RS(255,223) gives up at >16 byte
-            // errors, but for long bursts on a marginal link the
-            // descrambled bytes are still mostly readable. When the
-            // Golay header decoded perfectly (errs==0) we trust the
-            // sync was real; retry with RS disabled to recover the
-            // uncorrected payload, mark it rs=-2 (UNCORRECTABLE), and
-            // hand it up so the operator sees "Happy birthday..." with
-            // a few flipped bytes instead of nothing at all. Off in
-            // HMAC mode (no integrity gate would mean we'd emit
-            // garbage at every false sync hit) and never overrides a
-            // good RS decode.
-            if (allow_partial_rs && opts->reed_solomon
-                && *out_golay_errs == 0) {
-                ax100_opts_t partial_opts = *opts;
-                partial_opts.reed_solomon = 0;
-                int p_golay = 0, p_hmac = -1, p_rs = -1, p_lensrc = -1;
-                ssize_t pp = ax100_unframe(bytes_scratch, n_bytes,
-                                           &partial_opts,
-                                           packet, packet_cap,
-                                           &p_golay, &p_hmac,
-                                           &p_rs, &p_lensrc,
-                                           NULL);
-                // Strip the trailing 32-byte RS parity (it's noise to
-                // the operator and would push the apparent length up
-                // by 32 vs. the as-transmitted packet). Anything <=32
-                // would underflow; treat as no usable bytes.
-                if (pp > 32) {
-                    *out_packet_len = pp - 32;
-                    *out_golay_errs = p_golay;
-                    *out_hmac_ok = -1;
-                    *out_rs_errs = -2;
-                    *out_used_golay_len = p_lensrc;
-                    if (out_sync_off) *out_sync_off = sync_off;
-                    return 1;
-                }
-            }
             min_offset = sync_off + 1;
             continue;
         }
@@ -343,34 +351,14 @@ int try_decode_window_iq(const int16_t *iq_pairs, size_t n_pairs,
         }
         size_t n_bytes = modem_bits_to_bytes(bits_scratch, n_bits,
                                              bytes_scratch);
-        ssize_t plen = ax100_unframe(bytes_scratch, n_bytes, opts,
-                                     packet, packet_cap,
-                                     out_golay_errs, out_hmac_ok,
-                                     out_rs_errs, out_used_golay_len,
-                                     out_rs_locs);
+        ssize_t plen = ax100_unframe_with_rescue(bytes_scratch, n_bytes, opts,
+                                                 allow_partial_rs,
+                                                 packet, packet_cap,
+                                                 out_golay_errs, out_hmac_ok,
+                                                 out_rs_errs, out_used_golay_len,
+                                                 out_rs_locs);
         (void) polarity_used;
         if (plen < 0) {
-            if (allow_partial_rs && opts->reed_solomon
-                && *out_golay_errs == 0) {
-                ax100_opts_t partial_opts = *opts;
-                partial_opts.reed_solomon = 0;
-                int p_golay = 0, p_hmac = -1, p_rs = -1, p_lensrc = -1;
-                ssize_t pp = ax100_unframe(bytes_scratch, n_bytes,
-                                           &partial_opts,
-                                           packet, packet_cap,
-                                           &p_golay, &p_hmac,
-                                           &p_rs, &p_lensrc,
-                                           NULL);
-                if (pp > 32) {
-                    *out_packet_len = pp - 32;
-                    *out_golay_errs = p_golay;
-                    *out_hmac_ok = -1;
-                    *out_rs_errs = -2;
-                    *out_used_golay_len = p_lensrc;
-                    if (out_sync_off) *out_sync_off = sync_off;
-                    return 1;
-                }
-            }
             min_offset = sync_off + 1;
             continue;
         }
@@ -421,34 +409,14 @@ int try_decode_window_fsk(const int16_t *iq_pairs, size_t n_pairs,
         }
         size_t n_bytes = modem_bits_to_bytes(bits_scratch, n_bits,
                                              bytes_scratch);
-        ssize_t plen = ax100_unframe(bytes_scratch, n_bytes, opts,
-                                     packet, packet_cap,
-                                     out_golay_errs, out_hmac_ok,
-                                     out_rs_errs, out_used_golay_len,
-                                     out_rs_locs);
+        ssize_t plen = ax100_unframe_with_rescue(bytes_scratch, n_bytes, opts,
+                                                 allow_partial_rs,
+                                                 packet, packet_cap,
+                                                 out_golay_errs, out_hmac_ok,
+                                                 out_rs_errs, out_used_golay_len,
+                                                 out_rs_locs);
         (void) polarity_used;
         if (plen < 0) {
-            if (allow_partial_rs && opts->reed_solomon
-                && *out_golay_errs == 0) {
-                ax100_opts_t partial_opts = *opts;
-                partial_opts.reed_solomon = 0;
-                int p_golay = 0, p_hmac = -1, p_rs = -1, p_lensrc = -1;
-                ssize_t pp = ax100_unframe(bytes_scratch, n_bytes,
-                                           &partial_opts,
-                                           packet, packet_cap,
-                                           &p_golay, &p_hmac,
-                                           &p_rs, &p_lensrc,
-                                           NULL);
-                if (pp > 32) {
-                    *out_packet_len = pp - 32;
-                    *out_golay_errs = p_golay;
-                    *out_hmac_ok = -1;
-                    *out_rs_errs = -2;
-                    *out_used_golay_len = p_lensrc;
-                    if (out_sync_off) *out_sync_off = sync_off;
-                    return 1;
-                }
-            }
             min_offset = sync_off + 1;
             continue;
         }
@@ -499,34 +467,14 @@ int try_decode_window_viterbi(const int16_t *iq_pairs, size_t n_pairs,
         }
         size_t n_bytes = modem_bits_to_bytes(bits_scratch, n_bits,
                                              bytes_scratch);
-        ssize_t plen = ax100_unframe(bytes_scratch, n_bytes, opts,
-                                     packet, packet_cap,
-                                     out_golay_errs, out_hmac_ok,
-                                     out_rs_errs, out_used_golay_len,
-                                     out_rs_locs);
+        ssize_t plen = ax100_unframe_with_rescue(bytes_scratch, n_bytes, opts,
+                                                 allow_partial_rs,
+                                                 packet, packet_cap,
+                                                 out_golay_errs, out_hmac_ok,
+                                                 out_rs_errs, out_used_golay_len,
+                                                 out_rs_locs);
         (void) polarity_used;
         if (plen < 0) {
-            if (allow_partial_rs && opts->reed_solomon
-                && *out_golay_errs == 0) {
-                ax100_opts_t partial_opts = *opts;
-                partial_opts.reed_solomon = 0;
-                int p_golay = 0, p_hmac = -1, p_rs = -1, p_lensrc = -1;
-                ssize_t pp = ax100_unframe(bytes_scratch, n_bytes,
-                                           &partial_opts,
-                                           packet, packet_cap,
-                                           &p_golay, &p_hmac,
-                                           &p_rs, &p_lensrc,
-                                           NULL);
-                if (pp > 32) {
-                    *out_packet_len = pp - 32;
-                    *out_golay_errs = p_golay;
-                    *out_hmac_ok = -1;
-                    *out_rs_errs = -2;
-                    *out_used_golay_len = p_lensrc;
-                    if (out_sync_off) *out_sync_off = sync_off;
-                    return 1;
-                }
-            }
             min_offset = sync_off + 1;
             continue;
         }
