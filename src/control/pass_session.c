@@ -24,6 +24,7 @@
 #include "prediction.h"
 #include "sso_audit.h"
 #include "sso_paths.h"
+#include "tle_io.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -98,14 +99,9 @@ int read_tle_name(const char *tle_path,
     if (f == NULL) return -1;
     char line[256];
     int rc = -1;
-    while (fgets(line, sizeof line, f) != NULL) {
-        size_t n = strlen(line);
-        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'
-                      || line[n - 1] == ' '  || line[n - 1] == '\t')) {
-            line[--n] = '\0';
-        }
-        if (n == 0) continue;
-        if ((line[0] == '1' || line[0] == '2') && line[1] == ' ') continue;
+    while (tle_io_read_line(f, line, sizeof line)) {
+        if (tle_io_is_element_line(line, '1') || tle_io_is_element_line(line, '2'))
+            continue;
         snprintf(out_name, out_cap, "%s", line);
         rc = 0;
         break;

@@ -35,6 +35,7 @@
 
 #include "argparse.h"
 #include "sso_paths.h"
+#include "tle_io.h"
 
 #include <sgp4sdp4.h>
 
@@ -78,26 +79,8 @@ typedef struct {
 
 // ---- TLE file reading -------------------------------------------------------
 
-// Read the next non-blank line, stripped of trailing CR/LF and spaces.
-// Returns 0 at end of file.
-static int read_line(FILE *fp, char *buf, size_t cap)
-{
-    while (fgets(buf, (int) cap, fp)) {
-        size_t n = strlen(buf);
-        while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r'
-                     || buf[n - 1] == ' ' || buf[n - 1] == '\t'))
-            buf[--n] = '\0';
-        if (n == 0) continue;
-        return 1;
-    }
-    return 0;
-}
-
-// True if the line looks like TLE card 1 or card 2 ("1 " / "2 " prefix).
-static int is_element_line(const char *s, char card)
-{
-    return s[0] == card && s[1] == ' ';
-}
+// Line-level TLE reading (tle_io_read_line / tle_io_is_element_line) is
+// shared with pass_session.c and tracking.c via tle_io.h.
 
 // Read every object in a TLE file into a grown array. Handles the usual
 // 3-line groups (name, card 1, card 2), the bare "0 " 3LE name prefix,
@@ -114,18 +97,18 @@ static int read_all_tles(const char *path, kep_t **out, int *count)
     int n = 0, cap = 0;
 
     char name[160], l1[160], l2[160];
-    while (read_line(fp, name, sizeof name)) {
+    while (tle_io_read_line(fp, name, sizeof name)) {
         const char *nm = name;
         // A bare two-line set has no name line: the line we just read is
         // already card 1. Otherwise strip an optional "0 " 3LE prefix.
-        if (is_element_line(name, '1')) {
+        if (tle_io_is_element_line(name, '1')) {
             snprintf(l1, sizeof l1, "%s", name);
-            if (!read_line(fp, l2, sizeof l2)) break;
+            if (!tle_io_read_line(fp, l2, sizeof l2)) break;
             nm = "";
         } else {
             if (nm[0] == '0' && nm[1] == ' ') nm += 2;
-            if (!read_line(fp, l1, sizeof l1)) break;
-            if (!read_line(fp, l2, sizeof l2)) break;
+            if (!tle_io_read_line(fp, l1, sizeof l1)) break;
+            if (!tle_io_read_line(fp, l2, sizeof l2)) break;
         }
 
         // sgp4sdp4 wants card 1 at [0..68] and card 2 at [69..137].

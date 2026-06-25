@@ -29,6 +29,7 @@
 #include "scan_sky.h"
 #include "cmd_line.h"
 #include "sso_audit.h"
+#include "tle_io.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -313,24 +314,19 @@ static int retarget_read_first_tle(const char *path,
     char l2[256] = {0};
     int  have_name = 0;
     name[0] = '\0';
-    while (fgets(line, sizeof line, f) != NULL) {
-        size_t n = strlen(line);
-        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'
-                      || line[n - 1] == ' '  || line[n - 1] == '\t')) {
-            line[--n] = '\0';
-        }
-        if (n == 0) continue;
-        int is_elem = ((line[0] == '1' || line[0] == '2') && line[1] == ' ');
+    while (tle_io_read_line(f, line, sizeof line)) {
+        int is_elem = tle_io_is_element_line(line, '1')
+                   || tle_io_is_element_line(line, '2');
         if (!have_name && !is_elem) {
             snprintf(name, name_cap, "%s", line);
             have_name = 1;
             continue;
         }
-        if (line[0] == '1' && line[1] == ' ' && l1[0] == '\0') {
+        if (tle_io_is_element_line(line, '1') && l1[0] == '\0') {
             snprintf(l1, sizeof l1, "%s", line);
             continue;
         }
-        if (line[0] == '2' && line[1] == ' ' && l2[0] == '\0') {
+        if (tle_io_is_element_line(line, '2') && l2[0] == '\0') {
             snprintf(l2, sizeof l2, "%s", line);
             break;  // first complete record -> done
         }
