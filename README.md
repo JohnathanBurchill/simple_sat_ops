@@ -2,12 +2,10 @@
 
 A set of tools for predicting and tracking satellite passes near a ground
 station, and for running a complete software-defined-radio link to a
-cubesat: receive, decode, transmit telecommands, and point the antenna —
-all from a single terminal program.
+cubesat: receive, decode, transmit telecommands, and point the antenna.
 
 The software was built for the University of Calgary
-[CalgaryToSpace](https://www.calgarytospace.ca) FrontierSat ground station,
-but nothing in it is mission-specific.
+[CalgaryToSpace](https://www.calgarytospace.ca) FrontierSat ground station.
 
 The aim is twofold: 1) demonstrate reliable, fast operation through a simple
 terminal interface, and 2) learn by doing. The software suits our needs;
