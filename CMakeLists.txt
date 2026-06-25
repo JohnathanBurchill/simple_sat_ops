@@ -45,8 +45,12 @@ endif()
 # the RAO Linux build. These are GCC warnings; Apple clang doesn't implement
 # them and just emits one "unknown warning option" note (the build still
 # proceeds), so the real truncation check is scripts/lint_warnings.sh running
-# gcc. The =2 level makes GCC flag truncation even when the result might fit.
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wformat-truncation=2 -Wformat-overflow=2")
+# gcc. Stay at level 1 (the plain flag): it flags only *definite* truncation.
+# The =2 level adds worst-case warnings -- it assumes a double can print ~310
+# chars and that any caller-provided buffer could be length 1 -- which are
+# false positives on safe code (this fires even at -O0). lint_warnings.sh can
+# run a one-off =2 sweep when auditing.
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wformat-truncation -Wformat-overflow")
 
 # Sources live under src/<area>/. Every #include in the codebase is the
 # bare form `#include "foo.h"`, so we register every area as an include

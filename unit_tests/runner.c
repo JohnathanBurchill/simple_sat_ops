@@ -47,6 +47,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <locale.h>
 #include <ncurses.h>
 #include <stdio.h>
@@ -281,8 +282,12 @@ static int discover_selftests(const char *dir, group_t **out_groups, int *out_n)
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         if (!ends_with(de->d_name, "_selftest")) continue;
-        char path[512];
-        snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
+        // dir can be a long build-tree path. Check the snprintf return and
+        // skip (rather than silently use) any entry whose full path wouldn't
+        // fit, so a test is never run against a clipped path.
+        char path[PATH_MAX];
+        int plen = snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
+        if (plen < 0 || (size_t) plen >= sizeof path) continue;
         struct stat st;
         if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
         if (access(path, X_OK) != 0) continue;

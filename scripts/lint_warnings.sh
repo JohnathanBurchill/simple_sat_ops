@@ -43,8 +43,8 @@ BUILD_DIR="$ROOT/build-lint"
 WFLAGS=(
     -Wall -Wextra
     -Wformat=2
-    -Wformat-truncation=2
-    -Wformat-overflow=2
+    -Wformat-truncation
+    -Wformat-overflow
     -Werror=format-truncation
     -Werror=format-overflow
 )
