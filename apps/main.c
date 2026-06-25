@@ -105,7 +105,9 @@
 
 // Refuse to fully start when the --tc-file agenda has telecommand lint
 // errors. --ignore-at-your-peril-all-tc-errors clears this and lets a
-// known-bad agenda through anyway.
+// known-bad agenda through anyway. A brick-risk command (a "danger"
+// finding, e.g. one arming the boot-time agenda) is gated separately by
+// --ignore-at-your-peril-dangerous-tcmds.
 
 // TX dry-run: record the command as not-sent (reason "dry-run")
 // instead of pushing the burst through rx_session. Lets the operator
@@ -199,7 +201,9 @@ int main(int argc, char **argv)
     cli_load_hmac_keyfile(&state.tx);
 
     // Telecommand-agenda lint gate: refuse to start on a --tc-file with lint
-    // errors, unless --ignore-at-your-peril-all-tc-errors. See cli_args.c.
+    // errors (unless --ignore-at-your-peril-all-tc-errors) or a brick-risk
+    // command (unless --ignore-at-your-peril-dangerous-tcmds). Runs before any
+    // hardware or IPC is brought up. See cli_args.c.
     if ((status = cli_tcmd_lint_gate(&state.tx)) != 0) {
         return status;
     }

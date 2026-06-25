@@ -554,9 +554,10 @@ static int auto_tcmd_reload(state_t *state) {
     {
         FILE *devnull = fopen("/dev/null", "w");
         if (devnull != NULL) {
-            int w = 0;
-            int e = tcmd_lint_file(state->tx.auto_tcmd_file_path, devnull, &w);
-            state->tx.auto_tcmd.lint_errors = (e > 0) ? e : 0;
+            int w = 0, d = 0;
+            int e = tcmd_lint_file(state->tx.auto_tcmd_file_path, devnull, &w, &d);
+            state->tx.auto_tcmd.lint_errors  = (e > 0) ? e : 0;
+            state->tx.auto_tcmd.lint_dangers = (d > 0) ? d : 0;
             fclose(devnull);
         }
     }
@@ -572,7 +573,15 @@ static int auto_tcmd_reload(state_t *state) {
     state->tx.auto_tcmd.cursors[AUTO_F_REPEATS]  = (int) strlen(state->tx.auto_tcmd.repeats);
     state->tx.auto_tcmd.cursors[AUTO_F_INTERVAL] = (int) strlen(state->tx.auto_tcmd.interval_s);
     state->tx.auto_tcmd.state    = AUTO_STATE_SETUP;
-    if (state->tx.auto_tcmd.lint_errors > 0 && !state->tx.ignore_tc_errors) {
+    if (state->tx.auto_tcmd.lint_dangers > 0 && !state->tx.ignore_dangerous_tcmds) {
+        snprintf(state->tx.auto_tcmd.status_msg, sizeof state->tx.auto_tcmd.status_msg,
+                 "loaded %d command(s) but %d can BRICK the satellite -- fix the "
+                 "file; run blocked", nc, state->tx.auto_tcmd.lint_dangers);
+    } else if (state->tx.auto_tcmd.lint_dangers > 0) {
+        snprintf(state->tx.auto_tcmd.status_msg, sizeof state->tx.auto_tcmd.status_msg,
+                 "loaded %d command(s); %d BRICK-RISK command(s) overridden. "
+                 "Enter to start.", nc, state->tx.auto_tcmd.lint_dangers);
+    } else if (state->tx.auto_tcmd.lint_errors > 0 && !state->tx.ignore_tc_errors) {
         snprintf(state->tx.auto_tcmd.status_msg, sizeof state->tx.auto_tcmd.status_msg,
                  "loaded %d command(s) but %d lint error(s) -- fix the file; "
                  "run blocked", nc, state->tx.auto_tcmd.lint_errors);
@@ -654,6 +663,16 @@ static int auto_tcmd_start(state_t *state) {
     if (a->n_commands == 0) {
         snprintf(a->status_msg, sizeof a->status_msg,
                  "rejected: file has no commands");
+        return -1;
+    }
+    // A file edited after launch can introduce a brick-risk command (one
+    // that arms the boot-time agenda). Re-lint on (re)load flagged it; refuse
+    // to run unless the operator started with
+    // --ignore-at-your-peril-dangerous-tcmds.
+    if (a->lint_dangers > 0 && !state->tx.ignore_dangerous_tcmds) {
+        snprintf(a->status_msg, sizeof a->status_msg,
+                 "rejected: %d command(s) can brick the satellite -- fix it and reopen",
+                 a->lint_dangers);
         return -1;
     }
     // A file edited after launch can introduce commands the satellite would

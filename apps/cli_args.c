@@ -359,8 +359,24 @@ int cli_tcmd_lint_gate(const tx_t *tx)
     if (tx->auto_tcmd_file_path[0] == '\0') {
         return 0;
     }
-    int tc_warns = 0;
-    int tc_errs = tcmd_lint_file(tx->auto_tcmd_file_path, stderr, &tc_warns);
+    int tc_warns = 0, tc_dangers = 0;
+    int tc_errs = tcmd_lint_file(tx->auto_tcmd_file_path, stderr,
+                                 &tc_warns, &tc_dangers);
+
+    // Brick-risk blacklist first: these are well-formed commands the
+    // satellite would run, so they outrank a parse error. They need their
+    // own override -- accepting parse errors must not also wave a brick
+    // command through.
+    if (tc_dangers > 0 && !tx->ignore_dangerous_tcmds) {
+        fprintf(stderr,
+            "simple_sat_ops: %d dangerous telecommand%s detected in %s (see the\n"
+            "'danger:' line%s above). These are valid commands that can brick the\n"
+            "satellite. Refusing to start. Remove them, or -- only if you truly\n"
+            "mean it -- re-run with --ignore-at-your-peril-dangerous-tcmds.\n",
+            tc_dangers, tc_dangers == 1 ? "" : "s", tx->auto_tcmd_file_path,
+            tc_dangers == 1 ? "" : "s");
+        return EXIT_FAILURE;
+    }
     if (tc_errs > 0 && !tx->ignore_tc_errors) {
         fprintf(stderr,
             "simple_sat_ops: %d error%s detected in the --tc-file content (%s).\n"
@@ -368,6 +384,12 @@ int cli_tcmd_lint_gate(const tx_t *tx)
             "--ignore-at-your-peril-all-tc-errors to bypass this check.\n",
             tc_errs, tc_errs == 1 ? "" : "s", tx->auto_tcmd_file_path);
         return EXIT_FAILURE;
+    }
+    if (tc_dangers > 0) {
+        fprintf(stderr,
+            "simple_sat_ops: %d DANGEROUS telecommand%s in %s -- proceeding anyway "
+            "(--ignore-at-your-peril-dangerous-tcmds).\n",
+            tc_dangers, tc_dangers == 1 ? "" : "s", tx->auto_tcmd_file_path);
     }
     if (tc_errs > 0) {
         fprintf(stderr,
@@ -392,8 +414,8 @@ int cli_tcmd_lint_gate(const tx_t *tx)
 // See src/cli/argparse.h for the convention.
 //
 // Option column width: widest label below is
-// "--ignore-at-your-peril-all-tc-errors" (36) + a small margin.
-#define OPTW 38
+// "--ignore-at-your-peril-dangerous-tcmds" (38) + a small margin.
+#define OPTW 40
 
 int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
 {
@@ -723,6 +745,12 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
             if (help) parse_help_line(OPTW, "--ignore-at-your-peril-all-tc-errors",
                 "start even if the --tc-file agenda has telecommand lint errors");
             else { state->app.n_options++; state->tx.ignore_tc_errors = 1; }
+            matched = 1;
+        }
+        if (strcmp("--ignore-at-your-peril-dangerous-tcmds", arg) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--ignore-at-your-peril-dangerous-tcmds",
+                "start even if the --tc-file has brick-risk commands (e.g. the boot agenda)");
+            else { state->app.n_options++; state->tx.ignore_dangerous_tcmds = 1; }
             matched = 1;
         }
         if (strcmp("--hmac-keyfile", arg) == 0 || help) {

@@ -106,6 +106,10 @@ typedef struct auto_tcmd {
     // lint gate runs once; this catches a --tc-file edited after launch.
     // Non-zero blocks the run (auto_tcmd_start) unless --ignore-...-tc-errors.
     int    lint_errors;
+    // Brick-risk blacklist hits (e.g. a command touching the boot-time
+    // agenda) from the same re-lint. Blocks the run unless the operator
+    // started with --ignore-at-your-peril-dangerous-tcmds.
+    int    lint_dangers;
 
     // Editable fields (text-edit semantics shared with TX compose).
     char power[12];
@@ -162,6 +166,12 @@ typedef struct tx {
     // (reason "dry-run") instead of keying the PA.
     int ignore_tc_errors;
     int tx_dry_run;
+
+    // --ignore-at-your-peril-dangerous-tcmds: override the brick-risk
+    // blacklist (e.g. a command that arms the boot-time agenda). Deliberately
+    // separate from ignore_tc_errors so accepting parse errors never also
+    // waves through a command that can wedge the spacecraft.
+    int ignore_dangerous_tcmds;
 
     // TX compose modal + payload history. tx_last_* survive Esc/commit so
     // a reopened modal picks up the previous draft (seeded "CTS1+" once).

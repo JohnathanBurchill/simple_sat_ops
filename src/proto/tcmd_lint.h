@@ -12,6 +12,16 @@
     is generated from the firmware. A command whose readiness level is not
     "operation" (ground-only, high-risk, etc.) is flagged as a warning.
 
+    On top of the firmware-parser mirror there is a small ground-policy
+    blacklist of substrings that make an otherwise-valid command dangerous to
+    fly (see tcmd_dangerous_substrings[] in tcmd_lint.c). The first is the
+    boot-time agenda filename "default_tcmd_agenda.txt": a command that writes
+    or enqueues it can wedge the satellite in a boot loop. A blacklist hit is
+    its own top severity, TCMD_LINT_DANGER -- worse than a parse error,
+    because the command is perfectly well-formed and the satellite would run
+    it. It blocks separately from structural errors and needs its own
+    override. (Issue #43.)
+
     Copyright (C) 2026  Johnathan K Burchill
 
     This program is free software: you can redistribute it and/or modify
@@ -32,9 +42,14 @@
 #include <stdio.h>
 
 typedef enum {
-    TCMD_LINT_OK    = 0,
-    TCMD_LINT_WARN  = 1,
-    TCMD_LINT_ERROR = 2,
+    TCMD_LINT_OK     = 0,
+    TCMD_LINT_WARN   = 1,
+    TCMD_LINT_ERROR  = 2,
+    // A well-formed command the satellite would happily run, but which is on
+    // the ground brick-risk blacklist (e.g. touches default_tcmd_agenda.txt).
+    // Ranked above ERROR so it wins the reported severity and gets its own
+    // gate; see the header note and tcmd_dangerous_substrings[] in the .c.
+    TCMD_LINT_DANGER = 3,
 } tcmd_lint_severity_t;
 
 // The longest telecommand (the whole "CTS1+...!" line, including any
@@ -58,9 +73,12 @@ tcmd_lint_severity_t tcmd_lint_command(const char *cmd, char *msg, size_t msg_ca
 // Lint every telecommand in an agenda file: one command per line, blank lines
 // and whole-line '#' comments skipped, inline '# ...' comments stripped (the
 // same rule simple_sat_ops transmits by). Prints
-// "<path>:<line>: error|warning: <msg>" for each flagged line to `out`.
-// Returns the number of ERROR lines (0 = safe to proceed); *warn_count, if
-// non-NULL, receives the WARNING count. Returns -1 if the file can't be read.
-int tcmd_lint_file(const char *path, FILE *out, int *warn_count);
+// "<path>:<line>: danger|error|warning: <msg>" for each flagged line to `out`.
+// Returns the number of structural ERROR lines (0 = no parse errors); the two
+// optional out-params receive the WARNING and DANGER counts. A DANGER line
+// (brick-risk blacklist hit) is counted in *danger_count, not the return
+// value, because it gates separately from parse errors. Any out-pointer may
+// be NULL. Returns -1 if the file can't be read.
+int tcmd_lint_file(const char *path, FILE *out, int *warn_count, int *danger_count);
 
 #endif // TCMD_LINT_H

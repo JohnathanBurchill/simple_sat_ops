@@ -10,7 +10,9 @@
     The command names / arg counts used below are real entries in the
     generated table (tag sat-1-rc3): hello_world(0), set_system_time(1),
     camera_capture(2), the ground-only mpi_demo_tx_to_mpi(0), and the
-    high-risk flash_force_corrupt_filesystem(1).
+    high-risk flash_force_corrupt_filesystem(1). The brick-risk blacklist
+    test uses fs_write_file_str(2)/fs_delete_file(1) naming the boot-time
+    agenda file default_tcmd_agenda.txt (issue #43).
 
     Exit status: 0 = all tests passed, non-zero = failure.
 
@@ -64,6 +66,16 @@ static void expect_warn(const char *cmd, const char *needle)
     tap_okf(got == TCMD_LINT_WARN && strstr(msg, needle) != NULL,
             "warn mentioning \"%s\" (got sev=%d msg: %s)",
             needle, (int) got, msg);
+}
+
+// Assert DANGER and that the message mentions `needle`.
+static void expect_danger(const char *cmd, const char *needle)
+{
+    char msg[512];
+    tcmd_lint_severity_t got = tcmd_lint_command(cmd, msg, sizeof msg);
+    tap_okf(got == TCMD_LINT_DANGER && strstr(msg, needle) != NULL,
+            "[%s] danger mentioning \"%s\" (got sev=%d msg: %s)",
+            cmd, needle, (int) got, msg);
 }
 
 static void test_valid_commands(void)
@@ -262,12 +274,59 @@ static void test_file_level(void)
 
     int warns = -1;
     FILE *out = fopen("/dev/null", "w");
-    int errors = tcmd_lint_file(path, out ? out : stderr, &warns);
+    // NULL danger_count exercises the optional-out-pointer path.
+    int errors = tcmd_lint_file(path, out ? out : stderr, &warns, NULL);
     if (out) fclose(out);
     unlink(path);
     tap_okf(errors == 1,
             "exactly one error line (the spaced numeric args); blanks/comments skipped (got %d)",
             errors);
+}
+
+static void test_dangerous_blacklist(void)
+{
+    fprintf(stderr, "tcmd_lint: brick-risk blacklist (boot-time agenda file)\n");
+
+    // The headline case: a routine, perfectly well-formed command that arms
+    // the boot-time agenda. fs_write_file_str is operation-readiness with two
+    // string args, so nothing else here would flag it -- yet bad contents in
+    // default_tcmd_agenda.txt boot-loop the satellite. Must be DANGER.
+    expect_danger("CTS1+fs_write_file_str(default_tcmd_agenda.txt,x)!",
+                  "default_tcmd_agenda.txt");
+    // Caught no matter which command names the file (substring match).
+    expect_danger("CTS1+fs_delete_file(default_tcmd_agenda.txt)!",
+                  "default_tcmd_agenda.txt");
+    expect_danger("CTS1+agenda_enqueue_from_file(default_tcmd_agenda.txt,0,0)!",
+                  "default_tcmd_agenda.txt");
+
+    // Danger outranks a structural error on the same line (3 > 2): the arg
+    // count is wrong AND the filename is blacklisted -> still DANGER, so the
+    // brick risk is never masked by an ordinary parse error.
+    expect_sev("CTS1+fs_write_file_str(default_tcmd_agenda.txt)!", TCMD_LINT_DANGER);
+
+    // No false positives: a different filename is fine.
+    expect_sev("CTS1+fs_write_file_str(todays_agenda.txt,x)!", TCMD_LINT_OK);
+    expect_sev("CTS1+fs_delete_file(beacon_log.txt)!", TCMD_LINT_OK);
+
+    // File level: a danger is counted in danger_count, NOT the error return,
+    // because the two gate separately (different override flags).
+    char path[] = "/tmp/sso_tcmd_danger_selftest_XXXXXX";
+    int fd = mkstemp(path);
+    tap_ok(fd >= 0, "mkstemp danger agenda");
+    if (fd < 0) return;
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(path); tap_ok(0, "fdopen danger agenda"); return; }
+    fputs("CTS1+hello_world()!\n", f);                            // clean
+    fputs("CTS1+fs_write_file_str(default_tcmd_agenda.txt,x)!\n", f); // 1 danger
+    fclose(f);
+    int warns = -1, dangers = -1;
+    FILE *out = fopen("/dev/null", "w");
+    int errors = tcmd_lint_file(path, out ? out : stderr, &warns, &dangers);
+    if (out) fclose(out);
+    unlink(path);
+    tap_okf(errors == 0 && dangers == 1,
+            "file: 0 errors, 1 danger for the boot-agenda write (got err=%d danger=%d)",
+            errors, dangers);
 }
 
 static void test_spec_table(void)
@@ -296,6 +355,7 @@ int main(void)
     test_blank();
     test_arg_types();
     test_arg_types_consistent();
+    test_dangerous_blacklist();
     test_file_level();
     test_spec_table();
     return tap_done();

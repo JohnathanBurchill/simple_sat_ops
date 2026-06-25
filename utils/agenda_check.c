@@ -40,11 +40,13 @@
     is a TTY the prefix is rendered in red bold so it stands out;
     when piped, the prefix is plain text so grep / less still see it.
 
-    A line the linter rejects is tagged "ERROR>" and, on a TTY, the
-    whole line is shown in bold bright red so it can't scroll past
-    unnoticed (the tag stays plain when piped). --errors-only instead
-    prints just the offending lines and suppresses the rest of the
-    listing, so no highlighting is applied in that mode.
+    A line the linter rejects is tagged "ERROR>" -- or "DANGER>" for a
+    brick-risk command, one that is well-formed but can wedge the
+    spacecraft -- and, on a TTY, the whole line is shown in bold bright
+    red so it can't scroll past unnoticed (the tag stays plain when
+    piped). --errors-only instead prints just the offending lines and
+    suppresses the rest of the listing, so no highlighting is applied in
+    that mode.
 
     Copyright (C) 2026  Johnathan K Burchill
 
@@ -451,7 +453,7 @@ int main(int argc, char **argv)
     int lineno = 0;
     int n_dups = 0;
     int total_commands = 0;
-    int lint_errors = 0, lint_warns = 0;
+    int lint_errors = 0, lint_warns = 0, lint_dangers = 0;
     while (fgets(buf, sizeof buf, in) != NULL) {
         ++lineno;
         // Pass through comments and blank lines verbatim — they're
@@ -485,7 +487,7 @@ int main(int argc, char **argv)
         // Issues go to stderr so stdout stays the clean, pipeable humanized
         // agenda; lint errors set the exit code below. had_error drives
         // the bold bright-red highlight of this line in the listing below.
-        int had_error = 0;
+        int had_error = 0, had_danger = 0;
         if (tc_lint) {
             char lintbuf[4096];
             snprintf(lintbuf, sizeof lintbuf, "%s", buf);
@@ -494,7 +496,19 @@ int main(int argc, char **argv)
             while (*cmd == ' ' || *cmd == '\t') ++cmd;
             char lint_msg[512];
             tcmd_lint_severity_t sev = tcmd_lint_command(cmd, lint_msg, sizeof lint_msg);
-            if (sev == TCMD_LINT_ERROR) {
+            if (sev == TCMD_LINT_DANGER) {
+                // A well-formed command that can brick the satellite. The
+                // worst thing the linter can find, so it takes the line.
+                ++lint_dangers;
+                had_danger = 1;
+                if (errors_only) {
+                    fprintf(stdout, "%d: %s\n     danger: %s\n",
+                            lineno, cmd, lint_msg);
+                } else {
+                    fprintf(stderr, "agenda_check: line %d: danger: %s\n",
+                            lineno, lint_msg);
+                }
+            } else if (sev == TCMD_LINT_ERROR) {
                 ++lint_errors;
                 had_error = 1;
                 if (errors_only) {
@@ -601,12 +615,13 @@ int main(int argc, char **argv)
         // erroneous lines (printed by the lint block above) reach stdout.
         const char *cmt_sep = inline_comment[0] ? "  " : "";
         if (!errors_only) {
-            // A lint-rejected line gets an ERROR> tag and is rendered in
-            // bold bright red so it stands out in a long listing; a DUP
-            // marker (if any) keeps its own colour alongside it.
-            const char *err_on  = had_error ? err_hi    : "";
-            const char *err_off = had_error ? err_reset : "";
-            const char *err_tag = had_error ? "ERROR> "  : "";
+            // A lint-rejected line gets an ERROR> tag (DANGER> for a
+            // brick-risk command) and is rendered in bold bright red so it
+            // stands out in a long listing; a DUP marker (if any) keeps its
+            // own colour alongside it.
+            const char *err_on  = (had_error || had_danger) ? err_hi    : "";
+            const char *err_off = (had_error || had_danger) ? err_reset : "";
+            const char *err_tag = had_danger ? "DANGER> " : (had_error ? "ERROR> " : "");
             if (first_seen && dup_check && !prune_dups) {
                 fprintf(stdout, "%s%sDUP(line %d)>%s %s%s%s%s%s%s\n",
                         prefix, dup_red, first_seen, dup_reset,
@@ -627,10 +642,11 @@ int main(int argc, char **argv)
         total_commands, total_commands == 1 ? "" : "s",
         dups.n, timed_uniq.n);
 
-    if (tc_lint && (lint_errors > 0 || lint_warns > 0)) {
+    if (tc_lint && (lint_errors > 0 || lint_warns > 0 || lint_dangers > 0)) {
         fprintf(stderr,
-            "agenda_check: telecommand lint: %d error%s, %d warning%s "
+            "agenda_check: telecommand lint: %d danger%s, %d error%s, %d warning%s "
             "(checked against firmware %s)\n",
+            lint_dangers, lint_dangers == 1 ? "" : "s",
             lint_errors, lint_errors == 1 ? "" : "s",
             lint_warns, lint_warns == 1 ? "" : "s", TCMD_SPEC_FW_TAG);
     }
@@ -647,9 +663,10 @@ int main(int argc, char **argv)
             n_dups, n_dups == 1 ? "" : "s");
         rc = 3;
     }
-    // Lint errors are the most serious finding -- a command that the
-    // satellite would reject or mis-parse -- so they take the exit code.
-    if (tc_lint && lint_errors > 0) {
+    // Lint problems are the most serious finding -- a command the satellite
+    // would reject or mis-parse, or one that could brick it -- so they take
+    // the exit code over a duplicate.
+    if (tc_lint && (lint_errors > 0 || lint_dangers > 0)) {
         rc = 4;
     }
     dup_table_free(&dups);

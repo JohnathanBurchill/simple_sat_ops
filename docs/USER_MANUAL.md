@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`280335a` (2026-06-25). This is a working draft.
+`7f0990d` (2026-06-25). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -925,6 +925,7 @@ is specified in [the viewer-stream JSON contract](VIEWER_STREAM_JSON.md).
 | `--hmac-keyfile <path>` | Override the HMAC keyfile. |
 | `--tc-file <path>` | Telecommand list for the `A` auto-tcmd modal. Linted against the firmware at startup; lint errors refuse startup (see [Telecommand linting](#telecommand-linting)). |
 | `--ignore-at-your-peril-all-tc-errors` | Start even when the `--tc-file` agenda has telecommand lint errors. Warnings never block. |
+| `--ignore-at-your-peril-dangerous-tcmds` | Start even when the `--tc-file` has a brick-risk command (a `danger:` finding, e.g. one that arms the boot-time agenda). A separate gate from the errors one, so accepting parse errors never also waves a brick command through (see [Telecommand linting](#telecommand-linting)). |
 | `--calibrate-rotator` `--confirm-rotator-calibrate` | One-shot calibration mode (see below). |
 | `--without-rotator-pursuit` | Disable the pursuit / lead-aim planner; the track loop falls back to today's aim-where-sat-is-now logic. Useful for A/B on the bench. |
 | `--scan-sky` `--scan-step=<deg>` | Drive the rotator through a sky grid, dwelling at each target. Bypasses the satellite-tracking gate. |
@@ -1182,9 +1183,15 @@ linting](#telecommand-linting)). If any line has a lint *error* (unknown
 command name, wrong argument count, broken `CTS1+...!` framing),
 `simple_sat_ops` prints the offending lines and refuses to start, so a
 malformed agenda is caught before the pass instead of on the air. Pass
-`--ignore-at-your-peril-all-tc-errors` to start anyway; *warnings* (such
-as a command not meant for routine flight operation) are printed but do
-not block startup.
+`--ignore-at-your-peril-all-tc-errors` to start anyway. A *danger*
+finding - a well-formed but brick-risk command, such as one that arms
+the boot-time agenda - also refuses startup, behind its own separate
+gate `--ignore-at-your-peril-dangerous-tcmds`. *Warnings* (such as a
+command not meant for routine flight operation) are printed but do not
+block startup. The same re-lint runs each time the `A` modal (re)loads
+the file, so an edit made after launch is caught too: a danger blocks
+the run with a `can BRICK the satellite` status until you fix the file
+or, having started with the gate, override it.
 
 The `A` modal lists the commands, lets the operator set per-pass
 parameters (power, repeats, delay), and ticks the same three TX
@@ -1363,11 +1370,37 @@ at startup and refuses to start on an error.
 > destructive command scheduled ahead of the one that would have undone
 > it.
 >
-> The protections are real but bounded: the lint warnings, the readiness
-> levels, the `agenda_check` dry run, and a second qualified reader. The
-> rule is the dull one - never fly a file you do not fully understand,
-> and have someone who knows the spacecraft vet anything that carries a
-> warning.
+> That example *warns* but does not block - readiness is advisory. There
+> is one brick path the ground stops outright. The firmware keeps a
+> boot-time agenda file, `default_tcmd_agenda.txt`: whatever it contains
+> is loaded into the agenda queue on *every* boot (a last-resort way to
+> resume an agenda after repeated crashes). Write that file with a
+> command that crashes the satellite -
+>
+> ```
+> CTS1+fs_write_file_str(default_tcmd_agenda.txt,<a command that crashes on boot>)!
+> ```
+>
+> - and you have armed a trap that springs on the next reset and every
+> reset after it: boot, load the bad agenda, crash, repeat. Nothing is
+> left listening long enough to fix it. Because this command is routine
+> in shape (it is just a file write, `operation` readiness), the linter
+> would not even warn - so it is on a small ground-side *brick-risk
+> blacklist* and flagged as a `danger:`, which **refuses startup** unless
+> you pass `--ignore-at-your-peril-dangerous-tcmds`. That gate is
+> deliberately separate from the errors gate: waving through a typo must
+> never also wave through a boot-loop.
+>
+> The protections are real but bounded: the readiness warnings, the
+> brick-risk `danger:` blacklist, the `agenda_check` dry run, and a
+> second qualified reader. None of them *understands* your agenda;
+> `simple_sat_ops` carries bytes, it does not vet missions, and it is not
+> designed to keep you from bricking the satellite. (It cannot: there are
+> days a satellite needs to be bricked on purpose - a deliberate reflash,
+> an end-of-life passivation - which is why the blacklist is a gate you
+> can open, not a wall. We are mostly joking. Mostly.) The rule is the
+> dull one - never fly a file you do not fully understand, and have
+> someone who knows the spacecraft vet anything that carries a warning.
 
 ### Rotator calibration (`--calibrate-rotator`)
 
@@ -1619,21 +1652,62 @@ satellite would do with the same bytes:
 * the firmware length limits, and
 * well-formed `@tssent=` / `@tsexec=` timestamps.
 
-Findings print to stderr as `line N: error: ...` or `line N:
-warning: ...`; an error additionally tags its line `ERROR>` (bold
-bright red on a terminal, plain text when piped) in the listing,
-which otherwise stays grep-friendly. A command not meant for
-routine flight operation - ground-only, high-risk, recovery/expert, or
-flight-testing - is a *warning*, not an error. `--no-tc-lint` disables
-the check. `--errors-only` flips the output around: it prints just the
-erroneous lines (number, command, and reason) to stdout and suppresses
-the echoed agenda, so the errors in a long agenda don't scroll away.
+Findings come in three severities, printed to stderr as `line N:
+warning|error|danger: ...`:
 
-The same lint gates `simple_sat_ops` startup: a `--tc-file` agenda with
-lint errors refuses to start unless you pass
-`--ignore-at-your-peril-all-tc-errors` (see [Command-line
-options](#command-line-options)). To regenerate the command table after
-a firmware change, see the header of `scripts/gen_tcmd_spec.py`.
+* **warning** - the satellite would run it, but it is worth a second
+  look: a command not meant for routine flight operation (ground-only,
+  high-risk, recovery/expert, or flight-testing), or a line too long for
+  one radio frame. Warnings never block.
+* **error** - the satellite's own parser would reject or mis-parse it:
+  bad framing, an unknown name, the wrong argument count, an over-length
+  line, a malformed timestamp. The line is tagged `ERROR>` (bold bright
+  red on a terminal, plain text when piped) in the listing.
+* **danger** - a perfectly well-formed command, one the satellite would
+  accept without complaint, that is on a ground-side *brick-risk
+  blacklist*. It is tagged `DANGER>` and ranks above an error, because
+  the problem isn't the bytes - it's what running them does.
+
+The blacklist is short and is the one check that does not mirror the
+firmware parser; it is ground policy. Its first (and at the time of
+writing only) entry is any command that names the boot-time agenda file
+`default_tcmd_agenda.txt` - the file the satellite loads into its agenda
+queue on every boot. Arm it with crashing commands and the spacecraft
+can boot-loop forever (see the worked example under [Populating a
+`--tc-file`](#populating-a---tc-file-for-auto-commanding)). The match is
+on the filename substring alone, so it catches the command whichever way
+it is written - `fs_write_file_str`, `fs_write_file_hex`,
+`agenda_enqueue_from_file`, even `fs_delete_file` - none of which would
+otherwise raise so much as a warning.
+
+`--no-tc-lint` disables the check entirely. `--errors-only` flips the
+output around: it prints just the error/danger lines (number, command,
+and reason) to stdout and suppresses the echoed agenda, so the serious
+findings in a long agenda don't scroll away.
+
+The same lint gates `simple_sat_ops` startup, and the two blocking
+severities have *separate* override gates so that accepting one never
+silently accepts the other:
+
+* lint **errors** refuse startup unless you pass
+  `--ignore-at-your-peril-all-tc-errors`, and
+* a **danger** finding refuses startup unless you pass
+  `--ignore-at-your-peril-dangerous-tcmds`.
+
+A word on what this is and isn't: the linter is a tripwire, not a
+safety harness. `simple_sat_ops` is not designed to prevent you from
+bricking the satellite, and it could not if it tried - it carries bytes;
+it does not second-guess the mission. The blacklist catches the one
+foot-gun we know the name of and makes you say "yes, really" before it
+goes up. And sometimes "yes, really" is the right answer: there are
+days when a satellite genuinely needs to be bricked on purpose - a
+deliberate reflash, an end-of-life passivation, a recovery move that
+looks destructive because it is - which is exactly why the gate is a
+gate and not a wall. (We are, of course, mostly joking. Mostly.)
+
+To regenerate the command table after a firmware change, see the header
+of `scripts/gen_tcmd_spec.py`; to add an entry to the brick-risk
+blacklist, see `tcmd_dangerous_substrings[]` in `src/proto/tcmd_lint.c`.
 
 ## Offline analysis tools
 
@@ -2390,7 +2464,10 @@ operate. The startup telecommand lint reads your `--tc-file`, parses
 each line the same way the flight firmware does, and refuses to fully
 start if any line is malformed or over the radio length limit, unless
 you override with `--ignore-at-your-peril-all-tc-errors` (the name is
-the warning). The framing layer's 223-byte refusal then sits underneath
+the warning). It also refuses on a brick-risk `danger:` finding, behind
+a second, deliberately separate override
+`--ignore-at-your-peril-dangerous-tcmds`, so accepting a typo never also
+accepts a boot-loop. The framing layer's 223-byte refusal then sits underneath
 the auto-telecommand and compose paths as a last line of defence. The
 practical consequence: a command that is too long, mistyped, or
 unsigned does not become a corrupted transmission - it becomes a

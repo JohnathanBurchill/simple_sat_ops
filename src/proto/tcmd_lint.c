@@ -59,6 +59,32 @@ static int is_name_char(char c)
     return isalnum((unsigned char) c) || c == '_';
 }
 
+// Ground-policy brick-risk blacklist. Each entry is a literal substring to
+// look for anywhere in the command text, with a one-line reason shown to the
+// operator. Unlike everything else in this file, these are NOT mirrored from
+// the firmware parser -- the satellite would accept these commands without
+// complaint. They are ground policy: commands known to be able to wedge the
+// spacecraft, caught here because nothing else would.
+//
+// default_tcmd_agenda.txt is the firmware's default boot-time agenda file
+// (TCMD_active_agenda_filename_default_file); whatever it contains is loaded
+// into the agenda queue on every STM32 boot. A command that creates,
+// overwrites, or enqueues it can boot-loop the satellite if the contents ever
+// crash, so any command that so much as names it is flagged. The match is on
+// the substring alone, so it catches every command that references the file
+// (fs_write_file_str, fs_write_file_hex, agenda_enqueue_from_file, ...),
+// regardless of the command's own readiness level. (Issue #43.)
+static const struct {
+    const char *substr;
+    const char *why;
+} tcmd_dangerous_substrings[] = {
+    { "default_tcmd_agenda.txt",
+      "names the boot-time agenda 'default_tcmd_agenda.txt'; bad contents "
+      "would boot-loop the satellite" },
+};
+#define TCMD_DANGEROUS_SUBSTR_COUNT \
+    (sizeof tcmd_dangerous_substrings / sizeof tcmd_dangerous_substrings[0])
+
 // Per-argument-type validators. Each mirrors the corresponding firmware
 // extractor in telecommand_args_helpers.c and answers one question: would the
 // satellite's parser accept this token? They are deliberately conservative --
@@ -208,6 +234,18 @@ tcmd_lint_severity_t tcmd_lint_command(const char *cmd, char *msg, size_t msg_ca
         flag(msg, msg_cap, &len, &worst, TCMD_LINT_WARN, m);
     }
 
+    // Ground brick-risk blacklist. Checked on the whole command text, before
+    // the structural checks below (which may bail early), so a dangerous
+    // command is always caught even if it is also malformed. A hit is the
+    // top severity -- the satellite would run this command fine; the danger
+    // is what running it does.
+    for (size_t b = 0; b < TCMD_DANGEROUS_SUBSTR_COUNT; ++b) {
+        if (strstr(cmd, tcmd_dangerous_substrings[b].substr)) {
+            flag(msg, msg_cap, &len, &worst, TCMD_LINT_DANGER,
+                 tcmd_dangerous_substrings[b].why);
+        }
+    }
+
     // Prefix.
     if (n <= TCMD_PREFIX_LEN || strncmp(cmd, TCMD_PREFIX, TCMD_PREFIX_LEN) != 0) {
         flag(msg, msg_cap, &len, &worst, TCMD_LINT_ERROR, "missing 'CTS1+' prefix");
@@ -351,17 +389,18 @@ tcmd_lint_severity_t tcmd_lint_command(const char *cmd, char *msg, size_t msg_ca
     return worst;
 }
 
-int tcmd_lint_file(const char *path, FILE *out, int *warn_count)
+int tcmd_lint_file(const char *path, FILE *out, int *warn_count, int *danger_count)
 {
     FILE *f = fopen(path, "r");
     if (!f) {
         fprintf(out, "tcmd lint: cannot open %s: %s\n", path, strerror(errno));
         if (warn_count) *warn_count = 0;
+        if (danger_count) *danger_count = 0;
         return -1;
     }
 
     char line[4096];
-    int lineno = 0, errors = 0, warns = 0;
+    int lineno = 0, errors = 0, warns = 0, dangers = 0;
     while (fgets(line, sizeof line, f) != NULL) {
         ++lineno;
 
@@ -392,7 +431,10 @@ int tcmd_lint_file(const char *path, FILE *out, int *warn_count)
 
         char msg[512];
         tcmd_lint_severity_t sev = tcmd_lint_command(s, msg, sizeof msg);
-        if (sev == TCMD_LINT_ERROR) {
+        if (sev == TCMD_LINT_DANGER) {
+            ++dangers;
+            fprintf(out, "%s:%d: danger: %s\n", path, lineno, msg);
+        } else if (sev == TCMD_LINT_ERROR) {
             ++errors;
             fprintf(out, "%s:%d: error: %s\n", path, lineno, msg);
         } else if (sev == TCMD_LINT_WARN) {
@@ -403,5 +445,6 @@ int tcmd_lint_file(const char *path, FILE *out, int *warn_count)
     fclose(f);
 
     if (warn_count) *warn_count = warns;
+    if (danger_count) *danger_count = dangers;
     return errors;
 }
