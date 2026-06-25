@@ -1,13 +1,14 @@
-# Build the bundled sgp4sdp4 library, then build and run the
-# simple_sat_ops unit-test (*_selftest) suite on every push / PR.
+# Build and run the simple_sat_ops unit-test (*_selftest) suite on every
+# push / PR.
+#
+# sgp4sdp4 is vendored under sgp4sdp4/ and built as part of the main
+# CMake project via add_subdirectory — no separate install step needed.
 #
 # Only the dependencies the selftests actually need are installed:
 #   build-essential cmake pkg-config   -> toolchain + CMake
 #   libssl-dev                         -> ax100/tx_burst/packet_db (libcrypto)
 #   libsqlite3-dev                     -> packet_db
 #   libncurses-dev                     -> prediction_selftest (header only)
-# sgp4sdp4 headers (installed below)   -> prediction + ipc_fill + packet_db
-#                                         (they #include <sgp4sdp4.h> via ephemeres.h)
 #
 # Deliberately NOT installed (not needed to build/run the selftests, and
 # they make CI slow / can be flaky on hosted runners):
@@ -42,34 +43,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config \
             libssl-dev libsqlite3-dev libncurses-dev
-
-      # The bundled sgp4sdp4/ is a SEPARATE CMake project with no install()
-      # rule. The main build finds it via find_library(SGP4SDP4_LIB sgp4sdp4)
-      # + #include <sgp4sdp4.h>, both of which resolve against /usr/local on
-      # a default GCC. So: build the static lib, then drop the .a + .h into
-      # /usr/local/{lib,include}. This is the same end state as a manual
-      # build+install on the dev/ground machines.
-      #
-      # Cache key is the sha256 of every file under sgp4sdp4/, so the lib is
-      # only rebuilt when those sources change (it is a ~40 KB static lib;
-      # the build is a few seconds, but caching keeps the step near-instant).
-      - name: Cache built sgp4sdp4
-        id: cache-sgp4sdp4
-        uses: actions/cache@v5
-        with:
-          path: |
-            /usr/local/lib/libsgp4sdp4.a
-            /usr/local/include/sgp4sdp4.h
-          key: sgp4sdp4-${{ runner.os }}-${{ hashFiles('sgp4sdp4/**') }}
-
-      - name: Build and install sgp4sdp4
-        if: steps.cache-sgp4sdp4.outputs.cache-hit != 'true'
-        run: |
-          cmake -S sgp4sdp4 -B sgp4sdp4/build -DCMAKE_BUILD_TYPE=Release
-          cmake --build sgp4sdp4/build --parallel
-          sudo install -m 0644 sgp4sdp4/build/libsgp4sdp4.a /usr/local/lib/libsgp4sdp4.a
-          sudo install -m 0644 sgp4sdp4/sgp4sdp4.h          /usr/local/include/sgp4sdp4.h
-          sudo ldconfig || true
 
       - name: Configure
         run: |
