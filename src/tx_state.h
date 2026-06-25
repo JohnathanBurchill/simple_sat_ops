@@ -80,7 +80,7 @@ typedef struct tx_compose {
 typedef enum {
     AUTO_F_POWER = 0,
     AUTO_F_REPEATS,
-    AUTO_F_DELAY,
+    AUTO_F_INTERVAL,
     AUTO_F_ALLOW_TX,
     AUTO_F_COUNT,
 } auto_tcmd_field_t;
@@ -110,7 +110,11 @@ typedef struct auto_tcmd {
     // Editable fields (text-edit semantics shared with TX compose).
     char power[12];
     char repeats[8];
-    char delay_s[12];
+    // Minimum spacing between the START of consecutive sends, in seconds.
+    // The next send fires at max(send_start + interval, burst_done) — the
+    // interval overlaps the burst rather than adding to it. Clamped to a
+    // floor at run start (AUTO_TCMD_MIN_INTERVAL_S).
+    char interval_s[12];
     int  allow_tx;
     auto_tcmd_field_t focus;
     int               cursors[AUTO_F_COUNT];
@@ -120,7 +124,7 @@ typedef struct auto_tcmd {
     int    cmd_idx;        // index into commands[]
     int    repeat_idx;     // how many sends of commands[cmd_idx] so far
     int    repeats_total;  // parsed from repeats at start
-    double delay_s_val;    // parsed from delay_s at start
+    double interval_s_val; // parsed from interval_s at start (after floor clamp)
     long   next_send_ns;
     long   start_ns;       // wall-clock at run start, for elapsed TX time
     long   pause_ns;       // ts_now_ns() when paused; shifts start_ns on resume
@@ -185,6 +189,14 @@ typedef struct tx {
     // and resumes RX.
     tx_request_slot_t tx_request;
     int               tx_inflight;
+    // End-to-end burst timing. tx_burst_submit_ns is stamped (ts_now_ns) the
+    // moment a burst is handed to the worker; last_burst_wall_s is the measured
+    // submit->done wall-clock of the most recent burst (RX pause + UHD start
+    // lead + on-air frame + RX resume), or -1 before any burst has completed.
+    // Surfaced in the auto-tcmd modal + the tx-result audit so the operator can
+    // read the real per-burst floor on hardware.
+    long              tx_burst_submit_ns;
+    double            last_burst_wall_s;
     // Doppler-corrected uplink carrier (Hz), refreshed each tick from the
     // range rate; snapshotted by compose-preview / commit / auto-tcmd so a
     // burst is keyed where the satellite hears the nominal carrier. Seeded

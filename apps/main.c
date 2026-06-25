@@ -190,6 +190,10 @@ int main(int argc, char **argv)
     state.tx.sso_pass_tssent_ms = (sso_now_utc_ms() / 60000LL) * 60000LL;
 #endif
 
+    // No burst has completed yet — the measured per-burst wall-time reads as
+    // "--" until the first one lands. See tx_burst_service_request.
+    state.tx.last_burst_wall_s = -1.0;
+
     // Resolve + load the HMAC keyfile (feeds every TX burst's AX100 frame and
     // lights the operator banner). See apps/cli_args.c.
     cli_load_hmac_keyfile(&state.tx);

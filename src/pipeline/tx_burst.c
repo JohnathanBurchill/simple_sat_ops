@@ -38,6 +38,7 @@
 #include "tx_compose.h"     // emit_tx_event_local
 #include "sso_audit.h"
 #include "sso_ipc.h"        // SSO_TX_TEXT_MAX, SSO_EVT_TX_*
+#include "sso_time.h"       // ts_now_ns -- end-to-end burst timing
 #endif
 
 #include <ctype.h>
@@ -314,6 +315,10 @@ void tx_burst_service_request(state_t *state)
         const char *outcome = NULL;
         int  on_air = 0;
         int  finished = 0;        // emit the result + clear pending this tick
+        // Measured submit->done wall-clock of THIS burst, set only on the
+        // async-completion path below. Stays -1 on dry-run / reject exits so
+        // the audit line doesn't carry a stale time. See state->tx.last_burst_wall_s.
+        double burst_wall_s = -1.0;
         if (state->tx.tx_dry_run) {
             snprintf(summary, sizeof summary, "%s",
                      state->tx.tx_request.summary);
@@ -340,6 +345,9 @@ void tx_burst_service_request(state_t *state)
                 if (rx_session_submit_burst(state->sdr.rx_session, &state->tx.tx_request,
                                              state->tx.hmac_key, state->tx.hmac_key_len) == 0) {
                     state->tx.tx_inflight = 1;
+                    // Stamp the handoff so the poll-done transition below can
+                    // report the real end-to-end burst time on hardware.
+                    state->tx.tx_burst_submit_ns = ts_now_ns();
                     // Stay pending; we'll poll on subsequent ticks.
                 } else {
                     // Worker refused (slot already busy or rxs error).
@@ -364,6 +372,14 @@ void tx_burst_service_request(state_t *state)
                     }
                     state->tx.tx_inflight = 0;
                     finished = 1;
+                    // Real submit->done wall-time of this burst (RX pause +
+                    // UHD start lead + on-air frame + RX resume). Surfaced in
+                    // the auto-tcmd modal + the audit so the operator can read
+                    // the per-burst floor that bounds the inter-send interval.
+                    if (state->tx.tx_burst_submit_ns > 0) {
+                        burst_wall_s = (double)(ts_now_ns() - state->tx.tx_burst_submit_ns) * 1e-9;
+                        state->tx.last_burst_wall_s = burst_wall_s;
+                    }
                 }
                 // else: still in flight; fall through and let the
                 // rest of the main loop run.
@@ -391,9 +407,15 @@ void tx_burst_service_request(state_t *state)
             // reached the air (on_air=1 means the burst left the radio).
             {
                 char det[512];
-                snprintf(det, sizeof det,
-                         "outcome=\"%.80s\" on_air=%d summary=\"%.300s\"",
-                         outcome ? outcome : "?", on_air, summary);
+                if (burst_wall_s >= 0.0) {
+                    snprintf(det, sizeof det,
+                             "outcome=\"%.80s\" on_air=%d burst_wall_s=%.3f summary=\"%.300s\"",
+                             outcome ? outcome : "?", on_air, burst_wall_s, summary);
+                } else {
+                    snprintf(det, sizeof det,
+                             "outcome=\"%.80s\" on_air=%d summary=\"%.300s\"",
+                             outcome ? outcome : "?", on_air, summary);
+                }
                 sso_audit_event("tx-result", det);
             }
             state->tx.tx_request.pending = 0;

@@ -43,7 +43,7 @@
 // Loaded via --tc-file=<path>; opened with 'A' (or `:auto`) from the
 // operator UI. Each non-blank, non-comment line in the file is one
 // CTS1+ telecommand. The operator picks TX power, how many times each
-// command should be sent, and the inter-send delay. Once started the
+// command should be sent, and the inter-send interval. Once started the
 // modal's tick runs alongside the main loop — non-blocking, like the
 // TX compose modal — and queues one state->tx.tx_request per shot, advancing
 // through the file. Stops automatically when the satellite drops
@@ -53,6 +53,15 @@
 // auto_tcmd_field_t, auto_tcmd_state_t and auto_tcmd_t now live in
 // state.h. The live modal state (active flag, window, the auto_tcmd_t
 // run state, and the --tc-file path) are fields on state_t.
+
+// Minimum spacing between the START of consecutive sends, in seconds. A
+// half-duplex burst already occupies ~1.3+ s end to end (RX pause + UHD
+// start lead + on-air frame + RX resume; see tx_burst.c), so a typed
+// interval below this floor would never be honoured anyway. Clamping at
+// run start, and saying so in the status line, keeps the readout honest
+// rather than silently ignoring a too-small number. The operator can read
+// the real measured per-burst time off the modal (last_burst_wall_s).
+#define AUTO_TCMD_MIN_INTERVAL_S 1.0
 
 // Wall-clock seconds one auto-tcmd send occupies, end to end. Mirrors
 // the framing and the fixed timing in tx_burst.c's build_iq / tx_burst_run:
@@ -71,7 +80,7 @@
 // and blocks until it completes, so each send is inhibited for the whole
 // span -- leaving it out is most of the per-burst underestimate. auto-tcmd
 // sends one burst per shot (repeat=1); the repeat count and inter-send
-// delay are folded in by the caller, so this stays a per-send quantum.
+// interval are folded in by the caller, so this stays a per-send quantum.
 static double auto_tcmd_burst_seconds(state_t *state, size_t payload_len) {
     const double start_delay_s = 0.500;   // tx_burst.c start_delay_s
     const double preroll_s     = (double) state->tx.tx_preroll_ms * 1e-3;
@@ -220,7 +229,7 @@ int auto_tcmd_progress(tx_t *tx, int *sent, int *total, const char **label) {
 }
 
 int auto_field_is_text(auto_tcmd_field_t f) {
-    return f == AUTO_F_POWER || f == AUTO_F_REPEATS || f == AUTO_F_DELAY;
+    return f == AUTO_F_POWER || f == AUTO_F_REPEATS || f == AUTO_F_INTERVAL;
 }
 static int auto_field_is_toggle(auto_tcmd_field_t f) {
     return f == AUTO_F_ALLOW_TX;
@@ -228,15 +237,15 @@ static int auto_field_is_toggle(auto_tcmd_field_t f) {
 
 static char *auto_field_buf(auto_tcmd_t *a, auto_tcmd_field_t f, size_t *cap) {
     switch (f) {
-        case AUTO_F_POWER:   *cap = sizeof a->power;   return a->power;
-        case AUTO_F_REPEATS: *cap = sizeof a->repeats; return a->repeats;
-        case AUTO_F_DELAY:   *cap = sizeof a->delay_s; return a->delay_s;
-        default:             *cap = 0; return NULL;
+        case AUTO_F_POWER:    *cap = sizeof a->power;      return a->power;
+        case AUTO_F_REPEATS:  *cap = sizeof a->repeats;    return a->repeats;
+        case AUTO_F_INTERVAL: *cap = sizeof a->interval_s; return a->interval_s;
+        default:              *cap = 0; return NULL;
     }
 }
 
 static int auto_field_char_ok(auto_tcmd_field_t f, int ch) {
-    if (f == AUTO_F_POWER || f == AUTO_F_DELAY) {
+    if (f == AUTO_F_POWER || f == AUTO_F_INTERVAL) {
         return (ch >= '0' && ch <= '9') || ch == '.' || ch == '-';
     }
     if (f == AUTO_F_REPEATS) {
@@ -367,11 +376,19 @@ static void auto_tcmd_draw(state_t *state) {
     mvwprintw(w, 4, 24, "per command (TCM1 Nx, then TCM2 Nx, ...)");
     wclrtoeol(w);
 
-    auto_draw_text_field(w, 5, 2, "Delay    ",
-                         a->delay_s, 8,
-                         !running_ro && a->focus == AUTO_F_DELAY,
-                         a->cursors[AUTO_F_DELAY]);
-    mvwprintw(w, 5, 24, "s between every send");
+    auto_draw_text_field(w, 5, 2, "Interval ",
+                         a->interval_s, 8,
+                         !running_ro && a->focus == AUTO_F_INTERVAL,
+                         a->cursors[AUTO_F_INTERVAL]);
+    // Show the real measured per-burst wall-time next to the interval the
+    // operator is setting, so the floor is grounded in hardware rather than
+    // guessed. Reads "--" until the first burst of the session completes.
+    if (state->tx.last_burst_wall_s >= 0.0) {
+        mvwprintw(w, 5, 24, "s min between send starts  (last burst %.2f s)",
+                  state->tx.last_burst_wall_s);
+    } else {
+        mvwprintw(w, 5, 24, "s min between send starts  (last burst --)");
+    }
     wclrtoeol(w);
 
     char tg[8];
@@ -442,10 +459,10 @@ static void auto_tcmd_draw(state_t *state) {
             int cur = a->cursors[AUTO_F_REPEATS];
             int vis = (cur > 5) ? 5 : cur;
             wmove(w, 4, 2 + 9 + vis);   // "Repeats  " is 9 chars
-        } else if (a->focus == AUTO_F_DELAY) {
-            int cur = a->cursors[AUTO_F_DELAY];
+        } else if (a->focus == AUTO_F_INTERVAL) {
+            int cur = a->cursors[AUTO_F_INTERVAL];
             int vis = (cur > 7) ? 7 : cur;
-            wmove(w, 5, 2 + 9 + vis);   // "Delay    " is 9 chars
+            wmove(w, 5, 2 + 9 + vis);   // "Interval " is 9 chars
         }
     }
     wrefresh(w);
@@ -504,12 +521,12 @@ static int auto_tcmd_reload(state_t *state) {
              state->tx.auto_tcmd_file_path);
     snprintf(state->tx.auto_tcmd.power,   sizeof state->tx.auto_tcmd.power,   "80.0");
     snprintf(state->tx.auto_tcmd.repeats, sizeof state->tx.auto_tcmd.repeats, "3");
-    snprintf(state->tx.auto_tcmd.delay_s, sizeof state->tx.auto_tcmd.delay_s, "2.0");
+    snprintf(state->tx.auto_tcmd.interval_s, sizeof state->tx.auto_tcmd.interval_s, "1.0");
     state->tx.auto_tcmd.allow_tx = 0;
     state->tx.auto_tcmd.focus    = AUTO_F_POWER;
-    state->tx.auto_tcmd.cursors[AUTO_F_POWER]   = (int) strlen(state->tx.auto_tcmd.power);
-    state->tx.auto_tcmd.cursors[AUTO_F_REPEATS] = (int) strlen(state->tx.auto_tcmd.repeats);
-    state->tx.auto_tcmd.cursors[AUTO_F_DELAY]   = (int) strlen(state->tx.auto_tcmd.delay_s);
+    state->tx.auto_tcmd.cursors[AUTO_F_POWER]    = (int) strlen(state->tx.auto_tcmd.power);
+    state->tx.auto_tcmd.cursors[AUTO_F_REPEATS]  = (int) strlen(state->tx.auto_tcmd.repeats);
+    state->tx.auto_tcmd.cursors[AUTO_F_INTERVAL] = (int) strlen(state->tx.auto_tcmd.interval_s);
     state->tx.auto_tcmd.state    = AUTO_STATE_SETUP;
     if (state->tx.auto_tcmd.lint_errors > 0 && !state->tx.ignore_tc_errors) {
         snprintf(state->tx.auto_tcmd.status_msg, sizeof state->tx.auto_tcmd.status_msg,
@@ -622,45 +639,59 @@ static int auto_tcmd_start(state_t *state) {
                  "rejected: repeats must be >= 1");
         return -1;
     }
-    double delay = atof(a->delay_s);
-    if (delay < 0.0) {
+    double interval = atof(a->interval_s);
+    if (interval < 0.0) {
         snprintf(a->status_msg, sizeof a->status_msg,
-                 "rejected: delay must be >= 0");
+                 "rejected: interval must be >= 0");
         return -1;
     }
-    a->repeats_total = repeats;
-    a->delay_s_val   = delay;
+    // A half-duplex burst can't be spaced tighter than its own wall-time;
+    // clamp to the floor and tell the operator rather than silently honour a
+    // smaller number. Note it for the status line set further down.
+    int interval_floored = 0;
+    if (interval < AUTO_TCMD_MIN_INTERVAL_S) {
+        interval = AUTO_TCMD_MIN_INTERVAL_S;
+        interval_floored = 1;
+    }
+    a->repeats_total  = repeats;
+    a->interval_s_val = interval;
     a->cmd_idx       = 0;
     a->repeat_idx    = 0;
     a->sends_total   = 0;
     a->tx_seconds_spent = 0.0;
     // Wall-clock estimate for the whole run. auto_tcmd_tick spaces sends
-    // by max(delay, burst): it waits `delay` measured from the start of
-    // each send AND for that send's burst to clear, so the delay and the
+    // by max(interval, burst): it waits `interval` measured from the start of
+    // each send AND for that send's burst to clear, so the interval and the
     // burst overlap rather than add. Every command is sent `repeats`
-    // times; only the final send has no trailing delay.
+    // times; only the final send has no trailing interval.
     a->tx_seconds_total = 0.0;
     double last_burst = 0.0;
     for (int i = 0; i < a->n_commands; ++i) {
         double burst = auto_tcmd_burst_seconds(state, strlen(a->commands[i]));
-        double slot  = (burst > delay) ? burst : delay;
+        double slot  = (burst > interval) ? burst : interval;
         a->tx_seconds_total += slot * (double) repeats;
         last_burst = burst;
     }
-    if (a->n_commands > 0 && delay > last_burst)
-        a->tx_seconds_total -= (delay - last_burst);
+    if (a->n_commands > 0 && interval > last_burst)
+        a->tx_seconds_total -= (interval - last_burst);
     a->start_ns      = ts_now_ns();
     a->next_send_ns  = a->start_ns;  // first send fires immediately
     a->state         = AUTO_STATE_RUNNING;
-    snprintf(a->status_msg, sizeof a->status_msg,
-             "running: %d cmds x %d repeats, %.2f s delay",
-             a->n_commands, repeats, delay);
+    if (interval_floored) {
+        snprintf(a->status_msg, sizeof a->status_msg,
+                 "running: %d cmds x %d repeats, interval raised to %.1f s floor",
+                 a->n_commands, repeats, interval);
+    } else {
+        snprintf(a->status_msg, sizeof a->status_msg,
+                 "running: %d cmds x %d repeats, %.2f s interval",
+                 a->n_commands, repeats, interval);
+    }
     {
         char det[256];
         snprintf(det, sizeof det,
-                 "n_commands=%d repeats=%d delay_s=%.2f "
+                 "n_commands=%d repeats=%d interval_s=%.2f "
                  "allow_tx=%d power=%.100s file=\"%.100s\"",
-                 a->n_commands, repeats, delay, a->allow_tx,
+                 a->n_commands, repeats, interval, a->allow_tx,
                  a->power, a->file_path);
         sso_audit_event("auto-tcmd-start", det);
     }
@@ -699,9 +730,9 @@ static void auto_tcmd_pause(state_t *state) {
     char det[256];
     snprintf(det, sizeof det,
              "cmd_idx=%d/%d repeat_idx=%d/%d sends_total=%d "
-             "power=%.20s delay_s=%.2f file=\"%.100s\"",
+             "power=%.20s interval_s=%.2f file=\"%.100s\"",
              a->cmd_idx + 1, a->n_commands, a->repeat_idx, a->repeats_total,
-             a->sends_total, a->power, a->delay_s_val, a->file_path);
+             a->sends_total, a->power, a->interval_s_val, a->file_path);
     auto_tcmd_log(state, "auto-tcmd-pause", det);
 }
 
@@ -873,7 +904,7 @@ int auto_tcmd_handle_key(state_t *state, int key) {
 }
 
 // Per-tick burst driver. When running, queues one state->tx.tx_request when
-// (a) the previous burst has cleared, and (b) the inter-send delay
+// (a) the previous burst has cleared, and (b) the inter-send interval
 // has elapsed. Stops automatically on LOS so an unattended run won't
 // keep TXing after the pass. emit_tx_event_local fires from the main
 // loop's burst-handler the same way it does for the manual TX
@@ -884,7 +915,7 @@ void auto_tcmd_tick(state_t *state) {
     if (a->state != AUTO_STATE_RUNNING) return;
 
     // Elapsed wall-clock since the run started, capped at the estimate,
-    // so the Progress line reads elapsed/total (inter-send delays and the
+    // so the Progress line reads elapsed/total (inter-send intervals and the
     // burst start lead included) rather than on-air seconds only. Frozen
     // automatically once the state leaves RUNNING -- this returns early then.
     {
@@ -948,8 +979,8 @@ void auto_tcmd_tick(state_t *state) {
         a->cmd_idx++;
         a->repeat_idx   = 0;
         // A skipped command keys nothing, so don't make the run idle the
-        // inter-send delay over it -- advance to the next command on the
-        // following tick. The delay paces actual transmissions, not no-ops.
+        // inter-send interval over it -- advance to the next command on the
+        // following tick. The interval paces actual transmissions, not no-ops.
         a->next_send_ns = now;
         auto_tcmd_draw(state);
         return;
@@ -968,8 +999,8 @@ void auto_tcmd_tick(state_t *state) {
         a->cmd_idx++;
         a->repeat_idx   = 0;
         // A skipped command keys nothing, so don't make the run idle the
-        // inter-send delay over it -- advance to the next command on the
-        // following tick. The delay paces actual transmissions, not no-ops.
+        // inter-send interval over it -- advance to the next command on the
+        // following tick. The interval paces actual transmissions, not no-ops.
         a->next_send_ns = now;
         auto_tcmd_draw(state);
         return;
@@ -1017,7 +1048,7 @@ void auto_tcmd_tick(state_t *state) {
         a->repeat_idx = 0;
     }
 
-    a->next_send_ns = now + (long)(a->delay_s_val * 1e9);
+    a->next_send_ns = now + (long)(a->interval_s_val * 1e9);
     auto_tcmd_draw(state);
 #else
     (void) state;
