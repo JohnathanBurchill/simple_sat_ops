@@ -58,6 +58,7 @@
 #include "argparse.h"
 #include "packet_db.h"
 #include "sso_paths.h"
+#include "tcmd_response.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -545,13 +546,8 @@ static void run_query(sqlite3 *db)
 // success, 0 if the row isn't a tcmd_response with enough bytes.
 static int row_ts_sent(const row_t *r, uint64_t *out_ms)
 {
-    if (r == NULL || r->payload == NULL || r->payload_len < 9) return 0;
-    if (r->packet_type != 0x04) return 0;
-    uint64_t v = 0;
-    for (int i = 0; i < 8; i++)
-        v |= (uint64_t)r->payload[1 + i] << (8 * i);
-    *out_ms = v;
-    return 1;
+    if (r == NULL || r->packet_type != TCMD_RESP_PACKET_TYPE) return 0;
+    return tcmd_resp_ts_sent_u64(r->payload, (size_t) r->payload_len, out_ms) == 0;
 }
 
 // Format a unix-ms instant as "YYYY-MM-DDTHH:MM:SSZ" (UTC, second
@@ -683,16 +679,14 @@ static void build_group(sqlite3 *db)
     group_n = 0;
     group_confirmed_n = 0;
 
-    uint64_t ts_ms = 0;
-    for (int i = 0; i < 8; i++) ts_ms |= (uint64_t)group_key[i] << (8 * i);
+    uint64_t ts_ms = tcmd_resp_key_to_u64(group_key);
 
     // Confirmed: every tcmd_response sharing this exact ts_sent, in
-    // response-sequence order (substr(payload,13,1) is response_seq_num),
-    // then by arrival time.
+    // response-sequence order (response_seq_num), then by arrival time.
     group_append(db,
         PACKET_SELECT_COLS
-        "FROM packet WHERE packet_type=4 AND substr(payload,2,8)=?1 "
-        "ORDER BY substr(payload,13,1), ts_received",
+        "FROM packet WHERE " TCMD_RESP_SQL_IS " AND " TCMD_RESP_SQL_TS_SENT "=?1 "
+        "ORDER BY " TCMD_RESP_SQL_SEQ ", ts_received",
         bind_group_confirmed, NULL);
     group_confirmed_n = group_n;
 
@@ -754,7 +748,7 @@ static void enter_group(sqlite3 *db)
     if (!row_ts_sent(&rows[sel], &ts_ms)) return;  // not a decodable response
     // Save the join key + run from the selected response, then build the
     // group from those alone (so a reload doesn't depend on a live row).
-    for (int i = 0; i < 8; i++) group_key[i] = rows[sel].payload[1 + i];
+    tcmd_resp_ts_sent(rows[sel].payload, (size_t) rows[sel].payload_len, group_key);
     snprintf(group_run, sizeof group_run, "%s", rows[sel].run);
     main_sel = sel; main_top = top; main_n = n_rows;
     build_group(db);
@@ -770,16 +764,14 @@ static void leave_group(void)
     in_group = 0;
 }
 
-// Firmware packet geometry (mirrors beacon_cts1.h; defined locally so the
-// browser doesn't pull in the firmware-struct header). Canonical for the
-// whole file — used here, by payload_content_span, and by draw_recon.
+// Firmware packet geometry for bulk_file (mirrors beacon_cts1.h; defined
+// locally so the browser doesn't pull in the firmware-struct header). The
+// tcmd_response geometry lives in the standalone tcmd_response.h, included
+// above, as TCMD_RESP_*.
 #define BULK_FILE_PACKET_TYPE      0x10
 #define BULK_FILE_HEADER_SIZE      5     // packet_type(1) + file_offset(4)
 #define BULK_FILE_MAX_DATA         195   // COMMS_BULK_FILE_..._MAX_DATA_..._PER_PACKET
 #define BULK_FILE_MAX_PLAUSIBLE    (2 * 1024 * 1024)  // firmware caps a download at 1 MB
-#define TCMD_RESPONSE_PACKET_TYPE  0x04
-#define TCMD_RESPONSE_HEADER_SIZE  14    // type+ts_sent+code+dur+seq+max_seq
-#define TCMD_RESPONSE_MAX_DATA     186   // COMMS_TCMD_RESPONSE_..._PER_PACKET
 #define CSP_CRC32_TRAILER_BYTES    4     // firmware appends, ground leaves in
 
 // The firmware appends a 4-byte CSP CRC32 trailer to every downlink packet and
@@ -792,10 +784,10 @@ static void leave_group(void)
 // real message bytes.
 static void trim_tcmd_crc_trailer(row_t *r)
 {
-    if (r->packet_type != TCMD_RESPONSE_PACKET_TYPE || r->payload == NULL)
+    if (r->packet_type != TCMD_RESP_PACKET_TYPE || r->payload == NULL)
         return;
-    int data_len = r->payload_len - TCMD_RESPONSE_HEADER_SIZE;
-    if (data_len <= TCMD_RESPONSE_MAX_DATA) return;   // no room for a trailer
+    int data_len = r->payload_len - TCMD_RESP_HDR_LEN;
+    if (data_len <= TCMD_RESP_MAX_DATA) return;   // no room for a trailer
 
     char *line = strstr(r->summary, "tcmd_response: data (");
     if (line == NULL) return;
@@ -805,7 +797,7 @@ static void trim_tcmd_crc_trailer(row_t *r)
     if (content == NULL) return;
     content += 4;   // step past `): "`
 
-    int trailer = shown - TCMD_RESPONSE_MAX_DATA;     // trailer bytes that got shown
+    int trailer = shown - TCMD_RESP_MAX_DATA;         // trailer bytes that got shown
     if (trailer <= 0) return;
     if (trailer > CSP_CRC32_TRAILER_BYTES) trailer = CSP_CRC32_TRAILER_BYTES;
     if ((int)strlen(content) < shown) return;         // summary was truncated; leave it
@@ -1088,15 +1080,15 @@ static void recon_build_tcmd(sqlite3 *db)
     recon_free();
     recon_kind = RECON_TCMD;
     recon_status[0] = '\0';
-    if (rows[sel].payload == NULL || rows[sel].payload_len < TCMD_RESPONSE_HEADER_SIZE)
+    if (rows[sel].payload == NULL || rows[sel].payload_len < TCMD_RESP_HDR_LEN)
         return;
     uint8_t key[8];
-    memcpy(key, rows[sel].payload + 1, 8);   // ts_sent
+    tcmd_resp_ts_sent(rows[sel].payload, (size_t) rows[sel].payload_len, key);  // ts_sent
 
     const char *sql =
         "SELECT payload FROM packet "
-        "WHERE packet_type=4 AND substr(payload,2,8)=?1 "
-        "ORDER BY substr(payload,13,1), ts_received";
+        "WHERE " TCMD_RESP_SQL_IS " AND " TCMD_RESP_SQL_TS_SENT "=?1 "
+        "ORDER BY " TCMD_RESP_SQL_SEQ ", ts_received";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return;
     sqlite3_bind_blob(st, 1, key, 8, SQLITE_TRANSIENT);
@@ -1106,14 +1098,14 @@ static void recon_build_tcmd(sqlite3 *db)
     while (sqlite3_step(st) == SQLITE_ROW) {
         const uint8_t *pl = (const uint8_t *) sqlite3_column_blob(st, 0);
         int pl_len = sqlite3_column_bytes(st, 0);
-        if (pl == NULL || pl_len < TCMD_RESPONSE_HEADER_SIZE + 1) continue;
-        int seq = pl[12];
+        if (pl == NULL || pl_len < TCMD_RESP_HDR_LEN + 1) continue;
+        int seq = tcmd_resp_seq(pl, (size_t) pl_len);
         if (seq < 1) continue;
-        long dl = pl_len - TCMD_RESPONSE_HEADER_SIZE;
-        if (dl > TCMD_RESPONSE_MAX_DATA) dl = TCMD_RESPONSE_MAX_DATA;
-        long end = (long)(seq - 1) * TCMD_RESPONSE_MAX_DATA + dl;
+        long dl = (long) tcmd_resp_data_len((size_t) pl_len);
+        long end = (long)(seq - 1) * TCMD_RESP_MAX_DATA + dl;
         if (end > size) size = end;
-        if (pl[13] > maxseq) maxseq = pl[13];
+        int max_seq = tcmd_resp_max_seq(pl, (size_t) pl_len);
+        if (max_seq > maxseq) maxseq = max_seq;
     }
     if (recon_alloc(size) != 0) { sqlite3_finalize(st); return; }
 
@@ -1123,13 +1115,12 @@ static void recon_build_tcmd(sqlite3 *db)
     while (sqlite3_step(st) == SQLITE_ROW) {
         const uint8_t *pl = (const uint8_t *) sqlite3_column_blob(st, 0);
         int pl_len = sqlite3_column_bytes(st, 0);
-        if (pl == NULL || pl_len < TCMD_RESPONSE_HEADER_SIZE + 1) continue;
-        int seq = pl[12];
+        if (pl == NULL || pl_len < TCMD_RESP_HDR_LEN + 1) continue;
+        int seq = tcmd_resp_seq(pl, (size_t) pl_len);
         if (seq < 1) continue;
-        long dl = pl_len - TCMD_RESPONSE_HEADER_SIZE;
-        if (dl > TCMD_RESPONSE_MAX_DATA) dl = TCMD_RESPONSE_MAX_DATA;
-        recon_place((long)(seq - 1) * TCMD_RESPONSE_MAX_DATA,
-                    pl + TCMD_RESPONSE_HEADER_SIZE, dl);
+        long dl = (long) tcmd_resp_data_len((size_t) pl_len);
+        recon_place((long)(seq - 1) * TCMD_RESP_MAX_DATA,
+                    pl + TCMD_RESP_HDR_LEN, dl);
         chunks++;
     }
     sqlite3_finalize(st);
@@ -1148,7 +1139,7 @@ static void enter_recon(sqlite3 *db)
 {
     int pt = rows[sel].packet_type;
     if (pt == BULK_FILE_PACKET_TYPE)        recon_build_bulk(db);
-    else if (pt == TCMD_RESPONSE_PACKET_TYPE) recon_build_tcmd(db);
+    else if (pt == TCMD_RESP_PACKET_TYPE) recon_build_tcmd(db);
     else return;
     if (recon_buf == NULL || recon_len == 0) { recon_free(); return; }
     recon_scroll = 0;
@@ -2306,7 +2297,7 @@ int main(int argc, char **argv)
                 // No-op on other rows.
                 if (rows[sel].packet_type == BULK_FILE_PACKET_TYPE)
                     enter_recon(db);
-                else if (rows[sel].packet_type == TCMD_RESPONSE_PACKET_TYPE) {
+                else if (rows[sel].packet_type == TCMD_RESP_PACKET_TYPE) {
                     if (in_group) enter_recon(db);
                     else          enter_group(db);
                 }

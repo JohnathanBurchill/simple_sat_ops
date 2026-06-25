@@ -21,13 +21,11 @@
 #include "gnss_frag.h"
 
 #include "beacon_cts1.h"
+#include "tcmd_response.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-#define TCMD_HDR      COMMS_TCMD_RESPONSE_HEADER_SIZE
-#define TCMD_MAXDATA  COMMS_TCMD_RESPONSE_PACKET_MAX_DATA_BYTES_PER_PACKET
 
 int gnss_starts_with(const char *s, const char *p)
 {
@@ -63,12 +61,12 @@ int gnss_reassemble(const gnss_frag_t *frags, int n, unsigned char *buf, int buf
     int total = 0;
     memset(buf, 0, (size_t)bufcap);
     for (int i = 0; i < n; ++i) {
-        int dl = frags[i].payload_len - TCMD_HDR;
+        int dl = frags[i].payload_len - TCMD_RESP_HDR_LEN;
         if (dl < 0) dl = 0;
-        if (dl > TCMD_MAXDATA) dl = TCMD_MAXDATA;
-        int off = (frags[i].seq - 1) * TCMD_MAXDATA;
+        if (dl > TCMD_RESP_MAX_DATA) dl = TCMD_RESP_MAX_DATA;
+        int off = (frags[i].seq - 1) * TCMD_RESP_MAX_DATA;
         if (off < 0 || off + dl > bufcap) continue;
-        memcpy(buf + off, frags[i].payload + TCMD_HDR, (size_t)dl);
+        memcpy(buf + off, frags[i].payload + TCMD_RESP_HDR_LEN, (size_t)dl);
         if (off + dl > total) total = off + dl;
     }
     if (total >= bufcap) total = bufcap - 1;

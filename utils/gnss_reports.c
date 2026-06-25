@@ -42,6 +42,7 @@
 #include "gnss_frag.h"
 #include "packet_db.h"
 #include "sso_version.h"
+#include "tcmd_response.h"
 
 #include <ctype.h>
 #include <stdint.h>
@@ -63,13 +64,6 @@ int main(int argc, char **argv)
 #else
 
 #include <sqlite3.h>
-
-// tcmd_response packet layout (see src/beacon/beacon_cts1.h): a 14-byte
-// header (packet_type, ts_sent[8], code, duration, seq, max_seq) then up to
-// 186 data bytes. ts_sent occupies payload[1..8]; seq is payload[12].
-#define TCMD_TYPE        0x04
-#define TCMD_HDR         COMMS_TCMD_RESPONSE_HEADER_SIZE
-#define TCMD_MAXDATA     COMMS_TCMD_RESPONSE_PACKET_MAX_DATA_BYTES_PER_PACKET
 
 // Format a unix-ms timestamp as ISO-8601 UTC with milliseconds.
 static void fmt_epoch_ms(uint64_t ms, char *out, size_t outn)
@@ -419,15 +413,15 @@ int main(int argc, char **argv)
     const char *sql =
         "SELECT id, ts_received, payload FROM packet "
         "WHERE packet_type=?1 AND length(payload) >= ?2 "
-        "ORDER BY substr(payload,2,8), ts_received, id";
+        "ORDER BY " TCMD_RESP_SQL_TS_SENT ", ts_received, id";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
         fprintf(stderr, "gnss_reports: query failed: %s\n", sqlite3_errmsg(db));
         sqlite3_close(db);
         return 1;
     }
-    sqlite3_bind_int(st, 1, TCMD_TYPE);
-    sqlite3_bind_int(st, 2, TCMD_HDR + 1);
+    sqlite3_bind_int(st, 1, TCMD_RESP_PACKET_TYPE);
+    sqlite3_bind_int(st, 2, TCMD_RESP_HDR_LEN + 1);
 
     // Group by ts_sent key; within a group, a new reception starts whenever
     // the sequence number does not advance (seq <= last seq seen).
@@ -447,12 +441,12 @@ int main(int argc, char **argv)
     while (sqlite3_step(st) == SQLITE_ROW) {
         const unsigned char *pl = sqlite3_column_blob(st, 2);
         int pl_len = sqlite3_column_bytes(st, 2);
-        if (pl == NULL || pl_len < TCMD_HDR + 1) continue;
-        int seq = pl[12];
+        if (pl == NULL || pl_len < TCMD_RESP_HDR_LEN + 1) continue;
+        int seq = tcmd_resp_seq(pl, (size_t) pl_len);
         if (seq < 1) continue;
 
         unsigned char key[8];
-        memcpy(key, pl + 1, 8);
+        tcmd_resp_ts_sent(pl, (size_t) pl_len, key);
 
         int new_group = !have_key || memcmp(key, curkey, 8) != 0;
         if (new_group) { FLUSH(); memcpy(curkey, key, 8); have_key = 1; last_seq = 0; }
@@ -466,7 +460,7 @@ int main(int argc, char **argv)
                  (const char *)sqlite3_column_text(st, 1));
         memcpy(f->tskey, key, 8);
         f->seq = seq;
-        f->max_seq = pl[13];
+        f->max_seq = tcmd_resp_max_seq(pl, (size_t) pl_len);
         f->payload_len = pl_len;
         f->payload = malloc((size_t)pl_len);
         // On OOM, zero the length so reassemble skips this fragment rather

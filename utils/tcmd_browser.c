@@ -35,6 +35,7 @@
 #include "beacon_cts1.h"
 #include "packet_db.h"
 #include "sso_version.h"
+#include "tcmd_response.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -187,14 +188,13 @@ static void build_resp_index(sqlite3 *db)
     g_resp_ts_n = 0;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
-            "SELECT payload FROM packet WHERE packet_type=4", -1, &st, NULL)
+            "SELECT payload FROM packet WHERE " TCMD_RESP_SQL_IS, -1, &st, NULL)
         != SQLITE_OK) return;
     while (g_resp_ts_n < MAX_RESP_TS && sqlite3_step(st) == SQLITE_ROW) {
         const uint8_t *pl = sqlite3_column_blob(st, 0);
         int n = sqlite3_column_bytes(st, 0);
-        if (pl == NULL || n < 9) continue;
         uint64_t v = 0;
-        for (int i = 0; i < 8; i++) v |= (uint64_t)pl[1 + i] << (8 * i);
+        if (tcmd_resp_ts_sent_u64(pl, (size_t) n, &v) != 0) continue;
         g_resp_ts[g_resp_ts_n++] = v;
     }
     // If we stopped on the cap rather than running out of rows, the response
@@ -296,13 +296,13 @@ static void open_responses(sqlite3 *db)
     resp_n = 0; resp_sel = 0; resp_top = 0;
     cmd_row_t *c = &rows[sel];
     uint8_t key[8];
-    for (int i = 0; i < 8; i++) key[i] = (uint8_t)(c->ts_sent_ms >> (8 * i));
+    tcmd_resp_key_from_u64(c->ts_sent_ms, key);
 
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
             "SELECT id, ts_received, payload FROM packet "
-            "WHERE packet_type=4 AND substr(payload,2,8)=?1 "
-            "ORDER BY substr(payload,13,1), ts_received", -1, &st, NULL)
+            "WHERE " TCMD_RESP_SQL_IS " AND " TCMD_RESP_SQL_TS_SENT "=?1 "
+            "ORDER BY " TCMD_RESP_SQL_SEQ ", ts_received", -1, &st, NULL)
         == SQLITE_OK) {
         sqlite3_bind_blob(st, 1, key, 8, SQLITE_TRANSIENT);
         while (resp_n < MAX_RESP && sqlite3_step(st) == SQLITE_ROW) {
