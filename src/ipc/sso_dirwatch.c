@@ -1,3 +1,23 @@
+/*
+
+    Simple Satellite Operations  src/ipc/sso_dirwatch.c
+
+    Copyright (C) 2026  Johnathan K Burchill
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
 // sso_dirwatch.c — directory-change watch (inotify on Linux, kqueue on
 // macOS/BSD). See sso_dirwatch.h for the contract. Each backend defines its
 // own struct sso_dirwatch; a third stub branch keeps the build linking on

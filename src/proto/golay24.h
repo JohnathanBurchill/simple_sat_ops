@@ -6,7 +6,7 @@
     the 12-bit length field. Systematic form: output = (parity << 12) | data.
     Matches the H-matrix in pycsplink.Golay24.
 
-    Copyright (C) 2025  Johnathan K Burchill
+    Copyright (C) 2025, 2026  Johnathan K Burchill
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by

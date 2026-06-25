@@ -5,7 +5,7 @@
     Minimal WAV reader, sized just large enough for the RIFF/WAVE files
     that pcm16_write_wav() in modem.c produces. Supports 16-bit PCM only.
 
-    Copyright (C) 2025  Johnathan K Burchill
+    Copyright (C) 2025, 2026  Johnathan K Burchill
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by

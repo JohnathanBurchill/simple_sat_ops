@@ -16,7 +16,7 @@
     module is the single funnel that converts CSV input to a 3-line
     tempfile so callers don't have to care which format they got.
 
-    Copyright (C) 2025  Johnathan K Burchill
+    Copyright (C) 2025, 2026  Johnathan K Burchill
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by

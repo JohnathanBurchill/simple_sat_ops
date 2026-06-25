@@ -9,7 +9,7 @@
     Used by next_in_queue to plan passes against a propagated trajectory
     stored in the SpaceX Space Safety API, without going through TLEs.
 
-    Copyright (C) 2025  Johnathan K Burchill
+    Copyright (C) 2025, 2026  Johnathan K Burchill
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by

@@ -7,7 +7,7 @@
     followed by payload. No HMAC/CRC/XTEA at the CSP layer — those, if
     used, are applied externally (e.g. at the AX100 framing layer).
 
-    Copyright (C) 2025  Johnathan K Burchill
+    Copyright (C) 2025, 2026  Johnathan K Burchill
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by

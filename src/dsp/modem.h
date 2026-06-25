@@ -12,7 +12,7 @@
     fsk_demodulator the gold-reference receiver uses is matched to NRZ
     FSK), gain=0 dB.
 
-    Copyright (C) 2025  Johnathan K Burchill
+    Copyright (C) 2025, 2026  Johnathan K Burchill
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by

@@ -17,7 +17,7 @@
     CRC-32C is still not implemented — pycsplink.AX100 enables it only on
     the downlink (reed_solomon=False, crc=True), which is not our TX path.
 
-    Copyright (C) 2025  Johnathan K Burchill
+    Copyright (C) 2025, 2026  Johnathan K Burchill
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by

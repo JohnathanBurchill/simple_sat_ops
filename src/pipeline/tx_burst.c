@@ -1,3 +1,23 @@
+/*
+
+    Simple Satellite Operations  tx_burst.c
+
+    Copyright (C) 2026  Johnathan K Burchill
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
 // tx_burst.c — see header. Body lifted from utils/b210_rx_tx.c
 // (tx_build_iq + tx_fm_modulate + tx_apply_envelope_ramp + the daemon's
 // daemon_service_tx_request wrapper) when the daemon was folded in.
