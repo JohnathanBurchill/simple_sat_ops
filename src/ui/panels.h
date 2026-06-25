@@ -149,10 +149,10 @@ void report_status(state_t *state, int *print_row, int print_col);
 void report_position(track_t *track, int *print_row, int print_col);
 
 // Paint the operator's whole-screen layout for one redraw tick (predictions /
-// status / position, low-disk refresh, RX panel, right-edge ribbon, TX log).
-// keyboard_info_row is the first keyboard-help row (used to fit the TX log).
-void render_operator_screen(state_t *state, double jul_utc, double t_now,
-                            int keyboard_info_row);
+// status / position, low-disk refresh, RX panel, right-edge ribbon, the
+// keyboard legend, and the TX log). The legend hangs off the actual bottom of
+// the left status column, so it sizes itself each tick.
+void render_operator_screen(state_t *state, double jul_utc, double t_now);
 
 // Plain-ASCII modal box drawer (locale-bulletproof, unlike ncurses box()).
 // Shared by the TX-compose and auto-tcmd modals.

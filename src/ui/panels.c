@@ -24,6 +24,7 @@
 #include "antenna_rotator_async.h"
 #include "beacon_cts1.h"     // RX_RS_FAIL_TOKEN -- the uncorrectable-RS marker
 #include "duration_fmt.h"
+#include "keybindings.h"     // the legend's single source of truth
 #include "pass_session.h"
 #include "prediction.h"
 #include "sso_ipc.h"
@@ -907,13 +908,51 @@ int tx_drain_csi(WINDOW *w) {
 }
 
 
+// Paint the keyboard legend + the lock / antenna-motion status below the
+// left status column, starting at start_row. Returns the row just past the
+// block so the caller can place the TX log without colliding. The legend is
+// generated from the keybindings table (single source of truth), so it can't
+// drift from what the keys actually do. On a terminal too short to hold the
+// whole block it collapses to a one-line hint -- ncurses silently drops
+// off-screen mvprintw rows, which is how the legend used to vanish unnoticed
+// when report_status grew the column down over it (issue #35).
+static int render_keyboard_legend(state_t *state, int start_row)
+{
+    if (start_row < 1) start_row = 1;
+    size_t nkb = 0;
+    const keybinding_t *tbl = keybindings_table(&nkb);
+    // Block height: one row per visible key + the lock line + a blank + the
+    // antenna line.
+    int block_height = keybindings_visible_count() + 3;
+    if (start_row + block_height >= LINES) {
+        mvprintw(start_row, 3, "%-66s",
+                 "keys hidden (terminal too short): K lock  T track  "
+                 "t TX  A auto  q quit");
+        return start_row + 1;
+    }
+
+    int r = start_row;
+    for (size_t i = 0; i < nkb; ++i) {
+        if (tbl[i].flags & KB_HIDDEN) continue;
+        // Width-padded (not clrtoeol) so the print doesn't wipe the signal
+        // ribbon painting over the right edge of these rows.
+        mvprintw(r++, 3, "%-3s- %-40s", tbl[i].combo, tbl[i].desc);
+    }
+    mvprintw(r, 3, "%s : %-8s", "Keyboard",
+             state->ui.keyboard_unlocked ? "unlocked" : "LOCKED");
+    r += 2;
+    mvprintw(r, 0, "%-18s",
+             state->rot.antenna_rotator.antenna_is_moving
+                 ? "Antenna moving"
+                 : "Antenna stationary");
+    return r + 1;
+}
+
 // Paint the operator's whole-screen layout for one redraw tick: the
 // predictions / status / position columns, the lazy low-disk refresh, the
-// RX panel, the right-edge signal ribbon, and (if the terminal is tall
-// enough below the keyboard-info rows) the TX log. keyboard_info_row is the
-// first keyboard-help row, used to decide whether the TX log fits.
-void render_operator_screen(state_t *state, double jul_utc, double t_now,
-                            int keyboard_info_row)
+// RX panel, the right-edge signal ribbon, the keyboard legend, and (if the
+// terminal is tall enough below the legend) the TX log.
+void render_operator_screen(state_t *state, double jul_utc, double t_now)
 {
     int row = 1;
     int col = 1;
@@ -921,18 +960,27 @@ void render_operator_screen(state_t *state, double jul_utc, double t_now,
 
     row++;
     report_status(state, &row, col);
-    row = 5;
-    col = 50;
-    report_position(&state->track, &row, col);
-    row++;
+    // The left status column's height varies -- the T/R-switch block grows
+    // it -- so capture where it actually ends before the right column reuses
+    // a local row counter. The keyboard legend hangs off this, not a fixed
+    // row, so report_status can't overpaint it (issue #35).
+    int left_end_row = row;
+
+    int rcol_row = 5;
+    int rcol_col = 50;
+    report_position(&state->track, &rcol_row, rcol_col);
+    rcol_row++;
     // Refresh the low-disk warning lazily -- statvfs every 30 s is plenty
     // given how slowly disk fills.
     low_disk_refresh(&state->op, t_now);
     rx_panel_data_t rxd;
     rx_panel_collect_local(state, &rxd);
-    render_rx_panel(&rxd, &row, 50);
+    render_rx_panel(&rxd, &rcol_row, 50);
 
     clrtoeol();
+
+    // Keyboard legend + lock / antenna status, below the left column.
+    int legend_bottom = render_keyboard_legend(state, left_end_row + 2);
 
     // Vertical ribbon on the right edge -- bottom = newest, with a bold '-'
     // tick crawling up one row per second so the timeline is visibly alive
@@ -944,10 +992,10 @@ void render_operator_screen(state_t *state, double jul_utc, double t_now,
         render_ribbon_vertical(&rxd, ribbon_top, ribbon_bot, ribbon_col);
     }
 
-    // TX log lives below the keyboard info / antenna status if the terminal
-    // is tall enough to host it without colliding.
+    // TX log lives below the legend if the terminal is tall enough to host
+    // it without colliding.
     int tx_log_row = LINES - TX_LOG_SIZE - 2;
-    if (tx_log_row >= keyboard_info_row + 4) {
+    if (tx_log_row >= legend_bottom + 1) {
         render_tx_log_panel(&state->tx, tx_log_row, 1);
     }
 }

@@ -296,31 +296,11 @@ int main(int argc, char **argv)
     state.rot.antenna_rotator.antenna_is_under_control =
         state.rot.antenna_rotator.antenna_should_be_controlled;
 
-    int keyboard_unlocked = 1;
-    int keyboard_info_row = 20;
-
-    mvprintw(keyboard_info_row++, 3, "%s", "T  - Track satellite");
-    clrtoeol();
-    mvprintw(keyboard_info_row++, 3, "%s", "s  - Stop antenna immediately");
-    clrtoeol();
-    mvprintw(keyboard_info_row++, 3, "%s", "r  - Reset to az=0 el=0");
-    clrtoeol();
-    mvprintw(keyboard_info_row++, 3, "%s", "[/]- Jog azimuth -5/+5 deg");
-    clrtoeol();
-    mvprintw(keyboard_info_row++, 3, "%s", "{/}- Jog azimuth -1/+1 deg");
-    clrtoeol();
-    mvprintw(keyboard_info_row++, 3, "%s", ",/.- Jog elevation -5/+5 deg");
-    clrtoeol();
-    mvprintw(keyboard_info_row++, 3, "%s", "</>- Jog elevation -1/+1 deg");
-    clrtoeol();
-    mvprintw(keyboard_info_row++, 3, "%s", "t  - Compose TX command");
-    clrtoeol();
-    mvprintw(keyboard_info_row++, 3, "%s", "A  - Auto-TCMD (needs --tc-file=)");
-    clrtoeol();
-    mvprintw(keyboard_info_row++, 3, "%s", "K  - Lock/unlock keyboard");
-    clrtoeol();
-    mvprintw(keyboard_info_row++, 3, "%s", "q  - Quit");
-    clrtoeol();
+    // Keyboard starts unlocked; 'K' toggles it. The legend is painted each
+    // redraw by render_operator_screen (below the live left column), so there
+    // is no static legend block to lay down here -- that fixed-row block used
+    // to be overpainted when the status column grew (issue #35).
+    state.ui.keyboard_unlocked = 1;
 
     double current_az = 0;
     double current_el = 0;
@@ -453,25 +433,15 @@ int main(int argc, char **argv)
 
         int redraw_due = (t_now - t_last_redraw) >= REDRAW_PERIOD_S;
         if (redraw_due) {
-            // Paint the whole operator layout for this tick. See ui/panels.c.
-            render_operator_screen(&state, jul_utc, t_now, keyboard_info_row);
-        }
-
-        // Read one key and route it: modals / command line / keyboard lock /
-        // unlocked operator keys (track, jog, modal openers). See ui/input.c.
-        input_handle_keys(&state, &keyboard_unlocked);
-
-        if (redraw_due) {
-            // Width-padded prints (not clrtoeol) so we don't wipe the
-            // signal ribbon that paints over the right edge of these rows.
-            mvprintw(keyboard_info_row, 3, "%s : %-8s", "Keyboard",
-                     keyboard_unlocked ? "unlocked" : "LOCKED");
-            mvprintw(keyboard_info_row + 2, 0, "%-18s",
-                     state.rot.antenna_rotator.antenna_is_moving
-                         ? "Antenna moving"
-                         : "Antenna stationary");
+            // Paint the whole operator layout for this tick, legend included.
+            // See ui/panels.c.
+            render_operator_screen(&state, jul_utc, t_now);
             t_last_redraw = t_now;
         }
+
+        // Read one key and route it: modals / command line / the keybindings
+        // table (keyboard lock + operator keys). See ui/input.c.
+        input_handle_keys(&state);
 
         // Pump the modal's debounced preview broadcast before the
         // screen flush so the mirror line is current when we paint.

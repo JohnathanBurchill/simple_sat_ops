@@ -541,6 +541,15 @@ target_include_directories(beacon_cts1_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(beacon_cts1_selftest PRIVATE m)
 list(APPEND SSO_TARGETS beacon_cts1_selftest)
 
+# Operator keyboard table selftest. Links only keybindings.c; the kb_act_*
+# action bodies (which would drag in tracking / SDR / ncurses) are stubbed in
+# the test itself, so this exercises the table integrity + dispatch lock
+# gating without the operator stack. See unit_tests/keybindings_selftest.c.
+add_executable(keybindings_selftest unit_tests/keybindings_selftest.c
+               src/ui/keybindings.c)
+target_include_directories(keybindings_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+list(APPEND SSO_TARGETS keybindings_selftest)
+
 # CSP v1 header codec + CRC32 selftest. Pins the 32-bit wire layout
 # byte-for-byte, exhaustively round-trips {min,max}^6 corner combos,
 # and audits csp_crc32_zlib against IEEE 802.3 reference vectors.
@@ -1099,6 +1108,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
                    src/ui/duration_fmt.c
                    src/ui/tx_compose.c src/ui/tx_log.c src/ui/viewer.c
                    src/ui/auto_tcmd.c src/ui/cmd_line.c src/ui/input.c
+                   src/ui/keybindings.c
                    src/ui/ui_textfield.c
                    src/ui/live_waterfall.c
                    src/control/pass_session.c src/control/scan_sky.c

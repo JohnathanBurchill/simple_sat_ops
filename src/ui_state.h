@@ -120,6 +120,10 @@ typedef struct ui {
     spectrum_job_t spec_job;
 
     int run_live_waterfall;  // --live-waterfall
+
+    // Keyboard lock. Starts unlocked (main sets it to 1); 'K' toggles it.
+    // The keybindings dispatcher only fires non-KB_ALWAYS keys while set.
+    int keyboard_unlocked;
 } ui_t;
 
 #endif // UI_STATE_H

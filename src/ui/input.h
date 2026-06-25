@@ -20,10 +20,10 @@
 
 // Top-level keyboard routing for the operator UI: read one key and dispatch
 // it to whichever consumer is active -- the TX-compose modal, the auto-tcmd
-// modal, the ":" command line, the keyboard lock, or the unlocked operator
-// keys (track / stop / home, the antenna jog keys, the modal openers). The
-// modals and the command line own their own key handling; this is just the
-// router that decides who gets the keystroke.
+// modal, the ":" command line, or (when none is up) the keybindings table,
+// which owns the keyboard lock and the operator keys. The modals and the
+// command line own their own key handling; this is just the router that
+// decides who gets the keystroke.
 
 #ifndef UI_INPUT_H
 #define UI_INPUT_H
@@ -35,10 +35,10 @@ extern "C" {
 struct state;
 typedef struct state state_t;
 
-// Read one key (getch) and act on it. *keyboard_unlocked carries the lock
-// toggle across ticks; 'K' flips it and the unlocked operator keys are only
-// honoured while it is set.
-void input_handle_keys(state_t *state, int *keyboard_unlocked);
+// Read one key (getch) and act on it. The lock state lives on
+// state->ui.keyboard_unlocked; 'K' flips it (via the keybindings table) and
+// the other operator keys are only honoured while it is set.
+void input_handle_keys(state_t *state);
 
 #ifdef __cplusplus
 }

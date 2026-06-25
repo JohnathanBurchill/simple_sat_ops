@@ -26,6 +26,7 @@
 #include "argparse.h"
 #include "frontiersat.h"
 #include "hmac_keyfile.h"
+#include "keybindings.h"
 #include "pass_session.h"
 #include "prediction.h"
 #include "sdr_backend.h"
@@ -1080,19 +1081,10 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
     // Full-help epilog: the keyboard layout + examples, printed once
     // after all the option lines (only for --help-full).
     if (help >= HELP_FULL) {
+        // Generated from the keybindings table so this listing can't drift
+        // from the live keys or the on-screen legend (it used to miss t / A).
+        keybindings_print_help(stdout);
         printf(
-            "\n"
-            "KEYBOARD (unlocked by default, press K to toggle lock state)\n"
-            "\n"
-            "  K         Toggle keyboard lock\n"
-            "  T         Start tracking the current satellite\n"
-            "  s         Stop tracking\n"
-            "  r         Reset rotator to az=0, el=0\n"
-            "  [ / ]     Nudge antenna azimuth -5 / +5 deg\n"
-            "  { / }     Nudge antenna azimuth -1 / +1 deg (fine)\n"
-            "  , / .     Nudge antenna elevation -5 / +5 deg\n"
-            "  < / >     Nudge antenna elevation -1 / +1 deg (fine)\n"
-            "  q         Quit\n"
             "\n"
             "EXAMPLES\n"
             "\n"
