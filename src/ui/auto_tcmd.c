@@ -426,6 +426,40 @@ static void auto_tcmd_draw(state_t *state) {
               width - 14, a->status_msg[0] ? a->status_msg : "-");
     wclrtoeol(w);
 
+    // Outcome of the most recent serviced burst. The modal covers the bottom
+    // TX-log panel, so this is the only place the operator sees whether a
+    // command reached the air or was rejected (no B210 / dry-run / ...). A
+    // NOT-SENT line is drawn bold so a silently-rejecting run can't pass for a
+    // transmitting one. See tx_burst_service_request.
+    mvwprintw(w, 13, 2, "Last burst:");
+    if (state->tx.last_burst_outcome[0] == '\0') {
+        mvwprintw(w, 13, 13, "(none yet)");
+    } else if (state->tx.last_burst_on_air) {
+        // air    = submit -> done (the half-duplex burst itself)
+        // held   = staging -> done (what actually gates the next auto-tcmd send)
+        // period = this send's staging minus the previous send's ("--" on the
+        //          first send of the run). The full hardware split lands in the
+        //          tx-timing / tx-result audit lines. See tx_burst.c.
+        char pstr[16];
+        if (state->tx.last_send_period_s >= 0.0)
+            snprintf(pstr, sizeof pstr, "%.2f", state->tx.last_send_period_s);
+        else
+            snprintf(pstr, sizeof pstr, "--");
+        char line[120];
+        snprintf(line, sizeof line,
+                 "on air - %.30s  air=%.2f held=%.2f period=%s s",
+                 state->tx.last_burst_outcome,
+                 state->tx.last_burst_wall_s,
+                 state->tx.last_burst_slot_s, pstr);
+        mvwprintw(w, 13, 13, "%.*s", width - 15, line);
+    } else {
+        wattron(w, A_BOLD);
+        mvwprintw(w, 13, 13, "NOT SENT - %.80s",
+                  state->tx.last_burst_outcome);
+        wattroff(w, A_BOLD);
+    }
+    wclrtoeol(w);
+
     if (a->state == AUTO_STATE_RUNNING) {
         mvwprintw(w, 14, 2,
                   "Running - s stops   Esc interrupts (pause/abort)");
@@ -466,6 +500,16 @@ static void auto_tcmd_draw(state_t *state) {
         }
     }
     wrefresh(w);
+}
+
+// Repaint the open modal from the main-loop redraw tick. auto_tcmd_draw is
+// otherwise only called on a keystroke or when a send is staged, so a burst
+// outcome that resolves in tx_burst_service_request (after the last draw)
+// would sit stale on screen. Calling this each redraw keeps the "Last burst"
+// line — and the progress numbers — live. No-op unless the modal is open.
+void auto_tcmd_refresh(state_t *state) {
+    if (state->tx.auto_tcmd_active && state->tx.auto_tcmd_win)
+        auto_tcmd_draw(state);
 }
 
 // Create the modal window. Returns 1 on success, 0 if newwin failed.
@@ -1039,6 +1083,9 @@ void auto_tcmd_tick(state_t *state) {
                      " (replaced '%s')", raw);
     }
     state->tx.tx_request.pending = 1;
+    // Stamp the staging moment so tx_burst_service_request can measure the
+    // real send-to-send period and slot-hold of this burst.
+    state->tx.tx_request_staged_ns = now;
     snprintf(a->last_sent, sizeof a->last_sent, "%.255s", wire);
     a->sends_total++;
 

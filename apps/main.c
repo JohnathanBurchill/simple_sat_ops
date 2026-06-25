@@ -472,6 +472,12 @@ int main(int argc, char **argv)
                 tx_field_t f = state.tx.tx_compose.focus;
                 show_hw_cursor = (f == TXF_PAYLOAD || f == TXF_POWER);
             } else if (state.tx.auto_tcmd_active && state.tx.auto_tcmd_win) {
+                // Repaint the modal content (not just re-flush it) so a burst
+                // outcome that resolved in tx_burst_service_request since the
+                // last draw — the "Last burst" line — appears instead of going
+                // stale. Gated to the 2 Hz redraw cadence (this block itself
+                // runs every tick while a modal is open). See ui/auto_tcmd.c.
+                if (redraw_due) auto_tcmd_refresh(&state);
                 touchwin(state.tx.auto_tcmd_win);
                 wrefresh(state.tx.auto_tcmd_win);
                 show_hw_cursor = (state.tx.auto_tcmd.state != AUTO_STATE_RUNNING)

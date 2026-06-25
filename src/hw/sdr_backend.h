@@ -78,6 +78,24 @@ typedef struct sdr_open_params {
     int         device_index;       // RTL-SDR: dongle index (0 = first)
 } sdr_open_params_t;
 
+// Optional per-burst timing breakdown (seconds), filled by the backend's
+// tx_burst when sdr_tx_burst_params.timing is non-NULL. Shows where a burst's
+// wall-clock goes so the operator can read the real floor that bounds the
+// auto-tcmd inter-send interval, rather than guess at it:
+//   config_s    device lock + rate/gain/freq set
+//   push_s      host send loop (samples handed to the FIFO)
+//   drain_s     wait for the scheduled burst to finish emitting
+//               (the start-delay lead plus the on-air frame)
+//   powerdown_s TX chain teardown
+//   total_s     the whole backend tx_burst call
+typedef struct sdr_tx_burst_timing {
+    double config_s;
+    double push_s;
+    double drain_s;
+    double powerdown_s;
+    double total_s;
+} sdr_tx_burst_timing_t;
+
 // One TX burst, half-duplex: the backend pauses its own RX, transmits,
 // and resumes RX. Same contract as the old b210_rx_tx_core_burst.
 typedef struct sdr_tx_burst_params {
@@ -88,6 +106,8 @@ typedef struct sdr_tx_burst_params {
     double         tx_gain_db;
     double         start_delay_s;
     double         rx_resume_freq_hz; // RX center freq to restore after TX
+    // NULL => don't measure. Non-NULL => the backend fills it (see above).
+    sdr_tx_burst_timing_t *timing;
 } sdr_tx_burst_params_t;
 
 typedef struct sdr_backend sdr_backend_t;

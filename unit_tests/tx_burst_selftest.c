@@ -392,7 +392,7 @@ static void test_run_doppler_freq_reaches_b210(void)
                                          &req,
                                          /*rx_resume=*/TEST_CARRIER_HZ,
                                          key, sizeof key - 1,
-                                         summary, sizeof summary);
+                                         summary, sizeof summary, NULL);
     tap_okf(rc == TX_BURST_OK,
             "run: tx_burst_run returns OK with stubbed b210 (rc=%d)", (int) rc);
     tap_okf(g_capture.called == 1,
@@ -425,7 +425,7 @@ static void test_run_hmac_key_changes_iq(void)
     tx_burst_result_t rc1 = tx_burst_run((b210_rx_tx_core_t*)0x1, &req,
                                           TEST_CARRIER_HZ,
                                           key, sizeof key - 1,
-                                          summary, sizeof summary);
+                                          summary, sizeof summary, NULL);
     tap_okf(rc1 == TX_BURST_OK, "run: with-key burst OK");
     size_t n_with = g_capture.n_samps;
     int16_t *iq_with = g_capture.iq;
@@ -436,7 +436,7 @@ static void test_run_hmac_key_changes_iq(void)
     tx_burst_result_t rc2 = tx_burst_run((b210_rx_tx_core_t*)0x1, &req,
                                           TEST_CARRIER_HZ,
                                           NULL, 0,
-                                          summary, sizeof summary);
+                                          summary, sizeof summary, NULL);
     tap_okf(rc2 == TX_BURST_OK, "run: no-key burst OK");
     size_t n_without = g_capture.n_samps;
     int16_t *iq_without = g_capture.iq;
@@ -479,14 +479,14 @@ static void test_run_deterministic_with_same_key(void)
 
     capture_reset();
     tx_burst_run((b210_rx_tx_core_t*)0x1, &req, TEST_CARRIER_HZ,
-                 key, sizeof key - 1, summary, sizeof summary);
+                 key, sizeof key - 1, summary, sizeof summary, NULL);
     size_t n_a = g_capture.n_samps;
     int16_t *iq_a = g_capture.iq;
     g_capture.iq = NULL;
     capture_reset();
 
     tx_burst_run((b210_rx_tx_core_t*)0x1, &req, TEST_CARRIER_HZ,
-                 key, sizeof key - 1, summary, sizeof summary);
+                 key, sizeof key - 1, summary, sizeof summary, NULL);
     size_t n_b = g_capture.n_samps;
     int16_t *iq_b = g_capture.iq;
     g_capture.iq = NULL;
@@ -629,7 +629,7 @@ static void test_summary_run_path_no_stale_byte(void)
     req.payload[n] = 'Z';                     // stale byte the readout must skip
     char summary[256];
     tx_burst_result_t rc = tx_burst_run(/*core=*/NULL, &req, 0.0,
-                                         NULL, 0, summary, sizeof summary);
+                                         NULL, 0, summary, sizeof summary, NULL);
     tap_okf(rc == TX_BURST_NO_CORE,
             "summary run-path: core=NULL returns NO_CORE after summarizing (rc=%d)",
             (int) rc);
@@ -646,7 +646,7 @@ static void test_summary_run_path_sso_origin_suffix(void)
     make_request(&req, "CTS1+xyz");
     snprintf(req.sso_origin, sizeof req.sso_origin, "SSO+TIME");
     char summary[256];
-    (void) tx_burst_run(NULL, &req, 0.0, NULL, 0, summary, sizeof summary);
+    (void) tx_burst_run(NULL, &req, 0.0, NULL, 0, summary, sizeof summary, NULL);
     tap_okf(strcmp(summary, "ascii:CTS1+xyz (replaced 'SSO+TIME')") == 0,
             "summary run-path: SSO+ origin suffix appended (\"%s\")", summary);
 }

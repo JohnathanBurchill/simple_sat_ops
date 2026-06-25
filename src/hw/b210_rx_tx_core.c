@@ -447,6 +447,7 @@ int b210_rx_tx_core_burst(b210_rx_tx_core_t *c,
         .tx_gain_db        = p->tx_gain_db,
         .start_delay_s     = p->start_delay_s,
         .rx_resume_freq_hz = p->rx_resume_freq_hz,
+        .timing            = p->timing,
     };
     // Full-duplex: the burst runs on the TX thread while the RX worker
     // keeps pumping. RX is never paused, so there is no demod seam to

@@ -197,6 +197,27 @@ typedef struct tx {
     // read the real per-burst floor on hardware.
     long              tx_burst_submit_ns;
     double            last_burst_wall_s;
+    // Outcome of the most recent serviced burst, mirrored here so the auto-tcmd
+    // modal can show whether commands actually left the radio. The modal
+    // overlays the bottom TX-log panel where the SENT / NOT_SENT events render,
+    // so without this the operator can't tell a real send from a run that's
+    // silently rejecting every command (no B210, dry-run, no HMAC key, ...).
+    // last_burst_on_air is 1 only when the burst reached the air; the string is
+    // the human reason ("ok" / "rejected: no B210" / "dry-run" / ...). Empty
+    // until the first burst is serviced.
+    int               last_burst_on_air;
+    char              last_burst_outcome[80];
+    // Send-pacing measurement. tx_request_staged_ns is stamped (ts_now_ns) the
+    // moment a burst's pending slot is raised (auto-tcmd tick / compose
+    // commit); prev_send_staged_ns is the previous burst's stamp. Together they
+    // give the real send-to-send period; with the poll-done time they give the
+    // slot-hold (staging -> burst done). Both are surfaced in the auto-tcmd
+    // modal + the tx-result audit so a "3 s interval spaced 5 s apart" report
+    // can be pinned to a number instead of guessed at. -1 / 0 == not measured.
+    long              tx_request_staged_ns;
+    long              prev_send_staged_ns;
+    double            last_burst_slot_s;
+    double            last_send_period_s;
     // Doppler-corrected uplink carrier (Hz), refreshed each tick from the
     // range rate; snapshotted by compose-preview / commit / auto-tcmd so a
     // burst is keyed where the satellite hears the nominal carrier. Seeded

@@ -32,6 +32,7 @@
 #include "modem.h"
 #include "modem_iq.h"
 #include "packet_db.h"
+#include "sso_audit.h"
 #include "tx_burst.h"
 
 #include <errno.h>
@@ -1609,6 +1610,7 @@ static void *rx_session_tx_thread_fn(void *arg)
 
         tx_burst_result_t br;
         char summary[256] = "";
+        sdr_tx_burst_timing_t bt = {0};
         if (lost) {
             // Device is gone — don't touch it (would risk a second
             // fault). Refuse the burst cleanly.
@@ -1620,10 +1622,24 @@ static void *rx_session_tx_thread_fn(void *arg)
             br = tx_burst_run(
                 rxs->core, &req, /*rx_resume_freq_hz=*/0.0,
                 hmac_local_len > 0 ? hmac_local : NULL, hmac_local_len,
-                summary, sizeof summary);
+                summary, sizeof summary, &bt);
         }
 
-        if (br == TX_BURST_OK) worker_record_sent_tcmd(rxs, &req);
+        if (br == TX_BURST_OK) {
+            worker_record_sent_tcmd(rxs, &req);
+            // Hardware-side breakdown of where the burst's wall-clock went.
+            // Logged from this worker thread (sso_audit_event is a thread-safe
+            // ring); the matching tx-result line on the main thread carries the
+            // slot-hold + send period. Together they show the full picture
+            // behind the per-burst floor.
+            char det[256];
+            snprintf(det, sizeof det,
+                     "config_s=%.3f push_s=%.3f drain_s=%.3f "
+                     "powerdown_s=%.3f total_s=%.3f",
+                     bt.config_s, bt.push_s, bt.drain_s,
+                     bt.powerdown_s, bt.total_s);
+            sso_audit_event("tx-timing", det);
+        }
 
         pthread_mutex_lock(&rxs->mu);
         rxs->burst_result = (rx_burst_result_t) br;

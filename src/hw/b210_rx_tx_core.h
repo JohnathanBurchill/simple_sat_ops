@@ -257,6 +257,9 @@ typedef struct b210_rx_tx_core_burst_params {
     double         tx_gain_db;
     double         start_delay_s;
     double         rx_resume_freq_hz;  // RX center freq to restore after TX
+    // Optional per-burst timing breakdown; forwarded to the SDR backend.
+    // NULL => don't measure. See sdr_tx_burst_timing_t.
+    sdr_tx_burst_timing_t *timing;
 } b210_rx_tx_core_burst_params_t;
 
 // Half-duplex switch-over: stop RX, drain residue, lazy-build the TX

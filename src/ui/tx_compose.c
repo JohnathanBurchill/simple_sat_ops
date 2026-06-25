@@ -467,6 +467,9 @@ static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, s
         tx_compose_summary(c, state->tx.tx_request.summary, sizeof state->tx.tx_request.summary);
     }
     state->tx.tx_request.pending = 1;
+    // Stamp the staging moment so the burst handler can measure the slot-hold
+    // (and, across sends, the period) the same way the auto-tcmd path does.
+    state->tx.tx_request_staged_ns = ts_now_ns();
     {
         // Audit: TX commit — the moment the operator pressed Enter in
         // the compose modal and the burst was queued for the main loop

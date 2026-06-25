@@ -21,6 +21,7 @@
 
 #include "sdr_backend.h"
 #include "sdr_usb_detect.h"
+#include "sso_time.h"     // ts_now_ns for the per-burst timing breakdown
 
 #include <math.h>
 #include <pthread.h>
@@ -532,6 +533,12 @@ static int uhd_tx_burst(sdr_backend_t *be, const sdr_tx_burst_params_t *p)
 
     int rc = -1;
     int locked = 0;
+    // Per-burst timing breakdown (filled into p->timing at the end). Stamp the
+    // phase boundaries as we pass them; an early `goto resume` leaves later
+    // stamps at t0 so a failed burst reads as zero-length for the phases it
+    // never reached. Only meaningful on a successful burst.
+    long t0 = ts_now_ns();
+    long t_cfg = t0, t_push = t0, t_drain = t0;
     // RX is NOT paused — it streams continuously on the worker thread.
     // We only bring the independent TX chain up, transmit, and drop it.
     // Hold the device lock across the configuration calls below (subdev /
@@ -576,6 +583,7 @@ static int uhd_tx_burst(sdr_backend_t *be, const sdr_tx_burst_params_t *p)
     // Configuration is done. Drop the device lock so the send loop overlaps
     // the RX worker's recv -- the two streamers are independent, and holding
     // the lock across the whole burst would starve the RX transport.
+    t_cfg = ts_now_ns();
     pthread_mutex_unlock(&u->dev_mu);
     locked = 0;
 
@@ -621,16 +629,31 @@ static int uhd_tx_burst(sdr_backend_t *be, const sdr_tx_burst_params_t *p)
         sent_total += items_sent;
     }
     if (md != NULL) uhd_tx_metadata_free(&md);
+    t_push = ts_now_ns();
 
-    // Let the FPGA FIFO drain — the host call returned when the FIFO
-    // accepted the last sample, not when the antenna stopped emitting.
+    // Wait until the scheduled burst has actually stopped emitting. The host
+    // send call returned when the FIFO accepted the last sample, not when the
+    // antenna went quiet: emission ends at the scheduled start (tx_start_s,
+    // device time) plus the on-air frame. Re-read the device clock so we sleep
+    // only the time still remaining — the old "start_delay + on_air + margin"
+    // measured from here waited the config + push time over again on top of
+    // the start-delay lead. Fall back to that conservative budget if the clock
+    // read fails.
     {
         double on_air_s = (double) p->n_samps / p->tx_rate_hz;
-        double drain_s  = p->start_delay_s + on_air_s + 0.05;
-        if (drain_s > 0.0) {
-            usleep((useconds_t) (drain_s * 1e6));
+        double remaining = p->start_delay_s + on_air_s + 0.05;
+        int64_t dn_full = 0;
+        double  dn_frac = 0.0;
+        if (uhd_usrp_get_time_now(u->dev, 0, &dn_full, &dn_frac)
+                == UHD_ERROR_NONE) {
+            remaining = (tx_start_s + on_air_s + 0.05)
+                      - ((double) dn_full + dn_frac);
+        }
+        if (remaining > 0.0) {
+            usleep((useconds_t) (remaining * 1e6));
         }
     }
+    t_drain = ts_now_ns();
     rc = 0;
 
 resume:
@@ -648,6 +671,15 @@ resume:
     }
     tx_power_down(u);
     pthread_mutex_unlock(&u->dev_mu);
+
+    if (p->timing != NULL) {
+        long t_end = ts_now_ns();
+        p->timing->config_s    = (double)(t_cfg   - t0)     * 1e-9;
+        p->timing->push_s      = (double)(t_push  - t_cfg)  * 1e-9;
+        p->timing->drain_s     = (double)(t_drain - t_push) * 1e-9;
+        p->timing->powerdown_s = (double)(t_end   - t_drain)* 1e-9;
+        p->timing->total_s     = (double)(t_end   - t0)     * 1e-9;
+    }
     return rc;
 }
 

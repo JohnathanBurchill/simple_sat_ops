@@ -236,7 +236,8 @@ tx_burst_result_t tx_burst_run(b210_rx_tx_core_t *core,
                                 const tx_request_slot_t *req,
                                 double rx_resume_freq_hz,
                                 const uint8_t *hmac_key, size_t hmac_key_len,
-                                char *out_summary, size_t summary_n)
+                                char *out_summary, size_t summary_n,
+                                sdr_tx_burst_timing_t *out_timing)
 {
     if (out_summary && summary_n) out_summary[0] = '\0';
     if (req == NULL) return TX_BURST_FRAME_BUILD_FAILED;
@@ -260,7 +261,12 @@ tx_burst_result_t tx_burst_run(b210_rx_tx_core_t *core,
     int preroll_ms   = req->preroll_ms > 0 ? req->preroll_ms : 200;
     int postroll_ms  = 50;
     double ramp_ms   = 1.0;
-    double start_delay_s = 0.5;
+    // Lead time the burst is scheduled into the future so the FPGA TX FIFO
+    // fills before emission begins. It is pure latency on the burst floor (the
+    // host waits it out in the drain), so keep it just large enough to buffer
+    // a telecommand-sized burst over USB. 0.15 s is comfortable on a B210; if
+    // UHD logs 'L' (late/underflow) at the start of a burst, raise it.
+    double start_delay_s = 0.15;
     double tx_gain_db    = req->tx_gain_db > 0 ? req->tx_gain_db : 70.0;
     long   tx_freq_hz    = req->tx_freq_hz > 0 ? req->tx_freq_hz : 436150000L;
 
@@ -282,6 +288,7 @@ tx_burst_result_t tx_burst_run(b210_rx_tx_core_t *core,
         .tx_gain_db        = tx_gain_db,
         .start_delay_s     = start_delay_s,
         .rx_resume_freq_hz = rx_resume_freq_hz,
+        .timing            = out_timing,
     };
     int rc = b210_rx_tx_core_burst(core, &bp);
     free(iq);
@@ -376,9 +383,28 @@ void tx_burst_service_request(state_t *state)
                     // UHD start lead + on-air frame + RX resume). Surfaced in
                     // the auto-tcmd modal + the audit so the operator can read
                     // the per-burst floor that bounds the inter-send interval.
+                    long done_ns = ts_now_ns();
                     if (state->tx.tx_burst_submit_ns > 0) {
-                        burst_wall_s = (double)(ts_now_ns() - state->tx.tx_burst_submit_ns) * 1e-9;
+                        burst_wall_s = (double)(done_ns - state->tx.tx_burst_submit_ns) * 1e-9;
                         state->tx.last_burst_wall_s = burst_wall_s;
+                    }
+                    // Slot-hold (staging -> done) is what actually gates the
+                    // next auto-tcmd send; the send-to-send period is this
+                    // burst's staging minus the previous one's. These — not the
+                    // submit->done burst_wall above — explain why an N-second
+                    // interval can space sends further apart. Logged below and
+                    // shown in the modal.
+                    if (state->tx.tx_request_staged_ns > 0) {
+                        state->tx.last_burst_slot_s =
+                            (double)(done_ns - state->tx.tx_request_staged_ns) * 1e-9;
+                        if (state->tx.prev_send_staged_ns > 0) {
+                            state->tx.last_send_period_s =
+                                (double)(state->tx.tx_request_staged_ns
+                                         - state->tx.prev_send_staged_ns) * 1e-9;
+                        } else {
+                            state->tx.last_send_period_s = -1.0;
+                        }
+                        state->tx.prev_send_staged_ns = state->tx.tx_request_staged_ns;
                     }
                 }
                 // else: still in flight; fall through and let the
@@ -391,6 +417,15 @@ void tx_burst_service_request(state_t *state)
             finished = 1;
         }
         if (finished) {
+            // Mirror the outcome onto state so the auto-tcmd modal can show
+            // whether this burst actually left the radio. The modal covers the
+            // bottom TX-log panel where the SENT / NOT_SENT events render, so
+            // this is the operator's only in-modal signal that a run is being
+            // rejected rather than transmitting. See state->tx.last_burst_outcome.
+            state->tx.last_burst_on_air = on_air;
+            snprintf(state->tx.last_burst_outcome,
+                     sizeof state->tx.last_burst_outcome, "%s",
+                     outcome ? outcome : "?");
             // A command that made it on the air gets a plain TX
             // record, nothing more: the ground station can confirm
             // it transmitted, but only the satellite can acknowledge,
@@ -409,8 +444,11 @@ void tx_burst_service_request(state_t *state)
                 char det[512];
                 if (burst_wall_s >= 0.0) {
                     snprintf(det, sizeof det,
-                             "outcome=\"%.80s\" on_air=%d burst_wall_s=%.3f summary=\"%.300s\"",
-                             outcome ? outcome : "?", on_air, burst_wall_s, summary);
+                             "outcome=\"%.80s\" on_air=%d burst_wall_s=%.3f "
+                             "slot_hold_s=%.3f period_s=%.3f summary=\"%.300s\"",
+                             outcome ? outcome : "?", on_air, burst_wall_s,
+                             state->tx.last_burst_slot_s,
+                             state->tx.last_send_period_s, summary);
                 } else {
                     snprintf(det, sizeof det,
                              "outcome=\"%.80s\" on_air=%d summary=\"%.300s\"",

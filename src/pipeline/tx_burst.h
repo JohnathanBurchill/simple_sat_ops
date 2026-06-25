@@ -29,6 +29,7 @@
 #define TX_BURST_H
 
 #include "csp.h"
+#include "sdr_backend.h"   // sdr_tx_burst_timing_t (optional per-burst timing)
 
 #include <stddef.h>
 #include <stdint.h>
@@ -84,11 +85,15 @@ typedef enum {
 // transmits, resumes RX at rx_resume_freq_hz). On success returns
 // TX_BURST_OK and fills `out_summary` with a one-line "ascii:..." /
 // "hex:..." description suitable for the UI / IPC fan-out.
+// out_timing (nullable): when non-NULL, filled with the SDR backend's
+// per-burst timing breakdown (device config / FIFO push / drain / power-down)
+// so the caller can log the real hardware floor. Pass NULL to skip it.
 tx_burst_result_t tx_burst_run(b210_rx_tx_core_t *core,
                                 const tx_request_slot_t *req,
                                 double rx_resume_freq_hz,
                                 const uint8_t *hmac_key, size_t hmac_key_len,
-                                char *out_summary, size_t summary_n);
+                                char *out_summary, size_t summary_n,
+                                sdr_tx_burst_timing_t *out_timing);
 
 // Parse a tolerant hex string ('a:b' / whitespace ignored). Returns
 // byte count on success, -1 on bad input.

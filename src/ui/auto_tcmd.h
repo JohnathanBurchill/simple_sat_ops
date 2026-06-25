@@ -43,6 +43,10 @@ int auto_tcmd_handle_key(state_t *state, int key);
 // Per-tick: advance the run state machine, queuing the next burst when due.
 void auto_tcmd_tick(state_t *state);
 
+// Repaint the open modal from the main redraw tick so a burst outcome that
+// resolves after the last draw shows up promptly. No-op if the modal is closed.
+void auto_tcmd_refresh(state_t *state);
+
 // Snapshot the run progress for the status line / IPC broadcast. Returns 1
 // when a run is active (fills sent/total/label), 0 otherwise.
 int auto_tcmd_progress(tx_t *tx, int *sent, int *total, const char **label);
