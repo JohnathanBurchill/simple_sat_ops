@@ -482,12 +482,12 @@ void render_predictions_panel(state_t *state, double jul_utc,
     double live_el = state->track.prediction.satellite_ephem.elevation;
     if (live_el > 0.0) {
         attron(COLOR_PAIR(3));
-        mvprintw(row++, col, "%15s   ** SATELLITE UP ** (el %.1f deg)",
-                 "status", live_el);
+        mvprintw(row++, col, "%15s   ** SATELLITE UP **",
+                 "status");
         attroff(COLOR_PAIR(3));
     } else {
-        mvprintw(row++, col, "%15s   below horizon (el %.1f deg)",
-                 "status", live_el);
+        mvprintw(row++, col, "%15s   below horizon",
+                 "status");
     }
     clrtoeol();
 
@@ -502,16 +502,7 @@ void render_predictions_panel(state_t *state, double jul_utc,
             snprintf(rot, sizeof rot, "resetting");
             rot_color = 2;
         } else if (state->rot.antenna_rotator.tracking) {
-            // Pointing error: how far the antenna's actual position is from
-            // the commanded target, which the tracker keeps on the
-            // satellite. The viewer shows this same value.
-            double err = antenna_rotator_pointing_error_deg(
-                state->rot.antenna_rotator.target_azimuth,
-                state->rot.antenna_rotator.target_elevation,
-                state->rot.antenna_rotator.azimuth,
-                state->rot.antenna_rotator.elevation);
-            snprintf(rot, sizeof rot,
-                     "TRACKING satellite  (pointing error %.1f deg)", err);
+            snprintf(rot, sizeof rot, "TRACKING satellite");
             rot_color = 3;
         } else if (state->track.satellite_tracking) {
             snprintf(rot, sizeof rot, "armed (will track at AOS)");
