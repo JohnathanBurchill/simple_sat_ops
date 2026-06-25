@@ -49,6 +49,7 @@
 #include "modem.h"   // pcm16_write_wav
 #include "frontiersat.h"   // FRONTIERSAT_CARRIER_HZ
 #include "carrier_trim.h"
+#include "fm_demod.h"
 #include "sw_nco.h"
 
 #include <ctype.h>
@@ -456,8 +457,7 @@ int main(int argc, char **argv)
     double       prev_I_live     = 0.0;
     double       prev_Q_live     = 0.0;
     int          have_prev_live  = 0;
-    const double k_scale_live    = actual_rate * 32767.0
-                                    / (fm_fullscale_hz * 2.0 * M_PI);
+    const double k_scale_live    = fm_demod_k_scale(actual_rate, fm_fullscale_hz);
     // Live monitor squelch threshold² — applied only to the audio sent
     // to ALSA, never to the iq[] buffer or the WAV write. 0 = ungated.
     // Filled in below: immediately for MONSQ_FIXED, after a short
@@ -642,11 +642,9 @@ int main(int argc, char **argv)
                     size_t idx = base + kk;
                     double I   = (double)iq[idx * 2 + 0];
                     double Q   = (double)iq[idx * 2 + 1];
-                    int16_t pcm = 0;
                     if (live_sq_mag_sq > 0.0) {
-                        double mag_sq  = I * I + Q * Q;
-                        double prev_sq = prev_I_live * prev_I_live
-                                          + prev_Q_live * prev_Q_live;
+                        double mag_sq  = fm_iq_mag_sq(I, Q);
+                        double prev_sq = fm_iq_mag_sq(prev_I_live, prev_Q_live);
                         double min_sq  = (mag_sq < prev_sq) ? mag_sq : prev_sq;
                         if (min_sq < live_sq_mag_sq) {
                             prev_I_live = I; prev_Q_live = Q;
@@ -654,14 +652,9 @@ int main(int argc, char **argv)
                             continue;
                         }
                     }
-                    double dphi  = atan2(Q * prev_I_live - I * prev_Q_live,
-                                         I * prev_I_live + Q * prev_Q_live);
-                    double pcm_d = dphi * k_scale_live;
-                    if (pcm_d >  32767.0) pcm_d =  32767.0;
-                    if (pcm_d < -32768.0) pcm_d = -32768.0;
-                    pcm = (int16_t)lround(pcm_d);
+                    monitor_chunk[out_n++] = fm_demod_pcm(prev_I_live, prev_Q_live,
+                                                          I, Q, k_scale_live, NULL);
                     prev_I_live = I; prev_Q_live = Q;
-                    monitor_chunk[out_n++] = pcm;
                 }
             }
             if (out_n > 0) {
@@ -811,8 +804,7 @@ int main(int argc, char **argv)
             }
             const double sq_mag_sq = sq_mag * sq_mag;
 
-            const double k_scale = actual_rate * 32767.0
-                                   / (fm_fullscale_hz * 2.0 * M_PI);
+            const double k_scale = fm_demod_k_scale(actual_rate, fm_fullscale_hz);
             int peak_pcm = 0;
             int clipped = 0;
             size_t squelched = 0;
@@ -825,19 +817,14 @@ int main(int argc, char **argv)
                 // magnitudes — a single-sample dropout at the edge
                 // of a burst would otherwise leak through. Compare
                 // squared values so we don't pay for two sqrts.
-                double mag1_sq = I1 * I1 + Q1 * Q1;
-                double mag0_sq = I0 * I0 + Q0 * Q0;
+                double mag1_sq = fm_iq_mag_sq(I1, Q1);
+                double mag0_sq = fm_iq_mag_sq(I0, Q0);
                 double min_sq = (mag0_sq < mag1_sq) ? mag0_sq : mag1_sq;
                 int16_t pcm = 0;
                 if (min_sq < sq_mag_sq) {
                     squelched++;
                 } else {
-                    double dphi = atan2(Q1 * I0 - I1 * Q0,
-                                        I1 * I0 + Q1 * Q0);
-                    double pcm_d = dphi * k_scale;
-                    if (pcm_d >  32767.0) { pcm_d =  32767.0; clipped++; }
-                    if (pcm_d < -32768.0) { pcm_d = -32768.0; clipped++; }
-                    pcm = (int16_t)lround(pcm_d);
+                    pcm = fm_demod_pcm(I0, Q0, I1, Q1, k_scale, &clipped);
                     if (abs(pcm) > peak_pcm) peak_pcm = abs(pcm);
                 }
                 audio[k - 1] = pcm;

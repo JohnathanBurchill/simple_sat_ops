@@ -27,6 +27,7 @@
 #include "b210_rx_tx_core.h"
 #include "sdr_backend.h"
 #include "fir_decim.h"
+#include "fm_demod.h"
 #include "iq_burst.h"
 #include "sw_nco.h"
 
@@ -164,7 +165,7 @@ int b210_rx_tx_core_open(const b210_rx_tx_core_params_t *p, b210_rx_tx_core_t **
     // rate-dependent, so k_scale scales with actual_rate to keep the
     // same int16 PCM amplitude.
     c->actual_rate = c->input_rate / (double)decim_M;
-    c->k_scale = c->actual_rate * 32767.0 / (c->fm_fullscale_hz * 2.0 * M_PI);
+    c->k_scale = fm_demod_k_scale(c->actual_rate, c->fm_fullscale_hz);
     c->iq_peak_release_alpha = exp(-1.0 / (0.5   * c->actual_rate));
     c->iq_rms_alpha          = exp(-1.0 / (0.030 * c->actual_rate));
 
@@ -360,12 +361,8 @@ ssize_t b210_rx_tx_core_pump(b210_rx_tx_core_t *c, int16_t *pcm_out, size_t pcm_
     for (; k < n_demod && out_n < pcm_cap; k++) {
         double I = (double)iq_demod[k * 2 + 0];
         double Q = (double)iq_demod[k * 2 + 1];
-        double dphi = atan2(Q * c->prev_I - I * c->prev_Q,
-                            I * c->prev_I + Q * c->prev_Q);
-        double pcm_d = dphi * c->k_scale;
-        if (pcm_d >  32767.0) pcm_d =  32767.0;
-        if (pcm_d < -32768.0) pcm_d = -32768.0;
-        pcm_out[out_n++] = (int16_t)lround(pcm_d);
+        pcm_out[out_n++] = fm_demod_pcm(c->prev_I, c->prev_Q, I, Q,
+                                        c->k_scale, NULL);
         c->prev_I = I;
         c->prev_Q = Q;
     }

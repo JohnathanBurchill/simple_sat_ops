@@ -516,6 +516,14 @@ target_include_directories(fm_mod_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(fm_mod_selftest PRIVATE m)
 list(APPEND SSO_TARGETS fm_mod_selftest)
 
+# FM discriminator kernel selftest (src/dsp/fm_demod.h). Header-only, pure
+# DSP: the atan2 discriminator + int16 scaling shared by the RX core and the
+# capture tool. Analytic tone oracle, no UHD/audio.
+add_executable(fm_demod_selftest unit_tests/fm_demod_selftest.c)
+target_include_directories(fm_demod_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(fm_demod_selftest PRIVATE m)
+list(APPEND SSO_TARGETS fm_demod_selftest)
+
 # Linear upsampler selftest (src/dsp/resample.c). Pure DSP.
 add_executable(resample_selftest unit_tests/resample_selftest.c
                src/dsp/resample.c)
