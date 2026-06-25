@@ -33,6 +33,7 @@
 
 #include "argparse.h"
 #include "beacon_cts1.h"
+#include "browser_timefmt.h"
 #include "packet_db.h"
 #include "sso_version.h"
 #include "tcmd_response.h"
@@ -140,39 +141,6 @@ static double monotonic_seconds(void)
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-// Render a stored ISO-8601 UTC timestamp into the chosen display mode
-// (UTC passthrough, or parsed and re-formatted to local). Same behaviour
-// as packet_browser's column.
-static void format_ts(const char *iso, char *out, size_t outn)
-{
-    if (iso == NULL || iso[0] == '\0') { if (outn) out[0] = '\0'; return; }
-    if (!show_local_time) { snprintf(out, outn, "%s", iso); return; }
-    int yr, mo, dd, hh, mm, ss, ms = 0;
-    int got = sscanf(iso, "%4d-%2d-%2dT%2d:%2d:%2d.%3d",
-                     &yr, &mo, &dd, &hh, &mm, &ss, &ms);
-    if (got < 6) { snprintf(out, outn, "%s", iso); return; }
-    struct tm utc = {0};
-    utc.tm_year = yr - 1900; utc.tm_mon = mo - 1; utc.tm_mday = dd;
-    utc.tm_hour = hh; utc.tm_min = mm; utc.tm_sec = ss;
-    time_t epoch = timegm(&utc);
-    if (epoch == (time_t)-1) { snprintf(out, outn, "%s", iso); return; }
-    struct tm local;
-    localtime_r(&epoch, &local);
-    char base[40];
-    strftime(base, sizeof base, "%Y-%m-%d %H:%M:%S", &local);
-    const char *tz = tzname[local.tm_isdst > 0 ? 1 : 0];
-    if (tz == NULL) tz = "";
-    snprintf(out, outn, "%s.%03d %s", base, ms, tz);
-}
-
-// Humanize a unix-ms instant as "YYYY-MM-DDTHH:MM:SSZ" (UTC, seconds).
-static void fmt_epoch_ms(uint64_t ms, char *out, size_t outn)
-{
-    time_t t = (time_t)(ms / 1000);
-    struct tm tm;
-    if (gmtime_r(&t, &tm) == NULL) { snprintf(out, outn, "?"); return; }
-    strftime(out, outn, "%Y-%m-%dT%H:%M:%SZ", &tm);
-}
 
 static int cmp_u64(const void *a, const void *b)
 {
@@ -367,7 +335,7 @@ static void draw_cmd_list(int list_top, int list_h, int cols)
         if (ridx >= n_rows) continue;
         cmd_row_t *r = &rows[ridx];
         char ts_disp[40], human[40];
-        format_ts(r->ts_tx, ts_disp, sizeof ts_disp);
+        format_ts(r->ts_tx, show_local_time, ts_disp, sizeof ts_disp);
         fmt_epoch_ms(r->ts_sent_ms, human, sizeof human);
         // First line of the command only, for the list. The on-screen row
         // is clipped to the column width anyway, so a bounded preview is
@@ -477,7 +445,7 @@ static void draw_resp_list(int list_top, int list_h, int cols)
         if (ridx >= resp_n) continue;
         resp_t *e = &resps[ridx];
         char ts_disp[40];
-        format_ts(e->ts, ts_disp, sizeof ts_disp);
+        format_ts(e->ts, show_local_time, ts_disp, sizeof ts_disp);
         char line[400];
         snprintf(line, sizeof line, "%6d  %-30.30s  %s", ridx + 1, ts_disp, e->line);
         int is_sel = (ridx == resp_sel);

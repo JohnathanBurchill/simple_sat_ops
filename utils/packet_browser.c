@@ -56,6 +56,7 @@
 */
 
 #include "argparse.h"
+#include "browser_timefmt.h"
 #include "packet_db.h"
 #include "sso_paths.h"
 #include "tcmd_response.h"
@@ -550,15 +551,6 @@ static int row_ts_sent(const row_t *r, uint64_t *out_ms)
     return tcmd_resp_ts_sent_u64(r->payload, (size_t) r->payload_len, out_ms) == 0;
 }
 
-// Format a unix-ms instant as "YYYY-MM-DDTHH:MM:SSZ" (UTC, second
-// resolution). Used for the group header and the heuristic time window.
-static void fmt_epoch_ms(uint64_t ms, char *out, size_t outn)
-{
-    time_t t = (time_t)(ms / 1000);
-    struct tm tm;
-    if (gmtime_r(&t, &tm) == NULL) { snprintf(out, outn, "?"); return; }
-    strftime(out, outn, "%Y-%m-%dT%H:%M:%SZ", &tm);
-}
 
 // Search the agenda files under the data root for "@tssent=<ms>" and
 // copy the first matching line into `out`. Best-effort fallback used
@@ -1232,51 +1224,6 @@ static void recon_clamp_scroll(int cols, int body_h)
     recon_scroll = top_row * bpr;
 }
 
-// Render a stored ISO-8601 UTC timestamp into the user's chosen
-// display mode. UTC mode is a passthrough; local mode parses the
-// "YYYY-MM-DDTHH:MM:SS[.fff]Z" form back to a time_t (via timegm)
-// then re-formats with localtime_r. Garbage that doesn't match the
-// pattern falls through unchanged so the operator can still see what
-// the column actually contains. The width is intentionally fixed
-// across modes (the list column is sized for it).
-static void format_ts(const char *iso, char *out, size_t outn)
-{
-    if (iso == NULL || iso[0] == '\0') {
-        if (outn > 0) out[0] = '\0';
-        return;
-    }
-    if (!show_local_time) {
-        snprintf(out, outn, "%s", iso);
-        return;
-    }
-    int yr, mo, dd, hh, mm, ss, ms = 0;
-    int got = sscanf(iso, "%4d-%2d-%2dT%2d:%2d:%2d.%3d",
-                     &yr, &mo, &dd, &hh, &mm, &ss, &ms);
-    if (got < 6) {
-        snprintf(out, outn, "%s", iso);
-        return;
-    }
-    struct tm utc = {0};
-    utc.tm_year = yr - 1900;
-    utc.tm_mon  = mo - 1;
-    utc.tm_mday = dd;
-    utc.tm_hour = hh;
-    utc.tm_min  = mm;
-    utc.tm_sec  = ss;
-    time_t epoch = timegm(&utc);
-    if (epoch == (time_t)-1) {
-        snprintf(out, outn, "%s", iso);
-        return;
-    }
-    struct tm local;
-    localtime_r(&epoch, &local);
-    char base[40];
-    strftime(base, sizeof base, "%Y-%m-%d %H:%M:%S", &local);
-    const char *tz = tzname[local.tm_isdst > 0 ? 1 : 0];
-    if (tz == NULL) tz = "";
-    snprintf(out, outn, "%s.%03d %s", base, ms, tz);
-}
-
 static int color_for_type(const char *name)
 {
     if (!g_have_color || name == NULL) return 0;
@@ -1313,7 +1260,7 @@ static void format_list_line(const row_t *r, int index_1based,
     const char *eol = strchr(summary_first, '\n');
     int body_len = eol ? (int)(eol - summary_first) : (int)strlen(summary_first);
     char ts_disp[40];
-    format_ts(r->ts, ts_disp, sizeof ts_disp);
+    format_ts(r->ts, show_local_time, ts_disp, sizeof ts_disp);
     snprintf(out, outn, "%6d  %-30.30s  %-13s  %-10s  %-13s  %-9s  %.*s",
              index_1based,
              ts_disp, r->tool,
@@ -1856,7 +1803,7 @@ static void draw_detail(int top_y, int height, int cols)
     // Header row in detail panel.
     char head[512];
     char ts_disp[40];
-    format_ts(r->ts, ts_disp, sizeof ts_disp);
+    format_ts(r->ts, show_local_time, ts_disp, sizeof ts_disp);
     snprintf(head, sizeof head,
              "id=%lld  ts=%s  type=%s  tool=%s  origin=%s  run=%s",
              (long long)r->id, ts_disp, r->type_name, r->tool,
