@@ -172,13 +172,20 @@ confirmed memory-safety overrun in the live RX byte-parsing core.
 
 ## §C — Cross-cutting (each = one refactor commit, fixes a class)
 
-- [ ] **X1 — Duplication.** (Remaining sub-items tracked in #23.) Same logic copy-pasted across files; consolidate each:
-  - [~] ASM-finder + M&M timing + boxcar matched filter copied ×4/×3 across
+- [~] **X1 — Duplication.** (Remaining sub-items tracked in #23.) Same logic copy-pasted across files; consolidate each. Five done in #23; the two below them left deliberately un-merged with rationale.
+  - [ ] ASM-finder + M&M timing + boxcar matched filter copied ×4/×3 across
     `modem.c`/`modem_iq.c`/`modem_viterbi.c`/`modem_fsk.c`. ASM finder DONE →
     shared `src/dsp/asm_search` (e01debd, byte-identical, also folds the 4×
-    `ASM_BIG_ENDIAN_U32` define). M&M timing + boxcar still copied — riskier
-    (tuned DSP, real-vs-IQ source variation, viterbi has side-products); leave
-    for a focused pass with the selftests as the guard.
+    `ASM_BIG_ENDIAN_U32` define). M&M timing + boxcar: CONSIDERED, DEFERRED
+    (#23). `modem_fsk` does not use M&M at all — it runs Gardner timing + a
+    Farrow cubic interpolator (different detector, opposite sign, different
+    gains), so it can't share. The other three M&M loops are arithmetically
+    identical but `modem_viterbi`'s strobe also emits the complex soft symbols
+    the Viterbi decoder consumes (a load-bearing side-product), and the loops
+    are inlined hot DSP. A shared block helper would change `modem_viterbi`'s
+    output path and add per-symbol call overhead for ~60 lines saved, guarded
+    only by the modem selftests. Not worth the risk; revisit only if a real
+    M&M bug appears in one copy.
   - [x] Text-field editing (`*_field_insert/backspace/.../draw`) duplicated
     `tx_compose.c` ↔ `auto_tcmd.c` → shared `src/ui/ui_textfield` + TAP selftest
     (cbea41e). Callers keep their own char-acceptance + side effects.
@@ -186,23 +193,49 @@ confirmed memory-safety overrun in the live RX byte-parsing core.
     ↔ `waterfall_core.c` → exported `wf_is_pow2`/`wf_fft_forward` + already-public
     `WF_VIRIDIS`, linked `waterfall_core` into `live_waterfall`, dropped the local
     copies (dcc5f14, -100 lines; verified gen_waterfall still renders).
-  - [ ] `tcmd_response` grouping SQL + magic offsets (`packet_type=4`,
-    `substr(payload,2,8)`, `substr(payload,13,1)`) across 7 sites
-    (`packet_browser.c:686,1090`, `tcmd_browser.c:292`, `gnss_opm.c:449`,
-    `gnss_reports.c:482`) → one `src/db`/`src/proto` helper.
+  - [x] `tcmd_response` grouping SQL + magic offsets (`packet_type=4`,
+    `substr(payload,2,8)`, `substr(payload,13,1)`) across 5 files → standalone
+    `src/proto/tcmd_response.h` (b67744a): offset constants, ts_sent/seq/max
+    accessors, and the SQL fragments, with static asserts tying them to the
+    firmware header where it's in scope. Each query's column list stays local
+    (they genuinely differ). Verified `gnss_opm`/`gnss_reports` output is
+    byte-identical on the live DB.
   - [x] `gnss_opm.c` ↔ `gnss_reports.c` (`starts_with`, `parse_time_spec`,
     `frag_t`, `reassemble`) → shared `src/proto/gnss_frag` (a16caf4). The
     tool-specific CONSIDER/FLUSH macros and trim logic stay local (they differ
     in semantics, not boilerplate).
-  - [ ] FM discriminator + min-mag squelch reimplemented in `b210_rx_capture.c`
-    (×2) vs `b210_rx_tx_core`/`monitor_squelch` → shared `src/dsp` helper.
-  - [ ] "newest .tle" discovery + TLE-name parsing across 4+ tools
-    (`pass_session.c`, `next_in_queue.c`, `tle_keps.c`, `tracking.c`) → one
-    tle-discovery module.
+  - [x] FM discriminator + min-mag squelch reimplemented in `b210_rx_capture.c`
+    (×2) vs `b210_rx_tx_core` → shared `src/dsp/fm_demod.h` (29d47e1):
+    `fm_demod_pcm` (clipped atan2 sample), `fm_demod_k_scale`, `fm_iq_mag_sq`.
+    The loops stay local (the core/live monitor carry phase state across
+    chunks; the WAV pass runs once and counts clipped/squelched), only the
+    arithmetic is shared. Added `fm_demod_selftest` with an analytic tone
+    oracle. `monitor_squelch` is a separate post-demod ratio detector, not
+    part of this. (The two `b210_rx_capture` paths can't run headless here;
+    guarded by the selftest + byte-exact extraction.)
+  - [~] "newest .tle" discovery + TLE-name parsing. Name-line parsing
+    consolidated → header-only `src/orbit/tle_io.h` (dd4e5a7):
+    `tle_io_read_line` + `tle_io_is_element_line`, adopted by `pass_session.c`,
+    `tracking.c`, `tle_keps.c` (verified `tle_keps --csv` identical over a
+    23-object TLE). Left deliberately: the three discovery routines
+    (`pass_session` newest-by-mtime, `next_in_queue` newest-dated-filename,
+    `tle_keps` FrontierSat day-directory layout) are three distinct policies,
+    not copies — folding them together relocates working code for no dedup.
+    `prediction.c` (core loader) and `rx_replay.c` keep their own line readers
+    (CR/LF-only trim, which the by-name prefix match + replay path rely on).
   - [~] Minor: `iso_utc` dup DONE → `sso_iso_utc_from_ts` in `sso_time.h`
-    (ffea7b0). Still open: `tcmd_browser.c:145-174` time fmt vs packet_browser;
-    `pass_schedule.c:36-53` private JSON reader vs the codec; `rx_decode.c:564-647`
-    decode loop vs `decode_loop`/`try_decode_window`.
+    (ffea7b0). `tcmd_browser` ↔ `packet_browser` `format_ts`/`fmt_epoch_ms`
+    DONE → header-only `utils/browser_timefmt.h` (5146425; `format_ts` now
+    takes the local-time flag as an argument). `rx_decode` decode loop vs
+    `decode_loop`: shared the subtle bit, the unframe + partial-RS rescue →
+    `ax100_unframe_with_rescue` (a5638bc), called by all four
+    `try_decode_window*` variants and `rx_decode`; `rx_decode` keeps its own
+    loop (polarity sweep, preamble anchoring, diagnostics — forensic, not
+    duplicated). `pass_schedule.c:36-53` private JSON reader vs the codec:
+    CONSIDERED, NOT MERGED — different contracts (the codec is bounds-checked
+    with full `\uXXXX` unescaping and brace-depth tracking; pass_schedule's is
+    an intentionally minimal flat-object reader for a fixed numeric payload).
+    Merging would regress one or bloat the other.
 - [x] **X2 — Stale HMAC surface** (RX dropped HMAC, integrity is CSP CRC32):
   `state.h` hmac fields + `HMAC_DISPLAY_*` enum + "TX REFUSED" comments;
   `panels.c:617-636` HMAC keyfile row; `packet_db` `hmac_ok` column (note as
