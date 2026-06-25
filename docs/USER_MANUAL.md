@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`a970b01` (2026-06-23). This is a working draft.
+`0aced5c` (2026-06-25). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -1588,12 +1588,29 @@ with `--lo-shift-khz=` and set the sample rate with `--rate=`.)
 
 The input format is picked from the extension: `.iq` is headerless
 int16 I/Q (the two-pass IQ decoder); `.raw` is headerless S16_LE PCM;
-anything else is read as a `.wav`. A **SatNOGS `.ogg`** recording is
-also accepted directly: it is the receiver's FM-demodulated *audio*
-(the discriminated voltages, just Vorbis-compressed), so `rx_replay`
-decodes it to PCM in memory via libsndfile and runs the **FM-audio
-chain** - the same path as a `.wav`, not the IQ path. Requires the
-build to have libsndfile; otherwise an `.ogg` errors with a hint.
+`.ogg` is a SatNOGS audio recording (see below); anything else is read
+as a `.wav`.
+
+A **SatNOGS `.ogg`** recording is accepted directly - no conversion
+step. It is the SatNOGS ground station's FM-demodulated *audio* (the
+discriminated voltages, just Vorbis-compressed), so `rx_replay` decodes
+it to PCM in memory via libsndfile and runs the **FM-audio chain** -
+the same code path as a `.wav`, not the IQ path. Requires the build to
+have libsndfile; otherwise an `.ogg` errors with a hint.
+
+Mind the **format difference**. The `.iq` and `.wav` sidecars that
+`simple_sat_ops` writes are at this station's post-decimation rate of
+**96 kHz** (the IQ is complex baseband; the WAV is mono FM-demod
+audio). A SatNOGS `.ogg` is *not* in that format: it is somebody
+else's recording, Vorbis-compressed, mono, at whatever rate that
+ground station used - **commonly 48 kHz, but not guaranteed**, and
+never 96 kHz. So `rx_replay` reads the sample rate out of the `.ogg`
+header and uses that; you do **not** pass `--rate=` for an `.ogg` (and
+the IQ-only `--lo-shift-khz=` does not apply). For our own `.iq`
+captures `rx_replay` instead auto-detects the rate from the companion
+`.wav` header, falling back to `--rate=48000` if there isn't one - so
+a bare `.iq` from this station still wants `--rate=96000` if its `.wav`
+is missing.
 
 ```sh
 rx_replay /FrontierSat/SatNOGS/.../satnogs_<id>_<utc>.ogg
@@ -1634,10 +1651,16 @@ rx_replay /FrontierSat/SatNOGS/<date>/satnogs_<id>_<utc>.ogg
 ```
 
 `rx_replay` detects the `.ogg`, decodes it to PCM in memory via
-libsndfile, reads the sample rate from the file (SatNOGS audio is
-typically 48 kHz), and runs the decoder. Add the usual flags as needed
-(`--bit-rate=`, `--window-s=`, `--tle=`, `--satellite=`, ...). Two notes:
+libsndfile, reads the sample rate **out of the file header**, and runs
+the decoder. Add the usual flags as needed (`--bit-rate=`,
+`--window-s=`, `--tle=`, `--satellite=`, ...). Three notes:
 
+- It is a **different format** from the `.iq` / `.wav` files
+  `simple_sat_ops` records here. Ours are 96 kHz (complex baseband IQ,
+  or mono FM-demod audio). A SatNOGS `.ogg` is Vorbis-compressed mono
+  audio at that station's rate - **commonly 48 kHz, sometimes other
+  rates, never 96 kHz**. You do **not** pass `--rate=`; `rx_replay`
+  takes the rate from the `.ogg` itself.
 - It is **audio, not IQ** - do not pass `--iq`, and the IQ-only knobs
   (`--lo-shift-khz=`) don't apply. The discriminated audio is what the
   decoder's FM-audio chain expects.
