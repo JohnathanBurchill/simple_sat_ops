@@ -1196,41 +1196,27 @@ static void try_decode_iq_at_window(rx_session_t *rxs)
 
         // Per-type bookkeeping. FrontierSat tags packet_type in the
         // first byte of the CSP payload (after the 4-byte CSP header).
+        uint8_t ptype = (plen >= 5) ? rxs->packet[4] : 0x00;
         rx_packet_type_slot_t slot = RX_PT_OTHER;
-        if (plen >= 5) {
-            uint8_t ptype = rxs->packet[4];
-            switch (ptype) {
-                case 0x01: slot = RX_PT_BEACON_BASIC; break;
-                case 0x02: slot = RX_PT_BEACON_PERIPHERAL; break;
-                case 0x03: slot = RX_PT_LOG_MESSAGE; break;
-                case 0x04: slot = RX_PT_TCMD_RESPONSE; break;
-                case 0x10: slot = RX_PT_BULK_FILE; break;
-                default:   slot = RX_PT_OTHER; break;
-            }
+        switch (ptype) {
+            case COMMS_PACKET_TYPE_BEACON_BASIC:       slot = RX_PT_BEACON_BASIC; break;
+            case COMMS_PACKET_TYPE_BEACON_PERIPHERAL:  slot = RX_PT_BEACON_PERIPHERAL; break;
+            case COMMS_PACKET_TYPE_LOG_MESSAGE:        slot = RX_PT_LOG_MESSAGE; break;
+            case COMMS_PACKET_TYPE_TCMD_RESPONSE:      slot = RX_PT_TCMD_RESPONSE; break;
+            case COMMS_PACKET_TYPE_BULK_FILE_DOWNLINK: slot = RX_PT_BULK_FILE; break;
+            default:                                   slot = RX_PT_OTHER; break;
         }
         rxs->per_type_count[slot]++;
         int copy = (plen < RX_LAST_PAYLOAD_MAX) ? (int)plen : RX_LAST_PAYLOAD_MAX;
         rxs->per_type_last_len[slot] = copy;
         memcpy(rxs->per_type_last_payload[slot], rxs->packet, (size_t)copy);
-        char *sum_out  = rxs->per_type_last_summary[slot];
-        size_t sum_cap = sizeof rxs->per_type_last_summary[slot];
-        sum_out[0] = '\0';
-        switch (slot) {
-            case RX_PT_BEACON_BASIC:
-                beacon_basic_summary(rxs->packet, (size_t) plen,
-                                     sum_out, sum_cap);
-                break;
-            case RX_PT_TCMD_RESPONSE:
-                tcmd_response_summary(rxs->packet, (size_t) plen,
-                                      sum_out, sum_cap);
-                break;
-            case RX_PT_LOG_MESSAGE:
-                log_message_summary(rxs->packet, (size_t) plen,
-                                    sum_out, sum_cap);
-                break;
-            default:
-                break;
-        }
+        // Build the one-line panel summary. An uncorrectable-RS frame
+        // (rs_errs == -2) yields the RS-FAIL marker instead of parsed
+        // telemetry, so the operator never reads garbage as a real reading;
+        // the frame still went to the DB above and the counter still bumped.
+        cts1_rx_panel_summary(rxs->packet, (size_t) plen, ptype, rs_errs,
+                              rxs->per_type_last_summary[slot],
+                              sizeof rxs->per_type_last_summary[slot]);
 
         struct timespec mono;
         if (clock_gettime(CLOCK_MONOTONIC, &mono) == 0) {

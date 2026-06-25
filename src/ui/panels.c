@@ -22,6 +22,7 @@
 #include "state.h"
 
 #include "antenna_rotator_async.h"
+#include "beacon_cts1.h"     // RX_RS_FAIL_TOKEN -- the uncorrectable-RS marker
 #include "duration_fmt.h"
 #include "pass_session.h"
 #include "prediction.h"
@@ -340,8 +341,19 @@ void render_rx_panel(const rx_panel_data_t *d,
         // produce one (basic beacon / tcmd response / log message);
         // fall back to a hex preview for unknown / unparsed types.
         if (d->pt_summary[s][0]) {
-            mvprintw(row++, col, "%15s   %s",
-                     rx_panel_pt_label(s), d->pt_summary[s]);
+            // An uncorrectable-RS frame carries the RS-FAIL marker instead
+            // of telemetry. Strip the lead token and draw the message in
+            // bold red so the operator can't mistake it for a valid decode.
+            size_t tok = strlen(RX_RS_FAIL_TOKEN);
+            if (strncmp(d->pt_summary[s], RX_RS_FAIL_TOKEN, tok) == 0) {
+                attron(COLOR_PAIR(1) | A_BOLD);
+                mvprintw(row++, col, "%15s   %s",
+                         rx_panel_pt_label(s), d->pt_summary[s] + tok);
+                attroff(COLOR_PAIR(1) | A_BOLD);
+            } else {
+                mvprintw(row++, col, "%15s   %s",
+                         rx_panel_pt_label(s), d->pt_summary[s]);
+            }
             clrtoeol();
             continue;
         }

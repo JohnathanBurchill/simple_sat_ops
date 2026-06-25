@@ -521,6 +521,68 @@ static void test_cts1_packet_print_dispatch(void)
     }
 }
 
+// ------------------------------------------------------------------
+// 12. cts1_rx_panel_summary: uncorrectable-RS frames are marked, not
+//     parsed (issue #37). The same bytes that yield real telemetry at
+//     rs_errs >= 0 must yield only the RS-FAIL marker at rs_errs == -2.
+// ------------------------------------------------------------------
+
+static void test_cts1_rx_panel_summary_rs_fail(void)
+{
+    uint8_t buf[130];
+    make_beacon_fixture(buf);
+    // Matches rx_session's RX_LAST_SUMMARY_MAX (the real on-panel buffer).
+    char out[160];
+    size_t tok = strlen(RX_RS_FAIL_TOKEN);
+
+    // rs_errs == 0 (corrected, frame valid): real beacon telemetry, and it
+    // must NOT carry the RS-FAIL marker. This is the baseline the bug fix
+    // must not regress -- valid beacons keep showing.
+    cts1_rx_panel_summary(buf, sizeof buf, COMMS_PACKET_TYPE_BEACON_BASIC,
+                          /*rs_errs=*/0, out, sizeof out);
+    tap_okf(strncmp(out, RX_RS_FAIL_TOKEN, tok) != 0,
+            "rs_panel: rs_errs=0 beacon is not marked RS-FAIL (%s)", out);
+    tap_ok(strstr(out, "batt=8.12V") != NULL,
+           "rs_panel: rs_errs=0 beacon shows real telemetry");
+
+    // rs_errs == -2 (uncorrectable): the SAME bytes must now be suppressed.
+    cts1_rx_panel_summary(buf, sizeof buf, COMMS_PACKET_TYPE_BEACON_BASIC,
+                          /*rs_errs=*/-2, out, sizeof out);
+    tap_okf(strncmp(out, RX_RS_FAIL_TOKEN, tok) == 0,
+            "rs_panel: rs_errs=-2 beacon carries the RS-FAIL marker (%s)", out);
+    tap_ok(strstr(out, "batt=") == NULL,
+           "rs_panel: rs_errs=-2 beacon hides the telemetry (no batt=)");
+    tap_ok(strncmp(out + tok, "RS-FAIL", 7) == 0,
+           "rs_panel: stripped display text begins 'RS-FAIL'");
+
+    // rs_errs == -1 (RS off / not applied): NOT suppressed -- only the
+    // uncorrectable sentinel hides data.
+    cts1_rx_panel_summary(buf, sizeof buf, COMMS_PACKET_TYPE_BEACON_BASIC,
+                          /*rs_errs=*/-1, out, sizeof out);
+    tap_ok(strncmp(out, RX_RS_FAIL_TOKEN, tok) != 0,
+           "rs_panel: rs_errs=-1 (RS off) is not marked RS-FAIL");
+
+    // The marker covers every type, including ones with no parser. A bulk
+    // / unknown type at rs_errs == -2 still gets the marker (not an empty
+    // string the panel would hex-dump as if it were real bytes).
+    cts1_rx_panel_summary(buf, sizeof buf, COMMS_PACKET_TYPE_TCMD_RESPONSE,
+                          /*rs_errs=*/-2, out, sizeof out);
+    tap_ok(strncmp(out, RX_RS_FAIL_TOKEN, tok) == 0,
+           "rs_panel: rs_errs=-2 tcmd type also marked RS-FAIL");
+    cts1_rx_panel_summary(buf, sizeof buf, COMMS_PACKET_TYPE_BULK_FILE_DOWNLINK,
+                          /*rs_errs=*/-2, out, sizeof out);
+    tap_ok(strncmp(out, RX_RS_FAIL_TOKEN, tok) == 0,
+           "rs_panel: rs_errs=-2 bulk type also marked RS-FAIL");
+
+    // A parser-less type with a good frame yields an empty summary (the
+    // panel hex-dumps it) -- and must NOT be marked. Guards against a
+    // mutation that bakes the marker unconditionally.
+    cts1_rx_panel_summary(buf, sizeof buf, COMMS_PACKET_TYPE_BULK_FILE_DOWNLINK,
+                          /*rs_errs=*/0, out, sizeof out);
+    tap_ok(out[0] == '\0',
+           "rs_panel: rs_errs=0 bulk type yields empty summary (hex fallback)");
+}
+
 int main(void)
 {
     test_beacon_is_basic_length_gates();
@@ -534,5 +596,6 @@ int main(void)
     test_bulk_file_is();
     test_cts1_sanitise_text();
     test_cts1_packet_print_dispatch();
+    test_cts1_rx_panel_summary_rs_fail();
     return tap_done();
 }

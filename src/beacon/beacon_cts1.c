@@ -577,6 +577,40 @@ int log_message_summary(const uint8_t *payload, size_t len,
     return (n < (int) out_size) ? n : (int) out_size - 1;
 }
 
+void cts1_rx_panel_summary(const uint8_t *packet, size_t len,
+                           uint8_t packet_type, int rs_errs,
+                           char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    if (rs_errs == -2) {
+        // Uncorrectable Reed-Solomon block: the recovered bytes are garbage,
+        // so parsing them into telemetry (battery voltage, log text, command
+        // IDs) would mislead the operator. Mark it for every type instead of
+        // decoding. CRC-mismatch frames (rs_errs >= 0) stay visible -- that is
+        // the existing low-SNR policy, a different case.
+        snprintf(out, out_size,
+                 "%sRS-FAIL: telemetry hidden (uncorrectable frame)",
+                 RX_RS_FAIL_TOKEN);
+        return;
+    }
+    switch (packet_type) {
+        case COMMS_PACKET_TYPE_BEACON_BASIC:
+            beacon_basic_summary(packet, len, out, out_size);
+            break;
+        case COMMS_PACKET_TYPE_TCMD_RESPONSE:
+            tcmd_response_summary(packet, len, out, out_size);
+            break;
+        case COMMS_PACKET_TYPE_LOG_MESSAGE:
+            log_message_summary(packet, len, out, out_size);
+            break;
+        default:
+            // Peripheral / bulk / unknown: no one-line parser; the panel
+            // falls back to a hex preview of the payload.
+            break;
+    }
+}
+
 int bulk_file_is(const uint8_t *payload, size_t len)
 {
     if (payload == NULL) return 0;

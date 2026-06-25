@@ -54,6 +54,14 @@
 #define COMMS_PACKET_TYPE_TCMD_RESPONSE     0x04
 #define COMMS_PACKET_TYPE_BULK_FILE_DOWNLINK 0x10
 
+// Lead token cts1_rx_panel_summary writes ahead of the summary text when a
+// frame's Reed-Solomon block was uncorrectable (rs_errs == -2): the recovered
+// bytes are garbage, so parsed telemetry would mislead. The panel renderer
+// matches this prefix, strips it, and draws the rest in red. The token itself
+// never reaches the operator as visible text. Kept printable so it survives
+// the IPC JSON encoding intact when the summary is fanned out to viewers.
+#define RX_RS_FAIL_TOKEN "!RS!"
+
 #define COMMS_BEACON_FRIENDLY_MESSAGE_SIZE 42
 
 // AX100_DOWNLINK_MAX_BYTES is 200 in the firmware (firmware/Core/Inc/
@@ -321,5 +329,20 @@ void cts1_packet_print(FILE *fp, const char *ts,
 size_t cts1_sanitise_text(const uint8_t *data, size_t data_len,
                           char *out, size_t outn,
                           int *out_truncated);
+
+// Build the one-line RX-panel summary for a decoded frame. packet is the
+// frame the per-type summary functions expect; packet_type is its
+// COMMS_PACKET_TYPE_* byte (the caller has already routed it to a panel
+// slot). When rs_errs == -2 the frame's Reed-Solomon block was
+// uncorrectable, so the bytes are garbage: out gets the RX_RS_FAIL_TOKEN
+// marker instead of parsed telemetry, for every type. Otherwise it
+// delegates to beacon_basic_summary / tcmd_response_summary /
+// log_message_summary by type, leaving out an empty string for types with
+// no parser (peripheral / bulk / unknown). rs_errs of -1 (RS off) or >= 0
+// (corrected, frame valid) take the normal parse path -- only the
+// uncorrectable sentinel is suppressed.
+void cts1_rx_panel_summary(const uint8_t *packet, size_t len,
+                           uint8_t packet_type, int rs_errs,
+                           char *out, size_t out_size);
 
 #endif // BEACON_CTS1_H
