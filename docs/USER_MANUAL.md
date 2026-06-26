@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`cbbcee7` (2026-06-26). This is a working draft.
+`e992e85` (2026-06-26). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2208,6 +2208,59 @@ gnss_reports --since=7d
 A `BESTXYZA` whose status reads `SOL_COMPUTED` is a real position fix;
 `INSUFFICIENT_OBS` means the receiver could not see enough satellites to
 solve. Those computed fixes are what feed the orbit upload below.
+
+### `mag_reports`
+
+A magnetometer counterpart to `gnss_reports`: it pulls FrontierSat's
+magnetic-field measurements out of the packet DB and ties each one to
+where the satellite was when the reading was taken, using the closest
+TLE in the DB by epoch (the same SGP4 path `next_in_queue` propagates
+with).
+
+The readings arrive in a few shapes, and the tool reads all of them.
+Most come down as responses to `adcs_generic_telemetry_request(151, 6)`
+-- CubeADCS frame 151, the *measured* field (frame 159 is the IGRF
+*model* field). That response is a short hex byte dump: a signed 16-bit
+value per axis, little-endian, which -- like the flight software -- the
+tool multiplies by 10 to read in nanotesla. The named commands that
+answer with JSON are read too: `adcs_magnetic_field_vector` and
+`adcs_measurements` (already in nT), and `adcs_get_raw_magnetometer_values`
+(bare sensor counts). A reading the satellite both answered directly
+*and* logged to an SD file and bulk-downlinked is recognized as the same
+reading and reported once.
+
+By default it prints a human report, one block per reading: the field
+vector and its magnitude, the sub-satellite latitude/longitude/altitude
+at the measurement time, the TLE used (with the gap between its epoch and
+the reading), and -- when a model (IGRF) reading sits within the pairing
+window -- the measured-minus-model residual. `--json` emits one JSON
+object per reading (JSONL) instead, with diagnostics on stderr.
+
+It defaults to NORAD 69015 (FrontierSat). `--catalog=<n>` or
+`--satellite=<name>` associates against a different object (`--catalog=0`
+for any). `--since` / `--until` restrict the time range (default: all),
+`--reverse` prints newest first, `--pair-window=<s>` sets how close a
+measured and a model reading must be in time to be paired (default
+120 s), and `--no-bulk` skips the bulk-downlinked `adcs_data` logs and
+reads only `tcmd_response` packets.
+
+```sh
+mag_reports                       # every FrontierSat reading, oldest first
+mag_reports --since=7d --reverse  # the last week, newest first
+mag_reports --json | jq .         # machine-readable
+```
+
+Two caveats on the numbers. The raw sensor counts have no committed
+scale on the ground -- the firmware applies a calibration matrix and
+offset from `adcs_get_magnetometer_config` that has never been
+downlinked -- so `mag_reports` reports raw readings at an approximate
+**1 nT per count**, and `--nt-per-count=<f>` overrides that first-order
+guess; the already-scaled readings (frame 151, `adcs_magnetic_field_vector`)
+are exact. And a position is only as good as the nearest TLE: if no TLE
+in the DB is close to a reading's epoch the position is reported as
+unavailable, and a large epoch gap is printed so you can judge it. The
+parsers, frame-id lookup, magnitude, TLE-epoch-to-unix-time conversion,
+and closest-epoch search are covered by `adcs_mag_selftest` (47 checks).
 
 ### `tle_from_state`
 
