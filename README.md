@@ -85,7 +85,6 @@ for most often:
 | `tle_keps` | Orbital-elements summary (apogee/perigee, period, sun-sync, LTAN/LTDN). |
 | `gnss_opm` / `gnss_reports` | Turn a downlinked GNSS fix into a CCSDS orbit message for space-safety upload. |
 | `ham_listen` / `ham_speak` | Amateur-band voice receive/transmit helpers. |
-| `lifetime` | Toy orbit-decay estimate (**inaccurate** — a "what if?" only). |
 
 This is a selection, not the full set — bench bring-up (`tx_frame_sdr`,
 `b210_rx_capture`, `b210_gain_sweep`, `beacon_gen`, …), IQ/WAV utilities,
