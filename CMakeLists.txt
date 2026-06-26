@@ -317,6 +317,16 @@ add_executable(gnss_frag_selftest
 target_include_directories(gnss_frag_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS gnss_frag_selftest)
 
+# ADCS magnetometer helper self-test: the JSON field-vector parse (the
+# measured and IGRF-model fields share a shape), the |B| magnitude, the
+# TLE-epoch -> unix-ms conversion, and the closest-epoch search -- the pure
+# pieces mag_reports builds on.
+add_executable(adcs_mag_selftest
+               unit_tests/adcs_mag_selftest.c src/proto/adcs_mag.c)
+target_include_directories(adcs_mag_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(adcs_mag_selftest PRIVATE m)
+list(APPEND SSO_TARGETS adcs_mag_selftest)
+
 # ASM search self-test: asm_find_best(), the sliding-window Hamming-distance
 # scan every demodulator uses to lock onto the AX100 sync marker. Golden cases
 # pin the wire bit order and selection rule; a brute-force oracle backs a
@@ -753,6 +763,24 @@ if (OPENSSL_FOUND)
     target_link_packet_db(gnss_opm)
     target_link_sso_core(gnss_opm)
     list(APPEND SSO_TARGETS gnss_opm)
+
+    # Report ADCS magnetometer readings, tying each to where the satellite
+    # was via the closest TLE by epoch. Pure JSON parse + epoch math live in
+    # adcs_mag.c (unit-tested); SGP4 propagation is gated on sgp4sdp4 the same
+    # way rx_replay's is, so the tool still decodes readings on a host without
+    # it (just no position).
+    add_executable(mag_reports utils/mag_reports.c src/proto/adcs_mag.c src/proto/gnss_frag.c)
+    target_include_directories(mag_reports PRIVATE ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(mag_reports PRIVATE ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(mag_reports PRIVATE ${OPENSSL_LIBRARIES} m)
+    if (SGP4SDP4_LIB)
+        target_compile_definitions(mag_reports PRIVATE WITH_SGP4SDP4)
+        target_sources(mag_reports PRIVATE src/orbit/prediction.c src/orbit/oem.c)
+        target_link_libraries(mag_reports PRIVATE ${SGP4SDP4_LIB})
+    endif()
+    target_link_packet_db(mag_reports)
+    target_link_sso_core(mag_reports)
+    list(APPEND SSO_TARGETS mag_reports)
 
     # Backfill the sent_tcmd table from historical tx.log files.
     add_executable(tcmd_import utils/tcmd_import.c src/proto/agenda_line.c)
