@@ -516,6 +516,14 @@ target_include_directories(fm_mod_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(fm_mod_selftest PRIVATE m)
 list(APPEND SSO_TARGETS fm_mod_selftest)
 
+# Per-frame RMS->dBFS selftest (src/dsp/frame_rssi.c), the rx_replay
+# --forensics-report "rssi" field. Textbook dB values as the oracle.
+add_executable(frame_rssi_selftest unit_tests/frame_rssi_selftest.c
+               src/dsp/frame_rssi.c)
+target_include_directories(frame_rssi_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(frame_rssi_selftest PRIVATE m)
+list(APPEND SSO_TARGETS frame_rssi_selftest)
+
 # FM discriminator kernel selftest (src/dsp/fm_demod.h). Header-only, pure
 # DSP: the atan2 discriminator + int16 scaling shared by the RX core and the
 # capture tool. Analytic tone oracle, no UHD/audio.
@@ -792,7 +800,7 @@ if (OPENSSL_FOUND)
                    src/pipeline/decode_loop.c
                    src/dsp/asm_search.c src/dsp/modem.c src/dsp/modem_fsk.c
                    src/dsp/modem_iq.c src/dsp/modem_viterbi.c
-                   src/dsp/sw_nco.c src/dsp/iq_burst.c
+                   src/dsp/sw_nco.c src/dsp/iq_burst.c src/dsp/frame_rssi.c
                    src/proto/ax100.c src/proto/rs.c src/proto/golay24.c
                    src/proto/csp.c src/proto/hmac_keyfile.c
                    src/beacon/beacon_cts1.c src/pipeline/rx_tui.c

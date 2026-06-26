@@ -1839,10 +1839,22 @@ Every input produces at least one line, so nothing is silently dropped:
   - `time_in_file_ms` - when the frame's sync word starts, in
     milliseconds from the head of the file (decimal, sub-millisecond
     precision).
-  - `rssi` - signal strength: the RMS level over the frame's sample
-    span, in dBFS relative to int16 full scale (the same scale the live
-    RX panel's level meter uses; floor `-90.0`). IQ files use the
-    magnitude `sqrt(I^2+Q^2)`; audio / `.wav` uses the sample value.
+  - `rssi` - a **relative** signal level, not a calibrated RSSI in dBm:
+    the RMS amplitude over the frame's sample span, in dBFS relative to
+    int16 full scale (the same scale the live RX panel's level meter
+    uses; floor `-90.0`). IQ files use the magnitude `sqrt(I^2+Q^2)`;
+    audio / `.wav` / `.ogg` uses the sample value. It is meaningful for
+    comparing frames from the **same IQ capture chain** (its intended use
+    - decoder scoring), where amplitude tracks received power modulo
+    gain/AGC. It is **not** a received-power figure for demodulated audio:
+    a SatNOGS `.ogg` is FM-discriminated audio normalised close to full
+    scale, so frames read near `0` dBFS regardless of how strong the pass
+    was (e.g. one capture whose whole-file mean is `-2.1` dBFS reports
+    `rssi` near `-2.0` on every frame). The window is also approximate -
+    it spans `(payload + 36) * 8 * samples-per-bit` samples from the sync
+    word, which estimates the frame's footprint rather than bounding it
+    exactly. The conversion is unit-tested in
+    `unit_tests/frame_rssi_selftest.c`.
   - `rs` - Reed-Solomon(255,223) result: the number of corrected bytes
     (`>= 0`), `-2` when the block was uncorrectable (the bytes are still
     recovered and reported, errors and all), or `-1` when RS was not

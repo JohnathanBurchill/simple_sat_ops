@@ -39,6 +39,7 @@
 #include "ax100.h"
 #include "csp.h"
 #include "decode_loop.h"
+#include "frame_rssi.h"
 #include "iq_burst.h"
 #include "modem.h"
 #include "modem_fsk.h"
@@ -814,38 +815,6 @@ static int forensics_fail(const char *fn_json, const char *msg)
     return 1;
 }
 
-// Signal-strength estimate for the --forensics-report "rssi" field:
-// the RMS level over the frame's sample span, in dBFS relative to
-// int16 full scale. Mirrors rx_session's level meter (rms/32768, -90
-// dBFS floor) so a forensics number is comparable to the live RX
-// panel. IQ files use the magnitude sqrt(I^2+Q^2); PCM uses the sample
-// value. Returns -90.0 when the span is empty or below the floor.
-static double rx_frame_rssi_dbfs(const int16_t *s, size_t n_frames,
-                                 int iq_mode,
-                                 uint64_t start, uint64_t span)
-{
-    if (s == NULL || span == 0 || start >= n_frames) return -90.0;
-    uint64_t end = start + span;
-    if (end > n_frames) end = n_frames;
-    double sum_sq = 0.0;
-    uint64_t count = 0;
-    for (uint64_t k = start; k < end; ++k) {
-        if (iq_mode) {
-            double i = (double)s[2 * k];
-            double q = (double)s[2 * k + 1];
-            sum_sq += i * i + q * q;
-        } else {
-            double v = (double)s[k];
-            sum_sq += v * v;
-        }
-        ++count;
-    }
-    if (count == 0) return -90.0;
-    double rms = sqrt(sum_sq / (double)count);
-    if (rms < 1.0) return -90.0;
-    return 20.0 * log10(rms / 32768.0);
-}
-
 // Post-decode pipeline: optional CSP CRC-32C trim, dedup by absolute
 // sample position, SGP4 observer state, emit_frame, --update DB writes,
 // TUI mirror, dedup ring update, and n_emitted bump. Used by both
@@ -969,8 +938,8 @@ static int rx_emit_decoded(rx_emit_ctx_t *ctx,
         char b64[(4100 + 2) / 3 * 4 + 4];
         long enc = sso_base64_encode(packet, (size_t)plen, b64, sizeof b64);
         uint64_t span = (uint64_t)(on_wire_plen + 36) * 8u * (uint64_t)ctx->sps;
-        double rssi = rx_frame_rssi_dbfs(ctx->samples, ctx->n_frames,
-                                         ctx->iq_mode, asm_abs_sample, span);
+        double rssi = frame_rssi_dbfs(ctx->samples, ctx->n_frames,
+                                      ctx->iq_mode, asm_abs_sample, span);
         printf("{\"filename\":\"%s\",\"time_in_file_ms\":%.3f,\"rssi\":%.1f,"
                "\"rs\":%d,\"data_base64\":\"%s\"}\n",
                ctx->filename_json ? ctx->filename_json : "",
