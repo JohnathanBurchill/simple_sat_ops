@@ -1817,50 +1817,66 @@ and `src/orbit/prediction.c` (the known-good path).
 #### Forensics report (`--forensics-report`)
 
 For research, and for scoring decode backends across a corpus,
-`rx_replay --forensics-report` emits one JSON object per decoded frame
-to stdout and **never touches the packet database** - it is a read-only
-mode, so `--update` and the curses `--ui` are refused, and any `--db=`
-is ignored. The human framing lines are suppressed, so stdout is a
-clean newline-delimited JSON (NDJSON) stream you can pipe straight to
-`jq`:
+`rx_replay --forensics-report` writes **nothing but JSON** to stdout and
+**never touches the packet database** - it is a read-only mode, so
+`--update` and the curses `--ui` are refused, and any `--db=` is ignored.
+The output is JSONL (one JSON object per line), so it pipes straight to
+`jq` and is the natural feed for a future live/streaming consumer; pack
+it into a single JSON array after the fact with `jq -s .` when you want a
+list-of-dicts instead:
 
 ```sh
 rx_replay capture.iq --rate=96000 --forensics-report
 rx_replay satnogs_<id>_<utc>.ogg --forensics-report | jq .
+rx_replay capture.iq --rate=96000 --forensics-report | jq -s .   # as an array
 ```
 
-Each line carries the four fields requested in issue #39:
+Every input produces at least one line, so nothing is silently dropped:
 
-- `time_in_file_ms` - when the frame's sync word starts, in
-  milliseconds from the head of the file (decimal, sub-millisecond
-  precision).
-- `rssi` - signal strength: the RMS level over the frame's sample
-  span, in dBFS relative to int16 full scale (the same scale the live
-  RX panel's level meter uses; floor `-90.0`). IQ files use the
-  magnitude `sqrt(I^2+Q^2)`; audio / `.wav` uses the sample value.
-- `rs` - Reed-Solomon(255,223) result: the number of corrected bytes
-  (`>= 0`), `-2` when the block was uncorrectable (the bytes are still
-  recovered and reported, errors and all), or `-1` when RS was not
-  applied (e.g. `--no-reed-solomon`).
-- `data_base64` - the decoded frame, base64-encoded. This is the CSP
-  frame as handed to the rest of the pipeline, with the trailing CSP
-  CRC-32C stripped when it validated.
+- A **decoded frame** is one object with the four fields requested in
+  issue #39 plus the source filename:
+  - `filename` - the capture path (or the `--report-filename=` value).
+  - `time_in_file_ms` - when the frame's sync word starts, in
+    milliseconds from the head of the file (decimal, sub-millisecond
+    precision).
+  - `rssi` - signal strength: the RMS level over the frame's sample
+    span, in dBFS relative to int16 full scale (the same scale the live
+    RX panel's level meter uses; floor `-90.0`). IQ files use the
+    magnitude `sqrt(I^2+Q^2)`; audio / `.wav` uses the sample value.
+  - `rs` - Reed-Solomon(255,223) result: the number of corrected bytes
+    (`>= 0`), `-2` when the block was uncorrectable (the bytes are still
+    recovered and reported, errors and all), or `-1` when RS was not
+    applied (e.g. `--no-reed-solomon`).
+  - `data_base64` - the decoded frame, base64-encoded. This is the CSP
+    frame as handed to the rest of the pipeline, with the trailing CSP
+    CRC-32C stripped when it validated.
+- A file that **decoded nothing** still emits one `{"filename": ...}`
+  object (no decode fields), so a batch consumer sees every input.
+- A **failure** (unreadable file, a refused option, ...) is reported as
+  `{"filename": ..., "error": "<reason>"}` rather than a stderr message,
+  and the process exits non-zero. Filter with `jq 'select(.error)'` to
+  find every input that didn't process.
 
-Frames are still de-duplicated by sample position exactly as in a
-normal decode, so a frame seen across overlapping windows is reported
-once. The mode is quiet by design: the usual progress chatter and the
-end-of-run decode summary are suppressed, so the JSON is the only
-output. Genuine errors (an unreadable file, a bad option) still print
-to stderr and set a non-zero exit.
+stderr is routed to `/dev/null` in this mode, so no helper or library
+text can leak onto the terminal - the JSON on stdout is the whole story.
+Frames are still de-duplicated by sample position exactly as in a normal
+decode, so a frame seen across overlapping windows is reported once.
+
+`--report-filename=<name>` overrides the value of the `filename` field
+(default: the input path), so a batch caller can report the original
+recording's name even when `rx_replay` is decoding a temporary copy.
 
 To run the report over every recording in a tree, `decode_passes.sh
 --forensics-report` walks the root, hands each file to `rx_replay
---forensics-report`, and groups the JSON per file under a `=== <path>`
-header. In that mode it never reads or writes the `.decoded` markers or
-the packet DB, so every file is re-processed on each run:
+--forensics-report`, and concatenates the JSON into one clean JSONL
+stream across the whole corpus - each line's `filename` is the original
+source even for an `.ogg` decoded through a temporary WAV, and the banner
+and end-of-run summary go to stderr to keep stdout pure. It never reads or
+writes the `.decoded` markers or the packet DB, so every file is
+re-processed on each run:
 
 ```sh
-decode_passes.sh --root /FrontierSat/SatNOGS --forensics-report
+decode_passes.sh --root /FrontierSat/SatNOGS --forensics-report > corpus.jsonl
 ```
 
 ### `decode_inspector`

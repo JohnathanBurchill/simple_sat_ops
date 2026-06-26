@@ -387,6 +387,7 @@ typedef struct {
     const char *source_run_override;
     int no_db;
     int forensics;
+    const char *report_filename;
     const char *tle_path;
     const char *sat_arg;
     const char *start_utc_arg;
@@ -623,8 +624,18 @@ static int parse_args(rxr_args_t *a, int argc, char **argv, int help)
         }
         if (strcmp(arg, "--forensics-report") == 0 || help) {
             if (help) parse_help_line(OPTW, "--forensics-report",
-                "emit one JSON line per decoded frame to stdout; never touches the DB");
+                "emit JSON to stdout (one line per frame, plus a filename-only "
+                "line for a no-decode file and an \"error\" line on failure); "
+                "never touches the DB");
             else a->forensics = 1;
+            matched = 1;
+        }
+        if (starts_with(arg, "--report-filename=") || help) {
+            if (help) parse_help_line(OPTW, "--report-filename=<name>",
+                "value for the forensics \"filename\" field (default: the input "
+                "path); lets a batch caller report the original name when "
+                "decoding a temporary copy");
+            else a->report_filename = arg + 18;
             matched = 1;
         }
         if (starts_with(arg, "--source-run=") || help) {
@@ -737,6 +748,7 @@ typedef struct {
     int             quiet;
     int             use_tui;
     int             forensics;
+    const char     *filename_json;
     const int16_t  *samples;
     size_t          n_frames;
     int             iq_mode;
@@ -750,6 +762,57 @@ typedef struct {
     uint64_t        dedup_quant_samples;
     int            *n_emitted_p;
 } rx_emit_ctx_t;
+
+// Escape a string into a JSON string body (no surrounding quotes added).
+// Used for the --forensics-report "filename" field so a path containing a
+// quote, backslash, or control character can't break the JSON. Output is
+// always NUL-terminated; an over-long input is truncated at a safe
+// boundary rather than overrunning the buffer.
+static void json_escape(const char *in, char *out, size_t out_sz)
+{
+    if (out_sz == 0) return;
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p; ++p) {
+        char tmp[8];
+        int n;
+        unsigned char c = *p;
+        switch (c) {
+            case '"':  tmp[0] = '\\'; tmp[1] = '"';  n = 2; break;
+            case '\\': tmp[0] = '\\'; tmp[1] = '\\'; n = 2; break;
+            case '\b': tmp[0] = '\\'; tmp[1] = 'b';  n = 2; break;
+            case '\f': tmp[0] = '\\'; tmp[1] = 'f';  n = 2; break;
+            case '\n': tmp[0] = '\\'; tmp[1] = 'n';  n = 2; break;
+            case '\r': tmp[0] = '\\'; tmp[1] = 'r';  n = 2; break;
+            case '\t': tmp[0] = '\\'; tmp[1] = 't';  n = 2; break;
+            default:
+                if (c < 0x20) {
+                    n = snprintf(tmp, sizeof tmp, "\\u%04x", c);
+                } else {
+                    tmp[0] = (char)c;
+                    n = 1;
+                }
+                break;
+        }
+        if (n < 0 || o + (size_t)n + 1 > out_sz) break;  // leave room for NUL
+        for (int k = 0; k < n; ++k) out[o++] = tmp[k];
+    }
+    out[o] = '\0';
+}
+
+// --forensics-report makes stdout "nothing but JSON" — failures included.
+// A fatal condition is reported as {"filename":..,"error":..} on stdout
+// (stderr is routed to /dev/null in this mode) so a batch consumer reads
+// one clean JSON stream and filters on the "error" key afterward. Returns
+// 1 for use as `return forensics_fail(fn_json, "...")` at each exit point.
+static int forensics_fail(const char *fn_json, const char *msg)
+{
+    char esc[1024];
+    json_escape(msg, esc, sizeof esc);
+    printf("{\"filename\":\"%s\",\"error\":\"%s\"}\n",
+           fn_json ? fn_json : "", esc);
+    fflush(stdout);
+    return 1;
+}
 
 // Signal-strength estimate for the --forensics-report "rssi" field:
 // the RMS level over the frame's sample span, in dBFS relative to
@@ -891,7 +954,10 @@ static int rx_emit_decoded(rx_emit_ctx_t *ctx,
     // --forensics-report: one JSON object per decoded frame to stdout
     // (the human framing lines are suppressed via ctx->quiet in this
     // mode, so stdout stays a clean newline-delimited JSON stream). The
-    // four fields are the ones requested in issue #39:
+    // fields are the four requested in issue #39 plus the source filename
+    // so multi-file consumers can attribute each line (main also emits a
+    // filename-only line for a file that decoded nothing):
+    //   filename        - the capture path rx_replay was handed
     //   time_in_file_ms - frame start offset from the head of the file
     //   rssi            - RMS level over the frame span, dBFS
     //   rs              - RS(255,223) corrected bytes; -2 uncorrectable,
@@ -905,8 +971,9 @@ static int rx_emit_decoded(rx_emit_ctx_t *ctx,
         uint64_t span = (uint64_t)(on_wire_plen + 36) * 8u * (uint64_t)ctx->sps;
         double rssi = rx_frame_rssi_dbfs(ctx->samples, ctx->n_frames,
                                          ctx->iq_mode, asm_abs_sample, span);
-        printf("{\"time_in_file_ms\":%.3f,\"rssi\":%.1f,\"rs\":%d,"
-               "\"data_base64\":\"%s\"}\n",
+        printf("{\"filename\":\"%s\",\"time_in_file_ms\":%.3f,\"rssi\":%.1f,"
+               "\"rs\":%d,\"data_base64\":\"%s\"}\n",
+               ctx->filename_json ? ctx->filename_json : "",
                t_sec * 1000.0, rssi, rs_errs, enc >= 0 ? b64 : "");
         fflush(stdout);
     }
@@ -1094,22 +1161,31 @@ int main(int argc, char **argv)
     double anchor_window_s = cfg.anchor_window_s;     // tight window around each anchor
     double anchor_pre_s    = cfg.anchor_pre_s;        // pre-anchor cushion for M&M lock
 
-    // --forensics-report is a read-only research/scoring mode: it prints
-    // a JSON line per frame and must never touch the DB. Force no_db so
-    // a stray --db= or the auto-discovered default can't write, and
-    // quiet so emit_frame's human framing text doesn't pollute the JSON
-    // stream on stdout (the JSON itself is printed independently of
-    // quiet). The curses UI and --update both contradict this mode.
+    // --forensics-report is a read-only research/scoring mode: stdout is
+    // nothing but newline-delimited JSON (one object per decoded frame, a
+    // filename-only object for a file that decoded nothing, or an "error"
+    // object when something goes wrong) and it must never touch the DB.
+    // Force no_db so a stray --db= or the auto-discovered default can't
+    // write, and quiet so emit_frame's human framing text doesn't pollute
+    // the stream. Route stderr to /dev/null so no helper/library message
+    // leaks onto the terminal — every failure surfaces as a JSON "error"
+    // line instead. fn_json holds the input path pre-escaped for the JSON
+    // "filename" field, computed once and reused by every emitted line.
+    char fn_json[2048] = "";
     if (forensics) {
+        const char *report_name = cfg.report_filename != NULL
+            ? cfg.report_filename : input_path;
+        json_escape(report_name, fn_json, sizeof fn_json);
+        (void)freopen("/dev/null", "w", stderr);
         if (use_tui) {
-            fprintf(stderr, "rx_replay: --forensics-report streams JSON to "
-                    "stdout and can't share the screen with --ui\n");
-            return 1;
+            return forensics_fail(fn_json,
+                "--forensics-report streams JSON to stdout and "
+                "can't share the screen with --ui");
         }
         if (update_mode) {
-            fprintf(stderr, "rx_replay: --forensics-report never writes the "
-                    "DB, so --update has nothing to do\n");
-            return 1;
+            return forensics_fail(fn_json,
+                "--forensics-report never writes the DB, so "
+                "--update has nothing to do");
         }
         no_db = 1;
         quiet = 1;
@@ -1127,7 +1203,8 @@ int main(int argc, char **argv)
                   : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
             if (v < 0) {
                 fprintf(stderr, "rx_replay: --ref-hex: bad char '%c'\n", c);
-                return 1;
+                return forensics ? forensics_fail(fn_json,
+                    "--ref-hex has a non-hex character") : 1;
             }
             if (high < 0) {
                 high = v;
@@ -1135,7 +1212,8 @@ int main(int argc, char **argv)
                 if (n >= sizeof ref_buf) {
                     fprintf(stderr, "rx_replay: --ref-hex too long (>%zu bytes)\n",
                             sizeof ref_buf);
-                    return 1;
+                    return forensics ? forensics_fail(fn_json,
+                        "--ref-hex is too long") : 1;
                 }
                 ref_buf[n++] = (uint8_t)((high << 4) | v);
                 high = -1;
@@ -1143,11 +1221,13 @@ int main(int argc, char **argv)
         }
         if (high >= 0) {
             fprintf(stderr, "rx_replay: --ref-hex: odd number of hex digits\n");
-            return 1;
+            return forensics ? forensics_fail(fn_json,
+                "--ref-hex has an odd number of hex digits") : 1;
         }
         if (n == 0) {
             fprintf(stderr, "rx_replay: --ref-hex: empty\n");
-            return 1;
+            return forensics ? forensics_fail(fn_json,
+                "--ref-hex is empty") : 1;
         }
         ref_buf_len = n;
     }
@@ -1197,7 +1277,8 @@ int main(int argc, char **argv)
     }
     if (raw_channels < 1 || raw_channels > 8) {
         fprintf(stderr, "rx_replay: --channels out of range [1,8]\n");
-        return 1;
+        return forensics ? forensics_fail(fn_json,
+            "--channels out of range [1,8]") : 1;
     }
 
     // Load samples and reduce to mono (PCM mode) or keep interleaved
@@ -1208,14 +1289,17 @@ int main(int argc, char **argv)
     int samp_rate = 0;
     int channels = 1;
     if (iq_mode) {
-        if (read_raw_pcm16(input_path, &samples, &n_samples) != 0) return 1;
+        if (read_raw_pcm16(input_path, &samples, &n_samples) != 0)
+            return forensics ? forensics_fail(fn_json,
+                "could not read input as raw int16 IQ") : 1;
         samp_rate = raw_rate;
         if ((n_samples & 1u) != 0) {
             fprintf(stderr,
                     "rx_replay: --iq file has odd int16 count (%zu); "
                     "not interleaved I,Q?\n", n_samples);
             free(samples);
-            return 1;
+            return forensics ? forensics_fail(fn_json,
+                "IQ file has an odd int16 count (not interleaved I,Q?)") : 1;
         }
         // Apply --lo-shift-khz BEFORE the decode loop. sw_nco_apply
         // rotates by exp(-j 2π f · n/fs), so positive lo_shift_hz
@@ -1236,14 +1320,17 @@ int main(int argc, char **argv)
                 lo_shift_hz / 1000.0, n_pairs);
         }
     } else if (raw_mode) {
-        if (read_raw_pcm16(input_path, &samples, &n_samples) != 0) return 1;
+        if (read_raw_pcm16(input_path, &samples, &n_samples) != 0)
+            return forensics ? forensics_fail(fn_json,
+                "could not read input as raw int16 PCM") : 1;
         samp_rate = raw_rate;
         channels = raw_channels;
     } else if (ogg_mode) {
 #ifdef HAVE_SNDFILE
         if (read_audio_sndfile(input_path, &samples, &n_samples,
                                &samp_rate) != 0) {
-            return 1;
+            return forensics ? forensics_fail(fn_json,
+                "could not decode audio file via libsndfile") : 1;
         }
         channels = 1;  // already downmixed to mono
         if (raw_rate_explicit) samp_rate = raw_rate;  // allow override
@@ -1256,12 +1343,14 @@ int main(int argc, char **argv)
             "Rebuild with libsndfile (brew install libsndfile / "
             "apt install libsndfile1-dev), or convert it to .wav first.\n",
             input_path);
-        return 1;
+        return forensics ? forensics_fail(fn_json,
+            "input is a .ogg but this build has no libsndfile support") : 1;
 #endif
     } else {
         if (wav_read_pcm16(input_path, &samples, &n_samples,
                            &samp_rate, &channels) != 0) {
-            return 1;
+            return forensics ? forensics_fail(fn_json,
+                "could not read input as a WAV file") : 1;
         }
     }
     size_t n_frames;
@@ -1280,7 +1369,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "rx_replay: samp_rate (%d) must be a multiple of "
                 "bit_rate (%d)\n", samp_rate, bit_rate);
         free(samples);
-        return 1;
+        return forensics ? forensics_fail(fn_json,
+            "sample rate is not a whole multiple of the bit rate") : 1;
     }
     int sps = samp_rate / bit_rate;
 
@@ -1307,7 +1397,8 @@ int main(int argc, char **argv)
     uint8_t packet[4100];
     if (bits_scratch == NULL || bytes_scratch == NULL) {
         free(bits_scratch); free(bytes_scratch); free(samples);
-        return 1;
+        return forensics ? forensics_fail(fn_json,
+            "out of memory allocating decode scratch buffers") : 1;
     }
 
     decode_loop_set_show_headers(show_packet_headers);
@@ -1666,6 +1757,7 @@ int main(int argc, char **argv)
         .quiet = quiet,
         .use_tui = use_tui,
         .forensics = forensics,
+        .filename_json = fn_json,
         .samples = samples,
         .n_frames = n_frames,
         .iq_mode = iq_mode,
@@ -2046,6 +2138,14 @@ done:
                     "tried %d candidate(s) and rescued %d.\n",
                     pass1_n_emitted, p2_attempts, p2_emitted);
         }
+    }
+    // --forensics-report always produces at least one JSON line per file:
+    // a file that decoded nothing still emits a filename-only object so a
+    // batch consumer sees every input accounted for (no decode fields ->
+    // zero frames recovered).
+    if (forensics && n_emitted == 0) {
+        printf("{\"filename\":\"%s\"}\n", fn_json);
+        fflush(stdout);
     }
     free(bits_scratch);
     free(bytes_scratch);

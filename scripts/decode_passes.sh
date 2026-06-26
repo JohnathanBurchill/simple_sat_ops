@@ -53,10 +53,13 @@
 # --forensics-report runs every file through rx_replay --forensics-report
 # (for research / decoder scoring across a corpus). The packet DB is never
 # touched and no `.decoded` markers are read or written, so every file is
-# re-processed each run. Output is grouped per file under a `=== <path>`
-# header, each followed by that file's JSON frame lines on stdout. For a
-# single flat JSON stream of one file, call rx_replay --forensics-report
-# directly.
+# re-processed each run. stdout is nothing but newline-delimited JSON: one
+# object per decoded frame, a filename-only object for a file that decoded
+# nothing, and an {"error":..} object when a file can't be processed — so
+# every input is accounted for and the stream pipes straight into jq. Each
+# object's "filename" is the original source path even when an .ogg is
+# decoded via a temp WAV. The banner and the run summary go to stderr to
+# keep stdout clean.
 #
 # Defaults: root=., sync-threshold=4, jobs=CPU count, skip already-decoded.
 
@@ -194,6 +197,34 @@ default_jobs() {
     echo "$n"
 }
 
+# Minimal JSON string encoder for the forensics skip lines: wraps in quotes
+# and escapes backslash and doublequote (the only structural characters a
+# capture-file path realistically carries). rx_replay does the full escaping
+# for its own JSON lines; this only ever handles paths for files rx_replay
+# never sees (the ones decode_passes skips before invoking it).
+json_str() {
+    local s=${1//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '"%s"' "$s"
+}
+
+# Record a skipped input. In forensics mode this is a JSON
+# {"filename":..,"error":"skipped: <reason>"} line so stdout stays pure
+# JSONL and every input is still accounted for; otherwise it's the human
+# [skip] line. Uses the caller's $out/$stat/$pos/$TOTAL (dynamic scope).
+# $1=src  $2=reason  $3=stat-status (skip_open|skip_fmt).
+emit_skip() {
+    local s="$1" reason="$2" sttype="$3"
+    if [[ "$FORENSICS_REPORT" -eq 1 ]]; then
+        printf '{"filename":%s,"error":%s}\n' \
+            "$(json_str "$s")" "$(json_str "skipped: $reason")" >> "$out"
+    else
+        printf '[skip] %s  (%s)\n' "$s" "$reason" >> "$out"
+    fi
+    printf '%s\t0\t0\t0\t0\n' "$sttype" > "$stat"
+    printf '[%d/%d skip] %s  (%s)\n' "$pos" "$TOTAL" "$s" "$reason" >&2
+}
+
 # Decode one file. Writes its human-readable report block to
 # $SCRATCH/<idx>.out and a tab-separated stat line to $SCRATCH/<idx>.stat
 # (status<TAB>frames<TAB>beacons<TAB>tcmd<TAB>other, status one of
@@ -226,16 +257,12 @@ process_one_file() {
     case "${src,,}" in
         *.ogg)
             if [[ -z "$have_ffmpeg" ]]; then
-                printf '[skip] %s  (ffmpeg not on PATH; install to decode .ogg)\n' "$src" >> "$out"
-                printf 'skip_open\t0\t0\t0\t0\n' > "$stat"
-                printf '[%d/%d skip] %s  (no ffmpeg)\n' "$pos" "$TOTAL" "$src" >&2
+                emit_skip "$src" "no ffmpeg on PATH to decode .ogg" skip_open
                 return 0
             fi
             tmp_wav="$(ogg_to_wav "$src")"
             if [[ -z "$tmp_wav" ]]; then
-                printf '[skip] %s  (ffmpeg conversion failed)\n' "$src" >> "$out"
-                printf 'skip_open\t0\t0\t0\t0\n' > "$stat"
-                printf '[%d/%d skip] %s  (ffmpeg failed)\n' "$pos" "$TOTAL" "$src" >&2
+                emit_skip "$src" "ffmpeg conversion failed" skip_open
                 return 0
             fi
             decode_path="$tmp_wav"
@@ -253,15 +280,11 @@ process_one_file() {
                     "OK "*)
                         ;;
                     "SKIP not_wav")
-                        printf '[skip] %s  (not a readable WAV)\n' "$src" >> "$out"
-                        printf 'skip_open\t0\t0\t0\t0\n' > "$stat"
-                        printf '[%d/%d skip] %s  (not WAV)\n' "$pos" "$TOTAL" "$src" >&2
+                        emit_skip "$src" "not a readable WAV" skip_open
                         return 0
                         ;;
                     SKIP*)
-                        printf '[skip] %s  (%s)\n' "$src" "${chk#SKIP }" >> "$out"
-                        printf 'skip_fmt\t0\t0\t0\t0\n' > "$stat"
-                        printf '[%d/%d skip] %s  (%s)\n' "$pos" "$TOTAL" "$src" "${chk#SKIP }" >&2
+                        emit_skip "$src" "${chk#SKIP }" skip_fmt
                         return 0
                         ;;
                 esac
@@ -273,15 +296,11 @@ process_one_file() {
                 "OK "*)
                     ;;
                 "SKIP not_wav")
-                    printf '[skip] %s  (not a readable WAV)\n' "$src" >> "$out"
-                    printf 'skip_open\t0\t0\t0\t0\n' > "$stat"
-                    printf '[%d/%d skip] %s  (not WAV)\n' "$pos" "$TOTAL" "$src" >&2
+                    emit_skip "$src" "not a readable WAV" skip_open
                     return 0
                     ;;
                 SKIP*)
-                    printf '[skip] %s  (%s)\n' "$src" "${chk#SKIP }" >> "$out"
-                    printf 'skip_fmt\t0\t0\t0\t0\n' > "$stat"
-                    printf '[%d/%d skip] %s  (%s)\n' "$pos" "$TOTAL" "$src" "${chk#SKIP }" >&2
+                    emit_skip "$src" "${chk#SKIP }" skip_fmt
                     return 0
                     ;;
             esac
@@ -324,21 +343,23 @@ process_one_file() {
         fi
     fi
 
-    # Forensics report: hand the file to rx_replay --forensics-report and
-    # stream its JSON frame lines. Capture stdout only — stderr carries the
-    # decode summary and progress notes that would corrupt the JSON. Group
-    # per file under a `=== <path>` header the parent collates newest-first,
-    # exactly like the normal report blocks. No DB, no `.decoded` marker.
+    # Forensics report: hand the file to rx_replay --forensics-report, which
+    # emits nothing but JSON on stdout — one object per decoded frame, a
+    # filename-only object for a file that decoded nothing, or an {"error":..}
+    # object on failure. --report-filename pins the JSON "filename" to the
+    # original source even when we decode a temp WAV (the .ogg path) or the
+    # .iq sidecar, so the collated stream attributes every line to $src. The
+    # output is pure newline-delimited JSON: no `=== <path>` headers (they'd
+    # break a downstream JSON parser). No DB, no `.decoded` marker.
     if [[ "$FORENSICS_REPORT" -eq 1 ]]; then
         local fr_json fr_count
-        fr_json="$("$RX_REPLAY" "$decode_path" "${rx_args[@]}" --forensics-report 2>/dev/null || true)"
+        fr_json="$("$RX_REPLAY" "$decode_path" "${rx_args[@]}" \
+                   --forensics-report --report-filename="$src" 2>/dev/null || true)"
         [[ -n "$cleanup_path" ]] && rm -f "$cleanup_path"
-        fr_count=$(printf '%s\n' "$fr_json" | grep -c '^{' || true)
-        {
-            echo
-            echo "=== $src"
-            [[ "$fr_count" -gt 0 ]] && printf '%s\n' "$fr_json" | grep '^{'
-        } >> "$out"
+        # Count decoded frames only: the always-present filename-only line for
+        # a no-decode file and any "error" line are bookkeeping, not messages.
+        fr_count=$(printf '%s\n' "$fr_json" | grep -c '"data_base64"' || true)
+        printf '%s\n' "$fr_json" | grep '^{' >> "$out"
         printf 'decoded\t%d\t0\t0\t0\n' "$fr_count" > "$stat"
         printf '[%d/%d] %s  messages=%d\n' "$pos" "$TOTAL" "$src" "$fr_count" >&2
         return 0
@@ -487,12 +508,18 @@ if [[ "$FORENSICS_REPORT" -eq 1 ]]; then
         echo "note: --db ignored under --forensics-report (the DB is never touched)" >&2
 fi
 
-echo "rx_replay:  $RX_REPLAY"
-echo "root:       $ROOT"
-echo "jobs:       $JOBS  (newest-first)"
+# In forensics mode stdout is nothing but JSON, so the banner and the
+# end-of-run summary go to stderr; in a normal run they're part of the
+# human report on stdout.
+if [[ "$FORENSICS_REPORT" -eq 1 ]]; then BANNER_FD=2; else BANNER_FD=1; fi
+{
+    echo "rx_replay:  $RX_REPLAY"
+    echo "root:       $ROOT"
+    echo "jobs:       $JOBS  (newest-first)"
+} >&"$BANNER_FD"
 
 if [[ "$FORENSICS_REPORT" -eq 1 ]]; then
-    echo "mode:       forensics report (JSON to stdout; packet DB not touched)"
+    echo "mode:       forensics report (JSON to stdout; packet DB not touched)" >&2
 else
     # --db routes every rx_replay to one packet DB by exporting SSO_PACKET_DB,
     # which rx_replay's default-path logic checks first. Exporting (not just
@@ -616,20 +643,22 @@ agg="$(find "$SCRATCH" -name '*.stat' -exec cat {} + 2>/dev/null | awk -F'\t' '
     END { printf "%d %d %d %d %d %d %d", d+0, so+0, sf+0, fr+0, be+0, tc+0, ot+0 }')"
 read -r t_decoded t_skip_open t_skip_fmt t_frames t_beacons t_tcmd t_other <<< "$agg"
 
-echo
-echo "=== summary"
-printf "    %-26s %d\n" "files seen:"             "$t_files"
-printf "    %-26s %d\n" "skipped (already done):" "$t_skip_done"
-printf "    %-26s %d\n" "skipped (not WAV):"      "$t_skip_open"
-printf "    %-26s %d\n" "skipped (wrong format):" "$t_skip_fmt"
-printf "    %-26s %d\n" "decoded:"                "$t_decoded"
-if [[ "$FORENSICS_REPORT" -eq 1 ]]; then
-    # Forensics mode reports raw frames as JSON; the beacon/TCMD/other
-    # split is a DB-recognition concept that isn't computed here.
-    printf "    %-26s %d\n" "JSON messages total:"    "$t_frames"
-else
-    printf "    %-26s %d\n" "frames total:"           "$t_frames"
-    printf "    %-26s %d\n" "  beacons:"              "$t_beacons"
-    printf "    %-26s %d\n" "  TCMD responses:"       "$t_tcmd"
-    printf "    %-26s %d\n" "  other (flagged):"      "$t_other"
-fi
+{
+    echo
+    echo "=== summary"
+    printf "    %-26s %d\n" "files seen:"             "$t_files"
+    printf "    %-26s %d\n" "skipped (already done):" "$t_skip_done"
+    printf "    %-26s %d\n" "skipped (not WAV):"      "$t_skip_open"
+    printf "    %-26s %d\n" "skipped (wrong format):" "$t_skip_fmt"
+    printf "    %-26s %d\n" "decoded:"                "$t_decoded"
+    if [[ "$FORENSICS_REPORT" -eq 1 ]]; then
+        # Forensics mode reports raw frames as JSON; the beacon/TCMD/other
+        # split is a DB-recognition concept that isn't computed here.
+        printf "    %-26s %d\n" "JSON messages total:"    "$t_frames"
+    else
+        printf "    %-26s %d\n" "frames total:"           "$t_frames"
+        printf "    %-26s %d\n" "  beacons:"              "$t_beacons"
+        printf "    %-26s %d\n" "  TCMD responses:"       "$t_tcmd"
+        printf "    %-26s %d\n" "  other (flagged):"      "$t_other"
+    fi
+} >&"$BANNER_FD"
