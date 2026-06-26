@@ -910,7 +910,7 @@ static void print_json(const rec_t *r)
     if (r->command[0]) printf("\"command\":\"%s\",", cmd_esc);
     else               printf("\"command\":null,");
 
-    if (r->ts_sent_ms) printf("\"ts_sent_ms\":%lld,", r->ts_sent_ms);
+    if (r->ts_sent_ms) printf("\"ts_sent_ms\":%lld,", (long long)r->ts_sent_ms);
     else               printf("\"ts_sent_ms\":null,");
 
     printf("\"meas_time\":\"%s\",\"meas_basis\":\"%s\",", meas_iso, r->meas_basis);
