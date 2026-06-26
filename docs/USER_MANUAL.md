@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`c55bf28` (2026-06-26). This is a working draft.
+`930aeda` (2026-06-26). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -344,20 +344,39 @@ $$
 $$
 
 Left alone that would walk the signal clean out of the matched
-filter's band by mid-pass. Instead the receiver recomputes the
-expected Doppler from the SGP4 propagator every tick and retunes the
-B210 whenever the prediction has drifted more than 200 Hz from the
-current tune. Near closest approach, where the Doppler rate peaks
-around 50 Hz/s, retunes fire every few seconds; far from it, rarely.
+filter's band by mid-pass. Instead the SDR's hardware tuner is set
+once, at session open, to the nominal carrier and never moves again
+during the pass; the correction is done in software, on the complex
+baseband stream itself. Every tick the receiver recomputes the
+expected Doppler $f_d(t)$ from the SGP4 propagator and multiplies each
+I/Q sample by a counter-rotating phasor,
 
-The chain downstream is built so a retune is a non-event: the FM
-discriminator (below) is differential, so the absolute tuner phase
-that jumps at each retune cancels; the residual offset between retunes
-is a small DC pedestal that the high-pass filter flattens in about a
-millisecond; and a frame lasts about 50 ms while retunes are seconds
-apart, so even a frame that straddles a retune loses at most one
-sample, well inside the error budget. The rest of this chapter assumes
-the tuner stays within $\pm 200$ Hz of the real carrier.
+$$
+y[n] = x[n]\, e^{-\,i\,2\pi f_d\, n / f_s},
+$$
+
+which slides the carrier straight back to where the rest of the chain
+expects it. It costs one complex multiply per sample
+(`src/dsp/sw_nco.c`, driven from `apps/main.c` once per tick) and
+resolves to a fraction of a hertz.
+
+Because that runs every tick rather than only when an error threshold
+trips, the correction is effectively continuous, and because the
+phasor's phase accumulator carries across each frequency update -
+`sw_nco_set_freq` deliberately does not reset it - the trajectory
+stays phase-coherent even where the Doppler rate peaks, around
+50 Hz/s near closest approach. There is no tuner step for the demod to
+absorb and no loop to glitch: the carrier holds within a fraction of a
+hertz of DC for the whole pass and the displayed RX frequency walks
+the curve smoothly.
+
+This replaced an earlier scheme that retuned the hardware LO whenever
+the prediction drifted more than 200 Hz from the current tune. Those
+retunes fired every few seconds near closest approach and each one
+briefly reset the phase of the coherent demod chain; doing the work in
+the I/Q data removes them. What is left is only the prediction error
+itself - a stale or wrong TLE - and the rest of this chapter assumes
+that stays within a couple of hundred hertz of the real carrier.
 
 ![A pass on the waterfall, Doppler curving the carrier](figures/pass-waterfall-doppler.png)
 
