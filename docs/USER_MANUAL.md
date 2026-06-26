@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`e992e85` (2026-06-26). This is a working draft.
+`c55bf28` (2026-06-26). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -582,6 +582,14 @@ sync search sweeps the whole capture and collects ASM candidate
 timestamps, then the heavier decoder runs on tight windows anchored at
 each candidate, which is far quicker than slicing the whole file at
 full cost.
+
+Here is that running on a real FrontierSat pass: the waterfall (top
+left) with the beacon boxed, the ASM-correlation panel (bottom left)
+dropping to a Hamming distance of zero at the frame start, and the
+`rx_replay` log (right) recording all twelve detected packets to the
+database.
+
+![A real FrontierSat pass through rx_replay: waterfall, ASM correlation, and decode log](figures/fig_12_packets_ASM_FrontierSat.png)
 
 ### The uplink, in reverse
 
