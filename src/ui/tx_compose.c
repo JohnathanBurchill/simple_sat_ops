@@ -190,6 +190,14 @@ static void tx_field_kill_to_end(tx_compose_t *c) {
         tx_field_after_edit(c);
 }
 
+static void tx_field_kill_word_back(tx_compose_t *c) {
+    size_t cap = 0;
+    char *buf = tx_field_buf(c, c->focus, &cap);
+    if (!buf) return;
+    if (ui_tf_kill_word_back(buf, &c->cursors[c->focus]))
+        tx_field_after_edit(c);
+}
+
 static void tx_field_left(tx_compose_t *c) {
     size_t cap = 0;
     if (!tx_field_buf(c, c->focus, &cap)) return;
@@ -614,6 +622,8 @@ int tx_compose_handle_key(state_t *state, int key) {
         tx_field_delete(c);
     } else if (key == 11 /* Ctrl-K */) {
         tx_field_kill_to_end(c);
+    } else if (key == 23 /* Ctrl-W */) {
+        tx_field_kill_word_back(c);
     } else if (key == KEY_LEFT) {
         tx_field_left(c);
     } else if (key == KEY_RIGHT) {

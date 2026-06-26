@@ -85,6 +85,22 @@ void ui_tf_end(const char *buf, int *cursor)
     *cursor = (int) strlen(buf);
 }
 
+int ui_tf_kill_word_back(char *buf, int *cursor)
+{
+    int cur = *cursor;
+    if (cur <= 0) return 0;
+    int end = cur;
+    // Skip trailing spaces before the cursor.
+    while (cur > 0 && buf[cur - 1] == ' ') cur--;
+    // Skip the word itself.
+    while (cur > 0 && buf[cur - 1] != ' ') cur--;
+    if (cur == end) return 0;
+    int n = (int) strlen(buf);
+    memmove(buf + cur, buf + end, (size_t)(n - end + 1));
+    *cursor = cur;
+    return 1;
+}
+
 void ui_tf_clamp_cursor(const char *buf, int *cursor)
 {
     int n = (int) strlen(buf);
