@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`10d4d38` (2026-06-25). This is a working draft.
+`d565916` (2026-06-25). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -1813,6 +1813,53 @@ Doppler from the recorded sidecar timestamps. The TLE-based
 predictions in some older `rx_replay` versions show inflated range
 numbers; for new TLE / SGP4 code, model on `apps/next_in_queue.c`
 and `src/orbit/prediction.c` (the known-good path).
+
+#### Forensics report (`--forensics-report`)
+
+For research, and for scoring decode backends across a corpus,
+`rx_replay --forensics-report` emits one JSON object per decoded frame
+to stdout and **never touches the packet database** - it is a read-only
+mode, so `--update` and the curses `--ui` are refused, and any `--db=`
+is ignored. The human framing lines are suppressed, so stdout is a
+clean newline-delimited JSON (NDJSON) stream you can pipe straight to
+`jq`:
+
+```sh
+rx_replay capture.iq --rate=96000 --forensics-report
+rx_replay satnogs_<id>_<utc>.ogg --forensics-report | jq .
+```
+
+Each line carries the four fields requested in issue #39:
+
+- `time_in_file_ms` - when the frame's sync word starts, in
+  milliseconds from the head of the file (decimal, sub-millisecond
+  precision).
+- `rssi` - signal strength: the RMS level over the frame's sample
+  span, in dBFS relative to int16 full scale (the same scale the live
+  RX panel's level meter uses; floor `-90.0`). IQ files use the
+  magnitude `sqrt(I^2+Q^2)`; audio / `.wav` uses the sample value.
+- `rs` - Reed-Solomon(255,223) result: the number of corrected bytes
+  (`>= 0`), `-2` when the block was uncorrectable (the bytes are still
+  recovered and reported, errors and all), or `-1` when RS was not
+  applied (e.g. `--no-reed-solomon`).
+- `data_base64` - the decoded frame, base64-encoded. This is the CSP
+  frame as handed to the rest of the pipeline, with the trailing CSP
+  CRC-32C stripped when it validated.
+
+Frames are still de-duplicated by sample position exactly as in a
+normal decode, so a frame seen across overlapping windows is reported
+once. The decode summary (chain, candidate/detected counts, RS tallies)
+still goes to **stderr**, leaving stdout pure JSON.
+
+To run the report over every recording in a tree, `decode_passes.sh
+--forensics-report` walks the root, hands each file to `rx_replay
+--forensics-report`, and groups the JSON per file under a `=== <path>`
+header. In that mode it never reads or writes the `.decoded` markers or
+the packet DB, so every file is re-processed on each run:
+
+```sh
+decode_passes.sh --root /FrontierSat/SatNOGS --forensics-report
+```
 
 ### `decode_inspector`
 

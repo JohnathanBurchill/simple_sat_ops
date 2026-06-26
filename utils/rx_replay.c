@@ -46,6 +46,7 @@
 #include "packet_db.h"
 #include "rx_tui.h"
 #include "sso_audit.h"
+#include "sso_base64.h"
 #include "sw_nco.h"
 #include "tle_csv.h"
 #include "wav_read.h"
@@ -385,6 +386,7 @@ typedef struct {
     const char *db_path;
     const char *source_run_override;
     int no_db;
+    int forensics;
     const char *tle_path;
     const char *sat_arg;
     const char *start_utc_arg;
@@ -619,6 +621,12 @@ static int parse_args(rxr_args_t *a, int argc, char **argv, int help)
             else a->no_db = 1;
             matched = 1;
         }
+        if (strcmp(arg, "--forensics-report") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--forensics-report",
+                "emit one JSON line per decoded frame to stdout; never touches the DB");
+            else a->forensics = 1;
+            matched = 1;
+        }
         if (starts_with(arg, "--source-run=") || help) {
             if (help) parse_help_line(OPTW, "--source-run=<id>", "override the per-launch run-id used for dedup");
             else a->source_run_override = arg + 13;
@@ -728,6 +736,10 @@ typedef struct {
     const char     *log_path;
     int             quiet;
     int             use_tui;
+    int             forensics;
+    const int16_t  *samples;
+    size_t          n_frames;
+    int             iq_mode;
     int             force_beacon;
     const uint8_t  *ref_buf;
     size_t          ref_buf_len;
@@ -738,6 +750,38 @@ typedef struct {
     uint64_t        dedup_quant_samples;
     int            *n_emitted_p;
 } rx_emit_ctx_t;
+
+// Signal-strength estimate for the --forensics-report "rssi" field:
+// the RMS level over the frame's sample span, in dBFS relative to
+// int16 full scale. Mirrors rx_session's level meter (rms/32768, -90
+// dBFS floor) so a forensics number is comparable to the live RX
+// panel. IQ files use the magnitude sqrt(I^2+Q^2); PCM uses the sample
+// value. Returns -90.0 when the span is empty or below the floor.
+static double rx_frame_rssi_dbfs(const int16_t *s, size_t n_frames,
+                                 int iq_mode,
+                                 uint64_t start, uint64_t span)
+{
+    if (s == NULL || span == 0 || start >= n_frames) return -90.0;
+    uint64_t end = start + span;
+    if (end > n_frames) end = n_frames;
+    double sum_sq = 0.0;
+    uint64_t count = 0;
+    for (uint64_t k = start; k < end; ++k) {
+        if (iq_mode) {
+            double i = (double)s[2 * k];
+            double q = (double)s[2 * k + 1];
+            sum_sq += i * i + q * q;
+        } else {
+            double v = (double)s[k];
+            sum_sq += v * v;
+        }
+        ++count;
+    }
+    if (count == 0) return -90.0;
+    double rms = sqrt(sum_sq / (double)count);
+    if (rms < 1.0) return -90.0;
+    return 20.0 * log10(rms / 32768.0);
+}
 
 // Post-decode pipeline: optional CSP CRC-32C trim, dedup by absolute
 // sample position, SGP4 observer state, emit_frame, --update DB writes,
@@ -752,6 +796,11 @@ static int rx_emit_decoded(rx_emit_ctx_t *ctx,
                            const int *rs_locs)
 {
     if (plen < 4) return 0;
+
+    // Length before the CRC trailer is (maybe) stripped below — used to
+    // size the RSSI sample span over the on-wire frame (+32 RS parity,
+    // +4 ASM sync word, all 8 bits each at `sps` samples/bit).
+    ssize_t on_wire_plen = plen;
 
     int crc_status = -1;
     uint32_t crc_computed = 0, crc_le = 0, crc_be = 0;
@@ -838,6 +887,29 @@ static int rx_emit_decoded(rx_emit_ctx_t *ctx,
                rs_locs,
                ctx->ref_buf_len > 0 ? ctx->ref_buf : NULL, ctx->ref_buf_len,
                ctx->force_beacon);
+
+    // --forensics-report: one JSON object per decoded frame to stdout
+    // (the human framing lines are suppressed via ctx->quiet in this
+    // mode, so stdout stays a clean newline-delimited JSON stream). The
+    // four fields are the ones requested in issue #39:
+    //   time_in_file_ms - frame start offset from the head of the file
+    //   rssi            - RMS level over the frame span, dBFS
+    //   rs              - RS(255,223) corrected bytes; -2 uncorrectable,
+    //                     -1 RS not applied
+    //   data_base64     - the decoded frame (CSP CRC-32C trailer
+    //                     stripped when it validated)
+    if (ctx->forensics) {
+        // packet[] is <= 4100 bytes; size the buffer for that ceiling.
+        char b64[(4100 + 2) / 3 * 4 + 4];
+        long enc = sso_base64_encode(packet, (size_t)plen, b64, sizeof b64);
+        uint64_t span = (uint64_t)(on_wire_plen + 36) * 8u * (uint64_t)ctx->sps;
+        double rssi = rx_frame_rssi_dbfs(ctx->samples, ctx->n_frames,
+                                         ctx->iq_mode, asm_abs_sample, span);
+        printf("{\"time_in_file_ms\":%.3f,\"rssi\":%.1f,\"rs\":%d,"
+               "\"data_base64\":\"%s\"}\n",
+               t_sec * 1000.0, rssi, rs_errs, enc >= 0 ? b64 : "");
+        fflush(stdout);
+    }
 
     if (ctx->update_mode && ctx->db != NULL && plen >= 4) {
         size_t pl = (size_t)plen;
@@ -981,6 +1053,7 @@ int main(int argc, char **argv)
     const char *db_path = cfg.db_path;
     const char *source_run_override = cfg.source_run_override;
     int no_db = cfg.no_db;
+    int forensics = cfg.forensics;
     const char *tle_path = cfg.tle_path;
     const char *sat_arg  = cfg.sat_arg;
     const char *start_utc_arg = cfg.start_utc_arg;
@@ -1020,6 +1093,27 @@ int main(int argc, char **argv)
     const char *anchor_csv_arg = cfg.anchor_csv_arg;
     double anchor_window_s = cfg.anchor_window_s;     // tight window around each anchor
     double anchor_pre_s    = cfg.anchor_pre_s;        // pre-anchor cushion for M&M lock
+
+    // --forensics-report is a read-only research/scoring mode: it prints
+    // a JSON line per frame and must never touch the DB. Force no_db so
+    // a stray --db= or the auto-discovered default can't write, and
+    // quiet so emit_frame's human framing text doesn't pollute the JSON
+    // stream on stdout (the JSON itself is printed independently of
+    // quiet). The curses UI and --update both contradict this mode.
+    if (forensics) {
+        if (use_tui) {
+            fprintf(stderr, "rx_replay: --forensics-report streams JSON to "
+                    "stdout and can't share the screen with --ui\n");
+            return 1;
+        }
+        if (update_mode) {
+            fprintf(stderr, "rx_replay: --forensics-report never writes the "
+                    "DB, so --update has nothing to do\n");
+            return 1;
+        }
+        no_db = 1;
+        quiet = 1;
+    }
 
     sso_audit_start("rx_replay", input_path);
     if (ref_hex_arg != NULL) {
@@ -1571,6 +1665,10 @@ int main(int argc, char **argv)
         .log_path = log_path,
         .quiet = quiet,
         .use_tui = use_tui,
+        .forensics = forensics,
+        .samples = samples,
+        .n_frames = n_frames,
+        .iq_mode = iq_mode,
         .force_beacon = force_beacon,
         .ref_buf = ref_buf_len > 0 ? ref_buf : NULL,
         .ref_buf_len = ref_buf_len,
@@ -1926,8 +2024,10 @@ done:
     decode_loop_get_stats(&st);
     fprintf(stderr, "rx_replay: decode summary (chain=%s):\n", chain);
     fprintf(stderr, "  candidate frames (pre-dedup)   : %ld\n", raw_decodes);
-    fprintf(stderr, "  detected (after position dedup): %d  "
-            "— all recorded to the DB\n", n_emitted);
+    fprintf(stderr, "  detected (after position dedup): %d  %s\n", n_emitted,
+            forensics ? "— JSON written to stdout, DB untouched"
+            : db ? "— all recorded to the DB"
+            : "— DB not written");
     fprintf(stderr, "    valid CSP header             : %ld\n", st.csp_ok);
     fprintf(stderr, "    RS corrected / uncorrectable : %ld / %ld\n",
             st.rs_corrected, st.rs_uncorrectable);

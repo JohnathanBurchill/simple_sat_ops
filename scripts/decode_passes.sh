@@ -40,6 +40,7 @@
 # Usage:
 #   decode_passes.sh [--root <dir>] [--db <path>] [--sync-threshold N]
 #                    [--jobs N] [--rx-replay <path>] [--force-redecode]
+#                    [--forensics-report]
 #
 # --db <path> sends every decoded packet to that SQLite file (it exports
 # SSO_PACKET_DB, which rx_replay honours first) instead of the default
@@ -48,6 +49,14 @@
 #
 # --jobs N runs N rx_replay decodes at once (default: CPU count). During
 # a live pass you may want a smaller number so the receiver isn't starved.
+#
+# --forensics-report runs every file through rx_replay --forensics-report
+# (for research / decoder scoring across a corpus). The packet DB is never
+# touched and no `.decoded` markers are read or written, so every file is
+# re-processed each run. Output is grouped per file under a `=== <path>`
+# header, each followed by that file's JSON frame lines on stdout. For a
+# single flat JSON stream of one file, call rx_replay --forensics-report
+# directly.
 #
 # Defaults: root=., sync-threshold=4, jobs=CPU count, skip already-decoded.
 
@@ -315,6 +324,26 @@ process_one_file() {
         fi
     fi
 
+    # Forensics report: hand the file to rx_replay --forensics-report and
+    # stream its JSON frame lines. Capture stdout only — stderr carries the
+    # decode summary and progress notes that would corrupt the JSON. Group
+    # per file under a `=== <path>` header the parent collates newest-first,
+    # exactly like the normal report blocks. No DB, no `.decoded` marker.
+    if [[ "$FORENSICS_REPORT" -eq 1 ]]; then
+        local fr_json fr_count
+        fr_json="$("$RX_REPLAY" "$decode_path" "${rx_args[@]}" --forensics-report 2>/dev/null || true)"
+        [[ -n "$cleanup_path" ]] && rm -f "$cleanup_path"
+        fr_count=$(printf '%s\n' "$fr_json" | grep -c '^{' || true)
+        {
+            echo
+            echo "=== $src"
+            [[ "$fr_count" -gt 0 ]] && printf '%s\n' "$fr_json" | grep '^{'
+        } >> "$out"
+        printf 'decoded\t%d\t0\t0\t0\n' "$fr_count" > "$stat"
+        printf '[%d/%d] %s  messages=%d\n' "$pos" "$TOTAL" "$src" "$fr_count" >&2
+        return 0
+    fi
+
     local out_text frames beacon_count tcmd_count other_count chain_tag wav
     out_text="$("$RX_REPLAY" "$decode_path" "${rx_args[@]}" 2>&1 || true)"
     [[ -n "$cleanup_path" ]] && rm -f "$cleanup_path"
@@ -394,6 +423,7 @@ RX_REPLAY=""
 SKIP_DECODED=1
 DB_PATH=""
 JOBS=""
+FORENSICS_REPORT=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -405,6 +435,7 @@ while [[ $# -gt 0 ]]; do
         --jobs=*)           JOBS="${1#*=}"; shift ;;
         --rx-replay)        RX_REPLAY="$2"; shift 2 ;;
         --force-redecode)   SKIP_DECODED=0; shift ;;
+        --forensics-report) FORENSICS_REPORT=1; shift ;;
         -h|--help)
             sed -n '2,/^# Defaults/p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
@@ -446,52 +477,67 @@ if [[ ! -d "$ROOT" ]]; then
     exit 2
 fi
 
-# --db routes every rx_replay to one packet DB by exporting SSO_PACKET_DB,
-# which rx_replay's default-path logic checks first. Exporting (not just
-# setting) is what makes the child rx_replay processes see it. Without --db
-# this is left alone: an SSO_PACKET_DB already in the environment still wins,
-# otherwise rx_replay falls back to $FRONTIERSAT_ROOT/packet_db.sqlite. That
-# fallback keys off the shared tree ROOT, NOT --root -- so a bare run that
-# scans, say, satnogs_archive still writes to the one main packet DB, never a
-# DB under the scanned directory.
-if [[ -n "$DB_PATH" ]]; then
-    export SSO_PACKET_DB="$DB_PATH"
+# --forensics-report is read-only: it never opens the packet DB and never
+# reads or writes the `.decoded` markers. Force a full re-process (markers
+# are a DB-decode bookkeeping concept that doesn't apply here) and warn if
+# --db was given, since it's ignored.
+if [[ "$FORENSICS_REPORT" -eq 1 ]]; then
+    SKIP_DECODED=0
+    [[ -n "$DB_PATH" ]] && \
+        echo "note: --db ignored under --forensics-report (the DB is never touched)" >&2
 fi
+
 echo "rx_replay:  $RX_REPLAY"
 echo "root:       $ROOT"
-echo "packet DB:  ${SSO_PACKET_DB:-$FRONTIERSAT_ROOT/packet_db.sqlite (rx_replay default)}"
 echo "jobs:       $JOBS  (newest-first)"
 
-# Pre-flight: refuse to run if that packet DB can't be written. Otherwise a
-# permissions problem is SILENT -- rx_replay drops the inserts but still exits
-# 0, decode_passes touches each <audio>.decoded marker below, and the passes
-# are then skipped on every future run even after the DB is fixed, quietly
-# losing them. Fail loud and early instead. The writer needs write access to
-# the .sqlite file, its -wal/-shm sidecars, AND the containing directory (WAL
-# creates the sidecars there), so we check the directory, the file, and any
-# existing WAL sidecars are writable.
-db_target="${SSO_PACKET_DB:-$FRONTIERSAT_ROOT/packet_db.sqlite}"
-db_dir="$(dirname "$db_target")"
-preflight_fail() {
-    echo "error: packet DB is not writable: $db_target" >&2
-    echo "       ($1)" >&2
-    echo "       Refusing to decode -- a silent write failure would mark every" >&2
-    echo "       pass '.decoded' without storing it, and they would be skipped" >&2
-    echo "       even after the DB is fixed. Give the writer (e.g. the cron" >&2
-    echo "       user) write access to the .sqlite file, its -wal/-shm" >&2
-    echo "       sidecars, and the directory $db_dir, then re-run." >&2
-    exit 3
-}
-[[ -d "$db_dir" && -w "$db_dir" && -x "$db_dir" ]] || preflight_fail "directory not writable"
-if [[ -e "$db_target" ]]; then
-    [[ -w "$db_target" ]] || preflight_fail "file not writable"
-    # In WAL mode the writer also updates these sidecars; a stale root- or
-    # other-user-owned -shm/-wal blocks every other writer, so if they exist
-    # they must be writable too. (-w uses access(2): it honours ACLs and is
-    # evaluated as the user actually running this, e.g. the cron user.)
-    for _sx in "$db_target-wal" "$db_target-shm"; do
-        [[ ! -e "$_sx" || -w "$_sx" ]] || preflight_fail "WAL sidecar not writable: $_sx"
-    done
+if [[ "$FORENSICS_REPORT" -eq 1 ]]; then
+    echo "mode:       forensics report (JSON to stdout; packet DB not touched)"
+else
+    # --db routes every rx_replay to one packet DB by exporting SSO_PACKET_DB,
+    # which rx_replay's default-path logic checks first. Exporting (not just
+    # setting) is what makes the child rx_replay processes see it. Without --db
+    # this is left alone: an SSO_PACKET_DB already in the environment still wins,
+    # otherwise rx_replay falls back to $FRONTIERSAT_ROOT/packet_db.sqlite. That
+    # fallback keys off the shared tree ROOT, NOT --root -- so a bare run that
+    # scans, say, satnogs_archive still writes to the one main packet DB, never a
+    # DB under the scanned directory.
+    if [[ -n "$DB_PATH" ]]; then
+        export SSO_PACKET_DB="$DB_PATH"
+    fi
+    echo "packet DB:  ${SSO_PACKET_DB:-$FRONTIERSAT_ROOT/packet_db.sqlite (rx_replay default)}"
+
+    # Pre-flight: refuse to run if that packet DB can't be written. Otherwise a
+    # permissions problem is SILENT -- rx_replay drops the inserts but still exits
+    # 0, decode_passes touches each <audio>.decoded marker below, and the passes
+    # are then skipped on every future run even after the DB is fixed, quietly
+    # losing them. Fail loud and early instead. The writer needs write access to
+    # the .sqlite file, its -wal/-shm sidecars, AND the containing directory (WAL
+    # creates the sidecars there), so we check the directory, the file, and any
+    # existing WAL sidecars are writable.
+    db_target="${SSO_PACKET_DB:-$FRONTIERSAT_ROOT/packet_db.sqlite}"
+    db_dir="$(dirname "$db_target")"
+    preflight_fail() {
+        echo "error: packet DB is not writable: $db_target" >&2
+        echo "       ($1)" >&2
+        echo "       Refusing to decode -- a silent write failure would mark every" >&2
+        echo "       pass '.decoded' without storing it, and they would be skipped" >&2
+        echo "       even after the DB is fixed. Give the writer (e.g. the cron" >&2
+        echo "       user) write access to the .sqlite file, its -wal/-shm" >&2
+        echo "       sidecars, and the directory $db_dir, then re-run." >&2
+        exit 3
+    }
+    [[ -d "$db_dir" && -w "$db_dir" && -x "$db_dir" ]] || preflight_fail "directory not writable"
+    if [[ -e "$db_target" ]]; then
+        [[ -w "$db_target" ]] || preflight_fail "file not writable"
+        # In WAL mode the writer also updates these sidecars; a stale root- or
+        # other-user-owned -shm/-wal blocks every other writer, so if they exist
+        # they must be writable too. (-w uses access(2): it honours ACLs and is
+        # evaluated as the user actually running this, e.g. the cron user.)
+        for _sx in "$db_target-wal" "$db_target-shm"; do
+            [[ ! -e "$_sx" || -w "$_sx" ]] || preflight_fail "WAL sidecar not writable: $_sx"
+        done
+    fi
 fi
 
 # ffmpeg is only required when an .ogg shows up in the tree; check
@@ -521,7 +567,7 @@ SCRATCH="$(mktemp -d -t decode_passes_run_XXXXXX)" \
 trap 'rm -rf "$SCRATCH"' EXIT
 
 # Things the worker re-entry needs from the environment.
-export RX_REPLAY SYNC_THR SKIP_DECODED have_ffmpeg SCRATCH TAB
+export RX_REPLAY SYNC_THR SKIP_DECODED have_ffmpeg SCRATCH TAB FORENSICS_REPORT
 
 # Build the worklist: walk newest-first, drop already-decoded files here in
 # the parent (so the workers aren't spawned just to skip them — keeps an
@@ -577,7 +623,13 @@ printf "    %-26s %d\n" "skipped (already done):" "$t_skip_done"
 printf "    %-26s %d\n" "skipped (not WAV):"      "$t_skip_open"
 printf "    %-26s %d\n" "skipped (wrong format):" "$t_skip_fmt"
 printf "    %-26s %d\n" "decoded:"                "$t_decoded"
-printf "    %-26s %d\n" "frames total:"           "$t_frames"
-printf "    %-26s %d\n" "  beacons:"              "$t_beacons"
-printf "    %-26s %d\n" "  TCMD responses:"       "$t_tcmd"
-printf "    %-26s %d\n" "  other (flagged):"      "$t_other"
+if [[ "$FORENSICS_REPORT" -eq 1 ]]; then
+    # Forensics mode reports raw frames as JSON; the beacon/TCMD/other
+    # split is a DB-recognition concept that isn't computed here.
+    printf "    %-26s %d\n" "JSON messages total:"    "$t_frames"
+else
+    printf "    %-26s %d\n" "frames total:"           "$t_frames"
+    printf "    %-26s %d\n" "  beacons:"              "$t_beacons"
+    printf "    %-26s %d\n" "  TCMD responses:"       "$t_tcmd"
+    printf "    %-26s %d\n" "  other (flagged):"      "$t_other"
+fi
