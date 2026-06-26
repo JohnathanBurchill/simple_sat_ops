@@ -67,19 +67,31 @@ never blocked.
 
 ## Other tools
 
+The build produces a couple of dozen smaller tools. The ones you reach
+for most often:
+
 | Tool | What it does |
 |------|--------------|
 | `next_in_queue` | Print upcoming overpasses from a file of TLEs (no hardware needed). |
 | `sdr_probe` | Report the attached SDR(s) and the RX/TX ports `simple_sat_ops` will use. |
 | `packet_browser` | ncurses explorer over the decoded-packet database; reconstructs and exports downlinked files. |
-| `tcmd_browser` | The inverse: browse transmitted telecommands and the responses they drew. |
+| `packet_query` | Non-interactive query of the same database from the shell (scripts, JSON/CSV export). |
+| `tcmd_browser` | The inverse of `packet_browser`: browse transmitted telecommands and the responses they drew. |
 | `agenda_check` | Lint a telecommand agenda file against the flight firmware's command set. |
+| `rx_replay` | Re-decode a recorded pass (`.wav`, or a SatNOGS `.ogg`) offline with different decoder settings. |
+| `rx_decode` | Decode a single recorded WAV/raw PCM capture to frames — the offline decoder in isolation. |
 | `decode_inspector` | Staged decoder visualizer (ASM → Golay → descrambler → Reed-Solomon → CSP); raylib. |
 | `live_waterfall` | Real-time spectrogram; raylib. |
 | `tle_keps` | Orbital-elements summary (apogee/perigee, period, sun-sync, LTAN/LTDN). |
 | `gnss_opm` / `gnss_reports` | Turn a downlinked GNSS fix into a CCSDS orbit message for space-safety upload. |
 | `ham_listen` / `ham_speak` | Amateur-band voice receive/transmit helpers. |
 | `lifetime` | Toy orbit-decay estimate (**inaccurate** — a "what if?" only). |
+
+This is a selection, not the full set — bench bring-up (`tx_frame_sdr`,
+`b210_rx_capture`, `b210_gain_sweep`, `beacon_gen`, …), IQ/WAV utilities,
+and orbit tools like `tle_from_state` and `tle_compare` round it out.
+[`docs/USER_MANUAL.md`](docs/USER_MANUAL.md) is the complete, tool-by-tool
+reference; every installed binary also accepts `--version`.
 
 # Installation
 

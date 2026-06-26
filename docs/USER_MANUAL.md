@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`7f0990d` (2026-06-25). This is a working draft.
+`10d4d38` (2026-06-25). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -141,12 +141,15 @@ manual can go back on the shelf where it belongs.
     - [`tcmd_import`](#tcmd_import)
     - [`tcmd_browser`](#tcmd_browser)
     - [`tle_keps`](#tle_keps)
+    - [`tle_compare`](#tle_compare)
     - [`gnss_reports`](#gnss_reports)
+    - [`tle_from_state`](#tle_from_state)
 12. [Uploading the orbit to the space safety database](#uploading-the-orbit-to-the-space-safety-database)
     - [The workflow](#the-workflow)
     - [When a fix is good enough to upload](#when-a-fix-is-good-enough-to-upload)
 13. [Bring-up and test tools](#bring-up-and-test-tools)
     - [`tx_frame_sdr`](#tx_frame_sdr)
+    - [`beacon_gen`](#beacon_gen)
     - [`b210_rx_capture` and `b210_gain_sweep`](#b210_rx_capture-and-b210_gain_sweep)
     - [`live_waterfall`](#live_waterfall)
     - [`uplink_test`](#uplink_test)
@@ -816,6 +819,7 @@ review it, or take apart what it recorded.
 | Run a live pass (the only tool that drives the radio and rotator) | [`simple_sat_ops`](#operator-ui-simple_sat_ops) |
 | Find the next pass and plan a schedule | [`next_in_queue`](#pass-scheduling-next_in_queue) |
 | Summarize a TLE's orbital elements (keps) | [`tle_keps`](#tle_keps) |
+| Tell apart two close catalog objects, or build a TLE from a downlinked fix | [`tle_compare`](#tle_compare) / [`tle_from_state`](#tle_from_state) |
 | Sanity-check a command list before you send it | [`agenda_check`](#agenda-review-agenda_check) |
 | Pull frames out of a recorded capture offline | [Offline analysis tools](#offline-analysis-tools) |
 | Bench bring-up, one-shot test transmits, IQ recording | [Bring-up and test tools](#bring-up-and-test-tools) |
@@ -2073,6 +2077,33 @@ above the mean Earth radius (6371 km), matching common online TLE tools;
 the J2 precession term keeps the equatorial radius, as that formula
 expects.
 
+### `tle_compare`
+
+A live, side-by-side comparison of two or more catalog objects from one
+TLE file. It exists to answer the question that comes up right after a
+ride-share deployment: when several freshly catalogued objects sit close
+together, which one is actually ours?
+
+For each named object it shows the same ephemeris `simple_sat_ops` does --
+az, el, range, range-rate, sub-point, Doppler -- plus the next pass to the
+nearest second, stacked one object per line so the numbers line up and the
+differences jump out. A SEPARATION block then reduces it to the handful of
+quantities a real pass can confirm: the angular gap on the sky, the range
+and Doppler differences, and how far apart the AOS times fall.
+
+```sh
+# Compare three candidate objects from the newest dated TLE
+tle_compare "OBJECT A" "OBJECT B" FrontierSat
+
+# A specific file, a different downlink frequency for the Doppler column
+tle_compare $TLES/recent.tle --freq=436.150 OBJ-X OBJ-Y
+```
+
+Read-only: no hardware, no transmit. Like `tle_keps` it needs only
+ncurses and the orbit library, so it runs on any host that builds
+`next_in_queue`. Watch the numbers across a pass or two and the decoy
+falls away.
+
 ### `gnss_reports`
 
 Reassembles the satellite's GNSS telecommand responses out of the packet
@@ -2100,6 +2131,36 @@ gnss_reports --since=7d
 A `BESTXYZA` whose status reads `SOL_COMPUTED` is a real position fix;
 `INSUFFICIENT_OBS` means the receiver could not see enough satellites to
 solve. Those computed fixes are what feed the orbit upload below.
+
+### `tle_from_state`
+
+Builds a NORAD two-line element set from a single position/velocity state
+vector -- the kind the satellite's GNSS receiver reports. The intended use
+is FrontierSat: downlink a fix (see `gnss_reports` above), drop it in a
+small text file, and get a TLE that `next_in_queue` and `simple_sat_ops`
+can track with -- useful early in a mission before a good catalog TLE
+exists, or as a cross-check against one.
+
+The input is a short text file (path on the command line, or stdin): an
+epoch line, then position, position 1-sigma, velocity, and velocity
+1-sigma, one vector per line. Vectors are Earth-fixed (ECEF / ITRF, the
+GNSS standard) unless `--frame=eci` is given.
+
+```sh
+tle_from_state fix.txt > frontiersat.tle
+gnss_reports --type=BESTXYZA --full   # where the numbers come from
+```
+
+The conversion rotates the state into the inertial frame the propagator
+uses, makes a two-body guess at the elements, then differentially corrects
+them until this build's own SGP4 reproduces the measured state at the
+epoch -- so the TLE is self-consistent with the propagator the rest of the
+suite runs. A drag term cannot be observed from one fix, so B\* and the
+mean-motion derivatives are written as zero. The 1-sigma values are a
+quality gate: if the fitted orbit cannot reproduce the measured state to
+within them the tool warns, or with `--strict-sigma` refuses to emit a
+TLE. The TLE goes to stdout; the fit log, orbit summary, and gate verdict
+go to stderr, so stdout can be redirected straight into a `.tle` file.
 
 ## Uploading the orbit to the space safety database
 
@@ -2224,6 +2285,28 @@ the resulting IQ via `--dump-iq=<path>` (or prints sizes via
 `--dry-run`). The streamer path is gone. Live RF goes through
 `simple_sat_ops`'s in-process TX burst; `tx_frame_sdr` is for bench
 inspection and offline tooling.
+
+### `beacon_gen`
+
+Synthesises a beacon recording so you can exercise the decode chain
+without waiting for a pass. It fills the firmware-canonical beacon packet
+with deterministic, plausible values, wraps it in CSP and AX100, and
+writes a 48 kHz mono WAV that matches what an FM discriminator would emit
+on a perfect-signal downlink. Feed the result to `rx_decode`, `rx_replay`,
+or the beacon parser to test the chain end to end.
+
+```sh
+# One beacon
+beacon_gen --out=beacon.wav
+
+# Ten beacons, 5 s apart, with the per-beacon counters advancing
+beacon_gen --out=session.wav --repeats=10 --gap-seconds=5
+rx_decode session.wav
+```
+
+With `--repeats=N` the per-beacon fields (uptime, EPS uptime, epoch time,
+total beacon count) advance from one beacon to the next, so the decoded
+"session" is internally coherent rather than ten copies of the same frame.
 
 ### `b210_rx_capture` and `b210_gain_sweep`
 
