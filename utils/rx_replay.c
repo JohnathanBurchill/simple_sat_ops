@@ -1184,7 +1184,7 @@ int main(int argc, char **argv)
                 wav_path[plen + 1] = '\0';
                 int wav_rate = read_wav_samp_rate(wav_path);
                 if (wav_rate > 0) {
-                    if (wav_rate != raw_rate) {
+                    if (wav_rate != raw_rate && !forensics) {
                         fprintf(stderr,
                             "rx_replay: auto-detected IQ rate %d Hz "
                             "from companion %s\n",
@@ -1231,7 +1231,7 @@ int main(int argc, char **argv)
             sw_nco_set_freq(&nco, lo_shift_hz);
             size_t n_pairs = n_samples / 2u;
             sw_nco_apply(&nco, samples, n_pairs);
-            fprintf(stderr,
+            if (!forensics) fprintf(stderr,
                 "rx_replay: applied --lo-shift-khz=%g (sw NCO over %zu IQ pairs)\n",
                 lo_shift_hz / 1000.0, n_pairs);
         }
@@ -1247,7 +1247,7 @@ int main(int argc, char **argv)
         }
         channels = 1;  // already downmixed to mono
         if (raw_rate_explicit) samp_rate = raw_rate;  // allow override
-        fprintf(stderr,
+        if (!forensics) fprintf(stderr,
             "rx_replay: decoded %s via libsndfile (%d Hz, %zu samples)\n",
             input_path, samp_rate, n_samples);
 #else
@@ -1388,7 +1388,7 @@ int main(int argc, char **argv)
         if (stat(input_path, &st) == 0) {
             start_utc_seconds = (double)st.st_mtime;
             have_start_utc = 1;
-            fprintf(stderr,
+            if (!forensics) fprintf(stderr,
                     "rx_replay: no UT stamp in filename and --start-utc "
                     "not set; falling back to file mtime\n");
         }
@@ -1530,7 +1530,7 @@ int main(int argc, char **argv)
                 fflush(bfp);
                 iq_burst_free(bdet);
                 fclose(bfp);
-                fprintf(stderr, "rx_replay: burst.csv -> %s\n",
+                if (!forensics) fprintf(stderr, "rx_replay: burst.csv -> %s\n",
                         burst_path);
             }
         }
@@ -1620,7 +1620,7 @@ int main(int argc, char **argv)
         rx_tui_set_header(tui_header);
         rx_tui_set_command_handler(rx_replay_cmd_handler, NULL);
         quiet = 1;
-    } else {
+    } else if (!forensics) {
         fprintf(stderr,
                 "rx_replay: %s  rate=%d Hz  channels=%d  bit_rate=%d  "
                 "window=%.2fs  slide=%.2fs  sync_thr=%d  rs=%s  crc=%s  "
@@ -2005,44 +2005,47 @@ done:
         if (!g_stop) rx_tui_hold_until_quit();
         rx_tui_close();
     }
-    const char *chain;
-    if (anchored_only) {
-        chain = "anchored-csv (fsk)";
-    } else if (!iq_mode) {
-        chain = "fm-audio";
-    } else if (two_pass) {
-        chain = pass1_use_fsk ? "iq+fsk+anchored-fsk"
-                              : "iq+slicer+anchored-fsk";
-    } else if (pass1_use_viterbi) {
-        chain = "iq+viterbi";
-    } else if (pass1_use_fsk) {
-        chain = "iq+fsk";
-    } else {
-        chain = "iq+slicer";
-    }
-    decode_loop_stats_t st;
-    decode_loop_get_stats(&st);
-    fprintf(stderr, "rx_replay: decode summary (chain=%s):\n", chain);
-    fprintf(stderr, "  candidate frames (pre-dedup)   : %ld\n", raw_decodes);
-    fprintf(stderr, "  detected (after position dedup): %d  %s\n", n_emitted,
-            forensics ? "— JSON written to stdout, DB untouched"
-            : db ? "— all recorded to the DB"
-            : "— DB not written");
-    fprintf(stderr, "    valid CSP header             : %ld\n", st.csp_ok);
-    fprintf(stderr, "    RS corrected / uncorrectable : %ld / %ld\n",
-            st.rs_corrected, st.rs_uncorrectable);
-    fprintf(stderr, "    recognized / unrecognized    : %ld / %ld\n",
-            st.recognized, st.unrecognized);
-    fprintf(stderr, "    recognized by type           : "
-            "beacon %ld, tcmd_response %ld, log %ld, bulk_file %ld\n",
-            st.beacon, st.tcmd_response, st.log_message, st.bulk_file);
-    fprintf(stderr, "  the DB keeps one row per distinct payload, "
-            "so repeats collapse.\n");
-    if (iq_mode && two_pass && !anchored_only) {
-        fprintf(stderr,
-                "rx_replay: pass-1 emitted %d, pass-2 (anchored FSK) "
-                "tried %d candidate(s) and rescued %d.\n",
-                pass1_n_emitted, p2_attempts, p2_emitted);
+    // --forensics-report keeps stdout a clean JSON stream and stays
+    // silent on stderr too — the decode summary below is suppressed so
+    // "just the JSON" is the only output. Genuine errors still print.
+    if (!forensics) {
+        const char *chain;
+        if (anchored_only) {
+            chain = "anchored-csv (fsk)";
+        } else if (!iq_mode) {
+            chain = "fm-audio";
+        } else if (two_pass) {
+            chain = pass1_use_fsk ? "iq+fsk+anchored-fsk"
+                                  : "iq+slicer+anchored-fsk";
+        } else if (pass1_use_viterbi) {
+            chain = "iq+viterbi";
+        } else if (pass1_use_fsk) {
+            chain = "iq+fsk";
+        } else {
+            chain = "iq+slicer";
+        }
+        decode_loop_stats_t st;
+        decode_loop_get_stats(&st);
+        fprintf(stderr, "rx_replay: decode summary (chain=%s):\n", chain);
+        fprintf(stderr, "  candidate frames (pre-dedup)   : %ld\n", raw_decodes);
+        fprintf(stderr, "  detected (after position dedup): %d  %s\n", n_emitted,
+                db ? "— all recorded to the DB" : "— DB not written");
+        fprintf(stderr, "    valid CSP header             : %ld\n", st.csp_ok);
+        fprintf(stderr, "    RS corrected / uncorrectable : %ld / %ld\n",
+                st.rs_corrected, st.rs_uncorrectable);
+        fprintf(stderr, "    recognized / unrecognized    : %ld / %ld\n",
+                st.recognized, st.unrecognized);
+        fprintf(stderr, "    recognized by type           : "
+                "beacon %ld, tcmd_response %ld, log %ld, bulk_file %ld\n",
+                st.beacon, st.tcmd_response, st.log_message, st.bulk_file);
+        fprintf(stderr, "  the DB keeps one row per distinct payload, "
+                "so repeats collapse.\n");
+        if (iq_mode && two_pass && !anchored_only) {
+            fprintf(stderr,
+                    "rx_replay: pass-1 emitted %d, pass-2 (anchored FSK) "
+                    "tried %d candidate(s) and rescued %d.\n",
+                    pass1_n_emitted, p2_attempts, p2_emitted);
+        }
     }
     free(bits_scratch);
     free(bytes_scratch);

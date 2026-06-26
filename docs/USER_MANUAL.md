@@ -1848,8 +1848,10 @@ Each line carries the four fields requested in issue #39:
 
 Frames are still de-duplicated by sample position exactly as in a
 normal decode, so a frame seen across overlapping windows is reported
-once. The decode summary (chain, candidate/detected counts, RS tallies)
-still goes to **stderr**, leaving stdout pure JSON.
+once. The mode is quiet by design: the usual progress chatter and the
+end-of-run decode summary are suppressed, so the JSON is the only
+output. Genuine errors (an unreadable file, a bad option) still print
+to stderr and set a non-zero exit.
 
 To run the report over every recording in a tree, `decode_passes.sh
 --forensics-report` walks the root, hands each file to `rx_replay
