@@ -1100,6 +1100,23 @@ if (SGP4SDP4_LIB)
     target_link_libraries(tle_from_state PRIVATE ${SGP4SDP4_LIB} m)
     list(APPEND SSO_TARGETS tle_from_state)
 
+    # Closest-approach (conjunction) finder for two satellites. Pure SGP4 +
+    # the conjunction.c geometry/Pc math; no ncurses, no UHD, so it builds
+    # wherever next_in_queue does.
+    add_executable(conjunction apps/conjunction.c
+                   src/orbit/conjunction.c src/orbit/prediction.c
+                   src/orbit/oem.c src/ui/duration_fmt.c)
+    target_link_libraries(conjunction PRIVATE ${SGP4SDP4_LIB} m)
+    list(APPEND SSO_TARGETS conjunction)
+
+    # Conjunction geometry + Foster (1992) Pc self-test. Pure math, links only
+    # the module under test; no SGP4/ncurses.
+    add_executable(conjunction_selftest
+                   unit_tests/conjunction_selftest.c src/orbit/conjunction.c)
+    target_include_directories(conjunction_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+    target_link_libraries(conjunction_selftest PRIVATE m)
+    list(APPEND SSO_TARGETS conjunction_selftest)
+
     # Live side-by-side TLE comparison (needs ncurses for the live UI).
     if (NCURSES_FOUND)
         add_executable(tle_compare apps/tle_compare.c

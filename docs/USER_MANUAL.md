@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`930aeda` (2026-06-26). This is a working draft.
+`f6f9d05` (2026-06-26). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -142,6 +142,7 @@ manual can go back on the shelf where it belongs.
     - [`tcmd_browser`](#tcmd_browser)
     - [`tle_keps`](#tle_keps)
     - [`tle_compare`](#tle_compare)
+    - [`conjunction`](#conjunction)
     - [`gnss_reports`](#gnss_reports)
     - [`tle_from_state`](#tle_from_state)
 12. [Uploading the orbit to the space safety database](#uploading-the-orbit-to-the-space-safety-database)
@@ -670,7 +671,7 @@ Which targets actually build depends on what the host has:
 |------------|---------------------|
 | always | `radio_ctl`, `rs_selftest`, `fm_preview`, `agenda_check` |
 | OpenSSL / libcrypto | `uplink_test`, `rx_decode`, `packet_query`, `packet_browser`, `tcmd_browser`, `tcmd_import` |
-| SGP4SDP4 | `next_in_queue`, `lifetime`, `tle_keps`, `prediction_selftest`, `pursuit_selftest` |
+| SGP4SDP4 | `next_in_queue`, `lifetime`, `tle_keps`, `conjunction`, `prediction_selftest`, `pursuit_selftest` |
 | UHD (B210) | `b210_rx_capture`, `b210_gain_sweep`, `tx_frame_sdr`, `sdr_probe` |
 | librtlsdr | RTL-SDR RX-only backend in `simple_sat_ops` (on by default; auto-disables if absent) |
 | libusb | USB-serial clone detection in the UHD backend (a UHD dependency, so normally already present) |
@@ -847,6 +848,7 @@ review it, or take apart what it recorded.
 | Find the next pass and plan a schedule | [`next_in_queue`](#pass-scheduling-next_in_queue) |
 | Summarize a TLE's orbital elements (keps) | [`tle_keps`](#tle_keps) |
 | Tell apart two close catalog objects, or build a TLE from a downlinked fix | [`tle_compare`](#tle_compare) / [`tle_from_state`](#tle_from_state) |
+| Screen two satellites for a close approach (conjunction) | [`conjunction`](#conjunction) |
 | Sanity-check a command list before you send it | [`agenda_check`](#agenda-review-agenda_check) |
 | Pull frames out of a recorded capture offline | [Offline analysis tools](#offline-analysis-tools) |
 | Bench bring-up, one-shot test transmits, IQ recording | [Bring-up and test tools](#bring-up-and-test-tools) |
@@ -2207,6 +2209,94 @@ Read-only: no hardware, no transmit. Like `tle_keps` it needs only
 ncurses and the orbit library, so it runs on any host that builds
 `next_in_queue`. Watch the numbers across a pass or two and the decoy
 falls away.
+
+### `conjunction`
+
+Finds the closest approach -- the conjunction -- of two satellites from their
+TLEs. It propagates both objects forward (one week by default) with the same
+SGP4/SDP4 core the rest of the toolchain uses, finds the first time they pass
+within a threshold distance, and reports that encounter:
+
+- the **miss distance**, in convenient units (metres under a kilometre, else
+  km), broken down into the **radial (height)**, **along-track**, and
+  **cross-track** separation in the primary's orbit frame (RTN: radial,
+  in-track, cross-track), which sum in quadrature back to the miss;
+- the **time of closest approach** in UTC and local time (MDT/MST for an
+  operator in Mountain Time), and **how long until** it happens;
+- the **relative speed** at closest approach;
+- **Foster's (1992) probability of collision** (`Pc`) for an assumed
+  covariance and hard-body size.
+
+It also prints each TLE's **epoch and age**, so a stale element set is obvious,
+and the NORAD ID of each object. It is read-only and observer-independent -- a
+conjunction is a fact about the two orbits, not about any ground station -- so
+it takes no location and needs only the orbit library (no ncurses, no SDR).
+
+```sh
+# Both objects in one file, FrontierSat as the primary (the reference pair
+# in unit_tests/fixtures/conjunction.tle):
+conjunction unit_tests/fixtures/conjunction.tle FrontierSat SPACEMOBILE-004
+
+# Search a fortnight at a finer step, with a tighter conjunction gate:
+conjunction unit_tests/fixtures/conjunction.tle FrontierSat SPACEMOBILE-004 \
+    --days=14 --step=5 --threshold-km=25
+
+# Secondary from a different file, every approach below the gate, and a
+# rendered 3-D view of the encounter:
+conjunction ours.tle FrontierSat --tle2=other.tle DEBRIS-123 --all --plot
+```
+
+By default it reports the **first** approach that breaks the threshold
+(`--threshold-km`, default 100 km); `--all` lists every one in the window. If
+nothing breaks the threshold it says so and still reports the closest approach
+it found, so you always get a number. Each candidate minimum from the coarse
+`--step` scan (default 10 s) is refined to the true time of closest approach
+with a golden-section search down to ~0.1 ms -- about a metre at a 15 km/s
+closing speed, near the limit a double-precision Julian date can resolve. That
+matters: at 15 km/s every 0.01 s of TCA error is ~150 m of travel that tilts
+the miss vector and skews the radial/along/cross split, so the refinement, not
+the step, sets the accuracy of the reported numbers (the displayed TCA carries
+milliseconds for the same reason). The `--step` only has to be fine enough not
+to step *over* an encounter -- a very fast, very close pass can slip between
+coarse samples, so shorten it if you are screening for sub-kilometre misses.
+
+**The probability of collision is only as good as the assumed covariance.** A
+TLE carries no uncertainty information, so `conjunction` assumes a placeholder
+per-object 1-sigma position error (radial 200 m, in-track 1000 m, cross-track
+200 m) and a combined hard-body radius of 20 m, all printed with the result.
+Override them with `--sigma1-rtn=R,I,C` / `--sigma2-rtn=R,I,C` (metres),
+`--sigma-m=<m>` (isotropic shorthand for both), and `--hbr-m=<m>`. Treat the
+`Pc` as a screening aid, not a flight-safety product.
+
+#### How accurate is it? (validated against a real CDM)
+
+The geometry math was checked against a CSpOC Conjunction Data Message for
+FrontierSat (a Space-Track CDM; the reference TLEs for the same pair are in
+`unit_tests/fixtures/conjunction.tle`). Fed the CDM's own state vectors and
+covariances, `conjunction` reproduces its published numbers **exactly**:
+radial/along-track/cross-track miss of -152.1 / -81.2 / 289.9 m,
+a 337 m total miss, and -- with the combined hard-body radius the message
+implies (~11.5 m) -- a Foster `Pc` of 1.4x10^-4 against the CDM's 1.36x10^-4.
+
+Run on the *TLEs* for the same pair, the tool lands the **time** of closest
+approach within ~1 second of the CDM and the **relative speed** on the nose
+(14.733 km/s), but the **miss distance** comes out at a few kilometres rather
+than 337 m. That gap is the well-known limit of TLE accuracy -- general-
+perturbation mean elements are good to roughly a kilometre in along-track,
+which dominates a close miss -- not an error in the tool. For an actual
+conjunction assessment, use a high-precision orbit (a CDM, or an ephemeris fit
+to tracking); the TLE answer is a heads-up, not a verdict.
+
+The optional `--plot` writes a gnuplot 3-D perspective view of the encounter:
+both trajectories over a short window centred on the closest approach (primary
+solid, secondary dashed), a filled arrow along each velocity for the direction
+of motion, the two closest-approach points marked, and the miss vector drawn
+and labelled. It recentres on the encounter so the kilometre-scale miss is a
+visible gap rather than a sub-pixel crossing. The C program writes a
+self-contained `conjunction.gp` script plus its `.dat` data and runs `gnuplot`
+to render `conjunction.png`; if gnuplot is not installed it leaves the script
+and data so you can render them by hand. `--plot-out=<path>` sets the output
+base, `--plot-window-sec=<s>` the half-window shown (default 90 s).
 
 ### `gnss_reports`
 
