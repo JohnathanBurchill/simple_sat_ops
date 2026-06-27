@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`f6f9d05` (2026-06-26). This is a working draft.
+`883e2a0` (2026-06-27). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -157,7 +157,14 @@ manual can go back on the shelf where it belongs.
     - [`rx_decode`](#rx_decode)
     - [`lifetime`](#lifetime)
     - [Amateur-band voice: `ham_listen` and `ham_speak`](#amateur-band-voice-ham_listen-and-ham_speak)
-14. [Testing and validation](#testing-and-validation)
+14. [Operations scripts](#operations-scripts)
+    - [Keeping the orbit and the recordings current](#keeping-the-orbit-and-the-recordings-current)
+    - [Scheduling and capture helpers](#scheduling-and-capture-helpers)
+    - [Audio and sky plots](#audio-and-sky-plots)
+    - [Database and log touch-ups](#database-and-log-touch-ups)
+    - [Development and firmware sync](#development-and-firmware-sync)
+    - [Provisioning a ground machine](#provisioning-a-ground-machine)
+15. [Testing and validation](#testing-and-validation)
     - [How the code is validated: four layers](#how-the-code-is-validated-four-layers)
     - [Running the unit tests](#running-the-unit-tests)
     - [Catching what the compiler hides](#catching-what-the-compiler-hides)
@@ -165,15 +172,15 @@ manual can go back on the shelf where it belongs.
     - [Validation that runs on every pass](#validation-that-runs-on-every-pass)
     - [Every bug leaves a test behind](#every-bug-leaves-a-test-behind)
     - [What isn't covered](#what-isnt-covered)
-15. [Architecture notes](#architecture-notes)
+16. [Architecture notes](#architecture-notes)
     - [IPC: one operator at a time](#ipc-one-operator-at-a-time)
     - [Worker threads](#worker-threads)
     - [TX safety gates](#tx-safety-gates)
     - [Pursuit planner internals](#pursuit-planner-internals)
-16. [File layout](#file-layout)
-17. [Troubleshooting](#troubleshooting)
-18. [A note on feel](#a-note-on-feel)
-19. [Glossary](#glossary)
+17. [File layout](#file-layout)
+18. [Troubleshooting](#troubleshooting)
+19. [A note on feel](#a-note-on-feel)
+20. [Glossary](#glossary)
 
 *Appendices:*
 
@@ -2653,6 +2660,151 @@ Etiquette and the rules:
   simplex carrier, fine for a brief "starting / finished" courtesy call.
   For an actual conversation, move to an appropriate local simplex
   frequency with `--freq-mhz=<f>`.
+
+## Operations scripts
+
+The compiled tools do the work of a pass; the scripts in `scripts/`
+are the glue around them. Some run from cron and keep the orbit and
+the recordings current without anyone watching; some wrap a long
+`ffmpeg` or `ssh` pipeline you would rather not retype; some touch up
+the database or the logs after a change in how a field is read; and two
+set up a fresh ground machine from nothing. They are run by hand or
+from a crontab, not built and installed, so none of them takes the
+`-V` / `--version` flag the binaries do. Each script opens with a
+comment header that is its real, authoritative usage — what is below is
+a map of which one to reach for.
+
+### Keeping the orbit and the recordings current
+
+These three are the daily pipeline. On the ground machine they run from
+cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
+
+* **`fetch_tle.sh`** — fetch the latest TLE for one catalogued object
+  from CelesTrak and write it as
+  `<root>/TLEs/YYYYMMDD/tle-YYYYMMDD.tle`, the dated file the tracking
+  tools auto-discover (see [First-run setup](#first-run-setup)). It
+  rewrites CelesTrak's upper-case name line to `FrontierSat` so the
+  case-sensitive name match works. Meant for a once-a-day cron entry.
+* **`satnogs_pull.sh`** — pull observation audio for FrontierSat (NORAD
+  69015 by default) from the [SatNOGS network](https://network.satnogs.org/)
+  and stash each pass in its own folder, laid out so `decode_passes.sh`
+  can walk it. Built for unattended cron: idempotent (it tracks fetched
+  observation IDs), locked against overlapping runs, atomic writes, and
+  politely rate-limited. `--decode` runs the decoder on each new pass as
+  it lands.
+* **`decode_passes.sh`** — walk a directory tree, find every `.wav` and
+  `.ogg`, run `rx_replay` on each (resampling `.ogg` first), and
+  summarize what decoded. Beacons print as readable telemetry; anything
+  that isn't a beacon (telecommand responses, odd frames) is called out
+  so it doesn't hide in a long batch. Parallel by default (`--jobs`, one
+  worker per CPU) and newest capture first; the shared packet DB is
+  WAL-mode and dedups, so the parallel writers are safe.
+
+### Scheduling and capture helpers
+
+* **`nextpass.sh`** — show FrontierSat's next pass using the orbit
+  currently in the space-safety database: it asks `ssm` for the newest
+  trajectory, exports it as a TLE, and feeds that to `next_in_queue`.
+  Use it when you want the next pass against the uploaded ephemeris
+  rather than a catalog TLE.
+* **`upcoming_amateur_satellite_passes.sh`** — list the coming passes of
+  a named amateur satellite (or all of them) from
+  `satellites/amateur.tle`, with the radio/beacon annotation. A thin
+  wrapper over `next_in_queue --list --reverse --show-radio-info`.
+* **`rx_record.sh`** — a quick standalone capture with an RTL-SDR:
+  `rtl_fm` FM-demodulates the chosen frequency (default 436.15 MHz) to a
+  `.raw`, then it writes a `.wav` and a spectrogram `.png`. Ctrl-C
+  stops it. No `simple_sat_ops`, no rotator — just a recording when
+  that's all you want.
+* **`stream_latest_iq.sh`** — follow the most-recently-modified `.iq` on
+  the remote ground station over SSH into a local file, so you can point
+  `decode_inspector --live` at a pass that is still being recorded
+  across the room. `HOST` and `REMOTE_ROOT` override the target.
+* **`antenna_cam.sh`** — a small always-on-top window showing the RAO
+  antenna webcam, fed over SSH (the remote `ffmpeg` repackages the
+  camera's native MJPEG, no transcode). `--with-timelapse=N` branches
+  off a sped-up MP4 written when you close the viewer. Run it from your
+  laptop, not on the ground machine.
+
+### Audio and sky plots
+
+* **`gate_beacon_audio.sh`** — take a long wideband capture and produce
+  a copy that's silent everywhere the satellite wasn't keying, by gating
+  the audio on a narrow detector tap around the 4800 Hz symbol tone. The
+  offline, one-shot twin of the live `--monitor` squelch — clean up an
+  existing recording without re-running the receiver.
+* **`pcm2wav.sh`** — split a stereo signed-16-bit `.raw` (48 kHz) into
+  two mono `.wav` files, one per channel, via `ffmpeg`.
+* **`plot_sky_pass.sh` / `plot_sky_pass.py`** — a polar sky plot of
+  where each decoded packet was received from, read from the packet
+  DB's az/el columns (north up, horizon on the outer ring). Two siblings
+  on the same data: the shell version needs only `gnuplot`; the Python
+  version uses matplotlib and adds an interactive `--show`. Packets with
+  no az/el (audio-path decodes that ran without SGP4) are dropped —
+  backfill them with `rx_replay --update`.
+* **`noise_skymap.py`** — build an all-sky noise map from a `--scan-sky`
+  run (see the [command-line options](#command-line-options)): for each
+  rotator dwell it averages IQ power over a window and plots it on a
+  Lambert equal-area polar chart, so you can see where the sky (or the
+  local horizon) is noisy.
+* **`scan_iq.py`** — a single-file Python prototype of the AX100 sync
+  search: it slides the ASM correlation across a raw `.iq` and reports
+  the best match per window. A bench aid for iterating on the demod
+  without rebuilding the C decoder; not part of the operational path.
+
+### Database and log touch-ups
+
+Both rewrite history in place, so both default to caution.
+
+* **`clean_tx_logs.sh`** — scrub the misleading "ack" lines out of old
+  per-pass `tx.log` files. Those acks were synthesised locally the
+  instant a burst left the radio — they were never replies from the
+  spacecraft — so they read as if the satellite answered when it didn't.
+  The current code no longer writes them; this brings old logs into the
+  newer shape. Dry-run by default; `-f` / `--force` to actually rewrite.
+* **`migrate_gnss_label.sh`** — rename the beacon field `gnss=` to
+  `gnss_rx_mode=` in already-decoded packet rows, so passes decoded under
+  the old reading match the new one without re-decoding everything. It
+  copies the DB to a `.bak-…` file first.
+
+### Development and firmware sync
+
+* **`lint_warnings.sh`** — a separate GCC build that catches the
+  `-Wformat-truncation` warnings Apple clang silently skips on the Mac
+  dev host, so you can answer "would the ground build complain?" before
+  pushing. Covered in full under [Catching what the compiler
+  hides](#catching-what-the-compiler-hides).
+* **`decode_regression.sh`** — the decode smoketest: re-run the FSK +
+  AX100 chain over small known-good fixtures and confirm the
+  recognized-frame counts haven't moved. Covered under [Decode
+  smoketest: known-good recordings](#decode-smoketest-known-good-recordings).
+* **`self_test_smoke.sh`** — run `simple_sat_ops --self-test` across the
+  mode matrix (control / viewer / viewer-stream / bad-TLE) and confirm
+  each comes up clean without crashing, guarding the argument-parse →
+  TLE-load path that a segfault once slipped through. Run it after any
+  change to the option parsing or the name resolution.
+* **`gen_tcmd_spec.py`** — regenerate the committed telecommand table
+  (`src/proto/tcmd_spec.c`) from the flight firmware's definitions when
+  the command set changes. Described where the linter is, under
+  [Telecommand linting](#telecommand-linting).
+* **`verify_uplink_frame.py`** — print the authoritative uplink-frame
+  hex by importing `pycsplink` from the CalgaryToSpace communications
+  repo, to byte-compare against `uplink_test --print-frame`. The
+  ground-truth oracle for the C framer.
+
+### Provisioning a ground machine
+
+Run these once when you stand up or hand over a ground computer; see
+also [First-run setup](#first-run-setup).
+
+* **`sso_setup_root.sh`** — the one-time root bootstrap: create the
+  `sso-ops` group, the `/FrontierSat/` data tree, the `/run/sso/` socket
+  directory, and `/var/log/sso/` for the audit log. Idempotent — safe to
+  re-run after an upgrade.
+* **`sso_admin.sh`** — guided, idempotent operator provisioning on top
+  of that bootstrap: `setup` installs the `/etc/` tmpfiles/udev/logrotate
+  snippets, `add-operator` creates a Unix account in `sso-ops` and drops
+  in an SSH key, and `verify` smoke-tests an account.
 
 ## Testing and validation
 
