@@ -35,6 +35,10 @@
         single-transaction flush lands every buffered row (issue #52 fix).
       - concurrent batch writers (flush per file) lose no rows and dedup
         correctly — the same exact-count oracle as the per-row path.
+      - register_tle does not leak a read snapshot: after registering a TLE
+        and a concurrent commit by another connection, a batch flush still
+        wins the write lock instead of failing with an immediate SQLITE_BUSY
+        (the true root cause of the issue #52 parallel-decode loss).
 
     Exit status: 0 = all tests passed, non-zero = failure.
 
@@ -877,6 +881,107 @@ static void test_batch_parallel_writers(void)
     snprintf(side, sizeof side, "%s-shm", path); unlink(side);
 }
 
+// ------------------------------------------------------------------
+// 16. register_tle must not leak a read snapshot. This is the real root
+//     cause of issue #52's parallel-decode loss. register_tle stepped its
+//     lookup SELECT to a row and returned WITHOUT resetting, so the
+//     connection's read transaction (WAL read mark) stayed open for the rest
+//     of the process. A later batch flush issues BEGIN IMMEDIATE, which must
+//     UPGRADE that stale snapshot; if any other process committed in the
+//     meantime, SQLite returns SQLITE_BUSY *immediately* -- the busy handler
+//     is bypassed for snapshot conflicts, so the 60 s busy_timeout never
+//     applies -- and the whole file's buffered rows are dropped. Every
+//     rx_replay registers the TLE at startup, so this hit nearly every
+//     parallel decode (and matched the original report exactly: --jobs 1
+//     worked, --jobs 4+ lost passes).
+//
+//     Reproduce deterministically, no threads: conn A registers a TLE (taking
+//     the snapshot in the buggy code), conn B commits a row to push the WAL
+//     HEAD past A's snapshot, then A flushes a batch. With the leak A's
+//     BEGIN IMMEDIATE upgrade returns BUSY and the batch is lost; with the
+//     reset A holds no snapshot, wins the lock, and stores the rows.
+//
+//     Two registration paths leak the same way and are tested independently:
+//     preseed=0 exercises the post-INSERT lookup (first registration),
+//     preseed=1 the "already exists" lookup (the steady-state hot path that
+//     every process after the first one takes). Mutation check: reverting
+//     either sqlite3_reset turns the matching case red.
+// ------------------------------------------------------------------
+
+static void snapshot_leak_case(int preseed, const char *label)
+{
+    char path[64];
+    if (make_tmp_db_path(path, sizeof path) != 0) {
+        tap_bail("mkstemp"); return;
+    }
+
+    const char *line1 = "1 25544U 98067A   24001.50000000  .00010000  00000-0  18000-3 0  9991";
+    const char *line2 = "2 25544  51.6400 100.0000 0007000 100.0000 260.0000 15.50000000999991";
+
+    // preseed: insert the TLE on a throwaway connection so A's registration
+    // takes the "already exists" lookup path instead of the post-INSERT one.
+    if (preseed) {
+        packet_db_t *s = packet_db_open(path);
+        if (!s) { tap_bail("open seed"); unlink(path); return; }
+        (void) packet_db_register_tle(s, "ISS", line1, line2);
+        packet_db_close(s);
+    }
+
+    packet_db_t *a = packet_db_open(path);
+    if (!a) { tap_bail("open A"); unlink(path); return; }
+    long long tid = packet_db_register_tle(a, "ISS", line1, line2);
+    tap_okf(tid > 0, "snapshot-leak[%s]: register_tle returned id=%lld",
+            label, tid);
+
+    // Conn B commits a row, advancing the WAL HEAD past A's snapshot, then
+    // releases the write lock (close) so the only thing that can fail A's
+    // flush is a stale snapshot, not live write contention.
+    packet_db_t *b = packet_db_open(path);
+    if (!b) { tap_bail("open B"); packet_db_close(a); unlink(path); return; }
+    uint8_t bpl[3] = { 0xDB, (uint8_t)preseed, 0x02 };
+    packet_db_record_t br = make_record(bpl, sizeof bpl, "snap-b");
+    tap_okf(packet_db_insert(b, &br) == 0,
+            "snapshot-leak[%s]: conn B committed a row (advances WAL HEAD)",
+            label);
+    packet_db_close(b);
+
+    // A flushes a batch. BEGIN IMMEDIATE must start a FRESH write
+    // transaction; a leaked read snapshot makes the upgrade fail with an
+    // immediate SQLITE_BUSY and the batch is silently lost (issue #52).
+    packet_db_set_batch(a, 1);
+    uint8_t apl[3] = { 0xDA, (uint8_t)preseed, 0x04 };
+    packet_db_record_t ar = make_record(apl, sizeof apl, "snap-a");
+    tap_okf(packet_db_insert(a, &ar) == 0,
+            "snapshot-leak[%s]: A buffered a row", label);
+    size_t pending = packet_db_batch_pending(a);
+    int frc = packet_db_flush(a);
+    tap_okf(frc == PACKET_DB_INSERT_OK,
+            "snapshot-leak[%s]: A's flush wins the lock after a concurrent "
+            "commit (got %d, %zu row%s)", label, frc, pending,
+            frc == PACKET_DB_INSERT_OK ? " stored" : " LOST");
+
+    packet_db_close(a);
+
+    // The row really landed -- rc alone could pass on a degenerate flush.
+    sqlite3 *raw = NULL;
+    sqlite3_open_v2(path, &raw, SQLITE_OPEN_READONLY, NULL);
+    long n = count_rows(raw,
+        "SELECT count(*) FROM packet WHERE source_tool='snap-a';");
+    tap_okf(n == 1, "snapshot-leak[%s]: A's row is stored (got %ld)", label, n);
+    sqlite3_close(raw);
+
+    unlink(path);
+    char side[80];
+    snprintf(side, sizeof side, "%s-wal", path); unlink(side);
+    snprintf(side, sizeof side, "%s-shm", path); unlink(side);
+}
+
+static void test_register_tle_no_snapshot_leak(void)
+{
+    snapshot_leak_case(0, "post-insert");
+    snapshot_leak_case(1, "already-exists");
+}
+
 int main(void)
 {
     test_open_fresh_creates_schema();
@@ -894,5 +999,6 @@ int main(void)
     test_insert_reports_failure();
     test_batch_buffers_until_flush();
     test_batch_parallel_writers();
+    test_register_tle_no_snapshot_leak();
     return tap_done();
 }

@@ -881,6 +881,16 @@ long long packet_db_register_tle(packet_db_t *db,
                       SQLITE_TRANSIENT);
     if (sqlite3_step(db->select_tle_id_stmt) == SQLITE_ROW) {
         long long id = sqlite3_column_int64(db->select_tle_id_stmt, 0);
+        // Reset before returning. A SELECT stepped to a row but never reset
+        // keeps its read transaction (and WAL read mark) open for the life of
+        // the connection. A later packet_db_flush would then try to upgrade
+        // that stale snapshot in BEGIN IMMEDIATE and, if any other process
+        // committed in the meantime, get SQLITE_BUSY *immediately* — the busy
+        // handler is bypassed for snapshot conflicts, so the 60 s timeout
+        // never applies — silently dropping the whole file's rows under
+        // parallel decode (issue #52). Every rx_replay registers the TLE at
+        // startup, so this is the common path, not a corner case.
+        sqlite3_reset(db->select_tle_id_stmt);
         return id;
     }
 
@@ -928,7 +938,11 @@ long long packet_db_register_tle(packet_db_t *db,
     sqlite3_bind_blob(db->select_tle_id_stmt, 1, sha, sizeof sha,
                       SQLITE_TRANSIENT);
     if (sqlite3_step(db->select_tle_id_stmt) == SQLITE_ROW) {
-        return sqlite3_column_int64(db->select_tle_id_stmt, 0);
+        long long id = sqlite3_column_int64(db->select_tle_id_stmt, 0);
+        // Same reset-before-return discipline as the lookup above: don't
+        // leave a read snapshot open for the rest of the process (issue #52).
+        sqlite3_reset(db->select_tle_id_stmt);
+        return id;
     }
     return 0;
 }
