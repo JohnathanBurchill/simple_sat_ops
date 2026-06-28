@@ -262,6 +262,20 @@ static int cmp_msg_asc(const void *a, const void *b)
     return strcmp(((const outmsg_t *)a)->ts, ((const outmsg_t *)b)->ts);
 }
 
+// Append a recovered log to the block buffer with any byte that isn't
+// printable ASCII replaced by '.'. The reassembled fragments can carry RF
+// bit errors -- a stray ESC (0x1b) or other control byte would otherwise be
+// taken as an escape sequence and garble the operator's terminal, which is
+// most visible with --full (it prints the whole log instead of a snippet).
+static void append_clean(char *block, int *off, int cap, const char *src, int n)
+{
+    for (int i = 0; i < n && *off < cap - 1; ++i) {
+        unsigned char c = (unsigned char)src[i];
+        block[(*off)++] = (c >= 0x20 && c <= 0x7e) ? (char)c : '.';
+    }
+    block[*off] = '\0';
+}
+
 // Process one reception: detect a GNSS response, verify the CRC, update the
 // tally, and (unless --summary) collect a formatted block for sorted output.
 // Returns 1 if it was a GNSS response, else 0.
@@ -357,11 +371,18 @@ static int process(const gnss_frag_t *frags, int n, const args_t *a,
                 b.num_sol_sv, b.num_sv);
     }
 
-    // The recovered log itself.
+    // The recovered log itself, sanitised so corrupted bytes can't garble
+    // the terminal (see append_clean).
     if (ls < le && le <= region) {
         int snip = le - ls;
-        if (a->full || snip <= 96) APP("    %.*s\n", snip, msg + ls);
-        else APP("    %.*s ...\n", 80, msg + ls);
+        APP("    ");
+        if (a->full || snip <= 96) {
+            append_clean(block, &off, sizeof block, msg + ls, snip);
+            APP("\n");
+        } else {
+            append_clean(block, &off, sizeof block, msg + ls, 80);
+            APP(" ...\n");
+        }
     }
     APP("\n");
     #undef APP
