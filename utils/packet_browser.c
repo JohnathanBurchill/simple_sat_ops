@@ -27,8 +27,8 @@
                        same-run log/bulk_file packets that follow); Esc /
                        Left / Backspace step back
       r                reload now (auto-poll happens every ~1 s anyway)
-      t                cycle type filter: all → beacon → tcmd_response →
-                       log → bulk_file → all
+      t / T            cycle type filter: all → beacon → tcmd_response →
+                       log → bulk_file → all (T cycles the other way)
       o                cycle origin filter: all → cts_ground → satnogs → all
       e                toggle hiding erroneous decodes (RS-uncorrectable,
                        HMAC mismatch, or CRC failure) from the list
@@ -2075,8 +2075,8 @@ static int parse_args(pbr_args_t *a, int argc, char **argv, int help)
                "                   Enter saves from either mode.\n"
                "    Esc / q        back to the list\n"
                "  r                reload (rebuilds the group when one is open)\n"
-               "  t                cycle type filter (all -> beacon -> tcmd_response\n"
-               "                   -> log -> bulk_file -> all)\n"
+               "  t / T            cycle type filter (all -> beacon -> tcmd_response\n"
+               "                   -> log -> bulk_file -> all; T cycles backward)\n"
                "  o                cycle capture-origin filter (all -> cts_ground\n"
                "                   -> satnogs -> all)\n"
                "  /                start a search. Substring-matches the\n"
@@ -2363,6 +2363,13 @@ int main(int argc, char **argv)
                 // sub-view deliberately ignores filters.
                 if (in_group) break;
                 type_idx = (type_idx + 1) % TYPE_CYCLE_N;
+                run_query(db);
+                last_query = monotonic_seconds();
+                break;
+            case 'T':
+                // Same type-filter cycle as 't', but the other way round.
+                if (in_group) break;
+                type_idx = (type_idx + TYPE_CYCLE_N - 1) % TYPE_CYCLE_N;
                 run_query(db);
                 last_query = monotonic_seconds();
                 break;
