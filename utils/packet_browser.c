@@ -248,6 +248,16 @@ static int starts_with(const char *s, const char *prefix)
     return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
+// For a satnogs capture the observation id is the last path component of
+// session_dir — satnogs_pull lays out <archive>/<obs-id>/satnogs_<obs-id>_*.
+// Returns "" when session_dir is empty.
+static const char *satnogs_obs_id(const char *session_dir)
+{
+    if (session_dir == NULL || session_dir[0] == '\0') return "";
+    const char *slash = strrchr(session_dir, '/');
+    return slash ? slash + 1 : session_dir;
+}
+
 // Minimal JSON helpers — good enough for the flat top-level fields
 // of a SatNOGS observation detail JSON (station_lat, station_lng,
 // station_alt, station_name, ground_station). Naive strstr matching
@@ -1804,10 +1814,17 @@ static void draw_detail(int top_y, int height, int cols)
     char head[512];
     char ts_disp[40];
     format_ts(r->ts, show_local_time, ts_disp, sizeof ts_disp);
+    // SatNOGS observation id (when applicable) goes right after origin so a
+    // narrow terminal truncates the run id rather than this.
+    char obs_field[40] = "";
+    if (strcmp(r->origin, "satnogs") == 0) {
+        const char *obs = satnogs_obs_id(r->session_dir);
+        if (obs[0]) snprintf(obs_field, sizeof obs_field, "  obs=%s", obs);
+    }
     snprintf(head, sizeof head,
-             "id=%lld  ts=%s  type=%s  tool=%s  origin=%s  run=%s",
+             "id=%lld  ts=%s  type=%s  tool=%s  origin=%s%s  run=%s",
              (long long)r->id, ts_disp, r->type_name, r->tool,
-             r->origin[0] ? r->origin : "-", r->run);
+             r->origin[0] ? r->origin : "-", obs_field, r->run);
     move(y, 0); clrtoeol();
     if (g_have_color) attron(A_BOLD);
     mvaddnstr(y, 2, head, cols - 2);
@@ -1865,12 +1882,10 @@ static void draw_detail(int top_y, int height, int cols)
                      g_station_cache_lat, g_station_cache_lng,
                      (int)g_station_cache_alt);
         } else {
-            const char *obs_id = r->session_dir[0]
-                ? strrchr(r->session_dir, '/') : NULL;
-            obs_id = obs_id ? obs_id + 1
-                            : (r->session_dir[0] ? r->session_dir : "?");
+            const char *obs_id = satnogs_obs_id(r->session_dir);
             snprintf(st, sizeof st,
-                     "station: (no meta.json for obs %.64s)", obs_id);
+                     "station: (no meta.json for obs %.64s)",
+                     obs_id[0] ? obs_id : "?");
         }
         move(y, 0); clrtoeol();
         mvaddnstr(y, 2, st, cols - 2);
