@@ -332,6 +332,14 @@ add_executable(gnss_frag_selftest
 target_include_directories(gnss_frag_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS gnss_frag_selftest)
 
+# Boom-camera JPEG decode self-test: sentence parsing, gap/partial recovery,
+# retransmit dedup, out-of-order placement (shared by cam_reconstruct and
+# packet_browser's "save camera JPEG").
+add_executable(cam_jpeg_selftest
+               unit_tests/cam_jpeg_selftest.c utils/cam_jpeg.c)
+target_include_directories(cam_jpeg_selftest PRIVATE ${UNIT_TESTS_INCLUDE} utils)
+list(APPEND SSO_TARGETS cam_jpeg_selftest)
+
 # ADCS magnetometer helper self-test: the JSON field-vector parse (the
 # measured and IGRF-model fields share a shape), the |B| magnitude, the
 # TLE-epoch -> unix-ms conversion, and the closest-epoch search -- the pure
@@ -425,6 +433,13 @@ add_executable(beacon_detect utils/beacon_detect.c utils/wav_read.c
                src/dsp/biquad.c src/dsp/monitor_squelch.c)
 target_link_libraries(beacon_detect PRIVATE m)
 list(APPEND SSO_TARGETS beacon_detect)
+
+# Boom-camera JPEG reconstructor: parses the START_CAM sentence stream out of a
+# downloaded camera file, rebuilds the JPEG (best effort across lost packets),
+# and lists the file ranges to re-download. The sentence-decode core in
+# cam_jpeg.c is shared with packet_browser. Standalone -- C library only.
+add_executable(cam_reconstruct utils/cam_reconstruct.c utils/cam_jpeg.c)
+list(APPEND SSO_TARGETS cam_reconstruct)
 
 # Shared FFT / dB / detrend / notch / zoom pipeline. Used by both the
 # CLI waterfall renderer (gen_waterfall) and the interactive annotator
@@ -817,7 +832,7 @@ if (OPENSSL_FOUND)
 
     # Curses TUI sibling of packet_query.
     if (NCURSES_FOUND)
-        add_executable(packet_browser utils/packet_browser.c
+        add_executable(packet_browser utils/packet_browser.c utils/cam_jpeg.c
                        src/ui/ui_textfield.c)
         target_compile_definitions(packet_browser PRIVATE
             PACKET_BROWSER_HAVE_NCURSES)

@@ -58,6 +58,7 @@
 
 #include "argparse.h"
 #include "browser_timefmt.h"
+#include "cam_jpeg.h"
 #include "packet_db.h"
 #include "sso_paths.h"
 #include "tcmd_response.h"
@@ -201,7 +202,9 @@ static const char *PV_NAME[] = { "hex", "ascii", "base64" };
 // the same hex/ascii/base64 toggle (`v`); any byte no packet supplied is
 // '?'. It's an overlay — the underlying list/group view and its scroll are
 // left untouched, so leaving returns exactly where you were. `e` exports
-// the reconstructed bytes to disk via a small vim-modal filename prompt.
+// the reconstructed bytes to disk via a small vim-modal filename prompt. When
+// the reassembled bulk_file is a boom-camera image (it starts with
+// "START_CAM:"), `c` decodes the JPEG it carries and saves it.
 enum { RECON_BULK = 0, RECON_TCMD };
 #define RECON_MAX_BYTES (16 * 1024 * 1024)
 static int      in_recon = 0;
@@ -215,6 +218,8 @@ static int      recon_chunks = 0;       // packets reassembled
 static char     recon_title[200] = "";  // shown in the view's top bar
 static char     recon_name[256] = "";   // auto filename offered by `e`
 static char     recon_status[200] = ""; // export result, shown in the footer
+static int      recon_is_cam = 0;       // reassembled bulk_file is a START_CAM image
+static char     recon_cam_name[256] = ""; // auto JPEG filename offered by `c`
 
 static int     g_have_color = 0;
 // draw_detail adds a "station: ..." line for satnogs rows, pulling the
@@ -901,15 +906,18 @@ static long bulk_offset(const uint8_t *pl)
          | ((long) pl[3] << 16) | ((long) pl[4] << 24);
 }
 
-// Reassemble ONE bulk_file download from the selected chunk. A single run can
-// hold more than one download (a second file, or the same file fetched again),
-// so we don't merge every bulk_file chunk in the run. Instead we scope the
-// reconstruction to the one contiguous download "burst" the selected chunk
-// belongs to: starting from it, we walk outward in time and keep a neighbour
-// only while the gap between the two is consistent with the firmware streaming
-// the chunks between their file_offsets at 9600 baud (the DOWNLINK_* model
-// above), within a generous margin. A burst from a different download sits
-// minutes away, outside the window.
+// Reassemble ONE bulk_file download from the selected chunk. The unit of a
+// download is a contiguous "burst" in TIME, not a source_run: parallel decoders
+// split one RF pass into several runs, each catching a different subset of the
+// same chunks (and a run may also hold a second, separate download). So we scope
+// by the burst the selected chunk belongs to and ignore which run decoded each
+// chunk -- otherwise the gaps one run dropped show as holes even though a
+// sibling run caught them. Starting from the selected chunk we walk outward in
+// time over EVERY bulk_file packet and keep a neighbour only while the gap
+// between the two is consistent with the firmware streaming the chunks between
+// their file_offsets at 9600 baud (the DOWNLINK_* model above), within a
+// generous margin. A different download -- another pass, or a second file after
+// the command/response gap -- sits outside the window.
 //
 // Within the window, chunks are placed by file_offset (they arrive out of
 // order and get retransmitted, so arrival order can't define file boundaries).
@@ -921,20 +929,22 @@ static void recon_build_bulk(sqlite3 *db)
     recon_free();
     recon_kind = RECON_BULK;
     recon_status[0] = '\0';
+    recon_is_cam = 0;
     if (rows[sel].payload == NULL) return;
     sqlite3_int64 anchor_id = rows[sel].id;
 
     // Pass A: load (reception time, file_offset) for every bulk_file chunk in
-    // the run and find the selected one, so we can bound the burst it's in.
+    // the DB (across all runs) and find the selected one, so we can bound the
+    // burst it's in by time. Run boundaries are deliberately ignored here -- see
+    // the function comment: parallel decoders scatter one download over runs.
     typedef struct { double ts_ms; long off; } bchunk_t;
     bchunk_t *cs = NULL;
     int n = 0, cap = 0, anchor = -1;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
             "SELECT id, (julianday(ts_received) - 2440587.5) * 86400000.0, payload "
-            "FROM packet WHERE packet_type=16 AND source_run=?1 "
+            "FROM packet WHERE packet_type=16 "
             "ORDER BY ts_received, id", -1, &st, NULL) != SQLITE_OK) return;
-    sqlite3_bind_text(st, 1, rows[sel].run, -1, SQLITE_TRANSIENT);
     while (sqlite3_step(st) == SQLITE_ROW) {
         const uint8_t *pl = (const uint8_t *) sqlite3_column_blob(st, 2);
         int pl_len = sqlite3_column_bytes(st, 2);
@@ -984,7 +994,7 @@ static void recon_build_bulk(sqlite3 *db)
         }
     }
     double t_lo = cs[lo].ts_ms, t_hi = cs[hi].ts_ms;
-    int total_in_run = n;
+    int total_in_window = hi - lo + 1;
     free(cs);
 
     // The telecommand that most likely triggered this burst: the latest one
@@ -1005,18 +1015,18 @@ static void recon_build_bulk(sqlite3 *db)
         }
     }
 
-    // Pass B: size the buffer, then place the chunks -- but only those inside
-    // the burst window [t_lo, t_hi] (widened 1 ms so the edge chunks match).
+    // Pass B: size the buffer, then place the chunks -- every bulk_file packet
+    // inside the burst window [t_lo, t_hi] (widened 1 ms so the edge chunks
+    // match), regardless of which run decoded it.
     const char *sql =
         "SELECT payload, rs_errs FROM packet "
-        "WHERE packet_type=16 AND source_run=?1 "
-        "AND (julianday(ts_received) - 2440587.5) * 86400000.0 BETWEEN ?2 AND ?3 "
+        "WHERE packet_type=16 "
+        "AND (julianday(ts_received) - 2440587.5) * 86400000.0 BETWEEN ?1 AND ?2 "
         "ORDER BY ts_received, id";
     st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return;
-    sqlite3_bind_text(st, 1, rows[sel].run, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_double(st, 2, t_lo - 1.0);
-    sqlite3_bind_double(st, 3, t_hi + 1.0);
+    sqlite3_bind_double(st, 1, t_lo - 1.0);
+    sqlite3_bind_double(st, 2, t_hi + 1.0);
 
     long size = 0;
     while (sqlite3_step(st) == SQLITE_ROW) {
@@ -1062,17 +1072,16 @@ static void recon_build_bulk(sqlite3 *db)
     recon_chunks = chunks;
     recon_count_gaps();
 
-    // Per-file completeness in bytes (exact), not a chunk ratio: "16/45" read
-    // as "16 of this file's 45 chunks", but 45 was every bulk_file packet in
-    // the run across all downloads. Report bytes present out of the file's
-    // reconstructed span, the packets used, and -- separately -- how many
-    // other bulk_file packets sit in the run (other downloads).
+    // Per-file completeness in bytes (exact), not a chunk ratio. Report bytes
+    // present out of the file's reconstructed span, the packets used (summed
+    // across every run that decoded part of this burst), and -- separately --
+    // any bulk_file packets in the window that didn't land in the file.
     long present = recon_len - recon_gap_bytes;
-    int other_in_run = total_in_run - chunks;
+    int other_in_window = total_in_window - chunks;
     char extra[96] = "";
-    if (other_in_run > 0)
+    if (other_in_window > 0)
         snprintf(extra + strlen(extra), sizeof extra - strlen(extra),
-                 "  (%d more bulk_file in run)", other_in_run);
+                 "  (%d more bulk_file in window)", other_in_window);
     if (trigger_ts >= 0)
         snprintf(extra + strlen(extra), sizeof extra - strlen(extra),
                  "  +%.0fs after cmd", (t_lo - trigger_ts) / 1000.0);
@@ -1081,8 +1090,39 @@ static void recon_build_bulk(sqlite3 *db)
              rows[sel].run, min_off, recon_len, present, recon_len,
              chunks, chunks == 1 ? "" : "s",
              (t_hi - t_lo) / 1000.0, extra);
-    snprintf(recon_name, sizeof recon_name,
-             "bulkfile_%.16s_%ld-%ld.bin", rows[sel].run, min_off, recon_len);
+    // A reception date/time for the export filenames, pulled from the anchor
+    // chunk's ISO ts_received ("2026-06-27T17:14:41.417Z" -> "20260627_171441").
+    // The bulk download now merges across parallel-decode runs, so the anchor
+    // row's source_run no longer identifies the file -- a date is the meaningful
+    // label, with the run hash kept only as a fallback when the ts is unusable.
+    char dstamp[16] = "";   // "YYYYMMDD_HHMMSS", or "" if the ts has < 14 digits
+    {
+        char d[15] = "";    // the 14 digits YYYYMMDDHHMMSS
+        int n = 0;
+        for (const char *s = rows[sel].ts; *s && n < 14; s++)
+            if (*s >= '0' && *s <= '9') d[n++] = *s;
+        if (n >= 14)
+            snprintf(dstamp, sizeof dstamp, "%.8s_%.6s", d, d + 8);
+    }
+    if (dstamp[0])
+        snprintf(recon_name, sizeof recon_name,
+                 "bulkfile_%s_%ld-%ld.bin", dstamp, min_off, recon_len);
+    else
+        snprintf(recon_name, sizeof recon_name,
+                 "bulkfile_%.16s_%ld-%ld.bin", rows[sel].run, min_off, recon_len);
+
+    // A boom-camera capture is a file that starts with "START_CAM:" and carries
+    // a JPEG as hex camera sentences; offer `c` to decode and save it. Name it
+    // from the same reception time: fs_boomcam_YYYYMMDD_HHMMSS.jpg.
+    recon_is_cam = cam_jpeg_is_camera_file(recon_buf, recon_len);
+    recon_cam_name[0] = '\0';
+    if (recon_is_cam) {
+        if (dstamp[0])
+            snprintf(recon_cam_name, sizeof recon_cam_name,
+                     "fs_boomcam_%s.jpg", dstamp);
+        else
+            snprintf(recon_cam_name, sizeof recon_cam_name, "fs_boomcam.jpg");
+    }
 }
 
 // Reassemble a multi-packet tcmd_response. All fragments of one response
@@ -1093,6 +1133,7 @@ static void recon_build_tcmd(sqlite3 *db)
     recon_free();
     recon_kind = RECON_TCMD;
     recon_status[0] = '\0';
+    recon_is_cam = 0;
     if (rows[sel].payload == NULL || rows[sel].payload_len < TCMD_RESP_HDR_LEN)
         return;
     uint8_t key[8];
@@ -1659,8 +1700,9 @@ static void draw_recon(int rows_total, int cols)
         snprintf(fb, sizeof fb, " %s", recon_status);
     } else {
         snprintf(fb, sizeof fb,
-                 " v:view  e:export  j/k PgUp/PgDn g/G:scroll  Esc:back"
+                 " v:view  e:export %s j/k PgUp/PgDn g/G:scroll  Esc:back"
                  "   (%ld gap byte%s)",
+                 recon_is_cam ? " c:save-jpg " : "",
                  recon_gap_bytes, recon_gap_bytes == 1 ? "" : "s");
     }
     if (g_have_color) attron(COLOR_PAIR(PAIR_BAR)); else attron(A_REVERSE);
@@ -1694,6 +1736,47 @@ static int recon_export(const char *path)
     snprintf(recon_status, sizeof recon_status,
              "exported %ld bytes to %s%s", recon_len, path,
              recon_gap_bytes ? "  (gaps written as '?')" : "");
+    return 0;
+}
+
+// Decode the JPEG out of a reassembled boom-camera file and write it to `path`.
+// Gaps from lost packets are left at 0x00 so the image stays byte-aligned for a
+// tolerant decoder. Records the outcome in recon_status. Returns 0 on success.
+static int recon_save_cam_jpeg(const char *path)
+{
+    if (recon_buf == NULL || recon_len <= 0) {
+        snprintf(recon_status, sizeof recon_status, "nothing to decode");
+        return -1;
+    }
+    cam_jpeg_stats_t st = {0};
+    long jlen = 0;
+    uint8_t *jpg = cam_jpeg_decode(recon_buf, recon_len, 0x00, &st, &jlen);
+    if (jpg == NULL) {
+        snprintf(recon_status, sizeof recon_status,
+                 "no camera sentences found -- not a boom-camera file?");
+        return -1;
+    }
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) {
+        snprintf(recon_status, sizeof recon_status,
+                 "save failed: %s: %s", path, strerror(errno));
+        free(jpg);
+        return -1;
+    }
+    size_t wrote = fwrite(jpg, 1, (size_t) jlen, f);
+    int ok = (wrote == (size_t) jlen);
+    if (fclose(f) != 0) ok = 0;
+    free(jpg);
+    if (!ok) {
+        snprintf(recon_status, sizeof recon_status,
+                 "save failed: short write to %s", path);
+        return -1;
+    }
+    double pct = st.image_bytes ? 100.0 * (double) st.recovered_bytes
+                                       / (double) st.image_bytes : 0.0;
+    snprintf(recon_status, sizeof recon_status,
+             "saved JPEG %ld bytes to %s  (%ld/%ld sentences, %.0f%% recovered)",
+             jlen, path, st.sentences_present, st.n_sentences, pct);
     return 0;
 }
 
@@ -2091,6 +2174,10 @@ static int parse_args(pbr_args_t *a, int argc, char **argv, int help)
                "                   vim-modal prompt offers an editable name: i/a to\n"
                "                   edit, Esc to leave insert (then Esc to cancel),\n"
                "                   Enter saves from either mode.\n"
+               "    c              boom-camera files only (those starting with\n"
+               "                   START_CAM): decode the JPEG they carry and save it\n"
+               "                   (offered as fs_boomcam_<date>_<time>.jpg). Lost\n"
+               "                   packets leave gaps a tolerant viewer skips past.\n"
                "    Esc / q        back to the list\n"
                "  r                reload (rebuilds the group when one is open)\n"
                "  t / T            cycle type filter (all -> beacon -> tcmd_response\n"
@@ -2230,7 +2317,7 @@ int main(int argc, char **argv)
             int bpr  = recon_bpr(cols);
             int page = (body_h - 1 > 0) ? body_h - 1 : 1;
             int half = (body_h / 2 > 0) ? body_h / 2 : 1;
-            if (ch != 'e') recon_status[0] = '\0';
+            if (ch != 'e' && ch != 'c') recon_status[0] = '\0';
             switch (ch) {
             case 'q': case 27: case KEY_LEFT: case KEY_BACKSPACE:
             case 127: case 8: case 'h':   leave_recon();                  break;
@@ -2267,6 +2354,20 @@ int main(int argc, char **argv)
                 if (prompt_export_filename(rows_total, cols, nm, sizeof nm)
                     && nm[0] != '\0')
                     recon_export(nm);
+                break;
+            }
+            case 'c': {
+                // Decode + save the JPEG carried by a boom-camera bulk_file.
+                if (!recon_is_cam) {
+                    snprintf(recon_status, sizeof recon_status,
+                             "not a boom-camera file (no START_CAM header)");
+                    break;
+                }
+                char nm[256];
+                snprintf(nm, sizeof nm, "%s", recon_cam_name);
+                if (prompt_export_filename(rows_total, cols, nm, sizeof nm)
+                    && nm[0] != '\0')
+                    recon_save_cam_jpeg(nm);
                 break;
             }
             default: break;
