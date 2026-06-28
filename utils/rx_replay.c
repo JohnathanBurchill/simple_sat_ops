@@ -877,13 +877,12 @@ static int rx_emit_decoded(rx_emit_ctx_t *ctx,
 #ifdef WITH_SGP4SDP4
     if (ctx->have_pred && ctx->have_start_utc && ctx->pred != NULL) {
         double abs_t = ctx->start_utc_seconds + t_sec;
-        time_t epoch = (time_t)abs_t;
-        struct tm utc;
-        gmtime_r(&epoch, &utc);
-        struct timeval tv;
-        tv.tv_sec = epoch;
-        tv.tv_usec = (long)((abs_t - epoch) * 1e6);
-        double jul_utc = Julian_Date(&utc, &tv);
+        // Unix seconds -> Julian Date. Must NOT go through gmtime_r() +
+        // Julian_Date(): sgp4sdp4 wants a non-POSIX struct tm, so that path
+        // computed a JD ~1900 years off and SGP4 returned a ~1e19 km range
+        // the geometry sanity gate dropped, losing every replayed pass's
+        // az/el/range (issue #53).
+        double jul_utc = julian_date_from_unix_seconds(abs_t);
         update_satellite_position(ctx->pred, jul_utc);
         az_deg = ctx->pred->satellite_ephem.azimuth;
         el_deg = ctx->pred->satellite_ephem.elevation;

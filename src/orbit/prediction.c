@@ -173,6 +173,12 @@ static int read_tle_line(char *buf, size_t size, FILE *f)
     return 1;
 }
 
+double julian_date_from_unix_seconds(double unix_seconds)
+{
+    // JD 2440587.5 == 1970-01-01T00:00:00Z (the Unix epoch); 86400 s/day.
+    return 2440587.5 + unix_seconds / 86400.0;
+}
+
 void update_satellite_position(prediction_t *prediction, double jul_utc)
 {
     // OEM-backed trajectory: interpolate ITRF state and derive az/el

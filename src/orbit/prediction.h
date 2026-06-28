@@ -83,6 +83,18 @@ typedef struct prediction
 #define RAO_LONGITUDE -114.2910 // Longitude in degrees
 #define RAO_ALTITUDE  1279.0   // Altitude in meters
 
+// Convert Unix epoch seconds (UTC) to a Julian Date for the SGP4/SDP4
+// propagator. JD 2440587.5 is the Unix epoch (1970-01-01T00:00:00Z); there
+// are 86400 seconds per day, and sub-second precision is preserved.
+//
+// Use this to turn a wall-clock time into the jul_utc argument of
+// update_satellite_position(). Do NOT build a struct tm with gmtime_r() and
+// pass it to sgp4sdp4's Julian_Date(): that function expects a non-POSIX
+// struct tm (full year in tm_year, 1-based tm_mon), so a POSIX struct tm
+// yields a JD ~1900 years off, and SGP4 then returns a garbage ~1e19 km
+// range (issue #53).
+double julian_date_from_unix_seconds(double unix_seconds);
+
 void update_satellite_position(prediction_t *state, double jul_utc);
 void update_pass_predictions(prediction_t *external_state, double jul_utc_start, double delta_t_minutes);
 void minutes_until_visible(prediction_t *external_state, double jul_utc_start, double jul_utc_stop, double delta_t_minutes);

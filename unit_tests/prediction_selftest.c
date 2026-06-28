@@ -3,6 +3,10 @@
     Simple Satellite Operations  unit_tests/prediction_selftest.c
 
     Tests for prediction.c:
+      - julian_date_from_unix_seconds: known JD anchors, and the issue #53
+        regression -- it must differ from the old gmtime_r()+Julian_Date()
+        path (which was ~1900 years off) and yield a sane SGP4 range where
+        the buggy path yields garbage.
       - tle_default_path: HOME-relative path expansion.
       - load_tle: known-hit, known-miss, and TLE name-match behaviour
         against a synthetic 3-line TLE fixture.
@@ -53,6 +57,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <sgp4sdp4.h>
@@ -537,6 +543,78 @@ static void test_pass_search_api(const char *tles_path)
     check(get_pass(0) == NULL, "get_pass(0) is NULL after free_passes");
 }
 
+// -------------------------------------------- julian_date_from_unix_seconds
+//
+// rx_replay turns a capture's wall-clock time into the jul_utc it feeds
+// update_satellite_position(). It used to do that with gmtime_r() +
+// sgp4sdp4's Julian_Date() -- but Julian_Date() expects a non-POSIX struct
+// tm (full year in tm_year, 1-based tm_mon), while gmtime_r() fills the POSIX
+// convention (tm_year = year - 1900). So Julian_Date() read 2026 as year 126:
+// the JD was ~1900 years off, SGP4 propagated ~1e9 minutes past epoch, and
+// returned a ~1e19 km range that the geometry gate dropped -- every replayed
+// SatNOGS pass lost az/el/range (issue #53).
+//
+// Pin the helper against known anchors, against the exact buggy path (so a
+// revert to gmtime_r is caught), and tie the JD error to the geometry symptom:
+// AO-7 at the correct JD gives a sane LEO range; at the buggy JD, garbage.
+static void test_julian_date_from_unix_seconds(const char *tles_path)
+{
+    fprintf(stderr, "julian_date_from_unix_seconds (issue #53):\n");
+
+    // Anchors: the Unix epoch is JD 2440587.5; one day later is +1.0.
+    check(fabs(julian_date_from_unix_seconds(0.0) - 2440587.5) < 1e-9,
+          "unix 0 -> JD 2440587.5");
+    check(fabs(julian_date_from_unix_seconds(86400.0) - 2440588.5) < 1e-9,
+          "unix +86400 s -> JD +1.0 day");
+    check(fabs(julian_date_from_unix_seconds(0.5) - (2440587.5 + 0.5 / 86400.0)) < 1e-12,
+          "fractional seconds preserved");
+
+    // Load AO-7 and choose a Unix time exactly at its TLE epoch, so a correct
+    // JD propagates to near-epoch (a sane LEO state).
+    prediction_t pred;
+    char name[64];
+    snprintf(name, sizeof name, "OSCAR 7");
+    init_pred(&pred, tles_path, name);
+    if (load_tle(&pred) != 0) { check(0, "load_tle preflight succeeded"); return; }
+    prep_propagator(&pred);
+    double jul_epoch = Julian_Date_of_Epoch(pred.satellite_ephem.tle.epoch);
+    double unix_at_epoch = (jul_epoch - 2440587.5) * 86400.0;
+
+    // The helper round-trips back to the epoch JD.
+    double jd_good = julian_date_from_unix_seconds(unix_at_epoch);
+    check(fabs(jd_good - jul_epoch) < 1e-6,
+          "helper(unix_at_epoch) == jul_epoch (round-trip)");
+
+    // The OLD buggy path: a POSIX struct tm fed to sgp4sdp4's Julian_Date.
+    time_t t = (time_t)unix_at_epoch;
+    struct tm posix_tm;
+    gmtime_r(&t, &posix_tm);
+    struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+    double jd_bug = Julian_Date(&posix_tm, &tv);
+    // tm_year (year - 1900) read as a full year -> off by ~1900 years.
+    check(fabs(jd_good - jd_bug) > 600000.0,
+          "buggy gmtime_r+Julian_Date path is ~1900 years (>600000 days) off");
+
+    // Geometry: the correct JD gives a sane LEO slant range; the buggy JD
+    // (~1900 yr of bogus propagation) gives a materially different, wrong one.
+    // For high-drag objects (e.g. FrontierSat) that wrong range is ~1e19 km
+    // and the geometry gate NULLs it -- the visible #53 symptom; for low-drag
+    // AO-7 it stays finite but is still hundreds of km off. The robust, drag-
+    // independent invariant is "different from the correct range".
+    update_satellite_position(&pred, jd_good);
+    double range_good = pred.satellite_ephem.range_km;
+    update_satellite_position(&pred, jd_bug);
+    double range_bug = pred.satellite_ephem.range_km;
+
+    check(isfinite(range_good) && range_good > 100.0 && range_good < 1.0e5,
+          "range at correct JD is a sane LEO slant range (100..1e5 km)");
+    check(!isfinite(range_bug) || fabs(range_bug - range_good) > 100.0,
+          "range at buggy JD is materially wrong (geometry corrupted)");
+
+    fprintf(stderr, "    range: correct JD %.1f km, buggy JD %.3e km\n",
+            range_good, range_bug);
+}
+
 int main(void)
 {
     test_tle_default_path();
@@ -550,6 +628,7 @@ int main(void)
     test_load_tle_hit(tles_path);
     test_load_tle_miss(tles_path);
     test_load_tle_bad_path();
+    test_julian_date_from_unix_seconds(tles_path);
     test_update_satellite_position(tles_path);
     test_update_satellite_position_deep_space(tles_path);
     test_update_pass_predictions(tles_path);
