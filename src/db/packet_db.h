@@ -135,6 +135,37 @@ packet_db_t *packet_db_open(const char *path);
 // lost — retry), or PACKET_DB_INSERT_ERROR (-1) on any other DB error.
 int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec);
 
+// Batch mode. When enabled, packet_db_insert buffers each row in memory
+// (a deep copy of the record) instead of writing it, and packet_db_flush
+// writes the whole buffer in a SINGLE transaction. This collapses one
+// write-lock acquisition per row into one per flush — the fix for the
+// parallel-decode WAL contention that silently dropped whole passes
+// (issue #52): N decoders each firing a burst of single-row commits
+// serialise on SQLite's one-writer rule and the late ones time out.
+//
+// Enabling batch mode does NOT hold the write lock — rows sit in process
+// memory until flush, so concurrent writers and a live capture run
+// unblocked during the (often multi-second) decode. Intended for the
+// offline/replay path; the live receiver leaves it off so each packet is
+// visible to readers as it arrives. Single inserting thread only.
+void packet_db_set_batch(packet_db_t *db, int enabled);
+
+// Flush all buffered rows (batch mode) in one transaction. Returns
+// PACKET_DB_INSERT_OK (0) when every buffered row was stored or deduped,
+// PACKET_DB_INSERT_BUSY (-2) if the write lock couldn't be won within the
+// busy timeout, or PACKET_DB_INSERT_ERROR (-1) on any other DB error. The
+// flush is ALL-OR-NOTHING: on a non-OK return the transaction is rolled
+// back and none of the rows are stored, so the caller should treat the
+// whole batch as not-yet-stored and retry (e.g. re-decode the file). The
+// buffer is emptied either way. A no-op returning 0 when batch mode is off,
+// nothing is buffered, or no DB is configured.
+int packet_db_flush(packet_db_t *db);
+
+// Number of rows currently buffered (batch mode) and not yet flushed. Lets
+// a caller report how many rows a failed flush lost (grab it before the
+// flush call). 0 in non-batch mode, after a flush, or with no DB.
+size_t packet_db_batch_pending(packet_db_t *db);
+
 // Insert one transmitted-telecommand row. Silently ignores duplicates
 // (same ts_sent_ms + source_run) so a repeated burst of the same command
 // in one pass records a single row. Returns 0 on success or silent dedup,

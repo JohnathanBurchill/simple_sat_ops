@@ -30,6 +30,11 @@
       - close() on NULL is a no-op.
       - a failed insert reports a negative return (never 0), so a dropped
         row can't masquerade as success (issue #52 silent-loss contract).
+      - batch mode buffers rows in memory until packet_db_flush: nothing is
+        written before the flush, batch_pending tracks the count, and the
+        single-transaction flush lands every buffered row (issue #52 fix).
+      - concurrent batch writers (flush per file) lose no rows and dedup
+        correctly — the same exact-count oracle as the per-row path.
 
     Exit status: 0 = all tests passed, non-zero = failure.
 
@@ -690,6 +695,188 @@ static void test_insert_reports_failure(void)
     snprintf(side, sizeof side, "%s-shm", path); unlink(side);
 }
 
+// ------------------------------------------------------------------
+// 14. Batch mode buffers until flush, then writes the whole file in one
+//     transaction. This is the issue #52 fix: collapse one write-lock
+//     acquisition per row into one per file so parallel decoders stop
+//     dropping rows on contention. Oracle: nothing is in the DB before
+//     flush (a second connection sees 0 rows), batch_pending tracks the
+//     buffered count, and after flush every row is present. A mutation
+//     that writes immediately (batch ignored) trips the pre-flush 0-rows
+//     check; one that skips the write trips the post-flush count.
+// ------------------------------------------------------------------
+
+static void test_batch_buffers_until_flush(void)
+{
+    char path[64];
+    if (make_tmp_db_path(path, sizeof path) != 0) {
+        tap_bail("mkstemp"); return;
+    }
+    packet_db_t *db = packet_db_open(path);
+    if (!db) { tap_bail("open"); unlink(path); return; }
+
+    packet_db_set_batch(db, 1);
+
+    enum { N = 5 };
+    for (int i = 0; i < N; ++i) {
+        uint8_t pl[3] = { 0xC0, (uint8_t)i, 0x00 };
+        packet_db_record_t r = make_record(pl, sizeof pl, "batch");
+        tap_okf(packet_db_insert(db, &r) == 0,
+                "batch: insert %d buffers (returns 0)", i);
+    }
+    tap_okf(packet_db_batch_pending(db) == (size_t)N,
+            "batch: %d rows pending before flush (got %zu)",
+            N, packet_db_batch_pending(db));
+
+    // Nothing should be in the DB yet — batch mode doesn't touch SQLite
+    // until flush. Read via an independent connection.
+    {
+        sqlite3 *raw = NULL;
+        sqlite3_open_v2(path, &raw, SQLITE_OPEN_READONLY, NULL);
+        long n = count_rows(raw, "SELECT count(*) FROM packet;");
+        tap_okf(n == 0, "batch: 0 rows written before flush (got %ld)", n);
+        sqlite3_close(raw);
+    }
+
+    int frc = packet_db_flush(db);
+    tap_okf(frc == 0, "batch: flush returns 0 (got %d)", frc);
+    tap_okf(packet_db_batch_pending(db) == 0,
+            "batch: 0 rows pending after flush (got %zu)",
+            packet_db_batch_pending(db));
+
+    // A second flush with nothing buffered is a no-op success.
+    tap_okf(packet_db_flush(db) == 0, "batch: empty flush is a no-op (0)");
+
+    packet_db_close(db);
+
+    sqlite3 *raw = NULL;
+    sqlite3_open_v2(path, &raw, SQLITE_OPEN_READONLY, NULL);
+    long n = count_rows(raw, "SELECT count(*) FROM packet;");
+    tap_okf(n == N, "batch: all %d rows present after flush (got %ld)", N, n);
+    sqlite3_close(raw);
+    unlink(path);
+    char side[80];
+    snprintf(side, sizeof side, "%s-wal", path); unlink(side);
+    snprintf(side, sizeof side, "%s-shm", path); unlink(side);
+}
+
+// ------------------------------------------------------------------
+// 15. Concurrent batch writers. Mirror of test_parallel_writers but each
+//     writer buffers and flushes once (the offline rx_replay path under
+//     decode_passes --jobs N). Same exact-count oracle: shared records
+//     dedup to PW_SHARED, every writer's unique records survive, no lost
+//     write. Proves the batched flush is loss-free and dedup-correct under
+//     real WAL contention — the property issue #52's fix must hold.
+// ------------------------------------------------------------------
+
+static int parallel_child_work_batch(const char *path, int child_idx)
+{
+    packet_db_t *db = packet_db_open(path);
+    if (db == NULL) return 1;
+    packet_db_set_batch(db, 1);
+    // Shared set: identical for every child, buffered twice each. Within a
+    // child's single flush transaction the repeat dedups; across children
+    // the unique index dedups. All collapse to PW_SHARED.
+    for (int rep = 0; rep < 2; ++rep) {
+        for (int k = 0; k < PW_SHARED; ++k) {
+            uint8_t pl[3] = { 0xAA, (uint8_t)k, 0x00 };
+            packet_db_record_t r = make_record(pl, sizeof pl, "pwb-shared");
+            if (packet_db_insert(db, &r) != 0) { packet_db_close(db); return 2; }
+        }
+    }
+    // Unique set: payload carries the child index, so none collide.
+    for (int j = 0; j < PW_UNIQUE; ++j) {
+        uint8_t pl[3] = { 0xBB, (uint8_t)child_idx, (uint8_t)j };
+        packet_db_record_t r = make_record(pl, sizeof pl, "pwb-unique");
+        if (packet_db_insert(db, &r) != 0) { packet_db_close(db); return 3; }
+    }
+    // Until here nothing is written; this is the one contended lock grab.
+    int frc = packet_db_flush(db);
+    packet_db_close(db);
+    return frc == 0 ? 0 : 4;
+}
+
+static void *parallel_writer_thread_batch(void *p)
+{
+    pw_thread_arg_t *a = (pw_thread_arg_t *)p;
+    a->rc = parallel_child_work_batch(a->path, a->idx);
+    return NULL;
+}
+
+static void test_batch_parallel_writers(void)
+{
+    char path[64];
+    if (make_tmp_db_path(path, sizeof path) != 0) {
+        tap_bail("mkstemp"); return;
+    }
+    // Create the schema once so writers only contend on the flush, not on
+    // first-time migration.
+    packet_db_t *seed = packet_db_open(path);
+    if (seed == NULL) {
+        tap_bail("seed open"); unlink(path); return;
+    }
+    packet_db_close(seed);
+
+    pthread_t th[PW_CHILDREN];
+    pw_thread_arg_t args[PW_CHILDREN];
+    int spawned = 0;
+    for (int c = 0; c < PW_CHILDREN; ++c) {
+        args[c].path = path;
+        args[c].idx  = c;
+        args[c].rc   = -1;
+        if (pthread_create(&th[c], NULL, parallel_writer_thread_batch,
+                           &args[c]) != 0) {
+            break;
+        }
+        spawned++;
+    }
+    for (int i = 0; i < spawned; ++i) {
+        pthread_join(th[i], NULL);
+    }
+    tap_okf(spawned == PW_CHILDREN,
+            "batch-parallel: spawned %d writers (want %d)",
+            spawned, PW_CHILDREN);
+
+    int all_ok = 1, worst = 0;
+    for (int i = 0; i < spawned; ++i) {
+        if (args[i].rc != 0) {
+            all_ok = 0;
+            if (args[i].rc > worst) worst = args[i].rc;
+        }
+    }
+    tap_okf(all_ok,
+            "batch-parallel: every writer's flush succeeded (worst rc=%d)",
+            worst);
+
+    sqlite3 *raw = NULL;
+    int rc = sqlite3_open_v2(path, &raw, SQLITE_OPEN_READONLY, NULL);
+    if (rc != SQLITE_OK) {
+        tap_okf(0, "batch-parallel: raw open (rc=%d)", rc);
+        unlink(path); return;
+    }
+    long shared = count_rows(raw,
+        "SELECT count(*) FROM packet WHERE source_tool='pwb-shared';");
+    long uniq = count_rows(raw,
+        "SELECT count(*) FROM packet WHERE source_tool='pwb-unique';");
+    long total = count_rows(raw, "SELECT count(*) FROM packet;");
+    sqlite3_close(raw);
+
+    tap_okf(shared == PW_SHARED,
+            "batch-parallel: shared deduped: %ld rows (want %d)",
+            shared, PW_SHARED);
+    tap_okf(uniq == (long)PW_CHILDREN * PW_UNIQUE,
+            "batch-parallel: every unique record survived: %ld (want %d)",
+            uniq, PW_CHILDREN * PW_UNIQUE);
+    tap_okf(total == PW_SHARED + (long)PW_CHILDREN * PW_UNIQUE,
+            "batch-parallel: total exact, no lost write: %ld (want %d)",
+            total, PW_SHARED + PW_CHILDREN * PW_UNIQUE);
+
+    unlink(path);
+    char side[80];
+    snprintf(side, sizeof side, "%s-wal", path); unlink(side);
+    snprintf(side, sizeof side, "%s-shm", path); unlink(side);
+}
+
 int main(void)
 {
     test_open_fresh_creates_schema();
@@ -705,5 +892,7 @@ int main(void)
     test_close_null_safe();
     test_parallel_writers();
     test_insert_reports_failure();
+    test_batch_buffers_until_flush();
+    test_batch_parallel_writers();
     return tap_done();
 }

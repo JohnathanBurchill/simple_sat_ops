@@ -1385,6 +1385,15 @@ int main(int argc, char **argv)
     // duplicate rx_replay rows in the DB.
     decode_loop_set_packet_db(update_mode ? NULL : db, "rx_replay", db_run_id);
 
+    // Buffer this file's rows and write them in one transaction at the end
+    // (see packet_db_set_batch): one short-held write lock per file instead
+    // of one per packet — the fix for the parallel-decode WAL contention in
+    // issue #52. Not in --update mode, which writes via
+    // packet_db_update_observer (a different path that doesn't insert rows).
+    if (db != NULL && !update_mode) {
+        packet_db_set_batch(db, 1);
+    }
+
     // Auto-discover TLE in the pass folder if --tle wasn't given.
     // Prefer --session-dir when the caller set it (decode_passes.sh
     // does, even when the input file is a temp WAV from an ogg
@@ -2066,6 +2075,19 @@ done:
         if (!g_stop) rx_tui_hold_until_quit();
         rx_tui_close();
     }
+
+    // Flush the file's buffered DB rows in one transaction (batch mode; see
+    // packet_db_set_batch). Writing the whole file under a single
+    // briefly-held write lock is the fix for the parallel-decode WAL
+    // contention that silently dropped rows (issue #52). A no-op (returns
+    // OK) when no DB is configured or batch mode is off. Captured here, once,
+    // so both the summary below and the exit code reflect the real store
+    // outcome — which is all-or-nothing per file.
+    size_t db_pending   = packet_db_batch_pending(db);
+    int    db_flush_rc  = packet_db_flush(db);
+    long   db_flush_lost =
+        (db_flush_rc != PACKET_DB_INSERT_OK) ? (long)db_pending : 0;
+
     // --forensics-report keeps stdout a clean JSON stream and stays
     // silent on stderr too — the decode summary below is suppressed so
     // "just the JSON" is the only output. Genuine errors still print.
@@ -2087,7 +2109,7 @@ done:
         }
         decode_loop_stats_t st;
         decode_loop_get_stats(&st);
-        long db_failed = st.db_busy + st.db_error;
+        long db_failed = st.db_busy + st.db_error + db_flush_lost;
         fprintf(stderr, "rx_replay: decode summary (chain=%s):\n", chain);
         fprintf(stderr, "  candidate frames (pre-dedup)   : %ld\n", raw_decodes);
         const char *db_note = !db ? "— DB not written"
@@ -2097,9 +2119,13 @@ done:
                 db_note);
         if (db && db_failed > 0) {
             fprintf(stderr,
-                    "    DB WRITE FAILURES            : %ld (busy %ld, error %ld)"
-                    " — NOT stored, run will be retried\n",
-                    db_failed, st.db_busy, st.db_error);
+                    "    DB WRITE FAILURES            : %ld not stored "
+                    "(append busy %ld, append error %ld, flush %s)"
+                    " — run will be retried\n",
+                    db_failed, st.db_busy, st.db_error,
+                    db_flush_rc == PACKET_DB_INSERT_OK ? "ok"
+                      : (db_flush_rc == PACKET_DB_INSERT_BUSY ? "BUSY"
+                                                              : "ERROR"));
         }
         fprintf(stderr, "    valid CSP header             : %ld\n", st.csp_ok);
         fprintf(stderr, "    RS corrected / uncorrectable : %ld / %ld\n",
@@ -2137,13 +2163,16 @@ done:
     // stay 0 and this path returns 0.
     decode_loop_stats_t fin;
     decode_loop_get_stats(&fin);
-    long db_failed = fin.db_busy + fin.db_error;
+    long db_failed = fin.db_busy + fin.db_error + db_flush_lost;
     if (db_failed > 0) {
         fprintf(stderr,
                 "rx_replay: %ld decoded packet(s) were NOT stored "
-                "(DB busy %ld, error %ld); exiting non-zero so the caller "
-                "retries instead of marking this capture done.\n",
-                db_failed, fin.db_busy, fin.db_error);
+                "(append busy %ld, append error %ld, flush %s); exiting "
+                "non-zero so the caller retries instead of marking this "
+                "capture done.\n",
+                db_failed, fin.db_busy, fin.db_error,
+                db_flush_rc == PACKET_DB_INSERT_OK ? "ok"
+                  : (db_flush_rc == PACKET_DB_INSERT_BUSY ? "busy" : "error"));
         return 2;
     }
     return 0;

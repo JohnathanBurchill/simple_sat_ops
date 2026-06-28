@@ -145,6 +145,14 @@ struct packet_db {
     sqlite3_stmt *register_tle_stmt;
     sqlite3_stmt *select_tle_id_stmt;
     sqlite3_stmt *insert_sent_tcmd_stmt;
+    // Batch mode (see packet_db_set_batch). When batch_mode is set,
+    // packet_db_insert deep-copies the record into `batch` instead of
+    // writing it; packet_db_flush writes the whole array in one
+    // transaction. Single inserting thread only.
+    int                  batch_mode;
+    packet_db_record_t  *batch;
+    size_t               batch_count;
+    size_t               batch_cap;
 };
 
 // Fresh-DB schema. Existing DBs from user_version=1 get the new columns
@@ -534,14 +542,102 @@ static void bind_double_or_null(sqlite3_stmt *s, int idx, double v)
     else sqlite3_bind_double(s, idx, v);
 }
 
-int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec)
+// --- Batch mode (issue #52) -----------------------------------------
+// Under decode_passes --jobs N, each rx_replay process used to commit one
+// write transaction per decoded row. With one WAL writer at a time, N
+// processes each firing a burst of ~150 single-row commits serialise on
+// the write lock and the late ones time out -> dropped rows. Batch mode
+// buffers a file's rows in memory (the DSP runs lock-free) and
+// packet_db_flush writes them all in ONE short transaction — one lock
+// acquisition per file instead of per row. The buffer holds OWNED deep
+// copies of every borrowed string/blob, since the caller's record doesn't
+// outlive the insert call.
+
+static char *dup_str(const char *s)
 {
-    if (db == NULL || db->db == NULL || db->insert_stmt == NULL) return 0;
-    if (rec == NULL || rec->ts_received == NULL
-        || rec->source_tool == NULL || rec->payload == NULL
-        || rec->packet_type_name == NULL) {
-        return -1;
+    if (s == NULL) return NULL;
+    size_t n = strlen(s) + 1;
+    char *p = (char *)malloc(n);
+    if (p != NULL) memcpy(p, s, n);
+    return p;
+}
+
+static uint8_t *dup_bytes(const uint8_t *p, size_t n)
+{
+    if (p == NULL) return NULL;
+    // malloc(1) for a zero-length payload so a non-NULL return always means
+    // "copied" — that lets the caller use NULL purely as the OOM flag.
+    uint8_t *q = (uint8_t *)malloc(n ? n : 1);
+    if (q != NULL && n) memcpy(q, p, n);
+    return q;
+}
+
+static void free_record(packet_db_record_t *d)
+{
+    free((void *)d->ts_received);
+    free((void *)d->satellite);
+    free((void *)d->packet_type_name);
+    free((void *)d->source_tool);
+    free((void *)d->source_run);
+    free((void *)d->decoded_summary);
+    free((void *)d->session_dir);
+    free((void *)d->capture_origin);
+    free((void *)d->payload);
+}
+
+static void batch_clear(packet_db_t *db)
+{
+    for (size_t i = 0; i < db->batch_count; i++) free_record(&db->batch[i]);
+    free(db->batch);
+    db->batch = NULL;
+    db->batch_count = 0;
+    db->batch_cap = 0;
+}
+
+static int batch_append(packet_db_t *db, const packet_db_record_t *rec)
+{
+    if (db->batch_count == db->batch_cap) {
+        size_t ncap = db->batch_cap ? db->batch_cap * 2 : 128;
+        packet_db_record_t *nb =
+            (packet_db_record_t *)realloc(db->batch, ncap * sizeof *nb);
+        if (nb == NULL) return PACKET_DB_INSERT_ERROR;
+        db->batch = nb;
+        db->batch_cap = ncap;
     }
+    packet_db_record_t *d = &db->batch[db->batch_count];
+    // Copy scalars, then replace every borrowed pointer with an owned copy.
+    *d = *rec;
+    d->ts_received      = dup_str(rec->ts_received);
+    d->satellite        = dup_str(rec->satellite);
+    d->packet_type_name = dup_str(rec->packet_type_name);
+    d->source_tool      = dup_str(rec->source_tool);
+    d->source_run       = dup_str(rec->source_run);
+    d->decoded_summary  = dup_str(rec->decoded_summary);
+    d->session_dir      = dup_str(rec->session_dir);
+    d->capture_origin   = dup_str(rec->capture_origin);
+    d->payload          = dup_bytes(rec->payload, rec->payload_len);
+    // A NULL copy of a field whose source was non-NULL means malloc failed.
+    // Fail the whole append so the row is reported lost, not stored truncated.
+    int oom = (d->ts_received == NULL || d->packet_type_name == NULL
+               || d->source_tool == NULL || d->payload == NULL
+               || (rec->satellite       != NULL && d->satellite       == NULL)
+               || (rec->source_run      != NULL && d->source_run      == NULL)
+               || (rec->decoded_summary != NULL && d->decoded_summary == NULL)
+               || (rec->session_dir     != NULL && d->session_dir     == NULL)
+               || (rec->capture_origin  != NULL && d->capture_origin  == NULL));
+    if (oom) {
+        free_record(d);
+        return PACKET_DB_INSERT_ERROR;
+    }
+    db->batch_count++;
+    return PACKET_DB_INSERT_OK;
+}
+
+// Bind one (already-validated) record into the prepared insert statement
+// and step it. Used both for the direct per-row path and, inside one
+// transaction, by packet_db_flush.
+static int insert_bound(packet_db_t *db, const packet_db_record_t *rec)
+{
     sqlite3_stmt *s = db->insert_stmt;
 
     // SHA1 of the raw payload, used for dedup. 20 bytes; stored as a
@@ -598,6 +694,79 @@ int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec)
     return PACKET_DB_INSERT_OK;
 }
 
+int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec)
+{
+    if (db == NULL || db->db == NULL || db->insert_stmt == NULL) return 0;
+    if (rec == NULL || rec->ts_received == NULL
+        || rec->source_tool == NULL || rec->payload == NULL
+        || rec->packet_type_name == NULL) {
+        return -1;
+    }
+    // Batch mode: stash an owned copy now, write it at flush time.
+    if (db->batch_mode) return batch_append(db, rec);
+    return insert_bound(db, rec);
+}
+
+void packet_db_set_batch(packet_db_t *db, int enabled)
+{
+    if (db == NULL) return;
+    db->batch_mode = enabled ? 1 : 0;
+}
+
+size_t packet_db_batch_pending(packet_db_t *db)
+{
+    if (db == NULL) return 0;
+    return db->batch_count;
+}
+
+int packet_db_flush(packet_db_t *db)
+{
+    if (db == NULL || db->db == NULL) return PACKET_DB_INSERT_OK;
+    if (db->batch_count == 0) return PACKET_DB_INSERT_OK;
+
+    // One write transaction for the whole file. BEGIN IMMEDIATE takes the
+    // write lock now (bounded by the busy_timeout) rather than on the first
+    // row, so the lock is either held for this whole short flush or not at
+    // all — no half-written batch. The DSP already ran; the lock is held
+    // only for the bind/step loop (milliseconds), so parallel decoders stop
+    // piling up on per-row commits.
+    char *errmsg = NULL;
+    int rc = sqlite3_exec(db->db, "BEGIN IMMEDIATE;", NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        int busy = (rc == SQLITE_BUSY || rc == SQLITE_LOCKED);
+        fprintf(stderr, "packet_db: flush BEGIN failed: %s\n",
+                errmsg ? errmsg : sqlite3_errmsg(db->db));
+        sqlite3_free(errmsg);
+        batch_clear(db);
+        return busy ? PACKET_DB_INSERT_BUSY : PACKET_DB_INSERT_ERROR;
+    }
+
+    int result = PACKET_DB_INSERT_OK;
+    for (size_t i = 0; i < db->batch_count; i++) {
+        int irc = insert_bound(db, &db->batch[i]);
+        if (irc != PACKET_DB_INSERT_OK) { result = irc; break; }
+    }
+
+    if (result == PACKET_DB_INSERT_OK) {
+        rc = sqlite3_exec(db->db, "COMMIT;", NULL, NULL, &errmsg);
+        if (rc != SQLITE_OK) {
+            int busy = (rc == SQLITE_BUSY || rc == SQLITE_LOCKED);
+            fprintf(stderr, "packet_db: flush COMMIT failed: %s\n",
+                    errmsg ? errmsg : sqlite3_errmsg(db->db));
+            sqlite3_free(errmsg);
+            (void) sqlite3_exec(db->db, "ROLLBACK;", NULL, NULL, NULL);
+            result = busy ? PACKET_DB_INSERT_BUSY : PACKET_DB_INSERT_ERROR;
+        }
+    } else {
+        // A row failed mid-transaction. Roll the whole batch back so the
+        // file is all-or-nothing and the caller re-decodes it cleanly.
+        (void) sqlite3_exec(db->db, "ROLLBACK;", NULL, NULL, NULL);
+    }
+
+    batch_clear(db);
+    return result;
+}
+
 int packet_db_insert_sent_tcmd(packet_db_t *db, const sent_tcmd_record_t *rec)
 {
     if (db == NULL || db->db == NULL || db->insert_sent_tcmd_stmt == NULL)
@@ -635,6 +804,9 @@ int packet_db_insert_sent_tcmd(packet_db_t *db, const sent_tcmd_record_t *rec)
 void packet_db_close(packet_db_t *db)
 {
     if (db == NULL) return;
+    // Drop any unflushed batch (caller forgot to flush, or a flush left it
+    // empty — batch_clear is a no-op then).
+    batch_clear(db);
     if (db->insert_stmt           != NULL) sqlite3_finalize(db->insert_stmt);
     if (db->update_gaps_stmt      != NULL) sqlite3_finalize(db->update_gaps_stmt);
     if (db->update_force_stmt     != NULL) sqlite3_finalize(db->update_force_stmt);
@@ -838,6 +1010,23 @@ packet_db_t *packet_db_open(const char *path)
 int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec)
 {
     (void)db; (void)rec;
+    return 0;
+}
+
+void packet_db_set_batch(packet_db_t *db, int enabled)
+{
+    (void)db; (void)enabled;
+}
+
+int packet_db_flush(packet_db_t *db)
+{
+    (void)db;
+    return 0;
+}
+
+size_t packet_db_batch_pending(packet_db_t *db)
+{
+    (void)db;
     return 0;
 }
 
