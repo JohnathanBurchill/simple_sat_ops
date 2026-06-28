@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`568f925` (2026-06-28). This is a working draft.
+`08e3438` (2026-06-28). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2510,6 +2510,21 @@ at a glance.
   `FINE...` clock; upload a `FREEWHEELING` (or coarser) fix only with
   caution -- and never paired with a stale one. `gnss_opm` prints the
   clock status in the OPM header and flags a non-`FINE` clock in `--list`.
+
+  The BESTXYZA log itself carries no receiver clock offset, so to pin the
+  epoch exactly `gnss_opm` looks for a **TIMEA** log near the fix in time:
+  the TIMEA carries the clock offset (the receiver-clock-minus-GPS bias)
+  and the live GPS-UTC leap-second count. When one is found within the
+  clock window (default 120 s, set by `--clock-window=<dur>`) it removes
+  the offset from the epoch and takes the leap seconds from the log, and
+  records both in the OPM header. A `FINESTEERING` clock's offset is only
+  a few nanoseconds, so this is a no-op for a healthy fix, but it is what
+  makes a `FREEWHEELING` fix's epoch trustworthy. **To get the
+  correction, downlink a TIMEA alongside the BESTXYZA** -- e.g. send
+  `log timea once` next to `log bestxyza once`, or include both in a
+  `ontime` firehose run. With no TIMEA in the window the epoch is
+  leap-corrected only (using the built-in 18 s) and `gnss_opm` says so on
+  stderr and in the OPM header.
 
 - **The fix is fresh.** The OEM is propagated forward from the fix with
   no atmospheric drag, so error grows with the fix's age: the along-track

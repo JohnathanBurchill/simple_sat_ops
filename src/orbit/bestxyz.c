@@ -201,6 +201,65 @@ int bestxyz_parse(const char *text, bestxyz_t *out, char *err, size_t errsz)
 #undef FAIL
 }
 
+// ---- TIMEA parse ------------------------------------------------------------
+
+// TIMEA layout: the header matches every NovAtel log (name through ';'),
+// then the body is:
+//   clockstatus,offset,offsetstd,utcoffset,utcyear,utcmon,utcday,
+//   utchour,utcmin,utcms,utcstatus*CRC
+int timea_parse(const char *text, timea_t *out, char *err, size_t errsz)
+{
+    memset(out, 0, sizeof *out);
+#define FAIL(msg) do { if (errsz) snprintf(err, errsz, "%s", (msg)); return -1; } while (0)
+
+    const char *name = strstr(text, "TIMEA");
+    if (!name) FAIL("no TIMEA log found in input");
+
+    const char *semi0 = strchr(name, ';');
+    if (!semi0) FAIL("TIMEA header has no ';' terminator");
+
+    const char *star = strchr(semi0, '*');
+    const char *raw_end = star;
+    if (!raw_end) {
+        raw_end = strpbrk(semi0, "\r\n");
+        if (!raw_end) raw_end = semi0 + strlen(semi0);
+    }
+
+    char msg[1024];
+    size_t mlen = json_unescape(name, (size_t) (raw_end - name), msg, sizeof msg);
+
+    if (star) {
+        out->crc_calc = bestxyz_novatel_crc32((const unsigned char *) msg, mlen);
+        out->crc_read = (unsigned) strtoul(star + 1, NULL, 16);
+        out->crc_present = 1;
+        out->crc_ok = (out->crc_calc == out->crc_read);
+    }
+
+    char *semi = strchr(msg, ';');
+    if (!semi) FAIL("TIMEA header has no ';' terminator");
+    *semi = '\0';
+
+    char *hf[MAX_FIELDS];
+    int hn = split_fields(msg, hf, MAX_FIELDS);
+    if (hn < 7) FAIL("TIMEA header has too few fields");
+    copy_field(out->time_status, sizeof out->time_status, hf[4]);
+    out->gps_week = atoi(hf[5]);
+    out->gps_sow = strtod(hf[6], NULL);
+
+    char *bf[MAX_FIELDS];
+    int bn = split_fields(semi + 1, bf, MAX_FIELDS);
+    if (bn < 11) FAIL("TIMEA body has too few fields");
+
+    copy_field(out->clock_status, sizeof out->clock_status, bf[0]);
+    out->clock_offset = strtod(bf[1], NULL);
+    out->clock_offset_std = strtod(bf[2], NULL);
+    out->utc_offset = strtod(bf[3], NULL);
+    copy_field(out->utc_status, sizeof out->utc_status, bf[10]);
+
+    return 0;
+#undef FAIL
+}
+
 // ---- GPS time -> UTC --------------------------------------------------------
 
 void bestxyz_gps_to_utc(int gps_week, double gps_sow, int leap_seconds,

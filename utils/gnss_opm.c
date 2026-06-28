@@ -101,9 +101,16 @@ typedef struct {
     double      hard_body_radius;
     long long   want_id;        // 0 = pick best
     const char *fit_window;     // e.g. "30m": short-arc LS over fixes in window
+    const char *clock_window;   // e.g. "120s": max age of a TIMEA used to correct the epoch
     int         list;
     int         allow_insufficient;
 } args_t;
+
+// Default tolerance for pairing a TIMEA clock-offset log with a BESTXYZA fix.
+// The offset only drifts meaningfully when the clock is not steered, and even
+// a poor unsteered TCXO drifts < 1 m of along-track over this window, so a
+// nearby TIMEA is representative; a more distant one is rejected as not recent.
+#define CLOCK_WINDOW_DEFAULT_S 120.0
 
 #define OPTW 26
 
@@ -158,6 +165,11 @@ static int parse_args(args_t *a, int argc, char **argv, int help)
             else a->fit_window = arg + 13;
             matched = 1;
         }
+        if (gnss_starts_with(arg, "--clock-window=") || help) {
+            if (help) parse_help_line(OPTW, "--clock-window=<dur>", "max age of a TIMEA log used to correct the fix epoch (default 120s); none in range -> leap-only");
+            else a->clock_window = arg + 15;
+            matched = 1;
+        }
         if (strcmp(arg, "--list") == 0 || help) {
             if (help) parse_help_line(OPTW, "--list", "list candidate fixes (newest first), write no OPM");
             else a->list = 1;
@@ -188,7 +200,41 @@ typedef struct {
     int       n_ids;
     int       crc_ok;
     double    epoch_s;     // GNSS solution epoch, GPS seconds (week*604800 + sow)
+
+    // Clock correction resolved from the nearest recent TIMEA (see
+    // resolve_clock_correction). When no TIMEA is in range these hold the
+    // leap-only fallback: clock_offset 0, leap = BESTXYZ_DEFAULT_LEAP_SECONDS.
+    int       timea_applied;    // 1 if a recent TIMEA supplied the correction
+    double    clock_offset;     // s to subtract from GPS time (0 if none)
+    double    clock_offset_std; // s (when applied)
+    int       leap_seconds;     // GPS-UTC leap seconds in effect
+    double    timea_dt;         // |fix epoch - TIMEA epoch| (s, when applied)
 } fix_t;
+
+// One TIMEA clock-offset log, kept as a correction source for the fixes.
+typedef struct {
+    double epoch_s;           // GPS seconds (week*604800 + sow)
+    double clock_offset;      // s
+    double clock_offset_std;  // s
+    double utc_offset;        // signed UTC - GPS (s)
+    int    crc_ok;
+    int    clock_valid;       // clock status == VALID
+    int    utc_valid;         // utc status == VALID
+} timea_rec_t;
+
+static timea_rec_t *g_timeas = NULL;
+static int          g_ntimeas = 0, g_captimeas = 0;
+
+static void collect_timea(const timea_rec_t *t)
+{
+    if (g_ntimeas == g_captimeas) {
+        int cap = g_captimeas ? g_captimeas * 2 : 32;
+        timea_rec_t *n = realloc(g_timeas, (size_t)cap * sizeof *n);
+        if (n == NULL) return;   // drop on OOM rather than crash
+        g_timeas = n; g_captimeas = cap;
+    }
+    g_timeas[g_ntimeas++] = *t;
+}
 
 // If the reassembled reception is a CRC-ok BESTXYZA, fill *out and return 1.
 static int parse_fix(const gnss_frag_t *frags, int n, fix_t *out)
@@ -219,6 +265,75 @@ static int parse_fix(const gnss_frag_t *frags, int n, fix_t *out)
     return 1;
 }
 
+// If the reassembled reception is a CRC-ok TIMEA, fill *out and return 1.
+static int parse_timea(const gnss_frag_t *frags, int n, timea_rec_t *out)
+{
+    static unsigned char buf[65536];
+    int len = gnss_reassemble(frags, n, buf, sizeof buf);
+    char *msg = (char *)buf;
+    char *marker = strstr(msg, "GNSS Response (");
+    if (marker == NULL) return 0;
+
+    int decl = 0;
+    char *colon = strstr(marker, "): ");
+    if (sscanf(marker, "GNSS Response (%d chars)", &decl) == 1 && colon && decl > 0) {
+        int end = (int)(colon + 3 - msg) + decl;
+        if (end < len) { len = end; msg[len] = '\0'; }
+    }
+    if (strstr(msg, "TIMEA") == NULL) return 0;
+
+    timea_t t;
+    char err[96];
+    if (timea_parse(msg, &t, err, sizeof err) != 0) return 0;
+    out->epoch_s          = (double)t.gps_week * 604800.0 + t.gps_sow;
+    out->clock_offset     = t.clock_offset;
+    out->clock_offset_std = t.clock_offset_std;
+    out->utc_offset       = t.utc_offset;
+    out->crc_ok           = t.crc_present && t.crc_ok;
+    out->clock_valid      = (strcmp(t.clock_status, "VALID") == 0);
+    out->utc_valid        = (strcmp(t.utc_status, "VALID") == 0);
+    return 1;
+}
+
+// Resolve the GPS->UTC correction for one fix from the nearest TIMEA whose GPS
+// epoch is within window_s of the fix epoch (CRC-ok, clock status VALID). Sets
+// the fix's clock_offset / clock_offset_std / leap_seconds / timea_applied /
+// timea_dt. When no TIMEA is in range, falls back to leap-only: no clock
+// offset, leap = BESTXYZ_DEFAULT_LEAP_SECONDS.
+static void resolve_clock_correction(fix_t *f, double window_s)
+{
+    f->timea_applied = 0;
+    f->clock_offset = 0.0;
+    f->clock_offset_std = 0.0;
+    f->leap_seconds = BESTXYZ_DEFAULT_LEAP_SECONDS;
+    f->timea_dt = 0.0;
+
+    int best = -1;
+    double best_dt = 0.0;
+    for (int i = 0; i < g_ntimeas; ++i) {
+        if (!g_timeas[i].crc_ok || !g_timeas[i].clock_valid) continue;
+        double dt = fabs(g_timeas[i].epoch_s - f->epoch_s);
+        if (dt > window_s) continue;
+        if (best < 0 || dt < best_dt) { best = i; best_dt = dt; }
+    }
+    if (best < 0) return;
+
+    f->clock_offset = g_timeas[best].clock_offset;
+    f->clock_offset_std = g_timeas[best].clock_offset_std;
+    // utc_offset is signed UTC - GPS (e.g. -18.0), so leap seconds = -utc_offset.
+    // Only trust it when the UTC status is VALID; otherwise keep the default.
+    if (g_timeas[best].utc_valid)
+        f->leap_seconds = (int)lround(-g_timeas[best].utc_offset);
+    f->timea_applied = 1;
+    f->timea_dt = best_dt;
+}
+
+// GPS solution epoch corrected to true GPS time (clock offset removed).
+static double fix_gps_epoch_corrected(const fix_t *f)
+{
+    return f->epoch_s - f->clock_offset;
+}
+
 static int fix_is_usable(const fix_t *f, const args_t *a)
 {
     if (!f->crc_ok) return 0;
@@ -228,17 +343,24 @@ static int fix_is_usable(const fix_t *f, const args_t *a)
 
 static void print_candidate(const fix_t *f)
 {
-    fprintf(stderr, "  %s  id %lld  %s/%s  %d/%d SV  CRC %s  clk %s\n",
+    char clk[64];
+    if (f->timea_applied)
+        snprintf(clk, sizeof clk, "TIMEA %+.3g s @%.0fs leap %d",
+                 f->clock_offset, f->timea_dt, f->leap_seconds);
+    else
+        snprintf(clk, sizeof clk, "no TIMEA (leap %d only)", f->leap_seconds);
+    fprintf(stderr, "  %s  id %lld  %s/%s  %d/%d SV  CRC %s  clk %s  corr %s\n",
             f->ts_received, f->ids[0], f->b.pos_sol_status, f->b.pos_type,
             f->b.num_sol_sv, f->b.num_sv, f->crc_ok ? "ok" : "BAD",
-            f->b.time_status);
+            f->b.time_status, clk);
 }
 
 // Age of the fix in hours (now - GNSS epoch), or -1 if the epoch won't convert.
-static double fix_age_hours(const bestxyz_t *b)
+// Uses the resolved clock offset and leap seconds so the epoch matches the OPM.
+static double fix_age_hours(const fix_t *f)
 {
     int y, mo, d, h, mi; double s;
-    bestxyz_gps_to_utc(b->gps_week, b->gps_sow, BESTXYZ_DEFAULT_LEAP_SECONDS,
+    bestxyz_gps_to_utc(f->b.gps_week, f->b.gps_sow - f->clock_offset, f->leap_seconds,
                        &y, &mo, &d, &h, &mi, &s);
     struct tm tm = {0};
     tm.tm_year = y - 1900; tm.tm_mon = mo - 1; tm.tm_mday = d;
@@ -282,7 +404,7 @@ static int fix_recommendation(const fix_t *f, char *reasons, size_t rsz)
         caution = 1; NOTE("%s clock", f->b.time_status);
     }
 
-    double age = fix_age_hours(&f->b);
+    double age = fix_age_hours(f);
     if (age >= 0.0) {
         if (age > 504.0)      { hard = 1;    NOTE("%.0f h old (>504 h API window)", age); }
         else if (age > 24.0)  { caution = 1; NOTE("%.0f h old (>24 h)", age); }
@@ -319,7 +441,7 @@ static void write_opm(FILE *fp, const fix_t *f, const args_t *a,
                       const shortarc_fit_t *fit, const char *window)
 {
     int y, mo, d, h, mi; double s;
-    bestxyz_gps_to_utc(f->b.gps_week, f->b.gps_sow, BESTXYZ_DEFAULT_LEAP_SECONDS,
+    bestxyz_gps_to_utc(f->b.gps_week, f->b.gps_sow - f->clock_offset, f->leap_seconds,
                        &y, &mo, &d, &h, &mi, &s);
 
     fprintf(fp, "# OPM generated by simple_sat_ops gnss_opm\n");
@@ -336,7 +458,12 @@ static void write_opm(FILE *fp, const fix_t *f, const args_t *a,
         fprintf(fp, "# r_ecef_sigma_m / v_ecef_sigma_m_per_s are the receiver 1-sigma\n");
     }
     fprintf(fp, "# epoch from GPS week %d sow %.3f, leap=%d s; %s clock\n",
-            f->b.gps_week, f->b.gps_sow, BESTXYZ_DEFAULT_LEAP_SECONDS, f->b.time_status);
+            f->b.gps_week, f->b.gps_sow, f->leap_seconds, f->b.time_status);
+    if (f->timea_applied)
+        fprintf(fp, "# clock offset %+.6g s (sigma %.2g s) from a TIMEA %.0f s away, removed from the epoch\n",
+                f->clock_offset, f->clock_offset_std, f->timea_dt);
+    else
+        fprintf(fp, "# no TIMEA within the clock window of this fix; epoch is leap-corrected only, no clock-offset removal\n");
     fprintf(fp, "# ssm rotates the sigmas ECEF->RTN and grows them over the propagation window.\n");
     fprintf(fp, "- name: %s\n", a->name);
     if (a->object_id && a->object_id[0])
@@ -421,6 +548,12 @@ int main(int argc, char **argv)
                     for (int k = 0; k < f.n_ids; ++k) if (f.ids[k] == cfg.want_id) id_match = 1; } \
                 if (in_range && id_match && fix_is_usable(&f, &cfg)) \
                     collect_candidate(&f); \
+            } else { \
+                /* Not a BESTXYZA -- a TIMEA is the clock-offset source, kept */ \
+                /* regardless of since/until so a fix at the window edge can */ \
+                /* still pair with one just outside it. */ \
+                timea_rec_t tr = {0}; \
+                if (parse_timea(recv, nrecv, &tr)) collect_timea(&tr); \
             } \
             for (int i = 0; i < nrecv; ++i) { free(recv[i].payload); } \
             nrecv = 0; \
@@ -459,6 +592,21 @@ int main(int argc, char **argv)
     sqlite3_finalize(st);
     sqlite3_close(db);
 
+    // Resolve the clock-offset correction for every candidate from the nearest
+    // recent TIMEA. Done after the full walk so a fix can pair with a TIMEA
+    // received in any order relative to it.
+    double clock_window_s = CLOCK_WINDOW_DEFAULT_S;
+    if (cfg.clock_window) {
+        clock_window_s = parse_duration_s(cfg.clock_window);
+        if (clock_window_s <= 0.0) {
+            fprintf(stderr, "gnss_opm: bad --clock-window=%s\n", cfg.clock_window);
+            free(g_cands); free(g_timeas);
+            return 1;
+        }
+    }
+    for (int i = 0; i < g_ncands; ++i)
+        resolve_clock_correction(&g_cands[i], clock_window_s);
+
     qsort(g_cands, (size_t)g_ncands, sizeof *g_cands, cmp_cand_desc);   // newest first
 
     if (cfg.list) {
@@ -478,7 +626,7 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "No fix clears every rule of thumb; the newest "
                     "\"usable with caution\" one is the best available.\n");
-        free(g_cands);
+        free(g_cands); free(g_timeas);
         return g_ncands ? 0 : 1;
     }
 
@@ -489,7 +637,7 @@ int main(int argc, char **argv)
                 "--allow-insufficient (not for upload).\n",
                 cfg.want_id ? " for that --id" : "",
                 cfg.allow_insufficient ? "" : " with SOL_COMPUTED");
-        free(g_cands);
+        free(g_cands); free(g_timeas);
         return 1;
     }
 
@@ -502,14 +650,17 @@ int main(int argc, char **argv)
         double win_s = parse_duration_s(cfg.fit_window);
         if (win_s <= 0.0) {
             fprintf(stderr, "gnss_opm: bad --fit-window=%s\n", cfg.fit_window);
-            free(g_cands);
+            free(g_cands); free(g_timeas);
             return 1;
         }
         // Gather fixes within [epoch - window, epoch] (epoch = newest fix).
+        // Time differences use the clock-corrected GPS epoch so the arc's
+        // dynamics see true elapsed time, not receiver-clock time.
         shortarc_obs_t obs[64];
         int nobs = 0;
+        double chosen_epoch = fix_gps_epoch_corrected(&chosen);
         for (int i = 0; i < g_ncands && nobs < 64; ++i) {
-            double dt = g_cands[i].epoch_s - chosen.epoch_s;   // <= 0
+            double dt = fix_gps_epoch_corrected(&g_cands[i]) - chosen_epoch;   // <= 0
             if (dt > 1e-6 || dt < -win_s - 1e-6) continue;
             shortarc_obs_t *o = &obs[nobs++];
             o->dt = dt;
@@ -551,8 +702,20 @@ int main(int argc, char **argv)
                 chosen.ts_received, chosen.ids[0], chosen.b.pos_sol_status, chosen.b.pos_type,
                 chosen.b.num_sol_sv, chosen.b.num_sv);
 
+    if (chosen.timea_applied)
+        fprintf(stderr,
+                "gnss_opm: epoch corrected by clock offset %+.6g s (sigma %.2g s) "
+                "from a TIMEA %.0f s away; leap %d s.\n",
+                chosen.clock_offset, chosen.clock_offset_std, chosen.timea_dt,
+                chosen.leap_seconds);
+    else
+        fprintf(stderr,
+                "gnss_opm: no TIMEA within %.0f s of the fix epoch; epoch is "
+                "leap-corrected only (leap %d s), no clock-offset removal.\n",
+                clock_window_s, chosen.leap_seconds);
+
     write_opm(stdout, &chosen, &cfg, did_fit ? &fit : NULL, cfg.fit_window);
-    free(g_cands);
+    free(g_cands); free(g_timeas);
     return 0;
 }
 

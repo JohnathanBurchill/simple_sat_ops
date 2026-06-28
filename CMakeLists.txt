@@ -284,6 +284,15 @@ target_include_directories(bestxyz_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(bestxyz_selftest PRIVATE m)
 list(APPEND SSO_TARGETS bestxyz_selftest)
 
+# NovAtel TIMEA parser self-test (src/orbit/bestxyz.c): clock offset, leap
+# seconds, CRC on a genuine log, and a receiver-produced cross-check that the
+# GPS->UTC conversion subtracts the leap seconds in the right direction.
+add_executable(timea_selftest
+               unit_tests/timea_selftest.c src/orbit/bestxyz.c)
+target_include_directories(timea_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(timea_selftest PRIVATE m)
+list(APPEND SSO_TARGETS timea_selftest)
+
 # Short-arc least-squares orbit fit (src/orbit/shortarc.c): synthetic-arc
 # recovery + velocity-tightening, since real data has no closely-spaced fixes.
 add_executable(shortarc_selftest

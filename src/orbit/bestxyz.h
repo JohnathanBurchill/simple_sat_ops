@@ -64,6 +64,34 @@ typedef struct {
 // short reason into err (when errsz > 0).
 int bestxyz_parse(const char *text, bestxyz_t *out, char *err, size_t errsz);
 
+// One parsed NovAtel TIMEA log. BESTXYZA carries no receiver clock offset,
+// so the offset that ties the solution epoch to true GPS time lives here
+// (along with the live GPS-UTC leap-second count). Pairing a TIMEA close in
+// time to a BESTXYZA fix is how the fix epoch is corrected exactly:
+//   GPS system time = header time - clock_offset      (clock_offset signed +ahead)
+//   UTC             = GPS system time + utc_offset     (utc_offset signed UTC-GPS, ~ -18)
+typedef struct {
+    int    gps_week;            // GPS week number (header field 6)
+    double gps_sow;             // GPS seconds into the week (header field 7)
+    char   time_status[24];     // e.g. FINESTEERING, FREEWHEELING
+
+    char   clock_status[16];    // VALID / INVALID (body field 1)
+    double clock_offset;        // receiver clock offset (s); GPS = ref - this
+    double clock_offset_std;    // 1-sigma of clock_offset (s)
+    double utc_offset;          // signed UTC - GPS (s), e.g. -18.0; leap = -utc_offset
+    char   utc_status[16];      // VALID / INVALID (body field 11)
+
+    unsigned crc_read;          // CRC printed after '*' (0 if absent)
+    unsigned crc_calc;          // CRC we computed over the message
+    int      crc_present;       // 1 if the log carried a *CRC
+    int      crc_ok;            // 1 if crc_read == crc_calc
+} timea_t;
+
+// Parse the first TIMEA log found anywhere in text (leading wrapper bytes are
+// skipped, like bestxyz_parse). On success returns 0 and fills *out; on
+// failure returns -1 and writes a short reason into err (when errsz > 0).
+int timea_parse(const char *text, timea_t *out, char *err, size_t errsz);
+
 // Convert a GPS week + seconds-of-week to UTC, applying leap_seconds.
 // Fills broken-down UTC using this codebase's convention (full year,
 // month 1-12) plus the fractional second. Pass leap_seconds as
