@@ -366,7 +366,16 @@ process_one_file() {
     fi
 
     local out_text frames beacon_count tcmd_count other_count chain_tag wav
-    out_text="$("$RX_REPLAY" "$decode_path" "${rx_args[@]}" 2>&1 || true)"
+    local rx_rc db_errs
+    # Capture rx_replay's exit code (no `|| true`): non-zero now means a real
+    # store failure, and we must NOT mark this file .decoded if so, or the
+    # dropped packets are skipped forever (issue #52). `if` keeps `set -u`/
+    # pipefail happy without errexit aborting on the non-zero.
+    if out_text="$("$RX_REPLAY" "$decode_path" "${rx_args[@]}" 2>&1)"; then
+        rx_rc=0
+    else
+        rx_rc=$?
+    fi
     [[ -n "$cleanup_path" ]] && rm -f "$cleanup_path"
 
     # The user-facing path is always the source file, regardless of which
@@ -400,13 +409,27 @@ process_one_file() {
             # can spot what actually landed.
             printf '%s\n' "$out_text" | grep -E '^\[t=[^]]*\] (AX100|CSP v1|hex|ascii):'
         fi
+        # rx_replay prints DB write failures to stderr (now captured in
+        # out_text). They used to be grepped away and lost; surface them so a
+        # silent drop is visible in the report, not just inferred later.
+        db_errs="$(printf '%s\n' "$out_text" | grep -E 'packet_db:|FAILED TO STORE|were NOT stored' || true)"
+        if [[ -n "$db_errs" ]]; then
+            echo "    !! packet DB write failure(s):"
+            printf '%s\n' "$db_errs" | sed 's/^/       /'
+        fi
     } >> "$out"
 
     printf 'decoded\t%d\t%d\t%d\t%d\n' "$frames" "$beacon_count" "$tcmd_count" "$other_count" > "$stat"
-    printf '[%d/%d] %s  frames=%d beacons=%d tcmd=%d other=%d\n' \
-        "$pos" "$TOTAL" "$src" "$frames" "$beacon_count" "$tcmd_count" "$other_count" >&2
+    printf '[%d/%d] %s  frames=%d beacons=%d tcmd=%d other=%d%s\n' \
+        "$pos" "$TOTAL" "$src" "$frames" "$beacon_count" "$tcmd_count" "$other_count" \
+        "$([[ "$rx_rc" -ne 0 ]] && printf '  STORE FAILED rc=%d' "$rx_rc")" >&2
 
-    if [[ "$SKIP_DECODED" -eq 1 ]]; then
+    if [[ "$rx_rc" -ne 0 ]]; then
+        # Decode/store failed (e.g. DB contention dropped rows). Do NOT mark
+        # .decoded: leaving the file unmarked means the next run retries it,
+        # and INSERT OR IGNORE makes the retry safe for rows already stored.
+        echo "    !! not marking .decoded (rx_replay rc=$rx_rc); will retry next run" >> "$out"
+    elif [[ "$SKIP_DECODED" -eq 1 ]]; then
         # The marker's mtime is the skip-test key — its presence alone
         # doesn't guarantee freshness if the audio is later overwritten.
         touch "${src}.decoded"

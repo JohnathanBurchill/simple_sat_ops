@@ -118,10 +118,21 @@ typedef struct {
 // the file couldn't be opened); errno is set on real I/O errors.
 packet_db_t *packet_db_open(const char *path);
 
+// packet_db_insert return codes. The sign is the contract callers must
+// honour: >= 0 means the row is safely accounted for (either stored, or an
+// existing duplicate); < 0 means the row was NOT stored and is LOST unless
+// the caller retries. A caller that discards a negative return silently
+// drops received data (see the silent-loss bug, issue #52).
+#define PACKET_DB_INSERT_OK     0    // stored, or a harmless duplicate (dedup)
+#define PACKET_DB_INSERT_ERROR  (-1) // constraint / I/O / misuse — hard failure
+#define PACKET_DB_INSERT_BUSY   (-2) // write lock not won within busy_timeout
+
 // Insert one row. Silently ignores duplicates (rows whose
 // payload_sha1 + source_tool + source_run already exist) so re-runs of
-// the same capture don't double-count. Returns 0 on success or silent
-// dedup, -1 on real DB errors.
+// the same capture don't double-count. Returns PACKET_DB_INSERT_OK (0) on
+// success or silent dedup, PACKET_DB_INSERT_BUSY (-2) when the write lock
+// couldn't be acquired within the busy timeout (contention; the row is
+// lost — retry), or PACKET_DB_INSERT_ERROR (-1) on any other DB error.
 int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec);
 
 // Insert one transmitted-telecommand row. Silently ignores duplicates

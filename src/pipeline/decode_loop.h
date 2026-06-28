@@ -265,6 +265,12 @@ typedef struct {
     long tcmd_response;
     long log_message;
     long bulk_file;
+    // Packet-DB write outcome (only nonzero when a DB is configured).
+    // A failed insert means the decoded packet was NOT stored and is lost
+    // unless the run is retried, so a caller that writes a DB must treat
+    // db_busy + db_error > 0 as a failed run (see issue #52).
+    long db_busy;            // inserts that failed on write-lock contention
+    long db_error;           // inserts that failed on a hard DB error
 } decode_loop_stats_t;
 
 // Zero the cumulative stats. Call before a run if the process decodes

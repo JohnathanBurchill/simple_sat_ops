@@ -2087,10 +2087,20 @@ done:
         }
         decode_loop_stats_t st;
         decode_loop_get_stats(&st);
+        long db_failed = st.db_busy + st.db_error;
         fprintf(stderr, "rx_replay: decode summary (chain=%s):\n", chain);
         fprintf(stderr, "  candidate frames (pre-dedup)   : %ld\n", raw_decodes);
+        const char *db_note = !db ? "— DB not written"
+            : (db_failed > 0 ? "— SOME ROWS FAILED TO STORE (see below)"
+                             : "— all recorded to the DB");
         fprintf(stderr, "  detected (after position dedup): %d  %s\n", n_emitted,
-                db ? "— all recorded to the DB" : "— DB not written");
+                db_note);
+        if (db && db_failed > 0) {
+            fprintf(stderr,
+                    "    DB WRITE FAILURES            : %ld (busy %ld, error %ld)"
+                    " — NOT stored, run will be retried\n",
+                    db_failed, st.db_busy, st.db_error);
+        }
         fprintf(stderr, "    valid CSP header             : %ld\n", st.csp_ok);
         fprintf(stderr, "    RS corrected / uncorrectable : %ld / %ld\n",
                 st.rs_corrected, st.rs_uncorrectable);
@@ -2119,5 +2129,22 @@ done:
     free(bits_scratch);
     free(bytes_scratch);
     free(samples);
+
+    // Exit non-zero if any decoded packet failed to store. decode_passes.sh
+    // keys the ".decoded" skip-marker off this exit code, so a contention/IO
+    // drop is retried next run instead of being marked done and lost forever
+    // (issue #52). Forensics and --no-db runs never write, so db_busy/error
+    // stay 0 and this path returns 0.
+    decode_loop_stats_t fin;
+    decode_loop_get_stats(&fin);
+    long db_failed = fin.db_busy + fin.db_error;
+    if (db_failed > 0) {
+        fprintf(stderr,
+                "rx_replay: %ld decoded packet(s) were NOT stored "
+                "(DB busy %ld, error %ld); exiting non-zero so the caller "
+                "retries instead of marking this capture done.\n",
+                db_failed, fin.db_busy, fin.db_error);
+        return 2;
+    }
     return 0;
 }

@@ -359,9 +359,16 @@ packet_db_t *packet_db_open(const char *path)
     // Set the busy timeout BEFORE any locking statement. The WAL pragma,
     // schema apply, and the migration blocks below all take the write lock;
     // without a timeout in place a concurrent opener that hits the lock fails
-    // the open outright (returns NULL) instead of waiting. 5 s is generous
-    // for our single-row work but bounded enough to surface a real deadlock.
-    sqlite3_busy_timeout(raw, 5000);
+    // the open outright (returns NULL) instead of waiting.
+    //
+    // 60 s, not 5 s: under parallel decode (decode_passes --jobs N) plus a
+    // live receiver writing the same file, a long capture's inserts are
+    // spread across a contended window, and a 5 s timeout let SQLITE_BUSY
+    // drop whole passes (issue #52). The window matters more than the per-row
+    // cost — single-row inserts still return in microseconds when the lock is
+    // free; the timeout only bounds how long a contended insert waits before
+    // giving up. A genuine deadlock still surfaces, just 60 s later.
+    sqlite3_busy_timeout(raw, 60000);
     // WAL gives concurrent readers + one writer without the readers
     // blocking. Multiple receivers writing in parallel still serialise
     // on the single-writer rule, but that's fine at our packet rates.
@@ -578,11 +585,17 @@ int packet_db_insert(packet_db_t *db, const packet_db_record_t *rec)
 
     int rc = sqlite3_step(s);
     if (rc != SQLITE_DONE) {
+        // INSERT OR IGNORE turns a duplicate into SQLITE_DONE, so reaching
+        // here is a genuine failure: the row did NOT land. Distinguish
+        // write-lock contention (retryable) from a hard error so the caller
+        // — and the operator reading the log — can tell "try again" from
+        // "something is broken".
         fprintf(stderr, "packet_db: insert failed: %s\n",
                 sqlite3_errmsg(db->db));
-        return -1;
+        return (rc == SQLITE_BUSY || rc == SQLITE_LOCKED)
+               ? PACKET_DB_INSERT_BUSY : PACKET_DB_INSERT_ERROR;
     }
-    return 0;
+    return PACKET_DB_INSERT_OK;
 }
 
 int packet_db_insert_sent_tcmd(packet_db_t *db, const sent_tcmd_record_t *rec)

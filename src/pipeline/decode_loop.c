@@ -820,5 +820,11 @@ void decode_loop_record_packet(const char *ts,
         .session_dir       = obs_session_dir,
         .capture_origin    = obs_capture_origin,
     };
-    (void)packet_db_insert(g_packet_db, &rec);
+    // Account for the write outcome instead of discarding it. A dropped
+    // insert (busy/error) used to vanish here, letting callers mark a
+    // capture "done" while storing nothing (issue #52). Tallying it lets
+    // rx_replay exit non-zero so decode_passes.sh retries instead.
+    int dbrc = packet_db_insert(g_packet_db, &rec);
+    if (dbrc == PACKET_DB_INSERT_BUSY)       g_stats.db_busy++;
+    else if (dbrc < 0)                       g_stats.db_error++;
 }

@@ -28,6 +28,8 @@
       - csp_present = 0 stores CSP columns as NULL.
       - make_run_id produces a 16-character lower-case hex string + NUL.
       - close() on NULL is a no-op.
+      - a failed insert reports a negative return (never 0), so a dropped
+        row can't masquerade as success (issue #52 silent-loss contract).
 
     Exit status: 0 = all tests passed, non-zero = failure.
 
@@ -631,6 +633,63 @@ static void test_parallel_writers(void)
     snprintf(side, sizeof side, "%s-shm", path); unlink(side);
 }
 
+// ------------------------------------------------------------------
+// 13. A failed insert is reported as a NEGATIVE return, never 0. This is
+//     the contract decode_loop relies on to know a row was dropped: the
+//     silent-loss bug (issue #52) survived because a dropped insert was
+//     indistinguishable from success at this boundary, so the caller marked
+//     the capture "done" and lost the packets. Force a deterministic step
+//     failure by dropping the `packet` table out from under the prepared
+//     statement via a second connection, then assert the insert returns < 0
+//     (not PACKET_DB_INSERT_OK). The earlier success keeps the assertion
+//     honest: it must flip from >= 0 to < 0, not be < 0 unconditionally.
+// ------------------------------------------------------------------
+
+static void test_insert_reports_failure(void)
+{
+    char path[64];
+    if (make_tmp_db_path(path, sizeof path) != 0) {
+        tap_bail("mkstemp"); return;
+    }
+    packet_db_t *db = packet_db_open(path);
+    if (!db) { tap_bail("open"); unlink(path); return; }
+
+    uint8_t payload[8] = {0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc};
+    packet_db_record_t r = make_record(payload, sizeof payload, "selftest");
+    tap_okf(packet_db_insert(db, &r) >= 0,
+            "fail-report: healthy insert reports success (>= 0)");
+
+    // Drop the table from an independent connection. The next step on
+    // packet_db's prepared INSERT then fails ("no such table") — a
+    // deterministic stand-in for any DB-level insert failure (contention,
+    // I/O, schema change).
+    sqlite3 *raw = NULL;
+    int orc = sqlite3_open_v2(path, &raw, SQLITE_OPEN_READWRITE, NULL);
+    if (orc != SQLITE_OK) {
+        tap_bail("raw rw open"); packet_db_close(db); unlink(path); return;
+    }
+    sqlite3_busy_timeout(raw, 60000);
+    int drc = sqlite3_exec(raw, "DROP TABLE packet;", NULL, NULL, NULL);
+    tap_okf(drc == SQLITE_OK, "fail-report: dropped packet table (rc=%d)", drc);
+    sqlite3_close(raw);
+
+    // A different payload so this isn't a dedup no-op: the table is gone, so
+    // the insert must fail and report a negative code (one stderr
+    // "insert failed: no such table" line below is expected).
+    uint8_t payload2[8] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+    packet_db_record_t r2 = make_record(payload2, sizeof payload2, "selftest");
+    int frc = packet_db_insert(db, &r2);
+    tap_okf(frc < 0,
+            "fail-report: insert against a broken DB returns < 0, not 0 (got %d)",
+            frc);
+
+    packet_db_close(db);
+    unlink(path);
+    char side[80];
+    snprintf(side, sizeof side, "%s-wal", path); unlink(side);
+    snprintf(side, sizeof side, "%s-shm", path); unlink(side);
+}
+
 int main(void)
 {
     test_open_fresh_creates_schema();
@@ -645,5 +704,6 @@ int main(void)
     test_make_run_id();
     test_close_null_safe();
     test_parallel_writers();
+    test_insert_reports_failure();
     return tap_done();
 }
