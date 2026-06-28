@@ -36,10 +36,9 @@
                        base64 (a bulk_file's ascii/base64 show the file
                        data after the 5-byte type+offset header)
       /                start a search; Enter applies, Esc cancels,
-                       Backspace edits. A bare number is treated as a
-                       SatNOGS observation id and lists every packet from
-                       that observation; any other text is a LIKE substring
-                       match against the firmware-interpreted text
+                       Backspace edits. Substring-matches the firmware-
+                       interpreted text and also matches the capture's
+                       SatNOGS observation id, so a number finds both
 
     Copyright (C) 2026  Johnathan K Burchill
 
@@ -260,19 +259,6 @@ static const char *satnogs_obs_id(const char *session_dir)
     return slash ? slash + 1 : session_dir;
 }
 
-// True when the `/` search text is a bare SatNOGS observation id — all
-// digits, non-empty — rather than a free-text substring. In that case the
-// search matches the capture's observation id (the trailing component of
-// session_dir) instead of running a decoded_summary LIKE, so typing
-// `/14391496` lists every packet decoded from that observation.
-static int like_is_obs_id(const char *s)
-{
-    if (s == NULL || s[0] == '\0') return 0;
-    for (const char *p = s; *p != '\0'; p++)
-        if (!isdigit((unsigned char)*p)) return 0;
-    return 1;
-}
-
 // Minimal JSON helpers — good enough for the flat top-level fields
 // of a SatNOGS observation detail JSON (station_lat, station_lng,
 // station_alt, station_name, ground_station). Naive strstr matching
@@ -491,7 +477,7 @@ static void run_query(sqlite3 *db)
         "FROM packet WHERE 1=1");
     if (off < 0 || off > (int) sizeof sql) off = (int) sizeof sql;
     int n_params = 0;
-    const char *param_text[4] = {0};
+    const char *param_text[5] = {0};
     char like_pattern[256];
     if (type_filter() != NULL) {
         off += snprintf(sql + off, sizeof sql - off,
@@ -515,24 +501,21 @@ static void run_query(sqlite3 *db)
         if (off > (int) sizeof sql) off = (int) sizeof sql;
     }
     if (like_text[0] != '\0') {
-        if (like_is_obs_id(like_text)) {
-            // A bare numeric search is a SatNOGS observation id: match the
-            // capture's obs id (the trailing component of session_dir),
-            // anchored on the '/' so a longer number can't partial-match.
-            // The same ?N appears twice — SQLite binds a reused parameter
-            // once, so n_params advances by a single value.
-            off += snprintf(sql + off, sizeof sql - off,
-                            " AND (session_dir = ?%d OR session_dir LIKE '%%/' || ?%d)",
-                            n_params + 1, n_params + 1);
-            if (off > (int) sizeof sql) off = (int) sizeof sql;
-            param_text[n_params++] = like_text;
-        } else {
-            snprintf(like_pattern, sizeof like_pattern, "%%%s%%", like_text);
-            off += snprintf(sql + off, sizeof sql - off,
-                            " AND decoded_summary LIKE ?%d", n_params + 1);
-            if (off > (int) sizeof sql) off = (int) sizeof sql;
-            param_text[n_params++] = like_pattern;
-        }
+        // A substring search over the decoded body, OR'd with a match on
+        // the capture's SatNOGS observation id — the trailing component of
+        // session_dir, anchored on the '/' so a longer number can't
+        // partial-match. A bare number isn't special: it searches the
+        // decoded text like any other term and also surfaces its
+        // observation. ?N is the %like% pattern (decoded_summary), ?N+1 is
+        // the raw text (obs id), reused twice and so bound once.
+        snprintf(like_pattern, sizeof like_pattern, "%%%s%%", like_text);
+        off += snprintf(sql + off, sizeof sql - off,
+                        " AND (decoded_summary LIKE ?%d"
+                        " OR session_dir = ?%d OR session_dir LIKE '%%/' || ?%d)",
+                        n_params + 1, n_params + 2, n_params + 2);
+        if (off > (int) sizeof sql) off = (int) sizeof sql;
+        param_text[n_params++] = like_pattern;
+        param_text[n_params++] = like_text;
     }
     snprintf(sql + off, sizeof sql - off,
              " ORDER BY ts_received DESC LIMIT %d", MAX_ROWS);
@@ -1318,21 +1301,12 @@ static void draw_top_bar(int cols)
     if (in_group) {
         snprintf(buf, sizeof buf, " packet_browser  %s", group_header);
     } else {
-        // A bare numeric search reads as a SatNOGS observation id, so label
-        // it as such rather than a free-text search to keep the mode clear.
-        char search_desc[160];
-        if (like_text[0] == '\0')
-            snprintf(search_desc, sizeof search_desc, "search=\"\"");
-        else if (like_is_obs_id(like_text))
-            snprintf(search_desc, sizeof search_desc, "obs-id=%s", like_text);
-        else
-            snprintf(search_desc, sizeof search_desc, "search=\"%s\"", like_text);
         snprintf(buf, sizeof buf,
-                 " packet_browser  filter: type=%-13s origin=%-10s errors=%-6s  %s  | %d row%s",
+                 " packet_browser  filter: type=%-13s origin=%-10s errors=%-6s  search=\"%s\"  | %d row%s",
                  type_filter() ? type_filter() : "all",
                  origin_filter() ? origin_filter() : "all",
                  hide_errors ? "hidden" : "shown",
-                 search_desc, n_rows, n_rows == 1 ? "" : "s");
+                 like_text, n_rows, n_rows == 1 ? "" : "s");
     }
     mvaddnstr(0, 0, buf, cols);
     if (g_have_color) attroff(COLOR_PAIR(PAIR_BAR));
@@ -2105,11 +2079,10 @@ static int parse_args(pbr_args_t *a, int argc, char **argv, int help)
                "                   -> log -> bulk_file -> all)\n"
                "  o                cycle capture-origin filter (all -> cts_ground\n"
                "                   -> satnogs -> all)\n"
-               "  /                start a search. A bare number is a SatNOGS\n"
-               "                   observation id (lists every packet from that\n"
-               "                   observation); any other text is a substring\n"
-               "                   search against the firmware-interpreted text.\n"
-               "                   Enter applies, Esc cancels.\n"
+               "  /                start a search. Substring-matches the\n"
+               "                   firmware-interpreted text and also matches the\n"
+               "                   capture's SatNOGS observation id, so a number\n"
+               "                   finds both. Enter applies, Esc cancels.\n"
                "  l                toggle timestamp display: UTC (storage) <-> local\n"
                "  s                toggle the recording-station summary in the\n"
                "                   detail panel (satnogs rows only; the values\n"

@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`5ca6f1e` (2026-06-28). This is a working draft.
+`568f925` (2026-06-28). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2009,8 +2009,9 @@ arguments.
 (`<root>/packet_db.sqlite`, where `<root>` is `$FRONTIERSAT_ROOT` if set
 and otherwise `/FrontierSat`; override the whole path with
 `$SSO_PACKET_DB` or `--db=<path>`). Filter by satellite, frame type,
-time range, source tool, capture origin, or a SatNOGS observation id
-(`--obs-id=14391496` lists every packet decoded from that observation).
+time range, source tool, or capture origin. `--like` matches the decoded
+text and also the capture's SatNOGS observation id, so
+`--like=14391496` lists every packet decoded from that observation.
 Output as a table
 (default), JSON, CSV, or raw bytes via `--format=table|json|csv|raw`.
 The `json`, `csv`, and `raw` forms emit the **whole** payload and
@@ -2039,10 +2040,10 @@ top bar reads `errors=shown` or `errors=hidden`, and like the type and
 origin filters it applies to the main list only (the command group and
 file-reconstruction sub-views always show every packet). Cycle the type
 filter with `t`, the capture-origin filter with `o`, and start a
-search with `/`. A bare number typed at the `/` prompt is treated as a
-SatNOGS observation id and lists every packet from that observation (the
-top bar reads `obs-id=...`); any other text is a substring search of the
-decoded text. (In the file-reconstruction
+search with `/`. The search substring-matches the decoded text and also
+matches the capture's SatNOGS observation id, so typing an observation
+number lists every packet from that observation alongside any text hits.
+(In the file-reconstruction
 view `e` means something different - it exports the reconstructed bytes,
 described below.)
 
