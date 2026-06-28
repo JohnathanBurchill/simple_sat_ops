@@ -11,6 +11,7 @@
       packet_query --type=beacon --like='%eps_mode=SAFETY%' --format=json
       packet_query --type=beacon --limit=1 --format=raw  > beacon.bin
       packet_query --since=7d --source-tool=rx_replay --format=csv > replay.csv
+      packet_query --obs-id=14391496        # all packets from a SatNOGS observation
 
     Copyright (C) 2026  Johnathan K Burchill
 
@@ -74,6 +75,7 @@ typedef struct {
     const char *source_tool;
     const char *capture_origin;
     const char *like_arg;
+    const char *obs_id;
     long limit;
     int order_desc;
     enum format fmt;
@@ -133,6 +135,11 @@ static int parse_args(packet_query_args_t *a, int argc, char **argv, int help)
         if (starts_with(arg, "--like=") || help) {
             if (help) parse_help_line(OPTW, "--like=<pattern>", "SQL LIKE over decoded_summary; %% is the wildcard");
             else a->like_arg = arg + 7;
+            matched = 1;
+        }
+        if (starts_with(arg, "--obs-id=") || help) {
+            if (help) parse_help_line(OPTW, "--obs-id=<id>", "all packets from a SatNOGS observation id");
+            else a->obs_id = arg + 9;
             matched = 1;
         }
         if (starts_with(arg, "--limit=") || help) {
@@ -369,6 +376,7 @@ int main(int argc, char **argv)
     const char *source_tool = cfg.source_tool;
     const char *capture_origin = cfg.capture_origin;
     const char *like_arg = cfg.like_arg;
+    const char *obs_id = cfg.obs_id;
     long limit = cfg.limit;
     int order_desc = cfg.order_desc;
     enum format fmt = cfg.fmt;
@@ -488,6 +496,16 @@ int main(int argc, char **argv)
         sql_off += snprintf(sql + sql_off, sizeof sql - sql_off,
                             " AND decoded_summary LIKE ?%d", n_params + 1);
         ADD_PARAM_TXT(like_arg);
+    }
+    if (obs_id != NULL) {
+        // Match the capture's SatNOGS observation id — the trailing path
+        // component of session_dir — anchored on the '/' so a longer number
+        // can't partial-match. The same ?N appears twice; SQLite binds a
+        // reused parameter once, so n_params advances by a single value.
+        sql_off += snprintf(sql + sql_off, sizeof sql - sql_off,
+                            " AND (session_dir = ?%d OR session_dir LIKE '%%/' || ?%d)",
+                            n_params + 1, n_params + 1);
+        ADD_PARAM_TXT(obs_id);
     }
 
     sql_off += snprintf(sql + sql_off, sizeof sql - sql_off,
