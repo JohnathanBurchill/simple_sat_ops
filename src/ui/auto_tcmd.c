@@ -286,6 +286,12 @@ static void auto_field_kill_to_end(auto_tcmd_t *a) {
     if (!buf) return;
     ui_tf_kill_to_end(buf, &a->cursors[a->focus]);
 }
+static void auto_field_kill_word_back(auto_tcmd_t *a) {
+    size_t cap = 0;
+    char *buf = auto_field_buf(a, a->focus, &cap);
+    if (!buf) return;
+    ui_tf_kill_word_back(buf, &a->cursors[a->focus]);
+}
 static void auto_field_left(auto_tcmd_t *a) {
     size_t cap = 0;
     if (!auto_field_buf(a, a->focus, &cap)) return;
@@ -949,6 +955,8 @@ int auto_tcmd_handle_key(state_t *state, int key) {
         auto_field_delete(a);
     } else if (key == 11) {
         auto_field_kill_to_end(a);
+    } else if (key == 23 /* Ctrl-W */) {
+        auto_field_kill_word_back(a);
     } else if (key == KEY_LEFT) {
         auto_field_left(a);
     } else if (key == KEY_RIGHT) {

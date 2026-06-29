@@ -61,6 +61,7 @@
 #include "packet_db.h"
 #include "sso_paths.h"
 #include "tcmd_response.h"
+#include "ui_textfield.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -1752,6 +1753,12 @@ static int prompt_export_filename(int rows_total, int cols, char *buf, size_t bu
                 if (cur > 0) { memmove(buf + cur - 1, buf + cur, (size_t)(len - cur + 1)); cur--; len--; }
                 continue;
             }
+            if (ch == 23 /* Ctrl-W */) {
+                int c = (int) cur;
+                ui_tf_kill_word_back(buf, &c);
+                cur = c; len = (long) strlen(buf);
+                continue;
+            }
             if (ch >= 0x20 && ch < 0x7F && len + 1 < (long) bufsz) {
                 memmove(buf + cur + 1, buf + cur, (size_t)(len - cur + 1));
                 buf[cur] = (char) ch; cur++; len++;
@@ -2002,6 +2009,10 @@ static int prompt_search(int rows_total, int cols)
         }
         if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
             if (len > 0) buf[--len] = '\0';
+        } else if (ch == 23 /* Ctrl-W */) {
+            int c = (int) len;
+            ui_tf_kill_word_back(buf, &c);
+            len = strlen(buf);
         } else if (ch >= 0x20 && ch < 0x7F && len + 1 < sizeof buf) {
             buf[len++] = (char)ch;
             buf[len] = '\0';

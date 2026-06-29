@@ -808,7 +808,8 @@ if (OPENSSL_FOUND)
 
     # Curses TUI sibling of packet_query.
     if (NCURSES_FOUND)
-        add_executable(packet_browser utils/packet_browser.c)
+        add_executable(packet_browser utils/packet_browser.c
+                       src/ui/ui_textfield.c)
         target_compile_definitions(packet_browser PRIVATE
             PACKET_BROWSER_HAVE_NCURSES)
         target_include_directories(packet_browser PRIVATE
@@ -824,7 +825,8 @@ if (OPENSSL_FOUND)
         # Command explorer over the sent_tcmd table (mirror of
         # packet_browser). Links beacon_cts1 for tcmd_response decoding.
         add_executable(tcmd_browser utils/tcmd_browser.c
-                       src/beacon/beacon_cts1.c)
+                       src/beacon/beacon_cts1.c
+                       src/ui/ui_textfield.c)
         target_compile_definitions(tcmd_browser PRIVATE
             TCMD_BROWSER_HAVE_NCURSES)
         target_include_directories(tcmd_browser PRIVATE

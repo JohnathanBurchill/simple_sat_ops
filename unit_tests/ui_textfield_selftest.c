@@ -125,6 +125,43 @@ int main(void)
                "kill-to-end truncates at the cursor");
     }
 
+    // --- kill word back (Ctrl-W) -------------------------------------
+    {
+        char buf[8] = "abc";
+        int cur = 0;
+        int r = ui_tf_kill_word_back(buf, &cur);
+        tap_ok(r == 0 && strcmp(buf, "abc") == 0 && cur == 0,
+               "kill-word-back at the start is a no-op (returns 0)");
+    }
+    {
+        char buf[16] = "hello world";
+        int cur = 11;                                  // end
+        int r = ui_tf_kill_word_back(buf, &cur);
+        tap_ok(r == 1 && strcmp(buf, "hello ") == 0 && cur == 6,
+               "kill-word-back removes the trailing word, keeps the gap");
+    }
+    {
+        char buf[16] = "hello world";
+        int cur = 5;                                   // right after "hello"
+        int r = ui_tf_kill_word_back(buf, &cur);
+        tap_ok(r == 1 && strcmp(buf, " world") == 0 && cur == 0,
+               "kill-word-back deletes the word left of the cursor only");
+    }
+    {
+        char buf[16] = "foo bar   ";
+        int cur = 10;                                  // end, after 3 spaces
+        int r = ui_tf_kill_word_back(buf, &cur);
+        tap_ok(r == 1 && strcmp(buf, "foo ") == 0 && cur == 4,
+               "kill-word-back eats trailing spaces then the word");
+    }
+    {
+        char buf[8] = "   ";
+        int cur = 3;
+        int r = ui_tf_kill_word_back(buf, &cur);
+        tap_ok(r == 1 && strcmp(buf, "") == 0 && cur == 0,
+               "kill-word-back on only-spaces clears them");
+    }
+
     // --- cursor moves ------------------------------------------------
     {
         char buf[8] = "abc";

@@ -37,6 +37,7 @@
 #include "packet_db.h"
 #include "sso_version.h"
 #include "tcmd_response.h"
+#include "ui_textfield.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -497,6 +498,7 @@ static int prompt_search(int rows_total, int cols)
         }
         if (ch == 27) { curs_set(0); nodelay(stdscr, TRUE); return 0; }
         if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) { if (len > 0) buf[--len] = '\0'; }
+        else if (ch == 23 /* Ctrl-W */) { int c = (int) len; ui_tf_kill_word_back(buf, &c); len = strlen(buf); }
         else if (ch >= 0x20 && ch < 0x7F && len + 1 < sizeof buf) { buf[len++] = (char)ch; buf[len] = '\0'; }
     }
 }
