@@ -46,16 +46,29 @@
          snapped out to the 195-byte download-chunk boundaries, and prints
          ready-to-use comms_bulk_file_downlink_start commands to re-fetch them.
 
+    When those re-fetched chunks come back they land in the packet DB as new
+    bulk_file packets, one per missing offset. Rather than reassemble the file
+    by hand in packet_browser, pass the new packets' DB ids with --patch and the
+    store with --db: each bulk_file payload is [type:1][file_offset:4 LE][data..],
+    and this tool lays that data over the matching '?' run in the raw file before
+    decoding -- closing the gaps the first download missed.
+
     Usage:
       cam_reconstruct <camera-file> [--jpg=<out.jpg>] [--fill=00|ff]
                       [--chunk=<bytes>] [--file-path=<sat-path>] [--quiet]
+                      [--db=<packet_db.sqlite>] [--patch=<id,id,...>]
 
     With no --jpg, the output is the input path with a trailing ".bin" removed
     (if present) and ".jpg" appended. --file-path sets the on-satellite path
     printed in the re-download commands (default a "<file_path>" placeholder,
     since the downloaded file is usually named by content hash on the ground).
+    --patch takes one or more bulk_file packet ids (the flag may repeat, and
+    each value may be a comma-separated list) and needs --db to point at the
+    packet store the ids live in.
 
-    Standalone: depends only on the C library. Buildable on the Mac dev host.
+    Standalone except for the optional --patch path, which reads the packet DB
+    and needs sqlite3 (compiled in when sqlite3 is found, as for packet_browser).
+    Everything else depends only on the C library and builds on the Mac host.
 
     Copyright (C) 2026  Johnathan K Burchill
 
@@ -79,6 +92,10 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifdef WITH_SQLITE3
+#include <sqlite3.h>
+#endif
+
 #include "cam_jpeg.h"
 
 // Bulk-downlink chunk size: the firmware sends this many file bytes per RF
@@ -88,6 +105,15 @@
 #define DEFAULT_CHUNK_BYTES     195
 
 #define GAP_CHAR                '?'    // simple_sat_ops fills lost bytes with this
+
+// A bulk_file packet payload is [packet_type:1][file_offset:4 LE][data...].
+// Same geometry packet_browser uses to place download chunks by file offset.
+#define BULK_FILE_PACKET_TYPE   16
+#define BULK_FILE_HEADER_SIZE   5
+
+// Most --patch ids a single image can need: a 25 KB capture is ~129 chunks, so
+// this is comfortably above any real run and bounds the fixed id array.
+#define MAX_PATCH_IDS           1024
 
 // Parse two hex chars at p into a byte value, or -1 if either isn't hex.
 static long parse_hex2(const char *p)
@@ -126,14 +152,125 @@ static uint8_t *read_file(const char *path, long *out_len)
     return buf;
 }
 
+#ifdef WITH_SQLITE3
+
+// Little-endian uint32 file_offset out of a bulk_file payload.
+static long bulk_file_offset(const uint8_t *pl)
+{
+    return (long) pl[1] | ((long) pl[2] << 8)
+         | ((long) pl[3] << 16) | ((long) pl[4] << 24);
+}
+
+// Lay the re-downloaded bulk_file packets named by `ids` over the raw camera
+// file in `buf`, overwriting the '?' gap bytes the first download missed. Each
+// packet's data goes at its own file_offset -- exactly where simple_sat_ops
+// left a gap. A missing id, a non-bulk_file id, or an offset outside the file
+// is warned and skipped, not fatal. Returns the number of gap bytes filled, or
+// -1 if the DB itself could not be opened.
+static long apply_patches(const char *db_path, uint8_t *buf, long len,
+                          const long *ids, int n_ids, int quiet)
+{
+    if (db_path == NULL) {
+        fprintf(stderr, "--patch needs --db=<packet_db.sqlite> to read the packets from.\n");
+        return -1;
+    }
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        fprintf(stderr, "cannot open %s: %s\n", db_path,
+                db ? sqlite3_errmsg(db) : "out of memory");
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT packet_type, payload FROM packet WHERE id = ?1",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "query failed on %s: %s\n", db_path, sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return -1;
+    }
+
+    if (!quiet) printf("patching from %s:\n", db_path);
+    long total_filled = 0;
+    for (int i = 0; i < n_ids; i++) {
+        sqlite3_reset(stmt);
+        sqlite3_bind_int64(stmt, 1, (sqlite3_int64) ids[i]);
+        if (sqlite3_step(stmt) != SQLITE_ROW) {
+            fprintf(stderr, "  id %ld: not found -- skipped\n", ids[i]);
+            continue;
+        }
+        int ptype = sqlite3_column_int(stmt, 0);
+        if (ptype != BULK_FILE_PACKET_TYPE) {
+            fprintf(stderr, "  id %ld: packet_type %d is not bulk_file (%d) -- skipped\n",
+                    ids[i], ptype, BULK_FILE_PACKET_TYPE);
+            continue;
+        }
+        const uint8_t *pl = (const uint8_t *) sqlite3_column_blob(stmt, 1);
+        int pl_len = sqlite3_column_bytes(stmt, 1);
+        if (pl == NULL || pl_len <= BULK_FILE_HEADER_SIZE) {
+            fprintf(stderr, "  id %ld: payload too short (%d bytes) -- skipped\n",
+                    ids[i], pl_len);
+            continue;
+        }
+        long off = bulk_file_offset(pl);
+        long dl = pl_len - BULK_FILE_HEADER_SIZE;
+        const uint8_t *src = pl + BULK_FILE_HEADER_SIZE;
+        if (off < 0 || off >= len) {
+            fprintf(stderr, "  id %ld: file offset %ld is outside the file (0..%ld) -- skipped\n",
+                    ids[i], off, len);
+            continue;
+        }
+        int clipped = 0;
+        if (off + dl > len) { dl = len - off; clipped = 1; }
+        long filled = 0, changed = 0;
+        for (long k = 0; k < dl; k++) {
+            if (buf[off + k] == GAP_CHAR) filled++;
+            else if (buf[off + k] != src[k]) changed++;
+            buf[off + k] = src[k];
+        }
+        total_filled += filled;
+        if (!quiet) {
+            printf("  id %ld -> offset %ld, %ld bytes (%ld gap byte%s filled",
+                   ids[i], off, dl, filled, filled == 1 ? "" : "s");
+            if (changed) printf(", %ld changed", changed);
+            if (clipped) printf(", clipped to file end");
+            printf(")\n");
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    if (!quiet) printf("\n");
+    return total_filled;
+}
+
+#else  // !WITH_SQLITE3
+
+// Patch ids name DB rows, so the feature needs sqlite3; main only calls this
+// when ids were given, so any call here means the build can't honour them.
+static long apply_patches(const char *db_path, uint8_t *buf, long len,
+                          const long *ids, int n_ids, int quiet)
+{
+    (void) db_path; (void) buf; (void) len; (void) ids; (void) n_ids; (void) quiet;
+    fprintf(stderr,
+        "--patch needs sqlite3 support, which this build lacks.\n"
+        "Rebuild with sqlite3 installed (brew install sqlite), or reassemble the\n"
+        "missing packets by hand in packet_browser.\n");
+    return -1;
+}
+
+#endif // WITH_SQLITE3
+
 int main(int argc, char **argv)
 {
     const char *in_path = NULL;
     const char *out_path = NULL;
     const char *sat_file_path = "<file_path>";
+    const char *db_path = NULL;
     uint8_t fill = 0x00;
     long chunk = DEFAULT_CHUNK_BYTES;
     int quiet = 0;
+    long patch_ids[MAX_PATCH_IDS];
+    int  n_patch_ids = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -148,6 +285,27 @@ int main(int argc, char **argv)
             if (chunk <= 0) { fprintf(stderr, "--chunk must be positive\n"); return 2; }
         } else if (strncmp(a, "--file-path=", 12) == 0) {
             sat_file_path = a + 12;
+        } else if (strncmp(a, "--db=", 5) == 0) {
+            db_path = a + 5;
+        } else if (strncmp(a, "--patch=", 8) == 0) {
+            // One or more packet ids, comma- or space-separated; the flag may
+            // also repeat. strtol stops at each separator and reports where.
+            const char *s = a + 8;
+            while (*s) {
+                char *end = NULL;
+                long v = strtol(s, &end, 0);
+                if (end == s) {
+                    fprintf(stderr, "--patch expects packet ids, e.g. --patch=30088,30090\n");
+                    return 2;
+                }
+                if (n_patch_ids >= MAX_PATCH_IDS) {
+                    fprintf(stderr, "--patch: too many ids (max %d)\n", MAX_PATCH_IDS);
+                    return 2;
+                }
+                patch_ids[n_patch_ids++] = v;
+                s = end;
+                while (*s == ',' || *s == ' ') s++;
+            }
         } else if (strcmp(a, "--quiet") == 0) {
             quiet = 1;
         } else if (a[0] == '-') {
@@ -164,13 +322,22 @@ int main(int argc, char **argv)
     if (in_path == NULL) {
         fprintf(stderr,
             "usage: cam_reconstruct <camera-file> [--jpg=<out.jpg>] [--fill=00|ff]\n"
-            "                       [--chunk=<bytes>] [--file-path=<sat-path>] [--quiet]\n");
+            "                       [--chunk=<bytes>] [--file-path=<sat-path>] [--quiet]\n"
+            "                       [--db=<packet_db.sqlite>] [--patch=<id,id,...>]\n");
         return 2;
     }
 
     long len = 0;
     uint8_t *buf = read_file(in_path, &len);
     if (buf == NULL) return 1;
+
+    // Lay any re-downloaded packets over the raw file before decoding, so the
+    // filled bytes flow into both the JPEG and the still-missing report below.
+    if (n_patch_ids > 0
+        && apply_patches(db_path, buf, len, patch_ids, n_patch_ids, quiet) < 0) {
+        free(buf);
+        return 1;
+    }
 
     if (!cam_jpeg_is_camera_file(buf, len)) {
         fprintf(stderr,

@@ -437,8 +437,17 @@ list(APPEND SSO_TARGETS beacon_detect)
 # Boom-camera JPEG reconstructor: parses the START_CAM sentence stream out of a
 # downloaded camera file, rebuilds the JPEG (best effort across lost packets),
 # and lists the file ranges to re-download. The sentence-decode core in
-# cam_jpeg.c is shared with packet_browser. Standalone -- C library only.
+# cam_jpeg.c is shared with packet_browser. C library only, except the optional
+# --patch path: it reads re-downloaded packets from the packet DB, so it links
+# sqlite3 and defines WITH_SQLITE3 when sqlite3 is present (the feature errors
+# out at runtime otherwise, like packet_browser's DB views).
 add_executable(cam_reconstruct utils/cam_reconstruct.c utils/cam_jpeg.c)
+if (SQLITE3_FOUND)
+    target_compile_definitions(cam_reconstruct PRIVATE WITH_SQLITE3)
+    target_include_directories(cam_reconstruct PRIVATE ${SQLITE3_INCLUDE_DIRS})
+    target_link_directories(cam_reconstruct PRIVATE ${SQLITE3_LIBRARY_DIRS})
+    target_link_libraries(cam_reconstruct PRIVATE ${SQLITE3_LIBRARIES})
+endif()
 list(APPEND SSO_TARGETS cam_reconstruct)
 
 # Shared FFT / dB / detrend / notch / zoom pipeline. Used by both the
