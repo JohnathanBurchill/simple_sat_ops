@@ -673,6 +673,15 @@ add_executable(duration_fmt_selftest
 target_include_directories(duration_fmt_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS duration_fmt_selftest)
 
+# Width-limited "..." clip used by the TX-log panel + auto-tcmd modal so a
+# long command shows a truncation marker instead of vanishing (issue #56).
+# Golden boundary cases, a reconstruct oracle sweep, and a buffer guard.
+# Pure C, no ncurses.
+add_executable(clip_ellipsis_selftest
+               unit_tests/clip_ellipsis_selftest.c src/ui/ui_text.c)
+target_include_directories(clip_ellipsis_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+list(APPEND SSO_TARGETS clip_ellipsis_selftest)
+
 # FIR decimator selftest. Audits constructor validation, accessors,
 # DC unity gain, passband transparency, anti-alias rejection (> 30 dB
 # in the would-alias stopband), decimation-ratio output count, and
@@ -1175,7 +1184,7 @@ endif()
 if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
     add_executable(simple_sat_ops apps/main.c apps/cli_args.c
                    src/ui/tui.c src/ui/spectrogram.c src/ui/panels.c
-                   src/ui/duration_fmt.c
+                   src/ui/duration_fmt.c src/ui/ui_text.c
                    src/ui/tx_compose.c src/ui/tx_log.c src/ui/viewer.c
                    src/ui/auto_tcmd.c src/ui/cmd_line.c src/ui/input.c
                    src/ui/keybindings.c

@@ -28,6 +28,7 @@
 #include "sso_pseudo.h"
 #include "sso_time.h"
 #include "tcmd_lint.h"      // TCMD_RF_MAX_LEN, tcmd_lint_file
+#include "ui_text.h"        // clip_ellipsis
 #include "ui_textfield.h"
 
 #include <ctype.h>
@@ -425,11 +426,16 @@ static void auto_tcmd_draw(state_t *state) {
         mvwprintw(w, 10, 2, "Progress: (no commands loaded)");
     }
     wclrtoeol(w);
-    mvwprintw(w, 11, 2, "Last sent: %.*s",
-              width - 14, a->last_sent[0] ? a->last_sent : "-");
+    // Mark a clip with a trailing "..." rather than letting the command /
+    // status text vanish silently off the modal's right edge. #56.
+    char shown[SSO_TX_TEXT_MAX + 16];
+    mvwprintw(w, 11, 2, "Last sent: %s",
+              clip_ellipsis(shown, sizeof shown,
+                            a->last_sent[0] ? a->last_sent : "-", width - 14));
     wclrtoeol(w);
-    mvwprintw(w, 12, 2, "Status:    %.*s",
-              width - 14, a->status_msg[0] ? a->status_msg : "-");
+    mvwprintw(w, 12, 2, "Status:    %s",
+              clip_ellipsis(shown, sizeof shown,
+                            a->status_msg[0] ? a->status_msg : "-", width - 14));
     wclrtoeol(w);
 
     // Outcome of the most recent serviced burst. The modal covers the bottom

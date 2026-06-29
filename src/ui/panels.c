@@ -29,6 +29,7 @@
 #include "prediction.h"
 #include "sso_ipc.h"
 #include "sso_time.h"
+#include "ui_text.h"
 
 #include <math.h>
 #include <ncurses.h>
@@ -49,6 +50,11 @@
 
 // Warn in the predictions panel when the TLE epoch is older than this.
 #define WARN_DAYS_SINCE_EPOCH 1.0
+
+// Most power-above-noise dots the vertical RX ribbon packs leftward from
+// its timeline marker. render_ribbon_vertical draws them; render_tx_log_panel
+// reserves room for them so a long TX-log line doesn't run into the ribbon.
+#define RIBBON_DOTS_MAX 4
 
 //
 // Ribbon tick semantics: every 20 seconds in absolute push-time gets a
@@ -111,9 +117,14 @@ void low_disk_refresh(op_t *op, double t_now)
 void render_tx_log_panel(const tx_t *tx, int start_row, int col)
 {
     int row = start_row;
-    // Cap width so clrtoeol-equivalent padding doesn't wipe the
-    // vertical ribbon (rendered at col COLS-2). Leave a 1-col gap.
-    int safe_w = COLS - col - 3;
+    // Reserve the right edge for the vertical RX ribbon (the "scrolling
+    // power level"): its timeline marker sits at col COLS-2 and its power
+    // dots pack up to RIBBON_DOTS_MAX columns further left, to COLS-2-
+    // RIBBON_DOTS_MAX. Stop the TX log a clear gap before that left-most
+    // power-dot column so a long command never merges into the ribbon. #56.
+    const int ribbon_gap = 6;  // blank columns between the text and the dots
+    int ribbon_leftmost  = (COLS - 2) - RIBBON_DOTS_MAX;
+    int safe_w = (ribbon_leftmost - ribbon_gap) - col;
     if (safe_w < 8)   safe_w = 8;
     if (safe_w > 200) safe_w = 200;
 
@@ -150,17 +161,13 @@ void render_tx_log_panel(const tx_t *tx, int start_row, int col)
             snprintf(line, sizeof line, "%s  %s %s%s",
                      e->ts, tag, src, e->ascii);
         }
-        // If the line overflows the column, mark the clip with a
-        // trailing "..." so the operator knows the on-screen text was
-        // cut — the full command still went out (tx.log has it). #56.
-        if ((int)strlen(line) > safe_w) {
-            line[safe_w - 3] = '.';
-            line[safe_w - 2] = '.';
-            line[safe_w - 1] = '.';
-            line[safe_w]     = '\0';
-        }
+        // Clip to the column with a trailing "..." so the operator knows
+        // the on-screen text was cut — the full command still went out
+        // (tx.log has it). %-*s then pads to safe_w to wipe stale cells. #56.
+        char shown[SSO_TX_TEXT_MAX + 96];
         attron(attr);
-        mvprintw(row++, col, "%-*.*s", safe_w, safe_w, line);
+        mvprintw(row++, col, "%-*s", safe_w,
+                 clip_ellipsis(shown, sizeof shown, line, safe_w));
         attroff(attr);
     }
 }
@@ -406,7 +413,6 @@ void render_ribbon_vertical(const rx_panel_data_t *d,
     if (col < 4) return;
 
     const int RIBBON_DB_PER_DOT = 10;
-    const int RIBBON_DOTS_MAX   = 4;
 
     // Median-of-peaks noise estimate. With RIBBON_LEN=60 and bursts
     // lasting a second or two, the median sits firmly in the noise
