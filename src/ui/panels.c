@@ -150,6 +150,15 @@ void render_tx_log_panel(const tx_t *tx, int start_row, int col)
             snprintf(line, sizeof line, "%s  %s %s%s",
                      e->ts, tag, src, e->ascii);
         }
+        // If the line overflows the column, mark the clip with a
+        // trailing "..." so the operator knows the on-screen text was
+        // cut — the full command still went out (tx.log has it). #56.
+        if ((int)strlen(line) > safe_w) {
+            line[safe_w - 3] = '.';
+            line[safe_w - 2] = '.';
+            line[safe_w - 1] = '.';
+            line[safe_w]     = '\0';
+        }
         attron(attr);
         mvprintw(row++, col, "%-*.*s", safe_w, safe_w, line);
         attroff(attr);
