@@ -72,6 +72,7 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/src/ui
     ${CMAKE_SOURCE_DIR}/src/control
     ${CMAKE_BINARY_DIR}/generated
+    ${CMAKE_SOURCE_DIR}/sgp4sdp4
 )
 
 # Bake the git commit into sso_version.h so every tool's -V / --version
@@ -126,7 +127,12 @@ pkg_check_modules(RAYLIB raylib)
 # without it, rx_replay still handles .wav/.iq, and .ogg errors with a
 # clear hint.
 pkg_check_modules(SNDFILE sndfile)
-find_library(SGP4SDP4_LIB sgp4sdp4)
+# Build the vendored sgp4sdp4 as part of this project. The library target
+# declares its source directory as a PUBLIC include path, so every target
+# that links against it automatically gets <sgp4sdp4.h> on the include
+# search path without any extra target_include_directories call here.
+add_subdirectory(sgp4sdp4)
+set(SGP4SDP4_LIB sgp4sdp4)
 # pthread for the sso_audit writer thread + the rx_session worker.
 # Used by target_link_sso_core() and the simple_sat_ops link line.
 set(THREADS_PREFER_PTHREAD_FLAG ON)

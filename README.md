@@ -126,10 +126,6 @@ A Mac dev host with neither SDR library still builds the non-RF tools
 (`next_in_queue`, `tle_keps`, the unit tests, …); the SDR backends are soft
 and turn themselves off if their library is missing.
 
-The bundled [`sgp4sdp4`](https://github.com/KJ7LNW/sgp4sdp4) orbit library
-is a separate CMake project that must be built and installed first — see
-`sgp4sdp4/README.md`.
-
 ## Graphical tools over SSH (raylib OpenGL 2.1 rebuild)
 
 `decode_inspector` and `live_waterfall` are raylib apps. raylib's default
