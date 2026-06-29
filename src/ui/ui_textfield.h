@@ -55,6 +55,11 @@ void ui_tf_right(const char *buf, int *cursor);
 void ui_tf_home(int *cursor);
 void ui_tf_end(const char *buf, int *cursor);
 
+// Delete from the cursor back to the start of the previous word (Unix ^W).
+// Skips trailing spaces, then removes the word before the cursor. Returns 1
+// if anything was deleted.
+int ui_tf_kill_word_back(char *buf, int *cursor);
+
 // Clamp the cursor into [0, strlen(buf)].
 void ui_tf_clamp_cursor(const char *buf, int *cursor);
 
