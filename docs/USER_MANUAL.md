@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`ad7babb` (2026-06-28). This is a working draft.
+`f41d923` (2026-06-28). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2027,7 +2027,12 @@ Bare tokens combine with the `--` filters too. Output as a table
 The `json`, `csv`, and `raw` forms emit the **whole** payload and
 decoded summary - there is no length cap, so a large packet comes out in
 full. `table` is the one-line-per-frame summary view; use the other
-three when you want every byte.
+three when you want every byte. Add `--full` to the table view to expand
+each match into a complete, human-readable dump - every field (CSP
+header, integrity counts, pointing geometry, capture provenance), the
+decoded summary, and an offset/hex/ASCII dump of the whole payload - so
+you can read a packet end to end on the terminal without switching to
+`json`/`csv`/`raw`.
 
 `packet_browser` is an ncurses TUI over the same database. Scroll
 through frames, expand to inspect the raw bytes and decoded fields,

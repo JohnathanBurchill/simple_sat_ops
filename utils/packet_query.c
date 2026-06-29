@@ -18,6 +18,7 @@
       packet_query --since=24h --type=tcmd_response
       packet_query --type=beacon --like='%eps_mode=SAFETY%' --format=json
       packet_query --type=beacon --limit=1 --format=raw  > beacon.bin
+      packet_query 14391496 --full          # every field + a full hex/ASCII payload dump
       packet_query --since=7d --source-tool=rx_replay --format=csv > replay.csv
       packet_query --like=14391496          # decoded text or SatNOGS observation id
 
@@ -87,6 +88,10 @@ typedef struct {
     int order_desc;
     enum format fmt;
     int local_time;
+    // --full: in table mode, expand each match into every field plus a
+    // full hex/ASCII dump of the payload (the json/csv/raw formats
+    // already carry the whole packet, so it's a no-op there).
+    int full;
     // Bare positional tokens: each is a free-text search term. Multiple
     // terms are AND'd, each matched as a substring across a row's text
     // columns, timestamp, and ids. Capped — a query with more than this
@@ -194,6 +199,11 @@ static int parse_args(packet_query_args_t *a, int argc, char **argv, int help)
         if (strcmp(arg, "--local-time") == 0 || help) {
             if (help) parse_help_line(OPTW, "--local-time", "render ts in local TZ (filter/sort still UTC)");
             else a->local_time = 1;
+            matched = 1;
+        }
+        if (strcmp(arg, "--full") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--full", "table mode: every field + full hex/ASCII payload dump");
+            else a->full = 1;
             matched = 1;
         }
         if (starts_with(arg, "--db=") || help) {
@@ -363,6 +373,29 @@ static void csv_escape(const char *in, char *out, size_t outn)
     out[o < outn ? o : outn - 1] = '\0';
 }
 
+// Print a classic offset/hex/ASCII dump of the payload to stdout, each
+// row indented by `indent` spaces: "<off>  <8 hex> <8 hex>  |<ascii>|".
+// Non-printable bytes show as '.'. Used by --full to render the whole
+// packet on the terminal; the json/csv/raw formats already carry every
+// byte, so this is the table-mode equivalent.
+static void hex_dump(const uint8_t *bytes, size_t n, int indent)
+{
+    for (size_t off = 0; off < n; off += 16) {
+        printf("%*s%04zx  ", indent, "", off);
+        for (size_t i = 0; i < 16; i++) {
+            if (off + i < n) printf("%02x ", bytes[off + i]);
+            else             printf("   ");
+            if (i == 7) putchar(' ');
+        }
+        printf(" |");
+        for (size_t i = 0; i < 16 && off + i < n; i++) {
+            unsigned char c = bytes[off + i];
+            putchar((c >= 0x20 && c < 0x7f) ? (int)c : '.');
+        }
+        printf("|\n");
+    }
+}
+
 // Hex-encode a BLOB into out (NUL-terminated). Truncates at outn-1 hex
 // chars if the blob is too big.
 static void hex_encode(const uint8_t *bytes, size_t n,
@@ -405,6 +438,7 @@ int main(int argc, char **argv)
     int order_desc = cfg.order_desc;
     enum format fmt = cfg.fmt;
     int local_time = cfg.local_time;
+    int full = cfg.full;
     const char *const *terms = cfg.terms;
     int n_terms = cfg.n_terms;
 
@@ -653,13 +687,39 @@ int main(int argc, char **argv)
         switch (fmt) {
         case FMT_TABLE: {
             char azel[40] = "";
-            if (has_az && has_el) {
+            // In --full the geom line below carries az/el (plus range,
+            // rate, doppler), so skip the compact header suffix.
+            if (!full && has_az && has_el) {
                 snprintf(azel, sizeof azel, "  az=%.1f° el=%+.1f°", az, el);
             }
             printf("%-7lld %-30s %-13s %-10s %-15s %-9s %d%s\n",
                    id, ts_disp[0] ? ts_disp : "?", tool ? tool : "?",
                    capture_origin_row ? capture_origin_row : "-",
                    pname ? pname : "?", sat ? sat : "-", rs_errs, azel);
+            if (full) {
+                printf("        csp: src=%d dst=%d dport=%d sport=%d "
+                       "prio=%d flags=0x%02x\n",
+                       csp_src, csp_dst, csp_dport, csp_sport,
+                       csp_prio, csp_flags);
+                printf("        integrity: rs_errs=%d golay_errs=%d crc=%s "
+                       "hmac=%s\n",
+                       rs_errs, golay_errs,
+                       crc_status == 1 ? "ok" : crc_status == 0 ? "MISMATCH" : "n/a",
+                       hmac_ok == 1 ? "ok" : hmac_ok == 0 ? "MISMATCH" : "off");
+                if (has_az || has_el || has_range || has_rrate || has_dop) {
+                    printf("        geom:");
+                    if (has_az)    printf(" az=%.2f°", az);
+                    if (has_el)    printf(" el=%+.2f°", el);
+                    if (has_range) printf(" range=%.1fkm", range_km);
+                    if (has_rrate) printf(" rate=%+.4fkm/s", range_rate);
+                    if (has_dop)   printf(" doppler=%+.1fHz", doppler_hz);
+                    printf("\n");
+                }
+                if (has_offset) printf("        audio_offset_s=%.3f\n", aoff);
+                if (run)        printf("        run=%s\n", run);
+                if (has_tle)    printf("        tle_id=%lld\n", tle_id);
+                if (session_dir) printf("        session_dir=%s\n", session_dir);
+            }
             if (summary != NULL) {
                 // Indent each line of summary under the row header.
                 const char *p = summary;
@@ -671,6 +731,10 @@ int main(int argc, char **argv)
                     p = eol + 1;
                     if (*p == '\0') break;
                 }
+            }
+            if (full) {
+                printf("        payload (%d bytes):\n", payload_n);
+                hex_dump(payload, (size_t)payload_n, 8);
             }
             break;
         }
