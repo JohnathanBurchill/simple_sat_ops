@@ -1874,10 +1874,17 @@ static void draw_detail(int top_y, int height, int cols)
         char geom[256];
         int gp = 0;
         gp += snprintf(geom + gp, sizeof geom - gp, "geom:");
+        // ASCII only: the degree sign is two UTF-8 bytes but one column,
+        // and narrow ncurses (the default over SSH, where the locale
+        // falls back to C/POSIX) counts bytes. That desyncs the
+        // virtual-screen column accounting from the terminal, so the
+        // diff-based refresh leaves stale tail content on the next
+        // render — which made range= pick up trailing junk when
+        // navigating between packets. Same fix as the bottom bar below.
         if (r->geom_az_valid)
-            gp += snprintf(geom + gp, sizeof geom - gp, " az=%.2f°", r->geom_az_deg);
+            gp += snprintf(geom + gp, sizeof geom - gp, " az=%.2fdeg", r->geom_az_deg);
         if (r->geom_el_valid)
-            gp += snprintf(geom + gp, sizeof geom - gp, " el=%.2f°", r->geom_el_deg);
+            gp += snprintf(geom + gp, sizeof geom - gp, " el=%.2fdeg", r->geom_el_deg);
         if (r->geom_range_valid)
             gp += snprintf(geom + gp, sizeof geom - gp, " range=%.1fkm", r->geom_range_km);
         if (r->geom_range_rate_valid)
@@ -1894,7 +1901,7 @@ static void draw_detail(int top_y, int height, int cols)
         char st[256];
         if (station_cache_for(r->session_dir)) {
             snprintf(st, sizeof st,
-                     "station: %s (id=%d) lat=%.4f° lng=%.4f° alt=%dm",
+                     "station: %s (id=%d) lat=%.4fdeg lng=%.4fdeg alt=%dm",
                      g_station_cache_name[0] ? g_station_cache_name : "?",
                      g_station_cache_id,
                      g_station_cache_lat, g_station_cache_lng,
