@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`08e3438` (2026-06-28). This is a working draft.
+`ad7babb` (2026-06-28). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2012,7 +2012,17 @@ and otherwise `/FrontierSat`; override the whole path with
 time range, source tool, or capture origin. `--like` matches the decoded
 text and also the capture's SatNOGS observation id, so
 `--like=14391496` lists every packet decoded from that observation.
-Output as a table
+
+For a quick lookup you can skip the options entirely and just type the
+thing you're after - a bare token is a free-text search matched as a
+substring across each row's text columns, its timestamp, and its ids. So
+`packet_query 14391496` lists the packets from that SatNOGS observation
+plus any row that mentions that number anywhere, `packet_query 2026-05-08`
+lists everything received that day (and any row whose decoded text
+mentions that date), and `packet_query SAFETY` finds rows whose decoded
+text mentions `SAFETY`. Give several tokens and they're ANDed, so
+`packet_query 2026-05-08 SAFETY` narrows to that day's `SAFETY` hits.
+Bare tokens combine with the `--` filters too. Output as a table
 (default), JSON, CSV, or raw bytes via `--format=table|json|csv|raw`.
 The `json`, `csv`, and `raw` forms emit the **whole** payload and
 decoded summary - there is no length cap, so a large packet comes out in

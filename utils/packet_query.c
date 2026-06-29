@@ -6,7 +6,15 @@
     offline AX100 receivers. Reads only — never writes — so it's safe to
     run while a receiver is filling the DB in another shell.
 
+    A bare token (no --option) is a free-text search: it's matched as a
+    substring across the row's text columns, its timestamp, and its ids,
+    so you can type a date, a SatNOGS observation id, a satellite name, or
+    anything that appears in the decoded text and get the matching packets.
+
     Examples:
+      packet_query 14391496                 # SatNOGS obs id, or that number anywhere in a row
+      packet_query 2026-05-08               # everything received that day
+      packet_query SAFETY                   # any row whose decoded text mentions SAFETY
       packet_query --since=24h --type=tcmd_response
       packet_query --type=beacon --like='%eps_mode=SAFETY%' --format=json
       packet_query --type=beacon --limit=1 --format=raw  > beacon.bin
@@ -79,7 +87,16 @@ typedef struct {
     int order_desc;
     enum format fmt;
     int local_time;
+    // Bare positional tokens: each is a free-text search term. Multiple
+    // terms are AND'd, each matched as a substring across a row's text
+    // columns, timestamp, and ids. Capped — a query with more than this
+    // many terms is almost certainly a mistake.
+    const char *terms[8];
+    int n_terms;
 } packet_query_args_t;
+
+#define MAX_TERMS ((int)(sizeof(((packet_query_args_t *)0)->terms) \
+                         / sizeof(((packet_query_args_t *)0)->terms[0])))
 
 // Option column width: the widest label below ("--format=table|json|csv|raw")
 // + a small margin. See src/cli/argparse.h for the parse_args convention.
@@ -88,7 +105,8 @@ typedef struct {
 // Parse argv into *a (help == 0), or print one right-aligned help line per
 // option and return (help != 0). Each option is one self-contained block whose
 // test carries "|| help", so help mode falls through and prints them all.
-// packet_query takes no positional argument; every token is an option.
+// A bare token (anything not starting with '-') is collected as a free-text
+// search term; everything else is an option.
 static int parse_args(packet_query_args_t *a, int argc, char **argv, int help)
 {
     int ntokens = help ? 1 : argc - 1;
@@ -96,6 +114,19 @@ static int parse_args(packet_query_args_t *a, int argc, char **argv, int help)
         const char *arg = help ? "" : argv[t + 1];
         int matched = 0;
 
+        // Positional first so <term> lists above the --options in help.
+        if ((arg[0] != '\0' && arg[0] != '-') || help) {
+            if (help) parse_help_line(OPTW, "<term> ...",
+                "free-text search (date, obs id, text); substring, ANDed");
+            else if (a->n_terms < MAX_TERMS) {
+                a->terms[a->n_terms++] = arg;
+            } else {
+                fprintf(stderr, "packet_query: too many search terms "
+                        "(max %d)\n", MAX_TERMS);
+                return PARSE_ERROR;
+            }
+            matched = 1;
+        }
         if (strcmp(arg, "--help") == 0 || help) {
             if (help) parse_help_line(OPTW, "--help", "show this help and exit");
             else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
@@ -374,6 +405,8 @@ int main(int argc, char **argv)
     int order_desc = cfg.order_desc;
     enum format fmt = cfg.fmt;
     int local_time = cfg.local_time;
+    const char *const *terms = cfg.terms;
+    int n_terms = cfg.n_terms;
 
     if (fmt == FMT_RAW && limit != 1) {
         fprintf(stderr, "packet_query: --format=raw needs --limit=1 "
@@ -423,7 +456,11 @@ int main(int argc, char **argv)
     }
     sqlite3_busy_timeout(db, 5000);
 
-    char sql[2048];
+    // Generous: the base SELECT plus up to MAX_TERMS free-text groups
+    // (~330 chars each) and the option clauses fit with room to spare.
+    // snprintf below underflows its size argument if sql_off ever passes
+    // sizeof sql, so headroom here is a correctness margin, not just style.
+    char sql[8192];
     int n_params = 0;
     int sql_off = snprintf(sql, sizeof sql,
         "SELECT id, ts_received, satellite, packet_type, packet_type_name, "
@@ -435,10 +472,16 @@ int main(int argc, char **argv)
         "FROM packet WHERE 1=1");
 
     // Slot 0..n_params-1 in these arrays mirror SQL ?1..?n_params.
+    // Sized for every option clause plus MAX_TERMS free-text terms.
     enum { TXT, INT_ };
-    int param_kind[16];
-    const char *param_text[16];
-    long param_int[16];
+    int param_kind[32];
+    const char *param_text[32];
+    long param_int[32];
+
+    // Backing storage for the "%term%" patterns the free-text search binds.
+    // SQLITE_TRANSIENT copies at bind time, but the pointers handed to
+    // ADD_PARAM_TXT must stay valid until then, so these live in main's frame.
+    char term_pat[MAX_TERMS][512];
 
 #define ADD_PARAM_TXT(s) do { \
         param_kind[n_params] = TXT; \
@@ -498,6 +541,31 @@ int main(int argc, char **argv)
                             " OR session_dir = ?%d OR session_dir LIKE '%%/' || ?%d)",
                             n_params + 1, n_params + 1, n_params + 1);
         ADD_PARAM_TXT(like_arg);
+    }
+
+    // Free-text terms (bare positional tokens). Each term is wrapped in
+    // SQL-LIKE wildcards and OR'd across the row's text columns, its
+    // timestamp (so a date like "2026-05-08" matches that day), and its
+    // ids (so an observation id matches session_dir, and a row/tle id
+    // matches too). The single ?N is reused across all columns of one
+    // term; multiple terms are AND'd, narrowing the result.
+    for (int i = 0; i < n_terms; i++) {
+        snprintf(term_pat[i], sizeof term_pat[i], "%%%s%%", terms[i]);
+        int p = n_params + 1;
+        sql_off += snprintf(sql + sql_off, sizeof sql - sql_off,
+                            " AND ("
+                            "ts_received LIKE ?%d"
+                            " OR IFNULL(satellite,'') LIKE ?%d"
+                            " OR packet_type_name LIKE ?%d"
+                            " OR IFNULL(decoded_summary,'') LIKE ?%d"
+                            " OR IFNULL(source_tool,'') LIKE ?%d"
+                            " OR IFNULL(source_run,'') LIKE ?%d"
+                            " OR IFNULL(session_dir,'') LIKE ?%d"
+                            " OR IFNULL(capture_origin,'') LIKE ?%d"
+                            " OR CAST(id AS TEXT) LIKE ?%d"
+                            " OR CAST(tle_id AS TEXT) LIKE ?%d)",
+                            p, p, p, p, p, p, p, p, p, p);
+        ADD_PARAM_TXT(term_pat[i]);
     }
 
     sql_off += snprintf(sql + sql_off, sizeof sql - sql_off,

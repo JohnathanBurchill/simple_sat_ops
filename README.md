@@ -75,7 +75,7 @@ for most often:
 | `next_in_queue` | Print upcoming overpasses from a file of TLEs (no hardware needed). |
 | `sdr_probe` | Report the attached SDR(s) and the RX/TX ports `simple_sat_ops` will use. |
 | `packet_browser` | ncurses explorer over the decoded-packet database; reconstructs and exports downlinked files. |
-| `packet_query` | Non-interactive query of the same database from the shell (scripts, JSON/CSV export). |
+| `packet_query` | Non-interactive query of the same database from the shell (scripts, JSON/CSV export); a bare token (date, observation id, text) is a free-text search. |
 | `tcmd_browser` | The inverse of `packet_browser`: browse transmitted telecommands and the responses they drew. |
 | `agenda_check` | Lint a telecommand agenda file against the flight firmware's command set. |
 | `rx_replay` | Re-decode a recorded pass (`.wav`, or a SatNOGS `.ogg`) offline with different decoder settings. |
