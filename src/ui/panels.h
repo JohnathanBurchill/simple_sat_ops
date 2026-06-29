@@ -158,6 +158,18 @@ void render_operator_screen(state_t *state, double jul_utc, double t_now);
 // Shared by the TX-compose and auto-tcmd modals.
 void draw_box(WINDOW *w);
 
+// printf a line at (row, col) inside a boxed modal window, clipped with a
+// trailing "..." so it can never reach the box's right border (one blank
+// column is left as a margin before the border). Use this for every modal
+// content line so a long value shows it was cut instead of running into —
+// or over — the frame. Does not clear to end of line; the caller's
+// per-frame werase handles that.
+void mvw_printf_clip(WINDOW *w, int row, int col, const char *fmt, ...)
+#if defined(__GNUC__)
+    __attribute__((format(printf, 4, 5)))
+#endif
+    ;
+
 // CSI fallback parser for terminals where ncurses' keypad mode doesn't
 // translate arrow/nav keys into KEY_* (some tmux configs). Returns a KEY_*
 // code, or -1 if the lookahead isn't a recognised CSI. Shared by the modals.

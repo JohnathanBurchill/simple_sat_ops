@@ -28,7 +28,6 @@
 #include "sso_pseudo.h"
 #include "sso_time.h"
 #include "tcmd_lint.h"      // TCMD_RF_MAX_LEN, tcmd_lint_file
-#include "ui_text.h"        // clip_ellipsis
 #include "ui_textfield.h"
 
 #include <ctype.h>
@@ -353,14 +352,13 @@ static void auto_tcmd_draw(state_t *state) {
     draw_box(w);
     int width = getmaxx(w);
 
-    mvwprintw(w, 0, 2, " Auto-TCMD (operator: %s)%s ",
-              state->op.operator_user ? state->op.operator_user : "?",
-              state->tx.no_tx ? "  [--no-tx]" : "");
+    mvw_printf_clip(w, 0, 2, " Auto-TCMD (operator: %s)%s ",
+                    state->op.operator_user ? state->op.operator_user : "?",
+                    state->tx.no_tx ? "  [--no-tx]" : "");
 
-    mvwprintw(w, 1, 2, "File:    %.*s  (%d commands)",
-              width - 28, a->file_path[0] ? a->file_path : "(none)",
-              a->n_commands);
-    wclrtoeol(w);
+    mvw_printf_clip(w, 1, 2, "File:    %.*s  (%d commands)",
+                    width - 28, a->file_path[0] ? a->file_path : "(none)",
+                    a->n_commands);
 
     // Fields are read-only while the run is active or while a prompt /
     // paused state owns the modal -- only the SETUP form is editable.
@@ -373,15 +371,13 @@ static void auto_tcmd_draw(state_t *state) {
                          a->power, 8,
                          !running_ro && a->focus == AUTO_F_POWER,
                          a->cursors[AUTO_F_POWER]);
-    mvwprintw(w, 3, 24, "dB  (B210 TX gain; 0..89.75)");
-    wclrtoeol(w);
+    mvw_printf_clip(w, 3, 24, "dB  (B210 TX gain; 0..89.75)");
 
     auto_draw_text_field(w, 4, 2, "Repeats  ",
                          a->repeats, 6,
                          !running_ro && a->focus == AUTO_F_REPEATS,
                          a->cursors[AUTO_F_REPEATS]);
-    mvwprintw(w, 4, 24, "per command (TCM1 Nx, then TCM2 Nx, ...)");
-    wclrtoeol(w);
+    mvw_printf_clip(w, 4, 24, "per command (TCM1 Nx, then TCM2 Nx, ...)");
 
     auto_draw_text_field(w, 5, 2, "Interval ",
                          a->interval_s, 8,
@@ -391,12 +387,11 @@ static void auto_tcmd_draw(state_t *state) {
     // operator is setting, so the floor is grounded in hardware rather than
     // guessed. Reads "--" until the first burst of the session completes.
     if (state->tx.last_burst_wall_s >= 0.0) {
-        mvwprintw(w, 5, 24, "s min between send starts  (last burst %.2f s)",
-                  state->tx.last_burst_wall_s);
+        mvw_printf_clip(w, 5, 24, "s min between send starts  (last burst %.2f s)",
+                        state->tx.last_burst_wall_s);
     } else {
-        mvwprintw(w, 5, 24, "s min between send starts  (last burst --)");
+        mvw_printf_clip(w, 5, 24, "s min between send starts  (last burst --)");
     }
-    wclrtoeol(w);
 
     char tg[8];
     snprintf(tg, sizeof tg, "[%c]", a->allow_tx ? 'x' : ' ');
@@ -404,17 +399,15 @@ static void auto_tcmd_draw(state_t *state) {
     if (!running_ro && a->focus == AUTO_F_ALLOW_TX) wattron(w, A_REVERSE);
     mvwprintw(w, 7, 2, "%s", tg);
     if (!running_ro && a->focus == AUTO_F_ALLOW_TX) wattroff(w, A_REVERSE);
-    mvwprintw(w, 7, 7, "allow-tx  (required to key the PA)");
-    wclrtoeol(w);
+    mvw_printf_clip(w, 7, 7, "allow-tx  (required to key the PA)");
 
-    mvwprintw(w, 9, 2, "State:    %s", auto_tcmd_state_label(a->state));
-    wclrtoeol(w);
+    mvw_printf_clip(w, 9, 2, "State:    %s", auto_tcmd_state_label(a->state));
     if (a->n_commands > 0) {
         int rt = a->repeats_total > 0 ? a->repeats_total : 0;
         char tx_spent[16], tx_total[16];
         fmt_minsec(a->tx_seconds_spent, tx_spent, sizeof tx_spent);
         fmt_minsec(a->tx_seconds_total, tx_total, sizeof tx_total);
-        mvwprintw(w, 10, 2,
+        mvw_printf_clip(w, 10, 2,
                   "Progress: cmd %d/%d   send %d/%d   total sent: %d   "
                   "(elapsed %s / ~%s)",
                   a->cmd_idx + (a->state == AUTO_STATE_RUNNING ? 1 : 0),
@@ -423,29 +416,21 @@ static void auto_tcmd_draw(state_t *state) {
                   a->sends_total,
                   tx_spent, tx_total);
     } else {
-        mvwprintw(w, 10, 2, "Progress: (no commands loaded)");
+        mvw_printf_clip(w, 10, 2, "Progress: (no commands loaded)");
     }
-    wclrtoeol(w);
-    // Mark a clip with a trailing "..." rather than letting the command /
-    // status text vanish silently off the modal's right edge. #56.
-    char shown[SSO_TX_TEXT_MAX + 16];
-    mvwprintw(w, 11, 2, "Last sent: %s",
-              clip_ellipsis(shown, sizeof shown,
-                            a->last_sent[0] ? a->last_sent : "-", width - 14));
-    wclrtoeol(w);
-    mvwprintw(w, 12, 2, "Status:    %s",
-              clip_ellipsis(shown, sizeof shown,
-                            a->status_msg[0] ? a->status_msg : "-", width - 14));
-    wclrtoeol(w);
+    mvw_printf_clip(w, 11, 2, "Last sent: %s",
+                    a->last_sent[0] ? a->last_sent : "-");
+    mvw_printf_clip(w, 12, 2, "Status:    %s",
+                    a->status_msg[0] ? a->status_msg : "-");
 
     // Outcome of the most recent serviced burst. The modal covers the bottom
     // TX-log panel, so this is the only place the operator sees whether a
     // command reached the air or was rejected (no B210 / dry-run / ...). A
     // NOT-SENT line is drawn bold so a silently-rejecting run can't pass for a
     // transmitting one. See tx_burst_service_request.
-    mvwprintw(w, 13, 2, "Last burst:");
+    mvw_printf_clip(w, 13, 2, "Last burst:");
     if (state->tx.last_burst_outcome[0] == '\0') {
-        mvwprintw(w, 13, 13, "(none yet)");
+        mvw_printf_clip(w, 13, 13, "(none yet)");
     } else if (state->tx.last_burst_on_air) {
         // air    = submit -> done (the half-duplex burst itself)
         // held   = staging -> done (what actually gates the next auto-tcmd send)
@@ -457,41 +442,48 @@ static void auto_tcmd_draw(state_t *state) {
             snprintf(pstr, sizeof pstr, "%.2f", state->tx.last_send_period_s);
         else
             snprintf(pstr, sizeof pstr, "--");
-        char line[120];
-        snprintf(line, sizeof line,
+        mvw_printf_clip(w, 13, 13,
                  "on air - %.30s  air=%.2f held=%.2f period=%s s",
                  state->tx.last_burst_outcome,
                  state->tx.last_burst_wall_s,
                  state->tx.last_burst_slot_s, pstr);
-        mvwprintw(w, 13, 13, "%.*s", width - 15, line);
     } else {
         wattron(w, A_BOLD);
-        mvwprintw(w, 13, 13, "NOT SENT - %.80s",
+        mvw_printf_clip(w, 13, 13, "NOT SENT - %.80s",
                   state->tx.last_burst_outcome);
         wattroff(w, A_BOLD);
     }
-    wclrtoeol(w);
 
     if (a->state == AUTO_STATE_RUNNING) {
-        mvwprintw(w, 14, 2,
+        mvw_printf_clip(w, 14, 2,
                   "Running - s stops   Esc interrupts (pause/abort)");
     } else if (a->state == AUTO_STATE_PAUSE_PROMPT) {
         wattron(w, A_BOLD);
-        mvwprintw(w, 14, 2,
+        mvw_printf_clip(w, 14, 2,
                   "INTERRUPT:  P pause (resume later)   A abort   "
                   "Esc keep running");
         wattroff(w, A_BOLD);
     } else if (a->state == AUTO_STATE_RESUME_PROMPT) {
         wattron(w, A_BOLD);
-        mvwprintw(w, 14, 2,
+        mvw_printf_clip(w, 14, 2,
                   "PAUSED:  R resume from here   S start over   "
                   "Esc keep paused");
         wattroff(w, A_BOLD);
     } else {
-        mvwprintw(w, 14, 2,
+        mvw_printf_clip(w, 14, 2,
                   "Tab focus  Space toggle  Enter start  Esc cancel");
     }
-    wclrtoeol(w);
+
+    // The text-field helper's wclrtoeol clears through the right border
+    // column draw_box drew; repaint the frame's vertical edges so the modal
+    // box stays unbroken on every row. (Content lines use mvw_printf_clip,
+    // which keeps off the border, but the field rows still need this.) Done
+    // before the cursor park below so the focused field keeps the cursor.
+    int height = getmaxy(w);
+    for (int y = 1; y < height - 1; ++y) {
+        mvwaddch(w, y, 0, '|');
+        mvwaddch(w, y, width - 1, '|');
+    }
 
     // Park the hardware cursor on the focused text field's cell. The
     // toggle field has no cursor; read-only states (running / prompts /

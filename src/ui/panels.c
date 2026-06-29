@@ -33,6 +33,7 @@
 
 #include <math.h>
 #include <ncurses.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -885,6 +886,21 @@ void draw_box(WINDOW *w) {
     mvwaddch(w, h - 1, 0, '+');
     for (int x = 1; x < wd - 1; ++x) mvwaddch(w, h - 1, x, '-');
     mvwaddch(w, h - 1, wd - 1, '+');
+}
+
+void mvw_printf_clip(WINDOW *w, int row, int col, const char *fmt, ...)
+{
+    // Columns available between col and the box: stop at wd-3 so the right
+    // border (wd-1) and one margin column (wd-2) are never touched.
+    int max_w = (getmaxx(w) - 2) - col;
+    if (max_w < 0) max_w = 0;
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    char shown[512];
+    mvwprintw(w, row, col, "%s", clip_ellipsis(shown, sizeof shown, buf, max_w));
 }
 
 // Tiny CSI fallback parser for terminals where ncurses' keypad mode

@@ -313,17 +313,15 @@ static void tx_compose_draw(state_t *state, WINDOW *w, const tx_compose_t *c) {
     if (payload_w > (int) sizeof c->payload - 1)
         payload_w = (int) sizeof c->payload - 1;
 
-    mvwprintw(w, 0, 2, " TX compose (operator: %s)%s ",
-              state->op.operator_user ? state->op.operator_user : "?",
-              state->tx.no_tx ? "  [--no-tx]" : "");
+    mvw_printf_clip(w, 0, 2, " TX compose (operator: %s)%s ",
+                    state->op.operator_user ? state->op.operator_user : "?",
+                    state->tx.no_tx ? "  [--no-tx]" : "");
 #ifdef SSO_WITH_SDR
-    mvwprintw(w, 1, 2,
-              "B210: %s",
-              state->sdr.rx_session ? "in-process (this binary)" : "(offline)");
+    mvw_printf_clip(w, 1, 2, "B210: %s",
+                    state->sdr.rx_session ? "in-process (this binary)" : "(offline)");
 #else
-    mvwprintw(w, 1, 2, "B210: (this build has no UHD)");
+    mvw_printf_clip(w, 1, 2, "B210: (this build has no UHD)");
 #endif
-    wclrtoeol(w);
 
     char buf[256];
     // Payload spans most of the modal width so a long telecommand
@@ -337,27 +335,29 @@ static void tx_compose_draw(state_t *state, WINDOW *w, const tx_compose_t *c) {
                        c->power, 8,
                        c->focus == TXF_POWER,
                        c->cursors[TXF_POWER]);
-    mvwprintw(w, 5, 24, "dB  (B210 TX gain; 0..89.75)");
-    wclrtoeol(w);
+    mvw_printf_clip(w, 5, 24, "dB  (B210 TX gain; 0..89.75)");
 
     snprintf(buf, sizeof buf, "[%c]", c->allow_tx ? 'x' : ' ');
     tx_draw_field(w, 7, 2, c->focus == TXF_ALLOW_TX,
                   "", buf);
-    mvwprintw(w, 7, 7, "allow-tx  (required to key the PA)");
-    wclrtoeol(w);
+    mvw_printf_clip(w, 7, 7, "allow-tx  (required to key the PA)");
 
     char summary[SSO_TX_TEXT_MAX];
     tx_compose_summary(c, summary, sizeof summary);
-    mvwprintw(w, 9, 2,  "Preview: %.*s",
-              width - 12, summary);
-    wclrtoeol(w);
-    mvwprintw(w, 10, 2, "Status:  %.*s",
-              width - 12, c->status_msg);
-    wclrtoeol(w);
+    mvw_printf_clip(w, 9, 2,  "Preview: %s", summary);
+    mvw_printf_clip(w, 10, 2, "Status:  %s", c->status_msg);
 
-    mvwprintw(w, 12, 2,
+    mvw_printf_clip(w, 12, 2,
               "Tab focus  Space toggle  Up/Down history  ^A/^E home/end  ^K kill  Enter send  Esc cancel");
-    wclrtoeol(w);
+
+    // The field helpers' wclrtoeol clears through the right border column
+    // draw_box drew; repaint the frame's vertical edges so the modal box
+    // stays unbroken. Before the cursor park so the field keeps the cursor.
+    int height = getmaxy(w);
+    for (int y = 1; y < height - 1; ++y) {
+        mvwaddch(w, y, 0, '|');
+        mvwaddch(w, y, width - 1, '|');
+    }
 
     // Park the hardware cursor over the focused field's text cell so
     // the main loop's curs_set(1) lands a visible blinking cursor on
