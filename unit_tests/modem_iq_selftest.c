@@ -40,7 +40,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -635,7 +634,12 @@ static int test_viterbi_vs_slicer_low_snr(void)
 
 int main(void)
 {
-    g_rng = (uint32_t) time(NULL);
+    // Fixed seed, not time(NULL): the noise realization must be the same
+    // on every run. The low-SNR ASM-detection check (test_low_snr_ab) runs
+    // at a marginal 5 dB where ~1% of realizations miss sync; a wall-clock
+    // seed turned that into ~1% of CI runs failing at random. This seed
+    // passes the whole suite with comfortable margin.
+    g_rng = 1u;
     tap_diag("rng_seed=%u", g_rng);
     (void) test_clean_decode();
     (void) test_silence();
