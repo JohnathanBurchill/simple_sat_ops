@@ -217,11 +217,10 @@ static char     recon_name[256] = "";   // auto filename offered by `e`
 static char     recon_status[200] = ""; // export result, shown in the footer
 
 static int     g_have_color = 0;
-// Toggled by `s`: when on, draw_detail adds a "station: ..." line for
-// satnogs rows, pulling station_lat/lng/alt out of the obs's
-// meta.json on demand. One-entry cache keyed by session_dir keeps the
-// fopen/parse off the hot path when the operator dwells on a row.
-static int     g_show_station = 0;
+// draw_detail adds a "station: ..." line for satnogs rows, pulling the
+// station name and lat/lng/alt out of the obs's meta.json on demand. A
+// one-entry cache keyed by session_dir keeps the fopen/parse off the
+// hot path when the operator dwells on a row.
 static char    g_station_cache_dir[256] = "";
 static int     g_station_cache_ok = 0;
 static char    g_station_cache_name[64] = "";
@@ -1895,9 +1894,10 @@ static void draw_detail(int top_y, int height, int cols)
         mvaddnstr(y, 2, geom, cols - 2);
         y++;
     }
-    // station line — only when the operator toggled it on (`s`) and
-    // the row is a satnogs capture (others have no meta.json to read).
-    if (g_show_station && strcmp(r->origin, "satnogs") == 0) {
+    // station line — always shown for a satnogs capture: the recording
+    // station's name and coordinates come from the obs's meta.json.
+    // Other origins have no meta.json to read, so they're skipped.
+    if (strcmp(r->origin, "satnogs") == 0) {
         char st[256];
         if (station_cache_for(r->session_dir)) {
             snprintf(st, sizeof st,
@@ -2102,13 +2102,14 @@ static int parse_args(pbr_args_t *a, int argc, char **argv, int help)
                "                   capture's SatNOGS observation id, so a number\n"
                "                   finds both. Enter applies, Esc cancels.\n"
                "  l                toggle timestamp display: UTC (storage) <-> local\n"
-               "  s                toggle the recording-station summary in the\n"
-               "                   detail panel (satnogs rows only; the values\n"
-               "                   come from <session>/satnogs_<id>.meta.json).\n"
                "  v                cycle the detail-pane payload view: hex -> ascii\n"
                "                   -> base64. A bulk_file's ascii/base64 views show\n"
                "                   the file data (after the 5-byte type+offset\n"
-               "                   header); hex always shows the whole payload.\n");
+               "                   header); hex always shows the whole payload.\n"
+               "\n"
+               "For a satnogs capture the detail panel always shows a\n"
+               "'station:' line with the recording station's name and\n"
+               "coordinates, read from <session>/satnogs_<id>.meta.json.\n");
     }
     return PARSE_OK;
 }
@@ -2407,9 +2408,6 @@ int main(int argc, char **argv)
                 break;
             case 'l':
                 show_local_time = !show_local_time;
-                break;
-            case 's':
-                g_show_station = !g_show_station;
                 break;
             case 'v':
                 // Cycle the detail-pane payload view: hex -> ascii ->
