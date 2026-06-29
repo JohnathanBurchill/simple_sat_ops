@@ -1344,6 +1344,7 @@ set(SSO_OPERATOR_SCRIPTS
     scripts/fetch_tle.sh
     scripts/gate_beacon_audio.sh
     scripts/migrate_gnss_label.sh
+    scripts/next_satellite.sh
     scripts/nextpass.sh
     scripts/noise_skymap.py
     scripts/pcm2wav.sh
