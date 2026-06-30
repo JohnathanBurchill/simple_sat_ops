@@ -124,6 +124,12 @@ typedef struct ui {
     // Keyboard lock. Starts unlocked (main sets it to 1); 'K' toggles it.
     // The keybindings dispatcher only fires non-KB_ALWAYS keys while set.
     int keyboard_unlocked;
+
+    // Set when the terminal is resized (KEY_RESIZE). The main loop repaints
+    // the whole screen on the next tick -- rather than waiting up to one
+    // redraw period -- so the panels pick up the new width/height and the
+    // old layout's stale cells get wiped right away. See ui/input.c.
+    int need_full_redraw;
 } ui_t;
 
 #endif // UI_STATE_H

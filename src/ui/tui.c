@@ -27,6 +27,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>   // TIOCGWINSZ, struct winsize
 #include <sys/stat.h>
 #include <termios.h>
 #include <time.h>
@@ -262,6 +263,29 @@ int tui_yield_requested(void)
 void tui_register_waterfall_pid(pid_t *pidp)
 {
     g_waterfall_pid_ptr = pidp;
+}
+
+void tui_handle_resize(void)
+{
+    // ncurses *usually* re-queries the size and updates LINES/COLS itself when
+    // it delivers KEY_RESIZE, but not on every build/platform. Do it explicitly
+    // so the panels -- whose truncation widths track COLS -- always follow the
+    // window, instead of staying stuck at the pre-resize size.
+    //
+    // Use resize_term, NOT resizeterm: when ncurses supplies its own SIGWINCH
+    // handler (the default), resizeterm ungetch's a fresh KEY_RESIZE. Calling
+    // it from inside our own KEY_RESIZE handler would re-arm that event on
+    // every getch, an endless loop that starves real keypresses. resize_term
+    // does the same window/LINES/COLS resize without that bookkeeping.
+    struct winsize ws = {0};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0
+        && ws.ws_row > 0 && ws.ws_col > 0) {
+        resize_term(ws.ws_row, ws.ws_col);
+    }
+    // clear() erases stdscr *and* arms clearok, so the next refresh wipes the
+    // physical screen before repainting -- no leftover characters from the
+    // old, differently sized layout (e.g. the vertical ribbon's old column).
+    clear();
 }
 
 void init_window(state_t *state)

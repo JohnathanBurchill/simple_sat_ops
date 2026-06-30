@@ -455,6 +455,18 @@ int main(int argc, char **argv)
         // handler below transmits and emits the SENT/NOT_SENT events.
         auto_tcmd_tick(&state);
 
+        // Terminal was resized this tick (input_handle_keys cleared the old
+        // layout and re-queried the size). Repaint the whole screen now,
+        // ahead of the 2 Hz redraw gate, so the new width/height take effect
+        // immediately. Forcing redraw_due also makes the flush block below
+        // run, which applies the pending clear() and re-stacks any modal.
+        if (state.ui.need_full_redraw) {
+            render_operator_screen(&state, jul_utc, t_now);
+            t_last_redraw = t_now;
+            redraw_due = 1;
+            state.ui.need_full_redraw = 0;
+        }
+
         // Bottom-row prompt + screen flush. When the operator is typing
         // in the ":" prompt we want this every tick (~50 Hz) so each
         // keystroke echoes immediately. Otherwise piggyback on the slow

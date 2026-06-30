@@ -69,6 +69,13 @@ int tui_yield_requested(void);
 // the crash handler can SIGKILL it before re-raising. Pass NULL to clear.
 void tui_register_waterfall_pid(pid_t *pidp);
 
+// Handle a terminal resize (a KEY_RESIZE from getch). Re-queries the real
+// window size and resizes ncurses' internal structures so LINES/COLS track
+// the window even on builds/platforms that don't auto-update them, then arms
+// a full clear so the old layout's stale cells are wiped on the next refresh.
+// The caller still owns repainting -- it should force a redraw afterwards.
+void tui_handle_resize(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -566,6 +566,13 @@ int run_viewer(const char *argv0)
         }
         int key = getch();
         if (key == ERR) continue;
+        if (key == KEY_RESIZE) {
+            // Re-query the size + wipe the old layout, then repaint now rather
+            // than waiting out the 5 s render gate.
+            tui_handle_resize();
+            v.event_pending = 1;
+            continue;
+        }
         if (confirm_armed) {
             if (key == 'y' || key == 'Y') {
                 // Commits: viewer_take_control re-execs on success and

@@ -29,6 +29,7 @@
 #include "scan_sky.h"
 #include "sso_audit.h"
 #include "tracking.h"
+#include "tui.h"
 #include "tx_compose.h"
 
 #include <ncurses.h>
@@ -141,6 +142,14 @@ void kb_act_cmdline(state_t *state, int key)
 void input_handle_keys(state_t *state)
 {
     int key = getch();
+    // Resize is global -- handle it before any modal / command-line routing
+    // so the layout repaints cleanly no matter what is on screen. The main
+    // loop repaints when it sees need_full_redraw.
+    if (key == KEY_RESIZE) {
+        tui_handle_resize();
+        state->ui.need_full_redraw = 1;
+        return;
+    }
     if (state->tx.tx_compose_active) {
         if (!tx_compose_handle_key(state, key)) {
             tx_compose_close(&state->tx);
