@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`c663ae0` (2026-06-30). This is a working draft.
+`2009372` (2026-06-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2778,12 +2778,13 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   and stash each pass in its own folder, laid out so `decode_passes.sh`
   can walk it. Built for unattended cron: idempotent (it tracks fetched
   observation IDs), locked against overlapping runs, atomic writes, and
-  politely rate-limited. Every log line is UTC-timestamped, and the
-  `done` summary reports the API accesses made that run (`api=`) and a
-  running mean per hour (`api_mean=`), so the cron log shows when each
-  tick fired and the headroom left against the SatNOGS throttle (60/hour
-  anonymous, 240 with a token). `--decode` runs the decoder on each new
-  pass as it lands.
+  politely rate-limited. Every log line is UTC-timestamped, and each run
+  ends with a `=== summary` table whose API rows report the accesses made
+  that run (`API calls (run)`) and the accesses in the trailing 60 minutes
+  against the ceiling (`API calls (last hr)`) — the same rolling hour the
+  SatNOGS throttle counts (60 anonymous, 240 with a token), so a one-off
+  backfill burst ages out instead of inflating the figure. `--decode` runs
+  the decoder on each new pass as it lands.
 * **`decode_passes.sh`** — walk a directory tree, find every `.wav` and
   `.ogg`, run `rx_replay` on each (resampling `.ogg` first), and
   summarize what decoded. Beacons print as readable telemetry; anything

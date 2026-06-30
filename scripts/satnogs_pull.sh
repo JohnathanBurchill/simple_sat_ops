@@ -40,11 +40,12 @@
 #   For many satellites at once, raise --rate-limit-ms, stagger the cron
 #   entries, or use a token.
 #
-#   Each run's `done` line reports `api=<n>` (API accesses this run, audio
-#   downloads excluded) and `api_mean=<r>/hr` (running mean since the
-#   window opened), so the log shows headroom against those ceilings. The
-#   window is tracked per archive in <out>/.api_stats.txt; delete it to
-#   reset.
+#   Each run ends with a `=== summary` table whose API rows report the
+#   accesses made this run (audio downloads excluded) and the accesses in
+#   the trailing 60 minutes against the ceiling — the same rolling hour the
+#   SatNOGS throttle counts, so a backfill burst ages out instead of
+#   poisoning the figure. The per-archive tally lives in
+#   <out>/.api_stats.txt; delete it to reset.
 #
 # Usage:
 #   satnogs_pull.sh [--norad-id=<n>] [options]
@@ -227,11 +228,13 @@ to_iso_utc() {
 # observations newer than what we already have.
 STATE_FILE="${OUT}/.latest_start.${NORAD_ID}.txt"
 
-# Per-archive API-access tally: "<first-access-epoch> <cumulative-count>".
-# Not keyed by NORAD ID — the SatNOGS throttle is per client, not per
-# satellite, and every run sharing this archive serialises on the lock,
-# so one shared counter reflects the real request rate even when several
-# satellites pull into the same --out. Delete it to reset the window.
+# Per-archive API-access tally: one "<epoch> <calls>" record per run.
+# Records older than an hour age out each run, so the surviving sum is the
+# request count in the trailing 60 minutes — exactly the rolling hour the
+# SatNOGS throttle counts. Not keyed by NORAD ID: the throttle is per
+# client, not per satellite, and every run sharing this archive serialises
+# on the lock, so one shared file reflects the real rate even when several
+# satellites pull into the same --out. Delete it to reset.
 STATS_FILE="${OUT}/.api_stats.txt"
 
 # Convert "YYYY-MM-DDTHH:MM:SSZ" to epoch (GNU and BSD date variants).
@@ -652,33 +655,50 @@ if [[ -n "$NEWEST_START" ]]; then
     printf '%s\n' "$NEWEST_START" > "$STATE_FILE"
 fi
 
-# Roll this run's API accesses into the per-archive tally and work out the
-# running mean requests/hour, so the log shows where we sit against the
-# SatNOGS throttle (60/hour anonymous, 240 with a token). Safe to do here
-# unlocked: the flock/mkdir lock above serialises every run on this archive.
-API_FIRST_TS=""
-API_TOTAL=0
-if [[ -s "$STATS_FILE" ]]; then
-    read -r API_FIRST_TS API_TOTAL _ < "$STATS_FILE" || true
-fi
+# Roll this run's API accesses into the per-archive tally and total the
+# accesses in the trailing 60 minutes — the same rolling hour the SatNOGS
+# throttle counts (60/hour anonymous, 240 with a token). Keeping a window
+# of per-run records (rather than a cumulative mean) means a one-off
+# backfill burst ages out after an hour instead of inflating the figure
+# for the rest of the day. Safe to do here unlocked: the flock/mkdir lock
+# above serialises every run on this archive.
 NOW_EPOCH_STATS="$(date -u +%s)"
-# Missing or corrupt file => start a fresh window at now.
-case "$API_FIRST_TS" in ''|*[!0-9]*) API_FIRST_TS="$NOW_EPOCH_STATS";; esac
-case "$API_TOTAL"    in ''|*[!0-9]*) API_TOTAL=0;; esac
-API_TOTAL=$((API_TOTAL + API_CALLS))
-printf '%s %s\n' "$API_FIRST_TS" "$API_TOTAL" > "$STATS_FILE"
-
-API_WINDOW_S=$((NOW_EPOCH_STATS - API_FIRST_TS))
-# Hold off on a rate until the window spans a few minutes — before that the
-# mean is dominated by the first run's burst and reads as nonsense.
-if [[ "$API_WINDOW_S" -ge 300 ]]; then
-    API_MEAN="$(awk -v t="$API_TOTAL" -v s="$API_WINDOW_S" \
-        'BEGIN { printf "%.1f/hr", t * 3600.0 / s }')"
-else
-    API_MEAN="warming-up"
+API_WINDOW_START=$((NOW_EPOCH_STATS - 3600))
+API_LAST_HOUR=0
+STATS_TMP="$(mktemp -t satnogs_pull_stats_XXXXXX)"
+if [[ -s "$STATS_FILE" ]]; then
+    # Keep only records inside the trailing hour; drop stale or malformed
+    # lines (this also retires the old cumulative-mean file format).
+    while read -r ts calls _; do
+        case "$ts"    in ''|*[!0-9]*) continue;; esac
+        case "$calls" in ''|*[!0-9]*) continue;; esac
+        if [[ "$ts" -ge "$API_WINDOW_START" ]]; then
+            printf '%s %s\n' "$ts" "$calls" >> "$STATS_TMP"
+            API_LAST_HOUR=$((API_LAST_HOUR + calls))
+        fi
+    done < "$STATS_FILE"
 fi
+printf '%s %s\n' "$NOW_EPOCH_STATS" "$API_CALLS" >> "$STATS_TMP"
+API_LAST_HOUR=$((API_LAST_HOUR + API_CALLS))
+mv -f "$STATS_TMP" "$STATS_FILE"
 
-log "done.  seen=${COUNT_SEEN}  fetched=${COUNT_FETCHED}  skipped=${COUNT_SKIPPED}  failed=${COUNT_FAILED}  api=${API_CALLS}  api_mean=${API_MEAN}${NEWEST_START:+  cursor=${NEWEST_START}}  out=${OUT}"
+# Throttle ceiling for the trailing-hour figure: a token lifts it 60 -> 240.
+if [[ -n "$API_TOKEN" ]]; then API_CEILING=240; else API_CEILING=60; fi
+
+# End-of-run summary table. The API rows sit in their own labelled lines
+# so the request budget reads clearly instead of buried in a stats line.
+log "done (norad ${NORAD_ID})"
+{
+    echo "=== summary"
+    printf '    %-22s %s\n' "observations seen:"  "$COUNT_SEEN"
+    printf '    %-22s %s\n' "downloaded:"         "$COUNT_FETCHED"
+    printf '    %-22s %s\n' "skipped:"            "$COUNT_SKIPPED"
+    printf '    %-22s %s\n' "failed:"             "$COUNT_FAILED"
+    printf '    %-22s %s\n' "API calls (run):"    "$API_CALLS"
+    printf '    %-22s %s\n' "API calls (last hr):" "${API_LAST_HOUR} / ${API_CEILING}"
+    [[ -n "$NEWEST_START" ]] && printf '    %-22s %s\n' "cursor:" "$NEWEST_START"
+    printf '    %-22s %s\n' "archive:"            "$OUT"
+}
 
 if [[ "$DECODE_AFTER" -eq 1 ]]; then
     if [[ -z "$DECODE_PASSES_BIN" ]]; then
