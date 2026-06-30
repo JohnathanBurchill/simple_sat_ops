@@ -117,7 +117,7 @@ NORAD_ID="69015"
 : "${FRONTIERSAT_ROOT:=$([[ -d /FrontierSat ]] && echo /FrontierSat || echo "$HOME/FrontierSat")}"
 OUT="$FRONTIERSAT_ROOT/satnogs_archive"
 SINCE_SPEC=""              # empty => resolve from state file or 24h fallback
-UNTIL_SPEC=""
+UNTIL_SPEC=""              # empty => now (excludes future scheduled passes)
 # Default to no status filter — FrontierSat uses a custom protocol that
 # SatNOGS can't decode, so the auto-classifier leaves our obs at
 # `unknown` indefinitely and `status=good` would silently drop them.
@@ -306,11 +306,18 @@ fi
 
 SINCE_ISO="$(to_iso_utc "$SINCE_SPEC")" || {
     echo "error: bad --since='$SINCE_SPEC'" >&2; exit 2; }
-UNTIL_ISO=""
-if [[ -n "$UNTIL_SPEC" ]]; then
-    UNTIL_ISO="$(to_iso_utc "$UNTIL_SPEC")" || {
-        echo "error: bad --until='$UNTIL_SPEC'" >&2; exit 2; }
+
+# Default the upper bound to now. SatNOGS returns observations
+# newest-first and schedules passes days ahead, so an unbounded query
+# walks every future scheduled pass first — each one an extra (slow)
+# list page plus a wasted detail GET on every run — before reaching the
+# completed passes that actually have audio. Bounding end=now drops the
+# future passes server-side. Pass --until explicitly to widen it.
+if [[ -z "$UNTIL_SPEC" ]]; then
+    UNTIL_SPEC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 fi
+UNTIL_ISO="$(to_iso_utc "$UNTIL_SPEC")" || {
+    echo "error: bad --until='$UNTIL_SPEC'" >&2; exit 2; }
 
 # Newest local TLE — used to override the SatNOGS-shipped per-obs TLE
 # when --tle-dir has at least one .tle. Walks the whole tree so the
