@@ -15,17 +15,30 @@
 #       <out>/<obs-id>/satnogs_<obs-id>.tle           (TLE used by SatNOGS)
 #       <out>/<obs-id>/satnogs_<obs-id>.meta.json     (detail-endpoint JSON)
 #
-# Cron example (every 5 min for FrontierSat, with auto-decode):
-#   */5 * * * * $HOME/bin/satnogs_pull.sh --decode \
+# Cron example (every 4 min for FrontierSat, with auto-decode):
+#   */4 * * * * $HOME/bin/satnogs_pull.sh --decode \
 #       >> $HOME/var/log/sso/satnogs_pull.log 2>&1
 #
 # Courtesy & rate limits
-#   SatNOGS Network has no published hard limit; the project's standing
-#   request is "be sensible — don't hammer." Each incremental run makes
-#   ~3-5 API calls (one list page + a detail GET per new observation +
-#   audio downloads from the CDN), so 5-minute polling for one satellite
-#   stays well inside any reasonable budget. If running for many sats at
-#   once, raise --rate-limit-ms or stagger the cron entries.
+#   The SatNOGS Network API throttles per client: 60 requests/hour
+#   anonymous, 240/hour with an API token (see the libre.space thread
+#   "API and throttling: anonymous vs with API token", topic 12091). A
+#   token raises only the rate ceiling — observation data is public
+#   either way — so pass one with --api-token / $SATNOGS_API_TOKEN when
+#   polling often.
+#
+#   Per run this script makes one list request, plus one detail GET for
+#   each new or still-pending observation; obs already in .fetched.txt
+#   are skipped without a detail GET. A quiet tick is a single request;
+#   a tick that catches a fresh pass is the list plus a detail GET per
+#   observation. Audio is pulled from object storage — a separate host
+#   the API throttle does not count. So 4-minute polling (15 runs/hour)
+#   for one satellite stays well under the anonymous 60/hour in steady
+#   state. A token gives 4x headroom for catch-up runs (a stale cursor
+#   walks the full --lookback-cap window, one detail GET per obs) and
+#   avoids 429s, whose curl --retry would otherwise multiply requests.
+#   For many satellites at once, raise --rate-limit-ms, stagger the cron
+#   entries, or use a token.
 #
 # Usage:
 #   satnogs_pull.sh [--norad-id=<n>] [options]
@@ -64,6 +77,11 @@
 #   --decode                On success, run decode_passes.sh against --out
 #   --rate-limit-ms=<n>     Sleep between HTTP calls (default 250)
 #   --user-agent=<str>      HTTP User-Agent (default "sso-satnogs-pull/1.0")
+#   --api-token=<str>       SatNOGS API token, sent as an Authorization
+#                           header on API requests (never on audio
+#                           downloads). Raises the throttle ceiling from
+#                           60 to 240 requests/hour. Defaults to
+#                           $SATNOGS_API_TOKEN.
 #   --decode-passes=<path>  Override decode_passes.sh location
 #   --db=<path>             Pass SSO_PACKET_DB into the --decode invocation
 #   --jobs=<n>              Parallel decode workers for --decode (passed
@@ -96,6 +114,9 @@ MAX_OBS=200
 DECODE_AFTER=0
 RATE_LIMIT_MS=250
 USER_AGENT="sso-satnogs-pull/1.0"
+# Optional SatNOGS API token. Sent only to the API host, never to the
+# audio/object-storage host. Lifts the throttle from 60 to 240 req/hour.
+API_TOKEN="${SATNOGS_API_TOKEN:-}"
 DECODE_PASSES_BIN=""
 DB_PATH=""
 JOBS_SPEC=""
@@ -123,6 +144,7 @@ while [[ $# -gt 0 ]]; do
         --decode)           DECODE_AFTER=1;;
         --rate-limit-ms=*)  RATE_LIMIT_MS="${1#--rate-limit-ms=}";;
         --user-agent=*)     USER_AGENT="${1#--user-agent=}";;
+        --api-token=*)      API_TOKEN="${1#--api-token=}";;
         --decode-passes=*)  DECODE_PASSES_BIN="${1#--decode-passes=}";;
         --db=*)             DB_PATH="${1#--db=}";;
         --jobs=*)           JOBS_SPEC="${1#--jobs=}";;
@@ -333,12 +355,18 @@ QUERY="norad_cat_id=${NORAD_ID}&start=${SINCE_ISO}"
 
 echo "satnogs_pull: norad=${NORAD_ID}  since=${SINCE_ISO}${UNTIL_ISO:+  until=${UNTIL_ISO}}  status=${STATUS_FILTER:-any}  out=${OUT}"
 
+# API requests carry the token when one is set. curl strips the
+# Authorization header on a cross-host redirect, so -L can't leak it to
+# the object-storage host; audio downloads (curl_audio) never get it.
 curl_api() {
+    local auth=()
+    [[ -n "$API_TOKEN" ]] && auth=(-H "Authorization: Token ${API_TOKEN}")
     curl --silent --show-error --fail -L \
          --connect-timeout 10 --max-time 60 \
          --retry 3 --retry-delay 2 \
          -H "User-Agent: ${USER_AGENT}" \
          -H "Accept: application/json" \
+         ${auth[@]+"${auth[@]}"} \
          "$@"
 }
 
