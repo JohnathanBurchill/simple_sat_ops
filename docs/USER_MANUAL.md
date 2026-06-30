@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`f41d923` (2026-06-28). This is a working draft.
+`34a2f25` (2026-06-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -138,6 +138,7 @@ manual can go back on the shelf where it belongs.
     - [`beacon_detect`](#beacon_detect)
     - [`fm_preview`](#fm_preview)
     - [`packet_query` and `packet_browser`](#packet_query-and-packet_browser)
+    - [`cam_reconstruct`](#cam_reconstruct)
     - [`tcmd_import`](#tcmd_import)
     - [`tcmd_browser`](#tcmd_browser)
     - [`tle_keps`](#tle_keps)
@@ -2098,7 +2099,12 @@ file.** The satellite splits a file into 195-byte chunks, each tagged with
 its `file_offset`, and downlinks them at 9600 baud; `packet_browser`
 reassembles them in offset order into one buffer and shows any bytes it never
 received as `?`. `v` cycles the view (hex / ASCII / base64) and `e` exports
-the reconstructed bytes to a file.
+the reconstructed bytes to a file. When the reassembled file is a boom-camera
+image - it starts with `START_CAM:` - `c` decodes the JPEG it carries and saves
+it (offered in the footer only for those files), filling any still-missing
+packets with zero bytes so a viewer can show what did come down. To fold
+re-downloaded packets back in first, see [`cam_reconstruct`](#cam_reconstruct)
+below.
 
 Because a single capture run can hold more than one download (a second file,
 or the same file fetched again), the reconstruction is scoped to the **one
@@ -2118,6 +2124,52 @@ when a matching `sent_tcmd` row exists - how long after the triggering
 telecommand (`@tssent`) the download began. A download split
 across a long pause, or across separate commands, reconstructs as separate
 bursts; open each from one of its own chunks.
+
+### `cam_reconstruct`
+
+Rebuild a boom-camera JPEG from a downloaded camera file. The satellite
+sends a picture as a stream of `@IIIITTTT...` sentences, each carrying 28
+image bytes at a known offset; `cam_reconstruct` lays them back in order
+and writes a viewable JPEG, recovering as much of the picture as possible
+when some packets never made it down. It is the standalone, scriptable twin
+of `packet_browser`'s `c` key, sharing the same decode core (`cam_jpeg.c`),
+and it also reports the file ranges to re-download for whatever is still
+missing.
+
+```sh
+# Decode a file exported from packet_browser; writes capture.jpg alongside it
+cam_reconstruct capture.bin
+
+# Choose the output name and the gap fill byte (0x00 default, or 0xff)
+cam_reconstruct capture.bin --jpg=boom_20260627.jpg --fill=ff
+```
+
+With no `--jpg`, the output name is the input with `.bin` stripped and
+`.jpg` appended. The run prints how many sentences were present (and how
+many arrived only partially), the recovered/missing image-byte counts and
+percent, and a **re-download list**: each run of still-missing bytes,
+snapped out to whole 195-byte download chunks and printed as a ready-to-send
+`comms_bulk_file_downlink_start(<path>,<offset>,<len>)` telecommand.
+`--chunk=` overrides the chunk size and `--file-path=` sets the on-satellite
+path written into those commands. Missing packets are not an error - the
+tool always writes the best image it has and exits success.
+
+Once those chunks come back down they land as new `bulk_file` packets in the
+packet database. **`--patch=<id,id,...>` together with `--db=<packet_db.sqlite>`
+folds them in**: each named `bulk_file` packet's data is laid over the
+matching `?` gap at its own file offset before the JPEG is decoded and the
+still-missing report is run, so a few re-fetched packets can take a partial
+image the rest of the way to complete. Ids that are missing, not
+`bulk_file` packets, or out of range are warned about and skipped. The
+`--patch` path links SQLite and is only built when SQLite is present (like
+`packet_browser`'s database views); without it the rest of the tool still
+works and `--patch` explains the rebuild.
+
+```sh
+# Three re-downloaded chunks fill the last gaps in a 25 KB capture
+cam_reconstruct capture.bin --db=/FrontierSat/packet_db.sqlite \
+                --patch=84213,84219,84231
+```
 
 ### `tcmd_import`
 
