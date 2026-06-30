@@ -40,6 +40,12 @@
 #   For many satellites at once, raise --rate-limit-ms, stagger the cron
 #   entries, or use a token.
 #
+#   Each run's `done` line reports `api=<n>` (API accesses this run, audio
+#   downloads excluded) and `api_mean=<r>/hr` (running mean since the
+#   window opened), so the log shows headroom against those ceilings. The
+#   window is tracked per archive in <out>/.api_stats.txt; delete it to
+#   reset.
+#
 # Usage:
 #   satnogs_pull.sh [--norad-id=<n>] [options]
 #
@@ -92,6 +98,14 @@
 
 set -uo pipefail
 export LC_ALL=C
+
+# Timestamped logging. The script is built for unattended cron use with
+# stdout/stderr appended to a log file, so every lifecycle line carries a
+# UTC timestamp (matching the SatNOGS API and the rest of this script) to
+# mark when each run — and each step within it — happened.
+now_ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+log()    { printf '%s satnogs_pull: %s\n' "$(now_ts)" "$*"; }
+logerr() { printf '%s satnogs_pull: %s\n' "$(now_ts)" "$*" >&2; }
 
 # Default to FrontierSat — current best-guess NORAD ID. Override with
 # --norad-id=<n> for other satellites.
@@ -172,6 +186,11 @@ command -v jq   >/dev/null 2>&1 \
 
 mkdir -p "$OUT"
 
+# Mark the start of every run up front — before lock contention or the
+# --since resolution can short-circuit — so the cron log always shows
+# when (and whether) a tick fired.
+log "start (norad ${NORAD_ID}, pid $$)"
+
 # Convert a since/until spec into an ISO-8601 Z timestamp. Accepts
 # duration-from-now (90s|30m|24h|7d) or any string with a `T`, which we
 # trust and pass through. The two `date` invocations bridge GNU
@@ -207,6 +226,13 @@ to_iso_utc() {
 # downloaded. We use it as the default cursor so we only ask the API for
 # observations newer than what we already have.
 STATE_FILE="${OUT}/.latest_start.${NORAD_ID}.txt"
+
+# Per-archive API-access tally: "<first-access-epoch> <cumulative-count>".
+# Not keyed by NORAD ID — the SatNOGS throttle is per client, not per
+# satellite, and every run sharing this archive serialises on the lock,
+# so one shared counter reflects the real request rate even when several
+# satellites pull into the same --out. Delete it to reset the window.
+STATS_FILE="${OUT}/.api_stats.txt"
 
 # Convert "YYYY-MM-DDTHH:MM:SSZ" to epoch (GNU and BSD date variants).
 iso_to_epoch() {
@@ -305,7 +331,7 @@ if [[ "$USE_LOCAL_TLE" -eq 1 && -d "$TLE_DIR" ]]; then
                     | sort -nr | head -n 1 | cut -d ' ' -f 2-)"
     fi
 fi
-[[ -n "$LOCAL_TLE" ]] && echo "satnogs_pull: using local TLE $LOCAL_TLE"
+[[ -n "$LOCAL_TLE" ]] && log "using local TLE $LOCAL_TLE"
 
 # Build the comma-separated status filter into a jq selector and a URL
 # query fragment. If STATUS_FILTER is empty, accept everything.
@@ -329,13 +355,13 @@ if command -v flock >/dev/null 2>&1; then
     LOCK_FILE="$OUT/.lock"
     exec 9>"$LOCK_FILE"
     if ! flock -n 9; then
-        echo "satnogs_pull: another instance holds $LOCK_FILE; exiting"
+        log "another instance holds $LOCK_FILE; exiting"
         exit 0
     fi
 else
     LOCK_DIR="$OUT/.lock.d"
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-        echo "satnogs_pull: another instance holds $LOCK_DIR; exiting"
+        log "another instance holds $LOCK_DIR; exiting"
         exit 0
     fi
     add_cleanup "rmdir \"$LOCK_DIR\" 2>/dev/null || true"
@@ -353,7 +379,7 @@ QUERY="norad_cat_id=${NORAD_ID}&start=${SINCE_ISO}"
 [[ -n "$UNTIL_ISO" ]]   && QUERY="${QUERY}&end=${UNTIL_ISO}"
 [[ -n "$STATUS_QUERY" ]] && QUERY="${QUERY}&${STATUS_QUERY}"
 
-echo "satnogs_pull: norad=${NORAD_ID}  since=${SINCE_ISO}${UNTIL_ISO:+  until=${UNTIL_ISO}}  status=${STATUS_FILTER:-any}  out=${OUT}"
+log "norad=${NORAD_ID}  since=${SINCE_ISO}${UNTIL_ISO:+  until=${UNTIL_ISO}}  status=${STATUS_FILTER:-any}  out=${OUT}"
 
 # API requests carry the token when one is set. curl strips the
 # Authorization header on a cross-host redirect, so -L can't leak it to
@@ -425,6 +451,10 @@ COUNT_FETCHED=0
 COUNT_SKIPPED=0
 COUNT_FAILED=0
 COUNT_SEEN=0
+# API accesses made this run: list-page requests plus one detail GET per
+# new/pending observation. Audio downloads go to object storage on a
+# separate host the throttle doesn't count, so they're excluded.
+API_CALLS=0
 NEWEST_START=""
 # Earliest already-happened obs (start < now) we saw without an audio
 # payload yet. Used at the end to clamp the cursor so the next run's
@@ -439,9 +469,10 @@ if [[ -s "$STATE_FILE" ]]; then
 fi
 
 while [[ -n "$URL" && "$COUNT_FETCHED" -lt "$MAX_OBS" ]]; do
-    echo "satnogs_pull: GET $URL"
+    log "GET $URL"
+    API_CALLS=$((API_CALLS + 1))
     if ! JSON="$(list_page "$URL")"; then
-        echo "satnogs_pull: API list request failed" >&2
+        logerr "API list request failed"
         break
     fi
 
@@ -479,6 +510,7 @@ while [[ -n "$URL" && "$COUNT_FETCHED" -lt "$MAX_OBS" ]]; do
         # over time. The detail endpoint returns the canonical audio URL
         # plus the TLE block. One extra GET per new obs is cheap and
         # avoids guessing at file names.
+        API_CALLS=$((API_CALLS + 1))
         if ! OBS="$(curl_api "${API_BASE}${OBS_ID}/?format=json")"; then
             echo "    !! detail fetch failed for obs $OBS_ID" >&2
             COUNT_FAILED=$((COUNT_FAILED + 1))
@@ -574,7 +606,7 @@ while [[ -n "$URL" && "$COUNT_FETCHED" -lt "$MAX_OBS" ]]; do
             fi
         fi
 
-        echo "satnogs_pull: GET $PAYLOAD"
+        log "GET $PAYLOAD"
         TMP="${AUDIO_FILE}.part"
         if curl_audio -o "$TMP" "$PAYLOAD"; then
             mv -f "$TMP" "$AUDIO_FILE"
@@ -613,7 +645,33 @@ if [[ -n "$NEWEST_START" ]]; then
     printf '%s\n' "$NEWEST_START" > "$STATE_FILE"
 fi
 
-echo "satnogs_pull: done.  seen=${COUNT_SEEN}  fetched=${COUNT_FETCHED}  skipped=${COUNT_SKIPPED}  failed=${COUNT_FAILED}${NEWEST_START:+  cursor=${NEWEST_START}}  out=${OUT}"
+# Roll this run's API accesses into the per-archive tally and work out the
+# running mean requests/hour, so the log shows where we sit against the
+# SatNOGS throttle (60/hour anonymous, 240 with a token). Safe to do here
+# unlocked: the flock/mkdir lock above serialises every run on this archive.
+API_FIRST_TS=""
+API_TOTAL=0
+if [[ -s "$STATS_FILE" ]]; then
+    read -r API_FIRST_TS API_TOTAL _ < "$STATS_FILE" || true
+fi
+NOW_EPOCH_STATS="$(date -u +%s)"
+# Missing or corrupt file => start a fresh window at now.
+case "$API_FIRST_TS" in ''|*[!0-9]*) API_FIRST_TS="$NOW_EPOCH_STATS";; esac
+case "$API_TOTAL"    in ''|*[!0-9]*) API_TOTAL=0;; esac
+API_TOTAL=$((API_TOTAL + API_CALLS))
+printf '%s %s\n' "$API_FIRST_TS" "$API_TOTAL" > "$STATS_FILE"
+
+API_WINDOW_S=$((NOW_EPOCH_STATS - API_FIRST_TS))
+# Hold off on a rate until the window spans a few minutes — before that the
+# mean is dominated by the first run's burst and reads as nonsense.
+if [[ "$API_WINDOW_S" -ge 300 ]]; then
+    API_MEAN="$(awk -v t="$API_TOTAL" -v s="$API_WINDOW_S" \
+        'BEGIN { printf "%.1f/hr", t * 3600.0 / s }')"
+else
+    API_MEAN="warming-up"
+fi
+
+log "done.  seen=${COUNT_SEEN}  fetched=${COUNT_FETCHED}  skipped=${COUNT_SKIPPED}  failed=${COUNT_FAILED}  api=${API_CALLS}  api_mean=${API_MEAN}${NEWEST_START:+  cursor=${NEWEST_START}}  out=${OUT}"
 
 if [[ "$DECODE_AFTER" -eq 1 ]]; then
     if [[ -z "$DECODE_PASSES_BIN" ]]; then
@@ -629,12 +687,12 @@ if [[ "$DECODE_AFTER" -eq 1 ]]; then
         done
     fi
     if [[ -z "$DECODE_PASSES_BIN" || ! -x "$DECODE_PASSES_BIN" ]]; then
-        echo "satnogs_pull: --decode requested but decode_passes.sh not found" >&2
+        logerr "--decode requested but decode_passes.sh not found"
         exit 1
     fi
     DECODE_ARGS=( --root "$OUT" )
     [[ -n "$JOBS_SPEC" ]] && DECODE_ARGS+=( --jobs "$JOBS_SPEC" )
-    echo "satnogs_pull: invoking $DECODE_PASSES_BIN ${DECODE_ARGS[*]}"
+    log "invoking $DECODE_PASSES_BIN ${DECODE_ARGS[*]}"
     if [[ -n "$DB_PATH" ]]; then
         SSO_PACKET_DB="$DB_PATH" "$DECODE_PASSES_BIN" "${DECODE_ARGS[@]}"
     else
