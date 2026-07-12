@@ -2249,6 +2249,8 @@ int main(int argc, char **argv)
     nonl();
     keypad(stdscr, TRUE);
     nodelay(stdscr, TRUE);
+    mousemask(BUTTON1_CLICKED | BUTTON4_PRESSED | BUTTON5_PRESSED, NULL);
+    mouseinterval(0);
     // A lone Esc is also the first byte of every arrow/function-key
     // escape sequence, so ncurses waits ESCDELAY (default 1000 ms) for a
     // continuation before reporting a bare Esc. That made Esc-to-back /
@@ -2348,6 +2350,24 @@ int main(int argc, char **argv)
                 break;
             case 'g': case KEY_HOME:  recon_scroll = 0;                  break;
             case 'G': case KEY_END:   recon_scroll = recon_len;          break;
+            case KEY_MOUSE: {
+                MEVENT mevent;
+                if (getmouse(&mevent) == OK) {
+                    int wheel_lines = 3;
+                    if (mevent.bstate & BUTTON4_PRESSED) {
+                        for (int i = 0; i < wheel_lines; i++) {
+                            if (payload_view == PV_ASCII) recon_scroll = recon_text_prev(recon_scroll, cols);
+                            else recon_scroll -= bpr;
+                        }
+                    } else if (mevent.bstate & BUTTON5_PRESSED) {
+                        for (int i = 0; i < wheel_lines; i++) {
+                            if (payload_view == PV_ASCII) recon_scroll = recon_text_next(recon_scroll, cols);
+                            else recon_scroll += bpr;
+                        }
+                    }
+                }
+                break;
+            }
             case 'e': {
                 char nm[256];
                 snprintf(nm, sizeof nm, "%s", recon_name);
@@ -2535,6 +2555,35 @@ int main(int argc, char **argv)
                 // ncurses already updated LINES/COLS; the next loop
                 // iteration redraws.
                 break;
+            case KEY_MOUSE: {
+                MEVENT mevent;
+                if (getmouse(&mevent) == OK) {
+                    int data_top = header_h + 1;
+                    int data_h   = list_h - 1;
+                    if (mevent.bstate & (BUTTON4_PRESSED | BUTTON5_PRESSED)) {
+                        // Wheel scroll moves the viewport, keeping sel
+                        // clamped into it (same convention as Ctrl-E/Ctrl-Y).
+                        int wheel_lines = 3;
+                        if (mevent.bstate & BUTTON4_PRESSED) {
+                            for (int i = 0; i < wheel_lines && top > 0; i++) {
+                                top--;
+                                if (sel >= top + data_h) sel = top + data_h - 1;
+                            }
+                        } else {
+                            for (int i = 0; i < wheel_lines && top < n_rows - 1; i++) {
+                                top++;
+                                if (sel < top) sel = top;
+                            }
+                        }
+                    } else if (mevent.y >= data_top && mevent.y < data_top + data_h) {
+                        int ridx = top + (mevent.y - data_top);
+                        if (ridx >= 0 && ridx < n_rows) {
+                            sel = ridx;
+                        }
+                    }
+                }
+                break;
+            }
             }
         }
 
