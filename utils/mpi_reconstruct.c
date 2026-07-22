@@ -450,17 +450,19 @@ static void emit_run(const char *sat_file_path, long cs, long ce, long size,
     }
 }
 
-// Report the missing data as re-download telecommands. The firmware transmits
-// whole 195-byte packets and a chunk is received or not (CRC pass/fail), so
-// every request asks for a whole number of packets: a command starts at the
-// first missing byte and its length rounds up to a multiple of 195. Missing
-// runs whose whole-packet requests would touch or overlap are coalesced into
-// one command (this only re-fetches present bytes that share a packet with a
-// gap -- unavoidable, since a partial packet can't be requested); a run of
-// fully-received packets between two gaps is left alone. A request wider than
-// the firmware's per-command cap (max_dl) is tiled into back-to-back commands.
-// Note the merged chunks come from passes on different 195-byte grids, so the
-// gaps -- and thus the request offsets -- need not sit on any single grid.
+// Report the missing data as re-download telecommands aligned to the file's
+// fixed 195-byte packet grid. The file is a sequence of 195-byte packets from
+// offset 0 (packet k is bytes [k*195, (k+1)*195)); a packet either arrived or
+// failed its CRC, and you can only ask for whole packets. So a missing run is
+// snapped OUT to packet boundaries -- start rounded down, end rounded up -- and
+// every request offset and length is a multiple of 195 (a single missing byte
+// pulls its one 195-byte packet). Requests for consecutive needed packets are
+// coalesced into one command; a stretch of fully-received packets between two
+// gaps is left alone. A request past the firmware's per-command cap (max_dl) is
+// tiled into back-to-back whole-packet commands. The one length that can be a
+// non-multiple of 195 is the command reaching the file's genuinely partial last
+// packet. (The download's chunks came from passes on different 195-byte grids,
+// which is why raw gaps land off-grid; the re-download uses the canonical grid.)
 static void report_gaps(const uint8_t *present, long size,
                         const char *sat_file_path, long max_dl, int quiet)
 {
@@ -471,7 +473,7 @@ static void report_gaps(const uint8_t *present, long size,
     if (!quiet) printf("  re-download (fewest telecommands, whole 195-byte packets):\n");
     long n_cmds = 0, missing = 0, download = 0;
     long run_start = -1;
-    long cs = -1, ce = -1;   // pending request [cs, ce); ce - cs is a multiple of 195
+    long cs = -1, ce = -1;   // pending request [cs, ce), snapped to the packet grid
 
     // Iterate one past the end so a gap that runs to EOF is closed.
     for (long i = 0; i <= size; i++) {
@@ -481,17 +483,18 @@ static void report_gaps(const uint8_t *present, long size,
         } else if (!gap && run_start >= 0) {
             long a = run_start, b = i;
             missing += b - a;
-            long want_ce = a + ((b - a + PKT - 1) / PKT) * PKT;   // a + ceil(len/195)*195
+            long sa = (a / PKT) * PKT;                    // snap down to a packet start
+            long sb = ((b + PKT - 1) / PKT) * PKT;        // snap up to a packet end
+            if (sb > size) sb = size;                     // last packet is partial at EOF
             if (cs < 0) {
-                cs = a; ce = want_ce;
-            } else if (a <= ce) {
-                // This gap starts inside the pending request's packets: extend
-                // to cover it, keeping the length a whole number of packets.
-                long ext = cs + ((b - cs + PKT - 1) / PKT) * PKT;
-                if (ext > ce) ce = ext;
+                cs = sa; ce = sb;
+            } else if (sa <= ce) {
+                // Same or adjacent packet(s) as the pending request: coalesce.
+                // A fully-received packet in between makes sa > ce, so it splits.
+                if (sb > ce) ce = sb;
             } else {
                 emit_run(sat_file_path, cs, ce, size, tile, quiet, &download, &n_cmds);
-                cs = a; ce = want_ce;
+                cs = sa; ce = sb;
             }
             run_start = -1;
         }

@@ -2209,20 +2209,21 @@ the tail shows the head as missing), the recovered/missing byte counts and
 percent, and the offset range the received data actually spans.
 
 The **re-download list** is the fewest `comms_bulk_file_downlink_start(<path>,
-<offset>,<len>)` telecommands that recover the missing data. The firmware
-transmits whole 195-byte packets and a chunk either arrives or fails its CRC,
-so **every request asks for a whole number of packets**: it starts at the first
-missing byte and its length rounds up to a multiple of 195. Gaps whose
-whole-packet requests would touch are coalesced into one command (which only
-re-fetches received bytes that share a packet with a gap -- unavoidable, since
-you can't ask for a partial packet), while a stretch of fully-received packets
-between two gaps is left alone. A request wider than the firmware's
-1,000,000-byte per-command cap
+<offset>,<len>)` telecommands that recover the missing data, **aligned to the
+file's 195-byte packet grid**. The file is a run of 195-byte packets from offset
+0, and a packet either arrived or failed its CRC, so a request always covers
+whole grid packets: a missing byte pulls the one packet that contains it
+(`offset = floor(byte / 195) * 195`, `len = 195`), and every request offset and
+length is a multiple of 195. Consecutive needed packets are coalesced into one
+command; a stretch of fully-received packets between two gaps is left alone. A
+request wider than the firmware's 1,000,000-byte per-command cap
 (`COMMS_bulk_file_downlink_max_allowable_total_bytes`) is tiled into
-back-to-back commands. Because the download's chunks came from passes on
-different 195-byte grids, request offsets need not sit on any single grid. Feed
-the re-fetched chunks back into the database and re-run to close the gaps.
-`--max-download=<n>` lowers the per-command cap.
+back-to-back commands. (The only non-multiple-of-195 length is the command that
+reaches the file's genuinely partial last packet.) The download's own chunks may
+have come from passes on several offset grids -- which is why the received data
+sits off the packet grid -- but the re-download always uses the canonical grid,
+so re-fetched packets line up cleanly. Feed them back into the database and
+re-run to close the gaps. `--max-download=<n>` lowers the per-command cap.
 
 `--file-path=` sets the on-satellite path written into those commands (the
 ground file is offset-addressed, so it defaults to a `<file_path>`
