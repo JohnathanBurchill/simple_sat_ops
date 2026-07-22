@@ -2209,13 +2209,20 @@ the tail shows the head as missing), the recovered/missing byte counts and
 percent, and the offset range the received data actually spans.
 
 The **re-download list** is the fewest `comms_bulk_file_downlink_start(<path>,
-<offset>,<len>)` telecommands that fetch **only the missing bytes**. A download
-grabs a contiguous range and cannot skip received bytes in its middle, so this
-is one command per contiguous gap (already-received data between gaps is never
-re-fetched), with any gap wider than the firmware's 1,000,000-byte per-command
-cap (`COMMS_bulk_file_downlink_max_allowable_total_bytes`) tiled into
-back-to-back commands. Feed the re-fetched chunks back into the database and
-re-run to close the gaps. `--max-download=<n>` lowers the per-command cap.
+<offset>,<len>)` telecommands that recover the missing data. The firmware
+transmits whole 195-byte packets and a chunk either arrives or fails its CRC,
+so **every request asks for a whole number of packets**: it starts at the first
+missing byte and its length rounds up to a multiple of 195. Gaps whose
+whole-packet requests would touch are coalesced into one command (which only
+re-fetches received bytes that share a packet with a gap -- unavoidable, since
+you can't ask for a partial packet), while a stretch of fully-received packets
+between two gaps is left alone. A request wider than the firmware's
+1,000,000-byte per-command cap
+(`COMMS_bulk_file_downlink_max_allowable_total_bytes`) is tiled into
+back-to-back commands. Because the download's chunks came from passes on
+different 195-byte grids, request offsets need not sit on any single grid. Feed
+the re-fetched chunks back into the database and re-run to close the gaps.
+`--max-download=<n>` lowers the per-command cap.
 
 `--file-path=` sets the on-satellite path written into those commands (the
 ground file is offset-addressed, so it defaults to a `<file_path>`

@@ -430,30 +430,49 @@ static int write_mpi_file(const char *dir, const char *stamp,
     return 0;
 }
 
-// Emit one re-download command spanning [off, off+len).
-static void emit_cmd(const char *sat_file_path, long off, long len, int quiet)
+// Emit the request that covers [cs, ce), tiled so no single command exceeds the
+// firmware's per-command cap. `tile` is a whole number of 195-byte packets, so
+// every command's length is a multiple of 195 -- except the one that reaches
+// the file's end, whose last packet is genuinely partial. ce is clamped to the
+// reconstructed file size. Accumulates the byte and command totals.
+static void emit_run(const char *sat_file_path, long cs, long ce, long size,
+                     long tile, int quiet, long *download, long *n_cmds)
 {
-    if (!quiet)
-        printf("    offset %8ld  len %7ld   "
-               "comms_bulk_file_downlink_start(%s,%ld,%ld)\n",
-               off, len, sat_file_path, off, len);
+    if (ce > size) ce = size;
+    for (long p = cs; p < ce; p += tile) {
+        long q = (p + tile < ce) ? p + tile : ce;
+        if (!quiet)
+            printf("    offset %8ld  len %7ld   "
+                   "comms_bulk_file_downlink_start(%s,%ld,%ld)\n",
+                   p, q - p, sat_file_path, p, q - p);
+        *download += q - p;
+        (*n_cmds)++;
+    }
 }
 
-// Report the missing data as the fewest re-download telecommands that fetch
-// ONLY missing bytes. A download command grabs a contiguous byte range and
-// cannot skip already-received bytes in its middle, so the minimum command set
-// is one command per maximal run of contiguous missing bytes -- with a run
-// wider than one download (max_dl, the firmware's per-command cap) tiled into
-// back-to-back max-length commands. The command spans the exact missing range;
-// offsets are NOT snapped to a fixed grid, because chunks merged from different
-// passes start at different offsets and share no common 195-byte grid (the
-// firmware re-chunks the requested range from its own start_offset anyway).
+// Report the missing data as re-download telecommands. The firmware transmits
+// whole 195-byte packets and a chunk is received or not (CRC pass/fail), so
+// every request asks for a whole number of packets: a command starts at the
+// first missing byte and its length rounds up to a multiple of 195. Missing
+// runs whose whole-packet requests would touch or overlap are coalesced into
+// one command (this only re-fetches present bytes that share a packet with a
+// gap -- unavoidable, since a partial packet can't be requested); a run of
+// fully-received packets between two gaps is left alone. A request wider than
+// the firmware's per-command cap (max_dl) is tiled into back-to-back commands.
+// Note the merged chunks come from passes on different 195-byte grids, so the
+// gaps -- and thus the request offsets -- need not sit on any single grid.
 static void report_gaps(const uint8_t *present, long size,
                         const char *sat_file_path, long max_dl, int quiet)
 {
-    if (!quiet) printf("  re-download (%s):\n",
-                       "fewest telecommands, missing bytes only");
-    long n_cmds = 0, missing = 0, run_start = -1;
+    const long PKT = BULK_FILE_MAX_DATA;         // 195 bytes per downlink packet
+    long tile = (max_dl / PKT) * PKT;            // per-command cap, whole packets
+    if (tile < PKT) tile = PKT;
+
+    if (!quiet) printf("  re-download (fewest telecommands, whole 195-byte packets):\n");
+    long n_cmds = 0, missing = 0, download = 0;
+    long run_start = -1;
+    long cs = -1, ce = -1;   // pending request [cs, ce); ce - cs is a multiple of 195
+
     // Iterate one past the end so a gap that runs to EOF is closed.
     for (long i = 0; i <= size; i++) {
         int gap = (i < size) && !present[i];
@@ -462,19 +481,28 @@ static void report_gaps(const uint8_t *present, long size,
         } else if (!gap && run_start >= 0) {
             long a = run_start, b = i;
             missing += b - a;
-            for (long p = a; p < b; p += max_dl) {
-                long e = (p + max_dl < b) ? p + max_dl : b;
-                emit_cmd(sat_file_path, p, e - p, quiet);
-                n_cmds++;
+            long want_ce = a + ((b - a + PKT - 1) / PKT) * PKT;   // a + ceil(len/195)*195
+            if (cs < 0) {
+                cs = a; ce = want_ce;
+            } else if (a <= ce) {
+                // This gap starts inside the pending request's packets: extend
+                // to cover it, keeping the length a whole number of packets.
+                long ext = cs + ((b - cs + PKT - 1) / PKT) * PKT;
+                if (ext > ce) ce = ext;
+            } else {
+                emit_run(sat_file_path, cs, ce, size, tile, quiet, &download, &n_cmds);
+                cs = a; ce = want_ce;
             }
             run_start = -1;
         }
     }
+    if (cs >= 0)
+        emit_run(sat_file_path, cs, ce, size, tile, quiet, &download, &n_cmds);
 
     if (!quiet) {
         if (n_cmds == 0) printf("    (none -- file is complete)\n");
-        printf("  missing     : %ld bytes in %ld telecommand%s\n",
-               missing, n_cmds, n_cmds == 1 ? "" : "s");
+        printf("  missing     : %ld bytes; re-download %ld bytes in %ld telecommand%s\n",
+               missing, download, n_cmds, n_cmds == 1 ? "" : "s");
     }
 }
 
