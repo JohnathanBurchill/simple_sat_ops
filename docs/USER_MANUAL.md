@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`2009372` (2026-06-30). This is a working draft.
+`34bfab7` (2026-06-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -139,6 +139,7 @@ manual can go back on the shelf where it belongs.
     - [`fm_preview`](#fm_preview)
     - [`packet_query` and `packet_browser`](#packet_query-and-packet_browser)
     - [`cam_reconstruct`](#cam_reconstruct)
+    - [`mpi_reconstruct`](#mpi_reconstruct)
     - [`tcmd_import`](#tcmd_import)
     - [`tcmd_browser`](#tcmd_browser)
     - [`tle_keps`](#tle_keps)
@@ -2170,6 +2171,61 @@ works and `--patch` explains the rebuild.
 cam_reconstruct capture.bin --db=/FrontierSat/packet_db.sqlite \
                 --patch=84213,84219,84231
 ```
+
+### `mpi_reconstruct`
+
+Rebuild an MPI science-data file straight from the packet database - the MPI
+counterpart to `cam_reconstruct` (boom-camera JPEGs) and `gnss_reports` (the
+GNSS firehose). The MPI records science to a file on the satellite's flash;
+that file is pulled to the ground with `comms_bulk_file_downlink`, and every
+received chunk lands in the DB as a `bulk_file` packet tagged with its byte
+offset. `mpi_reconstruct` scans those packets, reassembles each MPI download
+by offset, and writes `MPI_yyyymmddThhmmss.bin` (the timestamp is the UTC
+reception time of the download's first chunk) to the working directory.
+
+```sh
+# Reconstruct every MPI download in the default database into the CWD
+mpi_reconstruct
+
+# Narrow to one pass and set the on-satellite path for the re-download list
+mpi_reconstruct --since=2026-07-21 --until=2026-07-22 \
+                --file-path=/mpi/20260721.bin
+```
+
+It tells MPI downloads apart from camera or other bulk files by content: an
+MPI file is at least 20000 bytes and carries the `0C FF FF 0C` frame sync word
+repeatedly (the same heuristic the firmware's own validator uses). The chunks
+that actually carry the sync word positively identify the file, so the tool
+**clusters those chunks into download sessions by time** - sync-bearing chunks
+more than 15 minutes apart belong to different downloads - and reconstructs one
+MPI file per session. Because bulk offsets are absolute file positions, a
+session that spans several passes (the usual case when early attempts drop
+chunks and the operator re-commands on a later pass) is **merged into one
+file** by offset, while another file pulled at a different time - a camera
+capture, an ASCII log - carries no sync word, falls outside every session
+window, and is never mixed in. The run prints, per file: the reception window
+and packet count, the file size (offset-0-based, so a download that only got
+the tail shows the head as missing), the recovered/missing byte counts and
+percent, and the offset range the received data actually spans.
+
+The **re-download list** is the fewest `comms_bulk_file_downlink_start(<path>,
+<offset>,<len>)` telecommands that fetch **only the missing bytes**. A download
+grabs a contiguous range and cannot skip received bytes in its middle, so this
+is one command per contiguous gap (already-received data between gaps is never
+re-fetched), with any gap wider than the firmware's 1,000,000-byte per-command
+cap (`COMMS_bulk_file_downlink_max_allowable_total_bytes`) tiled into
+back-to-back commands. Feed the re-fetched chunks back into the database and
+re-run to close the gaps. `--max-download=<n>` lowers the per-command cap.
+
+`--file-path=` sets the on-satellite path written into those commands (the
+ground file is offset-addressed, so it defaults to a `<file_path>`
+placeholder). `--since=`/`--until=` scope which packets are considered (handy
+when two different MPI files were downloaded close together - a "clean chunks
+disagree" warning flags that case). `--dir=` chooses the output directory,
+`--fill=` the byte left where data is still missing (`00` default, or `ff`),
+and `--min-sync=` how many sync words a session needs before it counts as MPI.
+Read-only on the database and safe to run while a receiver is filling it; like
+`cam_reconstruct`, missing packets are reported, not an error.
 
 ### `tcmd_import`
 

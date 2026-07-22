@@ -803,6 +803,17 @@ if (OPENSSL_FOUND)
     target_link_sso_core(gnss_reports)
     list(APPEND SSO_TARGETS gnss_reports)
 
+    # Reassemble an MPI science-data file from its bulk_file packets, the MPI
+    # counterpart to cam_reconstruct and gnss_reports. gnss_frag.c is reused for
+    # the shared --since/--until time-spec parsing.
+    add_executable(mpi_reconstruct utils/mpi_reconstruct.c src/proto/gnss_frag.c)
+    target_include_directories(mpi_reconstruct PRIVATE ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(mpi_reconstruct PRIVATE ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(mpi_reconstruct PRIVATE ${OPENSSL_LIBRARIES} m)
+    target_link_packet_db(mpi_reconstruct)
+    target_link_sso_core(mpi_reconstruct)
+    list(APPEND SSO_TARGETS mpi_reconstruct)
+
     # Build an OPM from the satellite's GNSS fix for ssm to propagate + upload.
     add_executable(gnss_opm utils/gnss_opm.c src/orbit/bestxyz.c src/orbit/shortarc.c src/proto/gnss_frag.c)
     target_include_directories(gnss_opm PRIVATE ${OPENSSL_INCLUDE_DIRS})
