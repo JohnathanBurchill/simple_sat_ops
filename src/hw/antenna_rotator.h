@@ -69,11 +69,18 @@ typedef struct antenna_rotator
     double target_elevation;
     double azimuth;
     double elevation;
-    // 1 once azimuth/elevation reflect a real STATUS reply from the
-    // rotator; 0 at startup before the first good reply lands. Callers
-    // (UI panel, IPC broadcast) must gate on this instead of trusting
-    // azimuth/elevation directly -- both are zero-initialized and would
-    // otherwise be indistinguishable from a genuine (0, 0) reading.
+    // 1 when azimuth/elevation currently reflect a recent, real STATUS
+    // reply from the rotator; 0 before the first good reply lands, OR
+    // once one has gone stale (see ANTENNA_ROTATOR_STATUS_STALE_MS).
+    // This wire-level struct only ever sets it true, alongside azimuth/
+    // elevation, on a synchronous seed (antenna_rotator_seed_from_status).
+    // The live --control path runs through the async worker instead, and
+    // the async callers (src/ui/panels.c report_status,
+    // src/control/tracking.c main_rotator_refresh_targets_from_snapshot)
+    // are responsible for re-deriving this flag every time from the
+    // snapshot's stale_ms -- it is deliberately NOT a one-shot latch, so a
+    // reading that stops arriving (pulled cable, wedged controller) stops
+    // being presented as current instead of freezing on its last value.
     int position_known;
     // Last commanded extended-range azimuth; canonical for path planning.
     // target_azimuth is kept as the display-friendly (often wrapped) form.

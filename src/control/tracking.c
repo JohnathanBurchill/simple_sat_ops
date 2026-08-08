@@ -419,7 +419,7 @@ int main_rotator_refresh_targets_from_snapshot(rot_t *rot)
     double az = 0.0, el = 0.0;
     int    ok = 0, stale_ms = 0;
     antenna_rotator_async_snapshot(rot->rot_async, &az, &el, &ok, &stale_ms, NULL);
-    if (!ok || stale_ms > 1500) return -1;
+    if (!ok || stale_ms > ANTENNA_ROTATOR_STATUS_STALE_MS) return -1;
     rot->antenna_rotator.azimuth                  = az;
     rot->antenna_rotator.elevation                = el;
     rot->antenna_rotator.target_azimuth           = az;

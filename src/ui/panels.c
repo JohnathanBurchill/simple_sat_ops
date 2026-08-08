@@ -679,7 +679,7 @@ void render_status_panel(const status_panel_t *p,
             mvprintw(row++, col, "%15s   %.1f deg", "azimuth", az_display);
         } else {
             mvprintw(row++, col, "%15s   %s", "azimuth",
-                     "? (waiting for rotator status)");
+                     "? (no recent status from rotator)");
         }
         clrtoeol();
         mvprintw(row++, col, "%15s   %.1f deg%s", "target elevation",
@@ -689,7 +689,7 @@ void render_status_panel(const status_panel_t *p,
             mvprintw(row++, col, "%15s   %.1f deg", "elevation", p->current_el);
         } else {
             mvprintw(row++, col, "%15s   %s", "elevation",
-                     "? (waiting for rotator status)");
+                     "? (no recent status from rotator)");
         }
         clrtoeol();
     } else {
@@ -800,23 +800,22 @@ void report_status(state_t *state, int *print_row, int print_col)
         // and no 500 ms VTIME hang if the cable is unplugged.
         double azimuth = state->rot.antenna_rotator.azimuth;
         double elevation = state->rot.antenna_rotator.elevation;
-        int    rot_ok = 0;
         int    rot_stale_ms = 0;
         if (state->rot.rot_async != NULL) {
             antenna_rotator_async_snapshot(state->rot.rot_async,
                                             &azimuth, &elevation,
-                                            &rot_ok, &rot_stale_ms, NULL);
+                                            NULL, &rot_stale_ms, NULL);
             // Cache the snapshot back into state so other code (the
             // antenna_is_moving heuristic, IPC broadcast, etc.) reads a
-            // single consistent value across the tick. position_known
-            // latches: rot_stale_ms == INT_MAX means "never had a good
-            // STATUS reply yet", so leave the flag alone rather than
-            // clobbering an earlier true back to false.
+            // single consistent value across the tick. position_known is
+            // recomputed from scratch every tick -- never known yet
+            // (stale_ms == INT_MAX) and gone stale (a pulled cable, a
+            // wedged controller) must both flip it back to false, so a
+            // reading that stops arriving stops being shown as current.
             state->rot.antenna_rotator.azimuth   = azimuth;
             state->rot.antenna_rotator.elevation = elevation;
-            if (rot_ok) {
-                state->rot.antenna_rotator.position_known = 1;
-            }
+            state->rot.antenna_rotator.position_known =
+                (rot_stale_ms <= ANTENNA_ROTATOR_STATUS_STALE_MS);
         }
         p.current_az     = azimuth;
         p.current_el     = elevation;
