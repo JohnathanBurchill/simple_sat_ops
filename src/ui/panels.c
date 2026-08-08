@@ -667,20 +667,30 @@ void render_status_panel(const status_panel_t *p,
     // on the RX panel's "RX freq" line, alongside the LO ± BW row that
     // tells the operator where the SDR is actually listening.)
     if (p->have_rotator) {
-        double az_display = p->current_az;
-        if (az_display < 0) az_display += 360.0;
         double target_az_display = p->target_az;
         if (target_az_display < 0) target_az_display += 360.0;
         const char *flip_tag = p->flip ? " (flip)" : "";
         mvprintw(row++, col, "%15s   %.1f deg%s", "target azimuth",
                  target_az_display, flip_tag);
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.1f deg", "azimuth", az_display);
+        if (p->rot_pos_known) {
+            double az_display = p->current_az;
+            if (az_display < 0) az_display += 360.0;
+            mvprintw(row++, col, "%15s   %.1f deg", "azimuth", az_display);
+        } else {
+            mvprintw(row++, col, "%15s   %s", "azimuth",
+                     "? (waiting for rotator status)");
+        }
         clrtoeol();
         mvprintw(row++, col, "%15s   %.1f deg%s", "target elevation",
                  p->target_el, flip_tag);
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.1f deg", "elevation", p->current_el);
+        if (p->rot_pos_known) {
+            mvprintw(row++, col, "%15s   %.1f deg", "elevation", p->current_el);
+        } else {
+            mvprintw(row++, col, "%15s   %s", "elevation",
+                     "? (waiting for rotator status)");
+        }
         clrtoeol();
     } else {
         mvprintw(row++, col, "%15s   %s",
@@ -798,12 +808,19 @@ void report_status(state_t *state, int *print_row, int print_col)
                                             &rot_ok, &rot_stale_ms, NULL);
             // Cache the snapshot back into state so other code (the
             // antenna_is_moving heuristic, IPC broadcast, etc.) reads a
-            // single consistent value across the tick.
+            // single consistent value across the tick. position_known
+            // latches: rot_stale_ms == INT_MAX means "never had a good
+            // STATUS reply yet", so leave the flag alone rather than
+            // clobbering an earlier true back to false.
             state->rot.antenna_rotator.azimuth   = azimuth;
             state->rot.antenna_rotator.elevation = elevation;
+            if (rot_ok) {
+                state->rot.antenna_rotator.position_known = 1;
+            }
         }
-        p.current_az = azimuth;
-        p.current_el = elevation;
+        p.current_az     = azimuth;
+        p.current_el     = elevation;
+        p.rot_pos_known  = state->rot.antenna_rotator.position_known;
         p.target_az  = state->rot.antenna_rotator.target_azimuth;
         p.target_el  = state->rot.antenna_rotator.target_elevation;
         p.flip       = state->rot.antenna_rotator.flip_mode_pass;

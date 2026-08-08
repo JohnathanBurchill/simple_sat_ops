@@ -69,6 +69,12 @@ typedef struct antenna_rotator
     double target_elevation;
     double azimuth;
     double elevation;
+    // 1 once azimuth/elevation reflect a real STATUS reply from the
+    // rotator; 0 at startup before the first good reply lands. Callers
+    // (UI panel, IPC broadcast) must gate on this instead of trusting
+    // azimuth/elevation directly -- both are zero-initialized and would
+    // otherwise be indistinguishable from a genuine (0, 0) reading.
+    int position_known;
     // Last commanded extended-range azimuth; canonical for path planning.
     // target_azimuth is kept as the display-friendly (often wrapped) form.
     double target_azimuth_unwrapped;

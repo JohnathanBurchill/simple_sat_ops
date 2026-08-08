@@ -275,6 +275,7 @@ int antenna_rotator_seed_from_status(antenna_rotator_t *antenna_rotator)
     antenna_rotator->target_elevation = el;
     antenna_rotator->target_azimuth_unwrapped = az;
     antenna_rotator->unwrapped_target_valid = 1;
+    antenna_rotator->position_known = 1;
     return ANTENNA_ROTATOR_OK;
 }
 

@@ -101,6 +101,9 @@ typedef struct {
     // Empty on an operator's own broadcasts (the relay stamps it).
     char source[16];
     double az, el;         // current rotator az/el (hardware-reported)
+    int rot_pos_known;     // 1 once az/el reflect a real STATUS reply;
+                            // 0 before the first good reply (az/el are
+                            // meaningless zero-init in that case)
     long freq_hz;
     double doppler_hz;
     char rx_status[160];

@@ -105,6 +105,9 @@ typedef struct {
     const  char *viewers;    // comma-separated viewer names, or "(none)"
     double carrier_hz;
     int    have_rotator;     // 1 -> render az/el block; 0 -> "not initialized"
+    int    rot_pos_known;    // 1 -> current_az/current_el are a real STATUS
+                              // reply; 0 -> no good reply yet, render "?"
+                              // instead of a fabricated (0, 0)
     double current_az;
     double current_el;
     double target_az;

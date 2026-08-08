@@ -426,6 +426,7 @@ int main_rotator_refresh_targets_from_snapshot(rot_t *rot)
     rot->antenna_rotator.target_elevation         = el;
     rot->antenna_rotator.target_azimuth_unwrapped = az;
     rot->antenna_rotator.unwrapped_target_valid   = 1;
+    rot->antenna_rotator.position_known           = 1;
     return 0;
 }
 
