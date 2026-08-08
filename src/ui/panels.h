@@ -114,6 +114,9 @@ typedef struct {
     double target_az;
     double target_el;
     int    flip;
+    const char *rot_activity;  // "Jogging" / "Returning to 0,0" /
+                                // "Sitting Idle" / "Sitting Idle at 0,0" /
+                                // "Connection Failure"; NULL -> line skipped
     // HMAC keyfile display. Only the operator process fills these; the
     // viewer leaves status == HMAC_DISPLAY_UNSET so the row is skipped.
     const char           *hmac_path;

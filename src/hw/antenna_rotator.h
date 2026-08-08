@@ -122,6 +122,37 @@ typedef struct antenna_rotator
     int flip_half;
 } antenna_rotator_t;
 
+// Tolerance (deg) below which target vs. actual (or either vs. 0,0) counts
+// as "the same place" for activity-status purposes. Matches the existing
+// MAX_DELTA_AZIMUTH/ELEVATION_DEGREES convention in control/tracking.h
+// (kept as a separate constant here so this hw-layer header doesn't have
+// to pull in the control layer).
+#define ANTENNA_ROTATOR_ACTIVITY_TOLERANCE_DEG 1.0
+
+// Operator-facing summary of what the rotator is doing right now, derived
+// primarily by comparing the commanded target to the last-reported actual
+// position (see antenna_rotator_activity_status).
+typedef enum {
+    ANTENNA_ROTATOR_ACTIVITY_CONNECTION_FAILURE = 0,
+    ANTENNA_ROTATOR_ACTIVITY_RETURNING_HOME,
+    ANTENNA_ROTATOR_ACTIVITY_JOGGING,
+    ANTENNA_ROTATOR_ACTIVITY_IDLE_AT_HOME,
+    ANTENNA_ROTATOR_ACTIVITY_IDLE,
+} antenna_rotator_activity_t;
+
+// Classify current activity from target vs. actual az/el:
+//   - !position_known                          -> CONNECTION_FAILURE
+//   - actual not within tolerance of target:
+//       - target (or, mid a two-step unwind, the pending final leg) is
+//         within tolerance of (0, 0)            -> RETURNING_HOME
+//       - otherwise                             -> JOGGING
+//   - actual within tolerance of target:
+//       - actual within tolerance of (0, 0)     -> IDLE_AT_HOME
+//       - otherwise                             -> IDLE
+const char *antenna_rotator_activity_name(antenna_rotator_activity_t status);
+antenna_rotator_activity_t antenna_rotator_activity_status(
+    const antenna_rotator_t *antenna_rotator);
+
 int antenna_rotator_init(antenna_rotator_t *antenna_rotator);
 void antenna_rotator_connect(antenna_rotator_t *antenna_rotator);
 void antenna_rotator_disconnect(antenna_rotator_t *antenna_rotator);

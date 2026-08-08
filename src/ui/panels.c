@@ -692,6 +692,13 @@ void render_status_panel(const status_panel_t *p,
                      "? (no recent status from rotator)");
         }
         clrtoeol();
+        if (p->rot_activity) {
+            int warn = (strcmp(p->rot_activity, "Connection Failure") == 0);
+            if (warn) attron(COLOR_PAIR(1));
+            mvprintw(row++, col, "%15s   %s", "activity", p->rot_activity);
+            if (warn) attroff(COLOR_PAIR(1));
+            clrtoeol();
+        }
     } else {
         mvprintw(row++, col, "%15s   %s",
                  "antenna rotator", "* not initialized *");
@@ -823,6 +830,8 @@ void report_status(state_t *state, int *print_row, int print_col)
         p.target_az  = state->rot.antenna_rotator.target_azimuth;
         p.target_el  = state->rot.antenna_rotator.target_elevation;
         p.flip       = state->rot.antenna_rotator.flip_mode_pass;
+        p.rot_activity = antenna_rotator_activity_name(
+            antenna_rotator_activity_status(&state->rot.antenna_rotator));
     }
 
     // T/R switch block — operator-only (this process owns the serial

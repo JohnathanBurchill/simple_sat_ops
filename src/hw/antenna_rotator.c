@@ -340,3 +340,48 @@ int antenna_rotator_set_unwrapped(antenna_rotator_t *antenna_rotator, double az_
     return ANTENNA_ROTATOR_OK;
 }
 
+const char *antenna_rotator_activity_name(antenna_rotator_activity_t status)
+{
+    switch (status) {
+    case ANTENNA_ROTATOR_ACTIVITY_CONNECTION_FAILURE: return "Connection Failure";
+    case ANTENNA_ROTATOR_ACTIVITY_RETURNING_HOME:     return "Returning to 0,0";
+    case ANTENNA_ROTATOR_ACTIVITY_JOGGING:            return "Jogging";
+    case ANTENNA_ROTATOR_ACTIVITY_IDLE_AT_HOME:       return "Sitting Idle at 0,0";
+    case ANTENNA_ROTATOR_ACTIVITY_IDLE:               return "Sitting Idle";
+    }
+    return "?";
+}
+
+antenna_rotator_activity_t antenna_rotator_activity_status(
+    const antenna_rotator_t *r)
+{
+    if (!r->position_known) {
+        return ANTENNA_ROTATOR_ACTIVITY_CONNECTION_FAILURE;
+    }
+
+    int at_target =
+        fabs(r->target_azimuth - r->azimuth) <= ANTENNA_ROTATOR_ACTIVITY_TOLERANCE_DEG
+        && fabs(r->target_elevation - r->elevation) <= ANTENNA_ROTATOR_ACTIVITY_TOLERANCE_DEG;
+
+    if (!at_target) {
+        // Mid a two-step unwind, target_azimuth briefly holds the
+        // intermediate waypoint rather than the commanded final leg --
+        // use home_pending_final_az so a large-unwind home-return still
+        // reads as "returning" rather than a generic "jogging" for its
+        // first leg.
+        double effective_target_az = r->homing_in_progress
+            ? r->home_pending_final_az : r->target_azimuth;
+        int target_is_home =
+            fabs(effective_target_az) <= ANTENNA_ROTATOR_ACTIVITY_TOLERANCE_DEG
+            && fabs(r->target_elevation) <= ANTENNA_ROTATOR_ACTIVITY_TOLERANCE_DEG;
+        return target_is_home ? ANTENNA_ROTATOR_ACTIVITY_RETURNING_HOME
+                               : ANTENNA_ROTATOR_ACTIVITY_JOGGING;
+    }
+
+    int actual_is_home =
+        fabs(r->azimuth) <= ANTENNA_ROTATOR_ACTIVITY_TOLERANCE_DEG
+        && fabs(r->elevation) <= ANTENNA_ROTATOR_ACTIVITY_TOLERANCE_DEG;
+    return actual_is_home ? ANTENNA_ROTATOR_ACTIVITY_IDLE_AT_HOME
+                           : ANTENNA_ROTATOR_ACTIVITY_IDLE;
+}
+

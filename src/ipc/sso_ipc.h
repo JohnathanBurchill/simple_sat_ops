@@ -118,6 +118,10 @@ typedef struct {
     int in_pass;
     int tracking;
     int has_rotator;         // operator's have_antenna_rotator
+    int rot_activity;        // antenna_rotator_activity_t ordinal -- the
+                              // operator's activity classification (target
+                              // vs. actual), rendered via
+                              // antenna_rotator_activity_name() on either end
     double jul_utc;          // operator's SGP4 epoch for this tick
 
     // Pre-computed prediction snapshot — the viewer renders these

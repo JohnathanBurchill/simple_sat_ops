@@ -115,6 +115,7 @@ void ipc_broadcast_state(state_t *s,
     evt.tracking  = s->rot.antenna_rotator.tracking;
     evt.has_rotator = s->rot.have_antenna_rotator;
     evt.rot_pos_known = s->rot.antenna_rotator.position_known;
+    evt.rot_activity = (int) antenna_rotator_activity_status(&s->rot.antenna_rotator);
     evt.jul_utc   = jul_utc;
 
     // Prediction snapshot (satellite name, idesg, pass timing, sky
@@ -183,6 +184,7 @@ void ipc_broadcast_state(state_t *s,
     s->op.last_state.in_pass = evt.in_pass;
     s->op.last_state.tracking= evt.tracking;
     s->op.last_state.has_rot = evt.has_rotator;
+    s->op.last_state.rot_activity = evt.rot_activity;
     s->op.last_state.jul     = evt.jul_utc;
     snprintf(s->op.last_state.idesg, sizeof s->op.last_state.idesg, "%s", evt.idesg);
     s->op.last_state.epoch_min    = evt.epoch_min;
@@ -239,6 +241,7 @@ void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
         welcome.in_pass     = state->op.last_state.in_pass;
         welcome.tracking    = state->op.last_state.tracking;
         welcome.has_rotator = state->op.last_state.has_rot;
+        welcome.rot_activity = state->op.last_state.rot_activity;
         welcome.jul_utc     = state->op.last_state.jul;
         snprintf(welcome.idesg, sizeof welcome.idesg, "%s", state->op.last_state.idesg);
         welcome.epoch_min      = state->op.last_state.epoch_min;

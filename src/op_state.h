@@ -46,6 +46,7 @@ typedef struct last_state {
     int    in_pass;
     int    tracking;
     int    has_rot;
+    int    rot_activity;
     double jul;
     char   idesg[9];
     double epoch_min;
