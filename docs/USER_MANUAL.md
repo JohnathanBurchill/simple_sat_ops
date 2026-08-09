@@ -2878,10 +2878,10 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   `decode_inspector --live` at a pass that is still being recorded
   across the room. `HOST` and `REMOTE_ROOT` override the target.
 * **`antenna_cam.sh`** — a small always-on-top window showing the RAO
-  antenna webcam, fed over SSH (the remote `ffmpeg` repackages the
-  camera's native MJPEG, no transcode). `--with-timelapse=N` branches
-  off a sped-up MP4 written when you close the viewer. Run it from your
-  laptop, not on the ground machine.
+  antenna webcam, run from the operator's laptop connected over SSH (the 
+  remote `ffmpeg` repackages the camera's native MJPEG, no transcode). 
+  `--with-timelapse=N` branches off a sped-up MP4 written when you close 
+  the viewer. Run it from your laptop, not on the ground machine.
 
 ### Audio and sky plots
 
