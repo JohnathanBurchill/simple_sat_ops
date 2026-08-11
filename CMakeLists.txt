@@ -525,8 +525,29 @@ if (RAYLIB_FOUND)
             "-framework Foundation")
     endif()
     list(APPEND SSO_TARGETS decode_inspector)
+
+    # mpi_viewer — raylib-backed inspector for MPI science imagery. Reconstructs
+    # every MPI download from the packet DB (like mpi_reconstruct), finds the
+    # 152-byte frames by their sync word, groups them into images by inner-dome
+    # target voltage, and plays them back grayscale with an adjustable DN range.
+    # Needs sqlite3 via packet_db.
+    add_executable(mpi_viewer utils/mpi_viewer.c)
+    target_include_directories(mpi_viewer PRIVATE ${RAYLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(mpi_viewer PRIVATE ${RAYLIB_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(mpi_viewer PRIVATE ${RAYLIB_LIBRARIES} ${OPENSSL_LIBRARIES} m)
+    target_link_packet_db(mpi_viewer)
+    target_link_sso_core(mpi_viewer)
+    if (APPLE)
+        target_link_libraries(mpi_viewer PRIVATE
+            "-framework Cocoa"
+            "-framework OpenGL"
+            "-framework IOKit"
+            "-framework CoreVideo"
+            "-framework Foundation")
+    endif()
+    list(APPEND SSO_TARGETS mpi_viewer)
 else()
-    message(STATUS "raylib not found via pkg-config; live_waterfall + decode_inspector skipped.")
+    message(STATUS "raylib not found via pkg-config; live_waterfall + decode_inspector + mpi_viewer skipped.")
 endif()
 
 # Selftest for the IQ-domain demods (modem_iq.c, modem_viterbi.c).
