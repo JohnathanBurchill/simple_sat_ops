@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`34bfab7` (2026-06-30). This is a working draft.
+`525ed50` (2026-08-10). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -139,7 +139,9 @@ manual can go back on the shelf where it belongs.
     - [`fm_preview`](#fm_preview)
     - [`packet_query` and `packet_browser`](#packet_query-and-packet_browser)
     - [`cam_reconstruct`](#cam_reconstruct)
+    - [`frontiersat_camera_viewer`](#frontiersat_camera_viewer)
     - [`mpi_reconstruct`](#mpi_reconstruct)
+    - [`mpi_viewer`](#mpi_viewer)
     - [`tcmd_import`](#tcmd_import)
     - [`tcmd_browser`](#tcmd_browser)
     - [`tle_keps`](#tle_keps)
@@ -2172,6 +2174,58 @@ cam_reconstruct capture.bin --db=/FrontierSat/packet_db.sqlite \
                 --patch=84213,84219,84231
 ```
 
+### `frontiersat_camera_viewer`
+
+A small raylib GUI for looking at the boom-camera pictures in the packet
+database. Where `cam_reconstruct` decodes one downloaded file you already have
+on disk, the viewer works straight from the database and shows one row per
+**picture the camera took**, merging every pass that downloaded that picture
+into a single image before decoding it. That merging is the point: on the
+current store it takes seven of the nine pictures to every byte recovered,
+where the best single pass had left holes.
+
+```sh
+frontiersat_camera_viewer                              # default database
+frontiersat_camera_viewer --db=/FrontierSat/packet_db.sqlite
+```
+
+Camera packets are picked out of the `bulk_file` traffic by the camera file's
+own layout rather than by timing. A camera file is `START_CAM:\n` followed by
+67-byte sentences, so sentence *k* always begins at file offset 11 + 67*k*; a
+packet counts as camera data when its `@` characters land on that grid and its
+bytes are nearly all hex digits. Science data and JSON logs fail the hex test,
+and so do the badly decoded packets whose `START_CAM:` header survived while
+the body turned to mush - which the older "does it start with START_CAM"
+check would have accepted.
+
+Those packets are then split into download sessions by reception time, and
+sessions of the same picture are merged. Two sessions are the same picture when
+the bytes they both carry agree: different pictures disagree on about four
+bytes in five, the same picture on at most one in five, its only disagreements
+coming from packets Reed-Solomon could not correct. The ground station's
+command log settles the case content cannot - a follow-up pass that re-fetched
+only the ranges the first pass missed shares no bytes at all with it, but both
+commands name the same file on the satellite.
+
+The command log (the `sent_tcmd` table) also supplies the two labels the file
+itself does not carry: the satellite path, shown as the title, and **when the
+picture was taken**, read off the `camera_capture` command that made it and
+shown in green. Both are best-effort - a download commanded from another
+ground station leaves the row labelled by its download time instead.
+
+The panel under the picture reports bytes and sentences recovered, whether the
+end marker arrived, the decoded JPEG size and dimensions, and the passes the
+download took. A picture too badly holed to decode says so rather than showing
+a broken image; `s` still saves the partial file for another decoder to try.
+
+Keys: `Up`/`Down` change picture, `z` cycles zoom (fit / 1:1 / 2:1), **`o` opens
+the picture in the desktop's image viewer** (Preview on macOS, the `xdg-open`
+default on Linux) via a copy in the temporary directory - a quick look at full
+resolution, with the pan and zoom your viewer already has. `s` saves the JPEG to
+the working directory as `fs_boomcam_<capture time>.jpg`, **`F5` re-reads the
+database** and rebuilds the list, and `q` quits. Read-only on the database and
+safe to run while a receiver is filling it.
+
 ### `mpi_reconstruct`
 
 Rebuild an MPI science-data file straight from the packet database - the MPI
@@ -2234,6 +2288,51 @@ disagree" warning flags that case). `--dir=` chooses the output directory,
 and `--min-sync=` how many sync words a session needs before it counts as MPI.
 Read-only on the database and safe to run while a receiver is filling it; like
 `cam_reconstruct`, missing packets are reported, not an error.
+
+### `mpi_viewer`
+
+A small raylib GUI for looking at the MPI imagery in the packet database. Where
+`mpi_reconstruct` writes one `.bin` per download burst, `mpi_viewer` shows one
+row per **experiment** - one time the MPI was actually run and recorded - and
+merges every download pass of that recording back into a single stream. The MPI
+has been run only a handful of times this mission, so the left panel is short.
+
+```sh
+mpi_viewer                              # default database
+mpi_viewer --db=/FrontierSat/packet_db.sqlite
+```
+
+The grouping and the timing both come from JSON markers the flight firmware
+writes into each science file: a `{"mpi_start":...,"timestamp_ms":N}` header at
+the start of the recording and a `{"uptime_ms":...,"timestamp_ms":N}` footer
+after every 20 KB buffer it flushes. Those markers survive into the `bulk_file`
+packets. The viewer clusters download bursts into experiments by the embedded
+`timestamp_ms` (all markers of one recording fall within its <=15-minute run,
+while separate experiments are days apart), then reassembles every contributing
+burst by absolute file offset - which also deletes duplicates, since a byte
+range re-downloaded on a later pass just overwrites the same offsets. Markers are
+downlinked bytes like any other, so a bit-flipped timestamp is rejected (it must
+fall in a sane range and cannot post-date the newest packet), and the true start
+is voted from the many clean markers rather than trusted from one.
+
+Each frame's **capture time** (not its download time) is read off an
+offset-to-time curve built from the markers: a footer's `timestamp_ms` is when
+that 20 KB block finished filling on the satellite, so a frame's time is
+interpolated by its byte position between the surrounding footers. An image's
+time is the time of its first frame, shown in green above the picture.
+
+The 20 KB flush is not frame-aligned, so once per ~20 KB a footer is spliced
+into the middle of a frame; that one frame reads as a garbage row. The viewer
+drops any frame whose body overlaps a marker, which removes the routine periodic
+artifact (roughly one frame in 134).
+
+Keys: `Up`/`Down` change experiment, `Left`/`Right` scrub images, `Space`
+plays/pauses, `,`/`.` set the playback speed, `f` cycles frames-per-image
+(auto/8/16), `s` zoom, `a` cycles the colour scale (auto-image / auto-experiment
+/ manual), `r` resets it to auto-image, `z`/`x` and `c`/`v` move the manual DN
+window (hold `Shift` for coarse steps), **`F5` re-reads the database** and
+rebuilds the list (keeping your selection and view settings), and `q` quits.
+Read-only on the database and safe to run while a receiver is filling it.
 
 ### `tcmd_import`
 
