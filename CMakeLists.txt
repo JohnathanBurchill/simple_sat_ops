@@ -546,8 +546,30 @@ if (RAYLIB_FOUND)
             "-framework Foundation")
     endif()
     list(APPEND SSO_TARGETS mpi_viewer)
+
+    # frontiersat_camera_viewer — raylib-backed inspector for the boom-camera
+    # pictures. Picks the camera packets out of the packet DB by the camera
+    # file's sentence layout, merges every pass that downloaded the same
+    # picture, decodes the JPEG (cam_jpeg.c, shared with cam_reconstruct and
+    # packet_browser) and shows it. Needs sqlite3 via packet_db.
+    add_executable(frontiersat_camera_viewer
+                   utils/frontiersat_camera_viewer.c utils/cam_jpeg.c)
+    target_include_directories(frontiersat_camera_viewer PRIVATE ${RAYLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(frontiersat_camera_viewer PRIVATE ${RAYLIB_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(frontiersat_camera_viewer PRIVATE ${RAYLIB_LIBRARIES} ${OPENSSL_LIBRARIES} m)
+    target_link_packet_db(frontiersat_camera_viewer)
+    target_link_sso_core(frontiersat_camera_viewer)
+    if (APPLE)
+        target_link_libraries(frontiersat_camera_viewer PRIVATE
+            "-framework Cocoa"
+            "-framework OpenGL"
+            "-framework IOKit"
+            "-framework CoreVideo"
+            "-framework Foundation")
+    endif()
+    list(APPEND SSO_TARGETS frontiersat_camera_viewer)
 else()
-    message(STATUS "raylib not found via pkg-config; live_waterfall + decode_inspector + mpi_viewer skipped.")
+    message(STATUS "raylib not found via pkg-config; live_waterfall + decode_inspector + mpi_viewer + frontiersat_camera_viewer skipped.")
 endif()
 
 # Selftest for the IQ-domain demods (modem_iq.c, modem_viterbi.c).
