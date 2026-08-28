@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`525ed50` (2026-08-10). This is a working draft.
+`88cf3ec` (2026-08-26). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2330,9 +2330,48 @@ Keys: `Up`/`Down` change experiment, `Left`/`Right` scrub images, `Space`
 plays/pauses, `,`/`.` set the playback speed, `f` cycles frames-per-image
 (auto/8/16), `s` zoom, `a` cycles the colour scale (auto-image / auto-experiment
 / manual), `r` resets it to auto-image, `z`/`x` and `c`/`v` move the manual DN
-window (hold `Shift` for coarse steps), **`F5` re-reads the database** and
-rebuilds the list (keeping your selection and view settings), and `q` quits.
+window (hold `Shift` for coarse steps), `d` writes the re-download
+telecommands (below), **`F5` re-reads the database** and rebuilds the
+list (keeping your selection and view settings), and `q` quits.
 Read-only on the database and safe to run while a receiver is filling it.
+
+**Press `d` to write the re-download telecommands** for the selected
+experiment. An experiment is only as complete as the passes that carried it, and
+the holes are usually scattered across the file; `d` turns them into the
+commands that fetch exactly those holes, written to
+`mpi_redownload_<experiment time>.txt` in the working directory and ready to
+hand to `simple_sat_ops --tc-file=`. The file names the experiment, the file on
+the satellite, and the received / missing byte counts in a comment header, then
+one command per line:
+
+```
+CTS1+exec_blob_from_fs(blobs/bulk_downlink_start_v2.blob,0,mpi_data/2026-08-08.mpi;544440;11310)!
+```
+
+Requests are snapped to the file's fixed 195-byte downlink packet grid, the same
+arithmetic `mpi_reconstruct` uses: a packet either arrived or failed its CRC and
+you can only ask for whole packets, so a single missing byte pulls its one
+195-byte packet, consecutive needed packets coalesce into one command, a stretch
+of fully-received packets between two gaps is left alone, and a run past the
+firmware's 1,000,000-byte per-command limit is split. The commands carry no
+`@tssent` or `@tsexec` - they run on receipt - so add scheduling yourself if the
+pass plan needs it.
+
+The name of the file on the satellite comes from the `sent_tcmd` command log:
+the `mpi_enable_active_mode(mpi_data/...)` sent when the recording started,
+falling back to whatever download command was flown while the experiment's
+packets were coming down. When neither is in the log the commands still carry
+the right offsets but the path is written as `<file_path>` for you to fill in,
+and the viewer says so. The aux panel shows the resolved name as `satellite
+file`.
+
+Two cautions worth reading before you fly the file. The reconstructed size is a
+**lower bound** - nothing proves the last received byte is the end of the file -
+so the header also gives you a single `;<size>;0` command that fetches any tail
+and reports the true `file_size` in its response. And `exec_blob_from_fs` is
+marked `recovery/expert` in the firmware, so every line draws a readiness
+warning from the linter; warnings never block startup, but run the file through
+[`agenda_check`](#agenda-review-agenda_check) and read them.
 
 ### `tcmd_import`
 

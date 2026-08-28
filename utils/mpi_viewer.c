@@ -62,6 +62,12 @@
         18..19 integration period            (big-endian uint16)
         22..151 pixels, 65 big-endian uint16 (per the First Light notebook)
 
+    Re-download export: press d to write the telecommands that fetch whatever of
+    the selected experiment never came down -- the holes snapped out to the
+    file's 195-byte downlink packet grid and merged into the fewest commands, as
+    a file for `simple_sat_ops --tc-file=`. The name of the file on the
+    satellite comes from the sent_tcmd command log.
+
     Read-only on the DB. Press F5 to re-read it and rebuild the experiment list.
 
     Usage:
@@ -140,6 +146,26 @@ int main(int argc, char **argv)
 #define MPI_MARKER_MIN_MS   1767225600000.0
 #define MPI_MARKER_MAX_MS   1798761600000.0
 
+// A single bulk-file download telecommand can fetch at most this much
+// contiguous data: the firmware clamps max_bytes to
+// COMMS_bulk_file_downlink_max_allowable_total_bytes (1,000,000) in
+// bulk_file_downlink.c. The re-download export merges the missing chunks into
+// the fewest commands that stay within this span (mirrors mpi_reconstruct.c).
+#define COMMS_BULK_DOWNLINK_MAX_BYTES  1000000L
+
+// Every MPI download this station has flown went through the stored blob rather
+// than calling the firmware command directly, so the exported commands use the
+// same wrapper. The blob forwards its three semicolon-separated arguments
+// (file_path;start_offset;byte_count) to COMMS_bulk_file_downlink_start.
+#define MPI_BLOB_PATH  "blobs/bulk_downlink_start_v2.blob"
+
+// Room for an on-satellite path like "mpi_data/2026-08-08.mpi".
+#define MPI_SAT_PATH_LEN  128
+
+// A download command sent this long before a burst's first packet still counts
+// as the command that started that download.
+#define MPI_CMD_LOOKBACK_MS  (30.0 * 60.0 * 1000.0)
+
 // On-wire MPI data frame geometry (measured; matches the aux packer above and
 // the First Light notebook's pixel slice).
 #define FRAME_STRIDE   152   // bytes per frame (sync .. last pixel)
@@ -161,6 +187,9 @@ typedef struct {
 typedef struct {
     char     utc[24];        // experiment start time "2026-07-21 17:23:00" (UTC)
     double   t_start_ms;     // experiment start (unix ms) from the mpi_start marker
+    char     sat_path[MPI_SAT_PATH_LEN];  // the file on the satellite, "" if unknown
+    double   t_first_recv_ms;// receive time of this experiment's earliest packet
+    double   t_last_recv_ms; // receive time of its latest packet
     uint8_t *buf;            // reconstructed bytes (all passes merged)
     uint8_t *present;        // 1 where a real byte landed
     long     size;
@@ -206,6 +235,17 @@ static void fmt_utc_s(double ts_ms, char *out, size_t n)
     struct tm tmv;
     gmtime_r(&secs, &tmv);
     snprintf(out, n, "%04d-%02d-%02d %02d:%02d:%02d",
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+}
+
+// "20260721T172300" (UTC) from a unix-ms timestamp, for export filenames.
+static void fmt_stamp(double ts_ms, char *out, size_t n)
+{
+    time_t secs = (time_t) (ts_ms / 1000.0);
+    struct tm tmv;
+    gmtime_r(&secs, &tmv);
+    snprintf(out, n, "%04d%02d%02dT%02d%02d%02d",
              tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
              tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
 }
@@ -394,6 +434,108 @@ fail:
     return -1;
 }
 
+// ---- the ground station's command log --------------------------------------
+//
+// sent_tcmd holds every telecommand this station transmitted. MPI work shows up
+// as a recording command and as download commands:
+//
+//   CTS1+mpi_enable_active_mode(mpi_data/2026-08-08.mpi)@...
+//   CTS1+exec_blob_from_fs(blobs/bulk_downlink_start_v2.blob,0,mpi_data/...;0;0)@...
+//   CTS1+comms_bulk_file_downlink_start(mpi_data/2026-08-08.mpi,160485,1170)@...
+//
+// so the file on the satellite is just the "mpi_data/....mpi" token in the text,
+// and the command started a recording rather than a download when
+// "mpi_enable_active_mode(" appears. This is best-effort: a download commanded
+// from elsewhere, or a store with no sent_tcmd table, simply leaves an
+// experiment's path blank and the export writes a placeholder instead.
+
+typedef struct {
+    double ts_ms;
+    char   path[MPI_SAT_PATH_LEN];
+    int    is_record;
+} mpicmd_t;
+
+// Copy the "mpi_data/....mpi" token out of a command into `path`. Returns 1 on
+// success. The token ends at the argument separator (',' in the direct form,
+// ';' in the blob form) or the closing parenthesis.
+static int extract_mpi_path(const char *text, char *path, size_t n)
+{
+    const char *s = strstr(text, "mpi_data/");
+    if (s == NULL) return 0;
+    size_t k = 0;
+    while (s[k] != '\0' && s[k] != ',' && s[k] != ';' && s[k] != ')' && k < n - 1) k++;
+    // s starts with "mpi_data/", so k is at least 9 and this test is in bounds.
+    if (strncmp(s + k - 4, ".mpi", 4) != 0) return 0;   // not a science file
+    memcpy(path, s, k);
+    path[k] = '\0';
+    return 1;
+}
+
+// Load every MPI-related telecommand, oldest first. Returns the count (0 if the
+// table is absent, which is not an error).
+static int load_mpi_commands(sqlite3 *db, mpicmd_t **out)
+{
+    *out = NULL;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT ts_sent_ms, command_text FROM sent_tcmd "
+            "WHERE command_text LIKE '%mpi_data/%' ORDER BY ts_sent_ms",
+            -1, &st, NULL) != SQLITE_OK)
+        return 0;
+
+    mpicmd_t *cmds = NULL;
+    int n = 0, cap = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *text = (const char *) sqlite3_column_text(st, 1);
+        if (text == NULL) continue;
+        char path[MPI_SAT_PATH_LEN];
+        if (!extract_mpi_path(text, path, sizeof path)) continue;
+        if (n == cap) {
+            cap = cap ? cap * 2 : 64;
+            mpicmd_t *t = (mpicmd_t *) realloc(cmds, (size_t) cap * sizeof *cmds);
+            if (t == NULL) break;
+            cmds = t;
+        }
+        cmds[n].ts_ms = (double) sqlite3_column_int64(st, 0);
+        snprintf(cmds[n].path, sizeof cmds[n].path, "%s", path);
+        cmds[n].is_record = (strstr(text, "mpi_enable_active_mode(") != NULL);
+        n++;
+    }
+    sqlite3_finalize(st);
+    *out = cmds;
+    return n;
+}
+
+// Name the file an experiment was written to. The recording command carries the
+// name and is sent at the moment the recording starts, so the mpi_enable_active_mode
+// nearest the experiment's embedded start time is the reliable answer. Failing
+// that (the command log predates the recording, or the recording was commanded
+// elsewhere) fall back to whatever download command was sent while this
+// experiment's packets were coming down. Leaves sat_path empty when neither
+// matches.
+static void label_experiment(experiment_t *e, const mpicmd_t *cmds, int ncmds)
+{
+    e->sat_path[0] = '\0';
+    double best = -1;
+    for (int k = 0; k < ncmds; k++) {
+        if (!cmds[k].is_record) continue;
+        double d = fabs(cmds[k].ts_ms - e->t_start_ms);
+        if (d > MPI_REC_WINDOW_MS) continue;
+        if (best < 0 || d < best) {
+            best = d;
+            snprintf(e->sat_path, sizeof e->sat_path, "%s", cmds[k].path);
+        }
+    }
+    if (best >= 0) return;
+
+    for (int k = 0; k < ncmds; k++) {
+        if (cmds[k].is_record) continue;
+        if (cmds[k].ts_ms > e->t_last_recv_ms) break;            // sorted by time
+        if (cmds[k].ts_ms < e->t_first_recv_ms - MPI_CMD_LOOKBACK_MS) continue;
+        snprintf(e->sat_path, sizeof e->sat_path, "%s", cmds[k].path);
+    }
+}
+
 // Reassemble the chunks named by idx[0..nidx) by absolute offset (mirrors
 // mpi_reconstruct). RS-clean chunks win; uncorrectable chunks only fill gaps.
 static long reassemble(const chunk_t *cs, const int *idx, int nidx,
@@ -470,6 +612,13 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
     memset(out, 0, sizeof *out);
     out->buf = buf; out->present = present; out->size = size;
     out->nframes = n;
+    out->t_first_recv_ms = cs[idx[0]].ts_ms;
+    out->t_last_recv_ms  = cs[idx[0]].ts_ms;
+    for (int j = 1; j < nidx; j++) {
+        double t = cs[idx[j]].ts_ms;
+        if (t < out->t_first_recv_ms) out->t_first_recv_ms = t;
+        if (t > out->t_last_recv_ms)  out->t_last_recv_ms  = t;
+    }
     out->fr_off = offs;
     out->fr_ctr  = (int *) malloc((size_t) n * sizeof(int));
     out->fr_scan = (int *) malloc((size_t) n * sizeof(int));
@@ -666,6 +815,12 @@ static int load_experiments_from_db(sqlite3 *db, experiment_t **out)
         bs[b].exp = best;   // -1 if no experiment had markers at all
     }
 
+    // The command log names the file each experiment was written to on the
+    // satellite, which the re-download export needs. An absent or unreadable
+    // sent_tcmd table just leaves the name blank.
+    mpicmd_t *cmds = NULL;
+    int ncmds = load_mpi_commands(db, &cmds);
+
     // Pass 3: for each experiment, union its bursts' chunks (dedup) and build.
     experiment_t *exps = (experiment_t *) malloc((size_t) (nexp > 0 ? nexp : 1) * sizeof *exps);
     int *uidx = (int *) malloc((size_t) n * sizeof(int));
@@ -683,10 +838,13 @@ static int load_experiments_from_db(sqlite3 *db, experiment_t **out)
                 }
             }
             experiment_t ex;
-            if (nu > 0 && build_experiment(cs, uidx, nu, exp_hint[e], max_ts, &ex))
+            if (nu > 0 && build_experiment(cs, uidx, nu, exp_hint[e], max_ts, &ex)) {
+                label_experiment(&ex, cmds, ncmds);
                 exps[nout++] = ex;
+            }
         }
     }
+    free(cmds);
     free(uidx); free(seen); free(ord); free(exp_hint);
     *out = exps;
 
@@ -937,6 +1095,161 @@ static int key_repeat(int key, float *cooldown)
     return 0;
 }
 
+// ---- re-download telecommand export ----------------------------------------
+//
+// An experiment is reassembled from whatever came down, and what did not come
+// down is a set of holes. This writes the telecommands that fetch exactly those
+// holes, as a file the operator can hand to `simple_sat_ops --tc-file=`.
+//
+// The requests are aligned to the file's fixed 195-byte downlink packet grid
+// (mirrors mpi_reconstruct's report, and the reasoning is the same). The file
+// is a sequence of 195-byte packets from offset 0; a packet either arrived or
+// failed its CRC, and you can only ask for whole packets. So a missing run is
+// snapped OUT to packet boundaries -- start rounded down, end rounded up -- and
+// every request offset and length is a multiple of 195 (a single missing byte
+// pulls its one 195-byte packet). Requests for consecutive needed packets are
+// coalesced into one command; a stretch of fully-received packets between two
+// gaps is left alone. A request past the firmware's per-command cap is tiled
+// into back-to-back whole-packet commands. The one length that can be a
+// non-multiple of 195 is the command reaching the reconstructed file's
+// genuinely partial last packet. (The chunks came from passes on different
+// 195-byte grids, which is why the raw gaps land off-grid; the re-download uses
+// the canonical grid.)
+
+// Emit the request that covers [cs, ce), tiled so no single command exceeds the
+// firmware's per-command cap. `tile` is a whole number of 195-byte packets, so
+// every command's length is a multiple of 195 -- except the one that reaches
+// the end. Pass f = NULL to count without writing. Accumulates the byte and
+// command totals.
+static void emit_run(FILE *f, const char *sat_path, long cs, long ce, long size,
+                     long tile, long *download, long *n_cmds)
+{
+    if (ce > size) ce = size;
+    for (long p = cs; p < ce; p += tile) {
+        long q = (p + tile < ce) ? p + tile : ce;
+        if (f != NULL)
+            fprintf(f, "CTS1+exec_blob_from_fs(%s,0,%s;%ld;%ld)!\n",
+                    MPI_BLOB_PATH, sat_path, p, q - p);
+        *download += q - p;
+        (*n_cmds)++;
+    }
+}
+
+// Walk the experiment's holes and emit one command per coalesced run. Pass
+// f = NULL to total the missing bytes, the bytes the commands would fetch and
+// the command count without writing anything.
+static void plan_redownload(FILE *f, const uint8_t *present, long size,
+                            const char *sat_path,
+                            long *missing, long *download, long *n_cmds)
+{
+    const long PKT = BULK_FILE_MAX_DATA;                         // 195 bytes per packet
+    long tile = (COMMS_BULK_DOWNLINK_MAX_BYTES / PKT) * PKT;     // per-command cap
+    if (tile < PKT) tile = PKT;
+
+    *missing = 0; *download = 0; *n_cmds = 0;
+    long run_start = -1;
+    long cs = -1, ce = -1;   // pending request [cs, ce), snapped to the packet grid
+
+    // Iterate one past the end so a gap that runs to EOF is closed.
+    for (long i = 0; i <= size; i++) {
+        int gap = (i < size) && !present[i];
+        if (gap && run_start < 0) {
+            run_start = i;
+        } else if (!gap && run_start >= 0) {
+            long a = run_start, b = i;
+            *missing += b - a;
+            long sa = (a / PKT) * PKT;                 // snap down to a packet start
+            long sb = ((b + PKT - 1) / PKT) * PKT;     // snap up to a packet end
+            if (sb > size) sb = size;                  // last packet is partial at EOF
+            if (cs < 0) {
+                cs = sa; ce = sb;
+            } else if (sa <= ce) {
+                // Same or adjacent packet(s) as the pending request: coalesce.
+                // A fully-received packet in between makes sa > ce, so it splits.
+                if (sb > ce) ce = sb;
+            } else {
+                emit_run(f, sat_path, cs, ce, size, tile, download, n_cmds);
+                cs = sa; ce = sb;
+            }
+            run_start = -1;
+        }
+    }
+    if (cs >= 0)
+        emit_run(f, sat_path, cs, ce, size, tile, download, n_cmds);
+}
+
+// Write the selected experiment's re-download telecommands to the working
+// directory. Puts the outcome, good or bad, in *status.
+static void export_redownload(const experiment_t *s, const char *db_path,
+                              char *status, size_t nstatus)
+{
+    // The satellite file name comes from the command log; without it the
+    // commands still spell out the right offsets, so write them with a
+    // placeholder for the operator to fill in rather than refusing.
+    int have_path = s->sat_path[0] != '\0';
+    const char *sat_path = have_path ? s->sat_path : "<file_path>";
+
+    long missing = 0, download = 0, n_cmds = 0;
+    plan_redownload(NULL, s->present, s->size, sat_path, &missing, &download, &n_cmds);
+    if (n_cmds == 0) {
+        snprintf(status, nstatus, "nothing missing below %ld bytes; no commands needed", s->size);
+        return;
+    }
+
+    char stamp[24];
+    fmt_stamp(s->t_start_ms, stamp, sizeof stamp);
+    char path[256];
+    snprintf(path, sizeof path, "mpi_redownload_%s.txt", stamp);
+
+    FILE *f = fopen(path, "w");
+    if (f == NULL) { snprintf(status, nstatus, "cannot write %s", path); return; }
+
+    char now[32];
+    fmt_utc_s((double) time(NULL) * 1000.0, now, sizeof now);
+    fprintf(f,
+        "# Re-download telecommands for the MPI experiment recorded %s UTC.\n"
+        "# Written by mpi_viewer at %s UTC from %s.\n"
+        "#\n"
+        "# on-satellite file : %s%s\n"
+        "# reconstructed     : %ld bytes, %ld received (%.1f%%)\n"
+        "# missing           : %ld bytes\n"
+        "# these commands    : %ld, fetching %ld bytes\n"
+        "#\n"
+        "# Every request is a whole number of 195-byte downlink packets, so a\n"
+        "# command can re-fetch a few bytes already in hand where a gap shares a\n"
+        "# packet with received data. Runs longer than the firmware's %ld-byte\n"
+        "# per-command limit are split.\n"
+        "#\n"
+        "# The reconstructed size is a LOWER bound: nothing here proves the last\n"
+        "# received byte is the end of the file. To find out, and to pick up any\n"
+        "# tail past it, send\n"
+        "#   CTS1+exec_blob_from_fs(%s,0,%s;%ld;0)!\n"
+        "# and read file_size out of the response.\n"
+        "#\n"
+        "# Run this through agenda_check before flying it. exec_blob_from_fs is\n"
+        "# marked recovery/expert in the firmware, so every line draws a readiness\n"
+        "# warning; warnings never block startup.\n"
+        "\n",
+        s->utc, now, db_path,
+        sat_path, have_path ? "" : "   <-- NOT in the command log; fill this in",
+        s->size, s->recovered, 100.0 * (double) s->recovered / (double) s->size,
+        missing, n_cmds, download,
+        COMMS_BULK_DOWNLINK_MAX_BYTES,
+        MPI_BLOB_PATH, sat_path, s->size);
+
+    long m2 = 0, d2 = 0, c2 = 0;
+    plan_redownload(f, s->present, s->size, sat_path, &m2, &d2, &c2);
+
+    int bad = ferror(f);
+    if (fclose(f) != 0 || bad) {
+        snprintf(status, nstatus, "write failed on %s", path);
+        return;
+    }
+    snprintf(status, nstatus, "wrote %s: %ld command%s, %ld bytes%s",
+             path, n_cmds, n_cmds == 1 ? "" : "s", download,
+             have_path ? "" : " (file path is a placeholder)");
+}
+
 // ---- main ------------------------------------------------------------------
 
 int main(int argc, char **argv)
@@ -949,7 +1262,9 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--help") == 0) {
             printf("Usage: mpi_viewer [--db=<packet_db.sqlite>]\n"
                    "Inspect MPI science imagery reconstructed from the packet DB.\n"
-                   "The left panel lists MPI experiments; F5 re-reads the DB.\n");
+                   "The left panel lists MPI experiments; F5 re-reads the DB.\n"
+                   "Press d to write the selected experiment's missing data as\n"
+                   "re-download telecommands, for simple_sat_ops --tc-file.\n");
             return 0;
         } else {
             fprintf(stderr, "mpi_viewer: unknown option '%s' (try --help)\n", argv[i]);
@@ -1005,6 +1320,10 @@ int main(int argc, char **argv)
     float rep_up = 0, rep_down = 0, rep_left = 0, rep_right = 0;
     float rep_z = 0, rep_x = 0, rep_c = 0, rep_v = 0;
 
+    // Outcome of the last d export, shown for a few seconds.
+    char  status[200] = "";
+    float status_left = 0.0f;
+
     while (!WindowShouldClose()) {
         experiment_t *s = &exps[v.sel];
 
@@ -1023,6 +1342,10 @@ int main(int argc, char **argv)
         }
         if (IsKeyPressed(KEY_S)) { v.zoom = v.zoom == 2 ? 4 : v.zoom == 4 ? 8 : v.zoom == 8 ? 16 : 2; }
         if (IsKeyPressed(KEY_A)) v.scale_mode = (v.scale_mode + 1) % 3;
+        if (IsKeyPressed(KEY_D)) {
+            export_redownload(s, db_path, status, sizeof status);
+            status_left = 8.0f;
+        }
         if (IsKeyPressed(KEY_R)) v.scale_mode = SCALE_AUTO_IMAGE;
         if (v.scale_mode == SCALE_MANUAL) {
             int step = IsKeyDown(KEY_LEFT_SHIFT) ? 500 : 100;
@@ -1055,6 +1378,7 @@ int main(int argc, char **argv)
             }
         }
         if (IsKeyPressed(KEY_Q)) break;
+        if (status_left > 0.0f) status_left -= GetFrameTime();
 
         // ---- playback ----
         if (v.playing && v.n_img > 0) {
@@ -1163,6 +1487,8 @@ int main(int argc, char **argv)
             draw_text(TextFormat("integration   : %d", be16(s->buf, o + 18)), ax, ay, 15, LIGHTGRAY); ay += 26;
         } else { ay += 20; }
         draw_text(TextFormat("experiment    : %s UTC", s->utc), ax, ay, 15, LIGHTGRAY); ay += 20;
+        draw_text(TextFormat("satellite file: %s", s->sat_path[0] ? s->sat_path : "unknown"),
+                  ax, ay, 15, LIGHTGRAY); ay += 20;
         draw_text(TextFormat("targets/sweep : %d", v.n_targets), ax, ay, 15, LIGHTGRAY); ay += 20;
         draw_text(TextFormat("columns/image : %d %s  (filled %d)",
                              v.ncols, v.fpi_override ? "(fixed)" : "(auto)", cols_present),
@@ -1175,10 +1501,15 @@ int main(int argc, char **argv)
         draw_text(TextFormat("playback      : %s  %.0f img/s", v.playing ? "PLAY" : "paused", v.ips),
                   ax, ay, 15, v.playing ? (Color){ 120, 220, 160, 255 } : GRAY); ay += 20;
 
+        // the d-export outcome, above the help footer
+        if (status_left > 0.0f)
+            draw_text(status, 12, GetScreenHeight() - 42, 14, (Color){ 120, 220, 160, 255 });
+
         // help footer
         const char *help =
             "Up/Down experiment   Left/Right image   Space play/pause   ,/. speed"
-            "   f steps/sweep   s zoom   a scale   z/x min  c/v max  F5 refresh  q quit";
+            "   f steps/sweep   s zoom   a scale   z/x min  c/v max"
+            "   d re-download commands   F5 refresh  q quit";
         draw_text(help, 12, GetScreenHeight() - 22, 12, (Color){ 150, 150, 160, 255 });
 
         EndDrawing();
