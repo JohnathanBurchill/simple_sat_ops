@@ -341,8 +341,195 @@ static int split_tabs(char *line, char **fields, int max)
     return n;
 }
 
-// Read the day cache into g_rows and work out the local state of each
-// observation. Returns 0 if there is no cache for the day yet.
+// One entry per observation this station has audio for, built by
+// walking the archive once at startup. The archive is filed by
+// observation id rather than by date, so without this index a day with
+// no SatNOGS listing yet would show nothing at all -- even a day whose
+// recordings are all sitting on the disk.
+typedef struct {
+    long id;
+    char day[12];     // YYYY-MM-DD, from the recording's filename
+    char start[32];   // the same timestamp as the API writes it
+} local_t;
+
+static local_t *g_local = NULL;
+static int      g_n_local = 0;
+
+// satnogs_<id>_YYYY-MM-DDTHH-MM-SS.<ext> is what satnogs_pull.sh names
+// a recording, so the filename alone dates the pass. Fills day and
+// start; returns 0 if the name is not one of ours.
+static int parse_recording_name(const char *name, long id,
+                                char *day, size_t dayn,
+                                char *start, size_t startn)
+{
+    char prefix[64];
+    int plen = snprintf(prefix, sizeof prefix, "satnogs_%ld_", id);
+    if (strncmp(name, prefix, (size_t)plen) != 0) return 0;
+
+    const char *ts = name + plen;
+    // YYYY-MM-DDTHH-MM-SS is 19 characters.
+    if (strlen(ts) < 19 || ts[4] != '-' || ts[7] != '-' || ts[10] != 'T')
+        return 0;
+
+    snprintf(day, dayn, "%.10s", ts);
+    snprintf(start, startn, "%.10sT%.2s:%.2s:%.2sZ",
+             ts, ts + 11, ts + 14, ts + 17);
+    return 1;
+}
+
+// Walk the archive and note every observation with a recording. Called
+// once before the interface starts, because on a real archive this is
+// tens of thousands of directories.
+static void scan_local_archive(void)
+{
+    DIR *d = opendir(g_archive);
+    if (d == NULL) return;
+
+    int cap = 4096;
+    g_local = malloc((size_t)cap * sizeof *g_local);
+    if (g_local == NULL) { closedir(d); return; }
+
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        char *endp = NULL;
+        long id = strtol(e->d_name, &endp, 10);
+        if (id <= 0 || endp == e->d_name || *endp != '\0') continue;
+
+        // Room for the archive path and any name the filesystem can
+        // hand back, so the join cannot be truncated into a path that
+        // names something else.
+        char sub[2048];
+        snprintf(sub, sizeof sub, "%s/%s", g_archive, e->d_name);
+        DIR *s = opendir(sub);
+        if (s == NULL) continue;
+
+        struct dirent *f;
+        while ((f = readdir(s)) != NULL) {
+            const char *dot = strrchr(f->d_name, '.');
+            if (dot == NULL || strcmp(dot, ".part") == 0) continue;
+
+            char day[12], start[32];
+            if (!parse_recording_name(f->d_name, id, day, sizeof day,
+                                      start, sizeof start))
+                continue;
+
+            if (g_n_local == cap) {
+                int ncap = cap * 2;
+                local_t *bigger = realloc(g_local, (size_t)ncap * sizeof *bigger);
+                if (bigger == NULL) break;
+                g_local = bigger;
+                cap = ncap;
+            }
+            g_local[g_n_local].id = id;
+            snprintf(g_local[g_n_local].day,   sizeof g_local[0].day,   "%s", day);
+            snprintf(g_local[g_n_local].start, sizeof g_local[0].start, "%s", start);
+            g_n_local++;
+            break;
+        }
+        closedir(s);
+    }
+    closedir(d);
+}
+
+// The meta.json beside a recording is jq's pretty-printed copy of the
+// observation record, one top-level field to a line at a two-space
+// indent. That is enough structure to pull the few fields the list
+// shows without a JSON parser -- and the indent is what keeps "status"
+// from matching "waterfall_status" or "transmitter_status".
+static int meta_field(const char *json, const char *key, char *out, size_t outn)
+{
+    char needle[64];
+    snprintf(needle, sizeof needle, "\n  \"%s\":", key);
+    const char *p = strstr(json, needle);
+    if (p == NULL) return 0;
+    p += strlen(needle);
+    while (*p == ' ') p++;
+
+    size_t n = 0;
+    if (*p == '"') {
+        p++;
+        while (*p != '\0' && *p != '"' && n + 1 < outn) out[n++] = *p++;
+    } else {
+        while (*p != '\0' && *p != ',' && *p != '\n' && n + 1 < outn) out[n++] = *p++;
+    }
+    out[n] = '\0';
+    return n > 0 && strcmp(out, "null") != 0;
+}
+
+// Fill in what the stored record knows about an observation we hold but
+// whose day has not been listed. Best effort: a row with nothing behind
+// it still shows its id, its time and the fact that we have it.
+static void fill_from_meta(obs_t *o)
+{
+    char path[900];
+    snprintf(path, sizeof path, "%s/%ld/satnogs_%ld.meta.json",
+             g_archive, o->id, o->id);
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return;
+
+    char json[8192];
+    size_t n = fread(json, 1, sizeof json - 1, f);
+    fclose(f);
+    json[n] = '\0';
+
+    // Each destination is sized for the value it holds, and a longer
+    // one is cut to fit rather than rejected -- these are display
+    // columns, and the precision says so explicitly.
+    char buf[128];
+    if (meta_field(json, "end", buf, sizeof buf))
+        snprintf(o->end, sizeof o->end, "%.*s", (int)sizeof o->end - 1, buf);
+    if (meta_field(json, "status", buf, sizeof buf))
+        snprintf(o->status, sizeof o->status, "%.*s", (int)sizeof o->status - 1, buf);
+    if (meta_field(json, "waterfall_status", buf, sizeof buf))
+        snprintf(o->waterfall, sizeof o->waterfall, "%.*s", (int)sizeof o->waterfall - 1, buf);
+    if (meta_field(json, "station_name", buf, sizeof buf))
+        snprintf(o->station, sizeof o->station, "%.*s", (int)sizeof o->station - 1, buf);
+    if (meta_field(json, "ground_station", buf, sizeof buf))
+        o->station_id = strtol(buf, NULL, 10);
+    if (meta_field(json, "max_altitude", buf, sizeof buf))
+        o->max_el = atof(buf);
+}
+
+static int cmp_obs_start(const void *a, const void *b)
+{
+    const obs_t *x = a, *y = b;
+    int c = strcmp(x->start, y->start);
+    if (c != 0) return c;
+    return (x->id > y->id) - (x->id < y->id);
+}
+
+// Add the observations we hold for this day that the listing does not
+// mention -- which, on a day never listed, is all of them. This is what
+// makes the archive visible before a single request has been spent.
+static void merge_local(void)
+{
+    for (int i = 0; i < g_n_local && g_n_rows < MAX_OBS_ROWS; i++) {
+        if (strcmp(g_local[i].day, g_day) != 0) continue;
+
+        int already = 0;
+        for (int j = 0; j < g_n_rows; j++)
+            if (g_rows[j].id == g_local[i].id) { already = 1; break; }
+        if (already) continue;
+
+        obs_t *o = &g_rows[g_n_rows++];
+        memset(o, 0, sizeof *o);
+        o->id = g_local[i].id;
+        snprintf(o->start,  sizeof o->start,  "%s", g_local[i].start);
+        snprintf(o->status, sizeof o->status, "%s", "held");
+        o->has_audio  = 1;
+        o->downloaded = 1;
+        o->decoded    = is_decoded(o->id);
+        // The record stored beside the recording fills in the station,
+        // the real status and the pass geometry, so a held observation
+        // reads the same as a listed one.
+        fill_from_meta(o);
+    }
+    qsort(g_rows, (size_t)g_n_rows, sizeof g_rows[0], cmp_obs_start);
+}
+
+// Read the day cache into g_rows, add whatever we hold locally for the
+// same day, and work out each observation's state. Returns 0 if the day
+// has no SatNOGS listing yet -- the rows can still be non-empty.
 static int load_day(void)
 {
     g_n_rows = 0;
@@ -355,6 +542,7 @@ static int load_day(void)
     struct stat st;
     if (stat(path, &st) != 0) {
         snprintf(g_cache_note, sizeof g_cache_note, "not listed yet");
+        merge_local();
         return 0;
     }
 
@@ -372,6 +560,7 @@ static int load_day(void)
     FILE *f = fopen(path, "r");
     if (f == NULL) {
         snprintf(g_cache_note, sizeof g_cache_note, "cache unreadable");
+        merge_local();
         return 0;
     }
 
@@ -406,6 +595,7 @@ static int load_day(void)
         g_n_rows++;
     }
     fclose(f);
+    merge_local();
     return 1;
 }
 
@@ -485,15 +675,26 @@ static int day_valid(const char *s)
     return strptime(s, "%Y-%m-%d", &tm) != NULL;
 }
 
-// Switching days drops the marks: they name observations on the day
-// they were made, and carrying them across would make `d` fetch things
-// scrolled off the screen days ago.
-static void go_to_day(const char *day)
+// Re-read whatever g_day now names. Switching days drops the marks:
+// they name observations on the day they were made, and carrying them
+// across would make `d` fetch things that scrolled off the screen days
+// ago.
+static void reload_day(void)
 {
-    snprintf(g_day, sizeof g_day, "%s", day);
     clear_marks();
     load_day();
     rebuild_view();
+}
+
+// Only for a day that came from somewhere else -- the `g` prompt, or
+// the command line. day_shift() has already written g_day, so its
+// callers use reload_day() directly: passing g_day back in here would
+// be snprintf copying a buffer onto itself, which is undefined and in
+// practice leaves the date empty.
+static void go_to_day(const char *day)
+{
+    snprintf(g_day, sizeof g_day, "%s", day);
+    reload_day();
 }
 
 // ----------------------------------------------------------------- job
@@ -904,12 +1105,30 @@ static void draw_help(int rows, int cols)
         "recording, which is roughly one pass in three. Those cannot be fetched",
         "by anyone; they are shown so the day's coverage reads honestly.",
         "",
+        "A day with no listing still shows what this station holds for it: the",
+        "archive is read at startup and merged into every day. `held` in the",
+        "status column means the recording is here but SatNOGS has not been",
+        "asked about that day yet.",
+        "",
+        // Stands in for the archive path, filled in below: knowing
+        // which tree is being read is the first thing to check when the
+        // rows are not the ones you expected.
+        "%ARCHIVE%",
+        "",
         "press any key",
         NULL,
     };
     erase();
-    for (int i = 0; help[i] != NULL && i + 1 < rows; i++)
-        put(i + 1, 2, cols - 4, A_NORMAL, help[i]);
+    for (int i = 0; help[i] != NULL && i + 1 < rows; i++) {
+        if (strcmp(help[i], "%ARCHIVE%") == 0) {
+            char line[1024];
+            snprintf(line, sizeof line, "archive: %s   (%d held, %d decoded)",
+                     g_archive, g_n_local, g_n_decoded);
+            put(i + 1, 2, cols - 4, A_NORMAL, line);
+        } else {
+            put(i + 1, 2, cols - 4, A_NORMAL, help[i]);
+        }
+    }
     refresh();
     nodelay(stdscr, FALSE);
     getch();
@@ -1047,7 +1266,21 @@ int main(int argc, char **argv)
     else
         day_today();
 
+    // The archive is a shared setgid tree that cron writes as another
+    // user, so anything fetched here has to stay group-writable. That
+    // is a property of the archive rather than a preference of whoever
+    // is running the browser, so set it here instead of asking the
+    // operator to remember a umask on the command line.
+    umask(0002);
+
+    // Both of these walk a lot of the disk, so say what is happening --
+    // on a real archive it is tens of thousands of directories and a
+    // couple of hundred thousand database rows.
+    fprintf(stderr, "satnogs_browser: reading %s ...\n", g_archive);
+    scan_local_archive();
     load_decoded_ids();
+    fprintf(stderr, "satnogs_browser: %d observation%s held locally\n",
+            g_n_local, g_n_local == 1 ? "" : "s");
 
     if (initscr() == NULL) {
         fprintf(stderr, "satnogs_browser: ncurses initscr failed\n");
@@ -1126,12 +1359,15 @@ int main(int argc, char **argv)
                             break;
             case KEY_HOME:  g_sel = 0; break;
             case KEY_END:   g_sel = g_n_view ? g_n_view - 1 : 0; break;
-            case KEY_LEFT:  day_shift(-1); go_to_day(g_day); break;
-            case KEY_RIGHT: day_shift(1);  go_to_day(g_day); break;
-            case 't':       day_today();   go_to_day(g_day); break;
+            case KEY_LEFT:  day_shift(-1); reload_day(); break;
+            case KEY_RIGHT: day_shift(1);  reload_day(); break;
+            case 't':       day_today();   reload_day(); break;
             case 'g': {
-                char buf[16];
-                snprintf(buf, sizeof buf, "%s", g_day);
+                // Empty, not pre-filled with the current day: with the
+                // cursor at the end of a seeded date, typing appends to
+                // it instead of replacing it, which is never what you
+                // meant by pressing g.
+                char buf[16] = "";
                 if (prompt("go to date (YYYY-MM-DD): ", buf, sizeof buf, rows, cols)) {
                     if (day_valid(buf)) go_to_day(buf);
                     else set_status("'%s' is not a YYYY-MM-DD date", buf);
@@ -1177,6 +1413,7 @@ int main(int argc, char **argv)
     endwin();
     free(g_job.queue);
     free(g_decoded_ids);
+    free(g_local);
     return 0;
 }
 
