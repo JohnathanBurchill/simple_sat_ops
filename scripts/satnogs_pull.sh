@@ -127,11 +127,17 @@
 #   --decode                On success, run decode_passes.sh against --out
 #   --rate-limit-ms=<n>     Sleep between HTTP calls (default 250)
 #   --user-agent=<str>      HTTP User-Agent (default "sso-satnogs-pull/1.0")
-#   --api-token=<str>       SatNOGS API token, sent as an Authorization
-#                           header on API requests (never on audio
-#                           downloads). Raises the throttle ceiling from
-#                           60 to 240 requests/hour. Defaults to
-#                           $SATNOGS_API_TOKEN.
+#   --api-token=<str>       SatNOGS Network API token, sent as an
+#                           Authorization header on listing requests
+#                           (never on audio downloads). Raises the
+#                           throttle ceiling from 60 to 240 listings an
+#                           hour. Falls back to $SATNOGS_API_TOKEN, then
+#                           to the first line of <out>/.api_token --
+#                           which is the one to use, since it is the
+#                           only place both cron and an operator's shell
+#                           look. Note it must be the *Network* token;
+#                           a SatNOGS DB token is a different thing and
+#                           is rejected with a 401.
 #   --decode-passes=<path>  Override decode_passes.sh location
 #   --db=<path>             Pass SSO_PACKET_DB into the --decode invocation
 #   --jobs=<n>              Parallel decode workers for --decode (passed
@@ -434,6 +440,28 @@ if [[ "$USE_LOCAL_TLE" -eq 1 && -d "$TLE_DIR" ]]; then
     fi
 fi
 [[ -n "$LOCAL_TLE" ]] && log "using local TLE $LOCAL_TLE"
+
+# Fall back to a token file when the environment has no token. The
+# token lives in two worlds -- crond's environment for the polling run,
+# an operator's shell for anything interactive -- and keeping it in one
+# file under the archive means both find the same one, instead of the
+# operator having to remember to export a value they cannot see. An
+# explicit --api-token still wins, then the environment, then this.
+if [[ -z "$API_TOKEN" && -r "${OUT}/.api_token" ]]; then
+    API_TOKEN="$(head -n 1 "${OUT}/.api_token" | tr -d '[:space:]')"
+    if [[ -n "$API_TOKEN" ]]; then
+        log "using the API token in ${OUT}/.api_token"
+        # A token is a credential; say so if the file is readable by
+        # everyone, since the archive itself is a shared tree.
+        PERMS="$(stat -f '%Lp' "${OUT}/.api_token" 2>/dev/null \
+                 || stat -c '%a' "${OUT}/.api_token" 2>/dev/null || echo "")"
+        # The last digit is the "other" field; 4 through 7 all include
+        # read.
+        case "$PERMS" in
+            *[4567]) logerr "warning: ${OUT}/.api_token is world-readable (mode $PERMS)";;
+        esac
+    fi
+fi
 
 # Build the comma-separated status filter into a jq selector and a URL
 # query fragment. If STATUS_FILTER is empty, accept everything.
