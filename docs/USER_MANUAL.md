@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`d631396` (2026-08-30). This is a working draft.
+`9bc0f22` (2026-08-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -3018,19 +3018,44 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   so browsing history cannot disturb the polling run.
 * **`satnogs_browser`** — a curses view of one UTC day of the archive:
   every observation SatNOGS holds for the satellite, what state each one
-  is in locally, and a way to mark passes and fetch them. Arrow keys
-  move, left and right step days, `t` jumps to today and `g` to a date,
-  `r` lists the day from SatNOGS, `space` marks, `a` marks everything
-  fetchable in view, `d` downloads what is marked, and `f` cycles the
-  filter (all, with audio, not downloaded, downloaded, decoded).
+  is in locally, and a way to mark passes, fetch them and decode them.
+  It takes vi motions alongside the arrows: `j`/`k` move, `h`/`l` step
+  days, `gg` and `G` go to the first and last row, `zz` centres the
+  selection. `t` jumps to today and `/` to a date, `r` lists the day
+  from SatNOGS, `space` marks, `a` marks everything in view that has a
+  recording, `d` downloads what is marked, `p` decodes what is marked,
+  and `f` cycles the filter (all, with audio, not downloaded,
+  downloaded, decoded).
+
+  Marks are a selection rather than an instruction, so the same set
+  serves both jobs: `d` takes the marked passes SatNOGS can still send,
+  `p` takes the marked passes already on the disk and runs
+  `decode_passes.sh` over each one, into the packet database the browser
+  is reading. That decoder is incremental, so a pass already decoded
+  costs nothing to press `p` on again.
 
   Each row says whether this station has the audio, and whether that
   audio produced packets — the second read from `session_dir` in the
   packet database, so "decoded" means the pass actually yielded
-  something rather than merely landing on disk. A row marked `no audio`
-  is one SatNOGS itself never received a recording for, roughly a third
-  of all observations; nobody can fetch those, and they are shown so a
-  day's coverage reads honestly.
+  something rather than merely landing on disk. Green is the finished
+  state, yellow the half-done one: audio here, nothing read from it yet.
+  A row marked `no audio` in red is one SatNOGS itself never received a
+  recording for, roughly a third of all observations; nobody can fetch
+  those, and they are shown so a day's coverage reads honestly.
+
+  The `data` column counts the frames SatNOGS demodulated from the pass
+  itself, which the listing carries and the browser also reads back from
+  the record stored beside a recording. One or two is a beacon; dozens
+  means the pass carried a bulk download, which makes it the quickest
+  way to find the passes worth having. A dash means nothing on this disk
+  knows the count — list the day with `r`.
+
+  `Enter` writes a note against the selected observation — your own line
+  about what the pass carried, shown at the right of the row (cut with
+  an ellipsis when the screen is too narrow) and in full in the pane
+  below. Notes live in `.notes.tsv` at the top of the archive, one
+  `<id><TAB><text>` line each, so they are readable without the browser;
+  emptying a note deletes it.
 
   A day with no SatNOGS listing yet still shows what this station holds
   for it. The archive is filed by observation id rather than by date, so
