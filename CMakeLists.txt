@@ -539,10 +539,15 @@ if (RAYLIB_FOUND)
     # 152-byte frames by their sync word, groups them into images by inner-dome
     # target voltage, and plays them back grayscale with an adjustable DN range.
     # Needs sqlite3 via packet_db.
-    add_executable(mpi_viewer utils/mpi_viewer.c src/proto/bulk_size.c)
+    # The globe under the experiment list propagates the DB's own TLEs with
+    # SGP4 and asks sgp4sdp4 where the Sun was, hence prediction.c (and oem.c,
+    # which it calls into) and the vendored library.
+    add_executable(mpi_viewer utils/mpi_viewer.c src/proto/bulk_size.c
+                   src/proto/adcs_mag.c src/orbit/prediction.c src/orbit/oem.c)
     target_include_directories(mpi_viewer PRIVATE ${RAYLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(mpi_viewer PRIVATE ${RAYLIB_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
-    target_link_libraries(mpi_viewer PRIVATE ${RAYLIB_LIBRARIES} ${OPENSSL_LIBRARIES} m)
+    target_link_libraries(mpi_viewer PRIVATE ${RAYLIB_LIBRARIES} ${OPENSSL_LIBRARIES}
+                          ${SGP4SDP4_LIB} m)
     target_link_packet_db(mpi_viewer)
     target_link_sso_core(mpi_viewer)
     if (APPLE)

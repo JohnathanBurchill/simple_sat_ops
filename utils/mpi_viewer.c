@@ -155,6 +155,26 @@
     times of the frames nearest those two bytes, so a stretch that never came
     down costs no time, the same way it takes up no columns.
 
+    Where it was: under the experiment list is the Earth, NASA's Blue Marble
+    wrapped on a sphere and lit from where the Sun actually stood while the MPI
+    was recording, so the part of the pass that was flown in darkness is drawn
+    dark. The satellite's ground track from the recording's first marker to its
+    last is drawn across it, with a dot at the point the satellite was over when
+    the image on screen was taken; the stretches round the far side of the globe
+    are drawn faintly rather than dropped. Drag the globe to turn it about its
+    own middle, scroll or pinch to zoom. Press with two fingers and slide and it
+    turns about the satellite instead: the dot keeps its place on screen and the
+    Earth swings around it, the disc sliding within the panel to make room.
+    Zooming holds the dot the same way, so closing in goes to the satellite.
+    Where the globe was left -- which way it faces, how far in, and where the
+    disc sits -- comes back with the experiment next session, and g puts it back
+    to the whole Earth on the whole track.
+    The orbit is whichever element set in the DB's own tle table
+    has the epoch closest to the recording, propagated by the same SGP4 the pass
+    predictor uses, and the caption says which one and how far from its epoch
+    the recording sat. The experiment list above it scrolls -- with the wheel,
+    or by clicking a row to select it.
+
     Between sessions: on exit the viewer writes which experiment was open, where
     the playhead sat, and every view setting to
     ~/.local/state/simple_sat_ops/mpi_viewer.state, and reads it back at
@@ -210,8 +230,10 @@
 
 #include <raylib.h>
 
+#include "adcs_mag.h"
 #include "bulk_size.h"
 #include "packet_db.h"
+#include "prediction.h"
 #include "sso_paths.h"
 #include "sso_version.h"
 
@@ -1878,6 +1900,753 @@ static int key_repeat(int key, float *cooldown)
     return 0;
 }
 
+// ---- the ephemeris globe ---------------------------------------------------
+//
+// Under the experiment list, the Earth as it was while the MPI was recording:
+// NASA's Blue Marble wrapped on a sphere, lit from where the Sun actually
+// stood so the night side of the recording is dark, with the satellite's
+// ground track from the first frame to the last drawn across it and a dot
+// where the satellite was when the image on screen was taken. Drag it to turn
+// it, scroll or pinch to zoom.
+//
+// The orbit comes out of the packet DB's own tle table -- whichever element
+// set's epoch is closest to the recording -- and is propagated by the same
+// SGP4 path next_in_queue uses. select_ephemeris rewrites a TLE's units in
+// place and sgp4sdp4's flags are module-level rather than per-object, so the
+// elements are converted once, when the experiment changes, and every sample
+// after that propagates that one converted set.
+//
+// The disc is drawn on the CPU, one ray per panel pixel into a unit sphere,
+// rather than as a 3D model: the terminator, the map lookup and the test for
+// whether a piece of track has gone round the far side all fall out of the
+// same few lines, and it needs no shader. It is redrawn only when the view or
+// the Sun moves; the track and the dot are drawn over it every frame.
+
+// The map is stored as an equirectangular image, so a level is just a smaller
+// copy of it: the whole 360 degrees of longitude spans about 2*pi*R pixels
+// across the middle of a disc of radius R, and picking the level nearest that
+// width keeps the globe from shimmering when it is small.
+#define GLOBE_MAP_LEVELS  5
+#define GLOBE_MAP_FILE    "nasa_blue_marble_2048.png"
+
+// How much of the panel the globe fills at zoom 1, and the zoom limits.
+#define GLOBE_FILL        0.47
+#define GLOBE_ZOOM_MIN    1.0
+#define GLOBE_ZOOM_MAX    16.0
+
+// How long after the last turn or zoom the disc is drawn again at the screen's
+// own resolution. Long enough that a flick of the wheel counts as one movement.
+#define GLOBE_SETTLE      0.20f
+
+// How bright the unlit side is drawn, and the sine of the half-width of the
+// soft terminator (0.10 is about six degrees of Sun elevation either way,
+// roughly civil twilight).
+#define GLOBE_NIGHT       0.24
+#define GLOBE_TERMINATOR  0.10
+
+// Samples along the ground track, and the panel geometry: the title row above
+// the disc, the whole panel's height, and the least it can shrink to before
+// the window is too short to show it at all.
+#define GLOBE_TRACK_PTS   240
+#define GLOBE_TITLE_H     22
+#define GLOBE_PANEL_H     360
+#define GLOBE_PANEL_MIN_H 190
+
+// The two lines along the bottom of the window -- the export outcome and the
+// help -- run the full width, so the left column stops above them.
+#define FOOTER_H          48
+
+// Earth's equatorial radius, for putting the track at its real altitude above
+// the unit sphere. sgp4sdp4's own xkmper, without pulling in its constants.
+#define GLOBE_EARTH_KM    6378.135
+
+typedef struct {
+    unsigned char *rgb;
+    int w, h;
+} maplevel_t;
+
+typedef struct {
+    float lat, lon, alt_km;
+} subpoint_t;
+
+typedef struct {
+    // The world map, and the same map halved a few times over.
+    maplevel_t lv[GLOBE_MAP_LEVELS];
+    int        nlv;
+
+    // Where the camera looks, and how much of the panel the disc fills.
+    double lat0, lon0, zoom;
+
+    // Where the middle of the disc sits, as an offset from the middle of the
+    // panel. Turning and zooming are about the satellite rather than about the
+    // panel, which means holding its dot still and letting the globe move
+    // under it -- this is how far it has moved.
+    double ox, oy;
+
+    // The satellite's own point, as of the last frame drawn: the thing turning
+    // and zooming pivot on. Read a frame late, which no drag can see.
+    double anchor_lat, anchor_lon, anchor_alt;
+    int    have_anchor;
+
+    // The rendered disc, and what it was rendered for.
+    Color    *pix;
+    Texture2D tex;
+    int       tex_w, tex_h;
+    int       valid;
+    double    r_lat0, r_lon0, r_zoom, r_sunlat, r_sunlon, r_ox, r_oy;
+
+    // The selected experiment's orbit: one converted element set, propagated
+    // for every sample. track_utc says which experiment it was built for.
+    int        have_tle;
+    tle_t      tle;
+    char       track_utc[24];
+    char       tle_note[64];
+    subpoint_t trk[GLOBE_TRACK_PTS];
+    int        ntrk;
+
+    // The sub-solar point, Earth-fixed, at the middle of that recording.
+    double sun_lat, sun_lon;
+
+    // A drag that began on the globe keeps turning it until the button is let
+    // go, the same way a whereogram scrub does.
+    int     drag;
+    int     drag_pivot;   // this drag turns about the satellite, not the middle
+    Vector2 drag_at;
+
+    // Seconds left of the coarse render the disc falls back to while it is
+    // being turned or zoomed. At zero it is drawn once more at the screen's
+    // own resolution, r_ss texture pixels to the panel pixel.
+    float   settle;
+    int     r_ss;
+
+    // Set when the session state carried a view for the experiment being
+    // resumed, so the first track built does not frame itself over it.
+    int     keep_view;
+} globe_t;
+
+// ---- the TLE table ---------------------------------------------------------
+//
+// Every element set the DB holds for FrontierSat, so an experiment can be
+// matched to the one closest to it in time. Read once at startup and again on
+// F5, like the experiments themselves.
+
+#define GLOBE_CATALOG  69015   // FrontierSat
+
+typedef struct {
+    long long catalog;
+    int64_t   epoch_ms;
+    char      line1[80];
+    char      line2[80];
+} tle_row_t;
+
+static tle_row_t *g_tles = NULL;
+static int64_t   *g_tle_epochs = NULL;   // parallel to g_tles, for the search
+static int        g_ntles = 0;
+
+static void free_tle_rows(void)
+{
+    free(g_tles); g_tles = NULL;
+    free(g_tle_epochs); g_tle_epochs = NULL;
+    g_ntles = 0;
+}
+
+// Load FrontierSat's element sets, each epoch worked out as unix ms. Returns
+// how many came back.
+static int load_tle_rows(const char *db_path)
+{
+    free_tle_rows();
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db != NULL) sqlite3_close(db);
+        return 0;
+    }
+    const char *sql =
+        "SELECT catalog_number, epoch_year, epoch_day, line1, line2 FROM tle "
+        "WHERE catalog_number = ?1 AND epoch_year IS NOT NULL "
+        "AND epoch_day IS NOT NULL";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return 0;
+    }
+    sqlite3_bind_int64(st, 1, GLOBE_CATALOG);
+    int cap = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        int64_t epoch_ms = 0;
+        if (adcs_tle_epoch_unix_ms(sqlite3_column_int(st, 1),
+                                   sqlite3_column_double(st, 2), &epoch_ms) != 0)
+            continue;
+        if (g_ntles == cap) {
+            int nc = cap ? cap * 2 : 64;
+            tle_row_t *tt = realloc(g_tles, (size_t) nc * sizeof *tt);
+            int64_t   *et = realloc(g_tle_epochs, (size_t) nc * sizeof *et);
+            if (tt != NULL) g_tles = tt;
+            if (et != NULL) g_tle_epochs = et;
+            if (tt == NULL || et == NULL) break;
+            cap = nc;
+        }
+        tle_row_t *r = &g_tles[g_ntles];
+        r->catalog  = sqlite3_column_int64(st, 0);
+        r->epoch_ms = epoch_ms;
+        snprintf(r->line1, sizeof r->line1, "%s", (const char *) sqlite3_column_text(st, 3));
+        snprintf(r->line2, sizeof r->line2, "%s", (const char *) sqlite3_column_text(st, 4));
+        g_tle_epochs[g_ntles] = epoch_ms;
+        g_ntles++;
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return g_ntles;
+}
+
+// ---- sphere geometry -------------------------------------------------------
+
+// Unit vector, Earth-fixed, of a point at (lat, lon) in degrees. X points at
+// 0 N 0 E, Y at 0 N 90 E, Z at the north pole.
+static void ll_vec(double lat_deg, double lon_deg, double v[3])
+{
+    double la = lat_deg * (M_PI / 180.0), lo = lon_deg * (M_PI / 180.0);
+    double c = cos(la);
+    v[0] = c * cos(lo);
+    v[1] = c * sin(lo);
+    v[2] = sin(la);
+}
+
+// The screen basis of a globe centred on (lat0, lon0): east across the panel,
+// north up it, and out of it towards the viewer.
+static void globe_basis(double lat0, double lon0,
+                        double e[3], double n[3], double o[3])
+{
+    double la = lat0 * (M_PI / 180.0), lo = lon0 * (M_PI / 180.0);
+    double sla = sin(la), cla = cos(la), slo = sin(lo), clo = cos(lo);
+    e[0] = -slo;        e[1] =  clo;        e[2] = 0.0;
+    n[0] = -sla * clo;  n[1] = -sla * slo;  n[2] = cla;
+    o[0] =  cla * clo;  o[1] =  cla * slo;  o[2] = sla;
+}
+
+// The disc's radius in panel pixels.
+static double globe_radius(int w, int h, double zoom)
+{
+    return GLOBE_FILL * (double) (w < h ? w : h) * zoom;
+}
+
+// Where a point at (lat, lon, altitude) lands on a panel of w x h whose disc is
+// centred (ox, oy) from the middle of it, and whether the globe itself is in
+// front of the point -- which it is when the point is behind the plane of the
+// disc and inside its outline.
+static void globe_project(const double e[3], const double n[3], const double o[3],
+                          double R, int w, int h, double ox, double oy,
+                          double lat, double lon, double alt_km,
+                          Vector2 *out, int *hidden)
+{
+    double p[3];
+    ll_vec(lat, lon, p);
+    double rr = 1.0 + alt_km / GLOBE_EARTH_KM;
+    double x = rr * (p[0] * e[0] + p[1] * e[1] + p[2] * e[2]);
+    double y = rr * (p[0] * n[0] + p[1] * n[1] + p[2] * n[2]);
+    double z = rr * (p[0] * o[0] + p[1] * o[1] + p[2] * o[2]);
+    out->x = (float) ((double) w * 0.5 + ox + R * x);
+    out->y = (float) ((double) h * 0.5 + oy - R * y);
+    *hidden = (z < 0.0 && x * x + y * y < 1.0);
+}
+
+// Where the satellite's dot sits on a w x h panel as the globe stands now.
+// The pivot works off the difference between two of these across a change, so
+// a globe with no orbit to draw reports a fixed point and moves nothing.
+static void globe_anchor_at(const globe_t *g, int w, int h, Vector2 *out)
+{
+    if (!g->have_anchor) { *out = (Vector2){ 0.0f, 0.0f }; return; }
+    double e[3], n[3], o[3];
+    int hidden = 0;
+    globe_basis(g->lat0, g->lon0, e, n, o);
+    globe_project(e, n, o, globe_radius(w, h, g->zoom), w, h, g->ox, g->oy,
+                  g->anchor_lat, g->anchor_lon, g->anchor_alt, out, &hidden);
+}
+
+// Hold the satellite's dot where it was across a change of view: given where it
+// sat before the change, slide the disc by however far the change moved it.
+static void globe_hold_anchor(globe_t *g, int w, int h, Vector2 before)
+{
+    Vector2 after;
+    globe_anchor_at(g, w, h, &after);
+    g->ox += before.x - after.x;
+    g->oy += before.y - after.y;
+}
+
+// ---- the world map ---------------------------------------------------------
+
+// One 2x2 box average of an RGB image, for the next level down.
+static void halve_rgb(const unsigned char *src, int sw, int sh, unsigned char *dst)
+{
+    int dw = sw / 2, dh = sh / 2;
+    for (int y = 0; y < dh; y++) {
+        for (int x = 0; x < dw; x++) {
+            const unsigned char *a = src + ((size_t) (2 * y) * sw + 2 * x) * 3;
+            const unsigned char *b = a + (size_t) sw * 3;
+            unsigned char *d = dst + ((size_t) y * dw + x) * 3;
+            for (int c = 0; c < 3; c++)
+                d[c] = (unsigned char) ((a[c] + a[c + 3] + b[c] + b[c + 3] + 2) / 4);
+        }
+    }
+}
+
+// Bilinear lookup, wrapping in longitude and clamping in latitude, with u and
+// v running 0..1 across the map. Falls back to a plain ocean blue if the map
+// never loaded, so the panel still shows the lighting and the track.
+static void map_sample(const globe_t *g, int lv, double u, double v, double out[3])
+{
+    if (g->nlv == 0) {
+        out[0] = 38.0; out[1] = 62.0; out[2] = 96.0;
+        return;
+    }
+    const maplevel_t *L = &g->lv[lv];
+    double fx = u * L->w - 0.5, fy = v * L->h - 0.5;
+    int x0 = (int) floor(fx), y0 = (int) floor(fy);
+    double tx = fx - x0, ty = fy - y0;
+    int x1 = ((x0 + 1) % L->w + L->w) % L->w;
+    x0 = (x0 % L->w + L->w) % L->w;
+    int y1 = y0 + 1;
+    if (y0 < 0) y0 = 0; else if (y0 > L->h - 1) y0 = L->h - 1;
+    if (y1 < 0) y1 = 0; else if (y1 > L->h - 1) y1 = L->h - 1;
+    const unsigned char *p00 = L->rgb + ((size_t) y0 * L->w + x0) * 3;
+    const unsigned char *p10 = L->rgb + ((size_t) y0 * L->w + x1) * 3;
+    const unsigned char *p01 = L->rgb + ((size_t) y1 * L->w + x0) * 3;
+    const unsigned char *p11 = L->rgb + ((size_t) y1 * L->w + x1) * 3;
+    for (int c = 0; c < 3; c++) {
+        double top = p00[c] + (p10[c] - p00[c]) * tx;
+        double bot = p01[c] + (p11[c] - p01[c]) * tx;
+        out[c] = top + (bot - top) * ty;
+    }
+}
+
+// Load the equirectangular world map and halve it a few times over. Looked for
+// the same places as the bundled font. Returns 0 if none of them had it, which
+// leaves the globe drawn as a plain sphere rather than not drawn at all.
+static int globe_load_map(globe_t *g)
+{
+    const char *home = getenv("HOME");
+    const char *xdg = getenv("XDG_DATA_HOME");
+    char cands[5][1024];
+    int n = 0;
+    if (xdg != NULL && xdg[0] != '\0')
+        snprintf(cands[n++], sizeof cands[0], "%s/simple_sat_ops/%s", xdg, GLOBE_MAP_FILE);
+    if (home != NULL && home[0] != '\0') {
+        snprintf(cands[n++], sizeof cands[0], "%s/.local/share/simple_sat_ops/%s", home, GLOBE_MAP_FILE);
+        snprintf(cands[n++], sizeof cands[0], "%s/src/simple_sat_ops/assets/%s", home, GLOBE_MAP_FILE);
+    }
+    snprintf(cands[n++], sizeof cands[0], "assets/%s", GLOBE_MAP_FILE);
+    snprintf(cands[n++], sizeof cands[0], "../assets/%s", GLOBE_MAP_FILE);
+
+    Image im = {0};
+    for (int i = 0; i < n && im.data == NULL; i++) {
+        if (!FileExists(cands[i])) continue;
+        im = LoadImage(cands[i]);
+    }
+    if (im.data == NULL) {
+        fprintf(stderr, "mpi_viewer: %s not found; the globe will be blank\n",
+                GLOBE_MAP_FILE);
+        return 0;
+    }
+    ImageFormat(&im, PIXELFORMAT_UNCOMPRESSED_R8G8B8);
+
+    size_t bytes = (size_t) im.width * im.height * 3;
+    g->lv[0].rgb = malloc(bytes);
+    if (g->lv[0].rgb == NULL) { UnloadImage(im); return 0; }
+    memcpy(g->lv[0].rgb, im.data, bytes);
+    g->lv[0].w = im.width;
+    g->lv[0].h = im.height;
+    g->nlv = 1;
+    UnloadImage(im);
+
+    while (g->nlv < GLOBE_MAP_LEVELS) {
+        const maplevel_t *src = &g->lv[g->nlv - 1];
+        int dw = src->w / 2, dh = src->h / 2;
+        if (dw < 16 || dh < 8) break;
+        unsigned char *dst = malloc((size_t) dw * dh * 3);
+        if (dst == NULL) break;
+        halve_rgb(src->rgb, src->w, src->h, dst);
+        g->lv[g->nlv].rgb = dst;
+        g->lv[g->nlv].w = dw;
+        g->lv[g->nlv].h = dh;
+        g->nlv++;
+    }
+    return 1;
+}
+
+// ---- where the Sun and the satellite were ----------------------------------
+
+// The sub-solar point, Earth-fixed. Calculate_Solar_Position works in the
+// inertial frame, so the longitude comes from taking Greenwich sidereal time
+// off the Sun's right ascension -- the same step Calculate_LatLonAlt makes for
+// the satellite.
+static void sun_subpoint(double jul_utc, double *lat_deg, double *lon_deg)
+{
+    vector_t sol = {0};
+    Calculate_Solar_Position(jul_utc, &sol);
+    double r = sqrt(sol.x * sol.x + sol.y * sol.y + sol.z * sol.z);
+    double lon = atan2(sol.y, sol.x) - ThetaG_JD(jul_utc);
+    lon = fmod(lon + M_PI, 2.0 * M_PI);
+    if (lon < 0.0) lon += 2.0 * M_PI;
+    *lat_deg = asin(sol.z / r) * (180.0 / M_PI);
+    *lon_deg = (lon - M_PI) * (180.0 / M_PI);
+}
+
+// The sub-satellite point at a moment, from the element set already converted
+// into the globe. Returns 0 if no element set is loaded.
+static int globe_subpoint(const globe_t *g, double unix_ms,
+                          double *lat, double *lon, double *alt_km)
+{
+    if (!g->have_tle) return 0;
+    prediction_t pred = {0};
+    pred.observer_ephem.position_geodetic.lat = RAO_LATITUDE  * (M_PI / 180.0);
+    pred.observer_ephem.position_geodetic.lon = RAO_LONGITUDE * (M_PI / 180.0);
+    pred.observer_ephem.position_geodetic.alt = RAO_ALTITUDE / 1000.0;
+    pred.satellite_ephem.tle = g->tle;
+    update_satellite_position(&pred, julian_date_from_unix_seconds(unix_ms / 1000.0));
+    double lo = pred.satellite_ephem.longitude;
+    if (lo > 180.0) lo -= 360.0;
+    *lat    = pred.satellite_ephem.latitude;
+    *lon    = lo;
+    *alt_km = pred.satellite_ephem.altitude_km;
+    return 1;
+}
+
+// Face the middle of the track the globe is showing, with the disc back in the
+// middle of the panel. The zoom is left alone: changing experiment re-frames,
+// but does not undo how far in the reader had gone.
+static void globe_frame_track(globe_t *g)
+{
+    g->ox = g->oy = 0.0;
+    if (g->ntrk > 0) {
+        const subpoint_t *m = &g->trk[g->ntrk / 2];
+        g->lat0 = m->lat;
+        g->lon0 = m->lon;
+    }
+    g->valid = 0;
+}
+
+// The whole view back to how it first opens -- framed on the track and zoomed
+// out to the whole Earth -- which is what g does, and the way back from having
+// turned or zoomed to somewhere unhelpful.
+static void globe_reset_view(globe_t *g)
+{
+    g->zoom = GLOBE_ZOOM_MIN;
+    globe_frame_track(g);
+}
+
+// Point the globe at a new experiment: pick the element set whose epoch is
+// closest to the recording, walk the ground track from its first marker to its
+// last, work out where the Sun was in the middle of it, and turn the globe to
+// face the middle of the track.
+static void globe_set_experiment(globe_t *g, const experiment_t *s)
+{
+    snprintf(g->track_utc, sizeof g->track_utc, "%s", s->utc);
+    g->ntrk = 0;
+    g->have_tle = 0;
+    g->have_anchor = 0;
+    g->valid = 0;
+
+    // A new track is framed in the middle of itself -- unless this is the
+    // experiment the last session had open, whose view came back with it.
+    int frame_it = !g->keep_view;
+    g->keep_view = 0;
+
+    double t0 = s->t_start_ms;
+    double t1 = s->t_end_ms > t0 ? s->t_end_ms : t0 + 60000.0;
+    double mid = 0.5 * (t0 + t1);
+    sun_subpoint(julian_date_from_unix_seconds(mid / 1000.0), &g->sun_lat, &g->sun_lon);
+
+    int idx = adcs_closest_index(g_tle_epochs, g_ntles, (int64_t) mid);
+    if (idx < 0) {
+        snprintf(g->tle_note, sizeof g->tle_note, "no TLE in the database");
+        return;
+    }
+    const tle_row_t *row = &g_tles[idx];
+
+    // Convert_Satellite_Data reads the two lines out of one 2 x 69 char buffer.
+    char lines[2 * 69 + 1] = {0};
+    size_t l1 = strlen(row->line1), l2 = strlen(row->line2);
+    if (l1 > 69) l1 = 69;
+    if (l2 > 69) l2 = 69;
+    memcpy(lines, row->line1, l1);
+    memcpy(lines + 69, row->line2, l2);
+    if (!Good_Elements(lines)) {
+        snprintf(g->tle_note, sizeof g->tle_note, "the nearest TLE will not parse");
+        return;
+    }
+    Convert_Satellite_Data(lines, &g->tle);
+    // select_ephemeris rewrites the elements in place and sets module-level
+    // flags, so it runs once per element set, on a cleared slate.
+    ClearFlag(ALL_FLAGS);
+    select_ephemeris(&g->tle);
+    g->have_tle = 1;
+
+    // How far the recording sat from the element set's epoch, which is what
+    // says how much to trust the track. In hours while it is under a day,
+    // where a tenth of a day would round most of the answer away.
+    double age_h = (mid - (double) row->epoch_ms) / 3600000.0;
+    char ep[24];
+    fmt_utc_s((double) row->epoch_ms, ep, sizeof ep);
+    ep[16] = '\0';   // to the minute; the seconds of a TLE epoch say nothing here
+    snprintf(g->tle_note, sizeof g->tle_note, "TLE %lld  %s  %+.1f %c",
+             row->catalog, ep,
+             fabs(age_h) < 24.0 ? age_h : age_h / 24.0,
+             fabs(age_h) < 24.0 ? 'h' : 'd');
+
+    for (int i = 0; i < GLOBE_TRACK_PTS; i++) {
+        double t = t0 + (t1 - t0) * (double) i / (double) (GLOBE_TRACK_PTS - 1);
+        double lat = 0, lon = 0, alt = 0;
+        if (!globe_subpoint(g, t, &lat, &lon, &alt)) break;
+        g->trk[g->ntrk].lat    = (float) lat;
+        g->trk[g->ntrk].lon    = (float) lon;
+        g->trk[g->ntrk].alt_km = (float) alt;
+        g->ntrk++;
+    }
+    if (frame_it) globe_frame_track(g);
+}
+
+// ---- drawing ---------------------------------------------------------------
+
+// Ray-cast the lit sphere into g->pix and hand it to the texture. One ray per
+// texture pixel: the ones that miss are left transparent, the ones that graze
+// the outline get a fraction of an alpha so the limb does not come out jagged.
+//
+// ss is how many texture pixels go to a panel pixel. A ray costs an atan2 and
+// an arcsine, so a screen-resolution disc on a retina panel is four times the
+// work of a panel-resolution one and too slow to keep up with a drag; the
+// caller renders coarse while the view is moving and sharp once it settles.
+static void globe_render(globe_t *g, int w, int h, int ss)
+{
+    int pw = w * ss, ph = h * ss;
+    if (pw != g->tex_w || ph != g->tex_h) {
+        Color *np = realloc(g->pix, (size_t) pw * ph * sizeof *np);
+        if (np == NULL) return;
+        g->pix = np;
+        if (g->tex.id != 0) UnloadTexture(g->tex);
+        Image im = { .data = g->pix, .width = pw, .height = ph,
+                     .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
+        memset(g->pix, 0, (size_t) pw * ph * sizeof *g->pix);
+        g->tex = LoadTextureFromImage(im);
+        SetTextureFilter(g->tex, TEXTURE_FILTER_BILINEAR);
+        g->tex_w = pw; g->tex_h = ph;
+    }
+
+    double R = globe_radius(w, h, g->zoom) * ss;
+    double cx = (double) pw * 0.5 + g->ox * ss;
+    double cy = (double) ph * 0.5 + g->oy * ss;
+
+    // The level whose texels are about a screen pixel across: 360 degrees of
+    // map spans roughly 2*pi*R pixels over the middle of the disc.
+    int lv = 0;
+    while (lv + 1 < g->nlv && (double) g->lv[lv + 1].w >= 2.0 * M_PI * R) lv++;
+
+    double e[3], n[3], o[3], sun[3];
+    globe_basis(g->lat0, g->lon0, e, n, o);
+    ll_vec(g->sun_lat, g->sun_lon, sun);
+
+    for (int py = 0; py < ph; py++) {
+        double sy = (cy - ((double) py + 0.5)) / R;
+        Color *row = &g->pix[(size_t) py * pw];
+        for (int px = 0; px < pw; px++) {
+            double sx = (((double) px + 0.5) - cx) / R;
+            double d2 = sx * sx + sy * sy;
+            double cov = R - sqrt(d2) * R + 0.5;
+            if (cov <= 0.0) { row[px] = (Color){ 0, 0, 0, 0 }; continue; }
+            if (cov > 1.0) cov = 1.0;
+
+            double sz = sqrt(d2 < 1.0 ? 1.0 - d2 : 0.0);
+            double p[3];
+            for (int c = 0; c < 3; c++) p[c] = sx * e[c] + sy * n[c] + sz * o[c];
+            double pz = p[2] > 1.0 ? 1.0 : p[2] < -1.0 ? -1.0 : p[2];
+            double u = atan2(p[1], p[0]) / (2.0 * M_PI) + 0.5;
+            double vv = 0.5 - asin(pz) / M_PI;
+
+            double rgb[3];
+            map_sample(g, lv, u, vv, rgb);
+
+            // Lambert, but with the terminator softened over a few degrees so
+            // it does not come out as a hard line the way a bare dot product
+            // would.
+            double f = (p[0] * sun[0] + p[1] * sun[1] + p[2] * sun[2]
+                        + GLOBE_TERMINATOR) / (2.0 * GLOBE_TERMINATOR);
+            f = f < 0.0 ? 0.0 : f > 1.0 ? 1.0 : f;
+            f = f * f * (3.0 - 2.0 * f);
+            double lit = GLOBE_NIGHT + (1.0 - GLOBE_NIGHT) * f;
+
+            row[px] = (Color){ (unsigned char) (rgb[0] * lit + 0.5),
+                               (unsigned char) (rgb[1] * lit + 0.5),
+                               (unsigned char) (rgb[2] * lit + 0.5),
+                               (unsigned char) (cov * 255.0 + 0.5) };
+        }
+    }
+    UpdateTexture(g->tex, g->pix);
+
+    g->r_lat0 = g->lat0; g->r_lon0 = g->lon0; g->r_zoom = g->zoom;
+    g->r_sunlat = g->sun_lat; g->r_sunlon = g->sun_lon;
+    g->r_ox = g->ox; g->r_oy = g->oy;
+    g->r_ss = ss;
+    g->valid = 1;
+}
+
+// The globe panel: the lit Earth, the experiment's ground track, and a dot
+// where the satellite was when the image on screen was taken. now_ms is that
+// image's capture time.
+static void globe_draw(globe_t *g, int x, int y, int w, int h, double now_ms)
+{
+    DrawRectangle(x, y, w, h, (Color){ 22, 22, 27, 255 });
+    DrawLine(x, y, x + w, y, (Color){ 56, 56, 66, 255 });
+    draw_text("Ground track", x + 12, y + 4, 13, LIGHTGRAY);
+    if (g->tle_note[0] != '\0')
+        draw_text(g->tle_note, x + w - 10 - text_width(g->tle_note, 12), y + 5, 12, GRAY);
+
+    int dy = y + GLOBE_TITLE_H, dh = h - GLOBE_TITLE_H;
+    if (dh < 32) return;
+
+    // Coarse while the view is still moving, then once more at the screen's own
+    // resolution when it has settled -- which on a retina display is where the
+    // coastlines come back.
+    if (g->settle > 0.0f) g->settle -= GetFrameTime();
+    int ss = 1;
+    if (g->settle <= 0.0f) {
+        ss = (int) GetWindowScaleDPI().x;
+        if (ss < 1) ss = 1;
+        if (ss > 2) ss = 2;
+    }
+    if (!g->valid || g->tex_w != w * ss || g->tex_h != dh * ss || g->r_ss != ss
+        || g->r_lat0 != g->lat0 || g->r_lon0 != g->lon0 || g->r_zoom != g->zoom
+        || g->r_sunlat != g->sun_lat || g->r_sunlon != g->sun_lon
+        || g->r_ox != g->ox || g->r_oy != g->oy)
+        globe_render(g, w, dh, ss);
+    if (g->tex.id == 0) return;
+    DrawTexturePro(g->tex,
+                   (Rectangle){ 0, 0, (float) g->tex_w, (float) g->tex_h },
+                   (Rectangle){ (float) x, (float) dy, (float) w, (float) dh },
+                   (Vector2){ 0, 0 }, 0.0f, WHITE);
+
+    double R = globe_radius(w, dh, g->zoom);
+    BeginScissorMode(x, dy, w, dh);
+
+    // A faint outline, so the unlit limb still reads against the panel.
+    DrawCircleLines(x + w / 2 + (int) g->ox, dy + dh / 2 + (int) g->oy,
+                    (float) R, (Color){ 90, 110, 140, 120 });
+
+    double e[3], n[3], o[3];
+    globe_basis(g->lat0, g->lon0, e, n, o);
+
+    // The track. The far-side stretches are drawn faintly rather than dropped,
+    // so a pass that goes over the horizon still reads as one arc.
+    const Color near_c = { 255, 150, 60, 255 };
+    const Color far_c  = { 255, 150, 60, 70 };
+    for (int i = 1; i < g->ntrk; i++) {
+        Vector2 a, b;
+        int ha = 0, hb = 0;
+        globe_project(e, n, o, R, w, dh, g->ox, g->oy,
+                      g->trk[i - 1].lat, g->trk[i - 1].lon,
+                      g->trk[i - 1].alt_km, &a, &ha);
+        globe_project(e, n, o, R, w, dh, g->ox, g->oy,
+                      g->trk[i].lat, g->trk[i].lon,
+                      g->trk[i].alt_km, &b, &hb);
+        a.x += x; a.y += dy;
+        b.x += x; b.y += dy;
+        DrawLineEx(a, b, 2.0f, (ha && hb) ? far_c : near_c);
+    }
+
+    // Where it was when this image was taken. This is also the point the next
+    // frame's turning and zooming pivot on.
+    double lat = 0, lon = 0, alt = 0;
+    int have_now = globe_subpoint(g, now_ms, &lat, &lon, &alt);
+    g->have_anchor = have_now;
+    if (have_now) {
+        g->anchor_lat = lat; g->anchor_lon = lon; g->anchor_alt = alt;
+        Vector2 p;
+        int hidden = 0;
+        globe_project(e, n, o, R, w, dh, g->ox, g->oy, lat, lon, alt, &p, &hidden);
+        p.x += x; p.y += dy;
+        if (hidden) {
+            DrawCircleLines((int) p.x, (int) p.y, 5.0f, (Color){ 255, 255, 255, 70 });
+        } else {
+            DrawCircleV(p, 6.0f, (Color){ 255, 150, 60, 160 });
+            DrawCircleV(p, 3.0f, RAYWHITE);
+        }
+    }
+    EndScissorMode();
+
+    // Where that is on the ground, along the bottom of the disc.
+    if (have_now) {
+        const char *ll = TextFormat("%.1f %c   %.1f %c   %.0f km",
+                                    fabs(lat), lat >= 0 ? 'N' : 'S',
+                                    fabs(lon), lon >= 0 ? 'E' : 'W', alt);
+        int tw = text_width(ll, 13);
+        DrawRectangle(x + 6, y + h - 24, tw + 14, 20, (Color){ 18, 18, 22, 200 });
+        draw_text(ll, x + 13, y + h - 21, 13, RAYWHITE);
+    }
+}
+
+// Drag turns the globe, the wheel (or two fingers) zooms it. A drag that began
+// on the globe keeps turning it wherever the pointer wanders, and one that
+// began anywhere else never does.
+//
+// An ordinary drag turns the globe about its own middle -- the plain thing to
+// do when you just want to look around. Pressing a Mac trackpad with two
+// fingers down is the secondary click, so a two-finger press and slide arrives
+// as a right-button drag, and that one turns the globe about the satellite
+// instead: the dot is noted before the turn and the disc slid afterwards by
+// however far the dot moved, which puts it back where it was and swings the
+// Earth around it. Zooming holds the dot the same way, so closing in goes to
+// the satellite rather than to whatever the middle of the disc happened to be.
+static void globe_input(globe_t *g, int x, int y, int w, int h)
+{
+    int dh = h - GLOBE_TITLE_H;
+    Vector2 m = GetMousePosition();
+    int over = m.x >= x && m.x < x + w && m.y >= y + GLOBE_TITLE_H && m.y < y + h;
+    if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)
+        && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) g->drag = 0;
+    if (over && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        g->drag = 1; g->drag_pivot = 0; g->drag_at = m;
+    }
+    if (over && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+        g->drag = 1; g->drag_pivot = 1; g->drag_at = m;
+    }
+
+    int turning = g->drag && (m.x != g->drag_at.x || m.y != g->drag_at.y);
+    float wheel = over ? GetMouseWheelMove() : 0.0f;
+    if (!turning && wheel == 0.0f) return;
+
+    if (turning) {
+        Vector2 before = {0};
+        if (g->drag_pivot) globe_anchor_at(g, w, dh, &before);
+        double R = globe_radius(w, dh, g->zoom);
+        g->lon0 -= (double) (m.x - g->drag_at.x) * (180.0 / M_PI) / R;
+        g->lat0 += (double) (m.y - g->drag_at.y) * (180.0 / M_PI) / R;
+        if (g->lat0 >  89.9) g->lat0 =  89.9;
+        if (g->lat0 < -89.9) g->lat0 = -89.9;
+        g->lon0 = fmod(g->lon0 + 180.0, 360.0);
+        if (g->lon0 < 0.0) g->lon0 += 360.0;
+        g->lon0 -= 180.0;
+        g->drag_at = m;
+        if (g->drag_pivot) globe_hold_anchor(g, w, dh, before);
+    }
+    if (wheel != 0.0f) {
+        Vector2 before;
+        globe_anchor_at(g, w, dh, &before);
+        g->zoom *= exp(0.14 * (double) wheel);
+        if (g->zoom < GLOBE_ZOOM_MIN) g->zoom = GLOBE_ZOOM_MIN;
+        if (g->zoom > GLOBE_ZOOM_MAX) g->zoom = GLOBE_ZOOM_MAX;
+        globe_hold_anchor(g, w, dh, before);
+    }
+    g->valid = 0;
+    g->settle = GLOBE_SETTLE;
+}
+
+static void globe_free(globe_t *g)
+{
+    for (int i = 0; i < g->nlv; i++) free(g->lv[i].rgb);
+    g->nlv = 0;
+    free(g->pix);
+    g->pix = NULL;
+    if (g->tex.id != 0) UnloadTexture(g->tex);
+    free_tle_rows();
+}
+
 // ---- re-download telecommand export ----------------------------------------
 //
 // An experiment is reassembled from whatever came down, and what did not come
@@ -2351,7 +3120,8 @@ static int clamp_int(int x, int lo, int hi)
 
 // Read the saved state into v, sel_utc (the experiment that was open) and g.
 // Anything the file does not carry is left as the caller set it.
-static void load_state(view_t *v, char *sel_utc, size_t utc_cap, geom_t *g)
+static void load_state(view_t *v, char *sel_utc, size_t utc_cap, geom_t *g,
+                       globe_t *gl)
 {
     char path[1024];
     if (state_path(path, sizeof path) != 0) return;
@@ -2394,6 +3164,29 @@ static void load_state(view_t *v, char *sel_utc, size_t utc_cap, geom_t *g)
             v->clean_win = clamp_int(n, 1, CLEAN_WIN_MAX) | 1;
         else if (strcmp(key, "clean_mean") == 0)
             v->clean_mean = n != 0;
+        // The globe's view. keep_view says the file carried one at all, which
+        // is what stops the resumed experiment framing itself over the top of
+        // it; the caller drops it again if the experiment is not the same one.
+        else if (strcmp(key, "globe_zoom") == 0) {
+            double z = atof(val);
+            gl->zoom = z < GLOBE_ZOOM_MIN ? GLOBE_ZOOM_MIN
+                     : z > GLOBE_ZOOM_MAX ? GLOBE_ZOOM_MAX : z;
+        } else if (strcmp(key, "globe_lat") == 0) {
+            double d = atof(val);
+            gl->lat0 = d < -89.9 ? -89.9 : d > 89.9 ? 89.9 : d;
+            gl->keep_view = 1;
+        } else if (strcmp(key, "globe_lon") == 0) {
+            double d = fmod(atof(val) + 180.0, 360.0);
+            if (d < 0.0) d += 360.0;
+            gl->lon0 = d - 180.0;
+            gl->keep_view = 1;
+        } else if (strcmp(key, "globe_offset_x") == 0) {
+            double d = atof(val);
+            gl->ox = d < -10000.0 ? -10000.0 : d > 10000.0 ? 10000.0 : d;
+        } else if (strcmp(key, "globe_offset_y") == 0) {
+            double d = atof(val);
+            gl->oy = d < -10000.0 ? -10000.0 : d > 10000.0 ? 10000.0 : d;
+        }
         else if (strcmp(key, "window_w") == 0)
             g->w = (n >= 640 && n <= 8192) ? n : WIN_W_DEFAULT;
         else if (strcmp(key, "window_h") == 0)
@@ -2407,7 +3200,8 @@ static void load_state(view_t *v, char *sel_utc, size_t utc_cap, geom_t *g)
 
 // Write the state back. Best effort: a session that cannot write its state was
 // still a good session, so nothing here is reported.
-static void save_state(const view_t *v, const experiment_t *s, const geom_t *g)
+static void save_state(const view_t *v, const experiment_t *s, const geom_t *g,
+                       const globe_t *gl)
 {
     char path[1024];
     if (state_path(path, sizeof path) != 0) return;
@@ -2431,6 +3225,11 @@ static void save_state(const view_t *v, const experiment_t *s, const geom_t *g)
     fprintf(f, "clean_step = %d\n", v->clean_step);
     fprintf(f, "clean_window = %d\n", v->clean_win);
     fprintf(f, "clean_mean = %d\n", v->clean_mean);
+    fprintf(f, "globe_zoom = %g\n", gl->zoom);
+    fprintf(f, "globe_lat = %g\n", gl->lat0);
+    fprintf(f, "globe_lon = %g\n", gl->lon0);
+    fprintf(f, "globe_offset_x = %g\n", gl->ox);
+    fprintf(f, "globe_offset_y = %g\n", gl->oy);
     fprintf(f, "window_w = %d\n", g->w);
     fprintf(f, "window_h = %d\n", g->h);
     fprintf(f, "window_x = %d\n", g->x);
@@ -2490,6 +3289,11 @@ int main(int argc, char **argv)
                    "mean.\n"
                    "Press d to write the selected experiment's missing data as\n"
                    "re-download telecommands, for simple_sat_ops --tc-file.\n"
+                   "Under the list is the lit Earth with the recording's ground\n"
+                   "track on it, from the DB's own TLEs; drag it to turn it and\n"
+                   "scroll over it to zoom. A two-finger press and slide turns\n"
+                   "it about the satellite instead of about its own middle, and\n"
+                   "g puts the view back to the whole Earth on the whole track.\n"
                    "--list prints what each experiment reconstructed to and exits,\n"
                    "without opening a window.\n"
                    "Which experiment was open, where the playhead sat and every\n"
@@ -2563,11 +3367,16 @@ int main(int argc, char **argv)
     // playhead has to wait until after it, because selecting an experiment
     // rewinds it to the first image.
     geom_t geom = { .w = WIN_W_DEFAULT, .h = WIN_H_DEFAULT };
+    globe_t globe = {0};
+    globe.zoom = 1.0;
     char sel_utc[24] = "";
-    load_state(&v, sel_utc, sizeof sel_utc, &geom);
+    load_state(&v, sel_utc, sizeof sel_utc, &geom, &globe);
     int saved_img = v.img_pos, saved_play = v.playing;
     int resumed = find_experiment(exps, nexp, sel_utc);
     if (resumed >= 0) v.sel = resumed;
+    // A saved globe view belongs to the experiment it was saved for. Opening on
+    // a different one frames that one's own track instead.
+    else globe.keep_view = 0;
     select_experiment(&v, &exps[v.sel]);
     if (resumed >= 0) {
         v.img_pos = saved_img >= v.n_img ? (v.n_img ? v.n_img - 1 : 0) : saved_img;
@@ -2596,6 +3405,21 @@ int main(int argc, char **argv)
     SetTextureFilter(tex, TEXTURE_FILTER_POINT);
 
     const int LEFT_W = 340;
+    const int row_h = 44, list_top = 40;
+
+    // The globe under the experiment list. The map and the element sets are
+    // read once here; the track itself is built the first time round the loop,
+    // when the experiment on screen is settled.
+    globe_load_map(&globe);
+    if (load_tle_rows(db_path) == 0)
+        fprintf(stderr, "mpi_viewer: no FrontierSat TLEs in the DB; "
+                        "the globe will show no ground track\n");
+
+    // Where the experiment list is scrolled to, in pixels. Scrolling is the
+    // reader's, not the selection's: the list is pulled back to the selected
+    // row only when the selection itself moves.
+    float list_px = 0.0f;
+    int   last_sel = -1;   // so a resumed selection below the fold scrolls into view
 
     // Per-key autorepeat timers for the arrow keys (files + image scrubber) and
     // the manual DN-range keys.
@@ -2624,11 +3448,45 @@ int main(int argc, char **argv)
     while (!WindowShouldClose()) {
         experiment_t *s = &exps[v.sel];
 
+        // ---- the left column: the experiment list above, the globe below ----
+        // Worked out before the input, since a press on the globe and a press
+        // on the list are told apart by where the two panels are. A window too
+        // short to hold the globe gives the whole column to the list.
+        int col_bottom = GetScreenHeight() - FOOTER_H;
+        int globe_h = GLOBE_PANEL_H;
+        int room = col_bottom - list_top - 2 * row_h;
+        if (globe_h > room) globe_h = room;
+        if (globe_h < GLOBE_PANEL_MIN_H) globe_h = 0;
+        int globe_y = col_bottom - globe_h;
+        int list_h = (globe_h ? globe_y : col_bottom) - list_top;
+        if (list_h < 0) list_h = 0;   // a window shorter than its own headings
+
         // ---- input ----
         // Letting the button go ends a whereogram scrub. Checked here rather
         // than beside the panel itself, which is not drawn at all in a window
         // too small for it -- a scrub must not survive that.
         if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) cov_drag = 0;
+
+        // The globe takes its own drags and its own wheel, so scrolling over it
+        // zooms rather than running the list underneath it.
+        if (globe_h > 0) globe_input(&globe, 0, globe_y, LEFT_W, globe_h);
+
+        // The experiment list: the wheel scrolls it, a press picks a row.
+        {
+            Vector2 m = GetMousePosition();
+            int over = m.x >= 0 && m.x < LEFT_W && m.y >= list_top
+                       && m.y < list_top + list_h;
+            if (over) list_px -= GetMouseWheelMove() * (float) row_h;
+            if (over && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                int r = (int) ((m.y - (float) list_top + list_px) / (float) row_h);
+                if (r >= 0 && r < nexp && r != v.sel) {
+                    v.sel = r;
+                    select_experiment(&v, &exps[v.sel]);
+                    s = &exps[v.sel];
+                }
+            }
+        }
+
         if (key_repeat(KEY_DOWN, &rep_down) && v.sel < nexp - 1) { v.sel++; select_experiment(&v, &exps[v.sel]); s = &exps[v.sel]; }
         if (key_repeat(KEY_UP, &rep_up)     && v.sel > 0)        { v.sel--; select_experiment(&v, &exps[v.sel]); s = &exps[v.sel]; }
         if (key_repeat(KEY_RIGHT, &rep_right) && v.img_pos < v.n_img - 1) v.img_pos++;
@@ -2715,13 +3573,36 @@ int main(int argc, char **argv)
                 v.playing = save_play;
                 s = &exps[v.sel];
                 cov_valid = 0;   // the reloaded experiment needs a fresh whereogram
+                load_tle_rows(db_path);
+                globe.track_utc[0] = '\0';   // and a fresh ground track
             } else if (ne != NULL) {
                 free_experiments(ne, nn);
             }
         }
         if (IsKeyPressed(KEY_M)) v.cmap = (v.cmap + 1) % N_CMAPS;
+        // g: the globe back to how it opens -- framed on the whole track, the
+        // whole Earth in view -- from wherever turning and zooming left it.
+        if (IsKeyPressed(KEY_G)) globe_reset_view(&globe);
         if (IsKeyPressed(KEY_Q)) break;
         if (status_left > 0.0f) status_left -= GetFrameTime();
+
+        // A different experiment is a different orbit, a different piece of
+        // ground track and a different Sun.
+        if (strcmp(globe.track_utc, s->utc) != 0) globe_set_experiment(&globe, s);
+
+        // Pull the list back to the selected row when the selection moves, and
+        // keep whatever the reader scrolled to when it does not.
+        if (v.sel != last_sel) {
+            float want_top = (float) (v.sel * row_h);
+            if (list_px > want_top) list_px = want_top;
+            if (list_px < want_top + (float) row_h - (float) list_h)
+                list_px = want_top + (float) row_h - (float) list_h;
+            last_sel = v.sel;
+        }
+        float list_max = (float) (nexp * row_h - list_h);
+        if (list_max < 0.0f) list_max = 0.0f;
+        if (list_px > list_max) list_px = list_max;
+        if (list_px < 0.0f) list_px = 0.0f;
 
         // ---- playback ----
         if (v.playing && v.n_img > 0) {
@@ -2783,14 +3664,16 @@ int main(int argc, char **argv)
         DrawRectangle(0, 0, LEFT_W, GetScreenHeight(), (Color){ 28, 28, 34, 255 });
         draw_text("MPI experiments", 12, 10, 18, RAYWHITE);
         draw_text(TextFormat("%d run%s", nexp, nexp == 1 ? "" : "s"), LEFT_W - 78, 14, 12, GRAY);
-        int row_h = 44, list_top = 40;
-        int visible = (GetScreenHeight() - list_top) / row_h;
-        int top = 0;
-        if (v.sel >= visible) top = v.sel - visible + 1;
-        for (int r = 0; r < visible && top + r < nexp; r++) {
-            int si = top + r;
+        // The rows are clipped to the list's own height rather than the
+        // window's, so a row half off the bottom is cut at the globe's edge
+        // instead of drawn over it.
+        BeginScissorMode(0, list_top, LEFT_W, list_h);
+        int first = (int) (list_px / (float) row_h);
+        if (first < 0) first = 0;
+        for (int si = first; si < nexp; si++) {
+            int y = list_top + si * row_h - (int) list_px;
+            if (y >= list_top + list_h) break;
             experiment_t *ss = &exps[si];
-            int y = list_top + r * row_h;
             if (si == v.sel) DrawRectangle(0, y, LEFT_W, row_h, (Color){ 44, 70, 110, 255 });
             double pct = 100.0 * (double) ss->recovered / (double) ss->size;
             draw_text(TextFormat("%s UTC", ss->utc), 10, y + 4, 15, si == v.sel ? RAYWHITE : LIGHTGRAY);
@@ -2804,6 +3687,21 @@ int main(int argc, char **argv)
             draw_text(TextFormat("%.0f KB  %.0f%%  %d frames",
                                  ss->size / 1024.0, pct, ss->nframes),
                       10, y + 23, 12, GRAY);
+        }
+        EndScissorMode();
+        // A thumb down the right edge, only while there is more list than room.
+        if (list_max > 0.0f) {
+            float frac = (float) list_h / (float) (nexp * row_h);
+            int th = (int) ((float) list_h * frac);
+            if (th < 20) th = 20;
+            int ty = list_top + (int) ((float) (list_h - th) * list_px / list_max);
+            DrawRectangle(LEFT_W - 5, ty, 3, th, (Color){ 90, 90, 105, 255 });
+        }
+
+        // The globe, under the list.
+        if (globe_h > 0) {
+            double dot_ms = frame_time >= 0 ? frame_time : s->t_start_ms;
+            globe_draw(&globe, 0, globe_y, LEFT_W, globe_h, dot_ms);
         }
 
         // Was any part of this image built from packets whose CRC failed?
@@ -3080,6 +3978,7 @@ int main(int argc, char **argv)
         // help footer
         const char *help =
             "Up/Down experiment   Left/Right image   drag whereogram: scrub + time span"
+            "   globe: drag turns, two-finger press-drag turns about the satellite, scroll zooms, g resets"
             "   Space play/pause   ,/. speed   f steps/sweep   s zoom   a scale"
             "   z/x min  c/v max   m colour map   b clean  B step   n bg window   e median/mean"
             "   d re-download commands   F5 refresh  q quit";
@@ -3093,9 +3992,10 @@ int main(int argc, char **argv)
     Vector2 wpos = GetWindowPosition();
     geom.x = (int) wpos.x; geom.y = (int) wpos.y;
     geom.w = GetScreenWidth(); geom.h = GetScreenHeight();
-    save_state(&v, &exps[v.sel], &geom);
+    save_state(&v, &exps[v.sel], &geom, &globe);
 
     UnloadTexture(tex);
+    globe_free(&globe);
     if (cov_tex.id != 0) UnloadTexture(cov_tex);
     if (g_ui_font_loaded) UnloadFont(g_ui_font);
     CloseWindow();

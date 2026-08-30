@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`50ee4bf` (2026-08-30). This is a working draft.
+`6268afe` (2026-08-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2337,7 +2337,9 @@ A small raylib GUI for looking at the MPI imagery in the packet database. Where
 `mpi_reconstruct` writes one `.bin` per download burst, `mpi_viewer` shows one
 row per **experiment** - one time the MPI was actually run and recorded - and
 merges every download pass of that recording back into a single stream. The MPI
-has been run only a handful of times this mission, so the left panel is short.
+has been run only a handful of times this mission, so the list is short; under
+it is a globe showing where the satellite was while the selected recording was
+being taken.
 
 ```sh
 mpi_viewer                              # default database
@@ -2501,11 +2503,63 @@ columns. The readout needs times on both ends; frames whose capture time never
 came down are passed over rather than answered with, and if no frame of the
 recording carries one the band is drawn without a label.
 
+**Where it was (the globe).** Under the experiment list is the Earth: NASA's
+Blue Marble wrapped on a sphere and lit from where the Sun actually stood while
+the MPI was recording, so the part of a pass flown in darkness is drawn dark,
+with a soft terminator a few degrees wide rather than a hard line. Across it
+runs the satellite's **ground track from the recording's first marker to its
+last**, and a dot marks the point it was over when the image on screen was
+taken - so scrubbing the whereogram walks the dot along the track. Stretches of
+track round the far side of the globe are drawn faintly rather than dropped, so
+a pass that goes over the horizon still reads as one arc. Under the disc is the
+sub-satellite latitude, longitude and altitude for the image being shown.
+
+**Drag the globe to turn it; scroll (or pinch) over it to zoom**, up to 16x. An
+ordinary drag turns the globe about its own middle, which is the plain way to
+look around.
+
+**Press with two fingers and slide and it turns about the satellite instead.**
+On a Mac trackpad that gesture is the secondary click, so it arrives as a
+right-button drag and the globe treats it as the orbit: the dot keeps its exact
+place on screen and the Earth swings around it, the disc sliding within the
+panel to make room. Because the drag starts with the dot somewhere on the panel,
+the satellite cannot be turned out of sight this way. **Zooming holds the dot
+the same way**, so scrolling closes in on the satellite rather than on whatever
+the middle of the disc happened to be. **`g` puts the view back** to the whole
+Earth framed on the whole track, which is the way out of having turned or zoomed
+to somewhere unhelpful.
+
+The view opens facing the middle of the track, and is framed there again
+whenever you change experiment - though the zoom carries over, since re-framing
+should not undo how far in you had gone. **Where you left the globe is
+remembered between sessions**: which way it faces, how far in, and where the
+disc sits are all written to the state file and come back at startup. That view
+belongs to the experiment it was saved for, so opening on a different one
+(or on a database that no longer holds it) frames that one's own track instead
+of restoring an orientation that means nothing for it.
+
+The orbit comes out of **the packet database's own `tle` table** - whichever
+element set for FrontierSat (NORAD 69015) has the epoch closest to the middle of
+the recording - and is propagated by the same SGP4 the pass predictor uses. The
+caption above the disc names that element set and says how far the recording sat
+from its epoch (`TLE 69015  2026-08-09 05:52  +0.7 h`), which is what says how
+much to trust the track: an element set hours old is good to well under a pixel
+here, one days old less so. If the database holds no TLE for the object the
+globe still draws, lit and turnable, with no track on it and the caption saying
+so.
+
+The map is `assets/nasa_blue_marble_2048.png`, looked for the same places as the
+bundled font; without it the globe falls back to a plain blue sphere and the
+track and lighting still work. The disc is ray-cast on the CPU rather than drawn
+as a 3D model, coarse while you are turning it and at the screen's own
+resolution once it settles.
+
 **What it remembers between sessions.** On exit the viewer writes
 `~/.local/state/simple_sat_ops/mpi_viewer.state` - which experiment was open,
 where the playhead sat in it, the cleaning stage and its window and estimator,
 the colour map, the colour scale and its manual DN window, the playback speed,
-the frames-per-sweep override, the zoom, and the size and place of the window -
+the frames-per-sweep override, the zoom, the globe's view (where it faces, its
+zoom and where the disc sits), and the size and place of the window -
 and reads it back at startup, printing a line naming what it resumed. The
 experiment is matched by its start time, so a database that no longer holds it
 opens on the first one with the view settings still restored. It is plain
@@ -2526,6 +2580,9 @@ mean,
 the re-download
 telecommands (below), **`F5` re-reads the database** and rebuilds the
 list (keeping your selection and view settings), and `q` quits.
+The experiment list scrolls with the wheel and a row can be clicked to select
+it; dragging the globe below it turns it, `g` puts its view back to the whole
+Earth, and scrolling over the globe zooms it rather than scrolling the list.
 Read-only on the database and safe to run while a receiver is filling it.
 
 **Where the pixels sit in a frame.** The 152-byte frame is 20 bytes of aux, then
