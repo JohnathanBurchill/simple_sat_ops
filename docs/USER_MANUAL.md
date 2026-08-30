@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`c45a25c` (2026-08-30). This is a working draft.
+`5baff87` (2026-08-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -3034,6 +3034,19 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   recording, `D` marks just the ones that carried data, `d` downloads
   what is marked, `p` decodes what is marked, and `f` cycles the filter
   (all, with audio, not downloaded, downloaded, decoded).
+
+  `o` cycles the column the rows are sorted by, and `O` cycles it the
+  other way: `no` (the day's own order, by start time, which is where it
+  starts), `id`, `start`, `el` and `data`. Each column sorts the way it
+  is worth asking for — id and start lowest and earliest first,
+  elevation and frame count largest first — so `o` three times puts the
+  day's highest passes at the top and a fourth press puts the ones that
+  carried the most data there. The sorted column is the capitalised
+  heading; the row numbers keep counting down the screen whatever the
+  order is, and the cursor stays on the observation it was on. The
+  filter and the sort are independent: filtering to the passes with
+  audio and sorting those by `data` is the short way to the day's worth
+  having.
 
   Marks are a selection rather than an instruction, so the same set
   serves both jobs: `d` takes the marked passes SatNOGS can still send,
