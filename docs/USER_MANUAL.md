@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`dda3a5c` (2026-08-30). This is a working draft.
+`7d074a0` (2026-08-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2389,12 +2389,15 @@ also earliest to latest, the same direction as the whereogram below, so an image
 reads as the stretch of whereogram its playback head is sitting on rather than
 as a mirror of it. One sweep of that bias is one image: 16 frames in 16 columns,
 one for each. The dome sits at 0 V for two frames running, straddling the turn
-of the sweep. The second of those two is the instrument's background: when it
-asks for the zero-volt setpoint it keeps that frame's counts as its no-ion-signal
-reference and takes them off every frame that follows, until the next zero-volt
-request. So that frame comes down raw, sitting on a pedestal about 1200 DN
-brighter than the rest of the sweep - the far-left column of every image, and the
-periodic bright line running through the whereogram. The far-right column is the
+of the sweep. The second of those two is the instrument's background: it keeps that frame's
+counts as its no-ion-signal reference and takes them off every frame that
+follows, until it estimates again - **every 256 frames, or 16 images, by
+default, and not once per sweep**. So one image in 16 has its first frame come
+down raw, being the background itself: around 20700 DN where the rest of the
+sweep reads about 2010, and one of the bright vertical stripes running through
+the whereogram. In the other 15 images that same first frame is the 0 V dwell
+with the last estimate already taken off it, and reads no differently from the
+rest of the sweep. The far-right column is the
 other frame of the dwell: 0 V read again with the background taken off it, which
 is the residue the subtraction leaves. Because every frame of the sweep is
 drawn, consecutive images tile the recording with nothing left over.
@@ -2403,32 +2406,102 @@ Note that a frame's pixels and its aux fields are one frame apart: the pixels
 were integrated during the previous frame's slot, while the aux is stamped when
 the frame is packed, by which time the dome has already been commanded to the
 next setpoint. The viewer places a frame by the target voltage the frame before
-it reported, which is why the raw 0 V frame lands at the right edge even though
+it reported, which is why the raw 0 V frame lands at the left edge even though
 its own aux reads 57343. The aux panel shows that frame's aux as it was sent, so
 its `dome target V` is one setpoint ahead of the column it is drawn in.
 
-**Where the pixels sit in a frame.** The 152-byte frame is 20 bytes of aux, then
-the 65 pixels as big-endian `uint16` in bytes 20..149, then a CCITT CRC-16 over
-everything before it in bytes 150..151. The flight software settles this:
-`TM_AUXDATA_BUFFER_SIZE` is 20 and `TM_BUFFER_PIXEL_OFFSET` is that same 20,
-`TM_FIRST_PIXEL_INDEX` and `TM_LAST_PIXEL_INDEX` are 48 and 112 for 65 pixels,
-and `calculateTelemetryCrc` writes the checksum into the last two bytes, most
-significant first. Reading the pixels from byte 22 instead - which the First
-Light notebook's `[[23;;-1;;2]]` does, and which this tool did until now -
-shifts the image by one pixel: it drops the first and shows the checksum as a
-65th row, which was the garbage bottom row on every image. The frame's own
-checksum confirms the layout, working out on 3611 of 3611 whole frames of the
-07-21 recording and 9025 of 9027 of the 08-09 one.
+**Cleaned imagery (`b`).** The MPI subtracts a background of its own in the
+FPGA, and `b` undoes that and puts a better one in its place, for the image and
+the whereogram together. `b` turns it on and off; **`shift-B`, while it is on,
+moves between the steps** - stopping after step 1 rather than running both - so
+you can see what each step did rather than only the end of it. With cleaning off
+there is no step to pick and `shift-B` does nothing. Turning cleaning back on
+returns to whichever step you left it showing. What arrives from the instrument is
+`raw - background + 2000`: it keeps a 0 V frame as its no-ion-signal background,
+takes those counts off every frame that follows, and lands the result on a fixed
+~2000 DN offset. The frame it kept is sent as measured.
+
+First, every frame gets its range's background estimate added back on **and the
+2000 DN offset taken off**, which leaves the raw counts. The viewer finds those
+estimate frames itself - a 0 V frame standing well above the level the frames
+after it sit at - and then makes the cadence confirm them, since a frame can
+read high for other reasons: it takes the interval to be the median spacing of
+the candidates and keeps only the beat most of them share. On the 2026-07-21
+recording that finds 14, at counters 73, 329, 585 ... 3401, exactly 256 apart,
+and rejects an impostor at counter 2425. With this done the recording sits at
+one level and the whereogram's bright stripes go - the frame the instrument kept
+was raw counts already, and now so is everything else.
+
+Second, a local background is taken off again and the 2000 DN put back. The
+first frame of an image is the 0 V dwell read back, so by construction it holds
+no ion signal. The viewer combines those first frames over the **N images
+centred on the current one** (5 by default; `n` cycles 1, 3, 5, 7, 9, and the
+window is clipped where it runs off either end of the recording) and subtracts
+the result, pixel by pixel, from every frame of the image.
+
+Only frames fit to stand as a sample go into that window: every byte of them
+arrived, **the frame's own CCITT CRC-16 checks out**, and no JSON marker was
+spliced into them. That CRC is the instrument's own word on the frame and covers
+exactly the bytes being read, which the CSP CRC32 on a packet does not - a frame
+is assembled from whatever packets its bytes happened to land in. Across the
+08-09 recording it catches 127 bad frames where the packet CRC flagged only 71.
+An image whose first frame fails any of that contributes nothing, and **the
+estimate is normalised by however many survive** - four samples divided by four,
+not by five. On that recording it rejects 3 of 558 candidate samples (2 for CRC,
+1 for a missing byte) and leaves 5 windows one sample short; the 07-21 recording
+is fully recovered and loses none.
+
+`e` switches the combination between **median** (the default) and **mean**.
+The median measures better on both recordings. Scoring each frame by how far its
+own level sits from the 2000 DN it should land on, the median leaves 24 and
+21 DN across ordinary images where the mean leaves 59 and 34; and on the one
+image per range whose first frame *is* the estimate - whose window therefore
+straddles a change of level - the median leaves 55 and 31 DN against the mean's
+128 and 96. That is the median returning the level the middle image is on where
+the mean returns a blend of the two. The mean is worth having when every value
+in the window really is the same quantity, and being able to put the two side by
+side is how the above was measured. The estimate and the subtraction are both
+done in floating point.
+
+What comes out has the same form the instrument sends, `raw - background + 2000`,
+and differs only in the background being one measured a few images away rather
+than one up to 255 frames stale. On the two recordings **99.1% and 99.8% of
+frames land within 200 DN of 2000**, with a tail out to a few hundred where ions
+were rammed in, and the sunlight depressions and beams survive intact. Because a
+cleaned count is on the same scale as a raw one, the same DN window serves both
+modes and toggling does not move the scale under you.
+
+The aux panel reports how many estimates were found, how far apart they ran, how
+many images yielded a usable sample and how many windows came up short, and how
+many frames came before the first estimate (those precede any estimate and are
+left as they arrived).
 
 Keys: `Up`/`Down` change experiment, `Left`/`Right` scrub images (or click or
 drag the whereogram to scrub through the recording), `Space` plays/pauses, `,`/`.`
 set the playback speed, `f` cycles frames-per-image (auto/8/16), `s` zoom, `a` cycles the colour scale (auto-image / auto-experiment
 / manual), `r` resets it to auto-image, `z`/`x` and `c`/`v` move the manual DN
-window (hold `Shift` for coarse steps), `m` cycles the colour map, `d` writes
+window (hold `Shift` for coarse steps), `m` cycles the colour map, `b` toggles
+the cleaned imagery and `shift-B` moves between its steps, `n` sets how many
+images its background is taken over and `e` switches that between median and
+mean,
+`d` writes
 the re-download
 telecommands (below), **`F5` re-reads the database** and rebuilds the
 list (keeping your selection and view settings), and `q` quits.
 Read-only on the database and safe to run while a receiver is filling it.
+
+**Where the pixels sit in a frame.** The 152-byte frame is 20 bytes of aux, then
+the 65 pixels as big-endian `uint16` in bytes 20..149, then a CCITT CRC-16 over
+everything before it in bytes 150..151. The flight firmware settles this:
+`TM_AUXDATA_BUFFER_SIZE` is 20 and `TM_BUFFER_PIXEL_OFFSET` is that same 20,
+`TM_FIRST_PIXEL_INDEX` and `TM_LAST_PIXEL_INDEX` are 48 and 112 for 65 pixels,
+and `calculateTelemetryCrc` writes the CRC into the last two bytes, most
+significant first. Reading the pixels from byte 22 instead - which the First
+Light notebook's `[[23;;-1;;2]]` does, and which this tool did until
+2026-08-30 - shifts the image by one pixel: it drops the first and shows the
+checksum as a 65th row, which was the garbage bottom row on every image. The
+frame's own CRC confirms the layout, checking out on 3611 of 3611 whole frames
+of the 07-21 recording and 9025 of 9027 of the 08-09 one.
 
 Under the aux panel is the **whereogram**: the whole recording as one spectrum,
 every frame a column of its 65 pixel intensities, time running left to right and

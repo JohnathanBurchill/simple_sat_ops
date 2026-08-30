@@ -43,20 +43,24 @@
     frame's slot, while the aux fields are stamped when the frame is packed, by
     which time the dome has already been commanded to the next setpoint. So a
     frame's bias is the target voltage the frame BEFORE it reported. What gives
-    it away is the one frame per sweep the MPI sends without subtracting its
-    background: it comes back sitting on a pedestal about 1200 DN above its
-    neighbours, a periodic bright line in the whereogram, and its own aux claims
-    the next setpoint down even though it was taken at 0 V. Reading that aux at
-    face value drew it one column in from the right instead of at the edge.
+    it away is the frame the MPI sends without subtracting its background: it
+    comes back around 20700 DN where its neighbours read about 2010, one of the
+    bright vertical stripes in the whereogram, and its own aux claims the next
+    setpoint down even though it was taken at 0 V. Reading that aux at face
+    value drew it one column in from the right instead of at the edge.
 
     One full inner-dome voltage sweep is one image: fpi frames (the scan period,
     auto-detected, 16) in fpi columns, one for each. The dome sits at 0 V for
     two slots running, straddling the turn of the sweep, and the second of those
-    two is the reference: when the instrument asks for the zero-volt setpoint it
-    keeps that frame's counts as its no-ion-signal background and takes them off
-    every frame that follows, until the next zero-volt request. So that one
-    comes down raw -- it IS the background -- and it is the image's first frame,
-    at the far LEFT. Increasingly negative bias voltages run to the right from
+    two is the reference: the instrument keeps that frame's counts as its
+    no-ion-signal background and takes them off every frame that follows, until
+    it estimates again -- every 256 frames, every 16 images, by default, and NOT
+    once a sweep. So one image in 16 has its first frame come down raw, being
+    the background itself; in the other 15 that frame is the same 0 V dwell with
+    the last estimate taken off it, and reads no differently from the rest of
+    the sweep (measured at 2012 DN against a sweep average of 2016). Either way
+    it is the image's first frame, at the far LEFT. Increasingly negative bias
+    voltages run to the right from
     there, most negative (setpoint 4095) next to last, and the far right column
     is the other frame of the dwell: 0 V read again with the background taken
     off it, which is the residue the subtraction leaves. Laying the sweep out in
@@ -89,7 +93,7 @@
     Both fit the 152 bytes exactly -- 65 words from 20 leaves the last two over,
     65 words from 22 uses them up -- and the First Light notebook's
     [[23;;-1;;2]] reads them from 22, which is where this tool read them until
-    now. The flight software settles it: MPITelemetry.h sets
+    2026-08-30. The flight firmware settles it: MPITelemetry.h sets
     TM_AUXDATA_BUFFER_SIZE to 20 and TM_BUFFER_PIXEL_OFFSET to that same 20,
     storeTelemetryAuxData fills TM_buf[0..19] and stops, storeTelemetryPixelData
     writes pixel i to TM_BUFFER_PIXEL_OFFSET + 2*(i - FirstPixelIndex), and
@@ -100,10 +104,36 @@
     the strip on a background frame; bytes 150..151 average 32991 -- uniform
     across the 16-bit range, which is what a checksum looks like -- do not
     correlate with the pixel before them (r = -0.04), and go DOWN on a
-    background frame where every pixel goes up. And the checksum itself works
-    out over bytes 0..149 on every whole frame of the 2026-07-21 recording and
-    all but 2 of the 2026-08-09 one. Read from 22 the image was one pixel out,
+    background frame where every pixel goes up. And the CRC itself checks out
+    over bytes 0..149 on every whole frame of the 2026-07-21 recording and all
+    but 2 of the 2026-08-09 one. Read from 22 the image was one pixel out,
     missing the first and carrying the checksum as its bottom row.
+
+    Cleaning (b): the MPI subtracts a background of its own in the FPGA, and
+    this undoes it and puts a better one in its place. Every 256 frames -- 16
+    images -- the instrument keeps a 0 V frame as its no-ion-signal background
+    and takes those counts off every frame until the next one, landing the
+    result on a fixed 2000 DN offset. The frame it kept is sent as measured, so
+    it arrives carrying the whole background: the bright vertical stripes across
+    the whereogram. Step 1 undoes that exactly -- add the range's background
+    frame back on and take the 2000 DN off -- which leaves raw counts, and the
+    stripes go, the frame the instrument kept having been raw counts already.
+    Step 2 subtracts a background again, but a local one: the first frame of an
+    image is the 0 V dwell read back and so holds no ion signal, and the
+    pixel-by-pixel median (or mean, e) of those over the five images centred on
+    this one (n cycles 1..9) comes off every frame of the image, with the 2000
+    DN put back on so a cleaned count reads on the scale the frames arrived on.
+    Only frames fit to be a sample go into that window -- all their bytes
+    arrived, the frame's own CRC checks out, no JSON marker spliced in -- and
+    the estimate is normalised by however many survive rather than by the width
+    of the window.
+    What is left has the same form the instrument sends, raw - background +
+    2000, and differs only in the background being one measured a few images
+    away instead of one up to 255 frames stale: 99% of frames land within 200 DN
+    of that level, with a tail out to a few hundred where ions were rammed in.
+    The toggle applies to the image and the whereogram together. shift-B, while
+    cleaning is on, stops after step 1 instead of running both, which is how you
+    see what each step did rather than only the end of it.
 
     Whereogram: under the aux panel sits the whole recording as one spectrum,
     every frame a column of its 65 intensities, time left to right and arrival
@@ -166,6 +196,7 @@
 #include "packet_db.h"
 #include "sso_version.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1182,6 +1213,19 @@ typedef struct {
     int    playing;
     float  ips;
     float  accum;
+    int    clean_stage;    // how much of the cleaning to apply (see the stage enum)
+    int    clean_step;     // the step b comes back on at, and shift-B moves
+    int    clean_win;      // images in the sliding background window (odd)
+    int    clean_mean;     // background estimator: 0 = median, 1 = mean
+    float *clean_pix;      // nframes * NPIX cleaned counts, NULL until built
+    unsigned char *clean_ok;  // per frame: a cleaned value exists
+    int   *key_fr;         // the frames that carried a background estimate
+    int    n_key;
+    int    key_step;       // frames between background estimates (256 by default)
+    int    n_pre_key;      // frames ahead of the first background estimate
+    int    clean_frames;   // frames a cleaned value was built for
+    int    bg_samples;     // images whose first frame was fit to be a sample
+    int    bg_short;       // images whose window lost at least one to that test
 } view_t;
 
 // Column of frame k within its image, from the inner-dome TARGET voltage (the
@@ -1269,30 +1313,410 @@ static void rebuild_image_list(view_t *v, const experiment_t *s)
     if (v->img_pos >= v->n_img) v->img_pos = v->n_img ? v->n_img - 1 : 0;
 }
 
+// ---- image cleaning ---------------------------------------------------------
+//
+// The MPI subtracts a background of its own in the FPGA, and cleaning undoes
+// that and puts a better one in its place.
+//
+// What the instrument does: every so often -- 256 frames, 16 images, by default
+// -- it keeps the frame it takes at the 0 V setpoint as its no-ion-signal
+// background, and takes those counts off every frame that follows until the
+// next such estimate, landing the result on a fixed offset of about 2000 DN.
+// So what arrives is raw - background + 2000, except on the frame it kept,
+// which is sent as measured and so arrives carrying the whole background:
+// about ten times what its neighbours read, and the bright vertical stripes
+// across the whereogram.
+//
+// Step 1 undoes exactly that, frame by frame: add back the range's background
+// frame and take off the 2000 DN offset, which leaves the raw counts. The
+// stripes go, because the frame the instrument kept was already raw counts and
+// now everything else is too. What is left is one level across the recording,
+// depressed where sunlight or an electron beam takes signal away and raised
+// where rammed ions add it.
+//
+// Step 2 subtracts a background again, but a local one that cannot go stale.
+// The first frame of an image is the 0 V dwell read back, so by construction it
+// holds no ion signal and is a measurement of the background alone. For each
+// image we take the first frames of the clean_win images centred on it (5 by
+// default, the window clipped where it runs off either end of the recording),
+// combine them pixel by pixel, and subtract that from every frame of the image
+// -- then put the same 2000 DN back on, so a cleaned count reads on the scale
+// the frames arrived on rather than as a difference around zero.
+//
+// The result has the same form as what the instrument sends, raw - background
+// + 2000, and differs only in the background being one measured a few images
+// away rather than one that can be 255 frames stale.
+//
+// Only frames fit to be a background sample go into that window: every byte of
+// them arrived, their own CCITT CRC-16 checks out, and no JSON marker was
+// spliced into them. An image whose first frame fails
+// any of that contributes nothing, and the estimate is normalised by what is
+// left -- four samples over four, not four over five.
+//
+// Median or mean, by the e key. The median is the default and measures better
+// on both recordings. Scoring each frame by how far its own level sits from the
+// 2000 DN it should land on, the median leaves 24 and 21 DN across ordinary
+// images where the mean leaves 59 and 34; on the one image per range whose
+// first frame IS the estimate, and whose window therefore straddles a change of
+// level, the median leaves 55 and 31 DN against the mean's 128 and 96. That is
+// the median returning the level the middle image is on where the mean returns
+// a blend of the two. The mean is kept because it is the better estimator when
+// every value in the window really is the same quantity, and because being able
+// to put the two side by side is how the above was measured.
+
+// How much of the cleaning is being applied: nothing, or the pipeline stopped
+// after any of its steps. b turns cleaning on and off, and shift-B picks which
+// step to stop after, which is only a question worth asking while it is on.
+// Seeing a step on its own is how you tell which of them did what -- step 1
+// alone is the whole recording flat at its raw level, with the sunlight
+// depressions and the ion enhancements the only things left standing on it.
+// Adding a step later means one more name here and one more block in
+// rebuild_clean; shift-B picks it up on its own.
+enum { CLEAN_OFF, CLEAN_STEP1, CLEAN_FULL, CLEAN_STAGES };
+
+// Frames after a candidate whose level says what the instrument has been taking
+// off them, and how far above that level a real background estimate stands.
+#define CLEAN_REF_FRAMES  32
+#define CLEAN_REF_RATIO   2
+#define CLEAN_WIN_MAX     9
+
+// The fixed offset the instrument's own background subtraction lands on, in DN.
+// Step 1 takes it off to recover the raw counts, and step 2 puts it back so a
+// cleaned frame reads on the same scale a raw one does: the same DN window
+// serves both modes, and nothing has to go negative to say "less signal than
+// the background". Measured at 1930 to 1950 DN on both recordings.
+#define CLEAN_PEDESTAL    2000.0
+
+static int cmp_int(const void *a, const void *b)
+{
+    int x = *(const int *) a, y = *(const int *) b;
+    return (x > y) - (x < y);
+}
+
+// Median of n values, sorting the array it is handed. An even count takes the
+// upper of the two middle values rather than averaging them: averaging would
+// blend the two levels a window straddling a boundary holds, which is the one
+// thing the median is here to avoid.
+static int median_int(int *v, int n)
+{
+    qsort(v, (size_t) n, sizeof *v, cmp_int);
+    return v[n / 2];
+}
+
+// The background estimate from the n samples in the window: their median, or
+// their mean over however many there are. Either way the normalisation is the
+// count that survived the fitness test, not the width of the window.
+static double estimate_bg(double *v, int n, int use_mean)
+{
+    if (use_mean) {
+        double sum = 0.0;
+        for (int i = 0; i < n; i++) sum += v[i];
+        return sum / (double) n;
+    }
+    qsort(v, (size_t) n, sizeof *v, cmp_double);
+    return v[n / 2];
+}
+
+// A frame's overall level. The median of its pixels rather than their mean,
+// because the last pixel of a frame reads tens of thousands where the other 64
+// read a couple of thousand, and one value in 65 does not move a median.
+static int frame_level(const experiment_t *s, int k)
+{
+    int p[NPIX];
+    long base = s->fr_off[k] + PIX_START;
+    for (int j = 0; j < NPIX; j++) p[j] = be16(s->buf, base + j * 2);
+    return median_int(p, NPIX);
+}
+
+// The CCITT CRC-16 the instrument puts in the last two bytes of every frame,
+// over the 150 bytes before them (avr-libc's _crc_ccitt_update seeded 0xFFFF,
+// most significant byte first -- calculateTelemetryCrc in the flight
+// MPITelemetry.c). This is the instrument's own word on whether the frame
+// arrived intact, and it covers exactly the bytes being read -- which the CSP
+// CRC32 on a packet does not, a frame being assembled from whatever packets its
+// bytes happened to land in. Measured, it passes on 3611 of 3611 whole frames
+// of the 2026-07-21 recording and 9025 of 9027 of the 2026-08-09 one.
+static int frame_crc_ok(const experiment_t *s, int k)
+{
+    const uint8_t *f = s->buf + s->fr_off[k];
+    uint16_t crc = 0xFFFF;
+    for (int i = 0; i < FRAME_STRIDE - 2; i++) {
+        uint8_t t = f[i] ^ (uint8_t) (crc & 0xFF);
+        t ^= (uint8_t) (t << 4);
+        crc = (uint16_t) ((crc >> 8) ^ ((uint16_t) t << 8)
+                          ^ ((uint16_t) t << 3) ^ ((uint16_t) t >> 4));
+    }
+    return crc == (uint16_t) be16(s->buf, s->fr_off[k] + FRAME_STRIDE - 2);
+}
+
+// Whether frame k is fit to stand as a background sample. Every byte of it has
+// to have arrived -- a byte that never came down reads as zero, and zero is not
+// a measurement of no signal -- its own CRC has to check out, and it must not
+// be one of the frames a JSON marker was spliced into. A frame that fails any
+// of this is left out of the window rather than averaged in.
+static int bg_sample_ok(const experiment_t *s, int k)
+{
+    if (s->fr_bad[k]) return 0;
+    long b1 = s->fr_off[k] + FRAME_STRIDE;
+    for (long b = s->fr_off[k]; b < b1; b++)
+        if (!s->present[b]) return 0;
+    return frame_crc_ok(s, k);
+}
+
+static void free_clean(view_t *v)
+{
+    free(v->clean_pix); v->clean_pix = NULL;
+    free(v->clean_ok);  v->clean_ok  = NULL;
+    free(v->key_fr);    v->key_fr    = NULL;
+    v->n_key = 0; v->key_step = 0; v->n_pre_key = 0;
+    v->clean_frames = 0; v->bg_samples = 0; v->bg_short = 0;
+}
+
+// Find the frames the instrument kept as background estimates. A candidate is a
+// 0 V frame (column 0, the image's first) standing well above the level the
+// frames after it sit at. That test alone also catches a frame that reads high
+// for some other reason -- a corrupt body, a bright event -- so the cadence has
+// the last word: the estimates run at a fixed interval, so take that interval
+// to be the median spacing of the candidates and keep only the beat most of
+// them share. Fills keys[] (room for nframes) and returns how many.
+static int find_background_frames(view_t *v, const experiment_t *s,
+                                  const int *lvl, int *keys)
+{
+    int nkey = 0;
+    for (int k = 0; k < s->nframes; k++) {
+        if (lvl[k] < 0 || col_of(v, s, k) != 0) continue;
+        int ref[CLEAN_REF_FRAMES], nr = 0;
+        for (int m = k + 1; m < s->nframes && nr < CLEAN_REF_FRAMES; m++)
+            if (lvl[m] >= 0) ref[nr++] = lvl[m];
+        if (nr == 0) continue;
+        if (lvl[k] >= CLEAN_REF_RATIO * median_int(ref, nr)) keys[nkey++] = k;
+    }
+    if (nkey < 2) return nkey;
+
+    int *d = (int *) malloc((size_t) (nkey - 1) * sizeof *d);
+    if (d == NULL) return nkey;
+    for (int i = 1; i < nkey; i++)
+        d[i - 1] = (s->fr_ctr[keys[i]] - s->fr_ctr[keys[i - 1]]) & 0xFFFF;
+    int step = median_int(d, nkey - 1);
+    free(d);
+    if (step < 2) return nkey;
+    v->key_step = step;
+    if (nkey < 3) return nkey;
+
+    int phase = 0, most = 0;
+    for (int i = 0; i < nkey; i++) {
+        int ph = s->fr_ctr[keys[i]] % step, cnt = 0;
+        for (int m = 0; m < nkey; m++)
+            if (s->fr_ctr[keys[m]] % step == ph) cnt++;
+        if (cnt > most) { most = cnt; phase = ph; }
+    }
+    int w = 0;
+    for (int i = 0; i < nkey; i++)
+        if (s->fr_ctr[keys[i]] % step == phase) keys[w++] = keys[i];
+    return w;
+}
+
+// Build the cleaned pixels for the selected experiment. Returns 0 if there is
+// nothing to show, in which case the buffers are left free.
+static int rebuild_clean(view_t *v, const experiment_t *s)
+{
+    free_clean(v);
+    if (s == NULL || s->nframes == 0 || v->fr_img == NULL || v->n_img == 0) return 0;
+
+    int nf = s->nframes;
+    float *pix = (float *) malloc((size_t) nf * NPIX * sizeof *pix);
+    unsigned char *ok = (unsigned char *) calloc((size_t) nf, 1);
+    int *lvl = (int *) malloc((size_t) nf * sizeof *lvl);
+    int *keys = (int *) malloc((size_t) nf * sizeof *keys);
+    if (pix == NULL || ok == NULL || lvl == NULL || keys == NULL) {
+        free(pix); free(ok); free(lvl); free(keys);
+        return 0;
+    }
+    for (int k = 0; k < nf; k++) lvl[k] = s->fr_bad[k] ? -1 : frame_level(s, k);
+    int nkey = find_background_frames(v, s, lvl, keys);
+    free(lvl);
+
+    // Step 1: undo the instrument's subtraction. A frame belongs to the last
+    // background frame at or before it in the file, so a range whose own
+    // estimate never came down carries the one before it instead of going
+    // uncorrected -- the background drifts only a few hundred DN across a
+    // range, and step 2 takes off whatever is left of it either way. The frame
+    // the instrument kept is already raw counts and is left alone; every other
+    // frame gets its background back and the 2000 DN offset taken off.
+    int cur = -1, nx = 0;
+    for (int k = 0; k < nf; k++) {
+        if (nx < nkey && keys[nx] == k) { cur = k; nx++; }
+        if (s->fr_bad[k]) continue;
+        long src = s->fr_off[k] + PIX_START;
+        long bg = cur >= 0 ? s->fr_off[cur] + PIX_START : -1;
+        for (int j = 0; j < NPIX; j++) {
+            double p = be16(s->buf, src + j * 2);
+            if (bg >= 0 && cur != k)
+                p += (double) be16(s->buf, bg + j * 2) - CLEAN_PEDESTAL;
+            pix[(long) k * NPIX + j] = (float) p;
+        }
+        ok[k] = 1;
+        if (cur < 0) {
+            v->n_pre_key++;
+            // Ahead of the first estimate, so there is nothing to add back and
+            // the frame is still on the instrument's own scale rather than at
+            // raw counts. Step 2 puts it right -- its neighbours are in the
+            // same state, so the local background it gets is the one it is
+            // actually sitting on -- but step 1 alone has no answer for it, and
+            // showing it beside corrected frames would read as a tenfold
+            // depression that never happened.
+            if (v->clean_stage < CLEAN_FULL) ok[k] = 0;
+        }
+    }
+
+    // Stop here if that is all the stage asks for: step 1 on its own is the
+    // recording at its raw level, which is what says whether the instrument's
+    // own subtraction was all that stood between it and being flat.
+    if (v->clean_stage < CLEAN_FULL) {
+        for (int k = 0; k < nf; k++) if (ok[k]) v->clean_frames++;
+        v->clean_pix = pix; v->clean_ok = ok;
+        v->key_fr = keys; v->n_key = nkey;
+        if (v->clean_frames == 0) { free_clean(v); return 0; }
+        return 1;
+    }
+
+    // The first frame of each image, where it is fit to be a background sample:
+    // the 0 V dwell read back, which is the background measured with no ion
+    // signal on it.
+    int *first = (int *) malloc((size_t) v->n_img * sizeof *first);
+    double *bgest = (double *) malloc((size_t) v->n_img * NPIX * sizeof *bgest);
+    unsigned char *have = (unsigned char *) calloc((size_t) v->n_img, 1);
+    if (first == NULL || bgest == NULL || have == NULL) {
+        free(first); free(bgest); free(have); free(pix); free(ok); free(keys);
+        return 0;
+    }
+    for (int i = 0; i < v->n_img; i++) first[i] = -1;
+    for (int k = 0; k < nf; k++) {
+        int im = v->fr_img[k];
+        if (im < 0 || im >= v->n_img || !ok[k] || first[im] >= 0) continue;
+        if (col_of(v, s, k) == 0 && bg_sample_ok(s, k)) first[im] = k;
+    }
+    for (int i = 0; i < v->n_img; i++) if (first[i] >= 0) v->bg_samples++;
+
+    // Step 2: the sliding background, one estimate per image.
+    int h = (v->clean_win - 1) / 2;
+    for (int i = 0; i < v->n_img; i++) {
+        int a = i - h < 0 ? 0 : i - h;
+        int b = i + h > v->n_img - 1 ? v->n_img - 1 : i + h;
+        int src[CLEAN_WIN_MAX], ns = 0, width = 0;
+        for (int m = a; m <= b && ns < CLEAN_WIN_MAX; m++) {
+            width++;
+            if (first[m] >= 0) src[ns++] = first[m];
+        }
+        have[i] = ns > 0;
+        if (ns < width) v->bg_short++;
+        double win[CLEAN_WIN_MAX];
+        for (int j = 0; j < NPIX; j++) {
+            for (int q = 0; q < ns; q++) win[q] = pix[(long) src[q] * NPIX + j];
+            bgest[(long) i * NPIX + j] = ns > 0 ? estimate_bg(win, ns, v->clean_mean) : 0.0;
+        }
+    }
+    free(first);
+
+    // Take it off, and put the instrument's own offset back on. A frame the
+    // image list dropped is cleaned too, on the background of the image it sits
+    // in: its aux was corrupt, which says nothing about its pixels, and leaving
+    // it out would open a hole in the whereogram that no gap in the data
+    // accounts for.
+    int last = -1;
+    for (int k = 0; k < nf; k++) {
+        if (!ok[k]) continue;
+        int im = v->fr_img[k];
+        if (im >= 0 && im < v->n_img) last = im;
+        int use = im;
+        if (use < 0 || use >= v->n_img) use = last < 0 ? 0 : last;
+        if (!have[use]) { ok[k] = 0; continue; }
+        for (int j = 0; j < NPIX; j++) {
+            double p = (double) pix[(long) k * NPIX + j]
+                     - bgest[(long) use * NPIX + j] + CLEAN_PEDESTAL;
+            pix[(long) k * NPIX + j] = (float) p;
+        }
+        v->clean_frames++;
+    }
+    free(bgest); free(have);
+
+    v->clean_pix = pix; v->clean_ok = ok;
+    v->key_fr = keys; v->n_key = nkey;
+    if (v->clean_frames == 0) { free_clean(v); return 0; }
+    return 1;
+}
+
+// What the viewer shows for pixel j of frame k: the counts as they came down,
+// or the cleaned value when cleaning is on. Only call it for a frame
+// frame_shown() has passed -- that is what says there is a cleaned value here.
+static double pix_val(const view_t *v, const experiment_t *s, int k, int j)
+{
+    if (v->clean_stage != CLEAN_OFF) return v->clean_pix[(long) k * NPIX + j];
+    return be16(s->buf, s->fr_off[k] + PIX_START + j * 2);
+}
+
+// Whether frame k has anything to show in the current mode. Cleaning needs a
+// background for the image the frame sits in; without one there is no cleaned
+// frame, and drawing the raw one beside cleaned neighbours would read as a
+// measurement of something it is not.
+static int frame_shown(const view_t *v, const experiment_t *s, int k)
+{
+    (void) s;
+    if (v->clean_stage == CLEAN_OFF) return 1;
+    return v->clean_pix != NULL && v->clean_ok[k];
+}
+
 // Per-experiment DN extent over all present pixels (for auto-session scaling).
 static void compute_session_extent(view_t *v, const experiment_t *s)
 {
-    int mn = 65535, mx = 0;
+    double mn = 0, mx = 0;
+    int any = 0;
     for (int k = 0; k < s->nframes; k++) {
-        long base = s->fr_off[k] + PIX_START;
+        if (!frame_shown(v, s, k)) continue;
         for (int j = 0; j < NPIX; j++) {
-            int p = be16(s->buf, base + j * 2);
-            if (p < mn) mn = p;
-            if (p > mx) mx = p;
+            double p = pix_val(v, s, k, j);
+            if (!any || p < mn) mn = p;
+            if (!any || p > mx) mx = p;
+            any = 1;
         }
     }
-    if (mx <= mn) mx = mn + 1;
-    v->sess_min = mn; v->sess_max = mx;
+    if (!any) { mn = 0; mx = 1; }
+    v->sess_min = (int) floor(mn);
+    v->sess_max = (int) ceil(mx);
+    if (v->sess_max <= v->sess_min) v->sess_max = v->sess_min + 1;
+}
+
+// Move to a cleaning stage and rebuild what it needs. The manual DN window
+// carries across the full stage, since a cleaned count is put back on the level
+// a raw one arrives at (see CLEAN_PEDESTAL); step 1 on its own sits at the raw
+// counts, about ten times higher, so the auto scales are the ones to be in
+// there. Returns 0 if the experiment has nothing to clean, having dropped back
+// to showing it as it came down.
+static int set_clean(view_t *v, const experiment_t *s, int stage)
+{
+    v->clean_stage = stage;
+    if (stage != CLEAN_OFF && !rebuild_clean(v, s)) {
+        v->clean_stage = CLEAN_OFF;
+        free_clean(v);
+        compute_session_extent(v, s);
+        return 0;
+    }
+    if (stage == CLEAN_OFF) free_clean(v);
+    compute_session_extent(v, s);
+    return 1;
 }
 
 // Switch to a different experiment and refresh everything derived from it.
+// Cleaning is rebuilt against the new experiment, and dropped if that one has
+// no background estimates to work from.
 static void select_experiment(view_t *v, const experiment_t *s)
 {
     v->img_pos = 0;
     v->playing = 0;
     apply_scan(v, s);
     rebuild_image_list(v, s);
-    compute_session_extent(v, s);
+    if (v->clean_stage == CLEAN_OFF) compute_session_extent(v, s);
+    else set_clean(v, s, v->clean_stage);
 }
 
 // ---- TTF font (pattern from decode_inspector.c / ~/src/ved) ----------------
@@ -1585,6 +2009,13 @@ static Color cmap_color(int map, unsigned char val)
 #define MPI_BG  ((Color){ 18, 18, 22, 255 })
 
 // ---- whereogram -------------------------------------------------------------
+//
+// A column no frame landed in. Columns are fractions once cleaning is on, and a
+// cleaned one can land below zero where a raw one never does -- a deep enough
+// depression, or a corrupt frame -- so the sentinel has to be a value no
+// reading can take.
+#define WG_NONE  (-DBL_MAX)
+//
 // The whole recording at a glance: every frame a column of its 65 pixels, time
 // running left to right, arrival direction up the vertical axis. It is the
 // spectrum the MPI actually measured, so it doubles as the map of the file --
@@ -1608,7 +2039,8 @@ static Color cmap_color(int map, unsigned char val)
 // of the whole recording to one image of it would make it flicker while
 // scrubbing and would leave one column not comparable with the next. Pass
 // lo >= hi to scale automatically; *out_lo / *out_hi report the range used.
-static void build_whereogram(const experiment_t *s, int cmap, int lo, int hi,
+static void build_whereogram(const view_t *v, const experiment_t *s,
+                             int cmap, int lo, int hi,
                              Color *pix, int w, unsigned char *missing,
                              int *out_lo, int *out_hi)
 {
@@ -1617,7 +2049,7 @@ static void build_whereogram(const experiment_t *s, int cmap, int lo, int hi,
 
     // Which frame, if any, begins in each frame-sized slice of the file.
     int *at = (int *) malloc((size_t) nslot * sizeof *at);
-    int *val = (int *) malloc((size_t) w * NPIX * sizeof *val);
+    double *val = (double *) malloc((size_t) w * NPIX * sizeof *val);
     if (at == NULL || val == NULL) { free(at); free(val); return; }
     for (long q = 0; q < nslot; q++) at[q] = -1;
     for (int k = 0; k < s->nframes; k++) {
@@ -1632,7 +2064,7 @@ static void build_whereogram(const experiment_t *s, int cmap, int lo, int hi,
         if (q1 <= q0) q1 = q0 + 1;
         if (q1 > nslot) q1 = nslot;
 
-        long sum[NPIX] = {0};
+        double sum[NPIX] = {0};
         int nsum = 0, gap = 0;
 
         for (long q = q0; q < q1; q++) {
@@ -1642,50 +2074,47 @@ static void build_whereogram(const experiment_t *s, int cmap, int lo, int hi,
                 if (!s->present[b]) { gap = 1; break; }
 
             int k = at[q];
-            if (k < 0 || s->fr_bad[k]) continue;
-            long base = s->fr_off[k] + PIX_START;
-            if (base + 2 * NPIX > s->size) continue;
-            for (int j = 0; j < NPIX; j++) sum[j] += be16(s->buf, base + j * 2);
+            if (k < 0 || s->fr_bad[k] || !frame_shown(v, s, k)) continue;
+            for (int j = 0; j < NPIX; j++) sum[j] += pix_val(v, s, k, j);
             nsum++;
         }
 
         missing[c] = (unsigned char) gap;
         for (int j = 0; j < NPIX; j++)
-            val[(long) j * w + c] = nsum > 0 ? (int) (sum[j] / nsum) : -1;
+            val[(long) j * w + c] = nsum > 0 ? sum[j] / nsum : WG_NONE;
     }
     free(at);
 
     // Auto scaling is over the whole whereogram -- but over what it holds, not
     // over its two most extreme samples. Taking the plain minimum and maximum
-    // gave 0 .. 49296 and painted a flat blue rectangle: a few corrupt readings
-    // reach the ends of the 16-bit range, and pixel 64 of every frame carries
-    // something around 32000 where the other 64 sit near 2010, so one row in
-    // 65 owns the whole top of the scale. The 1st and 95th percentile step past
-    // both and leave the range the readings actually occupy.
+    // gave 0 .. 49296 and painted a flat blue rectangle, because a few corrupt
+    // readings reach the ends of the 16-bit range. The 1st and 95th percentile
+    // step past those and leave the range the readings actually occupy. They
+    // are read off the sorted values rather
+    // than a histogram of them, because a cleaned column is a fraction and can
+    // land outside the 16-bit range a histogram would have to cover.
     if (lo >= hi) {
-        long *hist = (long *) calloc(65536, sizeof *hist);
-        long total = 0;
-        if (hist != NULL) {
+        double *sorted = (double *) malloc((size_t) w * NPIX * sizeof *sorted);
+        long n = 0;
+        if (sorted != NULL)
             for (long i = 0; i < (long) w * NPIX; i++)
-                if (val[i] >= 0 && val[i] <= 65535) { hist[val[i]]++; total++; }
+                if (val[i] != WG_NONE) sorted[n++] = val[i];
+        double mn = 0, mx = 1;
+        if (n > 0) {
+            qsort(sorted, (size_t) n, sizeof *sorted, cmp_double);
+            mn = sorted[(n - 1) / 100];
+            mx = sorted[(n - 1) * 95 / 100];
         }
-        int mn = 0, mx = 65535;
-        if (total > 0) {
-            long seen = 0;
-            for (int p = 0; p < 65536; p++) { seen += hist[p]; if (seen * 100 >= total) { mn = p; break; } }
-            seen = 0;
-            for (int p = 65535; p >= 0; p--) { seen += hist[p]; if (seen * 20 >= total) { mx = p; break; } }
-        }
-        free(hist);
-        lo = mn;
-        hi = mx;
+        free(sorted);
+        lo = (int) floor(mn);
+        hi = (int) ceil(mx);
     }
     if (hi <= lo) hi = lo + 1;
 
     // Second pass: paint it.
     for (long i = 0; i < (long) w * NPIX; i++) {
-        int p = val[i];
-        if (p < 0) { pix[i] = MPI_BG; continue; }
+        double p = val[i];
+        if (p == WG_NONE) { pix[i] = MPI_BG; continue; }
         int g = p <= lo ? 0 : p >= hi ? 255 : (int) (255.0 * (p - lo) / (hi - lo));
         pix[i] = cmap_color(cmap, (unsigned char) g);
     }
@@ -1773,6 +2202,11 @@ int main(int argc, char **argv)
             printf("Usage: mpi_viewer [--db=<packet_db.sqlite>] [--list]\n"
                    "Inspect MPI science imagery reconstructed from the packet DB.\n"
                    "The left panel lists MPI experiments; F5 re-reads the DB.\n"
+                   "Press b to show the cleaned imagery -- the instrument's own\n"
+                   "background subtraction undone and a sliding local one put in its\n"
+                   "place -- and shift-B, while it is on, to stop after the first of\n"
+                   "those steps instead. n sets how many images the sliding one is\n"
+                   "taken over, and e whether they are combined by median or mean.\n"
                    "Press d to write the selected experiment's missing data as\n"
                    "re-download telecommands, for simple_sat_ops --tc-file.\n"
                    "--list prints what each experiment reconstructed to and exits,\n"
@@ -1835,6 +2269,8 @@ int main(int argc, char **argv)
     v.zoom = 8; v.ips = 8.0f;
     v.scale_mode = SCALE_AUTO_IMAGE;
     v.dn_min = 1800; v.dn_max = 2300;
+    v.clean_win = 5;
+    v.clean_step = CLEAN_FULL;
     select_experiment(&v, &exps[v.sel]);
 
     SetTraceLogLevel(LOG_NONE);
@@ -1869,7 +2305,8 @@ int main(int argc, char **argv)
     // when the experiment, the colour map, the scale or the panel width change.
     Color    *cov_pix = NULL;
     Texture2D cov_tex = {0};
-    int cov_w = 0, cov_sel = -1;
+    int cov_w = 0, cov_valid = 0;
+    unsigned cov_sig = 0;
     unsigned char *wg_missing = NULL;   // per column: some of its bytes never came down
     int wg_lo = -1, wg_hi = -1;         // the DN window its colours were built for
     // Set while the pointer is scrubbing the whereogram, so a press that
@@ -1896,6 +2333,45 @@ int main(int argc, char **argv)
             v.fpi_override = v.fpi_override == 0 ? 8 : v.fpi_override == 8 ? 16 : 0;
             apply_scan(&v, s);
             rebuild_image_list(&v, s);
+            // Cleaning is built on the images and on which frame of each is the
+            // 0 V one, so a different scan period rebuilds it.
+            if (v.clean_stage != CLEAN_OFF) set_clean(&v, s, v.clean_stage);
+            cov_valid = 0;
+        }
+        // b turns cleaning on and off, coming back on at whichever step it was
+        // left showing. shift-B moves between the steps -- the instrument's own
+        // subtraction undone, then the sliding local one taken off as well --
+        // and is ignored with cleaning off, there being no step to pick then.
+        if (IsKeyPressed(KEY_B)) {
+            int shifted = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+            int want = -1;
+            if (!shifted) {
+                want = v.clean_stage == CLEAN_OFF ? v.clean_step : CLEAN_OFF;
+            } else if (v.clean_stage != CLEAN_OFF) {
+                v.clean_step = v.clean_step + 1 >= CLEAN_STAGES ? CLEAN_STEP1
+                                                               : v.clean_step + 1;
+                want = v.clean_step;
+            }
+            if (want >= 0) {
+                if (!set_clean(&v, s, want)) {
+                    snprintf(status, sizeof status,
+                             "nothing to clean: no background frames in this experiment");
+                    status_left = 6.0f;
+                }
+                cov_valid = 0;
+            }
+        }
+        // n: how many images the sliding background is taken over.
+        if (IsKeyPressed(KEY_N)) {
+            v.clean_win = v.clean_win >= CLEAN_WIN_MAX ? 1 : v.clean_win + 2;
+            if (v.clean_stage != CLEAN_OFF) set_clean(&v, s, v.clean_stage);
+            cov_valid = 0;
+        }
+        // e: how those images are combined into the estimate.
+        if (IsKeyPressed(KEY_E)) {
+            v.clean_mean = !v.clean_mean;
+            if (v.clean_stage != CLEAN_OFF) set_clean(&v, s, v.clean_stage);
+            cov_valid = 0;
         }
         if (IsKeyPressed(KEY_S)) { v.zoom = v.zoom == 2 ? 4 : v.zoom == 4 ? 8 : v.zoom == 8 ? 16 : 2; }
         if (IsKeyPressed(KEY_A)) v.scale_mode = (v.scale_mode + 1) % 3;
@@ -1930,7 +2406,7 @@ int main(int argc, char **argv)
                 v.img_pos = save_img;
                 v.playing = save_play;
                 s = &exps[v.sel];
-                cov_sel = -1;   // the reloaded experiment needs a fresh whereogram
+                cov_valid = 0;   // the reloaded experiment needs a fresh whereogram
             } else if (ne != NULL) {
                 free_experiments(ne, nn);
             }
@@ -1953,18 +2429,21 @@ int main(int argc, char **argv)
         int lo = v.dn_min, hi = v.dn_max;
         if (v.scale_mode == SCALE_AUTO_SESSION) { lo = v.sess_min; hi = v.sess_max; }
         else if (v.scale_mode == SCALE_AUTO_IMAGE) {
-            int mn = 65535, mx = 0;
+            double mn = 0, mx = 0;
+            int any = 0;
             for (int k = 0; k < s->nframes; k++) {
                 if (v.fr_img == NULL || v.fr_img[k] != v.img_pos) continue;
-                long base = s->fr_off[k] + PIX_START;
+                if (!frame_shown(&v, s, k)) continue;
                 for (int j = 0; j < NPIX; j++) {
-                    int p = be16(s->buf, base + j * 2);
-                    if (p < mn) mn = p;
-                    if (p > mx) mx = p;
+                    double p = pix_val(&v, s, k, j);
+                    if (!any || p < mn) mn = p;
+                    if (!any || p > mx) mx = p;
+                    any = 1;
                 }
             }
-            if (mx <= mn) mx = mn + 1;
-            lo = mn; hi = mx;
+            if (!any) { mn = 0; mx = 1; }
+            lo = (int) floor(mn); hi = (int) ceil(mx);
+            if (hi <= lo) hi = lo + 1;
         }
 
         // ---- rasterise the image into the grayscale texture ----
@@ -1975,12 +2454,12 @@ int main(int argc, char **argv)
             if (v.fr_img == NULL || v.fr_img[k] != v.img_pos) continue;
             int col = col_of(&v, s, k);
             if (col < 0 || col >= v.ncols) continue;
-            cols_present++;
             if (rep_frame < 0) rep_frame = k;
             if (s->fr_ts[k] >= 0 && (frame_time < 0 || s->fr_ts[k] < frame_time)) frame_time = s->fr_ts[k];
-            long base = s->fr_off[k] + PIX_START;
+            if (!frame_shown(&v, s, k)) continue;
+            cols_present++;
             for (int j = 0; j < NPIX; j++) {
-                int p = be16(s->buf, base + j * 2);
+                double p = pix_val(&v, s, k, j);
                 int g = p <= lo ? 0 : p >= hi ? 255 : (int) (255.0 * (p - lo) / (hi - lo));
                 // Column = bias voltage (background left, most negative right); pixel -> row.
                 imgbuf[j * MAX_FPI + col] = cmap_color(v.cmap, (unsigned char) g);
@@ -2084,6 +2563,42 @@ int main(int argc, char **argv)
                              g_cmaps[v.cmap].name, v.cmap + 1, N_CMAPS),
                   ax, ay, 15, LIGHTGRAY); ay += 20;
 
+        // Cleaning: what is being shown, and what it was built from. The
+        // background-estimate count and their spacing are the check that the
+        // right frames were picked out -- the instrument runs them every 256.
+        if (v.clean_stage == CLEAN_OFF) {
+            draw_text("cleaning      : off  (counts as they came down)", ax, ay, 15, GRAY);
+            ay += 20;
+        } else {
+            if (v.clean_stage == CLEAN_STEP1)
+                draw_text("cleaning      : step 1  (the instrument's own subtraction undone)",
+                          ax, ay, 15, (Color){ 120, 220, 160, 255 });
+            else
+                draw_text(TextFormat("cleaning      : steps 1+2  (%d-image %s)",
+                                     v.clean_win, v.clean_mean ? "mean" : "median"),
+                          ax, ay, 15, (Color){ 120, 220, 160, 255 });
+            ay += 20;
+            if (v.clean_stage == CLEAN_FULL) {
+                draw_text(TextFormat("bg samples    : %d of %d images%s",
+                                     v.bg_samples, v.n_img,
+                                     v.bg_short ? TextFormat(", %d windows short", v.bg_short) : ""),
+                          ax, ay, 15, LIGHTGRAY); ay += 20;
+            }
+            if (v.key_step > 0)
+                draw_text(TextFormat("bg estimates  : %d frames, every %d",
+                                     v.n_key, v.key_step),
+                          ax, ay, 15, LIGHTGRAY);
+            else
+                draw_text(TextFormat("bg estimates  : %d frames", v.n_key),
+                          ax, ay, 15, LIGHTGRAY);
+            ay += 20;
+            if (v.n_pre_key > 0) {
+                draw_text(TextFormat("                %d frames ahead of the first",
+                                     v.n_pre_key),
+                          ax, ay, 15, (Color){ 206, 150, 42, 255 }); ay += 20;
+            }
+        }
+
         // The whereogram, under the aux panel: the whole recording as a
         // spectrum, one column per frame, arrival direction up the vertical
         // axis. Five times as wide as it is high, because the interesting axis
@@ -2108,26 +2623,33 @@ int main(int argc, char **argv)
             int wlo = v.scale_mode == SCALE_MANUAL ? v.dn_min : 0;
             int whi = v.scale_mode == SCALE_MANUAL ? v.dn_max : 0;
             // What the built pixels depend on: any change here rebuilds them.
-            int sig = ((v.sel * N_CMAPS + v.cmap) * 4 + v.scale_mode) * 65536
-                    + (v.scale_mode == SCALE_MANUAL ? (v.dn_min ^ (v.dn_max << 3)) & 0xFFFF : 0);
+            unsigned sig = (unsigned) v.sel;
+            sig = sig * 31u + (unsigned) v.cmap;
+            sig = sig * 31u + (unsigned) v.scale_mode;
+            sig = sig * 31u + (unsigned) v.clean_stage;
+            sig = sig * 31u + (unsigned) v.clean_win;
+            sig = sig * 31u + (unsigned) v.clean_mean;
+            sig = sig * 31u + (unsigned) v.fpi;
+            if (v.scale_mode == SCALE_MANUAL)
+                sig = sig * 31u + (unsigned) (v.dn_min ^ (v.dn_max << 3));
             if (cw != cov_w) {
                 Color *np = (Color *) realloc(cov_pix, (size_t) cw * NPIX * sizeof *cov_pix);
                 unsigned char *nm = (unsigned char *) realloc(wg_missing, (size_t) cw);
                 if (np != NULL && nm != NULL) {
                     cov_pix = np; wg_missing = nm; cov_w = cw;
                     if (cov_tex.id != 0) UnloadTexture(cov_tex);
-                    build_whereogram(s, v.cmap, wlo, whi, cov_pix, cov_w, wg_missing,
+                    build_whereogram(&v, s, v.cmap, wlo, whi, cov_pix, cov_w, wg_missing,
                                      &wg_lo, &wg_hi);
-                    cov_sel = sig;
+                    cov_sig = sig; cov_valid = 1;
                     Image ci = { .data = cov_pix, .width = cov_w, .height = NPIX,
                                  .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
                     cov_tex = LoadTextureFromImage(ci);
                     SetTextureFilter(cov_tex, TEXTURE_FILTER_POINT);
                 }
-            } else if (cov_sel != sig) {
-                build_whereogram(s, v.cmap, wlo, whi, cov_pix, cov_w, wg_missing,
+            } else if (!cov_valid || cov_sig != sig) {
+                build_whereogram(&v, s, v.cmap, wlo, whi, cov_pix, cov_w, wg_missing,
                                  &wg_lo, &wg_hi);
-                cov_sel = sig;
+                cov_sig = sig; cov_valid = 1;
                 UpdateTexture(cov_tex, cov_pix);
             }
             if (cov_tex.id != 0) {
@@ -2205,7 +2727,8 @@ int main(int argc, char **argv)
         const char *help =
             "Up/Down experiment   Left/Right image   click or drag whereogram"
             "   Space play/pause   ,/. speed   f steps/sweep   s zoom   a scale"
-            "   z/x min  c/v max   m colour map   d re-download commands   F5 refresh  q quit";
+            "   z/x min  c/v max   m colour map   b clean  B step   n bg window   e median/mean"
+            "   d re-download commands   F5 refresh  q quit";
         draw_text(help, 12, GetScreenHeight() - 22, 12, (Color){ 150, 150, 160, 255 });
 
         EndDrawing();
@@ -2218,6 +2741,7 @@ int main(int argc, char **argv)
 
     free_experiments(exps, nexp);
     free(v.fr_img);
+    free_clean(&v);
     free(cov_pix);
     free(wg_missing);
     return 0;
