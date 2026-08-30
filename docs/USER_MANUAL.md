@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`4859cd8` (2026-08-30). This is a working draft.
+`c45a25c` (2026-08-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2334,6 +2334,14 @@ window (hold `Shift` for coarse steps), `d` writes the re-download
 telecommands (below), **`F5` re-reads the database** and rebuilds the
 list (keeping your selection and view settings), and `q` quits.
 Read-only on the database and safe to run while a receiver is filling it.
+
+Under the aux panel is a **data-coverage map** of the whole reconstructed file:
+byte 0 at the top left, the last byte at the bottom right, reading left to right
+then down. Green is a byte that came down, black one that never did, and the
+line beneath it gives the received percentage and how much is still missing.
+Each pixel stands for a slice of the file and goes black as soon as any byte in
+that slice is missing, so a single lost packet still shows - a quick read on how
+much of an experiment is still on the satellite before you press `d`.
 
 **Press `d` to write the re-download telecommands** for the selected
 experiment. An experiment is only as complete as the passes that carried it, and
