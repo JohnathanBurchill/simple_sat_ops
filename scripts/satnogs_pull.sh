@@ -35,10 +35,27 @@
 #   the API throttle does not count. So 4-minute polling (15 runs/hour)
 #   for one satellite stays well under the anonymous 60/hour in steady
 #   state. A token gives 4x headroom for catch-up runs (a stale cursor
-#   walks the full --lookback-cap window, one detail GET per obs) and
-#   avoids 429s, whose curl --retry would otherwise multiply requests.
+#   walks the full --lookback-cap window, one detail GET per obs).
 #   For many satellites at once, raise --rate-limit-ms, stagger the cron
 #   entries, or use a token.
+#
+#   That budget holds only while the cursor keeps advancing, and two
+#   bugs used to stop it — between them they got the ground station's
+#   IP blocked at the SatNOGS edge in August 2026, after weeks at
+#   700-900 calls/hour against a 240/hour ceiling:
+#
+#     - An observation whose audio never arrived pinned the cursor to
+#       its start time forever, so every 4-minute tick re-listed the
+#       whole 24-hour window and re-fetched a detail GET per obs.
+#       --pending-max-age now writes such an obs off (default 6h).
+#     - curl --retry treats a 429 as retryable, so each throttled
+#       request became four. curl_api no longer retries at all; the
+#       next cron tick is the retry.
+#
+#   The `API calls (last hr)` row in the run summary is the early
+#   warning. If it climbs toward the ceiling, the cursor is stuck —
+#   check <out>/.latest_start.<norad>.txt against the current time
+#   before it turns into another block.
 #
 #   Each run ends with a `=== summary` table whose API rows report the
 #   accesses made this run (audio downloads excluded) and the accesses in
@@ -63,6 +80,13 @@
 #   --lookback-cap=<spec>   Floor on the resolved --since when it would
 #                           otherwise be older. Default 24h. Use 0 to
 #                           disable.
+#   --pending-max-age=<spec> How long an observation whose audio hasn't
+#                           been uploaded yet may hold the cursor back.
+#                           Default 6h. Past that the cursor moves on
+#                           and the obs is written off, so a recording
+#                           that never arrives can't pin every future
+#                           run to the same window. Use 0 to wait
+#                           indefinitely.
 #   --until=<spec>          Same syntax as --since (default: now)
 #   --status=<value>        Filter by SatNOGS observation status
 #                           (good|bad|failed|future|unknown). Default
@@ -142,6 +166,14 @@ USE_LOCAL_TLE=1
 # host or after the state file was wiped). Override with
 # --lookback-cap=<spec>; 0 disables the cap (use cursor verbatim).
 LOOKBACK_CAP_SPEC="24h"
+# How long an observation with no audio yet may hold the cursor back.
+# SatNOGS usually uploads within ~30 min of a pass ending, but an obs
+# whose recording never arrives (a station that dropped it, a `failed`
+# obs with nothing to upload) would otherwise pin the cursor forever
+# and make every tick re-walk the whole window. Past this age we stop
+# waiting and let the cursor move on. Override with --pending-max-age;
+# 0 waits indefinitely (the old behaviour).
+PENDING_MAX_AGE_SPEC="6h"
 
 usage() {
     sed -n '2,/^# Usage:/p' "$0" | sed 's/^# \{0,1\}//'
@@ -166,6 +198,7 @@ while [[ $# -gt 0 ]]; do
         --tle-dir=*)        TLE_DIR="${1#--tle-dir=}";;
         --no-local-tle)     USE_LOCAL_TLE=0;;
         --lookback-cap=*)   LOOKBACK_CAP_SPEC="${1#--lookback-cap=}";;
+        --pending-max-age=*) PENDING_MAX_AGE_SPEC="${1#--pending-max-age=}";;
         -h|--help)          usage; exit 0;;
         *)                  echo "unknown arg: $1" >&2; usage >&2; exit 2;;
     esac
@@ -394,12 +427,17 @@ log "norad=${NORAD_ID}  since=${SINCE_ISO}${UNTIL_ISO:+  until=${UNTIL_ISO}}  st
 # API requests carry the token when one is set. curl strips the
 # Authorization header on a cross-host redirect, so -L can't leak it to
 # the object-storage host; audio downloads (curl_audio) never get it.
+# No --retry here, deliberately. curl treats a 429 as retryable, so a
+# throttled request would become four, pushing us further over the
+# ceiling exactly when we need to back off. The cron tick is the retry:
+# a failed list just ends the run and the next one picks it up. Audio
+# downloads keep their retries — they go to object storage, which the
+# API throttle doesn't count.
 curl_api() {
     local auth=()
     [[ -n "$API_TOKEN" ]] && auth=(-H "Authorization: Token ${API_TOKEN}")
     curl --silent --show-error --fail -L \
          --connect-timeout 10 --max-time 60 \
-         --retry 3 --retry-delay 2 \
          -H "User-Agent: ${USER_AGENT}" \
          -H "Accept: application/json" \
          ${auth[@]+"${auth[@]}"} \
@@ -472,6 +510,16 @@ NEWEST_START=""
 # newer pass's audio first.
 EARLIEST_PENDING_START=""
 NOW_ISO_FOR_PENDING="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# Oldest start time a pending (no-audio-yet) observation may have and
+# still hold the cursor back. Empty means no floor — wait forever.
+PENDING_FLOOR_ISO=""
+if ! PENDING_MAX_AGE_S="$(spec_to_seconds "$PENDING_MAX_AGE_SPEC")"; then
+    echo "error: bad --pending-max-age='$PENDING_MAX_AGE_SPEC'" >&2
+    exit 2
+fi
+if [[ "$PENDING_MAX_AGE_S" -gt 0 ]]; then
+    PENDING_FLOOR_ISO="$(epoch_to_iso $(( $(date -u +%s) - PENDING_MAX_AGE_S )))"
+fi
 if [[ -s "$STATE_FILE" ]]; then
     # Carry the existing cursor forward so a run that downloads nothing
     # still seeds the same state file value (no regressions on disk).
@@ -544,7 +592,13 @@ while [[ -n "$URL" && "$COUNT_FETCHED" -lt "$MAX_OBS" ]]; do
             # Only track obs whose pass should already be over; future
             # passes shouldn't hold the cursor back for hours/days.
             if [[ -n "$START" && "$START" < "$NOW_ISO_FOR_PENDING" ]]; then
-                if [[ -z "$EARLIEST_PENDING_START" || "$START" < "$EARLIEST_PENDING_START" ]]; then
+                if [[ -n "$PENDING_FLOOR_ISO" && "$START" < "$PENDING_FLOOR_ISO" ]]; then
+                    # Waited long enough. The recording isn't coming,
+                    # so stop letting this obs hold the cursor back —
+                    # otherwise every future run re-walks the window
+                    # from here and burns through the API throttle.
+                    echo "    .. giving up on obs $OBS_ID (start $START, still no audio)" >&2
+                elif [[ -z "$EARLIEST_PENDING_START" || "$START" < "$EARLIEST_PENDING_START" ]]; then
                     EARLIEST_PENDING_START="$START"
                 fi
             fi
