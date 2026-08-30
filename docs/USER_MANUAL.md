@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`88cf3ec` (2026-08-26). This is a working draft.
+`980d896` (2026-08-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2985,8 +2985,15 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   that run (`API calls (run)`) and the accesses in the trailing 60 minutes
   against the ceiling (`API calls (last hr)`) — the same rolling hour the
   SatNOGS throttle counts (60 anonymous, 240 with a token), so a one-off
-  backfill burst ages out instead of inflating the figure. `--decode` runs
-  the decoder on each new pass as it lands.
+  backfill burst ages out instead of inflating the figure. Watch that
+  second row: in steady state it should sit in the low tens, and a value
+  climbing toward the ceiling means the download cursor has stopped
+  advancing and every run is re-walking the same window — left alone,
+  that ends in the SatNOGS edge blocking the station's IP, which is what
+  happened in August 2026. `--pending-max-age` (default 6h) is the guard;
+  it stops an observation whose audio never arrives from pinning the
+  cursor in place. `--decode` runs the decoder on each new pass as it
+  lands.
 * **`decode_passes.sh`** — walk a directory tree, find every `.wav` and
   `.ogg`, run `rx_replay` on each (resampling `.ogg` first), and
   summarize what decoded. Beacons print as readable telemetry; anything
