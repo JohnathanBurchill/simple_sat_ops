@@ -2876,6 +2876,12 @@ static Color cmap_color(int map, unsigned char val)
 // depression, or a corrupt frame -- so the sentinel has to be a value no
 // reading can take.
 #define WG_NONE  (-DBL_MAX)
+
+// The playback head under the whereogram: how tall its uprights are, and the
+// narrowest it is drawn, which is just enough to keep the two uprights apart:
+// the bracket is the image's own span, not a fixed size.
+#define WG_HEAD_H      5
+#define WG_HEAD_MIN_W  2
 //
 // The whole recording at a glance: every frame a column of its 65 pixels, time
 // running left to right, arrival direction up the vertical axis. It is the
@@ -2987,11 +2993,11 @@ static void build_whereogram(const view_t *v, const experiment_t *s,
 // offset a column stands for -- the two directions of the same mapping, used to
 // place the playback head and to turn a pointer position back into an image.
 //
-// The head is placed in panel pixels rather than in whole columns, so the arrow
-// points at where the image's first frame actually sits rather than at the
-// column that happens to contain it. Nothing is pulled back inside the panel
-// either, so passing the byte one past a span gives that span's exclusive right
-// edge.
+// The head is placed in panel pixels rather than in whole columns, so its two
+// ends point at where the image's first and last frames actually sit rather
+// than at the columns that happen to contain them. Nothing is pulled back
+// inside the panel either, so passing the byte one past a span gives that
+// span's exclusive right edge, which is where the head's far upright goes.
 static int wg_x_of_byte(const experiment_t *s, int w, long byte)
 {
     long nslot = s->size / FRAME_STRIDE;
@@ -3879,29 +3885,33 @@ int main(int argc, char **argv)
                     DrawRectangle(x, ay - 5, xe - x, 3, (Color){ 220, 60, 60, 255 });
                 }
 
-                // Playback head: a small arrow just under the whereogram with
-                // its point on the panel's bottom edge, at the first frame of
-                // the shown image. An image is only a few pixels wide on a
-                // panel holding a whole recording, so the box that used to be
-                // drawn around its byte span was nearly all outline and covered
-                // the little it enclosed; an arrow marks the same place and
-                // leaves every column to be read.
+                // Playback head: the stretch of recording the shown image was
+                // built from, bracketed just under the whereogram. An upright
+                // at each end of its bytes and a rule joining them, open at the
+                // top, so the two uprights point up at the first and last
+                // frames rather than at one end alone. Sitting below the panel
+                // it hides no columns -- unlike the box this once was, drawn
+                // around the span, which on a panel holding a whole recording
+                // was nearly all outline and covered the little it enclosed.
                 //
-                // The vertices go apex, bottom left, bottom right. raylib culls
-                // a triangle wound the other way and draws nothing at all --
-                // measured, by rendering both orders into an off-screen texture
-                // and counting the pixels that came out: this order 18, the
-                // other 0. (decode_inspector's arrowheads are wound the other
-                // way and do not draw.)
+                // Both ends are placed in panel pixels rather than rounded out
+                // to whole columns, so the bracket is as wide as the image
+                // really is and no wider -- a pixel or three on a long
+                // recording. It is only opened out when the span comes to less
+                // than the two uprights need to stand apart at all.
                 long pb0 = 0, pb1 = 0;
                 if (v.n_img > 0 && image_byte_span(&v, s, v.img_pos, &pb0, &pb1)) {
-                    float px = (float) (ax + wg_x_of_byte(s, cw, pb0));
-                    float edge = (float) (ay + ch);
-                    Vector2 apex = { px, edge };
-                    Vector2 bl = { px - 3.0f, edge + 6.0f };
-                    Vector2 br = { px + 3.0f, edge + 6.0f };
-                    DrawTriangle(apex, bl, br, RAYWHITE);
-                    DrawTriangleLines(apex, bl, br, (Color){ 18, 18, 22, 255 });
+                    int x0 = ax + wg_x_of_byte(s, cw, pb0);
+                    int x1 = ax + wg_x_of_byte(s, cw, pb1);
+                    if (x1 - x0 < WG_HEAD_MIN_W) {
+                        int mid = (x0 + x1) / 2;
+                        x0 = mid - WG_HEAD_MIN_W / 2;
+                        x1 = x0 + WG_HEAD_MIN_W;
+                    }
+                    int top = ay + ch + 1, bot = top + WG_HEAD_H;
+                    DrawRectangle(x0, top, 1, WG_HEAD_H, RAYWHITE);
+                    DrawRectangle(x1, top, 1, WG_HEAD_H, RAYWHITE);
+                    DrawRectangle(x0, bot, x1 - x0 + 1, 1, RAYWHITE);
                 }
 
                 draw_text(TextFormat("%.1f%% of %.0f KB down, %.0f KB missing  (%s)",
