@@ -82,7 +82,28 @@
         16     first pixel index             (uint8)
         17     last pixel index              (uint8)
         18..19 integration period            (big-endian uint16)
-        22..151 pixels, 65 big-endian uint16 (per the First Light notebook)
+        20..149 pixels, 65 big-endian uint16
+        150..151 checksum                    (not a pixel)
+
+    The pixels start at byte 20, not 22, and the last two bytes are a checksum.
+    Both fit the 152 bytes exactly -- 65 words from 20 leaves the last two over,
+    65 words from 22 uses them up -- and the First Light notebook's
+    [[23;;-1;;2]] reads them from 22, which is where this tool read them until
+    now. The flight software settles it: MPITelemetry.h sets
+    TM_AUXDATA_BUFFER_SIZE to 20 and TM_BUFFER_PIXEL_OFFSET to that same 20,
+    storeTelemetryAuxData fills TM_buf[0..19] and stops, storeTelemetryPixelData
+    writes pixel i to TM_BUFFER_PIXEL_OFFSET + 2*(i - FirstPixelIndex), and
+    calculateTelemetryCrc puts a CCITT CRC-16 over everything before it into the
+    last two bytes, most significant first. The data says the same: bytes 20..21
+    sit at 2057 DN beside neighbours at 2112 and 2100, track the pixel next to
+    them across frames at r = +0.99, and jump ninefold to 18695 with the rest of
+    the strip on a background frame; bytes 150..151 average 32991 -- uniform
+    across the 16-bit range, which is what a checksum looks like -- do not
+    correlate with the pixel before them (r = -0.04), and go DOWN on a
+    background frame where every pixel goes up. And the checksum itself works
+    out over bytes 0..149 on every whole frame of the 2026-07-21 recording and
+    all but 2 of the 2026-08-09 one. Read from 22 the image was one pixel out,
+    missing the first and carrying the checksum as its bottom row.
 
     Whereogram: under the aux panel sits the whole recording as one spectrum,
     every frame a column of its 65 intensities, time left to right and arrival
@@ -217,7 +238,7 @@ int main(int argc, char **argv)
 // On-wire MPI data frame geometry (measured; matches the aux packer above and
 // the First Light notebook's pixel slice).
 #define FRAME_STRIDE   152   // bytes per frame (sync .. last pixel)
-#define PIX_START      22    // first pixel byte within a frame
+#define PIX_START      20    // first pixel byte within a frame
 #define NPIX           65    // big-endian uint16 pixels per frame
 #define SCAN_IDX_OFF   13    // inner dome scan index byte (the image row)
 #define MAX_FPI        64    // largest scan period we render

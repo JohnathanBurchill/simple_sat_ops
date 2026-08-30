@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`6985506` (2026-08-30). This is a working draft.
+`dda3a5c` (2026-08-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2406,6 +2406,19 @@ next setpoint. The viewer places a frame by the target voltage the frame before
 it reported, which is why the raw 0 V frame lands at the right edge even though
 its own aux reads 57343. The aux panel shows that frame's aux as it was sent, so
 its `dome target V` is one setpoint ahead of the column it is drawn in.
+
+**Where the pixels sit in a frame.** The 152-byte frame is 20 bytes of aux, then
+the 65 pixels as big-endian `uint16` in bytes 20..149, then a CCITT CRC-16 over
+everything before it in bytes 150..151. The flight software settles this:
+`TM_AUXDATA_BUFFER_SIZE` is 20 and `TM_BUFFER_PIXEL_OFFSET` is that same 20,
+`TM_FIRST_PIXEL_INDEX` and `TM_LAST_PIXEL_INDEX` are 48 and 112 for 65 pixels,
+and `calculateTelemetryCrc` writes the checksum into the last two bytes, most
+significant first. Reading the pixels from byte 22 instead - which the First
+Light notebook's `[[23;;-1;;2]]` does, and which this tool did until now -
+shifts the image by one pixel: it drops the first and shows the checksum as a
+65th row, which was the garbage bottom row on every image. The frame's own
+checksum confirms the layout, working out on 3611 of 3611 whole frames of the
+07-21 recording and 9025 of 9027 of the 08-09 one.
 
 Keys: `Up`/`Down` change experiment, `Left`/`Right` scrub images (or click or
 drag the whereogram to scrub through the recording), `Space` plays/pauses, `,`/`.`
