@@ -48,6 +48,7 @@
       D                mark the ones that carried data
       n                clear all marks
       f | F            cycle the filter forwards / backwards
+      o | O            cycle the column the rows are sorted by
       d                download the marked observations
       p                decode the marked observations into the packet DB
       c                cancel the running job
@@ -165,6 +166,20 @@ static const char *const FLT_NAME[FLT_N] = {
     "all", "with audio", "not downloaded", "downloaded", "decoded"
 };
 
+// Sortable columns, in the order `o` cycles them. Each sorts the way it
+// is worth asking for: a time or an id smallest first, an elevation or
+// a frame count largest first, because sorting by those at all is
+// asking which passes were the good ones.
+enum { ORD_NO = 0, ORD_ID, ORD_START, ORD_EL, ORD_DATA, ORD_N };
+static const char *const ORD_NAME[ORD_N] = { "no", "id", "start", "el", "data" };
+static const char *const ORD_HOW[ORD_N] = {
+    "the day's own order",
+    "lowest first",
+    "earliest first",
+    "highest first",
+    "most frames first",
+};
+
 // What a running child is doing, which decides how its progress is
 // counted and what is re-read when it finishes.
 enum { JOB_NONE = 0, JOB_LIST, JOB_DOWNLOAD, JOB_DECODE };
@@ -197,6 +212,7 @@ static int    g_n_view = 0;
 static int    g_sel = 0;
 static int    g_top = 0;
 static int    g_filter = FLT_ALL;
+static int    g_order = ORD_NO;
 static int    g_truncated = 0;
 
 static char   g_day[16] = "";          // YYYY-MM-DD, UTC
@@ -804,6 +820,40 @@ static int passes_filter(const obs_t *o)
     }
 }
 
+// Ranks two rows -- given as indices into g_rows -- by the column the
+// operator is sorting on. Ties fall back to the day's own order, which
+// is by start time, so rows the column cannot separate stay in the
+// order the passes happened. That fallback is the whole of the `no`
+// order: the row numbers count down the screen, so there is nothing of
+// their own to sort by.
+static int cmp_view(const void *a, const void *b)
+{
+    int ia = *(const int *)a, ib = *(const int *)b;
+    const obs_t *x = &g_rows[ia], *y = &g_rows[ib];
+
+    int c = 0;
+    switch (g_order) {
+        case ORD_ID:
+            c = (x->id > y->id) - (x->id < y->id);
+            break;
+        case ORD_START:
+            c = strcmp(x->start, y->start);
+            break;
+        case ORD_EL:
+            c = (y->max_el > x->max_el) - (y->max_el < x->max_el);
+            break;
+        case ORD_DATA:
+            // An unknown count is -1, so it lands below a pass known to
+            // have carried nothing rather than above everything.
+            c = (y->n_data > x->n_data) - (y->n_data < x->n_data);
+            break;
+        default:
+            break;
+    }
+    if (c != 0) return c;
+    return (ia > ib) - (ia < ib);
+}
+
 // Rebuild the filtered index, keeping the cursor on the same
 // observation where it survives the new filter.
 static void rebuild_view(void)
@@ -813,6 +863,7 @@ static void rebuild_view(void)
     g_n_view = 0;
     for (int i = 0; i < g_n_rows; i++)
         if (passes_filter(&g_rows[i])) g_view[g_n_view++] = i;
+    qsort(g_view, (size_t)g_n_view, sizeof g_view[0], cmp_view);
 
     g_sel = 0;
     if (keep >= 0) {
@@ -1302,11 +1353,24 @@ static void draw_top_bar(int cols)
 
 static void draw_headings(int cols)
 {
+    static const char *const NAME[9] = {
+        "no", "id", "start", "len", "el", "data", "status", "local", "station"
+    };
+    // Where each sortable column sits among the headings.
+    static const int SORTED[ORD_N] = { 0, 1, 2, 4, 5 };
+
+    // The column the rows are sorted by is capitalised. A marker beside
+    // the name would push it wider than the column it heads, and a
+    // heading has to stay over the rows it names.
+    char h[9][12];
+    for (int i = 0; i < 9; i++) snprintf(h[i], sizeof h[i], "%s", NAME[i]);
+    for (char *p = h[SORTED[g_order]]; *p != '\0'; p++)
+        *p = (char)toupper((unsigned char)*p);
+
     char line[512];
     snprintf(line, sizeof line,
              "   %4s %-9s %-8s %5s %4s %5s  %-8s %-8s %s",
-             "no", "id", "start", "len", "el", "data",
-             "status", "local", "station");
+             h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8]);
     put(1, 0, cols, A_BOLD, line);
 }
 
@@ -1472,8 +1536,8 @@ static void draw_bottom_bar(int rows, int cols)
         snprintf(line, sizeof line, " c cancel   q quit   ? help");
     else
         snprintf(line, sizeof line,
-                 " j/k move  h/l day  t today  / date  r list  "
-                 "space mark  a all  D data  n none  f filter  d get  p decode  q quit  ? help");
+                 " j/k move  h/l day  t today  / date  r list  space mark  a all  "
+                 "D data  n none  f filter  o order  d get  p decode  q quit  ? help");
     put(rows - 1, 0, cols, attr_for(PAIR_BAR), line);
 }
 
@@ -1495,6 +1559,7 @@ static void draw_help(int rows, int cols)
         "  D                                   mark the ones that carried data",
         "  n                                   clear all marks",
         "  f, F                                cycle the filter either way",
+        "  o, O                                cycle the sort column either way",
         "  d                                   download what is marked",
         "  p                                   decode what is marked into the database",
         "  c                                   cancel a running job",
@@ -1522,6 +1587,12 @@ static void draw_help(int rows, int cols)
         "itself. One or two is a beacon; dozens means the pass carried a bulk",
         "download, which is the quickest way to find the passes worth having. A",
         "dash means nothing here knows the count yet -- press r to list the day.",
+        "",
+        "o sorts the rows by a column, and the sorted column is the capitalised",
+        "heading. Each sorts the way it is worth asking for: id and start",
+        "lowest and earliest first, el and data largest first, which is how to",
+        "put the best passes of the day at the top. `no` is the day's own order,",
+        "by start time, and is where o starts.",
         "",
         "A note written with Enter is your own line about the pass -- what it",
         "carried, why it matters. It shows at the right of the row, cut with an",
@@ -1924,6 +1995,12 @@ int main(int argc, char **argv)
             case 'n': clear_marks(); set_status("marks cleared"); break;
             case 'f': g_filter = (g_filter + 1) % FLT_N; rebuild_view(); break;
             case 'F': g_filter = (g_filter + FLT_N - 1) % FLT_N; rebuild_view(); break;
+            case 'o': case 'O':
+                g_order = (ch == 'o') ? (g_order + 1) % ORD_N
+                                      : (g_order + ORD_N - 1) % ORD_N;
+                rebuild_view();
+                set_status("order: %s -- %s", ORD_NAME[g_order], ORD_HOW[g_order]);
+                break;
             case 'd':
                 if (g_job.running) set_status("a job is already running");
                 else job_start_download();
