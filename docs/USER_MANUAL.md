@@ -2401,9 +2401,11 @@ minimum, or (when the log never named it) the largest offset received. That last
 case is the only one where the percentage is measured against a guess; see
 `mpi_reconstruct` above for how the length is established.
 
-A **white outline** on the map marks the bytes the image on screen was
+A **white marker** on the map covers the bytes the image on screen was
 reconstructed from, so you can see where in the file you are as you scrub or
-play. **Clicking anywhere on the map jumps to the image nearest that point in
+play. An image's bytes are one run, and the map wraps, so the marker wraps too -
+part of a row, then whole rows, then part of a row, the way a line of selected
+text does. **Clicking anywhere on the map jumps to the image nearest that point in
 the file** and pauses playback - handy for going straight to the far side of a
 gap. And an image with any frame built from a failed-CRC packet is **flagged**:
 its border turns amber and a line under it says how many of its frames are

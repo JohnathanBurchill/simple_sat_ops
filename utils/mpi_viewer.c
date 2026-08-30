@@ -1870,11 +1870,13 @@ int main(int argc, char **argv)
                 DrawTexture(cov_tex, ax, ay, WHITE);
                 DrawRectangleLines(ax - 1, ay - 1, cov_w + 2, cov_h + 2, (Color){ 70, 70, 80, 255 });
 
-                // Playhead: a white box around the cells holding the bytes the
-                // shown image was built from. The map reads left to right then
-                // down, so an image's byte run is a partial row, a band of whole
-                // rows, or (usually) both -- outline the smallest row band that
-                // contains it and mark the exact span within the end rows.
+                // Playhead: the cells holding the bytes the shown image was
+                // built from. The map reads left to right then down, so the
+                // run wraps the way a line of selected text does -- part of a
+                // row, then whole rows, then part of a row -- and is drawn that
+                // way, one filled segment per row. A row of the map is one
+                // pixel tall, so outlining the band instead would draw the band
+                // plus a line above and a line below it that mark nothing.
                 long pb0 = 0, pb1 = 0;
                 if (v.n_img > 0 && image_byte_span(&v, s, v.img_pos, &pb0, &pb1)) {
                     long ncell = (long) cov_w * (long) cov_h;
@@ -1884,13 +1886,14 @@ int main(int argc, char **argv)
                     if (c1 > ncell) c1 = ncell;
                     int r0 = (int) (c0 / cov_w), r1 = (int) ((c1 - 1) / cov_w);
                     int x0 = (int) (c0 % cov_w), x1 = (int) ((c1 - 1) % cov_w) + 1;
-                    if (r0 == r1) {
-                        DrawRectangleLines(ax + x0 - 1, ay + r0 - 1, x1 - x0 + 2, 3, RAYWHITE);
-                    } else {
-                        DrawRectangleLines(ax - 1, ay + r0 - 1, cov_w + 2,
-                                           r1 - r0 + 3, RAYWHITE);
-                        DrawRectangle(ax + x0, ay + r0, cov_w - x0, 1, RAYWHITE);
-                        DrawRectangle(ax, ay + r1, x1, 1, RAYWHITE);
+                    for (int r = r0; r <= r1; r++) {
+                        int a = (r == r0) ? x0 : 0;
+                        int b = (r == r1) ? x1 : cov_w;
+                        // An image can cover fewer cells than it takes to see.
+                        if (b - a < 3) b = a + 3;
+                        if (b > cov_w) { b = cov_w; a = cov_w - 3; }
+                        if (a < 0) a = 0;
+                        DrawRectangle(ax + a, ay + r, b - a, 1, RAYWHITE);
                     }
                 }
 
