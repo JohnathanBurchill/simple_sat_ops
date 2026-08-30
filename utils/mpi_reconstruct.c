@@ -35,8 +35,8 @@
     What this tool does:
       1. Loads every bulk_file chunk with a sane file offset, splits them into
          download bursts by time, and reassembles each burst by offset (a byte
-         is a gap until a chunk fills it; RS-clean chunks win, uncorrectable
-         chunks only fill still-missing bytes).
+         is a gap until a chunk fills it; CRC-verified chunks win, chunks whose
+         CRC failed only fill still-missing bytes).
       2. For each burst that looks like MPI science data (>= 20000 bytes and the
          0C FF FF 0C sync word seen repeatedly), writes MPI_yyyymmddThhmmss.bin
          to the output directory (the CWD by default). The timestamp is the UTC
@@ -46,6 +46,21 @@
          195-byte download-chunk boundaries, and prints ready-to-use
          comms_bulk_file_downlink_start commands to re-fetch them. Feed those
          re-fetched chunks back into the DB and re-run to close the gaps.
+
+    How long the file is decides what "missing" means, and the chunks do not
+    say: a bulk_file packet carries an offset but never a length. Sizing the
+    file as the largest offset seen makes one bit-flipped offset field the
+    answer, which is how the 2026-07-21 MPI download came to be reported as
+    1024870 bytes and 14% recovered when it is 556728 bytes and complete. So
+    the length is read out of the satellite's own log stream instead.
+
+    An offset field is only as good as the packet carrying it, and the same CSP
+    CRC32 covers both, so only CRC-verified chunks are trusted to say where they
+    belong: they set the file's extent and teach the download's 195-byte offset
+    grid. A chunk whose CRC failed still fills bytes nothing verified claimed --
+    often it is the only copy -- but only if its offset lands on that grid, and
+    the bytes it contributes are tracked and reported, because nothing vouches
+    for them. Both live in bulk_size.c.
 
     Read-only on the DB -- safe to run while a receiver is filling it.
 
@@ -78,6 +93,7 @@
 */
 
 #include "argparse.h"
+#include "bulk_size.h"
 #include "gnss_frag.h"
 #include "packet_db.h"
 #include "sso_version.h"
@@ -110,6 +126,7 @@ int main(int argc, char **argv)
 #define BULK_FILE_PACKET_TYPE      16
 #define BULK_FILE_HEADER_SIZE      5
 #define BULK_FILE_MAX_DATA         195
+#define BULK_FILE_CRC_LEN          4     // CSP CRC32 trailer, stripped only when it verified
 #define BULK_FILE_MAX_PLAUSIBLE    (2 * 1024 * 1024)   // firmware caps a download at 1 MB
 
 // A single comms_bulk_file_downlink telecommand can re-fetch at most this much
@@ -140,10 +157,16 @@ int main(int argc, char **argv)
 #define MPI_SESSION_GAP_MS         (15.0 * 60.0 * 1000.0)   // 15 minutes
 #define MPI_SESSION_MARGIN_MS      (120.0 * 1000.0)         // 2 minutes
 
+// A download command scheduled this long before a session's first chunk still
+// counts as the command that started that download. A pass is under 15 minutes,
+// so this cannot reach back past the previous one.
+#define MPI_CMD_LOOKBACK_MS        (15.0 * 60.0 * 1000.0)   // 15 minutes
+
 typedef struct {
     double   ts_ms;    // reception time, unix ms
     long     off;      // file offset (sane: 0 .. BULK_FILE_MAX_PLAUSIBLE)
     int      rs;       // rs_errs: >=0 clean/corrected, -2 uncorrectable
+    int      crc_ok;   // CSP CRC32 verified, so this chunk's offset is a fact
     long     dlen;     // data bytes (clamped to BULK_FILE_MAX_DATA)
     int      has_sync; // this chunk's own bytes contain the MPI sync word
     uint8_t *data;     // owned copy of the chunk's data bytes
@@ -266,7 +289,7 @@ static int load_chunks(sqlite3 *db, const char *since_iso, const char *until_iso
     // ts_ms as unix ms, same expression packet_browser uses for burst timing.
     const char *sql =
         "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, "
-        "       ts_received, payload, rs_errs "
+        "       ts_received, payload, rs_errs, crc_status "
         "FROM packet WHERE packet_type=16 "
         "  AND (?1 = '' OR ts_received >= ?1) "
         "  AND (?2 = '' OR ts_received <= ?2) "
@@ -288,8 +311,13 @@ static int load_chunks(sqlite3 *db, const char *since_iso, const char *until_iso
         long off = bulk_offset(pl);
         if (off < 0 || off > BULK_FILE_MAX_PLAUSIBLE) continue;   // bit-flipped offset
 
-        long dlen = pl_len - BULK_FILE_HEADER_SIZE;
-        if (dlen > BULK_FILE_MAX_DATA) dlen = BULK_FILE_MAX_DATA;  // drop CSP CRC32 trailer
+        // A verified packet had its 4-byte CSP CRC32 trailer stripped on the
+        // way in; one that failed still carries it, and those 4 bytes are not
+        // file data.
+        int crc_ok = (sqlite3_column_int(st, 4) == 1);
+        long dlen = pl_len - BULK_FILE_HEADER_SIZE - (crc_ok ? 0 : BULK_FILE_CRC_LEN);
+        if (dlen <= 0) continue;
+        if (dlen > BULK_FILE_MAX_DATA) dlen = BULK_FILE_MAX_DATA;
         if (off + dlen > BULK_FILE_MAX_PLAUSIBLE) continue;
 
         if (n == cap) {
@@ -303,6 +331,7 @@ static int load_chunks(sqlite3 *db, const char *since_iso, const char *until_iso
         c->ts_ms = sqlite3_column_double(st, 0);
         c->off   = off;
         c->rs    = sqlite3_column_int(st, 3);
+        c->crc_ok = crc_ok;
         c->dlen  = dlen;
         c->data  = (uint8_t *) malloc((size_t) dlen);
         if (c->data == NULL) { fprintf(stderr, "out of memory\n"); goto fail; }
@@ -328,6 +357,143 @@ fail:
     return -1;
 }
 
+// ---- the satellite's own account of each download ---------------------------
+//
+// The log packets that bracket a download name the file and say how many bytes
+// it sent, which together give the file's true length (see bulk_size.h). The
+// "complete" line comes down in the same pass as the chunks, so its reception
+// time is also what ties a download to the session reconstructed here -- this
+// tool has no other way to know which flash file a session's offsets belong to.
+
+typedef struct {
+    double ts_ms;
+    char   path[BULK_SIZE_PATH_LEN];
+} complete_event_t;
+
+// Read every bulk-downlink log line into the size table, and keep the
+// "complete" events with their reception times. Missing or unreadable logs are
+// not an error: the tool falls back to sizing the file from its chunks.
+static int load_bulk_log(sqlite3 *db, bulk_size_table_t *sizes,
+                         complete_event_t **out, int *out_n)
+{
+    *out = NULL;
+    *out_n = 0;
+
+    // Log packets are packet_type 3; the two lines of interest both mention
+    // "downl", which keeps the scan off the rest of the log traffic.
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload "
+            "FROM packet WHERE packet_type = 3 AND payload LIKE '%downl%' "
+            "ORDER BY ts_received, id", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+
+    complete_event_t *evs = NULL;
+    int n = 0, cap = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const void *pl = sqlite3_column_blob(st, 1);
+        int pl_len = sqlite3_column_bytes(st, 1);
+        if (pl == NULL || pl_len <= 0) continue;
+
+        // A log payload is raw bytes, not a C string, and may hold anything
+        // after RS failed on it, so copy it out NUL-terminated before parsing.
+        char text[512];
+        int m = pl_len < (int) sizeof text - 1 ? pl_len : (int) sizeof text - 1;
+        memcpy(text, pl, (size_t) m);
+        text[m] = '\0';
+
+        double ts_ms = sqlite3_column_double(st, 0);
+        bulk_size_feed(sizes, text, ts_ms);
+
+        bulk_complete_t cp = {0};
+        if (!bulk_parse_complete(text, &cp)) continue;
+        if (n == cap) {
+            int ncap = cap ? cap * 2 : 32;
+            complete_event_t *t = (complete_event_t *) realloc(evs, (size_t) ncap * sizeof *t);
+            if (t == NULL) break;
+            evs = t; cap = ncap;
+        }
+        evs[n].ts_ms = ts_ms;
+        snprintf(evs[n].path, sizeof evs[n].path, "%s", cp.path);
+        n++;
+    }
+    sqlite3_finalize(st);
+    *out = evs;
+    *out_n = n;
+    return 0;
+}
+
+// Every bulk-downlink command this station transmitted, with the time it was
+// scheduled to run on the satellite. Most downloads never send a "complete"
+// line the ground decodes -- the pass ends first, or the log packet is lost --
+// so the command log is usually the only record of which file a session's
+// offsets belong to. Returns the count; an absent sent_tcmd table gives 0,
+// which is not an error.
+typedef struct {
+    double ts_ms;
+    char   path[BULK_SIZE_PATH_LEN];
+} download_cmd_t;
+
+static int load_download_commands(sqlite3 *db, download_cmd_t **out)
+{
+    *out = NULL;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT ts_sent_ms, command_text FROM sent_tcmd "
+            "WHERE command_text LIKE '%downlink%' ORDER BY ts_sent_ms",
+            -1, &st, NULL) != SQLITE_OK)
+        return 0;
+
+    download_cmd_t *cmds = NULL;
+    int n = 0, cap = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *text = (const char *) sqlite3_column_text(st, 1);
+        bulk_start_t s = {0};
+        if (text == NULL || !bulk_parse_start(text, &s)) continue;
+        if (n == cap) {
+            int ncap = cap ? cap * 2 : 32;
+            download_cmd_t *t = (download_cmd_t *) realloc(cmds, (size_t) ncap * sizeof *t);
+            if (t == NULL) break;
+            cmds = t; cap = ncap;
+        }
+        cmds[n].ts_ms = (double) sqlite3_column_int64(st, 0);
+        snprintf(cmds[n].path, sizeof cmds[n].path, "%s", s.path);
+        n++;
+    }
+    sqlite3_finalize(st);
+    *out = cmds;
+    return n;
+}
+
+// Which file a session's chunks belong to. The "complete" line that came down
+// with them is the first answer; failing that, the download command scheduled
+// to run while they were arriving. Returns 1 and fills `path` when exactly one
+// file is named, 0 when none is or when two name different files (guessing
+// between them would size the wrong file).
+static int session_file_path(const complete_event_t *evs, int nev,
+                             const download_cmd_t *cmds, int ncmds,
+                             double wlo, double whi, char *path, size_t pathn)
+{
+    const char *found = NULL;
+    for (int k = 0; k < nev; k++) {
+        if (evs[k].ts_ms < wlo || evs[k].ts_ms > whi) continue;
+        if (found != NULL && strcmp(found, evs[k].path) != 0) return 0;
+        found = evs[k].path;
+    }
+    if (found == NULL) {
+        // A download runs from the moment it is commanded until the pass ends,
+        // so allow a command sent shortly before the first chunk arrived.
+        for (int k = 0; k < ncmds; k++) {
+            if (cmds[k].ts_ms < wlo - MPI_CMD_LOOKBACK_MS || cmds[k].ts_ms > whi) continue;
+            if (found != NULL && strcmp(found, cmds[k].path) != 0) return 0;
+            found = cmds[k].path;
+        }
+    }
+    if (found == NULL) return 0;
+    snprintf(path, pathn, "%s", found);
+    return 1;
+}
+
 // Reassemble the chunks named by idx[0..nidx) by absolute file offset into a
 // freshly allocated buffer. Bulk offsets are absolute file positions, so chunks
 // from different passes of the same download merge here regardless of when they
@@ -339,48 +505,91 @@ fail:
 // disagreed -- a sign the window mixes more than one file. Returns the buffer
 // size (file span), or -1 on error; *out_buf / *out_present are owned by the
 // caller.
+//
+// known_size is the satellite-reported file length, or 0 when the log did not
+// say. An exact length IS the buffer size, and any chunk claiming to start past
+// the end of the file is discarded. A length the satellite could only put a
+// floor under is used as a floor: the buffer still stretches to the last chunk
+// received, because truncating there would throw away real data. Chunks whose
+// offset does not sit on a real download grid are discarded either way.
+// *out_dropped counts everything set aside, so the report can say so.
 static long reassemble(const chunk_t *cs, const int *idx, int nidx, uint8_t fill,
-                       uint8_t **out_buf, uint8_t **out_present, long *out_min_off,
-                       long *out_conflicts)
+                       long known_size, int known_exact,
+                       uint8_t **out_buf, uint8_t **out_present, uint8_t **out_verified,
+                       long *out_min_off, long *out_conflicts, long *out_dropped)
 {
     long size = 0, min_off = -1;
-    for (int j = 0; j < nidx; j++) {
-        const chunk_t *c = &cs[idx[j]];
-        if (c->off + c->dlen > size) size = c->off + c->dlen;
-    }
-    if (size <= 0) return -1;
 
-    uint8_t *buf     = (uint8_t *) malloc((size_t) size);
-    uint8_t *present = (uint8_t *) calloc((size_t) size, 1);
-    if (buf == NULL || present == NULL) { free(buf); free(present); return -1; }
+    long *offs = (long *) malloc((size_t) (nidx > 0 ? nidx : 1) * sizeof *offs);
+    unsigned char *ver = (unsigned char *) malloc((size_t) (nidx > 0 ? nidx : 1));
+    unsigned char *keep = (unsigned char *) malloc((size_t) (nidx > 0 ? nidx : 1));
+    if (offs == NULL || ver == NULL || keep == NULL) {
+        free(offs); free(ver); free(keep); return -1;
+    }
+    for (int j = 0; j < nidx; j++) {
+        offs[j] = cs[idx[j]].off;
+        ver[j]  = (unsigned char) (cs[idx[j]].crc_ok != 0);
+    }
+    unsigned char grid[195];
+    bulk_grid_learn(offs, ver, nidx, grid);
+    for (int j = 0; j < nidx; j++) keep[j] = ver[j] || bulk_grid_ok(grid, offs[j]);
+    free(offs); free(ver);
+
+    if (known_size > 0 && known_exact) {
+        size = known_size;
+    } else {
+        size = known_size;   // 0 when nothing is known, else a floor
+        for (int j = 0; j < nidx; j++) {
+            const chunk_t *c = &cs[idx[j]];
+            if (!c->crc_ok) continue;              // only a verified offset sets the extent
+            if (c->off + c->dlen > size) size = c->off + c->dlen;
+        }
+    }
+    if (size <= 0) { free(keep); return -1; }
+    for (int j = 0; j < nidx; j++)
+        if (cs[idx[j]].off >= size) keep[j] = 0;
+
+    long dropped = 0;
+    for (int j = 0; j < nidx; j++) if (!keep[j]) dropped++;
+
+    uint8_t *buf      = (uint8_t *) malloc((size_t) size);
+    uint8_t *present  = (uint8_t *) calloc((size_t) size, 1);
+    uint8_t *verified = (uint8_t *) calloc((size_t) size, 1);
+    if (buf == NULL || present == NULL || verified == NULL) {
+        free(buf); free(present); free(verified); free(keep); return -1;
+    }
     memset(buf, fill, (size_t) size);
 
     long conflicts = 0;
     for (int phase = 0; phase < 2; phase++) {
         for (int j = 0; j < nidx; j++) {
+            if (!keep[j]) continue;
             const chunk_t *c = &cs[idx[j]];
-            int clean = (c->rs >= 0);              // rs_errs == -2 is uncorrectable
-            if ((phase == 0) != clean) continue;    // phase 0 clean, phase 1 the rest
+            if ((phase == 0) != (c->crc_ok != 0)) continue;   // verified first
             long off = c->off;
             for (long k = 0; k < c->dlen && off + k < size; k++) {
                 if (present[off + k]) {
-                    // Two RS-clean chunks landing different bytes here means the
-                    // window holds more than one file at this offset.
+                    // Two CRC-verified chunks landing different bytes here means
+                    // the window holds more than one file at this offset.
                     if (phase == 0 && buf[off + k] != c->data[k]) conflicts++;
                     if (phase == 1) continue;        // never clobber good data
                 }
                 buf[off + k] = c->data[k];
                 present[off + k] = 1;
+                if (phase == 0) verified[off + k] = 1;
             }
             if (min_off < 0 || off < min_off) min_off = off;
         }
     }
     if (min_off < 0) min_off = 0;
+    free(keep);
 
     *out_buf = buf;
     *out_present = present;
+    *out_verified = verified;
     *out_min_off = min_off;
     *out_conflicts = conflicts;
+    *out_dropped = dropped;
     return size;
 }
 
@@ -558,6 +767,15 @@ int main(int argc, char **argv)
         sqlite3_close(db);
         return 1;
     }
+    // The whole log is read, not just the --since/--until window: a file pulled
+    // over several passes is often sized by a download outside the window being
+    // reconstructed.
+    bulk_size_table_t sizes = {0};
+    complete_event_t *evs = NULL;
+    int nev = 0;
+    load_bulk_log(db, &sizes, &evs, &nev);
+    download_cmd_t *dlcmds = NULL;
+    int ndlcmds = load_download_commands(db, &dlcmds);
     sqlite3_close(db);
 
     if (n == 0) {
@@ -609,17 +827,37 @@ int main(int argc, char **argv)
         }
         i = last_i + 1;   // resume after this session's sync chunks
 
-        uint8_t *buf = NULL, *present = NULL;
-        long min_off = 0, conflicts = 0;
-        long size = reassemble(cs, idx, nidx, cfg.fill, &buf, &present, &min_off, &conflicts);
+        // Name the file from the "complete" line that came down with these
+        // chunks, unless the operator named it; either way, the satellite's own
+        // byte count for that file is the length to reconstruct against.
+        char sat_path[BULK_SIZE_PATH_LEN] = {0};
+        int have_path = 0;
+        if (cfg.sat_file_path != NULL && strcmp(cfg.sat_file_path, "<file_path>") != 0) {
+            snprintf(sat_path, sizeof sat_path, "%s", cfg.sat_file_path);
+            have_path = 1;
+        } else {
+            have_path = session_file_path(evs, nev, dlcmds, ndlcmds,
+                                          wlo, whi, sat_path, sizeof sat_path);
+        }
+        int size_exact = 0;
+        long known_size = have_path ? bulk_size_lookup(&sizes, sat_path, &size_exact) : 0;
+
+        uint8_t *buf = NULL, *present = NULL, *verified = NULL;
+        long min_off = 0, conflicts = 0, dropped = 0;
+        long size = reassemble(cs, idx, nidx, cfg.fill, known_size, size_exact,
+                               &buf, &present, &verified, &min_off, &conflicts, &dropped);
         long sync = (size > 0) ? count_sync(buf, size) : 0;
         if (size < MPI_MIN_FILE_BYTES || sync < cfg.min_sync) {
-            free(buf); free(present);
+            free(buf); free(present); free(verified);
             continue;   // this cluster does not hold enough MPI to be a file
         }
 
-        long present_bytes = 0;
-        for (long b = 0; b < size; b++) if (present[b]) present_bytes++;
+        long present_bytes = 0, unverified_bytes = 0;
+        for (long b = 0; b < size; b++) {
+            if (!present[b]) continue;
+            present_bytes++;
+            if (!verified[b]) unverified_bytes++;
+        }
 
         char stamp[32];
         stamp_from_iso(cs[first].ts_iso, stamp, sizeof stamp);
@@ -633,22 +871,44 @@ int main(int argc, char **argv)
             printf("MPI file    : %s\n", out_path);
             printf("  received  : %.24s .. %.24s, %d packets, %ld sync words\n",
                    cs[first].ts_iso, cs[last].ts_iso, nidx, sync);
-            printf("  file      : %ld bytes (offset 0 .. %ld)\n", size, size);
+            if (known_size > 0 && size == known_size)
+                printf("  file      : %ld bytes (%s length for %s)\n",
+                       size, size_exact ? "satellite-reported" : "satellite-reported minimum",
+                       sat_path);
+            else if (known_size > 0)
+                printf("  file      : %ld bytes (largest offset received; the satellite has\n"
+                       "              only ever confirmed %ld bytes of %s)\n",
+                       size, known_size, sat_path);
+            else
+                printf("  file      : %ld bytes (largest offset received -- a LOWER bound;\n"
+                       "              no bulk-downlink log line gives this file's length)\n", size);
             printf("  recovered : %ld of %ld bytes (%.1f%%); data spans offset %ld .. %ld\n",
                    present_bytes, size,
                    100.0 * (double) present_bytes / (double) size, min_off, size);
+            if (unverified_bytes > 0)
+                printf("  unverified: %ld of those bytes came from packets whose CRC failed;\n"
+                       "              they are the only copy of that data, but nothing checks it\n",
+                       unverified_bytes);
+            if (dropped > 0)
+                printf("  dropped   : %ld packet(s) whose offset is not on a download grid\n"
+                       "              or lies past the end of the file (bit-flipped offsets)\n",
+                       dropped);
             if (conflicts > 0)
                 printf("  warning   : %ld byte(s) where two clean chunks disagree -- this window\n"
                        "              may mix more than one file; scope it with --since/--until\n",
                        conflicts);
-            report_gaps(present, size, cfg.sat_file_path, cfg.max_dl, cfg.quiet);
+            report_gaps(present, size, have_path ? sat_path : cfg.sat_file_path,
+                        cfg.max_dl, cfg.quiet);
             printf("\n");
             n_files++;
         }
-        free(buf); free(present);
+        free(buf); free(present); free(verified);
     }
 
     free(idx);
+    free(evs);
+    free(dlcmds);
+    bulk_size_free(&sizes);
     for (int i2 = 0; i2 < n; i2++) free(cs[i2].data);
     free(cs);
 

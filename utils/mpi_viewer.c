@@ -74,10 +74,26 @@
     a file for `simple_sat_ops --tc-file=`. The name of the file on the
     satellite comes from the sent_tcmd command log.
 
+    How long the file is: a bulk_file packet carries a byte offset but never the
+    file's length, so taking the length to be the largest offset seen hands the
+    answer to whichever offset field was worst corrupted. One chunk claiming
+    offset 2051784 sized the 2026-07-21 experiment at 2051979 bytes, and a file
+    that is complete showed as 27% recovered with a re-download list demanding
+    1.5 MB that does not exist. The length is read out of the satellite's own
+    "Bulk downlink complete" log lines instead.
+
+    An offset field is only as good as the packet carrying it, and the same CSP
+    CRC32 covers both, so only CRC-verified chunks are trusted to say where they
+    belong. A chunk whose CRC failed still fills bytes nothing verified claimed,
+    but only if its offset lands on the grid the verified ones establish, and
+    every byte it contributes is marked: the coverage map paints those bytes
+    amber, and any image with a frame resting on them is flagged. Both live in
+    bulk_size.c.
+
     Read-only on the DB. Press F5 to re-read it and rebuild the experiment list.
 
     Usage:
-      mpi_viewer [--db=<packet_db.sqlite>]
+      mpi_viewer [--db=<packet_db.sqlite>] [--list]
 
     With no --db the default store is used ($SSO_PACKET_DB, else the FrontierSat
     root's packet_db.sqlite).
@@ -101,6 +117,7 @@
 
 #include <raylib.h>
 
+#include "bulk_size.h"
 #include "packet_db.h"
 #include "sso_version.h"
 
@@ -130,6 +147,7 @@ int main(int argc, char **argv)
 #define BULK_FILE_PACKET_TYPE   16
 #define BULK_FILE_HEADER_SIZE   5
 #define BULK_FILE_MAX_DATA      195
+#define BULK_FILE_CRC_LEN       4    // CSP CRC32 trailer, stripped only when it verified
 #define BULK_FILE_MAX_PLAUSIBLE (2 * 1024 * 1024)
 
 // MPI science-data heuristics (mirror mpi_reconstruct.c / the firmware).
@@ -184,6 +202,7 @@ typedef struct {
     double   ts_ms;
     long     off;
     int      rs;
+    int      crc_ok;    // the packet's CSP CRC32 checked out, so its offset is a fact
     long     dlen;
     int      has_sync;
     uint8_t *data;
@@ -196,10 +215,16 @@ typedef struct {
     char     sat_path[MPI_SAT_PATH_LEN];  // the file on the satellite, "" if unknown
     double   t_first_recv_ms;// receive time of this experiment's earliest packet
     double   t_last_recv_ms; // receive time of its latest packet
+    double   t_end_ms;       // last marker time (unix ms); recording end
     uint8_t *buf;            // reconstructed bytes (all passes merged)
     uint8_t *present;        // 1 where a real byte landed
+    uint8_t *verified;       // 1 where that byte came from a CRC-verified packet
     long     size;
+    int      size_from_log;  // size is the satellite's own byte count, not a guess
+    int      size_exact;     // that byte count came from a download that hit EOF
+    long     dropped;        // chunks set aside: off-grid or past the end of the file
     long     recovered;      // present bytes
+    long     unverified;     // present bytes that no CRC vouches for
     int      nframes;        // number of sync words found
     long    *fr_off;         // byte offset of each frame's sync word
     int     *fr_ctr;         // running counter (bytes 4-5) per frame
@@ -207,7 +232,19 @@ typedef struct {
     int     *fr_tv;          // inner dome target voltage (bytes 11-12) per frame
     double  *fr_ts;          // capture time (unix ms) per frame, -1 if unknown
     int     *fr_bad;         // 1 if the frame body overlaps a JSON marker (drop it)
+    int     *fr_unver;       // 1 if any of the frame's bytes came from a failed-CRC packet
 } experiment_t;
+
+// Release one experiment's buffers. Split out of free_experiments because a
+// rebuild against the satellite-reported file length has to drop the first,
+// shorter-lived reconstruction.
+static void free_experiment(experiment_t *e)
+{
+    free(e->buf); free(e->present); free(e->verified);
+    free(e->fr_off); free(e->fr_ctr);
+    free(e->fr_scan); free(e->fr_tv);
+    free(e->fr_ts); free(e->fr_bad); free(e->fr_unver);
+}
 
 // Little-endian uint32 file offset out of a bulk_file payload.
 static long bulk_offset(const uint8_t *pl)
@@ -387,7 +424,7 @@ static int load_chunks(sqlite3 *db, chunk_t **out, int *out_n)
 {
     const char *sql =
         "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, "
-        "       ts_received, payload, rs_errs "
+        "       ts_received, payload, rs_errs, crc_status "
         "FROM packet WHERE packet_type=16 ORDER BY ts_received, id";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
@@ -403,7 +440,12 @@ static int load_chunks(sqlite3 *db, chunk_t **out, int *out_n)
         if (pl == NULL || pl_len < BULK_FILE_HEADER_SIZE + 1) continue;
         long off = bulk_offset(pl);
         if (off < 0 || off > BULK_FILE_MAX_PLAUSIBLE) continue;
-        long dlen = pl_len - BULK_FILE_HEADER_SIZE;
+        // A verified packet had its 4-byte CSP CRC32 trailer stripped on the
+        // way in; one that failed still carries it, and those 4 bytes are not
+        // file data.
+        int crc_ok = (sqlite3_column_int(st, 4) == 1);
+        long dlen = pl_len - BULK_FILE_HEADER_SIZE - (crc_ok ? 0 : BULK_FILE_CRC_LEN);
+        if (dlen <= 0) continue;
         if (dlen > BULK_FILE_MAX_DATA) dlen = BULK_FILE_MAX_DATA;
         if (off + dlen > BULK_FILE_MAX_PLAUSIBLE) continue;
 
@@ -418,6 +460,7 @@ static int load_chunks(sqlite3 *db, chunk_t **out, int *out_n)
         c->ts_ms = sqlite3_column_double(st, 0);
         c->off   = off;
         c->rs    = sqlite3_column_int(st, 3);
+        c->crc_ok = crc_ok;
         c->dlen  = dlen;
         c->data  = (uint8_t *) malloc((size_t) dlen);
         if (c->data == NULL) { fprintf(stderr, "out of memory\n"); goto fail; }
@@ -512,6 +555,37 @@ static int load_mpi_commands(sqlite3 *db, mpicmd_t **out)
     return n;
 }
 
+// Read every bulk-downlink log line the satellite sent into the size table, so
+// each experiment's file can be reconstructed against its real length instead
+// of against the largest offset that happened to arrive. Missing or unreadable
+// log packets are not an error: an experiment whose file is not named there
+// falls back to sizing itself from its chunks.
+static void load_bulk_log(sqlite3 *db, bulk_size_table_t *sizes)
+{
+    // Log packets are packet_type 3; both lines of interest mention "downl",
+    // which keeps the scan off the rest of the log traffic.
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload "
+            "FROM packet WHERE packet_type = 3 AND payload LIKE '%downl%' "
+            "ORDER BY ts_received, id", -1, &st, NULL) != SQLITE_OK)
+        return;
+
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const void *pl = sqlite3_column_blob(st, 1);
+        int pl_len = sqlite3_column_bytes(st, 1);
+        if (pl == NULL || pl_len <= 0) continue;
+        // A log payload is raw bytes, not a C string, and holds anything at all
+        // once RS has failed on it, so copy it out NUL-terminated first.
+        char text[512];
+        int m = pl_len < (int) sizeof text - 1 ? pl_len : (int) sizeof text - 1;
+        memcpy(text, pl, (size_t) m);
+        text[m] = '\0';
+        bulk_size_feed(sizes, text, sqlite3_column_double(st, 0));
+    }
+    sqlite3_finalize(st);
+}
+
 // Name the file an experiment was written to. The recording command carries the
 // name and is sent at the moment the recording starts, so the mpi_enable_active_mode
 // nearest the experiment's embedded start time is the reliable answer. Failing
@@ -544,35 +618,85 @@ static void label_experiment(experiment_t *e, const mpicmd_t *cmds, int ncmds)
 
 // Reassemble the chunks named by idx[0..nidx) by absolute offset (mirrors
 // mpi_reconstruct). RS-clean chunks win; uncorrectable chunks only fill gaps.
+// A chunk's offset field is covered by the same CRC32 as its data, so only a
+// CRC-verified chunk knows where it belongs. Verified chunks therefore decide
+// the file's extent, are laid down first, and are the only ones allowed to
+// teach the download's 195-byte offset grid. A chunk that failed its CRC is
+// still worth having -- it is often the only copy of those bytes -- so it fills
+// bytes nothing verified has claimed, but only if its offset at least lands on
+// the grid, and every byte it contributes is marked unverified so the viewer
+// can flag the images built from it.
+//
+// known_size is the satellite-reported file length, or 0 when the log did not
+// say. An exact length IS the buffer size, and a chunk claiming to start past
+// the end of the file is discarded. A length the satellite could only put a
+// floor under is used as a floor: the buffer still stretches to the last
+// verified chunk, because truncating there would throw away real data.
+// *out_dropped counts the chunks set aside.
 static long reassemble(const chunk_t *cs, const int *idx, int nidx,
-                       uint8_t **out_buf, uint8_t **out_present)
+                       long known_size, int known_exact,
+                       uint8_t **out_buf, uint8_t **out_present,
+                       uint8_t **out_verified, long *out_dropped)
 {
     long size = 0;
-    for (int j = 0; j < nidx; j++) {
-        const chunk_t *c = &cs[idx[j]];
-        if (c->off + c->dlen > size) size = c->off + c->dlen;
-    }
-    if (size <= 0) return -1;
 
-    uint8_t *buf     = (uint8_t *) malloc((size_t) size);
-    uint8_t *present = (uint8_t *) calloc((size_t) size, 1);
-    if (buf == NULL || present == NULL) { free(buf); free(present); return -1; }
+    long *offs = (long *) malloc((size_t) (nidx > 0 ? nidx : 1) * sizeof *offs);
+    unsigned char *ver = (unsigned char *) malloc((size_t) (nidx > 0 ? nidx : 1));
+    unsigned char *keep = (unsigned char *) malloc((size_t) (nidx > 0 ? nidx : 1));
+    if (offs == NULL || ver == NULL || keep == NULL) {
+        free(offs); free(ver); free(keep); return -1;
+    }
+    for (int j = 0; j < nidx; j++) {
+        offs[j] = cs[idx[j]].off;
+        ver[j]  = (unsigned char) (cs[idx[j]].crc_ok != 0);
+    }
+    unsigned char grid[195];
+    bulk_grid_learn(offs, ver, nidx, grid);
+    for (int j = 0; j < nidx; j++) keep[j] = ver[j] || bulk_grid_ok(grid, offs[j]);
+    free(offs); free(ver);
+
+    if (known_size > 0 && known_exact) {
+        size = known_size;
+    } else {
+        size = known_size;   // 0 when nothing is known, else a floor
+        for (int j = 0; j < nidx; j++) {
+            const chunk_t *c = &cs[idx[j]];
+            if (!c->crc_ok) continue;                 // only a verified offset sets the extent
+            if (c->off + c->dlen > size) size = c->off + c->dlen;
+        }
+    }
+    if (size <= 0) { free(keep); return -1; }
+    for (int j = 0; j < nidx; j++)
+        if (cs[idx[j]].off >= size) keep[j] = 0;
+
+    long dropped = 0;
+    for (int j = 0; j < nidx; j++) if (!keep[j]) dropped++;
+
+    uint8_t *buf      = (uint8_t *) malloc((size_t) size);
+    uint8_t *present  = (uint8_t *) calloc((size_t) size, 1);
+    uint8_t *verified = (uint8_t *) calloc((size_t) size, 1);
+    if (buf == NULL || present == NULL || verified == NULL) {
+        free(buf); free(present); free(verified); free(keep); return -1;
+    }
     memset(buf, 0, (size_t) size);
 
     for (int phase = 0; phase < 2; phase++) {
         for (int j = 0; j < nidx; j++) {
+            if (!keep[j]) continue;
             const chunk_t *c = &cs[idx[j]];
-            int clean = (c->rs >= 0);
-            if ((phase == 0) != clean) continue;
+            if ((phase == 0) != (c->crc_ok != 0)) continue;
             long off = c->off;
             for (long k = 0; k < c->dlen && off + k < size; k++) {
                 if (present[off + k] && phase == 1) continue;
                 buf[off + k] = c->data[k];
                 present[off + k] = 1;
+                if (phase == 0) verified[off + k] = 1;
             }
         }
     }
-    *out_buf = buf; *out_present = present;
+    free(keep);
+    *out_buf = buf; *out_present = present; *out_verified = verified;
+    *out_dropped = dropped;
     return size;
 }
 
@@ -591,12 +715,16 @@ static long count_sync(const uint8_t *buf, long size)
 // pass; max_ts is the newest packet time (upper bound on plausible markers).
 // Returns 0 if the merged stream is not valid MPI.
 static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
-                            double start_hint, double max_ts, experiment_t *out)
+                            double start_hint, double max_ts,
+                            long known_size, int known_exact,
+                            experiment_t *out)
 {
-    uint8_t *buf = NULL, *present = NULL;
-    long size = reassemble(cs, idx, nidx, &buf, &present);
+    uint8_t *buf = NULL, *present = NULL, *verified = NULL;
+    long dropped = 0;
+    long size = reassemble(cs, idx, nidx, known_size, known_exact,
+                           &buf, &present, &verified, &dropped);
     if (size < MPI_MIN_FILE_BYTES || count_sync(buf, size) < MPI_MIN_SYNC) {
-        free(buf); free(present);
+        free(buf); free(present); free(verified);
         return 0;
     }
 
@@ -613,10 +741,12 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
             offs[n++] = o;
         }
     }
-    if (n < MPI_MIN_SYNC) { free(offs); free(buf); free(present); return 0; }
+    if (n < MPI_MIN_SYNC) { free(offs); free(buf); free(present); free(verified); return 0; }
 
     memset(out, 0, sizeof *out);
-    out->buf = buf; out->present = present; out->size = size;
+    out->buf = buf; out->present = present; out->verified = verified;
+    out->size = size;
+    out->dropped = dropped;
     out->nframes = n;
     out->t_first_recv_ms = cs[idx[0]].ts_ms;
     out->t_last_recv_ms  = cs[idx[0]].ts_ms;
@@ -631,11 +761,12 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
     out->fr_tv   = (int *) malloc((size_t) n * sizeof(int));
     out->fr_ts   = (double *) malloc((size_t) n * sizeof(double));
     out->fr_bad  = (int *) calloc((size_t) n, sizeof(int));
+    out->fr_unver = (int *) calloc((size_t) n, sizeof(int));
     if (out->fr_ctr == NULL || out->fr_scan == NULL || out->fr_tv == NULL
-        || out->fr_ts == NULL || out->fr_bad == NULL) {
+        || out->fr_ts == NULL || out->fr_bad == NULL || out->fr_unver == NULL) {
         free(out->fr_ctr); free(out->fr_scan); free(out->fr_tv);
-        free(out->fr_ts); free(out->fr_bad);
-        free(offs); free(buf); free(present);
+        free(out->fr_ts); free(out->fr_bad); free(out->fr_unver);
+        free(offs); free(buf); free(present); free(verified);
         return 0;
     }
     for (int k = 0; k < n; k++) {
@@ -646,9 +777,23 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
         out->fr_ts[k]   = -1.0;
     }
 
-    long recovered = 0;
-    for (long b = 0; b < size; b++) if (present[b]) recovered++;
+    long recovered = 0, unverified = 0;
+    for (long b = 0; b < size; b++) {
+        if (!present[b]) continue;
+        recovered++;
+        if (!verified[b]) unverified++;
+    }
     out->recovered = recovered;
+    out->unverified = unverified;
+
+    // A frame is suspect if any byte of it came from a packet whose CRC failed:
+    // those bytes were placed on an offset nothing vouches for, and their
+    // contents were never checked either.
+    for (int k = 0; k < n; k++) {
+        long o = offs[k];
+        for (long b = o; b < o + FRAME_STRIDE && b < size; b++)
+            if (present[b] && !verified[b]) { out->fr_unver[k] = 1; break; }
+    }
 
     // Locate the JSON markers in the merged stream. They give both the
     // (offset -> time) curve and the byte spans to drop straddling frames.
@@ -672,6 +817,15 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
     out->t_start_ms = start;
     if (start > 0) fmt_utc_s(start, out->utc, sizeof out->utc);
     else snprintf(out->utc, sizeof out->utc, "unknown");
+
+    // Recording end = the latest marker still inside the recording window. The
+    // firmware writes one every 20 KB it flushes, so the last one lands within
+    // a few seconds of the stop, and the span is how long the MPI actually ran.
+    out->t_end_ms = start;
+    for (int k = 0; k < nm; k++) {
+        if (mt[k] < start || mt[k] > start + MPI_REC_WINDOW_MS) continue;
+        if (mt[k] > out->t_end_ms) out->t_end_ms = mt[k];
+    }
 
     // Build the (offset -> time) curve: anchor offset 0 to the start, then add
     // each in-window marker keeping the curve strictly increasing in offset and
@@ -758,8 +912,9 @@ static int load_experiments_from_db(sqlite3 *db, experiment_t **out)
         }
         i = last_i + 1;
 
-        uint8_t *buf = NULL, *present = NULL;
-        long size = reassemble(cs, idx, nidx, &buf, &present);
+        uint8_t *buf = NULL, *present = NULL, *verified = NULL;
+        long dropped = 0;
+        long size = reassemble(cs, idx, nidx, 0, 0, &buf, &present, &verified, &dropped);
         if (size >= MPI_MIN_FILE_BYTES && count_sync(buf, size) >= MPI_MIN_SYNC) {
             long *mo = NULL; double *mt = NULL;
             int nm = scan_markers(buf, size, max_ts, &mo, &mt);
@@ -778,7 +933,7 @@ static int load_experiments_from_db(sqlite3 *db, experiment_t **out)
             bs[nb].exp = -1;
             nb++;
         }
-        free(buf); free(present);
+        free(buf); free(present); free(verified);
     }
     free(idx);
 
@@ -827,6 +982,10 @@ static int load_experiments_from_db(sqlite3 *db, experiment_t **out)
     mpicmd_t *cmds = NULL;
     int ncmds = load_mpi_commands(db, &cmds);
 
+    // What the satellite said each of those files is actually long.
+    bulk_size_table_t sizes = {0};
+    load_bulk_log(db, &sizes);
+
     // Pass 3: for each experiment, union its bursts' chunks (dedup) and build.
     experiment_t *exps = (experiment_t *) malloc((size_t) (nexp > 0 ? nexp : 1) * sizeof *exps);
     int *uidx = (int *) malloc((size_t) n * sizeof(int));
@@ -843,14 +1002,37 @@ static int load_experiments_from_db(sqlite3 *db, experiment_t **out)
                     if (!seen[ci]) { seen[ci] = 1; uidx[nu++] = ci; }
                 }
             }
+            // Build once to read the markers, which is what names the file;
+            // then, if the satellite has told us how long that file is, build
+            // again against the real length. The first build's size is only the
+            // largest offset that survived the grid filter.
             experiment_t ex;
-            if (nu > 0 && build_experiment(cs, uidx, nu, exp_hint[e], max_ts, &ex)) {
+            if (nu > 0 && build_experiment(cs, uidx, nu, exp_hint[e], max_ts, 0, 0, &ex)) {
                 label_experiment(&ex, cmds, ncmds);
+                int exact = 0;
+                long known = bulk_size_lookup(&sizes, ex.sat_path, &exact);
+                if (known > 0 && known != ex.size) {
+                    experiment_t re;
+                    if (build_experiment(cs, uidx, nu, exp_hint[e], max_ts,
+                                         known, exact, &re)) {
+                        label_experiment(&re, cmds, ncmds);
+                        free_experiment(&ex);
+                        ex = re;
+                    }
+                }
+                // Only claim the length came from the satellite if it is the
+                // length actually reconstructed against: a floor the chunks
+                // already reach past is the chunks' answer, not the log's.
+                if (known > 0 && known == ex.size) {
+                    ex.size_from_log = 1;
+                    ex.size_exact = exact;
+                }
                 exps[nout++] = ex;
             }
         }
     }
     free(cmds);
+    bulk_size_free(&sizes);
     free(uidx); free(seen); free(ord); free(exp_hint);
     *out = exps;
 
@@ -870,12 +1052,7 @@ done:
 
 static void free_experiments(experiment_t *exps, int nexp)
 {
-    for (int k = 0; k < nexp; k++) {
-        free(exps[k].buf); free(exps[k].present);
-        free(exps[k].fr_off); free(exps[k].fr_ctr);
-        free(exps[k].fr_scan); free(exps[k].fr_tv);
-        free(exps[k].fr_ts); free(exps[k].fr_bad);
-    }
+    for (int k = 0; k < nexp; k++) free_experiment(&exps[k]);
     free(exps);
 }
 
@@ -1089,6 +1266,14 @@ static void draw_text(const char *s, int x, int y, int size, Color c)
         DrawText(s, x, y, size, c);
 }
 
+// Width of a string as draw_text would render it, for right-justifying.
+static int text_width(const char *s, int size)
+{
+    if (g_ui_font_loaded)
+        return (int) MeasureTextEx(g_ui_font, s, (float) size, g_ui_font_spacing).x;
+    return MeasureText(s, size);
+}
+
 // Fire once on press, then rapidly while the key is held (after a short delay).
 // *cooldown carries the time until the next repeat -- pass one float per key.
 static int key_repeat(int key, float *cooldown)
@@ -1198,7 +1383,13 @@ static void export_redownload(const experiment_t *s, const char *db_path,
     long missing = 0, download = 0, n_cmds = 0;
     plan_redownload(NULL, s->present, s->size, sat_path, &missing, &download, &n_cmds);
     if (n_cmds == 0) {
-        snprintf(status, nstatus, "nothing missing below %ld bytes; no commands needed", s->size);
+        if (s->size_from_log && s->size_exact)
+            snprintf(status, nstatus,
+                     "complete: all %ld bytes are down; no commands needed", s->size);
+        else
+            snprintf(status, nstatus,
+                     "nothing missing below %ld bytes, but that is only as far as "
+                     "the file is known to run; no commands needed", s->size);
         return;
     }
 
@@ -1217,7 +1408,8 @@ static void export_redownload(const experiment_t *s, const char *db_path,
         "# Written by mpi_viewer at %s UTC from %s.\n"
         "#\n"
         "# on-satellite file : %s%s\n"
-        "# reconstructed     : %ld bytes, %ld received (%.1f%%)\n"
+        "# file length       : %ld bytes (%s)\n"
+        "# received          : %ld bytes (%.1f%%)\n"
         "# missing           : %ld bytes\n"
         "# these commands    : %ld, fetching %ld bytes\n"
         "#\n"
@@ -1225,23 +1417,43 @@ static void export_redownload(const experiment_t *s, const char *db_path,
         "# command can re-fetch a few bytes already in hand where a gap shares a\n"
         "# packet with received data. Runs longer than the firmware's %ld-byte\n"
         "# per-command limit are split.\n"
-        "#\n"
-        "# The reconstructed size is a LOWER bound: nothing here proves the last\n"
-        "# received byte is the end of the file. To find out, and to pick up any\n"
-        "# tail past it, send\n"
-        "#   CTS1+exec_blob_from_fs(%s,0,%s;%ld;0)!\n"
-        "# and read file_size out of the response.\n"
-        "#\n"
+        "#\n",
+        s->utc, now, db_path,
+        sat_path, have_path ? "" : "   <-- NOT in the command log; fill this in",
+        s->size,
+        s->size_from_log
+            ? (s->size_exact ? "the satellite's own byte count for this file"
+                             : "the satellite's own byte count, a MINIMUM: every download"
+                               " of this file so far was stopped by a byte cap")
+            : "the largest offset received, a LOWER bound",
+        s->recovered, 100.0 * (double) s->recovered / (double) s->size,
+        missing, n_cmds, download,
+        COMMS_BULK_DOWNLINK_MAX_BYTES);
+
+    if (!s->size_from_log || !s->size_exact)
+        fprintf(f,
+            "# Nothing here proves the last byte above is the end of the file. To\n"
+            "# find out, and to pick up any tail past it, send\n"
+            "#   CTS1+exec_blob_from_fs(%s,0,%s;%ld;0)!\n"
+            "# and let it run to the end; the satellite's \"Bulk downlink complete\"\n"
+            "# log line then gives the length outright.\n"
+            "#\n",
+            MPI_BLOB_PATH, sat_path, s->size);
+
+    if (s->dropped > 0)
+        fprintf(f,
+            "# %ld received packet(s) were set aside: their offset field does not\n"
+            "# sit on a download grid, or points past the end of the file, so it\n"
+            "# was corrupted in flight. The bytes they claimed are listed below as\n"
+            "# missing, which they are.\n"
+            "#\n",
+            s->dropped);
+
+    fprintf(f,
         "# Run this through agenda_check before flying it. exec_blob_from_fs is\n"
         "# marked recovery/expert in the firmware, so every line draws a readiness\n"
         "# warning; warnings never block startup.\n"
-        "\n",
-        s->utc, now, db_path,
-        sat_path, have_path ? "" : "   <-- NOT in the command log; fill this in",
-        s->size, s->recovered, 100.0 * (double) s->recovered / (double) s->size,
-        missing, n_cmds, download,
-        COMMS_BULK_DOWNLINK_MAX_BYTES,
-        MPI_BLOB_PATH, sat_path, s->size);
+        "\n");
 
     long m2 = 0, d2 = 0, c2 = 0;
     plan_redownload(f, s->present, s->size, sat_path, &m2, &d2, &c2);
@@ -1271,12 +1483,53 @@ static void build_coverage(const experiment_t *s, Color *pix, int w, int h)
         long b1 = (long) ((double) s->size * (double) (i + 1) / (double) ncell);
         if (b1 <= b0) b1 = b0 + 1;
         if (b1 > s->size) b1 = s->size;
-        int missing = 0;
+        int missing = 0, unverified = 0;
         for (long b = b0; b < b1; b++) {
             if (!s->present[b]) { missing = 1; break; }
+            if (!s->verified[b]) unverified = 1;
         }
-        pix[i] = missing ? (Color){ 8, 8, 10, 255 } : (Color){ 89, 184, 85, 255 };
+        // Amber for a slice that is all there but rests on packets whose CRC
+        // failed: the bytes are readable, nothing says they are right.
+        pix[i] = missing      ? (Color){ 8, 8, 10, 255 }
+               : unverified   ? (Color){ 206, 150, 42, 255 }
+                              : (Color){ 89, 184, 85, 255 };
     }
+}
+
+// The byte range the currently shown image was reconstructed from, so the
+// coverage map can mark where in the file you are looking. Returns 0 if the
+// image has no frames.
+static int image_byte_span(const view_t *v, const experiment_t *s, int img,
+                           long *out_b0, long *out_b1)
+{
+    long b0 = -1, b1 = -1;
+    for (int k = 0; k < s->nframes; k++) {
+        if (v->fr_img == NULL || v->fr_img[k] != img) continue;
+        long o = s->fr_off[k];
+        if (b0 < 0 || o < b0) b0 = o;
+        if (b1 < 0 || o + FRAME_STRIDE > b1) b1 = o + FRAME_STRIDE;
+    }
+    if (b0 < 0) return 0;
+    if (b1 > s->size) b1 = s->size;
+    *out_b0 = b0; *out_b1 = b1;
+    return 1;
+}
+
+// The image whose bytes sit closest to file offset `byte`, for click-to-seek on
+// the coverage map. Returns -1 if there are no images.
+static int image_nearest_byte(const view_t *v, const experiment_t *s, long byte)
+{
+    int best = -1;
+    long best_d = 0;
+    for (int k = 0; k < s->nframes; k++) {
+        if (v->fr_img == NULL || v->fr_img[k] < 0) continue;
+        long o = s->fr_off[k];
+        long d = byte < o ? o - byte
+               : byte >= o + FRAME_STRIDE ? byte - (o + FRAME_STRIDE - 1) : 0;
+        if (best < 0 || d < best_d) { best = v->fr_img[k]; best_d = d; }
+        if (d == 0) break;
+    }
+    return best;
 }
 
 // ---- main ------------------------------------------------------------------
@@ -1286,14 +1539,18 @@ int main(int argc, char **argv)
     if (sso_version_handle(argc, argv, "mpi_viewer")) return 0;
 
     const char *db_arg = NULL;
+    int list_only = 0;
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--db=", 5) == 0) db_arg = argv[i] + 5;
+        else if (strcmp(argv[i], "--list") == 0) list_only = 1;
         else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: mpi_viewer [--db=<packet_db.sqlite>]\n"
+            printf("Usage: mpi_viewer [--db=<packet_db.sqlite>] [--list]\n"
                    "Inspect MPI science imagery reconstructed from the packet DB.\n"
                    "The left panel lists MPI experiments; F5 re-reads the DB.\n"
                    "Press d to write the selected experiment's missing data as\n"
-                   "re-download telecommands, for simple_sat_ops --tc-file.\n");
+                   "re-download telecommands, for simple_sat_ops --tc-file.\n"
+                   "--list prints what each experiment reconstructed to and exits,\n"
+                   "without opening a window.\n");
             return 0;
         } else {
             fprintf(stderr, "mpi_viewer: unknown option '%s' (try --help)\n", argv[i]);
@@ -1319,6 +1576,34 @@ int main(int argc, char **argv)
         return 1;
     }
     fprintf(stderr, "mpi_viewer: %d MPI experiment%s.\n", nexp, nexp == 1 ? "" : "s");
+
+    if (list_only) {
+        for (int k = 0; k < nexp; k++) {
+            const experiment_t *e = &exps[k];
+            printf("%s UTC  %s  (%.1f min)\n", e->utc,
+                   e->sat_path[0] ? e->sat_path : "(file not in the command log)",
+                   (e->t_end_ms - e->t_start_ms) / 60000.0);
+            printf("  file      : %ld bytes (%s)\n", e->size,
+                   e->size_from_log
+                       ? (e->size_exact ? "satellite-reported length"
+                                        : "satellite-reported minimum")
+                       : "largest offset received -- a lower bound");
+            printf("  recovered : %ld bytes (%.1f%%), %ld missing\n",
+                   e->recovered, 100.0 * (double) e->recovered / (double) e->size,
+                   e->size - e->recovered);
+            printf("  unverified: %ld bytes from packets whose CRC failed\n", e->unverified);
+            printf("  frames    : %d", e->nframes);
+            int nunver = 0;
+            for (int f = 0; f < e->nframes; f++) if (e->fr_unver[f]) nunver++;
+            if (nunver > 0) printf(" (%d touch unverified bytes)", nunver);
+            printf("\n");
+            if (e->dropped > 0)
+                printf("  dropped   : %ld packet(s) with an off-grid or past-the-end offset\n",
+                       e->dropped);
+        }
+        free_experiments(exps, nexp);
+        return 0;
+    }
 
     view_t v = {0};
     v.zoom = 8; v.ips = 8.0f;
@@ -1484,9 +1769,24 @@ int main(int argc, char **argv)
             if (si == v.sel) DrawRectangle(0, y, LEFT_W, row_h, (Color){ 44, 70, 110, 255 });
             double pct = 100.0 * (double) ss->recovered / (double) ss->size;
             draw_text(TextFormat("%s UTC", ss->utc), 10, y + 4, 15, si == v.sel ? RAYWHITE : LIGHTGRAY);
+            // How long the MPI actually ran, right-justified on the date line.
+            double mins = (ss->t_end_ms - ss->t_start_ms) / 60000.0;
+            if (mins > 0) {
+                const char *dur = TextFormat("%.1f min", mins);
+                draw_text(dur, LEFT_W - 10 - text_width(dur, 12), y + 7, 12,
+                          si == v.sel ? LIGHTGRAY : GRAY);
+            }
             draw_text(TextFormat("%.0f KB  %.0f%%  %d frames",
                                  ss->size / 1024.0, pct, ss->nframes),
                       10, y + 23, 12, GRAY);
+        }
+
+        // Was any part of this image built from packets whose CRC failed?
+        int img_unver = 0, img_unver_frames = 0, img_frames = 0;
+        for (int k = 0; k < s->nframes; k++) {
+            if (v.fr_img == NULL || v.fr_img[k] != v.img_pos) continue;
+            img_frames++;
+            if (s->fr_unver[k]) { img_unver = 1; img_unver_frames++; }
         }
 
         // right: title / time
@@ -1502,8 +1802,13 @@ int main(int argc, char **argv)
         int dw = v.ncols * v.zoom, dh = NPIX * v.zoom;
         Rectangle src = { 0, 0, (float) v.ncols, (float) NPIX };
         Rectangle dst = { (float) rx, (float) iy, (float) dw, (float) dh };
-        DrawRectangleLines(rx - 1, iy - 1, dw + 2, dh + 2, (Color){ 70, 70, 80, 255 });
+        DrawRectangleLines(rx - 1, iy - 1, dw + 2, dh + 2,
+                           img_unver ? (Color){ 206, 150, 42, 255 } : (Color){ 70, 70, 80, 255 });
         DrawTexturePro(tex, src, dst, (Vector2){ 0, 0 }, 0.0f, WHITE);
+        if (img_unver)
+            draw_text(TextFormat("UNVERIFIED  %d of %d frames rest on packets whose CRC failed",
+                                 img_unver_frames, img_frames),
+                      rx, iy + dh + 8, 14, (Color){ 206, 150, 42, 255 });
 
         // aux panel to the right of the image
         int ax = rx + dw + 30;
@@ -1564,10 +1869,54 @@ int main(int argc, char **argv)
             if (cov_tex.id != 0) {
                 DrawTexture(cov_tex, ax, ay, WHITE);
                 DrawRectangleLines(ax - 1, ay - 1, cov_w + 2, cov_h + 2, (Color){ 70, 70, 80, 255 });
-                draw_text(TextFormat("%.1f%% of %.0f KB down, %.0f KB missing",
+
+                // Playhead: a white box around the cells holding the bytes the
+                // shown image was built from. The map reads left to right then
+                // down, so an image's byte run is a partial row, a band of whole
+                // rows, or (usually) both -- outline the smallest row band that
+                // contains it and mark the exact span within the end rows.
+                long pb0 = 0, pb1 = 0;
+                if (v.n_img > 0 && image_byte_span(&v, s, v.img_pos, &pb0, &pb1)) {
+                    long ncell = (long) cov_w * (long) cov_h;
+                    long c0 = pb0 * ncell / s->size;
+                    long c1 = (pb1 * ncell + s->size - 1) / s->size;
+                    if (c1 <= c0) c1 = c0 + 1;
+                    if (c1 > ncell) c1 = ncell;
+                    int r0 = (int) (c0 / cov_w), r1 = (int) ((c1 - 1) / cov_w);
+                    int x0 = (int) (c0 % cov_w), x1 = (int) ((c1 - 1) % cov_w) + 1;
+                    if (r0 == r1) {
+                        DrawRectangleLines(ax + x0 - 1, ay + r0 - 1, x1 - x0 + 2, 3, RAYWHITE);
+                    } else {
+                        DrawRectangleLines(ax - 1, ay + r0 - 1, cov_w + 2,
+                                           r1 - r0 + 3, RAYWHITE);
+                        DrawRectangle(ax + x0, ay + r0, cov_w - x0, 1, RAYWHITE);
+                        DrawRectangle(ax, ay + r1, x1, 1, RAYWHITE);
+                    }
+                }
+
+                draw_text(TextFormat("%.1f%% of %.0f KB down, %.0f KB missing  (%s)",
                                      100.0 * (double) s->recovered / (double) s->size,
-                                     s->size / 1024.0, (s->size - s->recovered) / 1024.0),
+                                     s->size / 1024.0, (s->size - s->recovered) / 1024.0,
+                                     s->size_from_log
+                                         ? (s->size_exact ? "length from the satellite"
+                                                          : "length is a satellite-reported minimum")
+                                         : "length is the largest offset seen"),
                           ax, ay + cov_h + 6, 13, GRAY);
+                if (s->unverified > 0)
+                    draw_text(TextFormat("amber: %.0f KB rest on packets whose CRC failed",
+                                         s->unverified / 1024.0),
+                              ax, ay + cov_h + 22, 13, (Color){ 206, 150, 42, 255 });
+            }
+
+            // Click the map to jump to the image nearest that point in the file.
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && v.n_img > 0) {
+                Vector2 m = GetMousePosition();
+                if (m.x >= ax && m.x < ax + cov_w && m.y >= ay && m.y < ay + cov_h) {
+                    long cell = (long) ((int) m.y - ay) * cov_w + ((int) m.x - ax);
+                    long byte = cell * s->size / ((long) cov_w * (long) cov_h);
+                    int img = image_nearest_byte(&v, s, byte);
+                    if (img >= 0) { v.img_pos = img; v.playing = 0; }
+                }
             }
         }
 
@@ -1577,9 +1926,9 @@ int main(int argc, char **argv)
 
         // help footer
         const char *help =
-            "Up/Down experiment   Left/Right image   Space play/pause   ,/. speed"
-            "   f steps/sweep   s zoom   a scale   z/x min  c/v max"
-            "   d re-download commands   F5 refresh  q quit";
+            "Up/Down experiment   Left/Right image   click coverage map to seek"
+            "   Space play/pause   ,/. speed   f steps/sweep   s zoom   a scale"
+            "   z/x min  c/v max   d re-download commands   F5 refresh  q quit";
         draw_text(help, 12, GetScreenHeight() - 22, 12, (Color){ 150, 150, 160, 255 });
 
         EndDrawing();

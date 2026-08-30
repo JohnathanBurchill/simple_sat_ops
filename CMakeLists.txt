@@ -332,6 +332,14 @@ add_executable(gnss_frag_selftest
 target_include_directories(gnss_frag_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS gnss_frag_selftest)
 
+# Bulk-download self-test: reading a downlinked file's true length out of the
+# satellite's log lines, and telling a real chunk offset from a bit-flipped one.
+# Both feed the missing-packet lists in mpi_reconstruct and mpi_viewer.
+add_executable(bulk_size_selftest
+               unit_tests/bulk_size_selftest.c src/proto/bulk_size.c)
+target_include_directories(bulk_size_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+list(APPEND SSO_TARGETS bulk_size_selftest)
+
 # Boom-camera JPEG decode self-test: sentence parsing, gap/partial recovery,
 # retransmit dedup, out-of-order placement (shared by cam_reconstruct and
 # packet_browser's "save camera JPEG").
@@ -531,7 +539,7 @@ if (RAYLIB_FOUND)
     # 152-byte frames by their sync word, groups them into images by inner-dome
     # target voltage, and plays them back grayscale with an adjustable DN range.
     # Needs sqlite3 via packet_db.
-    add_executable(mpi_viewer utils/mpi_viewer.c)
+    add_executable(mpi_viewer utils/mpi_viewer.c src/proto/bulk_size.c)
     target_include_directories(mpi_viewer PRIVATE ${RAYLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(mpi_viewer PRIVATE ${RAYLIB_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(mpi_viewer PRIVATE ${RAYLIB_LIBRARIES} ${OPENSSL_LIBRARIES} m)
@@ -849,7 +857,8 @@ if (OPENSSL_FOUND)
     # Reassemble an MPI science-data file from its bulk_file packets, the MPI
     # counterpart to cam_reconstruct and gnss_reports. gnss_frag.c is reused for
     # the shared --since/--until time-spec parsing.
-    add_executable(mpi_reconstruct utils/mpi_reconstruct.c src/proto/gnss_frag.c)
+    add_executable(mpi_reconstruct utils/mpi_reconstruct.c src/proto/gnss_frag.c
+                   src/proto/bulk_size.c)
     target_include_directories(mpi_reconstruct PRIVATE ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(mpi_reconstruct PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(mpi_reconstruct PRIVATE ${OPENSSL_LIBRARIES} m)

@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`a24ce48` (2026-08-30). This is a working draft.
+`1e44c89` (2026-08-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2258,9 +2258,51 @@ chunks and the operator re-commands on a later pass) is **merged into one
 file** by offset, while another file pulled at a different time - a camera
 capture, an ASCII log - carries no sync word, falls outside every session
 window, and is never mixed in. The run prints, per file: the reception window
-and packet count, the file size (offset-0-based, so a download that only got
-the tail shows the head as missing), the recovered/missing byte counts and
-percent, and the offset range the received data actually spans.
+and packet count, the file size and where that number came from, the
+recovered/missing byte counts and percent, and the offset range the received
+data actually spans.
+
+**How long the file is** decides what counts as missing, and a `bulk_file`
+packet carries a byte offset but never a length. Taking the length to be the
+largest offset received therefore hands the answer to whichever offset field
+was worst corrupted -- one chunk of the 2026-07-21 MPI download claimed offset
+2051784, which sized a 556728-byte file at 2051979 bytes and reported a
+complete file as 14% recovered, with a re-download list demanding 1.5 MB that
+does not exist. So the length is read out of the satellite's own log instead:
+
+```
+[A:LFS:INFO]: Bulk downlink complete. 556728 bytes (2856 packets) downlinked. File: mpi_data/2026-07-21.mpi
+```
+
+That line counts the bytes *that download* sent, so it is the file's length
+only when the download started at offset 0 and was not cut short. Pairing it
+with the `bulk_downlink_start_blob` line (or, when that was never decoded, with
+the command in `sent_tcmd`) covers the other cases: the 2026-08-28 pull of the
+same file started at 307125 and reported 249603 bytes, and the two sum to
+556728 exactly. A download that sent exactly its allowance -- the ground's byte
+cap, or the firmware's own 1,000,000-byte clamp, which binds even when the
+whole file was asked for -- only puts a **floor** under the length, and is
+reported as a minimum and never used to truncate. Whichever way the number was
+arrived at, the printed line says so.
+
+**Only CRC-verified packets are trusted with an offset.** A packet's offset
+field is covered by the same CSP CRC32 as its data, so a packet that passed its
+CRC says where it belongs and one that failed does not. The split is stark: of
+the chunks belonging to the 2026-07-21 experiment, the 3522 CRC-verified ones
+use exactly two offset residues mod 195 - 0 and 45, the two offsets the
+downloads were commanded from - and not one lands anywhere else, while the 1796
+that failed their CRC are scattered over 113 residues. So verified chunks alone
+set the file's extent, are laid down first, and are the only ones that teach the
+download's 195-byte offset grid.
+
+A failed-CRC chunk is still used - it is often the only copy of those bytes -
+but only to fill bytes no verified chunk claimed, and only if its offset at
+least lands on the learned grid; otherwise it is **dropped and counted**, rather
+than written into the middle of the file where it would read back as received
+and hide the gap it displaced. Every byte a failed-CRC chunk contributes is
+tracked, and both tools report the total. (A packet that failed its CRC also
+still carries its 4-byte CRC32 trailer, which is not file data; that is trimmed
+too.)
 
 The **re-download list** is the fewest `comms_bulk_file_downlink_start(<path>,
 <offset>,<len>)` telecommands that recover the missing data, **aligned to the
@@ -2300,7 +2342,20 @@ has been run only a handful of times this mission, so the left panel is short.
 ```sh
 mpi_viewer                              # default database
 mpi_viewer --db=/FrontierSat/packet_db.sqlite
+mpi_viewer --list                       # print what each experiment reconstructed to
 ```
+
+`--list` prints one block per experiment - the on-satellite file, how long the
+recording ran, its length and where that number came from, the recovered and
+missing byte counts, how much rests on packets whose CRC failed, the frame
+count, and how many packets were set aside for a corrupted offset - then exits
+without opening a window. It answers "how much of this do we actually have?"
+from a terminal or over ssh, and is the same reconstruction the GUI shows.
+
+Each row of the experiment list carries the recording's **duration in minutes**,
+right-justified on the date line - the span from the `mpi_start` marker to the
+last marker inside the recording window, which is how long the MPI actually ran
+rather than how long it was commanded for.
 
 The grouping and the timing both come from JSON markers the flight firmware
 writes into each science file: a `{"mpi_start":...,"timestamp_ms":N}` header at
@@ -2326,7 +2381,8 @@ into the middle of a frame; that one frame reads as a garbage row. The viewer
 drops any frame whose body overlaps a marker, which removes the routine periodic
 artifact (roughly one frame in 134).
 
-Keys: `Up`/`Down` change experiment, `Left`/`Right` scrub images, `Space`
+Keys: `Up`/`Down` change experiment, `Left`/`Right` scrub images (or click the
+coverage map to jump to the image at that point in the file), `Space`
 plays/pauses, `,`/`.` set the playback speed, `f` cycles frames-per-image
 (auto/8/16), `s` zoom, `a` cycles the colour scale (auto-image / auto-experiment
 / manual), `r` resets it to auto-image, `z`/`x` and `c`/`v` move the manual DN
@@ -2337,8 +2393,22 @@ Read-only on the database and safe to run while a receiver is filling it.
 
 Under the aux panel is a **data-coverage map** of the whole reconstructed file:
 byte 0 at the top left, the last byte at the bottom right, reading left to right
-then down. Green is a byte that came down, black one that never did, and the
-line beneath it gives the received percentage and how much is still missing.
+then down. Green is a byte that came down, **amber** one that came down only on a
+packet whose CRC failed, black one that never did. The line beneath gives the
+received percentage, how much is still missing, and where the file's length came
+from - the satellite's own byte count for that file, a satellite-reported
+minimum, or (when the log never named it) the largest offset received. That last
+case is the only one where the percentage is measured against a guess; see
+`mpi_reconstruct` above for how the length is established.
+
+A **white outline** on the map marks the bytes the image on screen was
+reconstructed from, so you can see where in the file you are as you scrub or
+play. **Clicking anywhere on the map jumps to the image nearest that point in
+the file** and pauses playback - handy for going straight to the far side of a
+gap. And an image with any frame built from a failed-CRC packet is **flagged**:
+its border turns amber and a line under it says how many of its frames are
+affected. The pixels are shown either way - they are the only copy of that data -
+but nothing vouches for them.
 Each pixel stands for a slice of the file and goes black as soon as any byte in
 that slice is missing, so a single lost packet still shows - a quick read on how
 much of an experiment is still on the satellite before you press `d`.
@@ -2349,8 +2419,8 @@ the holes are usually scattered across the file; `d` turns them into the
 commands that fetch exactly those holes, written to
 `mpi_redownload_<experiment time>.txt` in the working directory and ready to
 hand to `simple_sat_ops --tc-file=`. The file names the experiment, the file on
-the satellite, and the received / missing byte counts in a comment header, then
-one command per line:
+the satellite, the file's length and where that number came from, and the
+received / missing byte counts in a comment header, then one command per line:
 
 ```
 CTS1+exec_blob_from_fs(blobs/bulk_downlink_start_v2.blob,0,mpi_data/2026-08-08.mpi;544440;11310)!
