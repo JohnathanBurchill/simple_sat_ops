@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`5baff87` (2026-08-30). This is a working draft.
+`fc33c61` (2026-08-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -3083,6 +3083,17 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   `<id><TAB><text>` line each, so they are readable without the browser;
   emptying a note deletes it.
 
+  Stepping between days keeps your place. Each day remembers the
+  observation the cursor was on, so `h` to look at yesterday and `l`
+  back returns to the row you left rather than the top of the day; a day
+  you have not looked at yet, or one whose observation the filter now
+  hides, opens on its first row as before. It is the observation that is
+  remembered rather than the row number, so the place survives a change
+  of filter or sort. Marks are the exception and are deliberately
+  dropped when the day changes: they name observations on the day they
+  were made, and carrying them across would let `d` fetch passes that
+  scrolled out of view days ago.
+
   A day with no SatNOGS listing yet still shows what this station holds
   for it. The archive is filed by observation id rather than by date, so
   the browser walks it once at startup and dates each recording from its
@@ -3102,7 +3113,10 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   bar shows what has gone out in the trailing hour against the ceiling
   (60 requests without an API token, 240 with one), read from the same
   `.api_stats.txt` tally the script keeps, so the budget is visible
-  before you spend it rather than in a summary afterwards. It sets
+  before you spend it rather than in a summary afterwards. The script
+  records each request as it makes it, so that figure climbs while a
+  listing is still walking and falls again of its own accord as
+  requests age past the hour, with no run needed to move it. It sets
   its own `umask` to 0002, since the archive is a shared setgid tree
   that cron writes as another user.
 * **`decode_passes.sh`** — walk a directory tree, find every `.wav` and
