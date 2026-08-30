@@ -31,20 +31,24 @@
       |                                                                 |
       +-- key hints (bottom reverse-video bar) -------------------------+
 
-    Keys:
+    Keys (vi motions alongside the arrows):
       q | Esc          quit (with a job running, ask first)
-      Up / Down        move the selection
+      j | k | Up|Down  move the selection
       PgUp / PgDn      move by a page
-      Home / End       first / last observation
-      Left / Right     previous / next day
+      gg | Home        first observation
+      G | End          last observation
+      zz               centre the selection
+      h | l | Left|Rt  previous / next day
       t                jump to today
-      g                go to a date (YYYY-MM-DD)
+      /                go to a date (YYYY-MM-DD)
       r                list this day from SatNOGS (or re-list it)
+      Enter            write a note against the selected observation
       space            mark / unmark the selected observation
       a                mark every fetchable observation in view
       n                clear all marks
       f | F            cycle the filter forwards / backwards
       d                download the marked observations
+      p                decode the marked observations into the packet DB
       c                cancel the running job
       ?                this help
 
@@ -111,11 +115,17 @@ int main(int argc, char **argv)
 #define IDS_PER_BATCH  100
 #define JOB_LOG_LINES  200
 #define JOB_LINE_LEN   256
+// Ceiling on a stored observation record. A pass with a few hundred
+// demodulated frames is a few tens of kilobytes; anything past this is
+// not the file we think it is, so it is left alone.
+#define META_MAX_BYTES (4L * 1024 * 1024)
+// A note is one line about one pass, not a log entry.
+#define NOTE_MAX       200
 
 enum {
     PAIR_BAR = 1,
-    PAIR_HAVE,      // already downloaded
-    PAIR_DECODED,   // downloaded and yielded packets
+    PAIR_HAVE,      // downloaded, nothing decoded from it yet
+    PAIR_DECODED,   // downloaded and in the packet database
     PAIR_NOAUDIO,   // SatNOGS holds no recording
     PAIR_MARKED,
     PAIR_SEL,
@@ -134,6 +144,10 @@ typedef struct {
     int    has_audio;    // SatNOGS holds a recording
     int    downloaded;   // this station already has the audio
     int    decoded;      // and the packet DB has rows from it
+    // Frames SatNOGS demodulated from the pass itself, or -1 when
+    // nothing here knows. Dozens of them is what a bulk download of
+    // stored science data looks like from the outside.
+    int    n_data;
     int    marked;
 } obs_t;
 
@@ -143,7 +157,12 @@ static const char *const FLT_NAME[FLT_N] = {
     "all", "with audio", "not downloaded", "downloaded", "decoded"
 };
 
+// What a running child is doing, which decides how its progress is
+// counted and what is re-read when it finishes.
+enum { JOB_NONE = 0, JOB_LIST, JOB_DOWNLOAD, JOB_DECODE };
+
 typedef struct {
+    int    kind;
     pid_t  pid;
     int    fd;                 // read end of the child's stdout+stderr
     int    running;
@@ -176,6 +195,7 @@ static char   g_day[16] = "";          // YYYY-MM-DD, UTC
 static char   g_archive[768] = "";
 static char   g_db_path[768] = "";
 static char   g_pull[768] = "satnogs_pull.sh";
+static char   g_decoder[768] = "decode_passes.sh";
 static long   g_norad = 69015;
 static int    g_have_color = 0;
 static char   g_status[256] = "";      // transient message on the bottom bar
@@ -275,6 +295,12 @@ static int have_audio_on_disk(long id)
 // element is the observation id.
 static void load_decoded_ids(void)
 {
+    // Read again after a decode, so start from nothing rather than
+    // adding a second array beside the first.
+    free(g_decoded_ids);
+    g_decoded_ids = NULL;
+    g_n_decoded = 0;
+
     sqlite3 *db = NULL;
     if (sqlite3_open_v2(g_db_path, &db, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
         // No database, or one we cannot open: the decoded column just
@@ -431,6 +457,110 @@ static void scan_local_archive(void)
     closedir(d);
 }
 
+// ---------------------------------------------------------------- notes
+//
+// A line of the operator's own words against an observation -- what a
+// pass was, why it matters -- kept in one tab-separated file at the top
+// of the archive so it survives the day caches being rewritten and can
+// be read without this program.
+
+typedef struct {
+    long id;
+    char text[NOTE_MAX];
+} note_t;
+
+static note_t *g_notes = NULL;
+static int     g_n_notes = 0;
+static int     g_notes_cap = 0;
+
+static void notes_path(char *out, size_t outn)
+{
+    snprintf(out, outn, "%s/.notes.tsv", g_archive);
+}
+
+static const char *note_for(long id)
+{
+    for (int i = 0; i < g_n_notes; i++)
+        if (g_notes[i].id == id) return g_notes[i].text;
+    return "";
+}
+
+static void notes_load(void)
+{
+    char path[800];
+    notes_path(path, sizeof path);
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return;
+
+    char line[NOTE_MAX + 64];
+    while (fgets(line, sizeof line, f) != NULL) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        char *tab = strchr(line, '\t');
+        if (tab == NULL) continue;
+        *tab = '\0';
+        long id = strtol(line, NULL, 10);
+        if (id <= 0 || tab[1] == '\0') continue;
+
+        if (g_n_notes == g_notes_cap) {
+            int ncap = g_notes_cap ? g_notes_cap * 2 : 64;
+            note_t *bigger = realloc(g_notes, (size_t)ncap * sizeof *bigger);
+            if (bigger == NULL) break;
+            g_notes = bigger;
+            g_notes_cap = ncap;
+        }
+        g_notes[g_n_notes].id = id;
+        snprintf(g_notes[g_n_notes].text, NOTE_MAX, "%s", tab + 1);
+        g_n_notes++;
+    }
+    fclose(f);
+}
+
+// Written whole, through a temporary, so an interrupted save leaves the
+// notes that were there rather than half of them.
+static int notes_save(void)
+{
+    char path[800], tmp[820];
+    notes_path(path, sizeof path);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+
+    FILE *f = fopen(tmp, "w");
+    if (f == NULL) return 0;
+    for (int i = 0; i < g_n_notes; i++)
+        fprintf(f, "%ld\t%s\n", g_notes[i].id, g_notes[i].text);
+    if (fclose(f) != 0) { unlink(tmp); return 0; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return 0; }
+    return 1;
+}
+
+// Set, replace or (with empty text) drop one observation's note.
+static int note_set(long id, const char *text)
+{
+    int at = -1;
+    for (int i = 0; i < g_n_notes; i++)
+        if (g_notes[i].id == id) { at = i; break; }
+
+    if (text[0] == '\0') {
+        if (at < 0) return 1;
+        g_notes[at] = g_notes[--g_n_notes];
+    } else if (at >= 0) {
+        snprintf(g_notes[at].text, NOTE_MAX, "%s", text);
+    } else {
+        if (g_n_notes == g_notes_cap) {
+            int ncap = g_notes_cap ? g_notes_cap * 2 : 64;
+            note_t *bigger = realloc(g_notes, (size_t)ncap * sizeof *bigger);
+            if (bigger == NULL) return 0;
+            g_notes = bigger;
+            g_notes_cap = ncap;
+        }
+        g_notes[g_n_notes].id = id;
+        snprintf(g_notes[g_n_notes].text, NOTE_MAX, "%s", text);
+        g_n_notes++;
+    }
+    return notes_save();
+}
+
 // The meta.json beside a recording is jq's pretty-printed copy of the
 // observation record, one top-level field to a line at a two-space
 // indent. That is enough structure to pull the few fields the list
@@ -456,21 +586,49 @@ static int meta_field(const char *json, const char *key, char *out, size_t outn)
     return n > 0 && strcmp(out, "null") != 0;
 }
 
+// The whole stored record, or NULL. Read entire rather than by the
+// headful: a pass with a lot of demodulated data runs past 8 kB on the
+// demoddata list alone, and everything the display wants -- the status,
+// the station, the elevation -- is written after it.
+static char *read_meta(long id)
+{
+    char path[900];
+    snprintf(path, sizeof path, "%s/%ld/satnogs_%ld.meta.json",
+             g_archive, id, id);
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return NULL;
+
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long size = ftell(f);
+    rewind(f);
+    if (size < 0 || size > META_MAX_BYTES) { fclose(f); return NULL; }
+
+    char *json = malloc((size_t)size + 1);
+    if (json == NULL) { fclose(f); return NULL; }
+    size_t n = fread(json, 1, (size_t)size, f);
+    fclose(f);
+    json[n] = '\0';
+    return json;
+}
+
+// One entry per frame SatNOGS demodulated, each carrying a URL to it.
+static int count_demoddata(const char *json)
+{
+    int n = 0;
+    for (const char *p = json;
+         (p = strstr(p, "\"payload_demod\"")) != NULL;
+         p += 15)
+        n++;
+    return n;
+}
+
 // Fill in what the stored record knows about an observation we hold but
 // whose day has not been listed. Best effort: a row with nothing behind
 // it still shows its id, its time and the fact that we have it.
 static void fill_from_meta(obs_t *o)
 {
-    char path[900];
-    snprintf(path, sizeof path, "%s/%ld/satnogs_%ld.meta.json",
-             g_archive, o->id, o->id);
-    FILE *f = fopen(path, "r");
-    if (f == NULL) return;
-
-    char json[8192];
-    size_t n = fread(json, 1, sizeof json - 1, f);
-    fclose(f);
-    json[n] = '\0';
+    char *json = read_meta(o->id);
+    if (json == NULL) return;
 
     // Each destination is sized for the value it holds, and a longer
     // one is cut to fit rather than rejected -- these are display
@@ -488,6 +646,9 @@ static void fill_from_meta(obs_t *o)
         o->station_id = strtol(buf, NULL, 10);
     if (meta_field(json, "max_altitude", buf, sizeof buf))
         o->max_el = atof(buf);
+    // What SatNOGS had demodulated when we pulled the recording down.
+    o->n_data = count_demoddata(json);
+    free(json);
 }
 
 static int cmp_obs_start(const void *a, const void *b)
@@ -519,6 +680,7 @@ static void merge_local(void)
         o->has_audio  = 1;
         o->downloaded = 1;
         o->decoded    = is_decoded(o->id);
+        o->n_data     = -1;
         // The record stored beside the recording fills in the station,
         // the real status and the pass geometry, so a held observation
         // reads the same as a listed one.
@@ -573,8 +735,8 @@ static int load_day(void)
 
         if (g_n_rows >= MAX_OBS_ROWS) { g_truncated = 1; break; }
 
-        char *fld[9] = {0};
-        int nf = split_tabs(line, fld, 9);
+        char *fld[10] = {0};
+        int nf = split_tabs(line, fld, 10);
         if (nf < 9) continue;
 
         obs_t *o = &g_rows[g_n_rows];
@@ -589,9 +751,20 @@ static int load_day(void)
         snprintf(o->station,   sizeof o->station,   "%s", fld[6]);
         o->max_el = atof(fld[7]);
         o->has_audio = (fld[8][0] != '\0');
+        // Day caches written before the count existed have nine
+        // columns. Rather than spend requests re-listing them, read the
+        // count off the record stored beside any recording we hold.
+        o->n_data = (nf >= 10) ? (int)strtol(fld[9], NULL, 10) : -1;
 
         o->downloaded = have_audio_on_disk(o->id);
         o->decoded    = o->downloaded && is_decoded(o->id);
+        if (o->n_data < 0 && o->downloaded) {
+            char *json = read_meta(o->id);
+            if (json != NULL) {
+                o->n_data = count_demoddata(json);
+                free(json);
+            }
+        }
         g_n_rows++;
     }
     fclose(f);
@@ -603,6 +776,13 @@ static int load_day(void)
 static int fetchable(const obs_t *o)
 {
     return o->has_audio && !o->downloaded;
+}
+
+// Worth marking if there is a recording anywhere: here to decode, or on
+// SatNOGS to fetch. A pass nobody recorded can only be looked at.
+static int markable(const obs_t *o)
+{
+    return o->has_audio || o->downloaded;
 }
 
 static int passes_filter(const obs_t *o)
@@ -711,7 +891,10 @@ static void job_add_line(const char *text)
 
     // The pull script announces each finished file with an indented
     // arrow and each failure with two bangs; counting those is what
-    // drives the progress figure.
+    // drives the progress figure. A decode is counted by its children
+    // instead -- one to an observation -- so this only reads download
+    // output.
+    if (g_job.kind != JOB_DOWNLOAD) return;
     if (strstr(text, "-> ") != NULL && strstr(text, "satnogs_") != NULL)
         g_job.done++;
     else if (strstr(text, "!! ") != NULL)
@@ -761,10 +944,29 @@ static int job_spawn(char *const argv[], const char *title)
 }
 
 // Hand the next batch of ids to the script. Returns 1 if one started.
+// One observation to a child: decode_passes.sh walks a directory, and
+// the marked set is a scattering of directories rather than a tree.
+static int decode_next_batch(void)
+{
+    long id = g_job.queue[g_job.queue_pos++];
+
+    // decode_passes.sh takes --root as two words, not as --root=<dir>.
+    char root[800], db_arg[800], title[128];
+    snprintf(root,   sizeof root,   "%s/%ld", g_archive, id);
+    snprintf(db_arg, sizeof db_arg, "--db=%s", g_db_path);
+    snprintf(title,  sizeof title,  "decoding %d observation%s",
+             g_job.queue_n, g_job.queue_n == 1 ? "" : "s");
+
+    char *argv[] = { g_decoder, (char *)"--root", root, db_arg, NULL };
+    return job_spawn(argv, title) == 0;
+}
+
 static int job_next_batch(void)
 {
     if (g_job.queue == NULL || g_job.queue_pos >= g_job.queue_n) return 0;
     if (g_job.cancelled) return 0;
+
+    if (g_job.kind == JOB_DECODE) return decode_next_batch();
 
     int n = g_job.queue_n - g_job.queue_pos;
     if (n > IDS_PER_BATCH) n = IDS_PER_BATCH;
@@ -794,27 +996,54 @@ static int job_next_batch(void)
     return job_spawn(argv, title) == 0;
 }
 
-static void job_start_download(void)
+// Marks are a selection, not an instruction: d takes the ones SatNOGS
+// can still send us, p takes the ones already on the disk. So each
+// starts by picking its own half out of the same set.
+static int job_queue_marked(int kind, int (*wanted)(const obs_t *))
 {
     int n = count_marked();
-    if (n == 0) { set_status("nothing marked"); return; }
+    if (n == 0) { set_status("nothing marked"); return 0; }
 
     free(g_job.queue);
     memset(&g_job, 0, sizeof g_job);
+    g_job.kind = kind;
     g_job.queue = malloc((size_t)n * sizeof *g_job.queue);
-    if (g_job.queue == NULL) { set_status("out of memory"); return; }
+    if (g_job.queue == NULL) { set_status("out of memory"); return 0; }
 
     for (int i = 0; i < g_n_rows; i++)
-        if (g_rows[i].marked) g_job.queue[g_job.queue_n++] = g_rows[i].id;
+        if (g_rows[i].marked && wanted(&g_rows[i]))
+            g_job.queue[g_job.queue_n++] = g_rows[i].id;
     g_job.total = g_job.queue_n;
+    return g_job.queue_n;
+}
 
+static int already_here(const obs_t *o) { return o->downloaded; }
+
+static void job_start_download(void)
+{
+    if (job_queue_marked(JOB_DOWNLOAD, fetchable) == 0) {
+        if (count_marked() > 0)
+            set_status("everything marked is already downloaded");
+        return;
+    }
     if (!job_next_batch()) set_status("could not start the download");
+}
+
+static void job_start_decode(void)
+{
+    if (job_queue_marked(JOB_DECODE, already_here) == 0) {
+        if (count_marked() > 0)
+            set_status("nothing marked is downloaded yet -- d fetches it first");
+        return;
+    }
+    if (!job_next_batch()) set_status("could not run %s", g_decoder);
 }
 
 static void job_start_listing(void)
 {
     free(g_job.queue);
     memset(&g_job, 0, sizeof g_job);
+    g_job.kind = JOB_LIST;
 
     char out_arg[800], norad_arg[64], day_arg[64], title[128];
     snprintf(out_arg,   sizeof out_arg,   "--out=%s", g_archive);
@@ -869,15 +1098,29 @@ static void job_poll(void)
     g_job.fd = -1;
     g_job.running = 0;
 
+    // A decode is one child to an observation, so the child's own exit
+    // status is the progress: the script's per-file chatter is about
+    // frames, not about which observation it belonged to.
+    if (g_job.kind == JOB_DECODE) {
+        if (WIFEXITED(st) && WEXITSTATUS(st) == 0) g_job.done++;
+        else                                       g_job.failed++;
+    }
+
     // More ids waiting means this was one batch of several.
     if (!g_job.cancelled && job_next_batch()) return;
 
     // Everything the job could change is on disk now, so re-read it.
+    // A decode also puts rows in the database, which is where the green
+    // in the local column comes from.
+    if (g_job.kind == JOB_DECODE) load_decoded_ids();
     load_day();
     rebuild_view();
 
     if (g_job.cancelled)
         set_status("cancelled after %d of %d", g_job.done, g_job.total);
+    else if (g_job.kind == JOB_DECODE)
+        set_status("decoded %d of %d%s", g_job.done, g_job.total,
+                   g_job.failed ? " (some failed)" : "");
     else if (g_job.total > 0)
         set_status("downloaded %d of %d%s", g_job.done, g_job.total,
                    g_job.failed ? " (some failed)" : "");
@@ -900,6 +1143,20 @@ static void put(int row, int col, int maxw, int attr, const char *text)
     attron(attr);
     mvaddnstr(row, col, buf, maxw);
     attroff(attr);
+}
+
+// Copy text into out, cut to width with a trailing ellipsis when it does
+// not fit. Width is in characters, ellipsis included.
+static void elide(char *out, size_t outn, const char *text, int width)
+{
+    if (width < 0) width = 0;
+    if ((int)strlen(text) <= width) {
+        snprintf(out, outn, "%.*s", width, text);
+        return;
+    }
+    int keep = width - 3;
+    if (keep < 0) keep = 0;
+    snprintf(out, outn, "%.*s...", keep, text);
 }
 
 static const char *local_word(const obs_t *o)
@@ -928,11 +1185,17 @@ static void draw_top_bar(int cols)
     }
     int marked = count_marked();
 
+    // With a filter on, the row numbers stop matching the day's count,
+    // so say how many rows they run to.
+    char shown[32] = "";
+    if (g_n_view != g_n_rows)
+        snprintf(shown, sizeof shown, " (%d shown)", g_n_view);
+
     char line[512];
     snprintf(line, sizeof line,
-             " %s UTC   %d obs  %d audio  %d have  %d decoded   filter: %s   %s",
+             " %s UTC   %d obs  %d audio  %d have  %d decoded   filter: %s%s   %s",
              g_day, g_n_rows, audio, have, decoded,
-             FLT_NAME[g_filter], g_cache_note);
+             FLT_NAME[g_filter], shown, g_cache_note);
     if (marked > 0) {
         char more[64];
         snprintf(more, sizeof more, "   %d marked", marked);
@@ -945,8 +1208,9 @@ static void draw_headings(int cols)
 {
     char line[512];
     snprintf(line, sizeof line,
-             "   %-9s %-8s %5s %4s  %-8s %-8s %s",
-             "id", "start", "len", "el", "status", "local", "station");
+             "   %4s %-9s %-8s %5s %4s %5s  %-8s %-8s %s",
+             "no", "id", "start", "len", "el", "data",
+             "status", "local", "station");
     put(1, 0, cols, A_BOLD, line);
 }
 
@@ -978,12 +1242,35 @@ static void draw_list(int top_row, int height, int cols)
         char el[8];
         snprintf(el, sizeof el, "%.0f", o->max_el);
 
+        // A dash, not a zero: nothing here has been told how many
+        // frames the pass yielded, which is a different thing from
+        // being told that it yielded none.
+        char data[16] = "    -";
+        if (o->n_data >= 0) snprintf(data, sizeof data, "%d", o->n_data);
+
         char line[1024];
-        snprintf(line, sizeof line,
-                 " %c %-9ld %-8s %5s %4s  %-8s %-8s %s",
-                 o->marked ? '*' : ' ',
-                 o->id, hhmmss(o->start), len, el,
-                 o->status, local_word(o), o->station);
+        // The number counts rows as displayed, so it follows the
+        // filter: with one on, row 1 is the first row you can see, not
+        // the first of the day. The station is boxed to a fixed width
+        // here so that the note after it starts in the same column on
+        // every row; the detail pane shows the name in full.
+        int used = snprintf(line, sizeof line,
+                            " %c %4d %-9ld %-8s %5s %4s %5s  %-8s %-8s %-14.14s",
+                            o->marked ? '*' : ' ', vi + 1,
+                            o->id, hhmmss(o->start), len, el, data,
+                            o->status, local_word(o), o->station);
+
+        const char *note = note_for(o->id);
+        if (note[0] != '\0' && used > 0 && used < (int)sizeof line) {
+            // Enough room to say something, or leave it to the detail
+            // pane rather than show an ellipsis and nothing else.
+            int room = cols - used - 1;
+            if (room >= 8) {
+                char cut[NOTE_MAX + 8];
+                elide(cut, sizeof cut, note, room);
+                snprintf(line + used, sizeof line - (size_t)used, " %s", cut);
+            }
+        }
 
         int attr;
         if (vi == g_sel)      attr = attr_for(PAIR_SEL) | A_BOLD;
@@ -1001,14 +1288,18 @@ static void draw_detail(int top_row, int height, int cols)
 
     // Room for the archive path, which is itself up to 768 bytes, plus
     // the sentence around it. The screen truncates what it cannot show.
-    char l[4][1024];
+    char l[5][1024];
     snprintf(l[0], sizeof l[0], "observation %ld   %s to %s",
              o->id, o->start, o->end);
     snprintf(l[1], sizeof l[1], "station %ld  %s   max elevation %.0f deg",
              o->station_id, o->station, o->max_el);
-    snprintf(l[2], sizeof l[2], "SatNOGS status %s   waterfall %s   audio %s",
+    char data[64] = "frames demodulated by SatNOGS unknown";
+    if (o->n_data >= 0)
+        snprintf(data, sizeof data, "%d frame%s demodulated by SatNOGS",
+                 o->n_data, o->n_data == 1 ? "" : "s");
+    snprintf(l[2], sizeof l[2], "SatNOGS status %s   waterfall %s   audio %s   %s",
              o->status, o->waterfall,
-             o->has_audio ? "available" : "none uploaded");
+             o->has_audio ? "available" : "none uploaded", data);
     if (o->downloaded)
         snprintf(l[3], sizeof l[3], "local %s/%ld/   %s",
                  g_archive, o->id,
@@ -1019,7 +1310,15 @@ static void draw_detail(int top_row, int height, int cols)
     else
         snprintf(l[3], sizeof l[3], "nothing to fetch: SatNOGS holds no recording");
 
-    for (int i = 0; i < 4 && i < height; i++)
+    // The row can only show as much of a note as the width allows, so
+    // the pane carries it in full -- and says how to write one.
+    const char *note = note_for(o->id);
+    if (note[0] != '\0')
+        snprintf(l[4], sizeof l[4], "note: %s", note);
+    else
+        snprintf(l[4], sizeof l[4], "no note -- Enter writes one");
+
+    for (int i = 0; i < 5 && i < height; i++)
         put(top_row + i, 1, cols - 1, A_NORMAL, l[i]);
 }
 
@@ -1073,8 +1372,8 @@ static void draw_bottom_bar(int rows, int cols)
         snprintf(line, sizeof line, " c cancel   q quit   ? help");
     else
         snprintf(line, sizeof line,
-                 " arrows move   left/right day   t today  g date  r list   "
-                 "space mark  a all  n none  f filter  d download  q quit  ? help");
+                 " j/k move   h/l day   t today  / date  r list   "
+                 "space mark  a all  n none  f filter  d get  p decode  q quit  ? help");
     put(rows - 1, 0, cols, attr_for(PAIR_BAR), line);
 }
 
@@ -1083,16 +1382,20 @@ static void draw_help(int rows, int cols)
     static const char *const help[] = {
         "satnogs_browser -- what SatNOGS has for this satellite, against what we hold",
         "",
-        "  arrows / PgUp / PgDn / Home / End   move the selection",
-        "  left, right                         previous, next UTC day",
+        "  j, k / arrows / PgUp / PgDn         move the selection",
+        "  gg, G / Home, End                   first, last observation",
+        "  zz                                  centre the selection",
+        "  h, l / left, right                  previous, next UTC day",
         "  t                                   today",
-        "  g                                   go to a date (YYYY-MM-DD)",
+        "  /                                   go to a date (YYYY-MM-DD)",
         "  r                                   list this day from SatNOGS",
+        "  Enter                               write a note on this observation",
         "  space                               mark or unmark an observation",
-        "  a                                   mark every fetchable one in view",
+        "  a                                   mark everything in view with a recording",
         "  n                                   clear all marks",
         "  f, F                                cycle the filter either way",
         "  d                                   download what is marked",
+        "  p                                   decode what is marked into the database",
         "  c                                   cancel a running job",
         "  q, Esc                              quit",
         "",
@@ -1101,9 +1404,24 @@ static void draw_help(int rows, int cols)
         "disk. Downloading audio is not rate limited: it comes from object",
         "storage rather than the API.",
         "",
+        "Green rows are finished: the audio is here and packets from it are in",
+        "the database. Yellow means the recording is here and nothing has read",
+        "it yet -- mark those and press p, which runs the same decoder as the",
+        "nightly batch and skips any file already decoded.",
+        "",
         "An observation shows as `no audio` when SatNOGS itself holds no",
         "recording, which is roughly one pass in three. Those cannot be fetched",
         "by anyone; they are shown so the day's coverage reads honestly.",
+        "",
+        "The `data` column counts the frames SatNOGS demodulated from the pass",
+        "itself. One or two is a beacon; dozens means the pass carried a bulk",
+        "download, which is the quickest way to find the passes worth having. A",
+        "dash means nothing here knows the count yet -- press r to list the day.",
+        "",
+        "A note written with Enter is your own line about the pass -- what it",
+        "carried, why it matters. It shows at the right of the row, cut with an",
+        "ellipsis when the screen is too narrow for it, and in full below. Notes",
+        "live in .notes.tsv at the top of the archive; emptying one deletes it.",
         "",
         "A day with no listing still shows what this station holds for it: the",
         "archive is read at startup and merged into every day. `held` in the",
@@ -1114,25 +1432,47 @@ static void draw_help(int rows, int cols)
         // which tree is being read is the first thing to check when the
         // rows are not the ones you expected.
         "%ARCHIVE%",
-        "",
-        "press any key",
         NULL,
     };
-    erase();
-    for (int i = 0; help[i] != NULL && i + 1 < rows; i++) {
-        if (strcmp(help[i], "%ARCHIVE%") == 0) {
-            char line[1024];
-            snprintf(line, sizeof line, "archive: %s   (%d held, %d decoded)",
-                     g_archive, g_n_local, g_n_decoded);
-            put(i + 1, 2, cols - 4, A_NORMAL, line);
-        } else {
-            put(i + 1, 2, cols - 4, A_NORMAL, help[i]);
-        }
-    }
-    refresh();
+    int n = 0;
+    while (help[n] != NULL) n++;
+
+    // A page at a time, because the text is longer than a short
+    // terminal and the archive path at the end of it is the one line
+    // worth reading when the rows look wrong.
+    int per_page = rows - 3;
+    if (per_page < 1) per_page = 1;
+
     nodelay(stdscr, FALSE);
-    getch();
+    for (int first = 0; first < n; first += per_page) {
+        erase();
+        for (int i = first; i < first + per_page && i < n; i++) {
+            char line[1024];
+            const char *text = help[i];
+            if (strcmp(text, "%ARCHIVE%") == 0) {
+                snprintf(line, sizeof line, "archive: %s   (%d held, %d decoded)",
+                         g_archive, g_n_local, g_n_decoded);
+                text = line;
+            }
+            put(i - first + 1, 2, cols - 4, A_NORMAL, text);
+        }
+        put(rows - 1, 0, cols, attr_for(PAIR_BAR),
+            first + per_page < n ? " any key for more" : " any key to go back");
+        refresh();
+        getch();
+    }
     nodelay(stdscr, TRUE);
+}
+
+// Second half of a vi two-key motion: returns 1 when the key that
+// follows is the one that completes it. Waits about a second, so a
+// dropped keystroke leaves the browser where it was rather than
+// hanging; the main loop's timeout is restored by its next pass.
+static int second_key(int want)
+{
+    timeout(1000);
+    int ch = getch();
+    return ch == want;
 }
 
 // Modal one-line prompt on the bottom bar. Returns 1 if the user
@@ -1171,6 +1511,7 @@ typedef struct {
     const char *archive;
     const char *db;
     const char *pull;
+    const char *decoder;
     const char *day;
     long        norad;
 } args_t;
@@ -1214,6 +1555,12 @@ static int parse_args(args_t *a, int argc, char **argv, int help)
             else a->pull = arg + 14;
             matched = 1;
         }
+        if (strncmp(arg, "--decode-script=", 16) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--decode-script=<path>",
+                                      "decode_passes.sh to run (default: found on PATH)");
+            else a->decoder = arg + 16;
+            matched = 1;
+        }
         if (strcmp(arg, "--help") == 0 || help) {
             if (help) parse_help_line(OPTW, "--help", "show this help and exit");
             else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
@@ -1253,6 +1600,8 @@ int main(int argc, char **argv)
         g_db_path[0] = '\0';
     if (a.pull != NULL)
         snprintf(g_pull, sizeof g_pull, "%s", a.pull);
+    if (a.decoder != NULL)
+        snprintf(g_decoder, sizeof g_decoder, "%s", a.decoder);
 
     struct stat st;
     if (stat(g_archive, &st) != 0 || !S_ISDIR(st.st_mode)) {
@@ -1279,6 +1628,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "satnogs_browser: reading %s ...\n", g_archive);
     scan_local_archive();
     load_decoded_ids();
+    notes_load();
     fprintf(stderr, "satnogs_browser: %d observation%s held locally\n",
             g_n_local, g_n_local == 1 ? "" : "s");
 
@@ -1298,10 +1648,13 @@ int main(int argc, char **argv)
         use_default_colors();
         short sel_bg = (COLORS >= 256) ? 240 : COLOR_WHITE;
         init_pair(PAIR_BAR,     COLOR_WHITE,   COLOR_BLUE);
-        init_pair(PAIR_HAVE,    COLOR_GREEN,   -1);
-        init_pair(PAIR_DECODED, COLOR_CYAN,    -1);
+        // Green is the finished state -- audio here and packets in the
+        // database. Yellow is the half-done one: the recording is on
+        // the disk and nothing has read it yet.
+        init_pair(PAIR_DECODED, COLOR_GREEN,   -1);
+        init_pair(PAIR_HAVE,    COLOR_YELLOW,  -1);
         init_pair(PAIR_NOAUDIO, COLOR_RED,     -1);
-        init_pair(PAIR_MARKED,  COLOR_YELLOW,  -1);
+        init_pair(PAIR_MARKED,  COLOR_CYAN,    -1);
         init_pair(PAIR_SEL,     COLOR_WHITE,   sel_bg);
         init_pair(PAIR_WARN,    COLOR_YELLOW,  -1);
         g_have_color = 1;
@@ -1315,9 +1668,14 @@ int main(int argc, char **argv)
         job_poll();
 
         int rows = LINES, cols = COLS;
-        int pane_h = g_job.running || g_job.n_lines > 0 ? 8 : 5;
-        int list_h = rows - 3 - pane_h;
-        if (list_h < 3) { list_h = 3; pane_h = rows - 3 - list_h; }
+        // Four rows are not the list or the pane: the day bar, the
+        // headings, the separator and the key hints. Counting only
+        // three of them handed the pane a row the bottom bar then
+        // painted over, which is where the last line of a note -- or of
+        // a job's output -- used to go.
+        int pane_h = g_job.running || g_job.n_lines > 0 ? 8 : 6;
+        int list_h = rows - 4 - pane_h;
+        if (list_h < 3) { list_h = 3; pane_h = rows - 4 - list_h; }
         if (pane_h < 1) pane_h = 1;
 
         erase();
@@ -1351,26 +1709,60 @@ int main(int argc, char **argv)
                 if (g_job.running) set_status("a job is running -- c cancels it first");
                 else quit = 1;
                 break;
-            case KEY_UP:    if (g_sel > 0) g_sel--; break;
-            case KEY_DOWN:  if (g_sel + 1 < g_n_view) g_sel++; break;
+            case KEY_UP:   case 'k': if (g_sel > 0) g_sel--; break;
+            case KEY_DOWN: case 'j': if (g_sel + 1 < g_n_view) g_sel++; break;
             case KEY_PPAGE: g_sel -= list_h; if (g_sel < 0) g_sel = 0; break;
             case KEY_NPAGE: g_sel += list_h;
                             if (g_sel >= g_n_view) g_sel = g_n_view ? g_n_view - 1 : 0;
                             break;
-            case KEY_HOME:  g_sel = 0; break;
-            case KEY_END:   g_sel = g_n_view ? g_n_view - 1 : 0; break;
-            case KEY_LEFT:  day_shift(-1); reload_day(); break;
-            case KEY_RIGHT: day_shift(1);  reload_day(); break;
-            case 't':       day_today();   reload_day(); break;
-            case 'g': {
+            case KEY_HOME:            g_sel = 0; break;
+            case KEY_END:  case 'G':  g_sel = g_n_view ? g_n_view - 1 : 0; break;
+            case KEY_LEFT:  case 'h': day_shift(-1); reload_day(); break;
+            case KEY_RIGHT: case 'l': day_shift(1);  reload_day(); break;
+            case 't':                 day_today();   reload_day(); break;
+            // vi's two-key motions. The second key is read here rather
+            // than kept as a mode, so a stray g or z does nothing at
+            // all instead of arming something the next keystroke fires.
+            case 'g':
+                if (second_key('g')) g_sel = 0;
+                break;
+            case 'z':
+                if (second_key('z')) {
+                    g_top = g_sel - list_h / 2;
+                    if (g_top < 0) g_top = 0;
+                }
+                break;
+            case '/': {
                 // Empty, not pre-filled with the current day: with the
                 // cursor at the end of a seeded date, typing appends to
                 // it instead of replacing it, which is never what you
-                // meant by pressing g.
+                // meant by asking to go somewhere.
                 char buf[16] = "";
                 if (prompt("go to date (YYYY-MM-DD): ", buf, sizeof buf, rows, cols)) {
                     if (day_valid(buf)) go_to_day(buf);
                     else set_status("'%s' is not a YYYY-MM-DD date", buf);
+                }
+                break;
+            }
+            case '\n': case '\r': case KEY_ENTER: {
+                if (cur == NULL) break;
+                // Seeded with whatever is already there, so Enter is
+                // how a note is written, corrected and (by emptying it)
+                // taken away again.
+                char buf[NOTE_MAX];
+                snprintf(buf, sizeof buf, "%s", note_for(cur->id));
+                const char *label = "note: ";
+                // The bar does not scroll, so don't accept more than it
+                // can show -- the rest would be typed blind.
+                size_t cap = sizeof buf;
+                if (cols > (int)strlen(label) + 8
+                    && (size_t)cols - strlen(label) - 2 < cap)
+                    cap = (size_t)cols - strlen(label) - 2;
+                if (prompt(label, buf, cap, rows, cols)) {
+                    if (note_set(cur->id, buf))
+                        set_status(buf[0] ? "note saved" : "note removed");
+                    else
+                        set_status("could not write %s/.notes.tsv", g_archive);
                 }
                 break;
             }
@@ -1380,9 +1772,8 @@ int main(int argc, char **argv)
                 break;
             case ' ':
                 if (cur == NULL) break;
-                if (!fetchable(cur)) {
-                    set_status(cur->downloaded ? "already downloaded"
-                                               : "SatNOGS holds no audio for that pass");
+                if (!markable(cur)) {
+                    set_status("SatNOGS holds no audio for that pass");
                 } else {
                     cur->marked = !cur->marked;
                     if (g_sel + 1 < g_n_view) g_sel++;
@@ -1392,11 +1783,15 @@ int main(int argc, char **argv)
                 int n = 0;
                 for (int i = 0; i < g_n_view; i++) {
                     obs_t *o = &g_rows[g_view[i]];
-                    if (fetchable(o) && !o->marked) { o->marked = 1; n++; }
+                    if (markable(o) && !o->marked) { o->marked = 1; n++; }
                 }
                 set_status("marked %d", n);
                 break;
             }
+            case 'p':
+                if (g_job.running) set_status("a job is already running");
+                else job_start_decode();
+                break;
             case 'n': clear_marks(); set_status("marks cleared"); break;
             case 'f': g_filter = (g_filter + 1) % FLT_N; rebuild_view(); break;
             case 'F': g_filter = (g_filter + FLT_N - 1) % FLT_N; rebuild_view(); break;
@@ -1414,6 +1809,7 @@ int main(int argc, char **argv)
     free(g_job.queue);
     free(g_decoded_ids);
     free(g_local);
+    free(g_notes);
     return 0;
 }
 

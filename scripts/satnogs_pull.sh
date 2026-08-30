@@ -663,7 +663,9 @@ while [[ -n "$URL" && "$COUNT_FETCHED" -lt "$MAX_OBS" ]]; do
         # One tab-separated line per observation. An empty payload
         # column means SatNOGS holds no audio for that pass, which is
         # the whole question the browser's day view asks -- the listing
-        # answers it, so nothing downstream has to ask again.
+        # answers it, so nothing downstream has to ask again. The last
+        # column counts the frames SatNOGS itself demodulated from the
+        # pass, which reads as a bulk download when it runs to dozens.
         echo "$RESULTS" | jq -r '.[] | [
                 (.id | tostring),
                 (.start // ""),
@@ -673,7 +675,8 @@ while [[ -n "$URL" && "$COUNT_FETCHED" -lt "$MAX_OBS" ]]; do
                 (.ground_station // "" | tostring),
                 (.station_name // ""),
                 (.max_altitude // "" | tostring),
-                (.payload // "")
+                (.payload // ""),
+                (.demoddata | length | tostring)
             ] | @tsv' >> "$CACHE_TMP"
         COUNT_SEEN=$((COUNT_SEEN + N))
         URL="$NEXT"
