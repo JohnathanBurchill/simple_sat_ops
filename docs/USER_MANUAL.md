@@ -3032,7 +3032,10 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   `p` takes the marked passes already on the disk and runs
   `decode_passes.sh` over each one, into the packet database the browser
   is reading. That decoder is incremental, so a pass already decoded
-  costs nothing to press `p` on again.
+  costs nothing to press `p` on again. A download decodes what it
+  fetched as soon as it finishes — audio nobody has read is not the
+  point — so `d` alone carries a pass all the way into the database, and
+  `p` is for the recordings that were already sitting there.
 
   Each row says whether this station has the audio, and whether that
   audio produced packets — the second read from `session_dir` in the
@@ -3074,7 +3077,11 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   archive lock, the polite delay and the request tally in one place.
   Listing a day is the only thing that costs a request — around 50 for a
   busy day, and nothing at all to revisit it, because the listing is
-  cached on disk. Downloading is free of the throttle entirely. It sets
+  cached on disk. Downloading is free of the throttle entirely. The top
+  bar shows what has gone out in the trailing hour against the ceiling
+  (60 requests without an API token, 240 with one), read from the same
+  `.api_stats.txt` tally the script keeps, so the budget is visible
+  before you spend it rather than in a summary afterwards. It sets
   its own `umask` to 0002, since the archive is a shared setgid tree
   that cron writes as another user.
 * **`decode_passes.sh`** — walk a directory tree, find every `.wav` and

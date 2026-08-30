@@ -131,6 +131,13 @@ enum {
     PAIR_MARKED,
     PAIR_SEL,
     PAIR_WARN,
+    // The same states again on the cursor's background. A row under the
+    // cursor keeps its own colour -- painting it white would hide the
+    // one thing the colour is there to say.
+    PAIR_SEL_HAVE,
+    PAIR_SEL_DECODED,
+    PAIR_SEL_NOAUDIO,
+    PAIR_SEL_MARKED,
 };
 
 typedef struct {
@@ -1030,6 +1037,32 @@ static void job_start_download(void)
     if (!job_next_batch()) set_status("could not start the download");
 }
 
+// Fetching a recording and then leaving it unread is never what was
+// wanted, so a finished download rolls straight into decoding what it
+// actually brought down -- read off the disk rather than off the day
+// view, which may have been paged elsewhere while the job ran. Returns
+// the number of observations handed to the decoder.
+static int job_start_followup_decode(void)
+{
+    if (g_job.queue == NULL || g_job.queue_n == 0) return 0;
+
+    long *keep = malloc((size_t)g_job.queue_n * sizeof *keep);
+    if (keep == NULL) return 0;
+    int n = 0;
+    for (int i = 0; i < g_job.queue_n; i++)
+        if (have_audio_on_disk(g_job.queue[i])) keep[n++] = g_job.queue[i];
+    if (n == 0) { free(keep); return 0; }
+
+    free(g_job.queue);
+    memset(&g_job, 0, sizeof g_job);
+    g_job.kind = JOB_DECODE;
+    g_job.queue = keep;
+    g_job.queue_n = n;
+    g_job.total = n;
+    if (!job_next_batch()) return 0;
+    return n;
+}
+
 static void job_start_decode(void)
 {
     if (job_queue_marked(JOB_DECODE, already_here) == 0) {
@@ -1117,16 +1150,24 @@ static void job_poll(void)
     load_day();
     rebuild_view();
 
-    if (g_job.cancelled)
+    if (g_job.cancelled) {
         set_status("cancelled after %d of %d", g_job.done, g_job.total);
-    else if (g_job.kind == JOB_DECODE)
+    } else if (g_job.kind == JOB_DECODE) {
         set_status("decoded %d of %d%s", g_job.done, g_job.total,
                    g_job.failed ? " (some failed)" : "");
-    else if (g_job.total > 0)
-        set_status("downloaded %d of %d%s", g_job.done, g_job.total,
-                   g_job.failed ? " (some failed)" : "");
-    else
+    } else if (g_job.kind == JOB_DOWNLOAD) {
+        // Read the tally out before the follow-up job clears it.
+        int done = g_job.done, total = g_job.total, failed = g_job.failed;
+        int decoding = job_start_followup_decode();
+        if (decoding > 0)
+            set_status("downloaded %d of %d -- now decoding %d",
+                       done, total, decoding);
+        else
+            set_status("downloaded %d of %d%s", done, total,
+                       failed ? " (some failed)" : "");
+    } else {
         set_status("listing finished");
+    }
 }
 
 // ---------------------------------------------------------------- draw
@@ -1160,6 +1201,18 @@ static void elide(char *out, size_t outn, const char *text, int width)
     snprintf(out, outn, "%.*s...", keep, text);
 }
 
+// The same colour, on the cursor's background.
+static int sel_pair(int pair)
+{
+    switch (pair) {
+        case PAIR_DECODED: return PAIR_SEL_DECODED;
+        case PAIR_HAVE:    return PAIR_SEL_HAVE;
+        case PAIR_NOAUDIO: return PAIR_SEL_NOAUDIO;
+        case PAIR_MARKED:  return PAIR_SEL_MARKED;
+        default:           return PAIR_SEL;
+    }
+}
+
 static const char *local_word(const obs_t *o)
 {
     if (o->decoded)    return "decoded";
@@ -1174,6 +1227,46 @@ static int local_pair(const obs_t *o)
     if (o->downloaded) return PAIR_HAVE;
     if (!o->has_audio) return PAIR_NOAUDIO;
     return 0;
+}
+
+// Requests inside the trailing hour, from the tally satnogs_pull.sh
+// keeps beside the archive -- the same rolling window SatNOGS throttles
+// on. Re-read once a second: it only moves while a child of ours is
+// walking a listing.
+static int api_last_hour(void)
+{
+    static time_t checked = 0;
+    static int    value = 0;
+
+    time_t now = time(NULL);
+    if (now == checked) return value;
+    checked = now;
+    value = 0;
+
+    char path[800];
+    snprintf(path, sizeof path, "%s/.api_stats.txt", g_archive);
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return 0;
+
+    long cutoff = (long)now - 3600;
+    long ts;
+    int calls;
+    while (fscanf(f, "%ld %d", &ts, &calls) == 2)
+        if (ts >= cutoff && calls > 0) value += calls;
+    fclose(f);
+    return value;
+}
+
+// A token lifts the throttle from 60 requests an hour to 240. The
+// script takes one from the environment or from the archive, so the
+// same two places decide which ceiling to show.
+static int api_ceiling(void)
+{
+    if (getenv("SATNOGS_API_TOKEN") != NULL) return 240;
+
+    char path[800];
+    snprintf(path, sizeof path, "%s/.api_token", g_archive);
+    return access(path, R_OK) == 0 ? 240 : 60;
 }
 
 static void draw_top_bar(int cols)
@@ -1194,9 +1287,11 @@ static void draw_top_bar(int cols)
 
     char line[512];
     snprintf(line, sizeof line,
-             " %s UTC   %d obs  %d audio  %d have  %d decoded   filter: %s%s   %s",
+             " %s UTC   %d obs  %d audio  %d have  %d decoded   filter: %s%s   %s"
+             "   API %d/%d per hour",
              g_day, g_n_rows, audio, have, decoded,
-             FLT_NAME[g_filter], shown, g_cache_note);
+             FLT_NAME[g_filter], shown, g_cache_note,
+             api_last_hour(), api_ceiling());
     if (marked > 0) {
         char more[64];
         snprintf(more, sizeof more, "   %d marked", marked);
@@ -1273,10 +1368,14 @@ static void draw_list(int top_row, int height, int cols)
             }
         }
 
-        int attr;
-        if (vi == g_sel)      attr = attr_for(PAIR_SEL) | A_BOLD;
-        else if (o->marked)   attr = attr_for(PAIR_MARKED) | A_BOLD;
-        else                  attr = attr_for(local_pair(o));
+        // The row's own colour decides what it says; the cursor only
+        // changes the background behind it.
+        int pair = o->marked ? PAIR_MARKED : local_pair(o);
+        int attr = attr_for(vi == g_sel ? sel_pair(pair) : pair);
+        if (vi == g_sel || o->marked) attr |= A_BOLD;
+        // Without colour there is no background to change, so the
+        // cursor has to be the reverse-video row.
+        if (vi == g_sel && !g_have_color) attr |= A_REVERSE;
         put(top_row + r, 0, cols, attr, line);
     }
 }
@@ -1404,12 +1503,16 @@ static void draw_help(int rows, int cols)
         "Only the day listing costs a SatNOGS request -- about fifty for a busy",
         "day, and nothing at all to revisit it, because the listing is cached on",
         "disk. Downloading audio is not rate limited: it comes from object",
-        "storage rather than the API.",
+        "storage rather than the API. The top bar counts what has gone out in",
+        "the trailing hour against the ceiling: 60 requests without an API",
+        "token, 240 with one.",
         "",
         "Green rows are finished: the audio is here and packets from it are in",
         "the database. Yellow means the recording is here and nothing has read",
         "it yet -- mark those and press p, which runs the same decoder as the",
-        "nightly batch and skips any file already decoded.",
+        "nightly batch and skips any file already decoded. A download decodes",
+        "what it fetched as soon as it finishes, so d alone carries a pass all",
+        "the way into the database.",
         "",
         "An observation shows as `no audio` when SatNOGS itself holds no",
         "recording, which is roughly one pass in three. Those cannot be fetched",
@@ -1657,7 +1760,11 @@ int main(int argc, char **argv)
         init_pair(PAIR_HAVE,    COLOR_YELLOW,  -1);
         init_pair(PAIR_NOAUDIO, COLOR_RED,     -1);
         init_pair(PAIR_MARKED,  COLOR_CYAN,    -1);
-        init_pair(PAIR_SEL,     COLOR_WHITE,   sel_bg);
+        init_pair(PAIR_SEL,     -1,            sel_bg);
+        init_pair(PAIR_SEL_DECODED, COLOR_GREEN,  sel_bg);
+        init_pair(PAIR_SEL_HAVE,    COLOR_YELLOW, sel_bg);
+        init_pair(PAIR_SEL_NOAUDIO, COLOR_RED,    sel_bg);
+        init_pair(PAIR_SEL_MARKED,  COLOR_CYAN,   sel_bg);
         init_pair(PAIR_WARN,    COLOR_YELLOW,  -1);
         g_have_color = 1;
     }
