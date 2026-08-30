@@ -17,8 +17,11 @@
     That split is also what makes browsing cheap. SatNOGS throttles the
     observations endpoint on its `list` action alone, so a day costs
     about fifty requests to list once and nothing at all thereafter,
-    however often it is revisited; fetching audio is off the meter
-    entirely, because it comes from object storage.
+    however often it is revisited. Fetching audio does not meet that
+    ceiling, because it comes from object storage -- which is not the
+    same as its being free: pulling recordings hard is what got this
+    station's address blocked. The top bar counts downloads beside the
+    requests for that reason.
 
     Layout:
 
@@ -167,15 +170,18 @@ static const char *const FLT_NAME[FLT_N] = {
 };
 
 // Sortable columns, in the order `o` cycles them. Each sorts the way it
-// is worth asking for: a time or an id smallest first, an elevation or
-// a frame count largest first, because sorting by those at all is
-// asking which passes were the good ones.
-enum { ORD_NO = 0, ORD_ID, ORD_START, ORD_EL, ORD_DATA, ORD_N };
-static const char *const ORD_NAME[ORD_N] = { "no", "id", "start", "el", "data" };
+// is worth asking for: a time or an id smallest first, a pass length,
+// an elevation or a frame count largest first, because sorting by those
+// at all is asking which passes were the good ones.
+enum { ORD_NO = 0, ORD_ID, ORD_START, ORD_LEN, ORD_EL, ORD_DATA, ORD_N };
+static const char *const ORD_NAME[ORD_N] = {
+    "no", "id", "start", "len", "el", "data"
+};
 static const char *const ORD_HOW[ORD_N] = {
     "the day's own order",
     "lowest first",
     "earliest first",
+    "longest first",
     "highest first",
     "most frames first",
 };
@@ -839,6 +845,13 @@ static int cmp_view(const void *a, const void *b)
         case ORD_START:
             c = strcmp(x->start, y->start);
             break;
+        case ORD_LEN: {
+            // Longest first, and a pass whose times will not parse (-1)
+            // sits below the shortest real one rather than above them.
+            long lx = pass_seconds(x), ly = pass_seconds(y);
+            c = (ly > lx) - (ly < lx);
+            break;
+        }
         case ORD_EL:
             c = (y->max_el > x->max_el) - (y->max_el < x->max_el);
             break;
@@ -1338,32 +1351,47 @@ static int local_pair(const obs_t *o)
     return 0;
 }
 
-// Requests inside the trailing hour, from the tally satnogs_pull.sh
-// keeps beside the archive -- the same rolling window SatNOGS throttles
-// on. Re-read once a second: it only moves while a child of ours is
-// walking a listing.
-static int api_last_hour(void)
+// What has gone out inside the trailing hour, from the tally
+// satnogs_pull.sh keeps beside the archive -- the same rolling window
+// SatNOGS throttles on. Listings and recordings are counted apart: only
+// the listings meet the API ceiling, but the recordings are the ones
+// that got this station's address blocked in August 2026, so both are
+// worth having in front of you. A record written before the tally
+// separated them has no kind column and is read as a listing.
+//
+// Re-read once a second, which is as often as it can change: the script
+// writes each record as it makes the request.
+static void api_last_hour(int *listings, int *audio)
 {
     static time_t checked = 0;
-    static int    value = 0;
+    static int    n_list = 0, n_audio = 0;
 
     time_t now = time(NULL);
-    if (now == checked) return value;
-    checked = now;
-    value = 0;
+    if (now != checked) {
+        checked = now;
+        n_list = 0;
+        n_audio = 0;
 
-    char path[800];
-    snprintf(path, sizeof path, "%s/.api_stats.txt", g_archive);
-    FILE *f = fopen(path, "r");
-    if (f == NULL) return 0;
-
-    long cutoff = (long)now - 3600;
-    long ts;
-    int calls;
-    while (fscanf(f, "%ld %d", &ts, &calls) == 2)
-        if (ts >= cutoff && calls > 0) value += calls;
-    fclose(f);
-    return value;
+        char path[800];
+        snprintf(path, sizeof path, "%s/.api_stats.txt", g_archive);
+        FILE *f = fopen(path, "r");
+        if (f != NULL) {
+            long cutoff = (long)now - 3600;
+            char line[256];
+            while (fgets(line, sizeof line, f) != NULL) {
+                long ts;
+                int calls;
+                char kind[16] = "list";
+                int n = sscanf(line, "%ld %d %15s", &ts, &calls, kind);
+                if (n < 2 || ts < cutoff || calls <= 0) continue;
+                if (strcmp(kind, "audio") == 0) n_audio += calls;
+                else                            n_list  += calls;
+            }
+            fclose(f);
+        }
+    }
+    *listings = n_list;
+    *audio    = n_audio;
 }
 
 // A token lifts the throttle from 60 requests an hour to 240. The
@@ -1394,13 +1422,19 @@ static void draw_top_bar(int cols)
     if (g_n_view != g_n_rows)
         snprintf(shown, sizeof shown, " (%d shown)", g_n_view);
 
+    // The listing requests carry a ceiling because the API throttles
+    // them; the downloads carry none, which is not the same as their
+    // being free, so they are shown next to it rather than folded in.
+    int reqs = 0, downloads = 0;
+    api_last_hour(&reqs, &downloads);
+
     char line[512];
     snprintf(line, sizeof line,
              " %s UTC   %d obs  %d audio  %d have  %d decoded   filter: %s%s   %s"
-             "   API %d/%d per hour",
+             "   API %d/%d and %d downloads per hour",
              g_day, g_n_rows, audio, have, decoded,
              FLT_NAME[g_filter], shown, g_cache_note,
-             api_last_hour(), api_ceiling());
+             reqs, api_ceiling(), downloads);
     if (marked > 0) {
         char more[64];
         snprintf(more, sizeof more, "   %d marked", marked);
@@ -1411,18 +1445,18 @@ static void draw_top_bar(int cols)
 
 static void draw_headings(int cols)
 {
+    // The sortable columns are the first six of these, in the order the
+    // ORD_ enum lists them, so g_order indexes straight into it.
     static const char *const NAME[9] = {
         "no", "id", "start", "len", "el", "data", "status", "local", "station"
     };
-    // Where each sortable column sits among the headings.
-    static const int SORTED[ORD_N] = { 0, 1, 2, 4, 5 };
 
     // The column the rows are sorted by is capitalised. A marker beside
     // the name would push it wider than the column it heads, and a
     // heading has to stay over the rows it names.
     char h[9][12];
     for (int i = 0; i < 9; i++) snprintf(h[i], sizeof h[i], "%s", NAME[i]);
-    for (char *p = h[SORTED[g_order]]; *p != '\0'; p++)
+    for (char *p = h[g_order]; *p != '\0'; p++)
         *p = (char)toupper((unsigned char)*p);
 
     char line[512];
@@ -1623,12 +1657,19 @@ static void draw_help(int rows, int cols)
         "  c                                   cancel a running job",
         "  q, Esc                              quit",
         "",
-        "Only the day listing costs a SatNOGS request -- about fifty for a busy",
-        "day, and nothing at all to revisit it, because the listing is cached on",
-        "disk. Downloading audio is not rate limited: it comes from object",
-        "storage rather than the API. The top bar counts what has gone out in",
-        "the trailing hour against the ceiling: 60 requests without an API",
-        "token, 240 with one.",
+        "Only the day listing costs a SatNOGS API request -- about fifty for a",
+        "busy day, and nothing at all to revisit it, because the listing is",
+        "cached on disk. The top bar counts those against the ceiling in the",
+        "trailing hour: 60 requests without an API token, 240 with one.",
+        "",
+        "Downloading audio does not meet that ceiling, because the recordings",
+        "come from object storage rather than the API. It is not free, though:",
+        "pulling recordings hard is what got this station's address blocked in",
+        "August 2026, and no ceiling here says when that is about to happen",
+        "again. So the bar counts downloads in the same trailing hour, next to",
+        "the requests -- a figure to keep an eye on rather than one to spend up",
+        "to. d fetches what is marked, so it is worth knowing how much that is",
+        "before pressing it.",
         "",
         "Green rows are finished: the audio is here and packets from it are in",
         "the database. Yellow means the recording is here and nothing has read",
@@ -1648,9 +1689,9 @@ static void draw_help(int rows, int cols)
         "",
         "o sorts the rows by a column, and the sorted column is the capitalised",
         "heading. Each sorts the way it is worth asking for: id and start",
-        "lowest and earliest first, el and data largest first, which is how to",
-        "put the best passes of the day at the top. `no` is the day's own order,",
-        "by start time, and is where o starts.",
+        "lowest and earliest first, len, el and data largest first, which is",
+        "how to put the best passes of the day at the top. `no` is the day's",
+        "own order, by start time, and is where o starts.",
         "",
         "A note written with Enter is your own line about the pass -- what it",
         "carried, why it matters. It shows at the right of the row, cut with an",
