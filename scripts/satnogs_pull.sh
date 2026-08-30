@@ -27,11 +27,17 @@
 #   observation data is public either way — so pass one with
 #   --api-token / $SATNOGS_API_TOKEN when polling often.
 #
-#   Only the listing is throttled. The endpoint installs its rate limit
-#   on the `list` action alone, so a request for one observation is not
-#   counted, and neither is the audio, which comes from object storage
-#   on another host. What this script spends, therefore, is one request
-#   per page of 25 observations in the window it asks for.
+#   Only the listing meets that ceiling. The endpoint installs its rate
+#   limit on the `list` action alone, so a request for one observation
+#   is not counted against it, and neither is the audio, which comes
+#   from object storage on another host. What this script spends against
+#   the ceiling, therefore, is one request per page of 25 observations
+#   in the window it asks for.
+#
+#   Audio being outside the API ceiling does not make it free. Pulling
+#   recordings hard is what got this station's address blocked in August
+#   2026, so downloads are tallied in the same file as the listings and
+#   reported beside them; watch that figure as well as the API one.
 #
 #   In steady state that is a single request per run: 4-minute polling
 #   is 15 requests an hour for one satellite, comfortably inside even
@@ -62,11 +68,12 @@
 #   turns into another block.
 #
 #   Each run ends with a `=== summary` table whose API rows report the
-#   accesses made this run (audio downloads excluded) and the accesses in
-#   the trailing 60 minutes against the ceiling — the same rolling hour the
-#   SatNOGS throttle counts, so a backfill burst ages out instead of
-#   poisoning the figure. The per-archive tally lives in
-#   <out>/.api_stats.txt; delete it to reset.
+#   list requests made this run and the list requests in the trailing 60
+#   minutes against the ceiling — the same rolling hour the SatNOGS
+#   throttle counts, so a backfill burst ages out instead of poisoning
+#   the figure — followed by the recordings fetched in that same hour.
+#   The per-archive tally lives in <out>/.api_stats.txt, one record per
+#   request as it is made; delete it to reset.
 #
 # Usage:
 #   satnogs_pull.sh [--norad-id=<n>] [options]
@@ -299,25 +306,38 @@ to_iso_utc() {
 # observations newer than what we already have.
 STATE_FILE="${OUT}/.latest_start.${NORAD_ID}.txt"
 
-# Per-archive API-access tally: one "<epoch> <calls>" record per request.
-# Records older than an hour age out each run, so the surviving sum is the
-# request count in the trailing 60 minutes — exactly the rolling hour the
-# SatNOGS throttle counts. Not keyed by NORAD ID: the throttle is per
-# client, not per satellite, and every run sharing this archive serialises
-# on the lock, so one shared file reflects the real rate even when several
-# satellites pull into the same --out. Delete it to reset.
+# Per-archive access tally: one "<epoch> <count> <kind>" record per
+# request, where kind is `list` for a throttled API listing and `audio`
+# for a downloaded recording. Records older than an hour age out each
+# run, so the surviving sums are the counts in the trailing 60 minutes —
+# the rolling hour the SatNOGS throttle counts. A record written before
+# the kind column existed has two fields and is read as a listing. Not
+# keyed by NORAD ID: what SatNOGS sees is per client, not per satellite,
+# and every run sharing this archive serialises on the lock, so one
+# shared file reflects the real rate even when several satellites pull
+# into the same --out. Delete it to reset.
 STATS_FILE="${OUT}/.api_stats.txt"
 
-# Count one list request, written to the tally as it is made rather than
+# Count one request, written to the tally as it is made rather than
 # totalled up at the end of the run. Two things need that: a browser
-# watching the file sees the trailing-hour figure climb while a listing
-# is still walking, and a run that is cancelled or killed part way
-# through has still spent those requests, so they have to be on disk
-# already to be counted against the hour. Runs on one archive serialise
-# on the lock above, so appending here cannot race the prune below.
+# watching the file sees the trailing-hour figures climb while a run is
+# still going, and a run that is cancelled or killed part way through
+# has still spent what it spent, so it has to be on disk already to be
+# counted against the hour. Runs on one archive serialise on the lock
+# above, so appending here cannot race the prune below.
 record_api_call() {
     API_CALLS=$((API_CALLS + 1))
-    printf '%s 1\n' "$(date -u +%s)" >> "$STATS_FILE"
+    printf '%s 1 list\n' "$(date -u +%s)" >> "$STATS_FILE"
+}
+
+# Audio is not throttled by the API — it comes from object storage on
+# another host — but it is not free either: a run that pulled recordings
+# hard enough got this station's address blocked in August 2026. It is
+# counted here so the volume is visible while it is happening, rather
+# than being reconstructed from the archive afterwards.
+record_audio_fetch() {
+    AUDIO_FETCHES=$((AUDIO_FETCHES + 1))
+    printf '%s 1 audio\n' "$(date -u +%s)" >> "$STATS_FILE"
 }
 
 # Convert "YYYY-MM-DDTHH:MM:SSZ" to epoch (GNU and BSD date variants).
@@ -619,12 +639,14 @@ COUNT_FETCHED=0
 COUNT_SKIPPED=0
 COUNT_FAILED=0
 COUNT_SEEN=0
-# List-page requests made this run. These are the only requests SatNOGS
-# throttles: the observations endpoint applies its rate limit to the
-# `list` action alone, so nothing else this script does is counted --
-# not the audio, which comes from object storage on another host, and
-# not any per-observation lookup, which this script no longer makes.
+# List-page requests made this run. These are the ones the API throttle
+# counts: the observations endpoint applies its rate limit to the `list`
+# action alone. The audio does not go near that ceiling -- it comes from
+# object storage on another host -- but it is counted separately below,
+# because volume there is what got this station blocked once already.
 API_CALLS=0
+# Recordings fetched this run, tallied alongside the listings.
+AUDIO_FETCHES=0
 NEWEST_START=""
 # Earliest already-happened obs (start < now) we saw without an audio
 # payload yet. Used at the end to clamp the cursor so the next run's
@@ -814,6 +836,7 @@ while [[ -n "$URL" && "$COUNT_FETCHED" -lt "$MAX_OBS" ]]; do
         fi
 
         log "GET $PAYLOAD"
+        record_audio_fetch
         TMP="${AUDIO_FILE}.part"
         if curl_audio -o "$TMP" "$PAYLOAD"; then
             mv -f "$TMP" "$AUDIO_FILE"
@@ -880,16 +903,24 @@ fi
 NOW_EPOCH_STATS="$(date -u +%s)"
 API_WINDOW_START=$((NOW_EPOCH_STATS - 3600))
 API_LAST_HOUR=0
+AUDIO_LAST_HOUR=0
 STATS_TMP="$(mktemp -t satnogs_pull_stats_XXXXXX)"
 if [[ -s "$STATS_FILE" ]]; then
     # Keep only records inside the trailing hour; drop stale or malformed
-    # lines (this also retires the old cumulative-mean file format).
-    while read -r ts calls _; do
+    # lines (this also retires the old cumulative-mean file format). A
+    # record with no kind column predates the audio tally and is a
+    # listing.
+    while read -r ts calls kind; do
         case "$ts"    in ''|*[!0-9]*) continue;; esac
         case "$calls" in ''|*[!0-9]*) continue;; esac
+        [[ -z "$kind" ]] && kind="list"
         if [[ "$ts" -ge "$API_WINDOW_START" ]]; then
-            printf '%s %s\n' "$ts" "$calls" >> "$STATS_TMP"
-            API_LAST_HOUR=$((API_LAST_HOUR + calls))
+            printf '%s %s %s\n' "$ts" "$calls" "$kind" >> "$STATS_TMP"
+            if [[ "$kind" == "audio" ]]; then
+                AUDIO_LAST_HOUR=$((AUDIO_LAST_HOUR + calls))
+            else
+                API_LAST_HOUR=$((API_LAST_HOUR + calls))
+            fi
         fi
     done < "$STATS_FILE"
 fi
@@ -909,6 +940,7 @@ log "done (norad ${NORAD_ID})"
     printf '    %-22s %s\n' "failed:"             "$COUNT_FAILED"
     printf '    %-22s %s\n' "list requests (run):" "$API_CALLS"
     printf '    %-22s %s\n' "list reqs (last hr):" "${API_LAST_HOUR} / ${API_CEILING}"
+    printf '    %-22s %s\n' "audio got (last hr):" "$AUDIO_LAST_HOUR"
     # Only the polling run has a cursor; the browser modes deliberately
     # leave it alone, so printing one there would misdescribe what the
     # run just did.
