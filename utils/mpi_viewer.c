@@ -62,6 +62,12 @@
         18..19 integration period            (big-endian uint16)
         22..151 pixels, 65 big-endian uint16 (per the First Light notebook)
 
+    Data coverage: under the aux panel sits a map of the whole reconstructed
+    file -- byte 0 at the top left, the last byte at the bottom right, reading
+    left to right then down. Green is a byte that came down, black one that
+    never did. Each pixel stands for a slice of the file and goes black as soon
+    as any byte in its slice is missing, so a single lost packet still shows.
+
     Re-download export: press d to write the telecommands that fetch whatever of
     the selected experiment never came down -- the holes snapped out to the
     file's 195-byte downlink packet grid and merged into the fewest commands, as
@@ -1250,6 +1256,29 @@ static void export_redownload(const experiment_t *s, const char *db_path,
              have_path ? "" : " (file path is a placeholder)");
 }
 
+// ---- data-coverage patch ---------------------------------------------------
+// The reconstructed file drawn as a patch of pixels: byte 0 at the top left,
+// the last byte at the bottom right, reading left to right then down. Green
+// where a byte came down, black where it never did. One pixel stands for a
+// slice of the file and goes black as soon as any byte in its slice is missing,
+// so even a one-packet hole is visible.
+
+static void build_coverage(const experiment_t *s, Color *pix, int w, int h)
+{
+    long ncell = (long) w * (long) h;
+    for (long i = 0; i < ncell; i++) {
+        long b0 = (long) ((double) s->size * (double) i / (double) ncell);
+        long b1 = (long) ((double) s->size * (double) (i + 1) / (double) ncell);
+        if (b1 <= b0) b1 = b0 + 1;
+        if (b1 > s->size) b1 = s->size;
+        int missing = 0;
+        for (long b = b0; b < b1; b++) {
+            if (!s->present[b]) { missing = 1; break; }
+        }
+        pix[i] = missing ? (Color){ 8, 8, 10, 255 } : (Color){ 89, 184, 85, 255 };
+    }
+}
+
 // ---- main ------------------------------------------------------------------
 
 int main(int argc, char **argv)
@@ -1324,6 +1353,12 @@ int main(int argc, char **argv)
     char  status[200] = "";
     float status_left = 0.0f;
 
+    // Data-coverage map: one texture pixel per slice of the reconstructed file,
+    // rebuilt when the experiment changes or the patch is resized.
+    Color    *cov_pix = NULL;
+    Texture2D cov_tex = {0};
+    int cov_w = 0, cov_h = 0, cov_sel = -1;
+
     while (!WindowShouldClose()) {
         experiment_t *s = &exps[v.sel];
 
@@ -1373,6 +1408,7 @@ int main(int argc, char **argv)
                 v.img_pos = save_img;
                 v.playing = save_play;
                 s = &exps[v.sel];
+                cov_sel = -1;   // the reloaded experiment needs a fresh coverage map
             } else if (ne != NULL) {
                 free_experiments(ne, nn);
             }
@@ -1501,6 +1537,40 @@ int main(int argc, char **argv)
         draw_text(TextFormat("playback      : %s  %.0f img/s", v.playing ? "PLAY" : "paused", v.ips),
                   ax, ay, 15, v.playing ? (Color){ 120, 220, 160, 255 } : GRAY); ay += 20;
 
+        // data-coverage patch, under the aux panel: the whole reconstructed
+        // file, green where the bytes came down and black where they never did
+        ay += 8;
+        draw_text("Data coverage", ax, ay, 18, RAYWHITE); ay += 24;
+        int cw = GetScreenWidth() - ax - 20;
+        if (cw > 340) cw = 340;
+        int ch = GetScreenHeight() - 68 - ay;
+        if (cw >= 40 && ch >= 24) {
+            if (cw != cov_w || ch != cov_h) {
+                Color *np = (Color *) realloc(cov_pix, (size_t) cw * (size_t) ch * sizeof *cov_pix);
+                if (np != NULL) {
+                    cov_pix = np; cov_w = cw; cov_h = ch;
+                    if (cov_tex.id != 0) UnloadTexture(cov_tex);
+                    build_coverage(s, cov_pix, cov_w, cov_h);
+                    cov_sel = v.sel;
+                    Image ci = { .data = cov_pix, .width = cov_w, .height = cov_h,
+                                 .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
+                    cov_tex = LoadTextureFromImage(ci);
+                }
+            } else if (cov_sel != v.sel) {
+                build_coverage(s, cov_pix, cov_w, cov_h);
+                cov_sel = v.sel;
+                UpdateTexture(cov_tex, cov_pix);
+            }
+            if (cov_tex.id != 0) {
+                DrawTexture(cov_tex, ax, ay, WHITE);
+                DrawRectangleLines(ax - 1, ay - 1, cov_w + 2, cov_h + 2, (Color){ 70, 70, 80, 255 });
+                draw_text(TextFormat("%.1f%% of %.0f KB down, %.0f KB missing",
+                                     100.0 * (double) s->recovered / (double) s->size,
+                                     s->size / 1024.0, (s->size - s->recovered) / 1024.0),
+                          ax, ay + cov_h + 6, 13, GRAY);
+            }
+        }
+
         // the d-export outcome, above the help footer
         if (status_left > 0.0f)
             draw_text(status, 12, GetScreenHeight() - 42, 14, (Color){ 120, 220, 160, 255 });
@@ -1516,11 +1586,13 @@ int main(int argc, char **argv)
     }
 
     UnloadTexture(tex);
+    if (cov_tex.id != 0) UnloadTexture(cov_tex);
     if (g_ui_font_loaded) UnloadFont(g_ui_font);
     CloseWindow();
 
     free_experiments(exps, nexp);
     free(v.fr_img);
+    free(cov_pix);
     return 0;
 }
 
