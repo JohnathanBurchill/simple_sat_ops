@@ -2562,12 +2562,14 @@ a satellite-reported minimum, or (when the log never named it) the largest offse
 received. That last case is the only one where the percentage is measured against
 a guess; see `mpi_reconstruct` above for how the length is established.
 
-A **white box** on the whereogram marks the stretch the image on screen was
-built from, so you can see where in the recording you are as you scrub or play.
-An image is only a few pixels wide on a panel holding a whole recording, so the
-box is placed to the pixel rather than rounded out to whole columns; where an
-image comes out narrower than three pixels the box is widened to that, since
-below it there is no inside left to draw.
+A **small white arrow** just under the whereogram, its point on the panel's
+bottom edge, marks the first frame of the image on screen, so you can see where
+in the recording you are as you scrub or play. An image is only a few pixels
+wide on a panel holding a whole recording, so the arrow is placed to the pixel
+rather than rounded out to whole columns, and sitting below the panel it hides
+no columns at all. It replaces the box that used to be drawn around the image's
+whole byte span, which at that width was nearly all outline and hid the little
+it enclosed.
 **Clicking jumps to the image at that moment**, and **dragging scrubs** - the
 picture follows the pointer for as long as the button is held, so you can run
 through an experiment by hand and stop where something looks interesting. Either

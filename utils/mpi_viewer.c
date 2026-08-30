@@ -2218,12 +2218,11 @@ static void build_whereogram(const view_t *v, const experiment_t *s,
 // offset a column stands for -- the two directions of the same mapping, used to
 // place the playback head and to turn a pointer position back into an image.
 //
-// The head is placed in panel pixels rather than in whole columns. An image is
-// only a few pixels wide on a panel holding a whole recording, so rounding its
-// byte span out to the columns that contain it drew a box with a margin of
-// recording inside it that the image does not hold. The right edge is not
-// pulled back inside the panel either, so passing the byte one past the span
-// gives the box's exclusive right edge.
+// The head is placed in panel pixels rather than in whole columns, so the arrow
+// points at where the image's first frame actually sits rather than at the
+// column that happens to contain it. Nothing is pulled back inside the panel
+// either, so passing the byte one past a span gives that span's exclusive right
+// edge.
 static int wg_x_of_byte(const experiment_t *s, int w, long byte)
 {
     long nslot = s->size / FRAME_STRIDE;
@@ -2982,18 +2981,29 @@ int main(int argc, char **argv)
                     DrawRectangle(x, ay - 5, xe - x, 3, (Color){ 220, 60, 60, 255 });
                 }
 
-                // Playback head: the stretch of the recording the shown image
-                // was built from, sitting exactly on it -- on the panel's own
-                // rows and on the pixels its frames occupy, with none of the
-                // outward rounding that used to leave a margin inside the box.
-                // Three pixels is the narrowest it can be and still have an
-                // inside; below that the image is thinner than its own outline.
+                // Playback head: a small arrow just under the whereogram with
+                // its point on the panel's bottom edge, at the first frame of
+                // the shown image. An image is only a few pixels wide on a
+                // panel holding a whole recording, so the box that used to be
+                // drawn around its byte span was nearly all outline and covered
+                // the little it enclosed; an arrow marks the same place and
+                // leaves every column to be read.
+                //
+                // The vertices go apex, bottom left, bottom right. raylib culls
+                // a triangle wound the other way and draws nothing at all --
+                // measured, by rendering both orders into an off-screen texture
+                // and counting the pixels that came out: this order 18, the
+                // other 0. (decode_inspector's arrowheads are wound the other
+                // way and do not draw.)
                 long pb0 = 0, pb1 = 0;
                 if (v.n_img > 0 && image_byte_span(&v, s, v.img_pos, &pb0, &pb1)) {
-                    int x0 = ax + wg_x_of_byte(s, cw, pb0);
-                    int x1 = ax + wg_x_of_byte(s, cw, pb1);
-                    if (x1 - x0 < 3) x1 = x0 + 3;
-                    DrawRectangleLines(x0, ay, x1 - x0, ch, RAYWHITE);
+                    float px = (float) (ax + wg_x_of_byte(s, cw, pb0));
+                    float edge = (float) (ay + ch);
+                    Vector2 apex = { px, edge };
+                    Vector2 bl = { px - 3.0f, edge + 6.0f };
+                    Vector2 br = { px + 3.0f, edge + 6.0f };
+                    DrawTriangle(apex, bl, br, RAYWHITE);
+                    DrawTriangleLines(apex, bl, br, (Color){ 18, 18, 22, 255 });
                 }
 
                 draw_text(TextFormat("%.1f%% of %.0f KB down, %.0f KB missing  (%s)",
