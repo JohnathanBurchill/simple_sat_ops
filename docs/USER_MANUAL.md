@@ -3023,9 +3023,9 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   days, `gg` and `G` go to the first and last row, `zz` centres the
   selection. `t` jumps to today and `/` to a date, `r` lists the day
   from SatNOGS, `space` marks, `a` marks everything in view that has a
-  recording, `d` downloads what is marked, `p` decodes what is marked,
-  and `f` cycles the filter (all, with audio, not downloaded,
-  downloaded, decoded).
+  recording, `D` marks just the ones that carried data, `d` downloads
+  what is marked, `p` decodes what is marked, and `f` cycles the filter
+  (all, with audio, not downloaded, downloaded, decoded).
 
   Marks are a selection rather than an instruction, so the same set
   serves both jobs: `d` takes the marked passes SatNOGS can still send,
@@ -3048,7 +3048,9 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   the record stored beside a recording. One or two is a beacon; dozens
   means the pass carried a bulk download, which makes it the quickest
   way to find the passes worth having. A dash means nothing on this disk
-  knows the count — list the day with `r`.
+  knows the count — list the day with `r`. `D` marks every pass in view
+  the count says carried something, which on a listed day is the whole
+  of the day's science in one keystroke.
 
   `Enter` writes a note against the selected observation — your own line
   about what the pass carried, shown at the right of the row (cut with

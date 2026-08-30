@@ -44,7 +44,8 @@
       r                list this day from SatNOGS (or re-list it)
       Enter            write a note against the selected observation
       space            mark / unmark the selected observation
-      a                mark every fetchable observation in view
+      a                mark every observation in view with a recording
+      D                mark the ones that carried data
       n                clear all marks
       f | F            cycle the filter forwards / backwards
       d                download the marked observations
@@ -1372,8 +1373,8 @@ static void draw_bottom_bar(int rows, int cols)
         snprintf(line, sizeof line, " c cancel   q quit   ? help");
     else
         snprintf(line, sizeof line,
-                 " j/k move   h/l day   t today  / date  r list   "
-                 "space mark  a all  n none  f filter  d get  p decode  q quit  ? help");
+                 " j/k move  h/l day  t today  / date  r list  "
+                 "space mark  a all  D data  n none  f filter  d get  p decode  q quit  ? help");
     put(rows - 1, 0, cols, attr_for(PAIR_BAR), line);
 }
 
@@ -1392,6 +1393,7 @@ static void draw_help(int rows, int cols)
         "  Enter                               write a note on this observation",
         "  space                               mark or unmark an observation",
         "  a                                   mark everything in view with a recording",
+        "  D                                   mark the ones that carried data",
         "  n                                   clear all marks",
         "  f, F                                cycle the filter either way",
         "  d                                   download what is marked",
@@ -1786,6 +1788,26 @@ int main(int argc, char **argv)
                     if (markable(o) && !o->marked) { o->marked = 1; n++; }
                 }
                 set_status("marked %d", n);
+                break;
+            }
+            case 'D': {
+                // The passes that carried something. Marking adds, the
+                // way a does, so D after a filter or a marks a few more
+                // rather than starting the selection over.
+                int n = 0, unknown = 0;
+                for (int i = 0; i < g_n_view; i++) {
+                    obs_t *o = &g_rows[g_view[i]];
+                    if (o->n_data < 0) unknown++;
+                    if (markable(o) && o->n_data > 0 && !o->marked) {
+                        o->marked = 1;
+                        n++;
+                    }
+                }
+                if (n == 0 && unknown > 0)
+                    set_status("no count for %d of these -- press r to list the day",
+                               unknown);
+                else
+                    set_status("marked %d with data", n);
                 break;
             }
             case 'p':
