@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`aaea93b` (2026-08-30). This is a working draft.
+`d631396` (2026-08-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -3003,6 +3003,13 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   guard: it stops an observation whose audio never arrives from pinning
   the cursor in place.
 
+  The API token is looked for in `--api-token`, then `$SATNOGS_API_TOKEN`,
+  then the first line of `<out>/.api_token`. Prefer the file: it is the
+  only place both cron and an operator's shell look, so the token stops
+  living in two places that can disagree. Keep it mode 640 — the script
+  says so if it is readable by everyone. It must be the **Network**
+  token; a SatNOGS DB token is a different credential and comes back 401.
+
   `--decode` runs the decoder on each new pass as it lands.
   `--cache-day=YYYY-MM-DD` lists one UTC day into
   `<out>/.daycache/<norad>/` and downloads nothing, and
@@ -3025,12 +3032,24 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   of all observations; nobody can fetch those, and they are shown so a
   day's coverage reads honestly.
 
+  A day with no SatNOGS listing yet still shows what this station holds
+  for it. The archive is filed by observation id rather than by date, so
+  the browser walks it once at startup and dates each recording from its
+  filename; those observations then merge into every day view, reading
+  their station and status from the record stored beside the audio.
+  `held` in the status column means exactly that — the recording is
+  here, and SatNOGS has not been asked about that day. `?` shows which
+  archive is being read and how much was found in it, which is the first
+  thing to check if the rows aren't the ones you expected.
+
   The browser makes no network requests of its own. It reads the day
   caches and spawns `satnogs_pull.sh` for anything else, which keeps the
   archive lock, the polite delay and the request tally in one place.
   Listing a day is the only thing that costs a request — around 50 for a
   busy day, and nothing at all to revisit it, because the listing is
-  cached on disk. Downloading is free of the throttle entirely.
+  cached on disk. Downloading is free of the throttle entirely. It sets
+  its own `umask` to 0002, since the archive is a shared setgid tree
+  that cron writes as another user.
 * **`decode_passes.sh`** — walk a directory tree, find every `.wav` and
   `.ogg`, run `rx_replay` on each (resampling `.ogg` first), and
   summarize what decoded. Beacons print as readable telemetry; anything
