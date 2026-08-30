@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`7d074a0` (2026-08-30). This is a working draft.
+`50ee4bf` (2026-08-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2413,10 +2413,11 @@ its `dome target V` is one setpoint ahead of the column it is drawn in.
 **Cleaned imagery (`b`).** The MPI subtracts a background of its own in the
 FPGA, and `b` undoes that and puts a better one in its place, for the image and
 the whereogram together. `b` turns it on and off; **`shift-B`, while it is on,
-moves between the steps** - stopping after step 1 rather than running both - so
-you can see what each step did rather than only the end of it. With cleaning off
-there is no step to pick and `shift-B` does nothing. Turning cleaning back on
-returns to whichever step you left it showing. What arrives from the instrument is
+moves between the steps** - stopping after step 1 or step 2 rather than running
+all three - so you can see what each step did rather than only the end of it.
+With cleaning off there is no step to pick and `shift-B` does nothing. Turning
+cleaning back on returns to whichever step you left it showing. What arrives
+from the instrument is
 `raw - background + 2000`: it keeps a 0 V frame as its no-ion-signal background,
 takes those counts off every frame that follows, and lands the result on a fixed
 ~2000 DN offset. The frame it kept is sent as measured.
@@ -2428,11 +2429,21 @@ after it sit at - and then makes the cadence confirm them, since a frame can
 read high for other reasons: it takes the interval to be the median spacing of
 the candidates and keeps only the beat most of them share. On the 2026-07-21
 recording that finds 14, at counters 73, 329, 585 ... 3401, exactly 256 apart,
-and rejects an impostor at counter 2425. With this done the recording sits at
-one level and the whereogram's bright stripes go - the frame the instrument kept
-was raw counts already, and now so is everything else.
+and rejects an impostor at counter 2425. With this done the whereogram's bright
+stripes go - the frame the instrument kept was raw counts already, and now so is
+everything else - and the recording sits at close to one level, stepping between
+one 256-frame range and the next where a range's own estimate had drifted by the
+end of it.
 
-Second, a local background is taken off again and the 2000 DN put back. The
+Second, every frame is detrended across its own strip. A straight line is fitted
+by least squares through its **first two and last two pixels (indexes 0, 1, 63
+and 64)** and subtracted from the strip pixel by pixel, in floating point, with
+the 2000 DN offset put back on. Because a least-squares fit with an intercept
+leaves its residuals summing to zero, those four pixels average 2000 again, so
+no frame sits at a level of its own: the 256-frame block shifts go with the
+levels they were riding on, and a tilt across the strip goes with them.
+
+Third, a local background is taken off again and the 2000 DN put back. The
 first frame of an image is the 0 V dwell read back, so by construction it holds
 no ion signal. The viewer combines those first frames over the **N images
 centred on the current one** (5 by default; `n` cycles 1, 3, 5, 7, 9, and the
@@ -2465,19 +2476,46 @@ done in floating point.
 
 What comes out has the same form the instrument sends, `raw - background + 2000`,
 and differs only in the background being one measured a few images away rather
-than one up to 255 frames stale. On the two recordings **99.1% and 99.8% of
-frames land within 200 DN of 2000**, with a tail out to a few hundred where ions
-were rammed in, and the sunlight depressions and beams survive intact. Because a
+than one up to 255 frames stale. Measured on the two-step pipeline, before the
+edge detrending was added, **99.1% and 99.8% of frames** on the two recordings
+landed within 200 DN of 2000, with a tail out to a few hundred where ions were
+rammed in, and the sunlight depressions and beams survive intact. Because a
 cleaned count is on the same scale as a raw one, the same DN window serves both
 modes and toggling does not move the scale under you.
 
 The aux panel reports how many estimates were found, how far apart they ran, how
 many images yielded a usable sample and how many windows came up short, and how
-many frames came before the first estimate (those precede any estimate and are
-left as they arrived).
+many frames came before the first estimate. Those frames precede any estimate,
+so step 1 has nothing to add back for them and does not show them; from step 2
+on they are detrended onto the same footing as the rest and are shown.
+
+**The time ruler (drag the whereogram).** A press on the whereogram jumps to the
+image at that moment in the recording and dragging scrubs, as before. While the
+button is down the drag is also a ruler: the stretch between where the press
+landed and where the pointer is now is marked on the panel, and the times of its
+two ends are read out above it in UTC with the span between them
+(`06:33:41.2 to 06:35:07.8 UTC   1 m 26.6 s`). It measures the recording rather
+than the screen - the ends are the capture times of the frames nearest those two
+bytes - so a stretch that never came down costs no time, just as it takes up no
+columns. The readout needs times on both ends; frames whose capture time never
+came down are passed over rather than answered with, and if no frame of the
+recording carries one the band is drawn without a label.
+
+**What it remembers between sessions.** On exit the viewer writes
+`~/.local/state/simple_sat_ops/mpi_viewer.state` - which experiment was open,
+where the playhead sat in it, the cleaning stage and its window and estimator,
+the colour map, the colour scale and its manual DN window, the playback speed,
+the frames-per-sweep override, the zoom, and the size and place of the window -
+and reads it back at startup, printing a line naming what it resumed. The
+experiment is matched by its start time, so a database that no longer holds it
+opens on the first one with the view settings still restored. It is plain
+`key = value` text: edit it by hand, or delete it to come back up on the
+defaults. Every value is range-checked on the way in, and a key the file does
+not carry keeps its built-in default, so a file written by another build is
+still worth reading.
 
 Keys: `Up`/`Down` change experiment, `Left`/`Right` scrub images (or click or
-drag the whereogram to scrub through the recording), `Space` plays/pauses, `,`/`.`
+drag the whereogram to scrub, which also rules off the time it spans), `Space` plays/pauses, `,`/`.`
 set the playback speed, `f` cycles frames-per-image (auto/8/16), `s` zoom, `a` cycles the colour scale (auto-image / auto-experiment
 / manual), `r` resets it to auto-image, `z`/`x` and `c`/`v` move the manual DN
 window (hold `Shift` for coarse steps), `m` cycles the colour map, `b` toggles

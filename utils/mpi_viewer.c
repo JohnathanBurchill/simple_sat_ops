@@ -118,7 +118,12 @@
     the whereogram. Step 1 undoes that exactly -- add the range's background
     frame back on and take the 2000 DN off -- which leaves raw counts, and the
     stripes go, the frame the instrument kept having been raw counts already.
-    Step 2 subtracts a background again, but a local one: the first frame of an
+    Step 2 detrends every frame across its own strip: a straight line fitted by
+    least squares through its first two and last two pixels (0, 1, 63 and 64)
+    comes off the strip pixel by pixel and the 2000 DN goes back on, which takes
+    out the block shifts a range corrected with an estimate that had drifted by
+    the end of it leaves behind, and any tilt across the strip with them.
+    Step 3 subtracts a background again, but a local one: the first frame of an
     image is the 0 V dwell read back and so holds no ion signal, and the
     pixel-by-pixel median (or mean, e) of those over the five images centred on
     this one (n cycles 1..9) comes off every frame of the image, with the 2000
@@ -129,11 +134,10 @@
     of the window.
     What is left has the same form the instrument sends, raw - background +
     2000, and differs only in the background being one measured a few images
-    away instead of one up to 255 frames stale: 99% of frames land within 200 DN
-    of that level, with a tail out to a few hundred where ions were rammed in.
+    away instead of one up to 255 frames stale.
     The toggle applies to the image and the whereogram together. shift-B, while
-    cleaning is on, stops after step 1 instead of running both, which is how you
-    see what each step did rather than only the end of it.
+    cleaning is on, stops after step 1 or step 2 instead of running all three,
+    which is how you see what each step did rather than only the end of it.
 
     Whereogram: under the aux panel sits the whole recording as one spectrum,
     every frame a column of its 65 intensities, time left to right and arrival
@@ -142,6 +146,20 @@
     is the file rather than the frames in hand, so a stretch that never came
     down takes its own width instead of being closed up, and is marked by a red
     rule above the panel. m cycles the colour map, which the image shares.
+
+    Time ruler: a press on the whereogram jumps to that moment in the recording
+    and dragging scrubs, and while the button is down the drag also measures.
+    The stretch between where the press landed and the pointer is marked on the
+    panel, with the times of its two ends read out in UTC and the span between
+    them. It measures the recording, not the screen: the ends are the capture
+    times of the frames nearest those two bytes, so a stretch that never came
+    down costs no time, the same way it takes up no columns.
+
+    Between sessions: on exit the viewer writes which experiment was open, where
+    the playhead sat, and every view setting to
+    ~/.local/state/simple_sat_ops/mpi_viewer.state, and reads it back at
+    startup. Plain key = value text, checked on the way in; delete it to come
+    back up on the defaults.
 
     Re-download export: press d to write the telecommands that fetch whatever of
     the selected experiment never came down -- the holes snapped out to the
@@ -194,8 +212,10 @@
 
 #include "bulk_size.h"
 #include "packet_db.h"
+#include "sso_paths.h"
 #include "sso_version.h"
 
+#include <ctype.h>
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
@@ -361,6 +381,32 @@ static void fmt_utc_s(double ts_ms, char *out, size_t n)
     snprintf(out, n, "%04d-%02d-%02d %02d:%02d:%02d",
              tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
              tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+}
+
+// "17:23:04.1" (UTC) from a unix-ms timestamp: the time of day alone, tenths
+// of a second, for the two ends of a drag across the whereogram. The date is
+// already on the panel above, and one recording runs for minutes.
+static void fmt_tod_ms(double ts_ms, char *out, size_t n)
+{
+    time_t secs = (time_t) (ts_ms / 1000.0);
+    int tenths = (int) ((ts_ms - (double) secs * 1000.0) / 100.0);
+    struct tm tmv;
+    gmtime_r(&secs, &tmv);
+    snprintf(out, n, "%02d:%02d:%02d.%d",
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec, tenths);
+}
+
+// How long a stretch of recording lasted: "37.5 s" under a minute, "2 m 05.3 s"
+// over one.
+static void fmt_span(double ms, char *out, size_t n)
+{
+    double sec = ms / 1000.0;
+    if (sec < 60.0) {
+        snprintf(out, n, "%.1f s", sec);
+        return;
+    }
+    int min = (int) (sec / 60.0);
+    snprintf(out, n, "%d m %04.1f s", min, sec - 60.0 * (double) min);
 }
 
 // "20260721T172300" (UTC) from a unix-ms timestamp, for export filenames.
@@ -1330,11 +1376,21 @@ static void rebuild_image_list(view_t *v, const experiment_t *s)
 // Step 1 undoes exactly that, frame by frame: add back the range's background
 // frame and take off the 2000 DN offset, which leaves the raw counts. The
 // stripes go, because the frame the instrument kept was already raw counts and
-// now everything else is too. What is left is one level across the recording,
-// depressed where sunlight or an electron beam takes signal away and raised
-// where rammed ions add it.
+// now everything else is too. What is left is close to one level across the
+// recording -- depressed where sunlight or an electron beam takes signal away
+// and raised where rammed ions add it -- but it steps between one range of 256
+// frames and the next: each range was corrected with an estimate of its own,
+// and one that has drifted by the end of its range leaves that whole block of
+// frames sitting off its neighbours.
 //
-// Step 2 subtracts a background again, but a local one that cannot go stale.
+// Step 2 detrends every frame across its own strip. A straight line is fitted
+// by least squares through its first two and last two pixels -- 0, 1, 63 and
+// 64 -- and comes off the strip pixel by pixel in floating point, with the 2000
+// DN offset put back on. Those four pixels then average 2000 again, so no frame
+// sits at a level of its own and the block shifts go with the levels they were
+// riding on; a tilt across the strip goes with them.
+//
+// Step 3 subtracts a background again, but a local one that cannot go stale.
 // The first frame of an image is the 0 V dwell read back, so by construction it
 // holds no ion signal and is a measurement of the background alone. For each
 // image we take the first frames of the clean_win images centred on it (5 by
@@ -1368,11 +1424,11 @@ static void rebuild_image_list(view_t *v, const experiment_t *s)
 // after any of its steps. b turns cleaning on and off, and shift-B picks which
 // step to stop after, which is only a question worth asking while it is on.
 // Seeing a step on its own is how you tell which of them did what -- step 1
-// alone is the whole recording flat at its raw level, with the sunlight
-// depressions and the ion enhancements the only things left standing on it.
+// alone is the whole recording at its raw level, with the block shifts the
+// ranges arrive on still standing, and step 2 is those shifts taken out.
 // Adding a step later means one more name here and one more block in
 // rebuild_clean; shift-B picks it up on its own.
-enum { CLEAN_OFF, CLEAN_STEP1, CLEAN_FULL, CLEAN_STAGES };
+enum { CLEAN_OFF, CLEAN_STEP1, CLEAN_STEP2, CLEAN_FULL, CLEAN_STAGES };
 
 // Frames after a candidate whose level says what the instrument has been taking
 // off them, and how far above that level a real background estimate stands.
@@ -1381,8 +1437,8 @@ enum { CLEAN_OFF, CLEAN_STEP1, CLEAN_FULL, CLEAN_STAGES };
 #define CLEAN_WIN_MAX     9
 
 // The fixed offset the instrument's own background subtraction lands on, in DN.
-// Step 1 takes it off to recover the raw counts, and step 2 puts it back so a
-// cleaned frame reads on the same scale a raw one does: the same DN window
+// Step 1 takes it off to recover the raw counts, and steps 2 and 3 put it back
+// so a cleaned frame reads on the same scale a raw one does: the same DN window
 // serves both modes, and nothing has to go negative to say "less signal than
 // the background". Measured at 1930 to 1950 DN on both recordings.
 #define CLEAN_PEDESTAL    2000.0
@@ -1540,7 +1596,7 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
     // background frame at or before it in the file, so a range whose own
     // estimate never came down carries the one before it instead of going
     // uncorrected -- the background drifts only a few hundred DN across a
-    // range, and step 2 takes off whatever is left of it either way. The frame
+    // range, and step 3 takes off whatever is left of it either way. The frame
     // the instrument kept is already raw counts and is left alone; every other
     // frame gets its background back and the 2000 DN offset taken off.
     int cur = -1, nx = 0;
@@ -1560,18 +1616,54 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
             v->n_pre_key++;
             // Ahead of the first estimate, so there is nothing to add back and
             // the frame is still on the instrument's own scale rather than at
-            // raw counts. Step 2 puts it right -- its neighbours are in the
-            // same state, so the local background it gets is the one it is
-            // actually sitting on -- but step 1 alone has no answer for it, and
+            // raw counts. Step 2 puts it on the same footing as everything
+            // else, a fit through a frame's own edges caring nothing for the
+            // scale it came in on, but step 1 alone has no answer for it, and
             // showing it beside corrected frames would read as a tenfold
             // depression that never happened.
-            if (v->clean_stage < CLEAN_FULL) ok[k] = 0;
+            if (v->clean_stage == CLEAN_STEP1) ok[k] = 0;
+        }
+    }
+
+    // Step 2: detrend every frame across its own strip. A straight line is
+    // fitted by least squares through the first two and last two pixels -- 0,
+    // 1, 63 and 64 -- and that line, evaluated at each pixel in turn, comes off
+    // the whole strip in floating point, with the 2000 DN offset put back on.
+    // A least-squares fit with an intercept leaves its four residuals summing
+    // to zero, so those four pixels average exactly 2000 again, and a frame
+    // arriving with a tilt across the strip as well as a level of its own loses
+    // both rather than only the level.
+    // This is what takes the 256-frame block shifts out: a range whose estimate
+    // has gone stale by the end of it, and the frames ahead of the first
+    // estimate that never had one, come in a few hundred DN off the ranges
+    // either side of them, which the whereogram shows as blocks that begin and
+    // end where the estimates do.
+    if (v->clean_stage >= CLEAN_STEP2) {
+        const int ex[4] = { 0, 1, NPIX - 2, NPIX - 1 };
+        for (int k = 0; k < nf; k++) {
+            if (!ok[k]) continue;
+            float *p = pix + (long) k * NPIX;
+            double sx = 0.0, sy = 0.0;
+            for (int i = 0; i < 4; i++) { sx += ex[i]; sy += (double) p[ex[i]]; }
+            double mx = sx / 4.0, my = sy / 4.0;
+            double num = 0.0, den = 0.0;
+            for (int i = 0; i < 4; i++) {
+                double dx = (double) ex[i] - mx;
+                num += dx * ((double) p[ex[i]] - my);
+                den += dx * dx;
+            }
+            double slope = num / den;
+            for (int j = 0; j < NPIX; j++) {
+                double fit = my + slope * ((double) j - mx);
+                p[j] = (float) ((double) p[j] - fit + CLEAN_PEDESTAL);
+            }
         }
     }
 
     // Stop here if that is all the stage asks for: step 1 on its own is the
     // recording at its raw level, which is what says whether the instrument's
-    // own subtraction was all that stood between it and being flat.
+    // own subtraction was all that stood between it and being flat, and step 2
+    // on top of it says whether the block shifts have gone with it.
     if (v->clean_stage < CLEAN_FULL) {
         for (int k = 0; k < nf; k++) if (ok[k]) v->clean_frames++;
         v->clean_pix = pix; v->clean_ok = ok;
@@ -1598,7 +1690,7 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
     }
     for (int i = 0; i < v->n_img; i++) if (first[i] >= 0) v->bg_samples++;
 
-    // Step 2: the sliding background, one estimate per image.
+    // Step 3: the sliding background, one estimate per image.
     int h = (v->clean_win - 1) / 2;
     for (int i = 0; i < v->n_img; i++) {
         int a = i - h < 0 ? 0 : i - h;
@@ -1687,11 +1779,11 @@ static void compute_session_extent(view_t *v, const experiment_t *s)
 }
 
 // Move to a cleaning stage and rebuild what it needs. The manual DN window
-// carries across the full stage, since a cleaned count is put back on the level
-// a raw one arrives at (see CLEAN_PEDESTAL); step 1 on its own sits at the raw
-// counts, about ten times higher, so the auto scales are the ones to be in
-// there. Returns 0 if the experiment has nothing to clean, having dropped back
-// to showing it as it came down.
+// carries across every stage that ends on the pedestal, since a cleaned count
+// is put back on the level a raw one arrives at (see CLEAN_PEDESTAL); step 1 on
+// its own sits at the raw counts, about ten times higher, so the auto scales are
+// the ones to be in there. Returns 0 if the experiment has nothing to clean,
+// having dropped back to showing it as it came down.
 static int set_clean(view_t *v, const experiment_t *s, int stage)
 {
     v->clean_stage = stage;
@@ -2151,6 +2243,26 @@ static long wg_byte_of_col(const experiment_t *s, int w, int col)
     return ((long) col * nslot / w) * FRAME_STRIDE;
 }
 
+// The capture time of the frame nearest a byte of the recording, in unix ms,
+// or -1 if no frame carries one. Frames whose time never came down are passed
+// over rather than answered with: the ruler is reading the recording's own
+// clock, and a frame without one has nothing to say about where it sat in
+// time. The frames run up the file in order, so the first one past the byte is
+// the last that can be nearer than what is already in hand.
+static double time_at_byte(const experiment_t *s, long byte)
+{
+    double best_t = -1.0;
+    long best_d = 0;
+    for (int k = 0; k < s->nframes; k++) {
+        if (s->fr_ts[k] < 0) continue;
+        long o = s->fr_off[k];
+        long d = byte < o ? o - byte : byte - o;
+        if (best_t < 0 || d < best_d) { best_t = s->fr_ts[k]; best_d = d; }
+        if (o > byte) break;
+    }
+    return best_t;
+}
+
 // The byte range the currently shown image was reconstructed from, so the
 // whereogram can mark where in the recording you are looking. Returns 0 if the
 // image has no frames.
@@ -2187,6 +2299,174 @@ static int image_nearest_byte(const view_t *v, const experiment_t *s, long byte)
     return best;
 }
 
+// ---- session state ---------------------------------------------------------
+//
+// Where the viewer was left: which experiment was open, where the playhead sat
+// in it, every view setting, and the size and place of the window. Written
+// when the window closes and read back at startup, so opening the viewer again
+// carries on from the last look rather than starting at the first experiment
+// with the defaults.
+//
+// Plain "key = value" text under ~/.local/state/simple_sat_ops, beside the
+// active TLE and the uplink key simple_sat_ops keeps there, so it reads and
+// edits by hand. A key this build does not know is ignored and a key the file
+// does not carry keeps its built-in default, which is what lets a file written
+// by an older or a newer build still be worth reading. Every value is checked
+// on the way in: it is a file on disk, so a stale or hand-edited one must
+// still leave the viewer somewhere it could have got to on its own.
+
+#define STATE_RELPATH  ".local/state/simple_sat_ops/mpi_viewer.state"
+#define WIN_W_DEFAULT  1280
+#define WIN_H_DEFAULT  800
+
+// The window's own geometry, kept out of view_t because it belongs to the
+// window rather than to what is being looked at. has_pos says the file carried
+// a place to put it; without one the window opens wherever the platform likes.
+typedef struct {
+    int has_pos;
+    int x, y, w, h;
+} geom_t;
+
+static int state_path(char *out, size_t cap)
+{
+    const char *home = getenv("HOME");
+    if (home == NULL || home[0] == '\0') return -1;
+    if (snprintf(out, cap, "%s/%s", home, STATE_RELPATH) >= (int) cap) return -1;
+    return 0;
+}
+
+// Whitespace off both ends of a line, in place, the newline with it.
+static char *trim(char *s)
+{
+    while (*s != '\0' && isspace((unsigned char) *s)) s++;
+    char *e = s + strlen(s);
+    while (e > s && isspace((unsigned char) e[-1])) e--;
+    *e = '\0';
+    return s;
+}
+
+static int clamp_int(int x, int lo, int hi)
+{
+    return x < lo ? lo : x > hi ? hi : x;
+}
+
+// Read the saved state into v, sel_utc (the experiment that was open) and g.
+// Anything the file does not carry is left as the caller set it.
+static void load_state(view_t *v, char *sel_utc, size_t utc_cap, geom_t *g)
+{
+    char path[1024];
+    if (state_path(path, sizeof path) != 0) return;
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return;
+    char line[512];
+    while (fgets(line, sizeof line, f) != NULL) {
+        char *eq = strchr(line, '=');
+        if (line[0] == '#' || eq == NULL) continue;
+        *eq = '\0';
+        char *key = trim(line), *val = trim(eq + 1);
+        int n = atoi(val);
+        if (strcmp(key, "experiment") == 0)
+            snprintf(sel_utc, utc_cap, "%s", val);
+        else if (strcmp(key, "image") == 0)
+            v->img_pos = n < 0 ? 0 : n;
+        else if (strcmp(key, "playing") == 0)
+            v->playing = n != 0;
+        else if (strcmp(key, "images_per_second") == 0) {
+            double r = atof(val);
+            v->ips = (float) (r < 1.0 ? 1.0 : r > 60.0 ? 60.0 : r);
+        } else if (strcmp(key, "frames_per_sweep") == 0)
+            v->fpi_override = (n == 8 || n == 16) ? n : 0;
+        else if (strcmp(key, "zoom") == 0)
+            v->zoom = (n == 2 || n == 4 || n == 8 || n == 16) ? n : 8;
+        else if (strcmp(key, "colour_map") == 0)
+            v->cmap = clamp_int(n, 0, N_CMAPS - 1);
+        else if (strcmp(key, "scale_mode") == 0)
+            v->scale_mode = clamp_int(n, SCALE_AUTO_IMAGE, SCALE_MANUAL);
+        else if (strcmp(key, "dn_min") == 0)
+            v->dn_min = clamp_int(n, 0, 65535);
+        else if (strcmp(key, "dn_max") == 0)
+            v->dn_max = clamp_int(n, 0, 65535);
+        else if (strcmp(key, "clean_stage") == 0)
+            v->clean_stage = clamp_int(n, CLEAN_OFF, CLEAN_STAGES - 1);
+        else if (strcmp(key, "clean_step") == 0)
+            v->clean_step = clamp_int(n, CLEAN_STEP1, CLEAN_STAGES - 1);
+        else if (strcmp(key, "clean_window") == 0)
+            // Odd widths only: the window is the images either side of this one.
+            v->clean_win = clamp_int(n, 1, CLEAN_WIN_MAX) | 1;
+        else if (strcmp(key, "clean_mean") == 0)
+            v->clean_mean = n != 0;
+        else if (strcmp(key, "window_w") == 0)
+            g->w = (n >= 640 && n <= 8192) ? n : WIN_W_DEFAULT;
+        else if (strcmp(key, "window_h") == 0)
+            g->h = (n >= 400 && n <= 8192) ? n : WIN_H_DEFAULT;
+        else if (strcmp(key, "window_x") == 0) { g->x = n; g->has_pos = 1; }
+        else if (strcmp(key, "window_y") == 0) g->y = n;
+    }
+    fclose(f);
+    if (v->dn_max <= v->dn_min) v->dn_max = v->dn_min + 1;
+}
+
+// Write the state back. Best effort: a session that cannot write its state was
+// still a good session, so nothing here is reported.
+static void save_state(const view_t *v, const experiment_t *s, const geom_t *g)
+{
+    char path[1024];
+    if (state_path(path, sizeof path) != 0) return;
+    if (sso_mkdir_p_for_file(path) != 0) return;
+    FILE *f = fopen(path, "w");
+    if (f == NULL) return;
+    fprintf(f, "# mpi_viewer session state -- written on exit, read at startup.\n");
+    fprintf(f, "# Delete this file to come back up on the defaults.\n");
+    if (s->sat_path[0] != '\0') fprintf(f, "# file = %s\n", s->sat_path);
+    fprintf(f, "experiment = %s\n", s->utc);
+    fprintf(f, "image = %d\n", v->img_pos);
+    fprintf(f, "playing = %d\n", v->playing);
+    fprintf(f, "images_per_second = %g\n", (double) v->ips);
+    fprintf(f, "frames_per_sweep = %d\n", v->fpi_override);
+    fprintf(f, "zoom = %d\n", v->zoom);
+    fprintf(f, "colour_map = %d\n", v->cmap);
+    fprintf(f, "scale_mode = %d\n", v->scale_mode);
+    fprintf(f, "dn_min = %d\n", v->dn_min);
+    fprintf(f, "dn_max = %d\n", v->dn_max);
+    fprintf(f, "clean_stage = %d\n", v->clean_stage);
+    fprintf(f, "clean_step = %d\n", v->clean_step);
+    fprintf(f, "clean_window = %d\n", v->clean_win);
+    fprintf(f, "clean_mean = %d\n", v->clean_mean);
+    fprintf(f, "window_w = %d\n", g->w);
+    fprintf(f, "window_h = %d\n", g->h);
+    fprintf(f, "window_x = %d\n", g->x);
+    fprintf(f, "window_y = %d\n", g->y);
+    fclose(f);
+}
+
+// The experiment the last session had open, found by its start time. Returns
+// its index, or -1 if this list does not hold it -- a different database, or
+// one whose experiments have since been split differently.
+static int find_experiment(const experiment_t *exps, int nexp, const char *utc)
+{
+    if (utc[0] == '\0') return -1;
+    for (int k = 0; k < nexp; k++)
+        if (strcmp(exps[k].utc, utc) == 0) return k;
+    return -1;
+}
+
+// Whether a saved window position still lands on a display. Positions are in
+// the desktop's own coordinates, which span every monitor, so the test is
+// against each monitor's own rectangle rather than against a size: a place on
+// a screen that has since been unplugged would open the window where nobody
+// can see it.
+static int position_on_a_monitor(int x, int y)
+{
+    for (int m = 0; m < GetMonitorCount(); m++) {
+        Vector2 o = GetMonitorPosition(m);
+        if (x >= (int) o.x && y >= (int) o.y
+            && x < (int) o.x + GetMonitorWidth(m)
+            && y < (int) o.y + GetMonitorHeight(m))
+            return 1;
+    }
+    return 0;
+}
+
 // ---- main ------------------------------------------------------------------
 
 int main(int argc, char **argv)
@@ -2203,14 +2483,20 @@ int main(int argc, char **argv)
                    "Inspect MPI science imagery reconstructed from the packet DB.\n"
                    "The left panel lists MPI experiments; F5 re-reads the DB.\n"
                    "Press b to show the cleaned imagery -- the instrument's own\n"
-                   "background subtraction undone and a sliding local one put in its\n"
-                   "place -- and shift-B, while it is on, to stop after the first of\n"
-                   "those steps instead. n sets how many images the sliding one is\n"
-                   "taken over, and e whether they are combined by median or mean.\n"
+                   "background subtraction undone, every frame detrended across its\n"
+                   "own edge pixels, and a sliding local background put in place of\n"
+                   "the instrument's -- and shift-B, while it is on, to stop after an\n"
+                   "earlier one of those steps. n sets how many images the sliding\n"
+                   "one is taken over, and e whether they are combined by median or\n"
+                   "mean.\n"
                    "Press d to write the selected experiment's missing data as\n"
                    "re-download telecommands, for simple_sat_ops --tc-file.\n"
                    "--list prints what each experiment reconstructed to and exits,\n"
-                   "without opening a window.\n");
+                   "without opening a window.\n"
+                   "Which experiment was open, where the playhead sat and every\n"
+                   "view setting are kept in ~/.local/state/simple_sat_ops/\n"
+                   "mpi_viewer.state and picked up next time; delete that file to\n"
+                   "come back up on the defaults.\n");
             return 0;
         } else {
             fprintf(stderr, "mpi_viewer: unknown option '%s' (try --help)\n", argv[i]);
@@ -2271,11 +2557,31 @@ int main(int argc, char **argv)
     v.dn_min = 1800; v.dn_max = 2300;
     v.clean_win = 5;
     v.clean_step = CLEAN_FULL;
+
+    // What the last session left, over those defaults. The view settings have
+    // to be in place before the experiment is selected, since the scan period
+    // and the cleaning stage are what select_experiment builds from; the
+    // playhead has to wait until after it, because selecting an experiment
+    // rewinds it to the first image.
+    geom_t geom = { .w = WIN_W_DEFAULT, .h = WIN_H_DEFAULT };
+    char sel_utc[24] = "";
+    load_state(&v, sel_utc, sizeof sel_utc, &geom);
+    int saved_img = v.img_pos, saved_play = v.playing;
+    int resumed = find_experiment(exps, nexp, sel_utc);
+    if (resumed >= 0) v.sel = resumed;
     select_experiment(&v, &exps[v.sel]);
+    if (resumed >= 0) {
+        v.img_pos = saved_img >= v.n_img ? (v.n_img ? v.n_img - 1 : 0) : saved_img;
+        v.playing = saved_play;
+        fprintf(stderr, "mpi_viewer: resuming %s UTC at image %d of %d.\n",
+                exps[v.sel].utc, v.img_pos + 1, v.n_img);
+    }
 
     SetTraceLogLevel(LOG_NONE);
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-    InitWindow(1280, 800, "mpi_viewer");
+    InitWindow(geom.w, geom.h, "mpi_viewer");
+    if (geom.has_pos && position_on_a_monitor(geom.x, geom.y))
+        SetWindowPosition(geom.x, geom.y);
     SetTargetFPS(60);
     g_ui_font_loaded = load_ui_font();
 
@@ -2311,8 +2617,10 @@ int main(int argc, char **argv)
     int wg_lo = -1, wg_hi = -1;         // the DN window its colours were built for
     // Set while the pointer is scrubbing the whereogram, so a press that
     // began there keeps control until the button is let go -- and a press that
-    // began anywhere else never takes it.
+    // began anywhere else never takes it. cov_anchor is the byte the press
+    // landed on, which the time ruler measures from.
     int cov_drag = 0;
+    long cov_anchor = 0;
 
     while (!WindowShouldClose()) {
         experiment_t *s = &exps[v.sel];
@@ -2340,8 +2648,9 @@ int main(int argc, char **argv)
         }
         // b turns cleaning on and off, coming back on at whichever step it was
         // left showing. shift-B moves between the steps -- the instrument's own
-        // subtraction undone, then the sliding local one taken off as well --
-        // and is ignored with cleaning off, there being no step to pick then.
+        // subtraction undone, then every frame detrended across its own edges,
+        // then the sliding local background taken off as well -- and is ignored
+        // with cleaning off, there being no step to pick then.
         if (IsKeyPressed(KEY_B)) {
             int shifted = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
             int want = -1;
@@ -2573,8 +2882,11 @@ int main(int argc, char **argv)
             if (v.clean_stage == CLEAN_STEP1)
                 draw_text("cleaning      : step 1  (the instrument's own subtraction undone)",
                           ax, ay, 15, (Color){ 120, 220, 160, 255 });
+            else if (v.clean_stage == CLEAN_STEP2)
+                draw_text("cleaning      : steps 1+2  (frames detrended across their own edges)",
+                          ax, ay, 15, (Color){ 120, 220, 160, 255 });
             else
-                draw_text(TextFormat("cleaning      : steps 1+2  (%d-image %s)",
+                draw_text(TextFormat("cleaning      : steps 1+2+3  (%d-image %s)",
                                      v.clean_win, v.clean_mean ? "mean" : "median"),
                           ax, ay, 15, (Color){ 120, 220, 160, 255 });
             ay += 20;
@@ -2705,17 +3017,49 @@ int main(int argc, char **argv)
             // instead of stopping dead.
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 Vector2 m = GetMousePosition();
-                if (m.x >= ax && m.x < ax + cw && m.y >= ay && m.y < ay + ch)
+                if (m.x >= ax && m.x < ax + cw && m.y >= ay && m.y < ay + ch) {
                     cov_drag = 1;
+                    cov_anchor = wg_byte_of_col(s, cov_w, ((int) m.x - ax) * cov_w / cw);
+                }
             }
             if (cov_drag && v.n_img > 0) {
                 Vector2 m = GetMousePosition();
                 int mx = (int) m.x - ax;
                 if (mx < 0) mx = 0;
                 if (mx > cw - 1) mx = cw - 1;
-                int img = image_nearest_byte(&v, s,
-                                             wg_byte_of_col(s, cov_w, mx * cov_w / cw));
+                long here = wg_byte_of_col(s, cov_w, mx * cov_w / cw);
+                int img = image_nearest_byte(&v, s, here);
                 if (img >= 0) { v.img_pos = img; v.playing = 0; }
+
+                // The time ruler: the stretch of recording between where the
+                // press landed and where the pointer is now, marked on the
+                // whereogram and read out in UTC above it. It measures the
+                // recording rather than the screen -- the two ends are the
+                // times of the frames nearest those two bytes -- so a stretch
+                // where nothing came down costs no time, the same way it takes
+                // up no columns.
+                int rx0 = ax + wg_x_of_byte(s, cw, cov_anchor);
+                int rx1 = ax + mx;
+                if (rx1 < rx0) { int t = rx0; rx0 = rx1; rx1 = t; }
+                DrawRectangle(rx0, ay, rx1 - rx0 < 1 ? 1 : rx1 - rx0, ch,
+                              (Color){ 255, 255, 255, 40 });
+                DrawLine(rx0, ay, rx0, ay + ch, RAYWHITE);
+                DrawLine(rx1, ay, rx1, ay + ch, RAYWHITE);
+                double ta = time_at_byte(s, cov_anchor), tb = time_at_byte(s, here);
+                if (ta >= 0.0 && tb >= 0.0) {
+                    if (tb < ta) { double t = ta; ta = tb; tb = t; }
+                    char t0[16], t1[16], sp[32];
+                    fmt_tod_ms(ta, t0, sizeof t0);
+                    fmt_tod_ms(tb, t1, sizeof t1);
+                    fmt_span(tb - ta, sp, sizeof sp);
+                    const char *lab = TextFormat("%s to %s UTC   %s", t0, t1, sp);
+                    int tw = text_width(lab, 13);
+                    int lx = (rx0 + rx1) / 2 - tw / 2;
+                    if (lx < ax) lx = ax;
+                    if (lx + tw > ax + cw) lx = ax + cw - tw;
+                    DrawRectangle(lx - 6, ay + 4, tw + 12, 20, (Color){ 18, 18, 22, 220 });
+                    draw_text(lab, lx, ay + 7, 13, RAYWHITE);
+                }
             }
         }
 
@@ -2725,7 +3069,7 @@ int main(int argc, char **argv)
 
         // help footer
         const char *help =
-            "Up/Down experiment   Left/Right image   click or drag whereogram"
+            "Up/Down experiment   Left/Right image   drag whereogram: scrub + time span"
             "   Space play/pause   ,/. speed   f steps/sweep   s zoom   a scale"
             "   z/x min  c/v max   m colour map   b clean  B step   n bg window   e median/mean"
             "   d re-download commands   F5 refresh  q quit";
@@ -2733,6 +3077,13 @@ int main(int argc, char **argv)
 
         EndDrawing();
     }
+
+    // Where this session got to, for the next one. Read while the window is
+    // still up, since its size and place are the window's to report.
+    Vector2 wpos = GetWindowPosition();
+    geom.x = (int) wpos.x; geom.y = (int) wpos.y;
+    geom.w = GetScreenWidth(); geom.h = GetScreenHeight();
+    save_state(&v, &exps[v.sel], &geom);
 
     UnloadTexture(tex);
     if (cov_tex.id != 0) UnloadTexture(cov_tex);
