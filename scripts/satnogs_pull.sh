@@ -299,7 +299,7 @@ to_iso_utc() {
 # observations newer than what we already have.
 STATE_FILE="${OUT}/.latest_start.${NORAD_ID}.txt"
 
-# Per-archive API-access tally: one "<epoch> <calls>" record per run.
+# Per-archive API-access tally: one "<epoch> <calls>" record per request.
 # Records older than an hour age out each run, so the surviving sum is the
 # request count in the trailing 60 minutes — exactly the rolling hour the
 # SatNOGS throttle counts. Not keyed by NORAD ID: the throttle is per
@@ -307,6 +307,18 @@ STATE_FILE="${OUT}/.latest_start.${NORAD_ID}.txt"
 # on the lock, so one shared file reflects the real rate even when several
 # satellites pull into the same --out. Delete it to reset.
 STATS_FILE="${OUT}/.api_stats.txt"
+
+# Count one list request, written to the tally as it is made rather than
+# totalled up at the end of the run. Two things need that: a browser
+# watching the file sees the trailing-hour figure climb while a listing
+# is still walking, and a run that is cancelled or killed part way
+# through has still spent those requests, so they have to be on disk
+# already to be counted against the hour. Runs on one archive serialise
+# on the lock above, so appending here cannot race the prune below.
+record_api_call() {
+    API_CALLS=$((API_CALLS + 1))
+    printf '%s 1\n' "$(date -u +%s)" >> "$STATS_FILE"
+}
 
 # Convert "YYYY-MM-DDTHH:MM:SSZ" to epoch (GNU and BSD date variants).
 iso_to_epoch() {
@@ -638,7 +650,7 @@ fi
 
 while [[ -n "$URL" && "$COUNT_FETCHED" -lt "$MAX_OBS" ]]; do
     log "GET $URL"
-    API_CALLS=$((API_CALLS + 1))
+    record_api_call
     if ! JSON="$(list_page "$URL")"; then
         logerr "API list request failed"
         WALK_OK=0
@@ -857,13 +869,14 @@ if [[ -n "$NEWEST_START" && -z "$CACHE_DAY" && -z "$OBS_IDS" ]]; then
     printf '%s\n' "$NEWEST_START" > "$STATE_FILE"
 fi
 
-# Roll this run's API accesses into the per-archive tally and total the
-# accesses in the trailing 60 minutes — the same rolling hour the SatNOGS
-# throttle counts (60/hour anonymous, 240 with a token). Keeping a window
-# of per-run records (rather than a cumulative mean) means a one-off
-# backfill burst ages out after an hour instead of inflating the figure
-# for the rest of the day. Safe to do here unlocked: the flock/mkdir lock
-# above serialises every run on this archive.
+# Total the accesses in the trailing 60 minutes — the same rolling hour
+# the SatNOGS throttle counts (60/hour anonymous, 240 with a token) — and
+# drop what has aged out of it. This run's own requests are already in the
+# file, written one at a time as they were made. Keeping a window of
+# records (rather than a cumulative mean) means a one-off backfill burst
+# ages out after an hour instead of inflating the figure for the rest of
+# the day. Safe to do here unlocked: the flock/mkdir lock above
+# serialises every run on this archive.
 NOW_EPOCH_STATS="$(date -u +%s)"
 API_WINDOW_START=$((NOW_EPOCH_STATS - 3600))
 API_LAST_HOUR=0
@@ -880,8 +893,6 @@ if [[ -s "$STATS_FILE" ]]; then
         fi
     done < "$STATS_FILE"
 fi
-printf '%s %s\n' "$NOW_EPOCH_STATS" "$API_CALLS" >> "$STATS_TMP"
-API_LAST_HOUR=$((API_LAST_HOUR + API_CALLS))
 mv -f "$STATS_TMP" "$STATS_FILE"
 
 # Throttle ceiling for the trailing-hour figure: a token lifts it 60 -> 240.
