@@ -925,6 +925,26 @@ if (OPENSSL_FOUND)
         target_link_packet_db(tcmd_browser)
         target_link_sso_core(tcmd_browser)
         list(APPEND SSO_TARGETS tcmd_browser)
+
+        # Day-at-a-time view of the SatNOGS archive: what the network
+        # holds for the satellite against what we have pulled down, and
+        # a way to mark passes and fetch them. Every request it makes
+        # goes out through scripts/satnogs_pull.sh, so it links no HTTP
+        # library of its own; it reads that script's day caches and the
+        # packet DB, and spawns it to do anything else.
+        add_executable(satnogs_browser utils/satnogs_browser.c
+                       src/ui/ui_textfield.c)
+        target_compile_definitions(satnogs_browser PRIVATE
+            SATNOGS_BROWSER_HAVE_NCURSES)
+        target_include_directories(satnogs_browser PRIVATE
+            ${OPENSSL_INCLUDE_DIRS} ${NCURSES_INCLUDE_DIRS})
+        target_link_directories(satnogs_browser PRIVATE
+            ${OPENSSL_LIBRARY_DIRS} ${NCURSES_LIBRARY_DIRS})
+        target_link_libraries(satnogs_browser PRIVATE
+            ${OPENSSL_LIBRARIES} ${NCURSES_LIBRARIES} m)
+        target_link_packet_db(satnogs_browser)
+        target_link_sso_core(satnogs_browser)
+        list(APPEND SSO_TARGETS satnogs_browser)
     endif()
 
     # Offline sliding-window decoder for WAV / raw S16_LE files.
