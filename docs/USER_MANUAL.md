@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`1e44c89` (2026-08-30). This is a working draft.
+`6985506` (2026-08-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2381,6 +2381,32 @@ into the middle of a frame; that one frame reads as a garbage row. The viewer
 drops any frame whose body overlaps a marker, which removes the routine periodic
 artifact (roughly one frame in 134).
 
+**What the picture's axes are.** Up the image is the 65 CCD pixels, the
+direction the ions arrived from. Across it is the inner-dome bias in the order
+the sweep was flown: 0 V at the far left, then increasingly negative bias to the
+right, most negative (setpoint 4095) next to last. Left to right is therefore
+also earliest to latest, the same direction as the whereogram below, so an image
+reads as the stretch of whereogram its playback head is sitting on rather than
+as a mirror of it. One sweep of that bias is one image: 16 frames in 16 columns,
+one for each. The dome sits at 0 V for two frames running, straddling the turn
+of the sweep. The second of those two is the instrument's background: when it
+asks for the zero-volt setpoint it keeps that frame's counts as its no-ion-signal
+reference and takes them off every frame that follows, until the next zero-volt
+request. So that frame comes down raw, sitting on a pedestal about 1200 DN
+brighter than the rest of the sweep - the far-left column of every image, and the
+periodic bright line running through the whereogram. The far-right column is the
+other frame of the dwell: 0 V read again with the background taken off it, which
+is the residue the subtraction leaves. Because every frame of the sweep is
+drawn, consecutive images tile the recording with nothing left over.
+
+Note that a frame's pixels and its aux fields are one frame apart: the pixels
+were integrated during the previous frame's slot, while the aux is stamped when
+the frame is packed, by which time the dome has already been commanded to the
+next setpoint. The viewer places a frame by the target voltage the frame before
+it reported, which is why the raw 0 V frame lands at the right edge even though
+its own aux reads 57343. The aux panel shows that frame's aux as it was sent, so
+its `dome target V` is one setpoint ahead of the column it is drawn in.
+
 Keys: `Up`/`Down` change experiment, `Left`/`Right` scrub images (or click or
 drag the whereogram to scrub through the recording), `Space` plays/pauses, `,`/`.`
 set the playback speed, `f` cycles frames-per-image (auto/8/16), `s` zoom, `a` cycles the colour scale (auto-image / auto-experiment
@@ -2412,8 +2438,12 @@ a satellite-reported minimum, or (when the log never named it) the largest offse
 received. That last case is the only one where the percentage is measured against
 a guess; see `mpi_reconstruct` above for how the length is established.
 
-A **white box** on the whereogram marks the columns the image on screen was
+A **white box** on the whereogram marks the stretch the image on screen was
 built from, so you can see where in the recording you are as you scrub or play.
+An image is only a few pixels wide on a panel holding a whole recording, so the
+box is placed to the pixel rather than rounded out to whole columns; where an
+image comes out narrower than three pixels the box is widened to that, since
+below it there is no inside left to draw.
 **Clicking jumps to the image at that moment**, and **dragging scrubs** - the
 picture follows the pointer for as long as the button is held, so you can run
 through an experiment by hand and stop where something looks interesting. Either

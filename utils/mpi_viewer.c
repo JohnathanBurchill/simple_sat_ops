@@ -38,15 +38,37 @@
     shifted pixels -- a garbage row. We drop any frame whose body overlaps a
     marker blob (~1 frame per 134), which removes the routine periodic artifact.
 
-    Each frame carries aux/housekeeping fields then a strip of image pixels. One
-    full inner-dome voltage sweep is one image; a new sweep begins each time the
-    scan index (aux byte 13) returns to a multiple of the scan period (auto-
-    detected, 16). Within an image a frame's column is its inner-dome target
-    voltage (the commanded bias): the 0 V background frame (setpoint 65535, no
-    ion signal on the CCD) sits at the far right and increasingly negative bias
-    voltages stack to the left, most negative at the far left. The tool plays the
-    images back like a movie, grayscale, with an adjustable DN range and
-    nearest-neighbour zoom, and shows the aux data beside each image.
+    Each frame carries aux/housekeeping fields then a strip of image pixels, and
+    the two are one frame apart: the pixels were integrated during the previous
+    frame's slot, while the aux fields are stamped when the frame is packed, by
+    which time the dome has already been commanded to the next setpoint. So a
+    frame's bias is the target voltage the frame BEFORE it reported. What gives
+    it away is the one frame per sweep the MPI sends without subtracting its
+    background: it comes back sitting on a pedestal about 1200 DN above its
+    neighbours, a periodic bright line in the whereogram, and its own aux claims
+    the next setpoint down even though it was taken at 0 V. Reading that aux at
+    face value drew it one column in from the right instead of at the edge.
+
+    One full inner-dome voltage sweep is one image: fpi frames (the scan period,
+    auto-detected, 16) in fpi columns, one for each. The dome sits at 0 V for
+    two slots running, straddling the turn of the sweep, and the second of those
+    two is the reference: when the instrument asks for the zero-volt setpoint it
+    keeps that frame's counts as its no-ion-signal background and takes them off
+    every frame that follows, until the next zero-volt request. So that one
+    comes down raw -- it IS the background -- and it is the image's first frame,
+    at the far LEFT. Increasingly negative bias voltages run to the right from
+    there, most negative (setpoint 4095) next to last, and the far right column
+    is the other frame of the dwell: 0 V read again with the background taken
+    off it, which is the residue the subtraction leaves. Laying the sweep out in
+    the order it was flown means left to right is earliest to latest, the same
+    direction as the whereogram below, so an image reads as the stretch of
+    whereogram its playback head is sitting on rather than as a mirror of it,
+    and consecutive images tile that recording with nothing left over. A new
+    image begins one frame past a multiple of the scan period, which the scan
+    index (aux byte 13) counts off. The tool plays the images back like a movie, grayscale, with
+    an adjustable DN range and nearest-neighbour zoom, and shows the aux data
+    beside each image -- that aux belonging, as above, to the frame after the
+    one the pixels were taken in.
 
     Aux frame layout (authoritative, from the MPI storeTelemetryAuxData packer):
         0..3   sync word 0C FF FF 0C
@@ -1089,8 +1111,8 @@ static int reload_experiments(const char *db_path, experiment_t **out)
 // each frame's column (via col_of). Because the real values sit on a coarse
 // grid, a bit-flipped voltage lands off-grid and is rejected -- unlike the raw
 // scan-index byte, where any 0..31 looks valid -- which is why the column axis
-// is keyed off the voltage. The firmware never commands m = N-1, so that
-// setpoint gets no column and the image is N-1 columns wide.
+// is keyed off the voltage. The firmware never commands m = N-1, and it
+// commands m = N twice a sweep, so a sweep's N frames fill N-1 columns.
 
 // Setpoint index (0..n-1) of a target voltage on the n-step grid, or -1 if the
 // value is off-grid (a corrupted byte).
@@ -1129,7 +1151,7 @@ typedef struct {
     int    n_img;
     int    n_targets;      // detected setpoints per sweep (8 or 16)
     int    fpi;            // scan period: n_targets or the override (boundary + column map)
-    int    ncols;          // image width in columns (fpi-1; the never-commanded setpoint gets none)
+    int    ncols;          // image width in columns (== fpi: every frame of the sweep gets one)
     int    fpi_override;   // 0 = use the detected count, else forced 8/16
     int    cmap;           // colour map index, shared by the image and the whereogram
     int    zoom;
@@ -1142,40 +1164,65 @@ typedef struct {
 } view_t;
 
 // Column of frame k within its image, from the inner-dome TARGET voltage (the
-// commanded bias). The columns are the physical scan axis: the 0 V background
-// frame (setpoint 65535, m = fpi -- no ion signal on the CCD, sent once per
-// sweep) sits at the far RIGHT, and increasingly negative bias voltages stack to
-// the LEFT, so the most negative bias (setpoint 4095, m = 1) is at the far left.
-// The firmware never commands the setpoint just below background (m = fpi-1,
-// e.g. 61439 for fpi=16), so it gets no column and the axis has no gap: the
-// image is fpi-1 columns wide. Returns -1 for an off-grid (bit-flipped) voltage
-// or that never-commanded setpoint, so the frame is dropped.
+// commanded bias) -- of the frame BEFORE it, because a frame's pixels were
+// integrated during the previous frame's slot while its aux was stamped a slot
+// later (see the file header). So the previous frame has to really be the
+// previous one: its counter one less than this one's, and its own aux sound.
+//
+// The columns are the physical scan axis, laid out in the order the sweep runs:
+// the 0 V background at the far LEFT, then increasingly negative bias voltages
+// to the RIGHT, so the most negative (setpoint 4095, m = 1) is next to last.
+// Left to right is therefore also earliest to latest, the same direction the
+// whereogram runs, which is what lets an image be read as the stretch of
+// whereogram its playback head is sitting on -- and every frame of the sweep is
+// drawn, so consecutive images tile that stretch with nothing left over.
+//
+// The dome sits at 0 V for two slots per sweep, so 0 V is measured at both ends
+// of the image: the raw background at the left, and at the far right the same
+// 0 V read again with that background taken off it, which is the residue the
+// subtraction leaves. Both are real frames of the sweep and both get a column,
+// which is why an image is fpi columns wide, not fpi-1.
+//
+// Returns -1 for an off-grid (bit-flipped) voltage, for the setpoint the
+// firmware never commands (m = fpi-1, e.g. 61439 for fpi=16), and for a frame
+// whose predecessor did not come down -- without it there is no telling which
+// column the frame belongs in.
 static int col_of(const view_t *v, const experiment_t *s, int k)
 {
-    int r = tv_row(s->fr_tv[k], v->fpi);      // 0..fpi-1 setpoint index, or -1
+    if (k == 0 || s->fr_bad[k - 1]) return -1;
+    if (((s->fr_ctr[k - 1] + 1) & 0xFFFF) != s->fr_ctr[k]) return -1;
+    int r = tv_row(s->fr_tv[k - 1], v->fpi);  // 0..fpi-1 setpoint index, or -1
     if (r < 0) return -1;
-    if (r == v->fpi - 1) return v->fpi - 2;   // background -> far right
+    if (r == v->fpi - 1) {
+        // Both frames of the 0 V dwell. The raw one is recognisable because its
+        // own aux has already moved on to the first negative setpoint, while
+        // the subtracted one still reads 0 V in its own aux; the sweep starts
+        // on the first and ends on the second.
+        if (tv_row(s->fr_tv[k], v->fpi) == v->fpi - 1) return v->fpi - 1;
+        return 0;                              // raw background -> far left
+    }
     if (r == v->fpi - 2) return -1;           // never-commanded setpoint
-    return r;                                  // 0..fpi-3 -> same column (left = most negative)
+    return v->fpi - 2 - r;                     // rightward = more negative
 }
 
 // Detect the setpoint count for the current experiment; fpi is the scan period
-// (setpoints per sweep) and ncols the image width (one fewer, since the setpoint
-// just below background is never commanded).
+// (frames per sweep) and ncols the image width, which is the same thing: every
+// frame of the sweep gets a column (see col_of).
 static void apply_scan(view_t *v, const experiment_t *s)
 {
     v->n_targets = detect_n_targets(s);
     v->fpi = v->fpi_override ? v->fpi_override : v->n_targets;
     if (v->fpi < 2) v->fpi = 16;
-    v->ncols = v->fpi - 1;
+    v->ncols = v->fpi;
 }
 
 // Assign every frame to an image. Frames are in file order; the image boundary
 // comes from the inner-dome scan index (the clean per-frame step counter) -- a
-// new image begins each time the scan index returns to a multiple of fpi, i.e.
-// at the start of a sweep -- while the column within the image comes from the
-// target voltage (see col_of). Corrupt frames (an off-grid target voltage or a
-// JSON-straddle body) and the partial leading sweep are dropped (fr_img < 0).
+// new image begins one frame past a multiple of fpi, at the raw frame that
+// carries the 0 V dwell's pixels -- while the column within the image comes
+// from the target voltage (see col_of). Corrupt frames (an off-grid target
+// voltage, a JSON-straddle body, a missing predecessor) and the partial leading
+// sweep are dropped (fr_img < 0).
 static void rebuild_image_list(view_t *v, const experiment_t *s)
 {
     free(v->fr_img);
@@ -1188,7 +1235,7 @@ static void rebuild_image_list(view_t *v, const experiment_t *s)
     for (int k = 0; k < s->nframes; k++) {
         if (s->fr_bad[k] || col_of(v, s, k) < 0) { v->fr_img[k] = -2; continue; }   // corrupt frame
         int sc = s->fr_scan[k];
-        int boundary = (sc >= 0 && sc < 4 * v->fpi && sc % v->fpi == 0);
+        int boundary = (sc >= 0 && sc < 4 * v->fpi && sc % v->fpi == 1);
         if (!started) {
             if (boundary) { started = 1; v->fr_img[k] = 0; }
             else v->fr_img[k] = -1;      // partial leading sweep, before the first boundary
@@ -1628,17 +1675,21 @@ static void build_whereogram(const experiment_t *s, int cmap, int lo, int hi,
 // Where a file offset falls along the whereogram's horizontal axis, and the
 // offset a column stands for -- the two directions of the same mapping, used to
 // place the playback head and to turn a pointer position back into an image.
-static int wg_col_of_byte(const experiment_t *s, int w, long byte)
+//
+// The head is placed in panel pixels rather than in whole columns. An image is
+// only a few pixels wide on a panel holding a whole recording, so rounding its
+// byte span out to the columns that contain it drew a box with a margin of
+// recording inside it that the image does not hold. The right edge is not
+// pulled back inside the panel either, so passing the byte one past the span
+// gives the box's exclusive right edge.
+static int wg_x_of_byte(const experiment_t *s, int w, long byte)
 {
     long nslot = s->size / FRAME_STRIDE;
     if (nslot < 1) nslot = 1;
     long q = byte / FRAME_STRIDE;
     if (q < 0) q = 0;
-    if (q > nslot - 1) q = nslot - 1;
-    int c = (int) (q * w / nslot);
-    if (c < 0) c = 0;
-    if (c > w - 1) c = w - 1;
-    return c;
+    if (q > nslot) q = nslot;
+    return (int) (q * w / nslot);
 }
 
 static long wg_byte_of_col(const experiment_t *s, int w, int col)
@@ -1910,7 +1961,7 @@ int main(int argc, char **argv)
             for (int j = 0; j < NPIX; j++) {
                 int p = be16(s->buf, base + j * 2);
                 int g = p <= lo ? 0 : p >= hi ? 255 : (int) (255.0 * (p - lo) / (hi - lo));
-                // Column = bias voltage (background right, most negative left); pixel -> row.
+                // Column = bias voltage (background left, most negative right); pixel -> row.
                 imgbuf[j * MAX_FPI + col] = cmap_color(v.cmap, (unsigned char) g);
             }
         }
@@ -2076,15 +2127,18 @@ int main(int argc, char **argv)
                     DrawRectangle(x, ay - 5, xe - x, 3, (Color){ 220, 60, 60, 255 });
                 }
 
-                // Playback head: the columns the shown image was built from.
+                // Playback head: the stretch of the recording the shown image
+                // was built from, sitting exactly on it -- on the panel's own
+                // rows and on the pixels its frames occupy, with none of the
+                // outward rounding that used to leave a margin inside the box.
+                // Three pixels is the narrowest it can be and still have an
+                // inside; below that the image is thinner than its own outline.
                 long pb0 = 0, pb1 = 0;
                 if (v.n_img > 0 && image_byte_span(&v, s, v.img_pos, &pb0, &pb1)) {
-                    int c0 = wg_col_of_byte(s, cov_w, pb0);
-                    int c1 = wg_col_of_byte(s, cov_w, pb1 - 1);
-                    int x0 = ax + c0 * cw / cov_w;
-                    int x1 = ax + (c1 + 1) * cw / cov_w;
+                    int x0 = ax + wg_x_of_byte(s, cw, pb0);
+                    int x1 = ax + wg_x_of_byte(s, cw, pb1);
                     if (x1 - x0 < 3) x1 = x0 + 3;
-                    DrawRectangleLines(x0 - 1, ay - 1, x1 - x0 + 2, ch + 2, RAYWHITE);
+                    DrawRectangleLines(x0, ay, x1 - x0, ch, RAYWHITE);
                 }
 
                 draw_text(TextFormat("%.1f%% of %.0f KB down, %.0f KB missing  (%s)",
