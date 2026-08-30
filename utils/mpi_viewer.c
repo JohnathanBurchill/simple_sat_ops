@@ -1643,11 +1643,19 @@ int main(int argc, char **argv)
     Color    *cov_pix = NULL;
     Texture2D cov_tex = {0};
     int cov_w = 0, cov_h = 0, cov_sel = -1;
+    // Set while the pointer is scrubbing the coverage map, so a press that
+    // began there keeps control until the button is let go -- and a press that
+    // began anywhere else never takes it.
+    int cov_drag = 0;
 
     while (!WindowShouldClose()) {
         experiment_t *s = &exps[v.sel];
 
         // ---- input ----
+        // Letting the button go ends a coverage-map scrub. Checked here rather
+        // than beside the map itself, which is not drawn at all in a window too
+        // small for it -- a scrub must not survive that.
+        if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) cov_drag = 0;
         if (key_repeat(KEY_DOWN, &rep_down) && v.sel < nexp - 1) { v.sel++; select_experiment(&v, &exps[v.sel]); s = &exps[v.sel]; }
         if (key_repeat(KEY_UP, &rep_up)     && v.sel > 0)        { v.sel--; select_experiment(&v, &exps[v.sel]); s = &exps[v.sel]; }
         if (key_repeat(KEY_RIGHT, &rep_right) && v.img_pos < v.n_img - 1) v.img_pos++;
@@ -1911,15 +1919,27 @@ int main(int argc, char **argv)
                               ax, ay + cov_h + 22, 13, (Color){ 206, 150, 42, 255 });
             }
 
-            // Click the map to jump to the image nearest that point in the file.
-            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && v.n_img > 0) {
+            // Press the map to jump to the image nearest that point in the
+            // file, and keep dragging to scrub through the experiment. Only a
+            // press that landed on the map starts a scrub; once it has, the
+            // pointer is clamped to the map, so wandering off an edge keeps
+            // scrubbing along that edge instead of stopping dead.
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 Vector2 m = GetMousePosition();
-                if (m.x >= ax && m.x < ax + cov_w && m.y >= ay && m.y < ay + cov_h) {
-                    long cell = (long) ((int) m.y - ay) * cov_w + ((int) m.x - ax);
-                    long byte = cell * s->size / ((long) cov_w * (long) cov_h);
-                    int img = image_nearest_byte(&v, s, byte);
-                    if (img >= 0) { v.img_pos = img; v.playing = 0; }
-                }
+                if (m.x >= ax && m.x < ax + cov_w && m.y >= ay && m.y < ay + cov_h)
+                    cov_drag = 1;
+            }
+            if (cov_drag && v.n_img > 0) {
+                Vector2 m = GetMousePosition();
+                int mx = (int) m.x - ax, my = (int) m.y - ay;
+                if (mx < 0) mx = 0;
+                if (mx > cov_w - 1) mx = cov_w - 1;
+                if (my < 0) my = 0;
+                if (my > cov_h - 1) my = cov_h - 1;
+                long cell = (long) my * cov_w + mx;
+                long byte = cell * s->size / ((long) cov_w * (long) cov_h);
+                int img = image_nearest_byte(&v, s, byte);
+                if (img >= 0) { v.img_pos = img; v.playing = 0; }
             }
         }
 
@@ -1929,7 +1949,7 @@ int main(int argc, char **argv)
 
         // help footer
         const char *help =
-            "Up/Down experiment   Left/Right image   click coverage map to seek"
+            "Up/Down experiment   Left/Right image   click or drag coverage map"
             "   Space play/pause   ,/. speed   f steps/sweep   s zoom   a scale"
             "   z/x min  c/v max   d re-download commands   F5 refresh  q quit";
         draw_text(help, 12, GetScreenHeight() - 22, 12, (Color){ 150, 150, 160, 255 });

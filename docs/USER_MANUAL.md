@@ -2381,10 +2381,9 @@ into the middle of a frame; that one frame reads as a garbage row. The viewer
 drops any frame whose body overlaps a marker, which removes the routine periodic
 artifact (roughly one frame in 134).
 
-Keys: `Up`/`Down` change experiment, `Left`/`Right` scrub images (or click the
-coverage map to jump to the image at that point in the file), `Space`
-plays/pauses, `,`/`.` set the playback speed, `f` cycles frames-per-image
-(auto/8/16), `s` zoom, `a` cycles the colour scale (auto-image / auto-experiment
+Keys: `Up`/`Down` change experiment, `Left`/`Right` scrub images (or click or
+drag the coverage map to scrub through the file), `Space` plays/pauses, `,`/`.`
+set the playback speed, `f` cycles frames-per-image (auto/8/16), `s` zoom, `a` cycles the colour scale (auto-image / auto-experiment
 / manual), `r` resets it to auto-image, `z`/`x` and `c`/`v` move the manual DN
 window (hold `Shift` for coarse steps), `d` writes the re-download
 telecommands (below), **`F5` re-reads the database** and rebuilds the
@@ -2406,8 +2405,11 @@ reconstructed from, so you can see where in the file you are as you scrub or
 play. An image's bytes are one run, and the map wraps, so the marker wraps too -
 part of a row, then whole rows, then part of a row, the way a line of selected
 text does. **Clicking anywhere on the map jumps to the image nearest that point in
-the file** and pauses playback - handy for going straight to the far side of a
-gap. And an image with any frame built from a failed-CRC packet is **flagged**:
+the file**, and **dragging scrubs** - the picture follows the pointer for as
+long as the button is held, so you can run through an experiment by hand and
+stop where something looks interesting. Either pauses playback. Only a press
+that lands on the map starts a scrub, and once one has, the pointer is clamped
+to the map, so drifting off an edge keeps scrubbing along it. And an image with any frame built from a failed-CRC packet is **flagged**:
 its border turns amber and a line under it says how many of its frames are
 affected. The pixels are shown either way - they are the only copy of that data -
 but nothing vouches for them.
