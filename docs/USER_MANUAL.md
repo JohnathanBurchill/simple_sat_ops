@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`fc33c61` (2026-08-30). This is a working draft.
+`a24ce48` (2026-08-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2991,16 +2991,27 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   politely rate-limited. Every log line is UTC-timestamped, and each run
   ends with a `=== summary` table.
 
-  Only the observation *listing* is rate limited. SatNOGS installs its
-  throttle on that endpoint's `list` action alone — 60 requests an hour
-  anonymous, 240 with a token — so nothing else the script does counts:
-  not the audio, which comes from object storage on another host, and
-  not the observation records, which the listing already carries. What
-  a run spends is therefore one request per page of 25 observations in
-  the window it asks for, which in steady state is a single request per
-  tick. The summary's `list reqs (last hr)` row reports that against
-  the ceiling over the same rolling hour SatNOGS counts, so a one-off
-  backfill ages out instead of inflating the figure.
+  Only the observation *listing* meets a published ceiling. SatNOGS
+  installs its throttle on that endpoint's `list` action alone — 60
+  requests an hour anonymous, 240 with a token — so nothing else the
+  script does counts against it: not the audio, which comes from object
+  storage on another host, and not the observation records, which the
+  listing already carries. What a run spends against the ceiling is
+  therefore one request per page of 25 observations in the window it
+  asks for, which in steady state is a single request per tick. The
+  summary's `list reqs (last hr)` row reports that against the ceiling
+  over the same rolling hour SatNOGS counts, so a one-off backfill ages
+  out instead of inflating the figure.
+
+  Audio sitting outside that ceiling does not make it free. Downloading
+  is the other half of what this script does to the network, and pulling
+  recordings hard is what got this station's address blocked in August
+  2026 — with no ceiling anywhere to say the limit is being approached.
+  Each recording fetched is therefore tallied alongside the listings, in
+  the same `.api_stats.txt` and the same rolling hour, and reported as
+  the summary's `audio got (last hr)` row. Treat it as a figure to watch
+  rather than one to spend up to: nothing enforces it, which is exactly
+  why it needs an eye on it.
 
   Watch that row. In steady state it should sit in the low tens, and a
   value climbing toward the ceiling means the download cursor has
@@ -3037,11 +3048,11 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
 
   `o` cycles the column the rows are sorted by, and `O` cycles it the
   other way: `no` (the day's own order, by start time, which is where it
-  starts), `id`, `start`, `el` and `data`. Each column sorts the way it
-  is worth asking for — id and start lowest and earliest first,
-  elevation and frame count largest first — so `o` three times puts the
-  day's highest passes at the top and a fourth press puts the ones that
-  carried the most data there. The sorted column is the capitalised
+  starts), `id`, `start`, `len`, `el` and `data`. Each column sorts the
+  way it is worth asking for — id and start lowest and earliest first,
+  pass length, elevation and frame count largest first — so sorting by
+  `el` puts the day's highest passes at the top, and by `data` the ones
+  that carried the most. The sorted column is the capitalised
   heading; the row numbers keep counting down the screen whatever the
   order is, and the cursor stays on the observation it was on. The
   filter and the sort are independent: filtering to the passes with
@@ -3107,16 +3118,22 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   The browser makes no network requests of its own. It reads the day
   caches and spawns `satnogs_pull.sh` for anything else, which keeps the
   archive lock, the polite delay and the request tally in one place.
-  Listing a day is the only thing that costs a request — around 50 for a
-  busy day, and nothing at all to revisit it, because the listing is
-  cached on disk. Downloading is free of the throttle entirely. The top
-  bar shows what has gone out in the trailing hour against the ceiling
-  (60 requests without an API token, 240 with one), read from the same
-  `.api_stats.txt` tally the script keeps, so the budget is visible
-  before you spend it rather than in a summary afterwards. The script
-  records each request as it makes it, so that figure climbs while a
-  listing is still walking and falls again of its own accord as
-  requests age past the hour, with no run needed to move it. It sets
+  Listing a day is the only thing that costs an API request — around 50
+  for a busy day, and nothing at all to revisit it, because the listing
+  is cached on disk. The top bar reads `API 12/60 and 38 downloads per
+  hour`: the first figure is the listing requests in the trailing hour
+  against the ceiling (60 without an API token, 240 with one), and the
+  second is the recordings fetched in that same hour. Downloads meet no
+  ceiling — they come from object storage rather than the API — but that
+  is not the same as their being free, and the volume is what blocked
+  this station once, so it is shown rather than left out. Both come from
+  the same `.api_stats.txt` tally the script keeps, and the script
+  records each request as it makes it, so the figures climb while a
+  listing or a download is still running and fall again of their own
+  accord as records age past the hour, with no run needed to move them.
+  Pressing `d` on a large mark set is the one action here that can put
+  real volume on the network, so it is worth reading that second figure
+  before and after. It sets
   its own `umask` to 0002, since the archive is a shared setgid tree
   that cron writes as another user.
 * **`decode_passes.sh`** — walk a directory tree, find every `.wav` and
