@@ -889,8 +889,63 @@ static void clear_marks(void)
 
 // ----------------------------------------------------------------- day
 
+// Where the cursor was on each day looked at this session, so stepping
+// away with h or l and coming back puts it where it was rather than at
+// the top of the day. Remembered as an observation id, not a row
+// number: the row an observation sits on moves with the filter and the
+// sort, the observation itself does not. Sixty-four days is further
+// than anyone steps in one sitting; past that the oldest is dropped.
+#define DAY_MEMORY 64
+
+typedef struct {
+    char day[16];
+    long id;
+} daysel_t;
+
+static daysel_t g_daysel[DAY_MEMORY];
+static int      g_n_daysel = 0;
+
+static void remember_day_selection(void)
+{
+    if (g_day[0] == '\0' || g_n_view == 0 || g_sel < 0 || g_sel >= g_n_view)
+        return;
+    long id = g_rows[g_view[g_sel]].id;
+
+    for (int i = 0; i < g_n_daysel; i++) {
+        if (strcmp(g_daysel[i].day, g_day) == 0) {
+            g_daysel[i].id = id;
+            return;
+        }
+    }
+    if (g_n_daysel == DAY_MEMORY) {
+        memmove(&g_daysel[0], &g_daysel[1], sizeof g_daysel[0] * (DAY_MEMORY - 1));
+        g_n_daysel--;
+    }
+    snprintf(g_daysel[g_n_daysel].day, sizeof g_daysel[0].day, "%s", g_day);
+    g_daysel[g_n_daysel].id = id;
+    g_n_daysel++;
+}
+
+// Put the cursor back on the observation this day was left on. A day
+// never visited, or one whose observation the filter now hides, keeps
+// the top row -- the same place it would have started before.
+static void restore_day_selection(void)
+{
+    for (int i = 0; i < g_n_daysel; i++) {
+        if (strcmp(g_daysel[i].day, g_day) != 0) continue;
+        for (int v = 0; v < g_n_view; v++) {
+            if (g_rows[g_view[v]].id == g_daysel[i].id) {
+                g_sel = v;
+                return;
+            }
+        }
+        return;
+    }
+}
+
 static void day_shift(int days)
 {
+    remember_day_selection();
     struct tm tm = {0};
     if (strptime(g_day, "%Y-%m-%d", &tm) == NULL) return;
     time_t t = timegm(&tm) + (time_t)days * 86400;
@@ -901,6 +956,7 @@ static void day_shift(int days)
 
 static void day_today(void)
 {
+    remember_day_selection();
     time_t now = time(NULL);
     struct tm out;
     gmtime_r(&now, &out);
@@ -917,12 +973,13 @@ static int day_valid(const char *s)
 // Re-read whatever g_day now names. Switching days drops the marks:
 // they name observations on the day they were made, and carrying them
 // across would make `d` fetch things that scrolled off the screen days
-// ago.
+// ago. The cursor is not a mark, so it does come back.
 static void reload_day(void)
 {
     clear_marks();
     load_day();
     rebuild_view();
+    restore_day_selection();
 }
 
 // Only for a day that came from somewhere else -- the `g` prompt, or
@@ -932,6 +989,7 @@ static void reload_day(void)
 // practice leaves the date empty.
 static void go_to_day(const char *day)
 {
+    remember_day_selection();
     snprintf(g_day, sizeof g_day, "%s", day);
     reload_day();
 }
@@ -1598,6 +1656,11 @@ static void draw_help(int rows, int cols)
         "carried, why it matters. It shows at the right of the row, cut with an",
         "ellipsis when the screen is too narrow for it, and in full below. Notes",
         "live in .notes.tsv at the top of the archive; emptying one deletes it.",
+        "",
+        "Stepping between days keeps your place. Each day remembers the",
+        "observation the cursor was on, so h to yesterday and l back returns to",
+        "the row you left. Marks are dropped when the day changes, on purpose:",
+        "they name observations on the day they were made.",
         "",
         "A day with no listing still shows what this station holds for it: the",
         "archive is read at startup and merged into every day. `held` in the",
