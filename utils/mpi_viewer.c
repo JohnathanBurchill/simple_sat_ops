@@ -62,11 +62,13 @@
         18..19 integration period            (big-endian uint16)
         22..151 pixels, 65 big-endian uint16 (per the First Light notebook)
 
-    Data coverage: under the aux panel sits a map of the whole reconstructed
-    file -- byte 0 at the top left, the last byte at the bottom right, reading
-    left to right then down. Green is a byte that came down, black one that
-    never did. Each pixel stands for a slice of the file and goes black as soon
-    as any byte in its slice is missing, so a single lost packet still shows.
+    Whereogram: under the aux panel sits the whole recording as one spectrum,
+    every frame a column of its 65 intensities, time left to right and arrival
+    direction up the vertical axis -- which is the direction the ions came in
+    from, hence the name. Five times as wide as it is high. Its horizontal axis
+    is the file rather than the frames in hand, so a stretch that never came
+    down takes its own width instead of being closed up, and is marked by a red
+    rule above the panel. m cycles the colour map, which the image shares.
 
     Re-download export: press d to write the telecommands that fetch whatever of
     the selected experiment never came down -- the holes snapped out to the
@@ -86,8 +88,8 @@
     CRC32 covers both, so only CRC-verified chunks are trusted to say where they
     belong. A chunk whose CRC failed still fills bytes nothing verified claimed,
     but only if its offset lands on the grid the verified ones establish, and
-    every byte it contributes is marked: the coverage map paints those bytes
-    amber, and any image with a frame resting on them is flagged. Both live in
+    every byte it contributes is marked, and any image with a frame resting on
+    them is flagged. Both live in
     bulk_size.c.
 
     Read-only on the DB. Press F5 to re-read it and rebuild the experiment list.
@@ -197,6 +199,11 @@ int main(int argc, char **argv)
 #define NPIX           65    // big-endian uint16 pixels per frame
 #define SCAN_IDX_OFF   13    // inner dome scan index byte (the image row)
 #define MAX_FPI        64    // largest scan period we render
+
+// The 0 V background frame's target-voltage setpoint. It carries no ion signal
+// by construction, so it is not a measurement of where anything came from: the
+// whereogram leaves it out, and so does the intensity range scaled for it.
+#define MPI_BACKGROUND_TV  65535
 
 typedef struct {
     double   ts_ms;
@@ -1124,6 +1131,7 @@ typedef struct {
     int    fpi;            // scan period: n_targets or the override (boundary + column map)
     int    ncols;          // image width in columns (fpi-1; the never-commanded setpoint gets none)
     int    fpi_override;   // 0 = use the detected count, else forced 8/16
+    int    cmap;           // colour map index, shared by the image and the whereogram
     int    zoom;
     int    scale_mode;
     int    dn_min, dn_max;
@@ -1468,36 +1476,182 @@ static void export_redownload(const experiment_t *s, const char *db_path,
              have_path ? "" : " (file path is a placeholder)");
 }
 
-// ---- data-coverage patch ---------------------------------------------------
-// The reconstructed file drawn as a patch of pixels: byte 0 at the top left,
-// the last byte at the bottom right, reading left to right then down. Green
-// where a byte came down, black where it never did. One pixel stands for a
-// slice of the file and goes black as soon as any byte in its slice is missing,
-// so even a one-packet hole is visible.
+// ---- colour maps ------------------------------------------------------------
+// An intensity has no colour of its own, so the choice is about what the eye
+// picks out. Grey is the honest one; ion is the blue-to-orange these spectra
+// are usually shown in; viridis and inferno are the perceptually even maps,
+// which bring up faint structure grey flattens. Each is a handful of anchor
+// colours with a straight ramp between them.
 
-static void build_coverage(const experiment_t *s, Color *pix, int w, int h)
+#define CMAP_STOPS 5
+
+typedef struct {
+    const char   *name;
+    unsigned char rgb[CMAP_STOPS][3];
+} cmap_t;
+
+static const cmap_t g_cmaps[] = {
+    { "grey",    { {   0,  0,  0 }, {  64, 64, 64 }, { 128,128,128 }, { 192,192,192 }, { 255,255,255 } } },
+    { "ion",     { {  45, 75,200 }, { 110,140,225 }, { 215,225,240 }, { 235,160, 70 }, { 255,228,185 } } },
+    { "viridis", { {  68,  1, 84 }, {  59, 82,139 }, {  33,145,140 }, {  94,201, 98 }, { 253,231, 37 } } },
+    { "inferno", { {   0,  0,  4 }, {  87, 16,110 }, { 188, 55, 84 }, { 249,142,  9 }, { 252,255,164 } } },
+};
+#define N_CMAPS ((int) (sizeof g_cmaps / sizeof g_cmaps[0]))
+
+static Color cmap_color(int map, unsigned char val)
 {
-    long ncell = (long) w * (long) h;
-    for (long i = 0; i < ncell; i++) {
-        long b0 = (long) ((double) s->size * (double) i / (double) ncell);
-        long b1 = (long) ((double) s->size * (double) (i + 1) / (double) ncell);
-        if (b1 <= b0) b1 = b0 + 1;
-        if (b1 > s->size) b1 = s->size;
-        int missing = 0, unverified = 0;
-        for (long b = b0; b < b1; b++) {
-            if (!s->present[b]) { missing = 1; break; }
-            if (!s->verified[b]) unverified = 1;
-        }
-        // Amber for a slice that is all there but rests on packets whose CRC
-        // failed: the bytes are readable, nothing says they are right.
-        pix[i] = missing      ? (Color){ 8, 8, 10, 255 }
-               : unverified   ? (Color){ 206, 150, 42, 255 }
-                              : (Color){ 89, 184, 85, 255 };
+    const cmap_t *c = &g_cmaps[((map % N_CMAPS) + N_CMAPS) % N_CMAPS];
+    double t = (double) val / 255.0 * (CMAP_STOPS - 1);
+    int i = (int) t;
+    if (i > CMAP_STOPS - 2) i = CMAP_STOPS - 2;
+    double f = t - (double) i;
+    Color out = { 0, 0, 0, 255 };
+    out.r = (unsigned char) (c->rgb[i][0] + f * ((int) c->rgb[i + 1][0] - (int) c->rgb[i][0]));
+    out.g = (unsigned char) (c->rgb[i][1] + f * ((int) c->rgb[i + 1][1] - (int) c->rgb[i][1]));
+    out.b = (unsigned char) (c->rgb[i][2] + f * ((int) c->rgb[i + 1][2] - (int) c->rgb[i][2]));
+    return out;
+}
+
+// The window's own background, which is what a column with no data is painted
+// in so that nothing reads as a measurement that was never made.
+#define MPI_BG  ((Color){ 18, 18, 22, 255 })
+
+// ---- whereogram -------------------------------------------------------------
+// The whole recording at a glance: every frame a column of its 65 pixels, time
+// running left to right, arrival direction up the vertical axis. It is the
+// spectrum the MPI actually measured, so it doubles as the map of the file --
+// which is why it replaced the coverage patch rather than sitting beside it.
+//
+// The horizontal axis is the file, not the frames we happen to hold: a column
+// covers a fixed run of frame-sized slices, so a stretch that never came down
+// takes up its own width instead of being closed up. That is what makes a gap
+// visible at all. Those columns are painted in the background colour -- a
+// colour map has no value that means "no data", and the darkest end of one
+// would read as a real, low measurement -- and are marked instead by the red
+// rule drawn above the panel.
+//
+// Several frames share a column once a recording is longer than the panel is
+// wide, and they are averaged. Taking the brightest instead lets the one
+// brightest frame in each column stand for all of them, which at ten frames a
+// column paints a picture of the outliers rather than of the data.
+//
+// The colour scale works the same way as the image's, but on the whereogram's
+// own terms: auto here means over the whole whereogram, since scaling a picture
+// of the whole recording to one image of it would make it flicker while
+// scrubbing and would leave one column not comparable with the next. Pass
+// lo >= hi to scale automatically; *out_lo / *out_hi report the range used.
+static void build_whereogram(const experiment_t *s, int cmap, int lo, int hi,
+                             Color *pix, int w, unsigned char *missing,
+                             int *out_lo, int *out_hi)
+{
+    long nslot = s->size / FRAME_STRIDE;
+    if (nslot < 1) nslot = 1;
+
+    // Which frame, if any, begins in each frame-sized slice of the file.
+    int *at = (int *) malloc((size_t) nslot * sizeof *at);
+    int *val = (int *) malloc((size_t) w * NPIX * sizeof *val);
+    if (at == NULL || val == NULL) { free(at); free(val); return; }
+    for (long q = 0; q < nslot; q++) at[q] = -1;
+    for (int k = 0; k < s->nframes; k++) {
+        long q = s->fr_off[k] / FRAME_STRIDE;
+        if (q >= 0 && q < nslot) at[q] = k;
     }
+
+    // First pass: what each column reads, averaged over the frames in it.
+    for (int c = 0; c < w; c++) {
+        long q0 = (long) c * nslot / w;
+        long q1 = (long) (c + 1) * nslot / w;
+        if (q1 <= q0) q1 = q0 + 1;
+        if (q1 > nslot) q1 = nslot;
+
+        long sum[NPIX] = {0};
+        int nsum = 0, gap = 0;
+
+        for (long q = q0; q < q1; q++) {
+            long b0 = q * FRAME_STRIDE, b1 = b0 + FRAME_STRIDE;
+            if (b1 > s->size) b1 = s->size;
+            for (long b = b0; b < b1; b++)
+                if (!s->present[b]) { gap = 1; break; }
+
+            int k = at[q];
+            if (k < 0 || s->fr_bad[k]) continue;
+            long base = s->fr_off[k] + PIX_START;
+            if (base + 2 * NPIX > s->size) continue;
+            for (int j = 0; j < NPIX; j++) sum[j] += be16(s->buf, base + j * 2);
+            nsum++;
+        }
+
+        missing[c] = (unsigned char) gap;
+        for (int j = 0; j < NPIX; j++)
+            val[(long) j * w + c] = nsum > 0 ? (int) (sum[j] / nsum) : -1;
+    }
+    free(at);
+
+    // Auto scaling is over the whole whereogram -- but over what it holds, not
+    // over its two most extreme samples. Taking the plain minimum and maximum
+    // gave 0 .. 49296 and painted a flat blue rectangle: a few corrupt readings
+    // reach the ends of the 16-bit range, and pixel 64 of every frame carries
+    // something around 32000 where the other 64 sit near 2010, so one row in
+    // 65 owns the whole top of the scale. The 1st and 95th percentile step past
+    // both and leave the range the readings actually occupy.
+    if (lo >= hi) {
+        long *hist = (long *) calloc(65536, sizeof *hist);
+        long total = 0;
+        if (hist != NULL) {
+            for (long i = 0; i < (long) w * NPIX; i++)
+                if (val[i] >= 0 && val[i] <= 65535) { hist[val[i]]++; total++; }
+        }
+        int mn = 0, mx = 65535;
+        if (total > 0) {
+            long seen = 0;
+            for (int p = 0; p < 65536; p++) { seen += hist[p]; if (seen * 100 >= total) { mn = p; break; } }
+            seen = 0;
+            for (int p = 65535; p >= 0; p--) { seen += hist[p]; if (seen * 20 >= total) { mx = p; break; } }
+        }
+        free(hist);
+        lo = mn;
+        hi = mx;
+    }
+    if (hi <= lo) hi = lo + 1;
+
+    // Second pass: paint it.
+    for (long i = 0; i < (long) w * NPIX; i++) {
+        int p = val[i];
+        if (p < 0) { pix[i] = MPI_BG; continue; }
+        int g = p <= lo ? 0 : p >= hi ? 255 : (int) (255.0 * (p - lo) / (hi - lo));
+        pix[i] = cmap_color(cmap, (unsigned char) g);
+    }
+    free(val);
+    *out_lo = lo; *out_hi = hi;
+}
+
+// Where a file offset falls along the whereogram's horizontal axis, and the
+// offset a column stands for -- the two directions of the same mapping, used to
+// place the playback head and to turn a pointer position back into an image.
+static int wg_col_of_byte(const experiment_t *s, int w, long byte)
+{
+    long nslot = s->size / FRAME_STRIDE;
+    if (nslot < 1) nslot = 1;
+    long q = byte / FRAME_STRIDE;
+    if (q < 0) q = 0;
+    if (q > nslot - 1) q = nslot - 1;
+    int c = (int) (q * w / nslot);
+    if (c < 0) c = 0;
+    if (c > w - 1) c = w - 1;
+    return c;
+}
+
+static long wg_byte_of_col(const experiment_t *s, int w, int col)
+{
+    long nslot = s->size / FRAME_STRIDE;
+    if (nslot < 1) nslot = 1;
+    if (col < 0) col = 0;
+    if (col > w - 1) col = w - 1;
+    return ((long) col * nslot / w) * FRAME_STRIDE;
 }
 
 // The byte range the currently shown image was reconstructed from, so the
-// coverage map can mark where in the file you are looking. Returns 0 if the
+// whereogram can mark where in the recording you are looking. Returns 0 if the
 // image has no frames.
 static int image_byte_span(const view_t *v, const experiment_t *s, int img,
                            long *out_b0, long *out_b1)
@@ -1516,7 +1670,7 @@ static int image_byte_span(const view_t *v, const experiment_t *s, int img,
 }
 
 // The image whose bytes sit closest to file offset `byte`, for click-to-seek on
-// the coverage map. Returns -1 if there are no images.
+// the whereogram. Returns -1 if there are no images.
 static int image_nearest_byte(const view_t *v, const experiment_t *s, long byte)
 {
     int best = -1;
@@ -1617,13 +1771,14 @@ int main(int argc, char **argv)
     SetTargetFPS(60);
     g_ui_font_loaded = load_ui_font();
 
-    // A fixed grayscale texture holding the image rotated 90 CW: the scan rows
-    // become columns (width MAX_FPI) and the 65 pixels become rows (height
-    // NPIX). We fill the top-left fpi x NPIX region and let raylib scale it with
-    // nearest-neighbour (POINT) filtering.
-    unsigned char graybuf[MAX_FPI * NPIX] = {0};
-    Image gimg = { .data = graybuf, .width = MAX_FPI, .height = NPIX,
-                   .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_GRAYSCALE };
+    // A fixed texture holding the image rotated 90 CW: the scan rows become
+    // columns (width MAX_FPI) and the 65 pixels become rows (height NPIX). We
+    // fill the top-left fpi x NPIX region and let raylib scale it with
+    // nearest-neighbour (POINT) filtering. Full colour rather than grey so the
+    // colour map applies here as well as to the whereogram.
+    Color imgbuf[MAX_FPI * NPIX] = {0};
+    Image gimg = { .data = imgbuf, .width = MAX_FPI, .height = NPIX,
+                   .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
     Texture2D tex = LoadTextureFromImage(gimg);
     SetTextureFilter(tex, TEXTURE_FILTER_POINT);
 
@@ -1638,12 +1793,14 @@ int main(int argc, char **argv)
     char  status[200] = "";
     float status_left = 0.0f;
 
-    // Data-coverage map: one texture pixel per slice of the reconstructed file,
-    // rebuilt when the experiment changes or the patch is resized.
+    // The whereogram: one texture column per run of frames, NPIX rows, rebuilt
+    // when the experiment, the colour map, the scale or the panel width change.
     Color    *cov_pix = NULL;
     Texture2D cov_tex = {0};
-    int cov_w = 0, cov_h = 0, cov_sel = -1;
-    // Set while the pointer is scrubbing the coverage map, so a press that
+    int cov_w = 0, cov_sel = -1;
+    unsigned char *wg_missing = NULL;   // per column: some of its bytes never came down
+    int wg_lo = -1, wg_hi = -1;         // the DN window its colours were built for
+    // Set while the pointer is scrubbing the whereogram, so a press that
     // began there keeps control until the button is let go -- and a press that
     // began anywhere else never takes it.
     int cov_drag = 0;
@@ -1652,9 +1809,9 @@ int main(int argc, char **argv)
         experiment_t *s = &exps[v.sel];
 
         // ---- input ----
-        // Letting the button go ends a coverage-map scrub. Checked here rather
-        // than beside the map itself, which is not drawn at all in a window too
-        // small for it -- a scrub must not survive that.
+        // Letting the button go ends a whereogram scrub. Checked here rather
+        // than beside the panel itself, which is not drawn at all in a window
+        // too small for it -- a scrub must not survive that.
         if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) cov_drag = 0;
         if (key_repeat(KEY_DOWN, &rep_down) && v.sel < nexp - 1) { v.sel++; select_experiment(&v, &exps[v.sel]); s = &exps[v.sel]; }
         if (key_repeat(KEY_UP, &rep_up)     && v.sel > 0)        { v.sel--; select_experiment(&v, &exps[v.sel]); s = &exps[v.sel]; }
@@ -1701,11 +1858,12 @@ int main(int argc, char **argv)
                 v.img_pos = save_img;
                 v.playing = save_play;
                 s = &exps[v.sel];
-                cov_sel = -1;   // the reloaded experiment needs a fresh coverage map
+                cov_sel = -1;   // the reloaded experiment needs a fresh whereogram
             } else if (ne != NULL) {
                 free_experiments(ne, nn);
             }
         }
+        if (IsKeyPressed(KEY_M)) v.cmap = (v.cmap + 1) % N_CMAPS;
         if (IsKeyPressed(KEY_Q)) break;
         if (status_left > 0.0f) status_left -= GetFrameTime();
 
@@ -1738,7 +1896,7 @@ int main(int argc, char **argv)
         }
 
         // ---- rasterise the image into the grayscale texture ----
-        memset(graybuf, 0, sizeof graybuf);
+        for (int q = 0; q < MAX_FPI * NPIX; q++) imgbuf[q] = MPI_BG;
         double frame_time = -1.0;
         int rep_frame = -1, cols_present = 0;
         for (int k = 0; k < s->nframes; k++) {
@@ -1753,10 +1911,10 @@ int main(int argc, char **argv)
                 int p = be16(s->buf, base + j * 2);
                 int g = p <= lo ? 0 : p >= hi ? 255 : (int) (255.0 * (p - lo) / (hi - lo));
                 // Column = bias voltage (background right, most negative left); pixel -> row.
-                graybuf[j * MAX_FPI + col] = (unsigned char) g;
+                imgbuf[j * MAX_FPI + col] = cmap_color(v.cmap, (unsigned char) g);
             }
         }
-        UpdateTexture(tex, graybuf);
+        UpdateTexture(tex, imgbuf);
 
         // ---- draw ----
         BeginDrawing();
@@ -1850,59 +2008,83 @@ int main(int argc, char **argv)
         draw_text(TextFormat("playback      : %s  %.0f img/s", v.playing ? "PLAY" : "paused", v.ips),
                   ax, ay, 15, v.playing ? (Color){ 120, 220, 160, 255 } : GRAY); ay += 20;
 
-        // data-coverage patch, under the aux panel: the whole reconstructed
-        // file, green where the bytes came down and black where they never did
+        draw_text(TextFormat("colour map    : %s  (%d/%d)",
+                             g_cmaps[v.cmap].name, v.cmap + 1, N_CMAPS),
+                  ax, ay, 15, LIGHTGRAY); ay += 20;
+
+        // The whereogram, under the aux panel: the whole recording as a
+        // spectrum, one column per frame, arrival direction up the vertical
+        // axis. Five times as wide as it is high, because the interesting axis
+        // is time and 65 pixels is all the other one ever has.
         ay += 8;
-        draw_text("Data coverage", ax, ay, 18, RAYWHITE); ay += 24;
+        draw_text("Whereogram  (arrival direction against time)", ax, ay, 18, RAYWHITE);
+        if (wg_hi > wg_lo) {
+            const char *wr = TextFormat("DN %d .. %d", wg_lo, wg_hi);
+            draw_text(wr, GetScreenWidth() - 20 - text_width(wr, 13), ay + 5, 13, GRAY);
+        }
+        ay += 24;
         int cw = GetScreenWidth() - ax - 20;
-        if (cw > 340) cw = 340;
-        int ch = GetScreenHeight() - 68 - ay;
-        if (cw >= 40 && ch >= 24) {
-            if (cw != cov_w || ch != cov_h) {
-                Color *np = (Color *) realloc(cov_pix, (size_t) cw * (size_t) ch * sizeof *cov_pix);
-                if (np != NULL) {
-                    cov_pix = np; cov_w = cw; cov_h = ch;
+        int avail_h = GetScreenHeight() - 74 - ay;
+        if (cw > avail_h * 5) cw = avail_h * 5;
+        int ch = cw / 5;
+        if (cw >= 80 && ch >= 20) {
+            // Same scale control as the image: a manual window is taken as
+            // given, and either auto mode scales the whereogram over the whole
+            // whereogram. Scaling it to the shown image instead would make it
+            // flicker while scrubbing and stop one column being comparable
+            // with the next.
+            int wlo = v.scale_mode == SCALE_MANUAL ? v.dn_min : 0;
+            int whi = v.scale_mode == SCALE_MANUAL ? v.dn_max : 0;
+            // What the built pixels depend on: any change here rebuilds them.
+            int sig = ((v.sel * N_CMAPS + v.cmap) * 4 + v.scale_mode) * 65536
+                    + (v.scale_mode == SCALE_MANUAL ? (v.dn_min ^ (v.dn_max << 3)) & 0xFFFF : 0);
+            if (cw != cov_w) {
+                Color *np = (Color *) realloc(cov_pix, (size_t) cw * NPIX * sizeof *cov_pix);
+                unsigned char *nm = (unsigned char *) realloc(wg_missing, (size_t) cw);
+                if (np != NULL && nm != NULL) {
+                    cov_pix = np; wg_missing = nm; cov_w = cw;
                     if (cov_tex.id != 0) UnloadTexture(cov_tex);
-                    build_coverage(s, cov_pix, cov_w, cov_h);
-                    cov_sel = v.sel;
-                    Image ci = { .data = cov_pix, .width = cov_w, .height = cov_h,
+                    build_whereogram(s, v.cmap, wlo, whi, cov_pix, cov_w, wg_missing,
+                                     &wg_lo, &wg_hi);
+                    cov_sel = sig;
+                    Image ci = { .data = cov_pix, .width = cov_w, .height = NPIX,
                                  .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
                     cov_tex = LoadTextureFromImage(ci);
+                    SetTextureFilter(cov_tex, TEXTURE_FILTER_POINT);
                 }
-            } else if (cov_sel != v.sel) {
-                build_coverage(s, cov_pix, cov_w, cov_h);
-                cov_sel = v.sel;
+            } else if (cov_sel != sig) {
+                build_whereogram(s, v.cmap, wlo, whi, cov_pix, cov_w, wg_missing,
+                                 &wg_lo, &wg_hi);
+                cov_sel = sig;
                 UpdateTexture(cov_tex, cov_pix);
             }
             if (cov_tex.id != 0) {
-                DrawTexture(cov_tex, ax, ay, WHITE);
-                DrawRectangleLines(ax - 1, ay - 1, cov_w + 2, cov_h + 2, (Color){ 70, 70, 80, 255 });
+                Rectangle wsrc = { 0, 0, (float) cov_w, (float) NPIX };
+                Rectangle wdst = { (float) ax, (float) ay, (float) cw, (float) ch };
+                DrawTexturePro(cov_tex, wsrc, wdst, (Vector2){ 0, 0 }, 0.0f, WHITE);
+                DrawRectangleLines(ax - 1, ay - 1, cw + 2, ch + 2, (Color){ 70, 70, 80, 255 });
 
-                // Playhead: the cells holding the bytes the shown image was
-                // built from. The map reads left to right then down, so the
-                // run wraps the way a line of selected text does -- part of a
-                // row, then whole rows, then part of a row -- and is drawn that
-                // way, one filled segment per row. A row of the map is one
-                // pixel tall, so outlining the band instead would draw the band
-                // plus a line above and a line below it that mark nothing.
+                // A red rule above the panel over every stretch that never came
+                // down. Those columns are painted in the background colour, and
+                // background is not a reading -- without the rule there would be
+                // nothing to tell "no data" from "nothing arriving".
+                for (int c = 0; c < cov_w; c++) {
+                    if (!wg_missing[c]) continue;
+                    int x = ax + c * cw / cov_w;
+                    int xe = ax + (c + 1) * cw / cov_w;
+                    if (xe <= x) xe = x + 1;
+                    DrawRectangle(x, ay - 5, xe - x, 3, (Color){ 220, 60, 60, 255 });
+                }
+
+                // Playback head: the columns the shown image was built from.
                 long pb0 = 0, pb1 = 0;
                 if (v.n_img > 0 && image_byte_span(&v, s, v.img_pos, &pb0, &pb1)) {
-                    long ncell = (long) cov_w * (long) cov_h;
-                    long c0 = pb0 * ncell / s->size;
-                    long c1 = (pb1 * ncell + s->size - 1) / s->size;
-                    if (c1 <= c0) c1 = c0 + 1;
-                    if (c1 > ncell) c1 = ncell;
-                    int r0 = (int) (c0 / cov_w), r1 = (int) ((c1 - 1) / cov_w);
-                    int x0 = (int) (c0 % cov_w), x1 = (int) ((c1 - 1) % cov_w) + 1;
-                    for (int r = r0; r <= r1; r++) {
-                        int a = (r == r0) ? x0 : 0;
-                        int b = (r == r1) ? x1 : cov_w;
-                        // An image can cover fewer cells than it takes to see.
-                        if (b - a < 3) b = a + 3;
-                        if (b > cov_w) { b = cov_w; a = cov_w - 3; }
-                        if (a < 0) a = 0;
-                        DrawRectangle(ax + a, ay + r, b - a, 1, RAYWHITE);
-                    }
+                    int c0 = wg_col_of_byte(s, cov_w, pb0);
+                    int c1 = wg_col_of_byte(s, cov_w, pb1 - 1);
+                    int x0 = ax + c0 * cw / cov_w;
+                    int x1 = ax + (c1 + 1) * cw / cov_w;
+                    if (x1 - x0 < 3) x1 = x0 + 3;
+                    DrawRectangleLines(x0 - 1, ay - 1, x1 - x0 + 2, ch + 2, RAYWHITE);
                 }
 
                 draw_text(TextFormat("%.1f%% of %.0f KB down, %.0f KB missing  (%s)",
@@ -1912,33 +2094,30 @@ int main(int argc, char **argv)
                                          ? (s->size_exact ? "length from the satellite"
                                                           : "length is a satellite-reported minimum")
                                          : "length is the largest offset seen"),
-                          ax, ay + cov_h + 6, 13, GRAY);
+                          ax, ay + ch + 8, 13, GRAY);
                 if (s->unverified > 0)
-                    draw_text(TextFormat("amber: %.0f KB rest on packets whose CRC failed",
+                    draw_text(TextFormat("%.0f KB of it rests on packets whose CRC failed",
                                          s->unverified / 1024.0),
-                              ax, ay + cov_h + 22, 13, (Color){ 206, 150, 42, 255 });
+                              ax, ay + ch + 24, 13, (Color){ 206, 150, 42, 255 });
             }
 
-            // Press the map to jump to the image nearest that point in the
-            // file, and keep dragging to scrub through the experiment. Only a
-            // press that landed on the map starts a scrub; once it has, the
-            // pointer is clamped to the map, so wandering off an edge keeps
-            // scrubbing along that edge instead of stopping dead.
+            // Press the whereogram to jump to the image at that moment in the
+            // recording, and keep dragging to scrub. Only a press that landed
+            // on it starts a scrub; once one has, the pointer is clamped to the
+            // panel, so wandering off an edge keeps scrubbing along that edge
+            // instead of stopping dead.
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 Vector2 m = GetMousePosition();
-                if (m.x >= ax && m.x < ax + cov_w && m.y >= ay && m.y < ay + cov_h)
+                if (m.x >= ax && m.x < ax + cw && m.y >= ay && m.y < ay + ch)
                     cov_drag = 1;
             }
             if (cov_drag && v.n_img > 0) {
                 Vector2 m = GetMousePosition();
-                int mx = (int) m.x - ax, my = (int) m.y - ay;
+                int mx = (int) m.x - ax;
                 if (mx < 0) mx = 0;
-                if (mx > cov_w - 1) mx = cov_w - 1;
-                if (my < 0) my = 0;
-                if (my > cov_h - 1) my = cov_h - 1;
-                long cell = (long) my * cov_w + mx;
-                long byte = cell * s->size / ((long) cov_w * (long) cov_h);
-                int img = image_nearest_byte(&v, s, byte);
+                if (mx > cw - 1) mx = cw - 1;
+                int img = image_nearest_byte(&v, s,
+                                             wg_byte_of_col(s, cov_w, mx * cov_w / cw));
                 if (img >= 0) { v.img_pos = img; v.playing = 0; }
             }
         }
@@ -1949,9 +2128,9 @@ int main(int argc, char **argv)
 
         // help footer
         const char *help =
-            "Up/Down experiment   Left/Right image   click or drag coverage map"
+            "Up/Down experiment   Left/Right image   click or drag whereogram"
             "   Space play/pause   ,/. speed   f steps/sweep   s zoom   a scale"
-            "   z/x min  c/v max   d re-download commands   F5 refresh  q quit";
+            "   z/x min  c/v max   m colour map   d re-download commands   F5 refresh  q quit";
         draw_text(help, 12, GetScreenHeight() - 22, 12, (Color){ 150, 150, 160, 255 });
 
         EndDrawing();
@@ -1965,6 +2144,7 @@ int main(int argc, char **argv)
     free_experiments(exps, nexp);
     free(v.fr_img);
     free(cov_pix);
+    free(wg_missing);
     return 0;
 }
 

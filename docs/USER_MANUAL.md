@@ -2382,40 +2382,60 @@ drops any frame whose body overlaps a marker, which removes the routine periodic
 artifact (roughly one frame in 134).
 
 Keys: `Up`/`Down` change experiment, `Left`/`Right` scrub images (or click or
-drag the coverage map to scrub through the file), `Space` plays/pauses, `,`/`.`
+drag the whereogram to scrub through the recording), `Space` plays/pauses, `,`/`.`
 set the playback speed, `f` cycles frames-per-image (auto/8/16), `s` zoom, `a` cycles the colour scale (auto-image / auto-experiment
 / manual), `r` resets it to auto-image, `z`/`x` and `c`/`v` move the manual DN
-window (hold `Shift` for coarse steps), `d` writes the re-download
+window (hold `Shift` for coarse steps), `m` cycles the colour map, `d` writes
+the re-download
 telecommands (below), **`F5` re-reads the database** and rebuilds the
 list (keeping your selection and view settings), and `q` quits.
 Read-only on the database and safe to run while a receiver is filling it.
 
-Under the aux panel is a **data-coverage map** of the whole reconstructed file:
-byte 0 at the top left, the last byte at the bottom right, reading left to right
-then down. Green is a byte that came down, **amber** one that came down only on a
-packet whose CRC failed, black one that never did. The line beneath gives the
-received percentage, how much is still missing, and where the file's length came
-from - the satellite's own byte count for that file, a satellite-reported
-minimum, or (when the log never named it) the largest offset received. That last
-case is the only one where the percentage is measured against a guess; see
-`mpi_reconstruct` above for how the length is established.
+Under the aux panel is the **whereogram**: the whole recording as one spectrum,
+every frame a column of its 65 pixel intensities, time running left to right and
+arrival direction up the vertical axis - which is what the name is about, since
+that axis is the direction the ions came in from. It is drawn five times as wide
+as it is high, because the axis worth room is time and the other one only ever
+has 65 pixels on it.
 
-A **white marker** on the map covers the bytes the image on screen was
-reconstructed from, so you can see where in the file you are as you scrub or
-play. An image's bytes are one run, and the map wraps, so the marker wraps too -
-part of a row, then whole rows, then part of a row, the way a line of selected
-text does. **Clicking anywhere on the map jumps to the image nearest that point in
-the file**, and **dragging scrubs** - the picture follows the pointer for as
-long as the button is held, so you can run through an experiment by hand and
-stop where something looks interesting. Either pauses playback. Only a press
-that lands on the map starts a scrub, and once one has, the pointer is clamped
-to the map, so drifting off an edge keeps scrubbing along it. And an image with any frame built from a failed-CRC packet is **flagged**:
-its border turns amber and a line under it says how many of its frames are
-affected. The pixels are shown either way - they are the only copy of that data -
-but nothing vouches for them.
-Each pixel stands for a slice of the file and goes black as soon as any byte in
-that slice is missing, so a single lost packet still shows - a quick read on how
-much of an experiment is still on the satellite before you press `d`.
+The horizontal axis is the file rather than the frames in hand: a column stands
+for a fixed run of frame-sized slices, so a stretch that never came down takes up
+its own width instead of being closed up. Those columns are painted in the
+window's background colour - a colour map has no value meaning "no data", and its
+darkest end would read as a real, low measurement - and a **red rule above the
+panel** marks them. Several frames share a column once a recording is longer
+than the panel is wide, and they are averaged.
+
+The line beneath gives the received percentage, how much is still missing, and
+where the file's length came from - the satellite's own byte count for that file,
+a satellite-reported minimum, or (when the log never named it) the largest offset
+received. That last case is the only one where the percentage is measured against
+a guess; see `mpi_reconstruct` above for how the length is established.
+
+A **white box** on the whereogram marks the columns the image on screen was
+built from, so you can see where in the recording you are as you scrub or play.
+**Clicking jumps to the image at that moment**, and **dragging scrubs** - the
+picture follows the pointer for as long as the button is held, so you can run
+through an experiment by hand and stop where something looks interesting. Either
+pauses playback. Only a press that lands on the panel starts a scrub, and once
+one has, the pointer is clamped to it, so drifting off an edge keeps scrubbing
+along that edge. An image with any frame built from a failed-CRC packet is
+**flagged**: its border turns amber and a line under it says how many of its
+frames are affected. The pixels are shown either way - they are the only copy of
+that data - but nothing vouches for them.
+
+**`m` cycles the colour map** - grey, ion (the blue-to-orange these spectra are
+usually shown in), viridis, inferno - and applies to both the image and the
+whereogram. (`c` was already taken by the manual DN maximum.) The colour scale
+control is the same `a` as the image's, but auto means something different for
+each: the image scales to the image, while the whereogram scales over the whole
+whereogram, since scaling a picture of the entire recording to one image of it
+would flicker while scrubbing and leave one column not comparable with the next.
+The range used is printed at the panel's right, and it is a 1st-to-95th
+percentile rather than the plain extremes - a handful of corrupt readings reach
+the ends of the 16-bit range, and pixel 64 of every frame carries something
+around 32000 where the other 64 sit near 2010, so the extremes flatten the whole
+picture into a featureless rectangle.
 
 **Press `d` to write the re-download telecommands** for the selected
 experiment. An experiment is only as complete as the passes that carried it, and
