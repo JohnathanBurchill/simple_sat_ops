@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`980d896` (2026-08-30). This is a working draft.
+`aaea93b` (2026-08-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -681,7 +681,7 @@ Which targets actually build depends on what the host has:
 | Dependency | Targets it unlocks |
 |------------|---------------------|
 | always | `radio_ctl`, `rs_selftest`, `fm_preview`, `agenda_check` |
-| OpenSSL / libcrypto | `uplink_test`, `rx_decode`, `packet_query`, `packet_browser`, `tcmd_browser`, `tcmd_import` |
+| OpenSSL / libcrypto | `uplink_test`, `rx_decode`, `packet_query`, `packet_browser`, `tcmd_browser`, `satnogs_browser`, `tcmd_import` |
 | SGP4SDP4 | `next_in_queue`, `lifetime`, `tle_keps`, `conjunction`, `prediction_selftest`, `pursuit_selftest` |
 | UHD (B210) | `b210_rx_capture`, `b210_gain_sweep`, `tx_frame_sdr`, `sdr_probe` |
 | librtlsdr | RTL-SDR RX-only backend in `simple_sat_ops` (on by default; auto-disables if absent) |
@@ -2981,19 +2981,56 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   can walk it. Built for unattended cron: idempotent (it tracks fetched
   observation IDs), locked against overlapping runs, atomic writes, and
   politely rate-limited. Every log line is UTC-timestamped, and each run
-  ends with a `=== summary` table whose API rows report the accesses made
-  that run (`API calls (run)`) and the accesses in the trailing 60 minutes
-  against the ceiling (`API calls (last hr)`) — the same rolling hour the
-  SatNOGS throttle counts (60 anonymous, 240 with a token), so a one-off
-  backfill burst ages out instead of inflating the figure. Watch that
-  second row: in steady state it should sit in the low tens, and a value
-  climbing toward the ceiling means the download cursor has stopped
-  advancing and every run is re-walking the same window — left alone,
-  that ends in the SatNOGS edge blocking the station's IP, which is what
-  happened in August 2026. `--pending-max-age` (default 6h) is the guard;
-  it stops an observation whose audio never arrives from pinning the
-  cursor in place. `--decode` runs the decoder on each new pass as it
-  lands.
+  ends with a `=== summary` table.
+
+  Only the observation *listing* is rate limited. SatNOGS installs its
+  throttle on that endpoint's `list` action alone — 60 requests an hour
+  anonymous, 240 with a token — so nothing else the script does counts:
+  not the audio, which comes from object storage on another host, and
+  not the observation records, which the listing already carries. What
+  a run spends is therefore one request per page of 25 observations in
+  the window it asks for, which in steady state is a single request per
+  tick. The summary's `list reqs (last hr)` row reports that against
+  the ceiling over the same rolling hour SatNOGS counts, so a one-off
+  backfill ages out instead of inflating the figure.
+
+  Watch that row. In steady state it should sit in the low tens, and a
+  value climbing toward the ceiling means the download cursor has
+  stopped advancing and every run is re-walking the same window — about
+  50 listing requests a tick, 15 ticks an hour. Left alone that ends in
+  the SatNOGS edge blocking the station's address, which is what
+  happened in August 2026. `--pending-max-age` (default 2h) is the
+  guard: it stops an observation whose audio never arrives from pinning
+  the cursor in place.
+
+  `--decode` runs the decoder on each new pass as it lands.
+  `--cache-day=YYYY-MM-DD` lists one UTC day into
+  `<out>/.daycache/<norad>/` and downloads nothing, and
+  `--obs-ids=<n,n,...>` downloads exactly the observations named; those
+  two are what `satnogs_browser` calls, and neither touches the cursor,
+  so browsing history cannot disturb the polling run.
+* **`satnogs_browser`** — a curses view of one UTC day of the archive:
+  every observation SatNOGS holds for the satellite, what state each one
+  is in locally, and a way to mark passes and fetch them. Arrow keys
+  move, left and right step days, `t` jumps to today and `g` to a date,
+  `r` lists the day from SatNOGS, `space` marks, `a` marks everything
+  fetchable in view, `d` downloads what is marked, and `f` cycles the
+  filter (all, with audio, not downloaded, downloaded, decoded).
+
+  Each row says whether this station has the audio, and whether that
+  audio produced packets — the second read from `session_dir` in the
+  packet database, so "decoded" means the pass actually yielded
+  something rather than merely landing on disk. A row marked `no audio`
+  is one SatNOGS itself never received a recording for, roughly a third
+  of all observations; nobody can fetch those, and they are shown so a
+  day's coverage reads honestly.
+
+  The browser makes no network requests of its own. It reads the day
+  caches and spawns `satnogs_pull.sh` for anything else, which keeps the
+  archive lock, the polite delay and the request tally in one place.
+  Listing a day is the only thing that costs a request — around 50 for a
+  busy day, and nothing at all to revisit it, because the listing is
+  cached on disk. Downloading is free of the throttle entirely.
 * **`decode_passes.sh`** — walk a directory tree, find every `.wav` and
   `.ogg`, run `rx_replay` on each (resampling `.ogg` first), and
   summarize what decoded. Beacons print as readable telemetry; anything
