@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`6268afe` (2026-08-30). This is a working draft.
+`d189852` (2026-08-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2218,10 +2218,17 @@ end marker arrived, the decoded JPEG size and dimensions, and the passes the
 download took. A picture too badly holed to decode says so rather than showing
 a broken image; `s` still saves the partial file for another decoder to try.
 
-Keys: `Up`/`Down` change picture, `z` cycles zoom (fit / 1:1 / 2:1), **`o` opens
-the picture in the desktop's image viewer** (Preview on macOS, the `xdg-open`
-default on Linux) via a copy in the temporary directory - a quick look at full
-resolution, with the pan and zoom your viewer already has. `s` saves the JPEG to
+The picture zooms and moves under the mouse: scroll the wheel or pinch the
+trackpad over it to zoom about the pointer, and drag it to move it around.
+Zoom starts at - and will not go below - the whole picture fitted to the pane,
+so scrolling back out always lands on the whole picture again, and a picture
+zoomed past the pane cannot be dragged off its edge. Both go back to the whole
+picture when you change picture or reload.
+
+Keys: `Up`/`Down` change picture, **`o` opens the picture in the desktop's
+image viewer** (Preview on macOS, the `xdg-open` default on Linux) via a copy
+in the temporary directory - for a look in whatever viewer you already keep
+your pictures in. `s` saves the JPEG to
 the working directory as `fs_boomcam_<capture time>.jpg`, **`F5` re-reads the
 database** and rebuilds the list, and `q` quits. Read-only on the database and
 safe to run while a receiver is filling it.

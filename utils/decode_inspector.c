@@ -54,11 +54,11 @@
 
 #ifdef __APPLE__
 // Trackpad pinch is delivered as NSEventTypeMagnify, which raylib/GLFW
-// don't forward. utils/decode_inspector_macos.m installs an NSEvent local
+// don't forward. utils/pinch_macos.m installs an NSEvent local
 // monitor that accumulates magnification deltas into this global; we
 // read & reset it each frame.
-extern float g_decode_inspector_pinch_delta;
-extern void  decode_inspector_install_pinch_monitor(void);
+extern float g_sso_pinch_delta;
+extern void  sso_install_pinch_monitor(void);
 #endif
 
 #include <ctype.h>
@@ -2107,7 +2107,7 @@ int main(int argc, char **argv)
     SetTargetFPS(60);
     SetExitKey(0);
 #ifdef __APPLE__
-    decode_inspector_install_pinch_monitor();
+    sso_install_pinch_monitor();
 #endif
     g_ui_font_loaded = load_ttf_from_known_paths();
 
@@ -2856,8 +2856,8 @@ int main(int argc, char **argv)
         // to whichever panel the cursor is over.
         float pinch = 0.0f;
 #ifdef __APPLE__
-        pinch = g_decode_inspector_pinch_delta;
-        g_decode_inspector_pinch_delta = 0.0f;
+        pinch = g_sso_pinch_delta;
+        g_sso_pinch_delta = 0.0f;
 #endif
         Vector2 wheel_v = GetMouseWheelMoveV();
         // Bottom slot: wf and decmode are mutually exclusive; whichever

@@ -41,6 +41,11 @@
     taken -- which the file itself does not record. Both are best-effort: a
     download commanded from another ground station leaves the row unlabelled.
 
+    Looking at the picture: scroll or pinch over it to zoom, and drag it to
+    move it around. Zoom starts at -- and never goes below -- the whole picture
+    fitted to the pane, so scrolling back out always lands on the whole picture
+    again, and a picture bigger than the pane cannot be dragged off the edge.
+
     Read-only on the DB. Press F5 to re-read it and rebuild the capture list.
 
     Usage:
@@ -72,6 +77,7 @@
 #include "packet_db.h"
 #include "sso_version.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,6 +97,15 @@ int main(int argc, char **argv)
 #else
 
 #include <sqlite3.h>
+
+#ifdef __APPLE__
+// Trackpad pinch arrives as NSEventTypeMagnify, which raylib/GLFW don't
+// forward. utils/pinch_macos.m installs an NSEvent local monitor that
+// accumulates magnification deltas into this global; we read & reset it
+// each frame.
+extern float g_sso_pinch_delta;
+extern void  sso_install_pinch_monitor(void);
+#endif
 
 // Bulk-file packet geometry (mirrors cam_reconstruct.c / mpi_viewer.c). A
 // bulk_file payload is [packet_type:1][file_offset:4 LE][data...]; at most 195
@@ -683,6 +698,54 @@ static int key_repeat(int key, float *cooldown)
     return 0;
 }
 
+// ---- where the picture sits in its pane ------------------------------------
+//
+// The picture is drawn at "fit" -- the largest scale the whole of it takes in
+// the pane -- times the operator's zoom, and slid by pan. Zoom 1 is fit and is
+// the floor, so scrolling back out always lands on the whole picture, and pan
+// is held to the picture's own edges so a zoomed-in picture always covers the
+// pane. The cursor-anchored zoom and the drag both come through here, so the
+// clamping lives in one place.
+#define CAM_ZOOM_MAX 40.0f
+
+static Rectangle picture_dst(const capture_t *c, int px, int py, int pw, int ph,
+                             float zoom, Vector2 *pan)
+{
+    float fit_x = (float) pw / (float) c->img_w;
+    float fit_y = (float) ph / (float) c->img_h;
+    float fit = fit_x < fit_y ? fit_x : fit_y;
+    float dw = c->img_w * fit * zoom, dh = c->img_h * fit * zoom;
+    // Nothing to slide while the whole picture fits.
+    float lim_x = dw > pw ? (dw - pw) / 2.0f : 0.0f;
+    float lim_y = dh > ph ? (dh - ph) / 2.0f : 0.0f;
+    if (pan->x >  lim_x) pan->x =  lim_x;
+    if (pan->x < -lim_x) pan->x = -lim_x;
+    if (pan->y >  lim_y) pan->y =  lim_y;
+    if (pan->y < -lim_y) pan->y = -lim_y;
+    Rectangle dst = { px + (pw - dw) / 2.0f + pan->x,
+                      py + (ph - dh) / 2.0f + pan->y, dw, dh };
+    return dst;
+}
+
+// Zoom by `step` (a log-scale nudge) about the cursor: note which point of the
+// picture the cursor is over, change the scale, then slide the picture so that
+// same point is back under the cursor.
+static void zoom_at_cursor(const capture_t *c, int px, int py, int pw, int ph,
+                           Vector2 m, float step, float *zoom, Vector2 *pan)
+{
+    Rectangle before = picture_dst(c, px, py, pw, ph, *zoom, pan);
+    float ux = (m.x - before.x) / before.width;
+    float uy = (m.y - before.y) / before.height;
+    float nz = *zoom * expf(step);
+    if (nz < 1.0f) nz = 1.0f;
+    if (nz > CAM_ZOOM_MAX) nz = CAM_ZOOM_MAX;
+    if (nz == *zoom) return;
+    *zoom = nz;
+    Rectangle after = picture_dst(c, px, py, pw, ph, *zoom, pan);
+    pan->x += (m.x - after.x) - ux * after.width;
+    pan->y += (m.y - after.y) - uy * after.height;
+}
+
 // The export name for a capture: when the picture was taken, or failing that
 // when the first pass downloaded it.
 static void jpeg_name(const capture_t *c, char *out, size_t n)
@@ -800,11 +863,19 @@ int main(int argc, char **argv)
     SetTargetFPS(60);
     g_ui_font_loaded = load_ui_font();
     build_textures(caps, ncaps);
+#ifdef __APPLE__
+    sso_install_pinch_monitor();
+#endif
 
     const int LEFT_W = 340;
-    enum { ZOOM_FIT, ZOOM_1X, ZOOM_2X };
 
-    int sel = 0, zoom = ZOOM_FIT;
+    int sel = 0;
+    // How the picture is being looked at: 1 is the whole picture fitted to the
+    // pane, pan is how far it has been dragged from the middle. Both go back
+    // to the start with every change of picture.
+    float zoom = 1.0f;
+    Vector2 pan = { 0, 0 };
+    int dragging = 0;
     char status[160] = "";
     float status_left = 0.0f;
     float rep_up = 0, rep_down = 0;
@@ -812,10 +883,43 @@ int main(int argc, char **argv)
     while (!WindowShouldClose()) {
         capture_t *c = &caps[sel];
 
+        // The picture's pane, which the mouse handling below and the drawing
+        // further down both need.
+        int sw = GetScreenWidth(), sh = GetScreenHeight();
+        const int info_h = 152;
+        int rx = LEFT_W + 20;
+        int px = rx, py = 70;
+        int pw = sw - rx - 20, ph = sh - py - info_h;
+        if (pw < 40) pw = 40;
+        if (ph < 40) ph = 40;
+
         // ---- input ----
-        if (key_repeat(KEY_DOWN, &rep_down) && sel < ncaps - 1) { sel++; c = &caps[sel]; }
-        if (key_repeat(KEY_UP, &rep_up)     && sel > 0)         { sel--; c = &caps[sel]; }
-        if (IsKeyPressed(KEY_Z)) zoom = (zoom + 1) % 3;
+        int moved = 0;
+        if (key_repeat(KEY_DOWN, &rep_down) && sel < ncaps - 1) { sel++; moved = 1; }
+        if (key_repeat(KEY_UP, &rep_up)     && sel > 0)         { sel--; moved = 1; }
+        if (moved) { c = &caps[sel]; zoom = 1.0f; pan = (Vector2){ 0, 0 }; }
+
+        // Scroll or pinch over the picture to zoom, drag it to move it about.
+        Vector2 m = GetMousePosition();
+        int over_pic = m.x >= px && m.x < px + pw && m.y >= py && m.y < py + ph;
+        float step = 0.0f;
+#ifdef __APPLE__
+        step += g_sso_pinch_delta;
+        g_sso_pinch_delta = 0.0f;
+#endif
+        if (over_pic) step += 0.14f * GetMouseWheelMove();
+        if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) dragging = 0;
+        if (over_pic && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) dragging = 1;
+        if (c->tex_ok) {
+            if (over_pic && step != 0.0f)
+                zoom_at_cursor(c, px, py, pw, ph, m, step, &zoom, &pan);
+            if (dragging) {
+                Vector2 d = GetMouseDelta();
+                pan.x += d.x;
+                pan.y += d.y;
+            }
+        }
+
         if (IsKeyPressed(KEY_S)) { save_jpeg(c, status, sizeof status); status_left = 6.0f; }
         if (IsKeyPressed(KEY_O)) { open_in_system_viewer(c, status, sizeof status); status_left = 6.0f; }
         if (IsKeyPressed(KEY_F5)) {
@@ -828,6 +932,8 @@ int main(int argc, char **argv)
                 build_textures(caps, ncaps);
                 if (sel >= ncaps) sel = ncaps - 1;
                 c = &caps[sel];
+                zoom = 1.0f;
+                pan = (Vector2){ 0, 0 };
                 snprintf(status, sizeof status, "reloaded: %d capture%s",
                          ncaps, ncaps == 1 ? "" : "s");
             } else {
@@ -842,8 +948,6 @@ int main(int argc, char **argv)
         // ---- draw ----
         BeginDrawing();
         ClearBackground((Color){ 18, 18, 22, 255 });
-
-        int sw = GetScreenWidth(), sh = GetScreenHeight();
 
         // left: capture list
         DrawRectangle(0, 0, LEFT_W, sh, (Color){ 28, 28, 34, 255 });
@@ -871,7 +975,6 @@ int main(int argc, char **argv)
         }
 
         // right: title
-        int rx = LEFT_W + 20;
         draw_text(c->sat_path[0] ? c->sat_path : "(satellite file unknown)",
                   rx, 12, 20, RAYWHITE);
         if (c->t_capture_ms > 0)
@@ -881,21 +984,13 @@ int main(int argc, char **argv)
             draw_text("capture time unknown (no camera_capture command on record)",
                       rx, 40, 17, (Color){ 190, 170, 110, 255 });
 
-        // the picture, fitted into the pane above the info panel
-        const int info_h = 152;
-        int px = rx, py = 70;
-        int pw = sw - rx - 20, ph = sh - py - info_h;
-        if (pw < 40) pw = 40;
-        if (ph < 40) ph = 40;
+        // the picture, in the pane above the info panel
         DrawRectangleLines(px - 1, py - 1, pw + 2, ph + 2, (Color){ 70, 70, 80, 255 });
+        float shown_scale = 0.0f;
         if (c->tex_ok) {
-            float fit_x = (float) pw / (float) c->img_w;
-            float fit_y = (float) ph / (float) c->img_h;
-            float fit = fit_x < fit_y ? fit_x : fit_y;
-            float scale = zoom == ZOOM_FIT ? fit : (zoom == ZOOM_1X ? 1.0f : 2.0f);
-            float dw = c->img_w * scale, dh = c->img_h * scale;
             Rectangle src = { 0, 0, (float) c->img_w, (float) c->img_h };
-            Rectangle dst = { px + (pw - dw) / 2.0f, py + (ph - dh) / 2.0f, dw, dh };
+            Rectangle dst = picture_dst(c, px, py, pw, ph, zoom, &pan);
+            shown_scale = dst.width / (float) c->img_w;
             BeginScissorMode(px, py, pw, ph);
             DrawTexturePro(c->tex, src, dst, (Vector2){ 0, 0 }, 0.0f, WHITE);
             EndScissorMode();
@@ -925,8 +1020,9 @@ int main(int argc, char **argv)
                   rx, iy + 40, 15, LIGHTGRAY);
 
         draw_text(TextFormat("packets      : %d", c->chunks), col2, iy, 15, LIGHTGRAY);
-        draw_text(TextFormat("zoom         : %s",
-                             zoom == ZOOM_FIT ? "fit" : zoom == ZOOM_1X ? "1:1" : "2:1"),
+        draw_text(c->tex_ok ? TextFormat("zoom         : %.0f%%%s", shown_scale * 100.0f,
+                                         zoom <= 1.0f ? "  (whole picture)" : "")
+                            : "zoom         : -",
                   col2, iy + 20, 15, LIGHTGRAY);
         if (status_left > 0.0f)
             draw_text(status, col2, iy + 40, 15, (Color){ 120, 220, 160, 255 });
@@ -949,7 +1045,8 @@ int main(int argc, char **argv)
         }
 
         // help footer
-        draw_text("Up/Down capture   z zoom   o open   s save jpeg   F5 refresh   q quit",
+        draw_text("Up/Down capture   scroll or pinch zoom   drag to move   "
+                  "o open   s save jpeg   F5 refresh   q quit",
                   12, sh - 22, 12, (Color){ 150, 150, 160, 255 });
 
         EndDrawing();

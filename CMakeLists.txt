@@ -517,7 +517,7 @@ if (RAYLIB_FOUND)
         # raylib/GLFW drop NSEventTypeMagnify (trackpad pinch); this
         # ObjC shim installs a global NSEvent monitor and accumulates
         # magnification into a global the C side reads each frame.
-        list(APPEND DECODE_INSPECTOR_SRCS utils/decode_inspector_macos.m)
+        list(APPEND DECODE_INSPECTOR_SRCS utils/pinch_macos.m)
     endif()
     add_executable(decode_inspector ${DECODE_INSPECTOR_SRCS})
     target_include_directories(decode_inspector PRIVATE ${RAYLIB_INCLUDE_DIRS})
@@ -565,8 +565,13 @@ if (RAYLIB_FOUND)
     # file's sentence layout, merges every pass that downloaded the same
     # picture, decodes the JPEG (cam_jpeg.c, shared with cam_reconstruct and
     # packet_browser) and shows it. Needs sqlite3 via packet_db.
-    add_executable(frontiersat_camera_viewer
-                   utils/frontiersat_camera_viewer.c utils/cam_jpeg.c)
+    set(CAMERA_VIEWER_SRCS utils/frontiersat_camera_viewer.c utils/cam_jpeg.c)
+    if (APPLE)
+        # Same trackpad-pinch shim decode_inspector uses: raylib/GLFW drop
+        # NSEventTypeMagnify, so an NSEvent monitor collects it for us.
+        list(APPEND CAMERA_VIEWER_SRCS utils/pinch_macos.m)
+    endif()
+    add_executable(frontiersat_camera_viewer ${CAMERA_VIEWER_SRCS})
     target_include_directories(frontiersat_camera_viewer PRIVATE ${RAYLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(frontiersat_camera_viewer PRIVATE ${RAYLIB_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(frontiersat_camera_viewer PRIVATE ${RAYLIB_LIBRARIES} ${OPENSSL_LIBRARIES} m)
@@ -575,6 +580,7 @@ if (RAYLIB_FOUND)
     if (APPLE)
         target_link_libraries(frontiersat_camera_viewer PRIVATE
             "-framework Cocoa"
+            "-framework AppKit"
             "-framework OpenGL"
             "-framework IOKit"
             "-framework CoreVideo"

@@ -1,11 +1,11 @@
 /*
 
-    Simple Satellite Operations  utils/decode_inspector_macos.m
+    Simple Satellite Operations  utils/pinch_macos.m
 
-    macOS-specific pinch-gesture shim for decode_inspector. raylib/GLFW
+    macOS pinch-gesture shim for the raylib viewers. raylib/GLFW
     don't forward NSEventTypeMagnify (trackpad pinch) to the C event
     loop, so we install an NSEvent local monitor that accumulates the
-    magnification delta into a global. decode_inspector reads & resets it
+    magnification delta into a global the viewer reads & resets
     every frame.
 
     Copyright (C) 2026  Johnathan K Burchill  --  GPLv3 or later.
@@ -21,17 +21,17 @@
 // thread's event loop and the frame loop reads it on the same thread, so
 // there's no real cross-thread race; a missed/duplicated delta would only
 // be a one-frame zoom hiccup. Promote to _Atomic if it ever moves threads.
-float g_decode_inspector_pinch_delta = 0.0f;
+float g_sso_pinch_delta = 0.0f;
 
 static id g_pinch_monitor = nil;
 
-void decode_inspector_install_pinch_monitor(void)
+void sso_install_pinch_monitor(void)
 {
     if (g_pinch_monitor != nil) return;
     g_pinch_monitor =
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskMagnify
             handler:^NSEvent *(NSEvent *event) {
-                g_decode_inspector_pinch_delta += (float) event.magnification;
+                g_sso_pinch_delta += (float) event.magnification;
                 return event;  // pass through (GLFW ignores it anyway)
             }];
 }
