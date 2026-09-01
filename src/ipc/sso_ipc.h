@@ -101,6 +101,10 @@ typedef struct {
     // Empty on an operator's own broadcasts (the relay stamps it).
     char source[16];
     double az, el;         // current rotator az/el (hardware-reported)
+    int rot_pos_known;     // 1 when az/el reflect a recent real STATUS
+                            // reply; 0 before the first good reply, or once
+                            // one has gone stale (operator recomputes this
+                            // every broadcast -- not a one-shot latch)
     long freq_hz;
     double doppler_hz;
     char rx_status[160];
@@ -114,6 +118,10 @@ typedef struct {
     int in_pass;
     int tracking;
     int has_rotator;         // operator's have_antenna_rotator
+    int rot_activity;        // antenna_rotator_activity_t ordinal -- the
+                              // operator's activity classification (target
+                              // vs. actual), rendered via
+                              // antenna_rotator_activity_name() on either end
     double jul_utc;          // operator's SGP4 epoch for this tick
 
     // Pre-computed prediction snapshot — the viewer renders these
