@@ -253,6 +253,17 @@ add_executable(rs_selftest unit_tests/rs_selftest.c src/proto/rs.c)
 target_include_directories(rs_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS rs_selftest)
 
+# T/R switch finder self-test: points tr_switch_scan at fake /sys and
+# /dev trees under /tmp to check which ports it picks out, and covers the
+# state file that remembers the board between runs. Touches no hardware;
+# the probe half (tr_switch_open_detected) needs the real thing and is
+# not covered.
+add_executable(tr_switch_find_selftest
+               unit_tests/tr_switch_find_selftest.c
+               src/hw/tr_switch_find.c src/hw/tr_switch.c src/ipc/sso_paths.c)
+target_include_directories(tr_switch_find_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+list(APPEND SSO_TARGETS tr_switch_find_selftest)
+
 # Antenna rotator self-test: covers the pure math helpers in
 # antenna_rotator.c (wrap_to_pm180, accumulate_unwrapped,
 # home_unwrapped_target, to_mech_coords). No serial/UHD/ncurses deps;
@@ -1318,7 +1329,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
                    src/hw/antenna_rotator.c
                    src/hw/antenna_rotator_async.c
                    src/hw/rotator_calibrate.c
-                   src/hw/tr_switch.c
+                   src/hw/tr_switch.c src/hw/tr_switch_find.c
                    src/beacon/telemetry.c
                    src/pipeline/decode_loop.c
                    src/dsp/asm_search.c src/dsp/modem.c src/dsp/modem_fsk.c

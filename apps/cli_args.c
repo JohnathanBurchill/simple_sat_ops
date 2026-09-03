@@ -488,11 +488,12 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         state->rot.antenna_rotator.serial_speed = B600;
         state->rot.antenna_rotator.fixed_target = 0;
 
-        // T/R antenna switch: auto-probe /dev/ttyACM0. Failure is a
-        // one-line warning, not an error.
+        // T/R antenna switch: a NULL device means work out which port it
+        // is on at startup. Finding nothing is a one-line warning, not an
+        // error.
         state->trsw.run_with_tr_switch = 1;
         state->trsw.have_tr_switch     = 0;
-        state->trsw.tr_switch.device_filename = "/dev/ttyACM0";
+        state->trsw.tr_switch.device_filename = NULL;
         state->trsw.tr_switch.serial_speed    = B115200;
     }
 
@@ -587,7 +588,7 @@ int apply_args(state_t *state, int argc, char **argv, double jul_utc, int help)
         }
         if (strncmp("--tr-switch-device=", arg, 19) == 0 || help) {
             if (help) parse_help_line(OPTW, "--tr-switch-device=<path>",
-                "UHF T/R antenna switch tty (default /dev/ttyACM0)");
+                "UHF T/R antenna switch tty (default: find it)");
             else {
                 state->app.n_options++;
                 if (strlen(arg) < 20) {

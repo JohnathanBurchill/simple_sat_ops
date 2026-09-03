@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`d189852` (2026-08-30). This is a working draft.
+`426f3b7` (2026-08-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -660,7 +660,7 @@ symptoms and fixes are collected in [Troubleshooting](#troubleshooting):
 |-----------|-------|
 | **USRP B210** | Two-channel SDR; channel 0 receives on `RX2` and transmits on `TX/RX`. UHD must be installed. Receive runs continuously, including during a transmit burst. |
 | **SPID Rot2ProG** | Az/El antenna rotator with a built-in controller. USB-serial CAT at any baud (it autodetects). Constant slew rates configured on the controller's front panel. |
-| **UHF T/R switch** | Optional CalgaryToSpace RP2040-Zero board on USB-CDC at `/dev/ttyACM0`. Senses RF on the TX line and flips two relays (K1 = antenna path, K2 = dummy). Auto-mode by default; the firmware emits a heartbeat the operator UI parses for a status panel. |
+| **UHF T/R switch** | Optional CalgaryToSpace RP2040-Zero board on USB-CDC. Which port it is on is worked out at startup, so it needs no flag. Senses RF on the TX line and flips two relays (K1 = antenna path, K2 = dummy). Auto-mode by default; the firmware emits a heartbeat the operator UI parses for a status panel. |
 
 The live RF path is the B210. A conventional transceiver (Yaesu
 FT-991A, Icom IC-9700) drove that path in an earlier design and the
@@ -790,8 +790,35 @@ warnings Apple clang misses. Output lives in `build-lint/`.
    pursuit planner reads them at the next normal startup. See
    [Rotator calibration](#rotator-calibration---calibrate-rotator).
 
-5. **T/R switch (optional).** If `/dev/ttyACM0` is present, the
-   operator UI auto-probes it on start. No flags needed.
+5. **T/R switch (optional).** Plug it in and start the operator UI:
+   which serial port it landed on is worked out at startup, so no flags
+   are needed.
+
+   The first run has to find it the hard way. It lists the machine's USB
+   serial ports - `ttyACM*` on Linux, `cu.usbmodem*` on macOS, and
+   nothing else, so the rotator's `ttyUSB0` is out of reach - opens each
+   in turn, and keeps whichever one produces a heartbeat within four
+   seconds. A heartbeat is the switch's own signature; a port that stays
+   quiet is handed back untouched.
+
+   What answered is then written to
+   `~/.local/state/simple_sat_ops/tr_switch.state`, and later runs look
+   for that board first. Nothing about the board is baked into the
+   program: the firmware leaves the Pico's stock USB descriptors in
+   place, so its vendor and product would fit any RP2040 on the machine
+   and only the **serial number** identifies it - which is why the answer
+   is learned and stored rather than hardcoded. A remembered serial that
+   turns up in the scan is opened straight away, so a normal startup
+   costs nothing. macOS publishes no serial beside the device node, so
+   there the remembered port is only tried first and still has to produce
+   a heartbeat.
+
+   Swap the board, move it to another port, or delete the state file and
+   the next run simply searches again and remembers the new answer. The
+   line it prints on startup names the port, the board, and whether that
+   was where the last run left it. `--tr-switch-device=<path>` skips the
+   search when you would rather say, and `--without-tr-switch` skips the
+   switch entirely.
 
 ## Before you operate: licensing and authorization
 
@@ -959,7 +986,7 @@ is specified in [the viewer-stream JSON contract](VIEWER_STREAM_JSON.md).
 | `--rotator-device <path>` | Override the SPID tty. |
 | `--without-rotator` (alias `--without-hardware`) | Skip the SPID entirely. |
 | `--without-tr-switch` | Skip the T/R switch probe. |
-| `--tr-switch-device=<path>` | Override the T/R switch tty. |
+| `--tr-switch-device=<path>` | Name the T/R switch tty yourself instead of letting startup find it. |
 | `--without-b210` | Run UI plus rotator only (skip the SDR). |
 | `--sdr-type=uhd\|rtlsdr\|auto` | SDR backend (default `auto`: probe UHD, then RTL-SDR). See [SDR backends](#sdr-backends). |
 | `--uhd-args=<args>` | UHD device args verbatim (e.g. `type=b200,serial=...`); overrides detection. |
@@ -3593,7 +3620,7 @@ cannot.
 
 **Unit selftests** cover the pure, deterministic cores - the parts of
 the code that take bytes in and produce bytes out with no hardware in
-the loop. There are 31 `*_selftest.c` binaries, and between them they
+the loop. There are 47 `*_selftest.c` binaries, and between them they
 exercise the whole signal chain on the bench: the DSP blocks (`modem`,
 `fir_decim`, `sw_nco`, `biquad`, `monitor_squelch`, `iq_burst`); the
 framing stack the link depends on (`rs` for Reed-Solomon, `golay24`
@@ -3605,6 +3632,17 @@ for the length-field code, the CCSDS scrambler and `ax100` framing,
 `ipc_fill`, `argparse`). The framing and command tests are the ones
 that stand between an operator's keystroke and the antenna, so they
 carry the most weight.
+
+One of them reaches further than bytes in and bytes out.
+`tr_switch_find_selftest` puts a stand-in for the T/R switch on a
+pseudo-terminal - the firmware's serial side reimplemented from its own
+`main.c`, silent until it is told to talk and then beating every 2500 ms
+in the real line format - points the port search at a fake `/sys` and
+`/dev`, and drives the whole thing: the quiet port rejected, the
+switch's heartbeat parsed, the board written down, and the next run
+opening it straight away. The decoy port on the other pty logs in the
+same house style, with the same `state=` and `mode=` fields a heartbeat
+carries, so nothing but the word `Heartbeat:` separates them.
 
 **Build-time static analysis** catches the class of bug the everyday
 compiler does not. Apple's clang accepts `-Wformat-truncation` and then
@@ -3925,6 +3963,7 @@ values are not disturbed).
 | `~/.local/share/simple_sat_ops/rotator_az_rate_dps` | Calibrated rotator azimuth slew rate (deg/s). |
 | `~/.local/share/simple_sat_ops/rotator_el_rate_dps` | Calibrated rotator elevation slew rate (deg/s). |
 | `~/.local/share/simple_sat_ops/carrier-trim-hz` | Per-host carrier-trim offset that lands the B210's analog LO on the requested frequency. |
+| `~/.local/state/simple_sat_ops/tr_switch.state` | The T/R switch as it was last found - USB serial, ids and port. Written by the startup search so later runs go straight to it; delete it to search from scratch. |
 | `/FrontierSat/packet_db.sqlite` | Shared SQLite packet database: received packets plus a `sent_tcmd` table of transmitted telecommands (keyed by `@tssent` for response correlation). Under `$FRONTIERSAT_ROOT` when set; override the path with `$SSO_PACKET_DB` or `--db=`. |
 | `~/.local/share/simple_sat_ops/runs.log` | Audit log (dev-host fallback when `/var/log/sso/` isn't writable). |
 | `/run/sso/simple_sat_ops.sock` | Operator IPC socket. |

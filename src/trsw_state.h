@@ -24,12 +24,17 @@
 #define TRSW_STATE_H
 
 #include "tr_switch.h"
+#include "tr_switch_find.h"
 
-// T/R antenna switch (USB-CDC, default /dev/ttyACM0).
-// run_with_tr_switch defaults to 1: auto-probe the device on start.
-// Absent hardware is a one-line warning, not an error.
+// T/R antenna switch (USB-CDC).
+// run_with_tr_switch defaults to 1: look for the device on start.
+// With no --tr-switch-device= the port is worked out at startup (see
+// tr_switch_find.h) and its path kept in device_path, which is what the
+// driver's device_filename then points at. Absent hardware is a one-line
+// warning, not an error.
 typedef struct trsw {
     tr_switch_t tr_switch;
+    char device_path[TR_SWITCH_PATH_MAX];
     int run_with_tr_switch;
     int have_tr_switch;
 } trsw_t;

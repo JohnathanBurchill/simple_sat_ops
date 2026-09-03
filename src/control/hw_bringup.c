@@ -27,6 +27,7 @@
 #include "rotator_calibrate.h"
 #include "tracking.h"          // main_rotator_refresh_targets_from_snapshot
 #include "tr_switch.h"
+#include "tr_switch_find.h"
 
 #include <stdio.h>
 #include <stdlib.h>            // EXIT_FAILURE, atoi
@@ -165,21 +166,61 @@ void hw_pursuit_rates_load(rot_t *rot)
 
 void hw_tr_switch_open(trsw_t *trsw)
 {
-    // T/R antenna switch — auto-probe before ncurses takes the screen, so a
+    // T/R antenna switch — opened before ncurses takes the screen, so a
     // "not connected" warning lands on the terminal. Absent or inaccessible
     // hardware is non-fatal; the UI panel reads "not connected" and the
     // program runs normally.
     if (!trsw->run_with_tr_switch) {
         return;
     }
+
+    // No --tr-switch-device=: look at the machine's USB serial ports and
+    // work out which one the switch is on (see tr_switch_find.h). The path
+    // that wins is kept in the state, since the driver and the UI panel
+    // both go on holding a pointer to it.
+    if (trsw->tr_switch.device_filename == NULL) {
+        char looked_at[256] = {0};
+        tr_switch_candidate_t found = {0};
+        int remembered = 0;
+        if (tr_switch_open_detected(&trsw->tr_switch,
+                                    trsw->device_path, sizeof trsw->device_path,
+                                    &found, &remembered,
+                                    looked_at, sizeof looked_at) == 0) {
+            trsw->have_tr_switch = 1;
+            // Name the board as well as the port: the descriptors are the
+            // stock Pico ones, so the serial is what says which board it is.
+            char id[192] = "";
+            if (found.vid != 0) {
+                snprintf(id, sizeof id, " (%04x:%04x %s%s%s)",
+                         found.vid, found.pid,
+                         found.product[0] != '\0' ? found.product : "unnamed",
+                         found.serial[0] != '\0' ? ", serial " : "",
+                         found.serial);
+            }
+            fprintf(stderr, "T/R switch: found on %s%s%s\n",
+                    trsw->device_path, id,
+                    remembered ? " -- where the last run left it"
+                               : ", and remembered for next time");
+        } else if (looked_at[0] != '\0') {
+            fprintf(stderr,
+                    "T/R switch: not on %s (skipping; pass "
+                    "--tr-switch-device=<path> to say where it is, or "
+                    "--without-tr-switch to silence)\n", looked_at);
+        } else {
+            fprintf(stderr,
+                    "T/R switch: no USB serial ports to look at (skipping; "
+                    "pass --without-tr-switch to silence)\n");
+        }
+        return;
+    }
+
     if (tr_switch_init(&trsw->tr_switch) == 0) {
         trsw->have_tr_switch = 1;
     } else {
         fprintf(stderr,
                 "T/R switch: could not open %s (skipping; "
                 "pass --without-tr-switch to silence)\n",
-                trsw->tr_switch.device_filename
-                    ? trsw->tr_switch.device_filename : "?");
+                trsw->tr_switch.device_filename);
     }
 }
 
