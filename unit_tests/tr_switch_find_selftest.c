@@ -99,6 +99,14 @@
     GNU General Public License for more details.
 */
 
+// glibc keeps posix_openpt / grantpt / unlockpt / ptsname behind a
+// feature macro, so without this they arrive on the ground machine as
+// implicit declarations -- and an implicit ptsname returns int, which
+// truncates the pty's path to garbage. Apple's headers declare them
+// regardless, which is why the Mac build and the gcc lint both stayed
+// quiet. Must come before every include.
+#define _GNU_SOURCE
+
 #include "tr_switch_find.h"
 #include "tap.h"
 
