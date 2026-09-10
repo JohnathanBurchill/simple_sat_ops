@@ -16,9 +16,18 @@ echo Starting
 #
 # Overrides:
 #   REMOTE   ssh target                  (default: rao)
+#   SIZE     per-camera capture size     (default: 640x480)
 #   FPS      capture/encode framerate    (default: 15)
-#   BITRATE  encoder cap, bits/sec        (default: 1500000)
+#   BITRATE  encoder cap, bits/sec        (default: 4000000)
 #   VERBOSE  1 = unfiltered ffmpeg/mpv logs (default: 0)
+#
+# SIZE is per camera; the two are stacked side by side, so the window
+# ends up twice that wide (the 640x480 default gives a 1280x480 view).
+# The camera has to actually support the requested mode -- check with
+#   ssh $REMOTE v4l2-ctl -d /dev/video0 --list-formats-ext
+# Note that pixel count drives remote encoder load, so a big SIZE and a
+# high FPS together can push the remote off realtime; watch for the
+# picture falling behind and back one of them off.
 #
 # On latency: at N fps each frame is inherently up to 1/N s stale
 # before it is even encoded, so 5 fps cost ~200 ms per frame before
@@ -37,8 +46,9 @@ echo Starting
 # pipe, so a burst of motion can't push the view seconds behind.
 
 REMOTE="${REMOTE:-rao}"
+SIZE="${SIZE:-640x480}"
 FPS="${FPS:-15}"
-BITRATE="${BITRATE:-1500000}"
+BITRATE="${BITRATE:-4000000}"
 VERBOSE="${VERBOSE:-0}"
 
 # The cameras emit JPEGs with APP markers ffmpeg's mjpeg decoder doesn't
@@ -48,6 +58,11 @@ VERBOSE="${VERBOSE:-0}"
 # -loglevel (the decoder logs it at error level), so it gets filtered
 # here by text. VERBOSE=1 turns the filtering off.
 BENIGN='unable to decode APP fields'
+
+if ! printf '%s' "$SIZE" | grep -Eq '^[0-9]+x[0-9]+$'; then
+  echo "antenna_cam_dual: SIZE must look like WIDTHxHEIGHT (got '$SIZE')" >&2
+  exit 2
+fi
 
 CLEANED_UP=0
 cleanup() {
@@ -106,12 +121,20 @@ fi
 
 echo "Starting stream..."
 ssh -T -e none -o ServerAliveInterval=30 "$REMOTE" \
-    FPS="$FPS" BITRATE="$BITRATE" RLOGLEVEL="$RLOGLEVEL" \
+    SIZE="$SIZE" FPS="$FPS" BITRATE="$BITRATE" RLOGLEVEL="$RLOGLEVEL" \
     bash -s 2> >(grep --line-buffered -v "$BENIGN" >&2) <<'REMOTE_SCRIPT' | "${viewer[@]}"
 # drawtext needs a real font file. Ubuntu server images don't always
 # ship fonts-dejavu-core, so probe the usual paths and fall back to
 # whatever fontconfig can find.
 RLOGLEVEL="${RLOGLEVEL:-error}"
+
+# scale= wants W:H, -video_size wants WxH. Font and padding scale with
+# frame height so the stamp stays the same relative size at any SIZE.
+SCALE="${SIZE/x/:}"
+HEIGHT="${SIZE#*x}"
+FONTSIZE=$((HEIGHT / 16))
+[ "$FONTSIZE" -lt 12 ] && FONTSIZE=12
+PAD=$((FONTSIZE / 2))
 
 FONT=""
 for f in /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf \
@@ -132,12 +155,12 @@ done
 # splits %{} arguments on whitespace, so the strftime format itself
 # must contain no spaces (ISO-8601 'T' separator, label outside).
 exec /usr/bin/ffmpeg -nostdin -hide_banner -nostats -loglevel $RLOGLEVEL \
-  -fflags nobuffer -f v4l2 -input_format mjpeg -framerate $FPS -video_size 320x240 -i /dev/video0 \
-  -fflags nobuffer -f v4l2 -input_format mjpeg -framerate $FPS -video_size 320x240 -i /dev/video2 \
-  -filter_complex "[0:v]scale=320:240[v0];[1:v]scale=320:240[v1];[v0][v1]hstack[st];\
+  -fflags nobuffer -f v4l2 -input_format mjpeg -framerate $FPS -video_size $SIZE -i /dev/video0 \
+  -fflags nobuffer -f v4l2 -input_format mjpeg -framerate $FPS -video_size $SIZE -i /dev/video2 \
+  -filter_complex "[0:v]scale=$SCALE[v0];[1:v]scale=$SCALE[v1];[v0][v1]hstack[st];\
 [st]drawtext=$FONT:text='%{gmtime\:%Y-%m-%dT%H\\\\\:%M\\\\\:%S} UTC':\
-fontcolor=white:fontsize=14:box=1:boxcolor=black@0.55:boxborderw=5:\
-x=8:y=h-th-8[out]" \
+fontcolor=white:fontsize=$FONTSIZE:box=1:boxcolor=black@0.55:boxborderw=$PAD:\
+x=$PAD:y=h-th-$PAD[out]" \
   -map "[out]" -c:v libx264 -preset ultrafast -tune zerolatency \
   -x264-params "bframes=0:rc-lookahead=0:sync-lookahead=0:sliced-threads=1" \
   -g $((FPS * 2)) -fps_mode cfr -r $FPS \
