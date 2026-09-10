@@ -18,6 +18,7 @@ echo Starting
 #   REMOTE   ssh target                  (default: rao)
 #   FPS      capture/encode framerate    (default: 15)
 #   BITRATE  encoder cap, bits/sec        (default: 1500000)
+#   VERBOSE  1 = unfiltered ffmpeg/mpv logs (default: 0)
 #
 # On latency: at N fps each frame is inherently up to 1/N s stale
 # before it is even encoded, so 5 fps cost ~200 ms per frame before
@@ -38,6 +39,15 @@ echo Starting
 REMOTE="${REMOTE:-rao}"
 FPS="${FPS:-15}"
 BITRATE="${BITRATE:-1500000}"
+VERBOSE="${VERBOSE:-0}"
+
+# The cameras emit JPEGs with APP markers ffmpeg's mjpeg decoder doesn't
+# recognise. It logs one line per frame per camera and decodes them fine
+# anyway -- at 15 fps that is 30 lines/sec of pure noise burying any real
+# error. It can't be fixed at the source and isn't selectable by
+# -loglevel (the decoder logs it at error level), so it gets filtered
+# here by text. VERBOSE=1 turns the filtering off.
+BENIGN='unable to decode APP fields'
 
 CLEANED_UP=0
 cleanup() {
@@ -51,6 +61,15 @@ trap cleanup INT TERM EXIT
 
 echo "Clearing any stale camera processes..."
 ssh -T "$REMOTE" "pkill -9 ffmpeg 2>/dev/null; sleep 0.5"
+
+if [ "$VERBOSE" = 1 ]; then
+  RLOGLEVEL=info
+  BENIGN='$^'   # matches nothing, so grep -v passes everything through
+  mpv_quiet=()
+else
+  RLOGLEVEL=error
+  mpv_quiet=(--term-status-msg= --msg-level=cplayer=warn)
+fi
 
 # Pick a local viewer. mpv handles a live mpegts pipe on stdin far more
 # reliably than ffplay, which tends to probe the stream and then exit
@@ -70,6 +89,7 @@ if command -v mpv >/dev/null 2>&1; then
           --video-latency-hacks=yes
           --untimed
           --no-osc --no-osd-bar
+          "${mpv_quiet[@]}"
           -)
 elif command -v ffplay >/dev/null 2>&1; then
   viewer=(ffplay
@@ -85,10 +105,14 @@ else
 fi
 
 echo "Starting stream..."
-ssh -T -e none -o ServerAliveInterval=30 "$REMOTE" FPS="$FPS" BITRATE="$BITRATE" bash -s <<'REMOTE_SCRIPT' | "${viewer[@]}"
+ssh -T -e none -o ServerAliveInterval=30 "$REMOTE" \
+    FPS="$FPS" BITRATE="$BITRATE" RLOGLEVEL="$RLOGLEVEL" \
+    bash -s 2> >(grep --line-buffered -v "$BENIGN" >&2) <<'REMOTE_SCRIPT' | "${viewer[@]}"
 # drawtext needs a real font file. Ubuntu server images don't always
 # ship fonts-dejavu-core, so probe the usual paths and fall back to
 # whatever fontconfig can find.
+RLOGLEVEL="${RLOGLEVEL:-error}"
+
 FONT=""
 for f in /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf \
          /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
@@ -107,7 +131,7 @@ done
 # \\\: before each colon in the time format. Note also that drawtext
 # splits %{} arguments on whitespace, so the strftime format itself
 # must contain no spaces (ISO-8601 'T' separator, label outside).
-exec /usr/bin/ffmpeg -nostdin \
+exec /usr/bin/ffmpeg -nostdin -hide_banner -nostats -loglevel $RLOGLEVEL \
   -fflags nobuffer -f v4l2 -input_format mjpeg -framerate $FPS -video_size 320x240 -i /dev/video0 \
   -fflags nobuffer -f v4l2 -input_format mjpeg -framerate $FPS -video_size 320x240 -i /dev/video2 \
   -filter_complex "[0:v]scale=320:240[v0];[1:v]scale=320:240[v1];[v0][v1]hstack[st];\
@@ -116,7 +140,7 @@ fontcolor=white:fontsize=14:box=1:boxcolor=black@0.55:boxborderw=5:\
 x=8:y=h-th-8[out]" \
   -map "[out]" -c:v libx264 -preset ultrafast -tune zerolatency \
   -x264-params "bframes=0:rc-lookahead=0:sync-lookahead=0:sliced-threads=1" \
-  -g $((FPS * 2)) -fps_mode passthrough \
+  -g $((FPS * 2)) -fps_mode cfr -r $FPS \
   -maxrate $BITRATE -bufsize $((BITRATE / 4)) \
   -muxdelay 0 -muxpreload 0 -flush_packets 1 \
   -f mpegts -
