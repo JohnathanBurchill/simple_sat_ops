@@ -15,9 +15,29 @@ echo Starting
 # antenna_cam_dual.sh — continuous dual-camera view over SSH, bash-forced remote shell
 #
 # Overrides:
-#   REMOTE   ssh target   (default: rao)
+#   REMOTE   ssh target                  (default: rao)
+#   FPS      capture/encode framerate    (default: 15)
+#   BITRATE  encoder cap, bits/sec        (default: 1500000)
+#
+# On latency: at N fps each frame is inherently up to 1/N s stale
+# before it is even encoded, so 5 fps cost ~200 ms per frame before
+# anything else. Raising FPS is the single biggest win; the rest of
+# the delay is encoder, mux and player buffering, all pinned open
+# below. Drop FPS back to 5 if the link or the remote CPU can't keep
+# up (watch the "speed=" figure -- it must stay at 1x).
+#
+# Temporal (inter-frame) compression is already on: libx264 codes P
+# frames against previous frames by default, which is why a mostly
+# static antenna scene costs so few bits. What -tune zerolatency
+# deliberately gives up is B-frames -- they reference *future* frames,
+# so they compress better but force the encoder to hold frames back,
+# which is latency. The -maxrate/-bufsize cap below is the other half:
+# a small bufsize bounds how much encoded data can queue in the SSH
+# pipe, so a burst of motion can't push the view seconds behind.
 
 REMOTE="${REMOTE:-rao}"
+FPS="${FPS:-15}"
+BITRATE="${BITRATE:-1500000}"
 
 CLEANED_UP=0
 cleanup() {
@@ -43,6 +63,12 @@ if command -v mpv >/dev/null 2>&1; then
           --profile=low-latency
           --cache=no
           --demuxer-readahead-secs=0
+          --demuxer-lavf-o=fflags=+nobuffer
+          --demuxer-lavf-probe-info=nostreams
+          --demuxer-lavf-analyzeduration=0.1
+          --vd-lavc-threads=1
+          --video-latency-hacks=yes
+          --untimed
           --no-osc --no-osd-bar
           -)
 elif command -v ffplay >/dev/null 2>&1; then
@@ -50,6 +76,7 @@ elif command -v ffplay >/dev/null 2>&1; then
           -loglevel warning
           -window_title "antenna-cam-dual"
           -fflags nobuffer -flags low_delay -framedrop
+          -probesize 32 -analyzeduration 0 -sync ext
           -an
           -f mpegts -i -)
 else
@@ -58,7 +85,7 @@ else
 fi
 
 echo "Starting stream..."
-ssh -T -e none -o ServerAliveInterval=30 "$REMOTE" bash -s <<'REMOTE_SCRIPT' | "${viewer[@]}"
+ssh -T -e none -o ServerAliveInterval=30 "$REMOTE" FPS="$FPS" BITRATE="$BITRATE" bash -s <<'REMOTE_SCRIPT' | "${viewer[@]}"
 # drawtext needs a real font file. Ubuntu server images don't always
 # ship fonts-dejavu-core, so probe the usual paths and fall back to
 # whatever fontconfig can find.
@@ -81,11 +108,16 @@ done
 # splits %{} arguments on whitespace, so the strftime format itself
 # must contain no spaces (ISO-8601 'T' separator, label outside).
 exec /usr/bin/ffmpeg -nostdin \
-  -f v4l2 -input_format mjpeg -framerate 5 -video_size 320x240 -i /dev/video0 \
-  -f v4l2 -input_format mjpeg -framerate 5 -video_size 320x240 -i /dev/video2 \
+  -fflags nobuffer -f v4l2 -input_format mjpeg -framerate $FPS -video_size 320x240 -i /dev/video0 \
+  -fflags nobuffer -f v4l2 -input_format mjpeg -framerate $FPS -video_size 320x240 -i /dev/video2 \
   -filter_complex "[0:v]scale=320:240[v0];[1:v]scale=320:240[v1];[v0][v1]hstack[st];\
 [st]drawtext=$FONT:text='%{gmtime\:%Y-%m-%dT%H\\\\\:%M\\\\\:%S} UTC':\
 fontcolor=white:fontsize=14:box=1:boxcolor=black@0.55:boxborderw=5:\
 x=8:y=h-th-8[out]" \
-  -map "[out]" -c:v libx264 -preset ultrafast -tune zerolatency -f mpegts -
+  -map "[out]" -c:v libx264 -preset ultrafast -tune zerolatency \
+  -x264-params "bframes=0:rc-lookahead=0:sync-lookahead=0:sliced-threads=1" \
+  -g $((FPS * 2)) -fps_mode passthrough \
+  -maxrate $BITRATE -bufsize $((BITRATE / 4)) \
+  -muxdelay 0 -muxpreload 0 -flush_packets 1 \
+  -f mpegts -
 REMOTE_SCRIPT
