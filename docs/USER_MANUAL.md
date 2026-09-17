@@ -3429,10 +3429,14 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   `p` takes the marked passes already on the disk and runs
   `decode_passes.sh` over each one, into the packet database the browser
   is reading. That decoder is incremental, so a pass already decoded
-  costs nothing to press `p` on again. A download decodes what it
-  fetched as soon as it finishes — audio nobody has read is not the
-  point — so `d` alone carries a pass all the way into the database, and
-  `p` is for the recordings that were already sitting there.
+  costs nothing to press `p` on again. `d` means get these into the
+  database rather than get these off the network: audio nobody has read
+  is not the point, so when the fetching is over it decodes the whole
+  marked set — including the passes that were already on the disk when
+  you pressed it, which a download of its own has nothing to say about.
+  `d` therefore carries a whole selection all the way into the database
+  in one keystroke, and with nothing left to fetch it goes straight to
+  decoding; `p` is there for when that is all you meant to do.
 
   Each row says whether this station has the audio, and whether that
   audio produced packets — the second read from `session_dir` in the
@@ -3470,14 +3474,16 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   day they were made on rather than following you to the next one, so
   `d` only ever fetches what was chosen on the day in front of you; `n`
   clears them, and so does finishing the work. A mark is a piece of work
-  to do, so once every pass marked on a day has packets in the database
+  to do, so once the decoder has been over every pass marked on a day
   that day lets its selection go by itself rather than leaving you to
   press `n` on a job you have already watched finish — the bottom bar
-  says `marks cleared` when it does. A day with anything still
-  undecoded keeps its marks, which is what leaves the retry list
-  standing; and because this goes day by day, a day you marked and then
-  paged away from is released on its own terms while its job finishes
-  behind you.
+  says `marks cleared` when it does. What counts is that the work
+  happened rather than that it bore fruit: a recording that decodes to
+  nothing is finished too, and waiting for it to turn green would strand
+  a selection for ever. A decode that actually failed is the other case,
+  and it leaves every mark standing as the list of what to try again.
+  Because this goes day by day, a day you marked and then paged away
+  from is released on its own terms while its job finishes behind you.
 
   A running job turns the rows as it goes rather than at the end: a pass
   goes yellow the moment its recording lands on the disk, and green when

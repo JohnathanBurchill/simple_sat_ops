@@ -208,6 +208,12 @@ typedef struct {
     long  *queue;
     int    queue_n;
     int    queue_pos;
+    // Everything d was asked to put in the database, kept aside while
+    // the download runs because the download itself only names the
+    // passes SatNOGS still has to send. The decode that follows works
+    // through this instead.
+    long  *after;
+    int    after_n;
     int    cancelled;
 } job_t;
 
@@ -1264,6 +1270,7 @@ static int job_queue_marked(int kind, int (*wanted)(const obs_t *))
     if (n == 0) { set_status("nothing marked"); return 0; }
 
     free(g_job.queue);
+    free(g_job.after);
     memset(&g_job, 0, sizeof g_job);
     g_job.kind = kind;
     g_job.queue = malloc((size_t)n * sizeof *g_job.queue);
@@ -1278,42 +1285,6 @@ static int job_queue_marked(int kind, int (*wanted)(const obs_t *))
 
 static int already_here(const obs_t *o) { return o->downloaded; }
 
-static void job_start_download(void)
-{
-    if (job_queue_marked(JOB_DOWNLOAD, fetchable) == 0) {
-        if (count_marked() > 0)
-            set_status("everything marked is already downloaded");
-        return;
-    }
-    if (!job_next_batch()) set_status("could not start the download");
-}
-
-// Fetching a recording and then leaving it unread is never what was
-// wanted, so a finished download rolls straight into decoding what it
-// actually brought down -- read off the disk rather than off the day
-// view, which may have been paged elsewhere while the job ran. Returns
-// the number of observations handed to the decoder.
-static int job_start_followup_decode(void)
-{
-    if (g_job.queue == NULL || g_job.queue_n == 0) return 0;
-
-    long *keep = malloc((size_t)g_job.queue_n * sizeof *keep);
-    if (keep == NULL) return 0;
-    int n = 0;
-    for (int i = 0; i < g_job.queue_n; i++)
-        if (have_audio_on_disk(g_job.queue[i])) keep[n++] = g_job.queue[i];
-    if (n == 0) { free(keep); return 0; }
-
-    free(g_job.queue);
-    memset(&g_job, 0, sizeof g_job);
-    g_job.kind = JOB_DECODE;
-    g_job.queue = keep;
-    g_job.queue_n = n;
-    g_job.total = n;
-    if (!job_next_batch()) return 0;
-    return n;
-}
-
 static void job_start_decode(void)
 {
     if (job_queue_marked(JOB_DECODE, already_here) == 0) {
@@ -1324,9 +1295,71 @@ static void job_start_decode(void)
     if (!job_next_batch()) set_status("could not run %s", g_decoder);
 }
 
+// d means get the marked passes into the database, not get them off the
+// network, so it carries the whole marked set through to the decode
+// even though the download itself can only be about the ones SatNOGS
+// still has to send. A pass already on the disk when d was pressed was
+// marked for a reason; leaving it out is what used to strand it on
+// `have` for ever while everything around it went green.
+static void job_start_download(void)
+{
+    int marked = count_marked();
+    if (marked == 0) { set_status("nothing marked"); return; }
+
+    if (job_queue_marked(JOB_DOWNLOAD, fetchable) == 0) {
+        // Nothing left to fetch, so this is a decode of what is already
+        // here -- which is what was being asked for.
+        job_start_decode();
+        return;
+    }
+
+    g_job.after = malloc((size_t)marked * sizeof *g_job.after);
+    if (g_job.after != NULL) {
+        for (int i = 0; i < g_n_rows; i++)
+            if (g_rows[i].marked) g_job.after[g_job.after_n++] = g_rows[i].id;
+    }
+
+    if (!job_next_batch()) set_status("could not start the download");
+}
+
+// Fetching a recording and then leaving it unread is never what was
+// wanted, so a finished download rolls straight into decoding. It works
+// through everything d was asked for, not only what this download
+// brought down, and reads the disk rather than the day view, which may
+// have been paged elsewhere while the job ran. Returns the number of
+// observations handed to the decoder.
+static int job_start_followup_decode(void)
+{
+    const long *want = g_job.after != NULL ? g_job.after : g_job.queue;
+    int want_n = g_job.after != NULL ? g_job.after_n : g_job.queue_n;
+    if (want == NULL || want_n == 0) return 0;
+
+    long *keep = malloc((size_t)want_n * sizeof *keep);
+    if (keep == NULL) return 0;
+    int n = 0;
+    for (int i = 0; i < want_n; i++) {
+        // One that failed to come down has nothing to read, and one the
+        // database already holds has been read; the rest are the work.
+        if (have_audio_on_disk(want[i]) && !is_decoded(want[i]))
+            keep[n++] = want[i];
+    }
+    if (n == 0) { free(keep); return 0; }
+
+    free(g_job.queue);
+    free(g_job.after);
+    memset(&g_job, 0, sizeof g_job);
+    g_job.kind = JOB_DECODE;
+    g_job.queue = keep;
+    g_job.queue_n = n;
+    g_job.total = n;
+    if (!job_next_batch()) return 0;
+    return n;
+}
+
 static void job_start_listing(void)
 {
     free(g_job.queue);
+    free(g_job.after);
     memset(&g_job, 0, sizeof g_job);
     g_job.kind = JOB_LIST;
 
@@ -1340,31 +1373,47 @@ static void job_start_listing(void)
     job_spawn(argv, title);
 }
 
+// Is this observation's work over? Either the database holds packets
+// from it, or the decode that has just ended went over it and came back
+// clean. The question is whether the work was done and not whether it
+// bore fruit: a recording can decode to nothing at all, and a day of
+// those would otherwise keep its marks for ever, waiting for a green
+// that is never coming.
+static int job_finished_with(long id)
+{
+    if (is_decoded(id)) return 1;
+    // Which of them failed is not reported one at a time, so any
+    // failure at all leaves every mark standing to be tried again.
+    if (g_job.failed > 0) return 0;
+    for (int q = 0; q < g_job.queue_n; q++)
+        if (g_job.queue[q] == id) return 1;
+    return 0;
+}
+
 // A mark is a piece of work to do, so it goes when the work is done:
-// once every pass marked on a day has packets in the database, that
-// day's selection clears itself rather than being left for the operator
-// to press n on. A day with anything still undecoded keeps its marks,
-// which is what leaves the retry list standing. Returns how many marks
-// were dropped.
+// once the decoder has been over every pass marked on a day, that day's
+// selection clears itself rather than being left for the operator to
+// press n on. A day with anything left keeps its marks, which is what
+// leaves the retry list standing. Returns how many marks were dropped.
 //
 // Worked through day by day, and only on the days this job actually
 // touched, because the operator may have paged somewhere else while it
 // ran: the day on screen holds its marks in the rows, and every other
 // day holds them in its memory.
-static int clear_decoded_day_marks(void)
+static int clear_finished_day_marks(void)
 {
     if (g_job.queue == NULL || g_job.queue_n == 0) return 0;
     int cleared = 0;
 
-    int marked = 0, all_decoded = 1, touched = 0;
+    int marked = 0, all_done = 1, touched = 0;
     for (int i = 0; i < g_n_rows; i++) {
         if (!g_rows[i].marked) continue;
         marked++;
-        if (!g_rows[i].decoded) all_decoded = 0;
+        if (!job_finished_with(g_rows[i].id)) all_done = 0;
         for (int q = 0; q < g_job.queue_n; q++)
             if (g_job.queue[q] == g_rows[i].id) { touched = 1; break; }
     }
-    if (marked > 0 && all_decoded && touched) {
+    if (marked > 0 && all_done && touched) {
         clear_marks();
         remember_day();
         cleared += marked;
@@ -1374,14 +1423,14 @@ static int clear_decoded_day_marks(void)
         daysel_t *e = &g_daysel[i];
         if (e->n_marks == 0 || strcmp(e->day, g_day) == 0) continue;
 
-        all_decoded = 1;
+        all_done = 1;
         touched = 0;
         for (int m = 0; m < e->n_marks; m++) {
-            if (!is_decoded(e->marks[m])) all_decoded = 0;
+            if (!job_finished_with(e->marks[m])) all_done = 0;
             for (int q = 0; q < g_job.queue_n; q++)
                 if (g_job.queue[q] == e->marks[m]) { touched = 1; break; }
         }
-        if (!all_decoded || !touched) continue;
+        if (!all_done || !touched) continue;
 
         cleared += e->n_marks;
         free(e->marks);
@@ -1463,7 +1512,7 @@ static void job_poll(void)
 
     // The decode is the end of the chain -- d runs one after its
     // download -- so this is where a finished selection is let go.
-    int cleared = (g_job.kind == JOB_DECODE) ? clear_decoded_day_marks() : 0;
+    int cleared = (g_job.kind == JOB_DECODE) ? clear_finished_day_marks() : 0;
 
     if (g_job.cancelled) {
         set_status("cancelled after %d of %d", g_job.done, g_job.total);
@@ -1868,9 +1917,12 @@ static void draw_help(int rows, int cols)
         "Green rows are finished: the audio is here and packets from it are in",
         "the database. Yellow means the recording is here and nothing has read",
         "it yet -- mark those and press p, which runs the same decoder as the",
-        "nightly batch and skips any file already decoded. A download decodes",
-        "what it fetched as soon as it finishes, so d alone carries a pass all",
-        "the way into the database.",
+        "nightly batch and skips any file already decoded. d means get these",
+        "into the database rather than get these off the network: when the",
+        "fetching is over it decodes everything that was marked, including the",
+        "passes that were already on the disk when you pressed it, so d alone",
+        "carries a whole selection all the way into the database. With nothing",
+        "left to fetch it goes straight to decoding.",
         "",
         "An observation shows as `no audio` when SatNOGS itself holds no",
         "recording, which is roughly one pass in three. Those cannot be fetched",
@@ -1899,9 +1951,11 @@ static void draw_help(int rows, int cols)
         "still made. Marks stay with the day they belong to rather than",
         "following you to the next one, so d only ever fetches what was chosen",
         "on the day in front of you. n clears them, and so does finishing the",
-        "work: once every pass marked on a day has packets in the database the",
-        "day lets its selection go, while a day with anything left undecoded",
-        "keeps its marks as the list of what to try again.",
+        "work: once the decoder has been over every pass marked on a day, that",
+        "day lets its selection go. A recording that decodes to nothing counts",
+        "as done -- the question is whether the work happened, not whether it",
+        "bore fruit -- but a decode that actually failed leaves every mark",
+        "standing as the list of what to try again.",
         "",
         "A running job turns the rows as it goes: a pass goes yellow the moment",
         "its recording lands and green when the database has packets from it,",
@@ -2324,6 +2378,7 @@ int main(int argc, char **argv)
     endwin();
     for (int i = 0; i < g_n_daysel; i++) free(g_daysel[i].marks);
     free(g_job.queue);
+    free(g_job.after);
     free(g_decoded_ids);
     free(g_local);
     free(g_notes);
