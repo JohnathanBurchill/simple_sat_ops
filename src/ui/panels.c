@@ -667,21 +667,38 @@ void render_status_panel(const status_panel_t *p,
     // on the RX panel's "RX freq" line, alongside the LO ± BW row that
     // tells the operator where the SDR is actually listening.)
     if (p->have_rotator) {
-        double az_display = p->current_az;
-        if (az_display < 0) az_display += 360.0;
         double target_az_display = p->target_az;
         if (target_az_display < 0) target_az_display += 360.0;
         const char *flip_tag = p->flip ? " (flip)" : "";
         mvprintw(row++, col, "%15s   %.1f deg%s", "target azimuth",
                  target_az_display, flip_tag);
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.1f deg", "azimuth", az_display);
+        if (p->rot_pos_known) {
+            double az_display = p->current_az;
+            if (az_display < 0) az_display += 360.0;
+            mvprintw(row++, col, "%15s   %.1f deg", "azimuth", az_display);
+        } else {
+            mvprintw(row++, col, "%15s   %s", "azimuth",
+                     "? (no recent status from rotator)");
+        }
         clrtoeol();
         mvprintw(row++, col, "%15s   %.1f deg%s", "target elevation",
                  p->target_el, flip_tag);
         clrtoeol();
-        mvprintw(row++, col, "%15s   %.1f deg", "elevation", p->current_el);
+        if (p->rot_pos_known) {
+            mvprintw(row++, col, "%15s   %.1f deg", "elevation", p->current_el);
+        } else {
+            mvprintw(row++, col, "%15s   %s", "elevation",
+                     "? (no recent status from rotator)");
+        }
         clrtoeol();
+        if (p->rot_activity) {
+            int warn = (strcmp(p->rot_activity, "Connection Failure") == 0);
+            if (warn) attron(COLOR_PAIR(1));
+            mvprintw(row++, col, "%15s   %s", "activity", p->rot_activity);
+            if (warn) attroff(COLOR_PAIR(1));
+            clrtoeol();
+        }
     } else {
         mvprintw(row++, col, "%15s   %s",
                  "antenna rotator", "* not initialized *");
@@ -790,23 +807,31 @@ void report_status(state_t *state, int *print_row, int print_col)
         // and no 500 ms VTIME hang if the cable is unplugged.
         double azimuth = state->rot.antenna_rotator.azimuth;
         double elevation = state->rot.antenna_rotator.elevation;
-        int    rot_ok = 0;
         int    rot_stale_ms = 0;
         if (state->rot.rot_async != NULL) {
             antenna_rotator_async_snapshot(state->rot.rot_async,
                                             &azimuth, &elevation,
-                                            &rot_ok, &rot_stale_ms, NULL);
+                                            NULL, &rot_stale_ms, NULL);
             // Cache the snapshot back into state so other code (the
             // antenna_is_moving heuristic, IPC broadcast, etc.) reads a
-            // single consistent value across the tick.
+            // single consistent value across the tick. position_known is
+            // recomputed from scratch every tick -- never known yet
+            // (stale_ms == INT_MAX) and gone stale (a pulled cable, a
+            // wedged controller) must both flip it back to false, so a
+            // reading that stops arriving stops being shown as current.
             state->rot.antenna_rotator.azimuth   = azimuth;
             state->rot.antenna_rotator.elevation = elevation;
+            state->rot.antenna_rotator.position_known =
+                (rot_stale_ms <= ANTENNA_ROTATOR_STATUS_STALE_MS);
         }
-        p.current_az = azimuth;
-        p.current_el = elevation;
+        p.current_az     = azimuth;
+        p.current_el     = elevation;
+        p.rot_pos_known  = state->rot.antenna_rotator.position_known;
         p.target_az  = state->rot.antenna_rotator.target_azimuth;
         p.target_el  = state->rot.antenna_rotator.target_elevation;
         p.flip       = state->rot.antenna_rotator.flip_mode_pass;
+        p.rot_activity = antenna_rotator_activity_name(
+            antenna_rotator_activity_status(&state->rot.antenna_rotator));
     }
 
     // T/R switch block — operator-only (this process owns the serial

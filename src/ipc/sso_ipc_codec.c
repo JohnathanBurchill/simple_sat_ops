@@ -520,6 +520,12 @@ int sso_event_encode(const sso_event_t *evt, char *out, size_t out_size) {
         if (evt->has_rotator) {
             if (json_field_bool(&p, end, &first, "has_rot", 1) < 0) return -1;
         }
+        if (evt->rot_pos_known) {
+            if (json_field_bool(&p, end, &first, "rot_pos_known", 1) < 0) return -1;
+        }
+        if (evt->has_rotator) {
+            if (json_field_int(&p, end, &first, "rot_act", evt->rot_activity) < 0) return -1;
+        }
         if (json_field_str(&p, end, &first, "idesg", evt->idesg) < 0) return -1;
         if (json_field_double(&p, end, &first, "ep_min",  evt->epoch_min) < 0) return -1;
         if (json_field_double(&p, end, &first, "mv",      evt->min_visible) < 0) return -1;
@@ -772,6 +778,12 @@ int sso_event_decode(const char *line, sso_event_t *evt) {
     if (json_get_double(line, line_len, "jul", &evt->jul_utc) > 0) evt->has_state = 1;
     int rotflag = 0;
     if (json_get_bool(line, line_len, "has_rot", &rotflag) > 0) evt->has_rotator = rotflag;
+    int rot_pos_known_flag = 0;
+    if (json_get_bool(line, line_len, "rot_pos_known", &rot_pos_known_flag) > 0)
+        evt->rot_pos_known = rot_pos_known_flag;
+    long rot_act = 0;
+    if (json_get_int(line, line_len, "rot_act", &rot_act) > 0)
+        evt->rot_activity = (int) rot_act;
     if (json_get_string(line, line_len, "idesg", evt->idesg, sizeof evt->idesg) > 0)
         evt->has_state = 1;
     if (json_get_double(line, line_len, "ep_min", &evt->epoch_min)    > 0) evt->has_state = 1;

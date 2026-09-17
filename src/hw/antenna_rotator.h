@@ -69,6 +69,19 @@ typedef struct antenna_rotator
     double target_elevation;
     double azimuth;
     double elevation;
+    // 1 when azimuth/elevation currently reflect a recent, real STATUS
+    // reply from the rotator; 0 before the first good reply lands, OR
+    // once one has gone stale (see ANTENNA_ROTATOR_STATUS_STALE_MS).
+    // This wire-level struct only ever sets it true, alongside azimuth/
+    // elevation, on a synchronous seed (antenna_rotator_seed_from_status).
+    // The live --control path runs through the async worker instead, and
+    // the async callers (src/ui/panels.c report_status,
+    // src/control/tracking.c main_rotator_refresh_targets_from_snapshot)
+    // are responsible for re-deriving this flag every time from the
+    // snapshot's stale_ms -- it is deliberately NOT a one-shot latch, so a
+    // reading that stops arriving (pulled cable, wedged controller) stops
+    // being presented as current instead of freezing on its last value.
+    int position_known;
     // Last commanded extended-range azimuth; canonical for path planning.
     // target_azimuth is kept as the display-friendly (often wrapped) form.
     double target_azimuth_unwrapped;
@@ -108,6 +121,37 @@ typedef struct antenna_rotator
     // try to bridge the 180 deg jump.
     int flip_half;
 } antenna_rotator_t;
+
+// Tolerance (deg) below which target vs. actual (or either vs. 0,0) counts
+// as "the same place" for activity-status purposes. Matches the existing
+// MAX_DELTA_AZIMUTH/ELEVATION_DEGREES convention in control/tracking.h
+// (kept as a separate constant here so this hw-layer header doesn't have
+// to pull in the control layer).
+#define ANTENNA_ROTATOR_ACTIVITY_TOLERANCE_DEG 1.0
+
+// Operator-facing summary of what the rotator is doing right now, derived
+// primarily by comparing the commanded target to the last-reported actual
+// position (see antenna_rotator_activity_status).
+typedef enum {
+    ANTENNA_ROTATOR_ACTIVITY_CONNECTION_FAILURE = 0,
+    ANTENNA_ROTATOR_ACTIVITY_RETURNING_HOME,
+    ANTENNA_ROTATOR_ACTIVITY_JOGGING,
+    ANTENNA_ROTATOR_ACTIVITY_IDLE_AT_HOME,
+    ANTENNA_ROTATOR_ACTIVITY_IDLE,
+} antenna_rotator_activity_t;
+
+// Classify current activity from target vs. actual az/el:
+//   - !position_known                          -> CONNECTION_FAILURE
+//   - actual not within tolerance of target:
+//       - target (or, mid a two-step unwind, the pending final leg) is
+//         within tolerance of (0, 0)            -> RETURNING_HOME
+//       - otherwise                             -> JOGGING
+//   - actual within tolerance of target:
+//       - actual within tolerance of (0, 0)     -> IDLE_AT_HOME
+//       - otherwise                             -> IDLE
+const char *antenna_rotator_activity_name(antenna_rotator_activity_t status);
+antenna_rotator_activity_t antenna_rotator_activity_status(
+    const antenna_rotator_t *antenna_rotator);
 
 int antenna_rotator_init(antenna_rotator_t *antenna_rotator);
 void antenna_rotator_connect(antenna_rotator_t *antenna_rotator);
