@@ -550,10 +550,11 @@ if (RAYLIB_FOUND)
     # 152-byte frames by their sync word, groups them into images by inner-dome
     # target voltage, and plays them back grayscale with an adjustable DN range.
     # Needs sqlite3 via packet_db.
-    # The globe under the experiment list propagates the DB's own TLEs with
-    # SGP4 and asks sgp4sdp4 where the Sun was, hence prediction.c (and oem.c,
-    # which it calls into) and the vendored library.
-    add_executable(mpi_viewer utils/mpi_viewer.c src/proto/bulk_size.c
+    # The globe under the experiment list (utils/sat_globe.c, shared with
+    # frontiersat_camera_viewer) propagates the DB's own TLEs with SGP4 and asks
+    # sgp4sdp4 where the Sun was, hence prediction.c (and oem.c, which it calls
+    # into) and the vendored library.
+    add_executable(mpi_viewer utils/mpi_viewer.c utils/sat_globe.c src/proto/bulk_size.c
                    src/proto/adcs_mag.c src/orbit/prediction.c src/orbit/oem.c)
     target_include_directories(mpi_viewer PRIVATE ${RAYLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(mpi_viewer PRIVATE ${RAYLIB_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
@@ -576,7 +577,13 @@ if (RAYLIB_FOUND)
     # file's sentence layout, merges every pass that downloaded the same
     # picture, decodes the JPEG (cam_jpeg.c, shared with cam_reconstruct and
     # packet_browser) and shows it. Needs sqlite3 via packet_db.
-    set(CAMERA_VIEWER_SRCS utils/frontiersat_camera_viewer.c utils/cam_jpeg.c)
+    # The globe under the capture list is utils/sat_globe.c, shared with
+    # mpi_viewer: it propagates the DB's own TLEs with SGP4 and asks sgp4sdp4
+    # where the Sun was, hence prediction.c (and oem.c, which it calls into),
+    # adcs_mag.c for the TLE epochs, and the vendored library.
+    set(CAMERA_VIEWER_SRCS utils/frontiersat_camera_viewer.c utils/cam_jpeg.c
+                           utils/sat_globe.c src/proto/adcs_mag.c
+                           src/orbit/prediction.c src/orbit/oem.c)
     if (APPLE)
         # Same trackpad-pinch shim decode_inspector uses: raylib/GLFW drop
         # NSEventTypeMagnify, so an NSEvent monitor collects it for us.
@@ -585,7 +592,8 @@ if (RAYLIB_FOUND)
     add_executable(frontiersat_camera_viewer ${CAMERA_VIEWER_SRCS})
     target_include_directories(frontiersat_camera_viewer PRIVATE ${RAYLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(frontiersat_camera_viewer PRIVATE ${RAYLIB_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
-    target_link_libraries(frontiersat_camera_viewer PRIVATE ${RAYLIB_LIBRARIES} ${OPENSSL_LIBRARIES} m)
+    target_link_libraries(frontiersat_camera_viewer PRIVATE ${RAYLIB_LIBRARIES} ${OPENSSL_LIBRARIES}
+                          ${SGP4SDP4_LIB} m)
     target_link_packet_db(frontiersat_camera_viewer)
     target_link_sso_core(frontiersat_camera_viewer)
     if (APPLE)

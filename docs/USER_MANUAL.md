@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`426f3b7` (2026-08-30). This is a working draft.
+`001b301` (2026-09-03). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2252,13 +2252,32 @@ so scrolling back out always lands on the whole picture again, and a picture
 zoomed past the pane cannot be dragged off its edge. Both go back to the whole
 picture when you change picture or reload.
 
+**Where it was taken (the globe).** Under the capture list is the same Earth
+panel `mpi_viewer` carries (`utils/sat_globe.c`): NASA's Blue Marble wrapped on
+a sphere and lit from where the Sun actually stood at that moment, so a picture
+taken over the night side has a dark Earth under it. Five minutes of ground
+track either side runs across it - a picture is taken in an instant, so unlike
+an MPI recording it has no arc of its own - with a dot on the point the
+satellite was over, and the sub-satellite latitude, longitude and altitude under
+the disc. Drag the globe to turn it, press with two fingers and slide to turn it
+about the satellite, scroll over it to zoom, and **`g` puts the view back** to
+the whole Earth framed on the track. The orbit is whichever element set in the
+database's own `tle` table has the epoch closest to the moment, propagated by
+the same SGP4 the pass predictor uses, and the caption above the disc names it
+and says how far from its epoch the picture sat.
+
+When no `camera_capture` command is on record the capture time is not known, and
+the globe falls back to **where the satellite was when the picture was first
+downloaded** - a different place on a different pass. The panel's heading says
+which it is showing: `Ground track at capture` or `Ground track at downlink`.
+
 Keys: `Up`/`Down` change picture, **`o` opens the picture in the desktop's
 image viewer** (Preview on macOS, the `xdg-open` default on Linux) via a copy
 in the temporary directory - for a look in whatever viewer you already keep
 your pictures in. `s` saves the JPEG to
-the working directory as `fs_boomcam_<capture time>.jpg`, **`F5` re-reads the
-database** and rebuilds the list, and `q` quits. Read-only on the database and
-safe to run while a receiver is filling it.
+the working directory as `fs_boomcam_<capture time>.jpg`, `g` resets the globe,
+**`F5` re-reads the database** and rebuilds the list, and `q` quits. Read-only
+on the database and safe to run while a receiver is filling it.
 
 ### `mpi_reconstruct`
 

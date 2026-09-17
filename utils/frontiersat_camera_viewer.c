@@ -46,6 +46,17 @@
     fitted to the pane, so scrolling back out always lands on the whole picture
     again, and a picture bigger than the pane cannot be dragged off the edge.
 
+    Where it was taken: under the capture list is the Earth (utils/sat_globe.c,
+    the same panel mpi_viewer carries), NASA's Blue Marble wrapped on a sphere
+    and lit from where the Sun actually stood at that moment, so a picture taken
+    over the night side has a dark Earth under it. Five minutes of ground track
+    either side of the moment is drawn across it, with a dot on the point the
+    satellite was over. Drag the globe to turn it, press with two fingers and
+    slide to turn it about the satellite, scroll to zoom, g to put it back. When
+    no camera_capture command is on record the capture time is not known, and
+    the globe falls back to where the satellite was when the picture was first
+    downloaded -- a different place entirely, which the panel's heading says.
+
     Read-only on the DB. Press F5 to re-read it and rebuild the capture list.
 
     Usage:
@@ -75,6 +86,7 @@
 
 #include "cam_jpeg.h"
 #include "packet_db.h"
+#include "sat_globe.h"
 #include "sso_version.h"
 
 #include <math.h>
@@ -151,6 +163,17 @@ extern void  sso_install_pinch_monitor(void);
 
 #define MAX_SESSIONS_SHOWN 6
 #define MAX_PATH_LEN 128
+
+// How much ground track the globe draws either side of the moment the picture
+// belongs to. A picture is taken in an instant, so unlike an MPI recording it
+// has no arc of its own; five minutes of flight each way is about 2000 km of
+// track either side, enough to say which way the satellite was going and where
+// it had come from without wrapping the arc round the whole Earth.
+#define CAM_TRACK_HALF_MS (5.0 * 60.0 * 1000.0)
+
+// The help line along the bottom of the window runs the full width, so the
+// left column stops above it.
+#define FOOTER_H 28
 
 typedef struct {
     double   ts_ms;
@@ -863,6 +886,17 @@ int main(int argc, char **argv)
     SetTargetFPS(60);
     g_ui_font_loaded = load_ui_font();
     build_textures(caps, ncaps);
+
+    // The globe under the capture list. The map and the element sets are read
+    // once here; the track itself is built the first time round the loop.
+    globe_t globe = {0};
+    globe.zoom = GLOBE_ZOOM_MIN;
+    globe_set_font(g_ui_font, g_ui_font_loaded, g_ui_font_spacing);
+    globe_load_map(&globe, "frontiersat_camera_viewer");
+    if (globe_load_tles(db_path) == 0)
+        fprintf(stderr, "frontiersat_camera_viewer: no FrontierSat TLEs in the "
+                        "DB; the globe will show no ground track\n");
+
 #ifdef __APPLE__
     sso_install_pinch_monitor();
 #endif
@@ -893,7 +927,23 @@ int main(int argc, char **argv)
         if (pw < 40) pw = 40;
         if (ph < 40) ph = 40;
 
+        // The left column: the capture list above, the globe below. Worked out
+        // before the input, since a press on the globe and a press on the list
+        // are told apart by where the two panels are. A window too short to
+        // hold the globe gives the whole column to the list.
+        const int row_h = 44, list_top = 40;
+        int col_bottom = sh - FOOTER_H;
+        int globe_h = GLOBE_PANEL_H;
+        int room = col_bottom - list_top - 2 * row_h;
+        if (globe_h > room) globe_h = room;
+        if (globe_h < GLOBE_PANEL_MIN_H) globe_h = 0;
+        int globe_y = col_bottom - globe_h;
+        int list_h = (globe_h ? globe_y : col_bottom) - list_top;
+        if (list_h < 0) list_h = 0;
+
         // ---- input ----
+        // The globe takes its own drags and its own wheel.
+        if (globe_h > 0) globe_input(&globe, 0, globe_y, LEFT_W, globe_h);
         int moved = 0;
         if (key_repeat(KEY_DOWN, &rep_down) && sel < ncaps - 1) { sel++; moved = 1; }
         if (key_repeat(KEY_UP, &rep_up)     && sel > 0)         { sel--; moved = 1; }
@@ -934,6 +984,8 @@ int main(int argc, char **argv)
                 c = &caps[sel];
                 zoom = 1.0f;
                 pan = (Vector2){ 0, 0 };
+                globe_load_tles(db_path);
+                globe.track_key[0] = '\0';   // and a fresh ground track
                 snprintf(status, sizeof status, "reloaded: %d capture%s",
                          ncaps, ncaps == 1 ? "" : "s");
             } else {
@@ -942,8 +994,24 @@ int main(int argc, char **argv)
             }
             status_left = 6.0f;
         }
+        // g: the globe back to how it opens -- the whole Earth, framed on the
+        // track -- from wherever turning and zooming left it.
+        if (IsKeyPressed(KEY_G)) globe_reset_view(&globe);
         if (IsKeyPressed(KEY_Q)) break;
         if (status_left > 0.0f) status_left -= GetFrameTime();
+
+        // Where the satellite was when this picture was taken -- or, when no
+        // camera_capture command is on record to say, when the first pass
+        // downloaded it, which is a different place and is labelled as such.
+        double dot_ms = c->t_capture_ms > 0 ? c->t_capture_ms : c->t_first_ms;
+
+        // A different picture is a different piece of ground track, a different
+        // orbit and a different Sun. Keyed on the row as well as the moment, so
+        // two pictures that share a timestamp still each get their own track.
+        const char *track_key = TextFormat("%d %.0f", sel, dot_ms);
+        if (strcmp(globe.track_key, track_key) != 0)
+            globe_set_track(&globe, track_key,
+                            dot_ms - CAM_TRACK_HALF_MS, dot_ms + CAM_TRACK_HALF_MS);
 
         // ---- draw ----
         BeginDrawing();
@@ -953,11 +1021,13 @@ int main(int argc, char **argv)
         DrawRectangle(0, 0, LEFT_W, sh, (Color){ 28, 28, 34, 255 });
         draw_text("Camera captures", 12, 10, 18, RAYWHITE);
         draw_text(TextFormat("%d", ncaps), LEFT_W - 40, 14, 12, GRAY);
-        int row_h = 44, list_top = 40;
-        int visible = (sh - list_top) / row_h;
+        int visible = list_h / row_h;
         int top = 0;
-        if (sel >= visible) top = sel - visible + 1;
-        for (int r = 0; r < visible && top + r < ncaps; r++) {
+        if (visible > 0 && sel >= visible) top = sel - visible + 1;
+        // A row half off the bottom is cut at the globe's edge rather than
+        // drawn over it.
+        BeginScissorMode(0, list_top, LEFT_W, list_h);
+        for (int r = 0; r <= visible && top + r < ncaps; r++) {
             int si = top + r;
             capture_t *cc = &caps[si];
             int y = list_top + r * row_h;
@@ -973,6 +1043,13 @@ int main(int argc, char **argv)
                                  cc->jpg_len / 1024.0, pct, cc->st.sentences_present),
                       10, y + 23, 12, GRAY);
         }
+        EndScissorMode();
+
+        // the globe, under the list
+        if (globe_h > 0)
+            globe_draw(&globe, 0, globe_y, LEFT_W, globe_h, dot_ms,
+                       c->t_capture_ms > 0 ? "Ground track at capture"
+                                           : "Ground track at downlink");
 
         // right: title
         draw_text(c->sat_path[0] ? c->sat_path : "(satellite file unknown)",
@@ -1046,12 +1123,14 @@ int main(int argc, char **argv)
 
         // help footer
         draw_text("Up/Down capture   scroll or pinch zoom   drag to move   "
+                  "globe: drag turns, scroll zooms, g resets   "
                   "o open   s save jpeg   F5 refresh   q quit",
                   12, sh - 22, 12, (Color){ 150, 150, 160, 255 });
 
         EndDrawing();
     }
 
+    globe_free(&globe);
     unload_textures(caps, ncaps);
     if (g_ui_font_loaded) UnloadFont(g_ui_font);
     CloseWindow();
