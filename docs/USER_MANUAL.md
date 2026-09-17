@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`001b301` (2026-09-03). This is a working draft.
+`68ad246` (2026-09-17). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -3410,12 +3410,14 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   (all, with audio, not downloaded, downloaded, decoded).
 
   `o` cycles the column the rows are sorted by, and `O` cycles it the
-  other way: `no` (the day's own order, by start time, which is where it
-  starts), `id`, `start`, `len`, `el` and `data`. Each column sorts the
-  way it is worth asking for — id and start lowest and earliest first,
-  pass length, elevation and frame count largest first — so sorting by
-  `el` puts the day's highest passes at the top, and by `data` the ones
-  that carried the most. The sorted column is the capitalised
+  other way: `no` (the day's own order, by start time), `id`, `start`,
+  `len`, `el` and `data`. Each column sorts the way it is worth asking
+  for — id and start lowest and earliest first, pass length, elevation
+  and frame count largest first — so sorting by `el` puts the day's
+  highest passes at the top, and by `data` the ones that carried the
+  most. A day opens sorted by `data`, most frames first: which passes
+  carried anything is the first question asked of a day, and the
+  answer should not need a keystroke. The sorted column is the capitalised
   heading; the row numbers keep counting down the screen whatever the
   order is, and the cursor stays on the observation it was on. The
   filter and the sort are independent: filtering to the passes with
@@ -3457,16 +3459,28 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   `<id><TAB><text>` line each, so they are readable without the browser;
   emptying a note deletes it.
 
-  Stepping between days keeps your place. Each day remembers the
-  observation the cursor was on, so `h` to look at yesterday and `l`
-  back returns to the row you left rather than the top of the day; a day
-  you have not looked at yet, or one whose observation the filter now
-  hides, opens on its first row as before. It is the observation that is
-  remembered rather than the row number, so the place survives a change
-  of filter or sort. Marks are the exception and are deliberately
-  dropped when the day changes: they name observations on the day they
-  were made, and carrying them across would let `d` fetch passes that
-  scrolled out of view days ago.
+  Stepping between days keeps your place. Each day remembers both the
+  observation the cursor was on and everything marked on it, so `h` to
+  look at yesterday and `l` back returns to the row you left with the
+  selection you had made still made; a day you have not looked at yet,
+  or one whose observation the filter now hides, opens on its first row
+  as before. Both are remembered as observation ids rather than row
+  numbers, so they survive a change of filter or sort, and they survive
+  the day being re-read from the disk after a job. Marks stay with the
+  day they were made on rather than following you to the next one, so
+  `d` only ever fetches what was chosen on the day in front of you; `n`
+  clears them.
+
+  A running job turns the rows as it goes rather than at the end: a pass
+  goes yellow the moment its recording lands on the disk, and green when
+  the database has packets decoded from it — the second asked of the
+  database one observation at a time, so "decoded" still means the pass
+  yielded something rather than that the decoder merely exited cleanly.
+  On a mark set of any size that is the difference between watching a
+  progress bar and watching the day fill in. The rows themselves stay
+  where they are until the job ends, filter and all: a row leaving the
+  screen from under the cursor because it no longer matches "not
+  downloaded" is not progress worth looking at.
 
   A day with no SatNOGS listing yet still shows what this station holds
   for it. The archive is filed by observation id rather than by date, so

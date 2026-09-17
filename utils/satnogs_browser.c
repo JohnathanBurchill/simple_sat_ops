@@ -218,7 +218,9 @@ static int    g_n_view = 0;
 static int    g_sel = 0;
 static int    g_top = 0;
 static int    g_filter = FLT_ALL;
-static int    g_order = ORD_NO;
+// Most frames first, because the first question asked of a day is
+// which of its passes carried anything. o cycles away from it.
+static int    g_order = ORD_DATA;
 static int    g_truncated = 0;
 
 static char   g_day[16] = "";          // YYYY-MM-DD, UTC
@@ -380,6 +382,35 @@ static void load_decoded_ids(void)
     } else {
         free(ids);
     }
+}
+
+// Does the database hold anything decoded from this one observation?
+// Asked of each file a running decode finishes, so a row turns green as
+// its own audio is read rather than only when the whole job ends.
+// load_decoded_ids() answers the same question for the entire archive,
+// which is far too much work to repeat once a file.
+static int db_has_packets(long id)
+{
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(g_db_path, &db, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return 0;
+    }
+    sqlite3_busy_timeout(db, 5000);
+
+    char dir[900];
+    snprintf(dir, sizeof dir, "%s/%ld", g_archive, id);
+
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM packet WHERE session_dir = ?1 LIMIT 1",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, dir, -1, SQLITE_STATIC);
+        found = sqlite3_step(st) == SQLITE_ROW;
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return found;
 }
 
 // Split a tab-separated line in place into at most `max` fields.
@@ -900,43 +931,99 @@ static void clear_marks(void)
     for (int i = 0; i < g_n_rows; i++) g_rows[i].marked = 0;
 }
 
+// The row an observation is on, or NULL when this day is not showing
+// it. A running job names observations, and the rows it changes as it
+// goes are whichever of them are in front of the operator.
+static obs_t *row_by_id(long id)
+{
+    for (int i = 0; i < g_n_rows; i++)
+        if (g_rows[i].id == id) return &g_rows[i];
+    return NULL;
+}
+
 // ----------------------------------------------------------------- day
 
-// Where the cursor was on each day looked at this session, so stepping
-// away with h or l and coming back puts it where it was rather than at
-// the top of the day. Remembered as an observation id, not a row
-// number: the row an observation sits on moves with the filter and the
-// sort, the observation itself does not. Sixty-four days is further
-// than anyone steps in one sitting; past that the oldest is dropped.
+// How each day looked at this session was left: where the cursor sat
+// and what was marked on it, so stepping away with h or l and coming
+// back finds the day as it was rather than at the top with nothing
+// chosen. Both are remembered as observation ids, not row numbers: the
+// row an observation sits on moves with the filter and the sort, the
+// observation itself does not. Sixty-four days is further than anyone
+// steps in one sitting; past that the oldest is dropped.
 #define DAY_MEMORY 64
 
 typedef struct {
-    char day[16];
-    long id;
+    char  day[16];
+    long  id;        // the observation the cursor was on, or -1
+    long *marks;     // the observations marked on that day
+    int   n_marks;
 } daysel_t;
 
 static daysel_t g_daysel[DAY_MEMORY];
 static int      g_n_daysel = 0;
 
-static void remember_day_selection(void)
+// What is remembered about a day, or NULL if it has not been looked at.
+static daysel_t *day_seen(const char *day)
 {
-    if (g_day[0] == '\0' || g_n_view == 0 || g_sel < 0 || g_sel >= g_n_view)
-        return;
-    long id = g_rows[g_view[g_sel]].id;
+    for (int i = 0; i < g_n_daysel; i++)
+        if (strcmp(g_daysel[i].day, day) == 0) return &g_daysel[i];
+    return NULL;
+}
 
-    for (int i = 0; i < g_n_daysel; i++) {
-        if (strcmp(g_daysel[i].day, g_day) == 0) {
-            g_daysel[i].id = id;
-            return;
-        }
-    }
+// The same, making the entry if this is the first time here.
+static daysel_t *day_entry(const char *day)
+{
+    daysel_t *e = day_seen(day);
+    if (e != NULL) return e;
+
     if (g_n_daysel == DAY_MEMORY) {
+        free(g_daysel[0].marks);
         memmove(&g_daysel[0], &g_daysel[1], sizeof g_daysel[0] * (DAY_MEMORY - 1));
         g_n_daysel--;
     }
-    snprintf(g_daysel[g_n_daysel].day, sizeof g_daysel[0].day, "%s", g_day);
-    g_daysel[g_n_daysel].id = id;
-    g_n_daysel++;
+    e = &g_daysel[g_n_daysel++];
+    memset(e, 0, sizeof *e);
+    e->id = -1;
+    snprintf(e->day, sizeof e->day, "%s", day);
+    return e;
+}
+
+// Note where this day is before its rows go away -- on the way to
+// another day, or to reading the same one back off the disk.
+static void remember_day(void)
+{
+    if (g_day[0] == '\0') return;
+    daysel_t *e = day_entry(g_day);
+
+    if (g_n_view > 0 && g_sel >= 0 && g_sel < g_n_view)
+        e->id = g_rows[g_view[g_sel]].id;
+
+    free(e->marks);
+    e->marks = NULL;
+    e->n_marks = 0;
+    int n = count_marked();
+    if (n == 0) return;
+    e->marks = malloc((size_t)n * sizeof *e->marks);
+    if (e->marks == NULL) return;
+    for (int i = 0; i < g_n_rows; i++)
+        if (g_rows[i].marked) e->marks[e->n_marks++] = g_rows[i].id;
+}
+
+// Put back what was marked on this day. The rows themselves are built
+// afresh every time the day is read, so this runs after each of those:
+// a mark names an observation, which outlives the row it was made on.
+// An observation that has since gone from the day simply loses its
+// mark, which is the honest answer -- there is nothing left to fetch.
+static void restore_day_marks(void)
+{
+    const daysel_t *e = day_seen(g_day);
+    if (e == NULL) return;
+    for (int i = 0; i < g_n_rows; i++) {
+        g_rows[i].marked = 0;
+        for (int m = 0; m < e->n_marks; m++) {
+            if (e->marks[m] == g_rows[i].id) { g_rows[i].marked = 1; break; }
+        }
+    }
 }
 
 // Put the cursor back on the observation this day was left on. A day
@@ -944,21 +1031,16 @@ static void remember_day_selection(void)
 // the top row -- the same place it would have started before.
 static void restore_day_selection(void)
 {
-    for (int i = 0; i < g_n_daysel; i++) {
-        if (strcmp(g_daysel[i].day, g_day) != 0) continue;
-        for (int v = 0; v < g_n_view; v++) {
-            if (g_rows[g_view[v]].id == g_daysel[i].id) {
-                g_sel = v;
-                return;
-            }
-        }
-        return;
+    const daysel_t *e = day_seen(g_day);
+    if (e == NULL || e->id < 0) return;
+    for (int v = 0; v < g_n_view; v++) {
+        if (g_rows[g_view[v]].id == e->id) { g_sel = v; return; }
     }
 }
 
 static void day_shift(int days)
 {
-    remember_day_selection();
+    remember_day();
     struct tm tm = {0};
     if (strptime(g_day, "%Y-%m-%d", &tm) == NULL) return;
     time_t t = timegm(&tm) + (time_t)days * 86400;
@@ -969,7 +1051,7 @@ static void day_shift(int days)
 
 static void day_today(void)
 {
-    remember_day_selection();
+    remember_day();
     time_t now = time(NULL);
     struct tm out;
     gmtime_r(&now, &out);
@@ -983,16 +1065,27 @@ static int day_valid(const char *s)
     return strptime(s, "%Y-%m-%d", &tm) != NULL;
 }
 
-// Re-read whatever g_day now names. Switching days drops the marks:
-// they name observations on the day they were made, and carrying them
-// across would make `d` fetch things that scrolled off the screen days
-// ago. The cursor is not a mark, so it does come back.
+// Re-read whatever g_day now names and put the day back the way it was
+// left: the rows come off the disk afresh, then the marks and the
+// cursor go back on. Marks stay with the day they were made on rather
+// than following the operator to the next one, so `d` fetches what was
+// chosen here and nothing that scrolled past days ago.
 static void reload_day(void)
 {
-    clear_marks();
     load_day();
+    restore_day_marks();
     rebuild_view();
     restore_day_selection();
+}
+
+// Re-read the day already on screen, after something has changed what
+// is on the disk. Same as arriving at a day, except that where the
+// cursor and the marks are has to be noted first: a day change notes
+// them on its way out, and this is not one.
+static void refresh_day(void)
+{
+    remember_day();
+    reload_day();
 }
 
 // Only for a day that came from somewhere else -- the `g` prompt, or
@@ -1002,12 +1095,32 @@ static void reload_day(void)
 // practice leaves the date empty.
 static void go_to_day(const char *day)
 {
-    remember_day_selection();
+    remember_day();
     snprintf(g_day, sizeof g_day, "%s", day);
     reload_day();
 }
 
 // ----------------------------------------------------------------- job
+
+// The observation id out of a finished-download line, which names the
+// file the pull script has just moved into place:
+// "    -> <archive>/<id>/satnogs_<id>_<start>.<ext>  status=...".
+// Returns -1 for a line that is not one of those.
+static long id_from_download_line(const char *text)
+{
+    // Every occurrence, not the first: the archive directory is itself
+    // called satnogs_archive on this station, so the path leading up to
+    // the file matches before the file does.
+    for (const char *p = text;
+         (p = strstr(p, "satnogs_")) != NULL;
+         p += strlen("satnogs_")) {
+        const char *digits = p + strlen("satnogs_");
+        char *endp = NULL;
+        long id = strtol(digits, &endp, 10);
+        if (endp != digits && *endp == '_' && id > 0) return id;
+    }
+    return -1;
+}
 
 static void job_add_line(const char *text)
 {
@@ -1025,10 +1138,26 @@ static void job_add_line(const char *text)
     // instead -- one to an observation -- so this only reads download
     // output.
     if (g_job.kind != JOB_DOWNLOAD) return;
-    if (strstr(text, "-> ") != NULL && strstr(text, "satnogs_") != NULL)
+    if (strstr(text, "-> ") != NULL && strstr(text, "satnogs_") != NULL) {
         g_job.done++;
-    else if (strstr(text, "!! ") != NULL)
+        // Turn the row the moment its recording lands, rather than
+        // leaving the whole day grey until the job ends: on a mark set
+        // of any size that is several minutes of watching nothing
+        // happen. The filtered view is deliberately left as it is --
+        // a row vanishing from under the cursor because it no longer
+        // matches "not downloaded" is not progress to look at.
+        long id = id_from_download_line(text);
+        obs_t *o = (id > 0) ? row_by_id(id) : NULL;
+        if (o != NULL) {
+            o->downloaded = 1;
+            // The stored record lands beside the audio, so a day that
+            // has never been listed can fill in its frame count and
+            // pass details now without spending a request.
+            if (o->n_data < 0) fill_from_meta(o);
+        }
+    } else if (strstr(text, "!! ") != NULL) {
         g_job.failed++;
+    }
 }
 
 // Spawn satnogs_pull.sh with the given arguments, reading its output
@@ -1260,6 +1389,16 @@ static void job_poll(void)
     if (g_job.kind == JOB_DECODE) {
         if (WIFEXITED(st) && WEXITSTATUS(st) == 0) g_job.done++;
         else                                       g_job.failed++;
+
+        // Turn this observation's row as its own file finishes.
+        // decode_next_batch() takes the id off the queue before
+        // spawning, so the child that just exited was given the one
+        // behind the queue position. A clean exit is not the same as
+        // packets -- a recording can decode to nothing -- so it is the
+        // database that decides, asked about this observation alone.
+        long id = g_job.queue_pos > 0 ? g_job.queue[g_job.queue_pos - 1] : -1;
+        obs_t *o = (id > 0) ? row_by_id(id) : NULL;
+        if (o != NULL && db_has_packets(id)) o->decoded = 1;
     }
 
     // More ids waiting means this was one batch of several.
@@ -1269,8 +1408,7 @@ static void job_poll(void)
     // A decode also puts rows in the database, which is where the green
     // in the local column comes from.
     if (g_job.kind == JOB_DECODE) load_decoded_ids();
-    load_day();
-    rebuild_view();
+    refresh_day();
 
     if (g_job.cancelled) {
         set_status("cancelled after %d of %d", g_job.done, g_job.total);
@@ -1690,8 +1828,9 @@ static void draw_help(int rows, int cols)
         "o sorts the rows by a column, and the sorted column is the capitalised",
         "heading. Each sorts the way it is worth asking for: id and start",
         "lowest and earliest first, len, el and data largest first, which is",
-        "how to put the best passes of the day at the top. `no` is the day's",
-        "own order, by start time, and is where o starts.",
+        "how to put the best passes of the day at the top. A day opens sorted",
+        "by data, most frames first, because that is the first thing asked of",
+        "one; `no` is the day's own order, by start time.",
         "",
         "A note written with Enter is your own line about the pass -- what it",
         "carried, why it matters. It shows at the right of the row, cut with an",
@@ -1699,9 +1838,17 @@ static void draw_help(int rows, int cols)
         "live in .notes.tsv at the top of the archive; emptying one deletes it.",
         "",
         "Stepping between days keeps your place. Each day remembers the",
-        "observation the cursor was on, so h to yesterday and l back returns to",
-        "the row you left. Marks are dropped when the day changes, on purpose:",
-        "they name observations on the day they were made.",
+        "observation the cursor was on and everything marked on it, so h to",
+        "yesterday and l back returns to the row you left with your selection",
+        "still made. Marks stay with the day they belong to rather than",
+        "following you to the next one, so d only ever fetches what was chosen",
+        "on the day in front of you. n clears them.",
+        "",
+        "A running job turns the rows as it goes: a pass goes yellow the moment",
+        "its recording lands and green when the database has packets from it,",
+        "so d on a long list reads as it runs. The rows themselves stay put",
+        "until the job is over, filter and all -- one leaving the screen from",
+        "under the cursor is not progress worth watching.",
         "",
         "A day with no listing still shows what this station holds for it: the",
         "archive is read at startup and merged into every day. `held` in the",
@@ -2116,6 +2263,7 @@ int main(int argc, char **argv)
     }
 
     endwin();
+    for (int i = 0; i < g_n_daysel; i++) free(g_daysel[i].marks);
     free(g_job.queue);
     free(g_decoded_ids);
     free(g_local);
