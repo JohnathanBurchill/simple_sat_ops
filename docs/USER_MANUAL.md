@@ -3469,7 +3469,15 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   the day being re-read from the disk after a job. Marks stay with the
   day they were made on rather than following you to the next one, so
   `d` only ever fetches what was chosen on the day in front of you; `n`
-  clears them.
+  clears them, and so does finishing the work. A mark is a piece of work
+  to do, so once every pass marked on a day has packets in the database
+  that day lets its selection go by itself rather than leaving you to
+  press `n` on a job you have already watched finish — the bottom bar
+  says `marks cleared` when it does. A day with anything still
+  undecoded keeps its marks, which is what leaves the retry list
+  standing; and because this goes day by day, a day you marked and then
+  paged away from is released on its own terms while its job finishes
+  behind you.
 
   A running job turns the rows as it goes rather than at the end: a pass
   goes yellow the moment its recording lands on the disk, and green when

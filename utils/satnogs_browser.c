@@ -1340,6 +1340,57 @@ static void job_start_listing(void)
     job_spawn(argv, title);
 }
 
+// A mark is a piece of work to do, so it goes when the work is done:
+// once every pass marked on a day has packets in the database, that
+// day's selection clears itself rather than being left for the operator
+// to press n on. A day with anything still undecoded keeps its marks,
+// which is what leaves the retry list standing. Returns how many marks
+// were dropped.
+//
+// Worked through day by day, and only on the days this job actually
+// touched, because the operator may have paged somewhere else while it
+// ran: the day on screen holds its marks in the rows, and every other
+// day holds them in its memory.
+static int clear_decoded_day_marks(void)
+{
+    if (g_job.queue == NULL || g_job.queue_n == 0) return 0;
+    int cleared = 0;
+
+    int marked = 0, all_decoded = 1, touched = 0;
+    for (int i = 0; i < g_n_rows; i++) {
+        if (!g_rows[i].marked) continue;
+        marked++;
+        if (!g_rows[i].decoded) all_decoded = 0;
+        for (int q = 0; q < g_job.queue_n; q++)
+            if (g_job.queue[q] == g_rows[i].id) { touched = 1; break; }
+    }
+    if (marked > 0 && all_decoded && touched) {
+        clear_marks();
+        remember_day();
+        cleared += marked;
+    }
+
+    for (int i = 0; i < g_n_daysel; i++) {
+        daysel_t *e = &g_daysel[i];
+        if (e->n_marks == 0 || strcmp(e->day, g_day) == 0) continue;
+
+        all_decoded = 1;
+        touched = 0;
+        for (int m = 0; m < e->n_marks; m++) {
+            if (!is_decoded(e->marks[m])) all_decoded = 0;
+            for (int q = 0; q < g_job.queue_n; q++)
+                if (g_job.queue[q] == e->marks[m]) { touched = 1; break; }
+        }
+        if (!all_decoded || !touched) continue;
+
+        cleared += e->n_marks;
+        free(e->marks);
+        e->marks = NULL;
+        e->n_marks = 0;
+    }
+    return cleared;
+}
+
 static void job_cancel(void)
 {
     if (!g_job.running) return;
@@ -1410,11 +1461,16 @@ static void job_poll(void)
     if (g_job.kind == JOB_DECODE) load_decoded_ids();
     refresh_day();
 
+    // The decode is the end of the chain -- d runs one after its
+    // download -- so this is where a finished selection is let go.
+    int cleared = (g_job.kind == JOB_DECODE) ? clear_decoded_day_marks() : 0;
+
     if (g_job.cancelled) {
         set_status("cancelled after %d of %d", g_job.done, g_job.total);
     } else if (g_job.kind == JOB_DECODE) {
-        set_status("decoded %d of %d%s", g_job.done, g_job.total,
-                   g_job.failed ? " (some failed)" : "");
+        set_status("decoded %d of %d%s%s", g_job.done, g_job.total,
+                   g_job.failed ? " (some failed)" : "",
+                   cleared ? " -- marks cleared" : "");
     } else if (g_job.kind == JOB_DOWNLOAD) {
         // Read the tally out before the follow-up job clears it.
         int done = g_job.done, total = g_job.total, failed = g_job.failed;
@@ -1842,7 +1898,10 @@ static void draw_help(int rows, int cols)
         "yesterday and l back returns to the row you left with your selection",
         "still made. Marks stay with the day they belong to rather than",
         "following you to the next one, so d only ever fetches what was chosen",
-        "on the day in front of you. n clears them.",
+        "on the day in front of you. n clears them, and so does finishing the",
+        "work: once every pass marked on a day has packets in the database the",
+        "day lets its selection go, while a day with anything left undecoded",
+        "keeps its marks as the list of what to try again.",
         "",
         "A running job turns the rows as it goes: a pass goes yellow the moment",
         "its recording lands and green when the database has packets from it,",
