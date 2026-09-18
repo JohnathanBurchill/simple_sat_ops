@@ -918,6 +918,12 @@ int main(int argc, char **argv)
     char status[160] = "";
     float status_left = 0.0f;
     float rep_up = 0, rep_down = 0;
+    // Where the capture list is scrolled to, in pixels. The reader's, not
+    // the selection's: it is pulled back only far enough to keep the
+    // selected picture in view, so scrolling away to look at the rest of
+    // the list stays where you put it.
+    float list_px = 0.0f;
+    int   last_sel = -1;
 
     while (!WindowShouldClose()) {
         capture_t *c = &caps[sel];
@@ -947,9 +953,24 @@ int main(int argc, char **argv)
         if (list_h < 0) list_h = 0;
 
         // ---- input ----
-        // The globe takes its own drags and its own wheel.
+        // The globe takes its own drags and its own wheel, so scrolling over
+        // it zooms rather than running the list underneath it.
         if (globe_h > 0) globe_input(&globe, 0, globe_y, LEFT_W, globe_h);
+
+        // The capture list: the wheel scrolls it, a press picks a picture.
+        // The same handling mpi_viewer's experiment list has, so the two
+        // read alike.
         int moved = 0;
+        {
+            Vector2 lm = GetMousePosition();
+            int over_list = lm.x >= 0 && lm.x < LEFT_W && lm.y >= list_top
+                            && lm.y < list_top + list_h;
+            if (over_list) list_px -= GetMouseWheelMove() * (float) row_h;
+            if (over_list && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                int r = (int) ((lm.y - (float) list_top + list_px) / (float) row_h);
+                if (r >= 0 && r < ncaps && r != sel) { sel = r; moved = 1; }
+            }
+        }
         if (key_repeat(KEY_DOWN, &rep_down) && sel < ncaps - 1) { sel++; moved = 1; }
         if (key_repeat(KEY_UP, &rep_up)     && sel > 0)         { sel--; moved = 1; }
         if (moved) { c = &caps[sel]; zoom = 1.0f; pan = (Vector2){ 0, 0 }; }
@@ -1009,6 +1030,20 @@ int main(int argc, char **argv)
         // Where the satellite was when this picture was taken -- or, when no
         // camera_capture command is on record to say, when the first pass
         // downloaded it, which is a different place and is labelled as such.
+        // Pull the list back to the selected row when the selection moves,
+        // and keep whatever the reader scrolled to when it does not.
+        if (sel != last_sel) {
+            float want_top = (float) (sel * row_h);
+            if (list_px > want_top) list_px = want_top;
+            if (list_px < want_top + (float) row_h - (float) list_h)
+                list_px = want_top + (float) row_h - (float) list_h;
+            last_sel = sel;
+        }
+        float list_max = (float) (ncaps * row_h - list_h);
+        if (list_max < 0.0f) list_max = 0.0f;
+        if (list_px > list_max) list_px = list_max;
+        if (list_px < 0.0f) list_px = 0.0f;
+
         double dot_ms = c->t_capture_ms > 0 ? c->t_capture_ms : c->t_first_ms;
 
         // A different picture is a different piece of ground track, a different
@@ -1036,16 +1071,13 @@ int main(int argc, char **argv)
         DrawRectangle(0, 0, LEFT_W, sh, (Color){ 28, 28, 34, 255 });
         draw_text("Camera captures", 12, 10, 18, RAYWHITE);
         draw_text(TextFormat("%d", ncaps), LEFT_W - 40, 14, 12, GRAY);
-        int visible = list_h / row_h;
-        int top = 0;
-        if (visible > 0 && sel >= visible) top = sel - visible + 1;
         // A row half off the bottom is cut at the globe's edge rather than
         // drawn over it.
         BeginScissorMode(0, list_top, LEFT_W, list_h);
-        for (int r = 0; r <= visible && top + r < ncaps; r++) {
-            int si = top + r;
+        for (int si = 0; si < ncaps; si++) {
             capture_t *cc = &caps[si];
-            int y = list_top + r * row_h;
+            int y = list_top + si * row_h - (int) list_px;
+            if (y + row_h < list_top || y > list_top + list_h) continue;
             if (si == sel) DrawRectangle(0, y, LEFT_W, row_h, (Color){ 44, 70, 110, 255 });
             double pct = 100.0 * (double) cc->recovered / (double) cc->size;
             if (cc->t_capture_ms > 0)
@@ -1059,6 +1091,15 @@ int main(int argc, char **argv)
                       10, y + 23, 12, GRAY);
         }
         EndScissorMode();
+        // A thumb down the right edge, only while there is more list than
+        // room -- the same one mpi_viewer's experiment list carries.
+        if (list_max > 0.0f) {
+            float frac = (float) list_h / (float) (ncaps * row_h);
+            int th = (int) ((float) list_h * frac);
+            if (th < 20) th = 20;
+            int ty = list_top + (int) ((float) (list_h - th) * list_px / list_max);
+            DrawRectangle(LEFT_W - 5, ty, 3, th, (Color){ 90, 90, 105, 255 });
+        }
 
         // the globe, under the list
         if (globe_h > 0)
