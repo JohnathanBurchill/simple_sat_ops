@@ -606,8 +606,34 @@ if (RAYLIB_FOUND)
             "-framework Foundation")
     endif()
     list(APPEND SSO_TARGETS frontiersat_camera_viewer)
+
+    # telemetry_browser — raylib-backed time-series plotter over the
+    # beacons in the packet DB, the satellite's own and the extended
+    # (blob) one. beacon_series.c is the catalogue of which telemetry
+    # field sits where in a beacon; beacon_cts1.c reads the packets.
+    # Needs sqlite3 via packet_db, and no orbit maths at all.
+    add_executable(telemetry_browser utils/telemetry_browser.c
+                   src/beacon/beacon_cts1.c src/beacon/beacon_series.c)
+    target_include_directories(telemetry_browser PRIVATE
+        ${RAYLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(telemetry_browser PRIVATE
+        ${RAYLIB_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(telemetry_browser PRIVATE
+        ${RAYLIB_LIBRARIES} ${OPENSSL_LIBRARIES} m)
+    target_link_packet_db(telemetry_browser)
+    target_link_sso_core(telemetry_browser)
+    if (APPLE)
+        target_link_libraries(telemetry_browser PRIVATE
+            "-framework Cocoa"
+            "-framework AppKit"
+            "-framework OpenGL"
+            "-framework IOKit"
+            "-framework CoreVideo"
+            "-framework Foundation")
+    endif()
+    list(APPEND SSO_TARGETS telemetry_browser)
 else()
-    message(STATUS "raylib not found via pkg-config; live_waterfall + decode_inspector + mpi_viewer + frontiersat_camera_viewer skipped.")
+    message(STATUS "raylib not found via pkg-config; live_waterfall + decode_inspector + mpi_viewer + frontiersat_camera_viewer + telemetry_browser skipped.")
 endif()
 
 # Selftest for the IQ-domain demods (modem_iq.c, modem_viterbi.c).
@@ -678,6 +704,17 @@ add_executable(beacon_cts1_selftest unit_tests/beacon_cts1_selftest.c
 target_include_directories(beacon_cts1_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(beacon_cts1_selftest PRIVATE m)
 list(APPEND SSO_TARGETS beacon_cts1_selftest)
+
+# Telemetry-field catalogue selftest (src/beacon/beacon_series.c): which
+# field sits where in a beacon, what unit it comes out in, and which
+# values mean "no reading". telemetry_browser plots whatever this table
+# says, so a wrong offset draws a wrong curve with nothing to give it
+# away. Checked against the same real extended beacon.
+add_executable(beacon_series_selftest unit_tests/beacon_series_selftest.c
+               src/beacon/beacon_series.c src/beacon/beacon_cts1.c)
+target_include_directories(beacon_series_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(beacon_series_selftest PRIVATE m)
+list(APPEND SSO_TARGETS beacon_series_selftest)
 
 # Operator keyboard table selftest. Links only keybindings.c; the kb_act_*
 # action bodies (which would drag in tracking / SDR / ncurses) are stubbed in
