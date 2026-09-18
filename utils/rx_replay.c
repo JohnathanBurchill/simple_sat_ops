@@ -2132,8 +2132,10 @@ done:
         fprintf(stderr, "    recognized / unrecognized    : %ld / %ld\n",
                 st.recognized, st.unrecognized);
         fprintf(stderr, "    recognized by type           : "
-                "beacon %ld, tcmd_response %ld, log %ld, bulk_file %ld\n",
-                st.beacon, st.tcmd_response, st.log_message, st.bulk_file);
+                "beacon %ld, beacon_ext %ld, tcmd_response %ld, log %ld, "
+                "bulk_file %ld\n",
+                st.beacon, st.beacon_ext, st.tcmd_response, st.log_message,
+                st.bulk_file);
         fprintf(stderr, "  the DB keeps one row per distinct payload, "
                 "so repeats collapse.\n");
         if (iq_mode && two_pass && !anchored_only) {

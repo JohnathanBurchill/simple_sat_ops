@@ -262,6 +262,7 @@ typedef struct {
     long unrecognized;       // detected + stored, but no known type
                              // (CSP-valid -> "unknown", non-CSP -> "unparsed")
     long beacon;             // recognized, by type
+    long beacon_ext;         // the extended (blob) beacon
     long tcmd_response;
     long log_message;
     long bulk_file;

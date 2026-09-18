@@ -672,6 +672,9 @@ void decode_loop_record_packet(const char *ts,
     if (csp_ok) {
         if (beacon_is_basic(payload, payload_len)) {
             ptype = 0x01; ptype_name = "beacon"; satellite = "CTS1";
+        } else if (beacon_is_extended(payload, payload_len)) {
+            ptype = COMMS_PACKET_TYPE_BEACON_EXTENDED;
+            ptype_name = "beacon_ext"; satellite = "CTS1";
         } else if (tcmd_response_is(payload, payload_len)) {
             ptype = 0x04; ptype_name = "tcmd_response";
         } else if (log_message_is(payload, payload_len)) {
@@ -688,6 +691,8 @@ void decode_loop_record_packet(const char *ts,
         g_stats.recognized++;
         switch (ptype) {
             case 0x01: g_stats.beacon++;        break;
+            case COMMS_PACKET_TYPE_BEACON_EXTENDED:
+                       g_stats.beacon_ext++;    break;
             case 0x04: g_stats.tcmd_response++; break;
             case 0x03: g_stats.log_message++;   break;
             case 0x10: g_stats.bulk_file++;     break;
@@ -705,11 +710,14 @@ void decode_loop_record_packet(const char *ts,
 
     if (g_packet_db == NULL) return;
 
-    // Render the firmware-aware text for recognized types only. 2 KiB
-    // is more than enough (beacon's six lines top out near 700 chars;
-    // tcmd_response adds ~200 for the data preview). Unknown/unparsed
-    // frames have no firmware rendering, so the column stays NULL.
-    char summary_buf[2048];
+    // Render the firmware-aware text for recognized types only. 3 KiB
+    // is more than enough: the basic beacon's six lines top out near
+    // 700 chars, tcmd_response adds ~200 for the data preview, and the
+    // extended beacon's twenty-odd lines come to about 1550 -- 1900 in
+    // the worst case, where every ADCS fault flag is set and each one
+    // gets named. Unknown/unparsed frames have no firmware rendering,
+    // so the column stays NULL.
+    char summary_buf[3072];
     const char *summary = NULL;
     if (recognized) {
         FILE *mem = fmemopen(summary_buf, sizeof summary_buf, "w");
