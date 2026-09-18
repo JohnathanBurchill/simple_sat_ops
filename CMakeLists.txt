@@ -554,8 +554,11 @@ if (RAYLIB_FOUND)
     # frontiersat_camera_viewer) propagates the DB's own TLEs with SGP4 and asks
     # sgp4sdp4 where the Sun was, hence prediction.c (and oem.c, which it calls
     # into) and the vendored library.
-    add_executable(mpi_viewer utils/mpi_viewer.c utils/sat_globe.c src/proto/bulk_size.c
-                   src/proto/adcs_mag.c src/orbit/prediction.c src/orbit/oem.c)
+    add_executable(mpi_viewer utils/mpi_viewer.c utils/sat_globe.c
+                   utils/sat_model.c
+                   utils/beacon_attitude.c src/proto/bulk_size.c
+                   src/proto/adcs_mag.c src/orbit/prediction.c src/orbit/oem.c
+                   src/orbit/attitude.c src/beacon/beacon_cts1.c)
     target_include_directories(mpi_viewer PRIVATE ${RAYLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(mpi_viewer PRIVATE ${RAYLIB_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(mpi_viewer PRIVATE ${RAYLIB_LIBRARIES} ${OPENSSL_LIBRARIES}
@@ -582,8 +585,11 @@ if (RAYLIB_FOUND)
     # where the Sun was, hence prediction.c (and oem.c, which it calls into),
     # adcs_mag.c for the TLE epochs, and the vendored library.
     set(CAMERA_VIEWER_SRCS utils/frontiersat_camera_viewer.c utils/cam_jpeg.c
-                           utils/sat_globe.c src/proto/adcs_mag.c
-                           src/orbit/prediction.c src/orbit/oem.c)
+                           utils/sat_globe.c utils/sat_model.c
+                           utils/beacon_attitude.c
+                           src/proto/adcs_mag.c
+                           src/orbit/prediction.c src/orbit/oem.c
+                           src/orbit/attitude.c src/beacon/beacon_cts1.c)
     if (APPLE)
         # Same trackpad-pinch shim decode_inspector uses: raylib/GLFW drop
         # NSEventTypeMagnify, so an NSEvent monitor collects it for us.

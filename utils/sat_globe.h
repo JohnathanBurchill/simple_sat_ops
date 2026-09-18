@@ -98,6 +98,59 @@ typedef struct {
     float lat, lon, alt_km;
 } subpoint_t;
 
+// The globe's projection, packaged so something other than sat_globe.c
+// can draw into the same scene. It is an orthographic view: a point's
+// Earth-fixed position, in units of one Earth radius, is resolved on the
+// screen basis (east across the panel, north up it, out of it towards
+// the viewer) and scaled by the disc's radius in pixels.
+typedef struct {
+    double e[3], n[3], o[3];  // the screen basis, Earth-fixed
+    double R;                 // one Earth radius, in panel pixels
+    double ox, oy;            // where the disc sits, from the panel's middle
+    int    x, y, w, h;        // the panel, in window coordinates
+} globe_proj_t;
+
+// Where a world point lands on the panel. *hidden comes back 1 when the
+// Earth is in front of it -- behind the plane of the disc and inside its
+// outline. Both are in the same units globe_proj_t documents.
+Vector2 globe_project_world(const globe_proj_t *pr, const double p[3],
+                            int *hidden);
+
+// How far the satellite has to be zoomed in on before the model of it
+// appears in place of the dot, and where it is drawn at full strength.
+// Between the two it fades in and the dot fades out, so neither pops.
+#define GLOBE_MODEL_ZOOM_MIN  3.0
+#define GLOBE_MODEL_ZOOM_FULL 4.5
+
+// How far out the body axes are drawn, and how many samples the line
+// from the satellite to the ground is broken into. The axes are drawn
+// at a length that reads as an arrow beside the dot rather than at any
+// physical scale; the ground line is sampled because it is a straight
+// line through space, not a great circle, and a straight line on a
+// sphere's projection is only straight when it is drawn piecewise.
+#define GLOBE_AXIS_KM      500.0
+#define GLOBE_RAY_SAMPLES  24
+
+// The satellite's attitude at the moment on screen, as the extended
+// beacons report it. The caller looks up the beacon nearest the moment
+// and fills this in; a zeroed one means there is nothing to draw, which
+// is the usual case (the ADCS only estimates an attitude in four of its
+// eight modes, and only the extended-beacon blob downlinks it at all).
+typedef struct {
+    int    have;
+
+    // The ADCS's estimated attitude angles, degrees, body frame with
+    // respect to the orbit frame.
+    double roll_deg, pitch_deg, yaw_deg;
+
+    // How far the beacon that carried them sat from the moment being
+    // drawn, in seconds, and which way. The satellite turns at a
+    // fraction of a degree a second, so a beacon a minute away still
+    // says roughly where it was looking -- but the reader should be
+    // told, so the panel prints it.
+    double age_s;
+} globe_attitude_t;
+
 typedef struct {
     // The world map, and the same map halved a few times over.
     maplevel_t lv[GLOBE_MAP_LEVELS];
@@ -152,6 +205,11 @@ typedef struct {
     // Set when the caller restored a saved view for the track being resumed,
     // so the first track built does not frame itself over it.
     int     keep_view;
+
+    // Where the satellite was looking, when a beacon says so. Drawn
+    // over the track as a ray down to the ground and a small set of
+    // body axes at the dot.
+    globe_attitude_t att;
 } globe_t;
 
 // Draw the panel's text with the caller's font. Without this the panel falls
@@ -183,6 +241,13 @@ void globe_reset_view(globe_t *g);
 // Returns 0 if there is no element set.
 int globe_subpoint(const globe_t *g, double unix_ms,
                    double *lat, double *lon, double *alt_km);
+
+// Tell the panel which way the satellite was facing, so it can draw
+// what the nadir face was looking at. Pass NULL, or a globe_attitude_t
+// with have == 0, to draw nothing -- which is what a moment with no
+// extended beacon near it, or one whose ADCS was not estimating an
+// attitude, should do.
+void globe_set_attitude(globe_t *g, const globe_attitude_t *att);
 
 // Drag turns the globe, the wheel (or two fingers) zooms it. Call it with the
 // panel's own rectangle, before drawing.

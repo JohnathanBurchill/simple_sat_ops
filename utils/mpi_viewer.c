@@ -235,6 +235,7 @@
 #include "bulk_size.h"
 #include "packet_db.h"
 #include "prediction.h"
+#include "beacon_attitude.h"
 #include "sat_globe.h"
 #include "sso_paths.h"
 #include "sso_version.h"
@@ -2681,6 +2682,9 @@ int main(int argc, char **argv)
     if (globe_load_tles(db_path) == 0)
         fprintf(stderr, "mpi_viewer: no FrontierSat TLEs in the DB; "
                         "the globe will show no ground track\n");
+    // The attitudes the extended beacons carry, for drawing which way the
+    // satellite was facing as the recording ran.
+    beacon_attitude_load(db_path);
 
     // Where the experiment list is scrolled to, in pixels. Scrolling is the
     // reader's, not the selection's: the list is pulled back to the selected
@@ -2841,6 +2845,7 @@ int main(int argc, char **argv)
                 s = &exps[v.sel];
                 cov_valid = 0;   // the reloaded experiment needs a fresh whereogram
                 globe_load_tles(db_path);
+                beacon_attitude_load(db_path);
                 globe.track_key[0] = '\0';   // and a fresh ground track
             } else if (ne != NULL) {
                 free_experiments(ne, nn);
@@ -2969,6 +2974,14 @@ int main(int argc, char **argv)
         // The globe, under the list.
         if (globe_h > 0) {
             double dot_ms = frame_time >= 0 ? frame_time : s->t_start_ms;
+            // Which way the satellite was facing at the moment the
+            // playback head is on, from the nearest extended beacon
+            // that carried an attitude. Looked up every frame, since
+            // the head moves through the recording; it is a bisect over
+            // a few thousand moments, so it costs nothing.
+            globe_attitude_t att = {0};
+            beacon_attitude_nearest(dot_ms, BEACON_ATTITUDE_MAX_AGE_S, &att);
+            globe_set_attitude(&globe, &att);
             globe_draw(&globe, 0, globe_y, LEFT_W, globe_h, dot_ms, "Ground track");
         }
 
@@ -3268,6 +3281,7 @@ int main(int argc, char **argv)
 
     UnloadTexture(tex);
     globe_free(&globe);
+    beacon_attitude_free();
     if (cov_tex.id != 0) UnloadTexture(cov_tex);
     if (g_ui_font_loaded) UnloadFont(g_ui_font);
     CloseWindow();

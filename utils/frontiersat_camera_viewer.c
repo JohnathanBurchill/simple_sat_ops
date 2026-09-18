@@ -84,6 +84,7 @@
 
 #include <raylib.h>
 
+#include "beacon_attitude.h"
 #include "cam_jpeg.h"
 #include "packet_db.h"
 #include "sat_globe.h"
@@ -896,6 +897,10 @@ int main(int argc, char **argv)
     if (globe_load_tles(db_path) == 0)
         fprintf(stderr, "frontiersat_camera_viewer: no FrontierSat TLEs in the "
                         "DB; the globe will show no ground track\n");
+    // The attitudes the extended beacons carry, for drawing which way
+    // the camera was facing. A mission whose blob has never run has
+    // none, and the globe then shows the ground track on its own.
+    beacon_attitude_load(db_path);
 
 #ifdef __APPLE__
     sso_install_pinch_monitor();
@@ -985,7 +990,8 @@ int main(int argc, char **argv)
                 zoom = 1.0f;
                 pan = (Vector2){ 0, 0 };
                 globe_load_tles(db_path);
-                globe.track_key[0] = '\0';   // and a fresh ground track
+                beacon_attitude_load(db_path);
+                globe.track_key[0] = 0;      // and a fresh ground track
                 snprintf(status, sizeof status, "reloaded: %d capture%s",
                          ncaps, ncaps == 1 ? "" : "s");
             } else {
@@ -1009,9 +1015,18 @@ int main(int argc, char **argv)
         // orbit and a different Sun. Keyed on the row as well as the moment, so
         // two pictures that share a timestamp still each get their own track.
         const char *track_key = TextFormat("%d %.0f", sel, dot_ms);
-        if (strcmp(globe.track_key, track_key) != 0)
+        if (strcmp(globe.track_key, track_key) != 0) {
             globe_set_track(&globe, track_key,
                             dot_ms - CAM_TRACK_HALF_MS, dot_ms + CAM_TRACK_HALF_MS);
+            // Which way it was facing when the shutter went, from the
+            // nearest extended beacon that carried an attitude. Most
+            // pictures have none -- the blob has to have been running,
+            // and the ADCS has to have been estimating -- and then the
+            // globe draws the track without a pointing direction.
+            globe_attitude_t att = {0};
+            beacon_attitude_nearest(dot_ms, BEACON_ATTITUDE_MAX_AGE_S, &att);
+            globe_set_attitude(&globe, &att);
+        }
 
         // ---- draw ----
         BeginDrawing();
@@ -1131,6 +1146,7 @@ int main(int argc, char **argv)
     }
 
     globe_free(&globe);
+    beacon_attitude_free();
     unload_textures(caps, ncaps);
     if (g_ui_font_loaded) UnloadFont(g_ui_font);
     CloseWindow();

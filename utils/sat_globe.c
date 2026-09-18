@@ -37,6 +37,8 @@
 #include "sat_globe.h"
 
 #include "adcs_mag.h"
+#include "attitude.h"
+#include "sat_model.h"
 #include "prediction.h"
 
 #include <math.h>
@@ -213,12 +215,30 @@ static void globe_project(const double e[3], const double n[3], const double o[3
     double p[3];
     ll_vec(lat, lon, p);
     double rr = 1.0 + alt_km / GLOBE_EARTH_KM;
-    double x = rr * (p[0] * e[0] + p[1] * e[1] + p[2] * e[2]);
-    double y = rr * (p[0] * n[0] + p[1] * n[1] + p[2] * n[2]);
-    double z = rr * (p[0] * o[0] + p[1] * o[1] + p[2] * o[2]);
+    p[0] *= rr; p[1] *= rr; p[2] *= rr;
+    double x = p[0] * e[0] + p[1] * e[1] + p[2] * e[2];
+    double y = p[0] * n[0] + p[1] * n[1] + p[2] * n[2];
+    double z = p[0] * o[0] + p[1] * o[1] + p[2] * o[2];
     out->x = (float) ((double) w * 0.5 + ox + R * x);
     out->y = (float) ((double) h * 0.5 + oy - R * y);
     *hidden = (z < 0.0 && x * x + y * y < 1.0);
+}
+
+// The same projection, for a point already in world coordinates and in
+// window rather than panel coordinates. This is the one anything drawing
+// its own geometry into the scene goes through -- the model of the
+// satellite, and the ray from it down to the ground.
+Vector2 globe_project_world(const globe_proj_t *pr, const double p[3],
+                            int *hidden)
+{
+    const double x = p[0] * pr->e[0] + p[1] * pr->e[1] + p[2] * pr->e[2];
+    const double y = p[0] * pr->n[0] + p[1] * pr->n[1] + p[2] * pr->n[2];
+    const double z = p[0] * pr->o[0] + p[1] * pr->o[1] + p[2] * pr->o[2];
+    if (hidden != NULL) *hidden = (z < 0.0 && x * x + y * y < 1.0);
+    Vector2 v;
+    v.x = (float) ((double) pr->x + (double) pr->w * 0.5 + pr->ox + pr->R * x);
+    v.y = (float) ((double) pr->y + (double) pr->h * 0.5 + pr->oy - pr->R * y);
+    return v;
 }
 
 // Where the satellite's dot sits on a w x h panel as the globe stands now.
@@ -382,6 +402,40 @@ int globe_subpoint(const globe_t *g, double unix_ms,
     return 1;
 }
 
+// The satellite's inertial position and velocity at a moment, which is
+// what the attitude geometry works in. Same propagation as
+// globe_subpoint -- SGP4 on the one converted element set -- but the
+// state vectors rather than the place under it. Returns 0 if there is
+// no element set.
+static int globe_state(const globe_t *g, double unix_ms,
+                       double r[3], double v[3])
+{
+    if (!g->have_tle) return 0;
+    prediction_t pred = {0};
+    pred.observer_ephem.position_geodetic.lat = RAO_LATITUDE  * (M_PI / 180.0);
+    pred.observer_ephem.position_geodetic.lon = RAO_LONGITUDE * (M_PI / 180.0);
+    pred.observer_ephem.position_geodetic.alt = RAO_ALTITUDE / 1000.0;
+    pred.satellite_ephem.tle = g->tle;
+    update_satellite_position(&pred, julian_date_from_unix_seconds(unix_ms / 1000.0));
+    r[0] = pred.satellite_ephem.position.x;
+    r[1] = pred.satellite_ephem.position.y;
+    r[2] = pred.satellite_ephem.position.z;
+    v[0] = pred.satellite_ephem.velocity.x;
+    v[1] = pred.satellite_ephem.velocity.y;
+    v[2] = pred.satellite_ephem.velocity.z;
+    return 1;
+}
+
+void globe_set_attitude(globe_t *g, const globe_attitude_t *att)
+{
+    if (att == NULL) {
+        globe_attitude_t none = {0};
+        g->att = none;
+        return;
+    }
+    g->att = *att;
+}
+
 // Face the middle of the track the globe is showing, with the disc back in the
 // middle of the panel. The zoom is left alone: a new track re-frames the view,
 // but does not undo how far in the reader had gone.
@@ -477,6 +531,196 @@ void globe_set_track(globe_t *g, const char *key, double t0_ms, double t1_ms)
 }
 
 // ---- drawing ---------------------------------------------------------------
+
+// The colour the pointing overlay is drawn in: a pale green, so it
+// reads against both the orange track and the blue-and-white Earth
+// under it.
+#define GLOBE_POINT_C ((Color){ 150, 240, 170, 255 })
+
+// How solid the model is at this zoom, 0 to 1. Below GLOBE_MODEL_ZOOM_MIN
+// there is no room for it and the satellite stays a dot; by
+// GLOBE_MODEL_ZOOM_FULL it has taken the dot's place entirely.
+static double model_strength(double zoom)
+{
+    if (zoom <= GLOBE_MODEL_ZOOM_MIN) return 0.0;
+    if (zoom >= GLOBE_MODEL_ZOOM_FULL) return 1.0;
+    return (zoom - GLOBE_MODEL_ZOOM_MIN)
+         / (GLOBE_MODEL_ZOOM_FULL - GLOBE_MODEL_ZOOM_MIN);
+}
+
+// The satellite itself, over the track: the model of it turned the way
+// it was turned, once the view is close enough in to make room, and --
+// when a beacon says which way it was facing -- the ray from it down to
+// the point on the ground its nadir face was aimed at. Writes the
+// caption the panel prints under the disc into note.
+//
+// The ray is a straight line through space, so it is sampled and drawn
+// piecewise -- a single line between the two end points would cut
+// through the Earth on a zoomed-in view instead of lying on it.
+//
+// Two ways the body frame can be arrived at, and they are never drawn
+// alike. With an attitude from a beacon, the model is solid and the ray
+// is drawn. Without one, the satellite's own orbit still says where it
+// is and which way it is going, so the model is drawn in the orbit frame
+// -- nadir down, ram forward -- as an outline, and the caption says the
+// attitude is assumed. An outline is not a claim.
+//
+// What the geometry assumes about the ADCS's frames is spelled out in
+// attitude.h. The short of it: at zero roll, pitch and yaw the body's
+// +Z face looks straight down, and that is the face the colour camera
+// and the ADCS's nadir sensor are on.
+static void draw_satellite(const globe_t *g, const globe_proj_t *pr,
+                           double now_ms, char *note, size_t note_n)
+{
+    double r[3], v[3];
+    if (!globe_state(g, now_ms, r, v)) return;
+
+    const double jd = julian_date_from_unix_seconds(now_ms / 1000.0);
+    const int measured = g->att.have;
+
+    // The body frame, measured or assumed.
+    attitude_frame_t f;
+    if (measured) {
+        attitude_rpy_t rpy = { .roll_deg  = g->att.roll_deg,
+                               .pitch_deg = g->att.pitch_deg,
+                               .yaw_deg   = g->att.yaw_deg };
+        attitude_solve(r, v, &rpy, &f);
+    } else {
+        // Level: the body axes lie on the orbit frame's.
+        attitude_rpy_t level = {0};
+        attitude_solve(r, v, &level, &f);
+    }
+
+    // An inertial point, projected onto the panel. Everything below
+    // goes through here, so a point behind the Earth is reported as
+    // hidden the same way the track's samples are.
+    Vector2 pt = {0};
+    int hidden = 0;
+    #define PROJECT(P) do { \
+        double la_ = 0, lo_ = 0, al_ = 0; \
+        attitude_eci_to_geodetic(jd, (P), &la_, &lo_, &al_); \
+        double w_[3]; \
+        ll_vec(la_, lo_, w_); \
+        const double rr_ = 1.0 + al_ / GLOBE_EARTH_KM; \
+        w_[0] *= rr_; w_[1] *= rr_; w_[2] *= rr_; \
+        pt = globe_project_world(pr, w_, &hidden); \
+    } while (0)
+
+    PROJECT(r);
+    const Vector2 sat = pt;
+    const int sat_hidden = hidden;
+
+    // The model, when there is room for it. Its axes have to be in the
+    // Earth-fixed frame the globe projects from, not the inertial one
+    // the attitude was worked out in.
+    const double strength = model_strength(g->zoom);
+    if (strength > 0.0 && !sat_hidden) {
+        double at[3], ebx[3], eby[3], ebz[3], sun[3];
+        double lat = 0, lon = 0, alt = 0;
+        globe_subpoint(g, now_ms, &lat, &lon, &alt);
+        ll_vec(lat, lon, at);
+        const double rr = 1.0 + alt / GLOBE_EARTH_KM;
+        at[0] *= rr; at[1] *= rr; at[2] *= rr;
+        attitude_eci_to_earth_fixed(jd, f.bx, ebx);
+        attitude_eci_to_earth_fixed(jd, f.by, eby);
+        attitude_eci_to_earth_fixed(jd, f.bz, ebz);
+        // Lit from where the Sun stood, the same as the Earth below it.
+        ll_vec(g->sun_lat, g->sun_lon, sun);
+        sat_model_draw(pr, at, ebx, eby, ebz, sun,
+                       (unsigned char) (strength * 255.0), measured);
+    }
+
+    // The two body axes the ray does not cover, as short spokes, so a
+    // dot still says which way the satellite was rolled. Once the model
+    // is up it says that better than the spokes do, so they fade out as
+    // it fades in.
+    if (measured && strength < 1.0) {
+        const unsigned char sa = (unsigned char) ((1.0 - strength) * 220.0);
+        const struct { const double *axis; Color c; const char *label; } spokes[] = {
+            { f.bx, (Color){ 240, 120, 120, sa }, "X" },
+            { f.by, (Color){ 120, 180, 240, sa }, "Y" },
+        };
+        for (size_t i = 0; i < sizeof spokes / sizeof spokes[0]; i++) {
+            double tip[3];
+            for (int k = 0; k < 3; k++)
+                tip[k] = r[k] + GLOBE_AXIS_KM * spokes[i].axis[k];
+            PROJECT(tip);
+            DrawLineEx(sat, pt, 1.5f, spokes[i].c);
+            draw_text(spokes[i].label, (int) pt.x + 2, (int) pt.y - 6, 10,
+                      spokes[i].c);
+        }
+    }
+
+    if (!measured) {
+        // Nothing more to draw: where it was looking is exactly what is
+        // not known. Say so, and only when the model is there to be
+        // explained.
+        if (strength > 0.0) {
+            snprintf(note, note_n,
+                     "no attitude on record here\nshown nadir-pointing, "
+                     "ram forward");
+        }
+        return;
+    }
+
+    // The ray the nadir face was looking along. When it reaches the
+    // ground it stops there; when it passes outside the limb it is
+    // drawn out to a fixed length so the direction still reads.
+    const double ray_km = f.hit ? f.hit_range_km : 3000.0;
+    Vector2 prev = sat;
+    for (int i = 1; i <= GLOBE_RAY_SAMPLES; i++) {
+        const double t = ray_km * (double) i / (double) GLOBE_RAY_SAMPLES;
+        double p[3];
+        for (int k = 0; k < 3; k++) p[k] = r[k] + t * f.bz[k];
+        PROJECT(p);
+        // A dashed line for a look that never reaches the ground, so
+        // the two cases cannot be confused at a glance.
+        if (f.hit || (i % 2) == 1)
+            DrawLineEx(prev, pt, f.hit ? 2.0f : 1.5f,
+                       hidden ? (Color){ 150, 240, 170, 70 } : GLOBE_POINT_C);
+        prev = pt;
+    }
+
+    if (f.hit) {
+        // A cross on the spot, rather than a filled dot, so the ground
+        // under it stays visible.
+        DrawLineEx((Vector2){ pt.x - 6, pt.y }, (Vector2){ pt.x + 6, pt.y },
+                   2.0f, GLOBE_POINT_C);
+        DrawLineEx((Vector2){ pt.x, pt.y - 6 }, (Vector2){ pt.x, pt.y + 6 },
+                   2.0f, GLOBE_POINT_C);
+        DrawCircleLines((int) pt.x, (int) pt.y, 9.0f,
+                        (Color){ 150, 240, 170, 140 });
+    }
+    #undef PROJECT
+
+    // The caption, as two lines: the panel is only as wide as the column
+    // it sits in (270 px in both viewers), and one line of this runs
+    // half as wide again as that. Off-nadir leads, since it is the
+    // number that says whether the picture is of the ground below or of
+    // the horizon, then which side of the track it was looking, then
+    // where that landed.
+    //
+    // The age is worth a word only when the beacon was not close to the
+    // moment; inside half a minute the satellite has barely turned.
+    char age[24] = "";
+    if (fabs(g->att.age_s) >= 30.0) {
+        snprintf(age, sizeof age, "  %+.0fs", g->att.age_s);
+    }
+    char where[48];
+    if (f.hit) {
+        double la = 0, lo = 0, al = 0;
+        attitude_eci_to_geodetic(jd, f.hit_eci, &la, &lo, &al);
+        snprintf(where, sizeof where, "looking at %.1f %c %.1f %c",
+                 fabs(la), la >= 0 ? 'N' : 'S',
+                 fabs(lo), lo >= 0 ? 'E' : 'W');
+    } else {
+        snprintf(where, sizeof where, "looking past the limb");
+    }
+    snprintf(note, note_n, "%.0f deg off nadir, %.0f %s%s\n%s",
+             f.off_nadir_deg, fabs(f.cross_track_deg),
+             f.cross_track_deg >= 0.0 ? "left" : "right",
+             age, where);
+}
 
 // Ray-cast the lit sphere into g->pix and hand it to the texture. One ray per
 // texture pixel: the ones that miss are left transparent, the ones that graze
@@ -628,22 +872,42 @@ void globe_draw(globe_t *g, int x, int y, int w, int h, double now_ms,
     double lat = 0, lon = 0, alt = 0;
     int have_now = globe_subpoint(g, now_ms, &lat, &lon, &alt);
     g->have_anchor = have_now;
+    // Zoomed out the satellite is this dot; zoomed in the model of it
+    // takes the dot's place, so the dot fades out as the model fades in.
+    const double strength = model_strength(g->zoom);
     if (have_now) {
         g->anchor_lat = lat; g->anchor_lon = lon; g->anchor_alt = alt;
         Vector2 p;
         int hidden = 0;
         globe_project(e, n, o, R, w, dh, g->ox, g->oy, lat, lon, alt, &p, &hidden);
         p.x += x; p.y += dy;
+        const unsigned char fade = (unsigned char) ((1.0 - strength) * 255.0);
         if (hidden) {
-            DrawCircleLines((int) p.x, (int) p.y, 5.0f, (Color){ 255, 255, 255, 70 });
-        } else {
-            DrawCircleV(p, 6.0f, (Color){ 255, 150, 60, 160 });
-            DrawCircleV(p, 3.0f, RAYWHITE);
+            DrawCircleLines((int) p.x, (int) p.y, 5.0f,
+                            (Color){ 255, 255, 255, (unsigned char) (fade * 70 / 255) });
+        } else if (fade > 0) {
+            DrawCircleV(p, 6.0f,
+                        (Color){ 255, 150, 60, (unsigned char) (fade * 160 / 255) });
+            DrawCircleV(p, 3.0f, (Color){ 245, 245, 245, fade });
         }
+    }
+    // The satellite itself: the model of it when the view is close
+    // enough in, and the ray to what it was looking at when a beacon
+    // says which way it was facing. Inside the scissor with the track,
+    // since the ray can run well off the disc.
+    char att_note[130] = "";
+    if (have_now) {
+        globe_proj_t pr = { .R = R, .ox = g->ox, .oy = g->oy,
+                            .x = x, .y = dy, .w = w, .h = dh };
+        memcpy(pr.e, e, sizeof pr.e);
+        memcpy(pr.n, n, sizeof pr.n);
+        memcpy(pr.o, o, sizeof pr.o);
+        draw_satellite(g, &pr, now_ms, att_note, sizeof att_note);
     }
     EndScissorMode();
 
-    // Where that is on the ground, along the bottom of the disc.
+    // Where that is on the ground, along the bottom of the disc, with
+    // what the satellite was looking at on the line above it.
     if (have_now) {
         const char *ll = TextFormat("%.1f %c   %.1f %c   %.0f km",
                                     fabs(lat), lat >= 0 ? 'N' : 'S',
@@ -651,6 +915,20 @@ void globe_draw(globe_t *g, int x, int y, int w, int h, double now_ms,
         int tw = text_width(ll, 13);
         DrawRectangle(x + 6, y + h - 24, tw + 14, 20, (Color){ 18, 18, 22, 200 });
         draw_text(ll, x + 13, y + h - 21, 13, RAYWHITE);
+    }
+    // The attitude caption, its lines stacked upward from just above the
+    // sub-satellite point so they read down the panel in order.
+    if (att_note[0] != '\0') {
+        const char *line[2] = { att_note, NULL };
+        char *nl = strchr(att_note, '\n');
+        if (nl != NULL) { *nl = '\0'; line[1] = nl + 1; }
+        const int nlines = (line[1] != NULL) ? 2 : 1;
+        for (int i = 0; i < nlines; i++) {
+            const int ly = y + h - 24 - (nlines - i) * 21;
+            const int tw = text_width(line[i], 12);
+            DrawRectangle(x + 6, ly, tw + 14, 19, (Color){ 18, 18, 22, 200 });
+            draw_text(line[i], x + 13, ly + 3, 12, GLOBE_POINT_C);
+        }
     }
 }
 
