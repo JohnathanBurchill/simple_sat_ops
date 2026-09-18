@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`68ad246` (2026-09-17). This is a working draft.
+`e408b71` (2026-09-17). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -106,6 +106,7 @@ manual can go back on the shelf where it belongs.
    - [Undoing the scrambler: CCSDS](#undoing-the-scrambler-ccsds)
    - [Correcting the errors: Reed-Solomon(255,223)](#correcting-the-errors-reed-solomon255223)
    - [Reading the packet: CSP](#reading-the-packet-csp)
+   - [Two beacons: the satellite's own, and the blob's](#two-beacons-the-satellites-own-and-the-blobs)
    - [Watching it happen](#watching-it-happen)
    - [The uplink, in reverse](#the-uplink-in-reverse)
    - [When the chain breaks](#when-the-chain-breaks)
@@ -138,6 +139,7 @@ manual can go back on the shelf where it belongs.
     - [`beacon_detect`](#beacon_detect)
     - [`fm_preview`](#fm_preview)
     - [`packet_query` and `packet_browser`](#packet_query-and-packet_browser)
+    - [`telemetry_browser`](#telemetry_browser)
     - [`cam_reconstruct`](#cam_reconstruct)
     - [`frontiersat_camera_viewer`](#frontiersat_camera_viewer)
     - [`mpi_reconstruct`](#mpi_reconstruct)
@@ -585,6 +587,74 @@ The deliberate choice is never to drop a frame on a bad CRC: a marginal
 pass where RS only just held is exactly when you most want to see what
 got through, errors and all. The CRC is advisory metadata, not a gate.
 
+### Two beacons: the satellite's own, and the blob's
+
+FrontierSat sends two different beacons, and it is worth knowing which
+one you are reading.
+
+The **basic beacon** is built into the flight firmware: 130 bytes, packet
+type `0x01`, one every half minute or so, starting `"CTS1"` and ending
+`"END"`. It carries the state of the computer and the power system - bus
+voltage and charge, the battery and computer temperatures, solar power in
+and out, uptime, the telecommand queue, and a configurable friendly
+message.
+
+The **extended beacon** is 198 bytes, packet type `0x20`, and does not
+come from the flight firmware at all. It is sent by a small program - a
+*blob* - uplinked into the satellite's filesystem and started with
+`exec_blob_from_fs`, which reschedules itself and so keeps beaconing at
+whatever interval it was given until a reboot or an
+`agenda_delete_by_name(exec_blob_from_fs)`. Its first 130 bytes are the
+basic beacon field for field, with `"END"` replaced by `" X2"`, `" X3"` or
+`" X4"` to say which version of the blob sent it; after that come the
+fields the built-in beacon leaves out:
+
+* the computer's own reading of the battery voltage, which is the one to
+  trust - the EPS fails to answer its housekeeping query on **two beacons
+  in three**, and leaves the voltage and charge at zero when it does;
+* the **solar array channel by channel** - input voltage and current for
+  each of the four conditioning channels - where the basic beacon has
+  only the total;
+* the battery pack's status bits, including whether the **heater** is on;
+* the last MPI temperature, and which oscillator the computer is running
+  on (25 MHz external, or 16 MHz internal and imprecise);
+* the **ADCS state**: run, control and estimation mode, which units are
+  powered, some forty fault flags, and whether the Sun was above the
+  local horizon;
+* the eight working **coarse sun sensors**, the calibrated **magnetic
+  field vector** in the body frame, the body **rotation rate**, and -
+  when the ADCS is in an estimation mode that computes one - the
+  satellite's **attitude**, as roll, pitch and yaw of the body frame with
+  respect to the orbit frame.
+
+The ground station reads both. An extended beacon is stored as type
+`beacon_ext`, shows in `packet_browser` as its own kind with every field
+named, feeds `telemetry_browser`'s plots, and is where the two raylib
+viewers get the pointing direction they draw on the globe. Live during a
+pass, the receiver's `BEACON` panel fills from whichever beacon arrived
+last - its heading reads `BEACON (blob v4)` for an extended one, with two
+extra lines for the ADCS modes, the field strength, the body rate and the
+attitude - and the footer counts them separately (`beacons=41 (17 ext)`).
+The rest of an extended beacon is for looking over afterwards rather than
+during a pass, which is what `packet_browser` and `telemetry_browser` are
+for.
+
+Two things to keep in mind when reading extended-beacon telemetry. The
+ADCS is queried over I2C while the beacon is being filled, and when it
+does not answer the blob leaves its whole block zeroed - so all-zero ADCS
+bytes mean *no answer*, not a satellite sitting perfectly still in no
+magnetic field, and every tool here reports it as unknown rather than as
+zero. And the attitude angles are only filled in **estimation modes 3
+through 6**; in the other four the ADCS reports zeros, which would
+otherwise read as a satellite pointing exactly at nadir. Across the
+record so far, about a third of extended beacons carry a real attitude.
+
+Source of truth for the layout is the blob itself, in the flight-firmware
+repository at
+`misc_tools/exec_blob/extended_beacon_blob/extended_beacon_blob_main.c`;
+the ground copy is in `src/beacon/beacon_cts1.h` with a `_Static_assert`
+on its size.
+
 ### Watching it happen
 
 `decode_inspector` renders this exact chain, stage by stage, on a live
@@ -888,6 +958,7 @@ review it, or take apart what it recorded.
 | Tell apart two close catalog objects, or build a TLE from a downlinked fix | [`tle_compare`](#tle_compare) / [`tle_from_state`](#tle_from_state) |
 | Screen two satellites for a close approach (conjunction) | [`conjunction`](#conjunction) |
 | Sanity-check a command list before you send it | [`agenda_check`](#agenda-review-agenda_check) |
+| Plot a telemetry field over days or months | [`telemetry_browser`](#telemetry_browser) |
 | Pull frames out of a recorded capture offline | [Offline analysis tools](#offline-analysis-tools) |
 | Bench bring-up, one-shot test transmits, IQ recording | [Bring-up and test tools](#bring-up-and-test-tools) |
 | Confirm the math still holds after a change | [Testing and validation](#testing-and-validation) |
@@ -2079,6 +2150,23 @@ stops at that end marker, so trailing framing/parity bytes don't show up
 as a garbage tail after the message. The raw byte dump still shows
 everything.
 
+**Extended beacons** (see [Two beacons](#two-beacons-the-satellites-own-and-the-blobs))
+show as their own type, `beacon_ext`, in their own colour, with all
+sixty-odd of their fields named in the detail pane - the ADCS modes, the
+fault flags by name, the sun sensors, the field vector and its magnitude,
+the rates, and the attitude. `t` cycles to them like any other type.
+
+Two details are worth knowing about that. The extended beacons received
+before the ground station knew the packet type - which is most of them,
+seventeen thousand and counting - are in the database as type `unknown`
+with no decoded text, because nothing recognised a `0x20` at the time.
+This tool never writes to the database, so rather than rewrite those rows
+it **decodes them as it loads them**, off their stored bytes: they are
+relabelled `beacon_ext` in the list and read the same as a freshly
+received one. The type filter finds them the same way, by shape rather
+than by stored name, so `t` to `beacon_ext` lists every extended beacon
+in the store whatever its row says.
+
 Rows whose decode had trouble - Reed-Solomon uncorrectable, an HMAC
 mismatch, or a CRC failure - are flagged with a `!` and shown in red.
 Press `e` to toggle hiding those erroneous decodes from the list; the
@@ -2154,6 +2242,81 @@ when a matching `sent_tcmd` row exists - how long after the triggering
 telecommand (`@tssent`) the download began. A download split
 across a long pause, or across separate commands, reconstructs as separate
 bursts; open each from one of its own chunks.
+
+### `telemetry_browser`
+
+The beacons as curves. `packet_query` and `packet_browser` show you one
+packet at a time; this shows one *quantity* over as much of the mission as
+you like. It reads every beacon in the packet database - both kinds - and
+plots any of their telemetry fields against time, one stacked panel per
+field, so a question like "was the battery colder on the passes where a
+solar channel dropped out" is a matter of ticking two boxes.
+
+```sh
+telemetry_browser                                    # default database
+telemetry_browser --db=/FrontierSat/packet_db.sqlite
+telemetry_browser --fields=batt_v,obc_t,solar1_i     # open on these
+telemetry_browser --help                             # every field, by name
+```
+
+It opens on the most recent pass with the battery voltage, solar power in
+and computer temperature plotted, which is the one screen that says
+whether the satellite is well.
+
+**The field list** on the left is grouped by subsystem - power,
+temperature, solar array, housekeeping, ADCS, attitude - and each row
+shows the field's key, which is also the name `--fields` takes and the
+column heading in the CSV. Fields marked **`ext`** come only from the
+extended beacon, so those series exist for the stretch of the mission
+where the blob has been running and stop where it was not. Up and down
+move the cursor, `space` plots or unplots, `a` takes the whole group the
+cursor is in, `n` clears them all. Eight panels is the limit; past that
+each is too short to read anything off.
+
+**Time.** The axis is real time, and the beacons arrive in clumps: a few
+minutes of them per pass, then hours of nothing. So **no line is drawn
+across a gap longer than five minutes** - a break in a curve is a gap in
+the record, not a value - and `[` and `]` jump from one pass to the next,
+which is the navigation that actually matches the data. Drag the plots or
+use left and right to pan, scroll to zoom about the pointer, and **`g`
+puts the whole record in view**. The heading above the panels says what
+window is on screen and how wide it is; the moment under the pointer is
+called out there too, with a vertical line down every panel and each
+series' nearest actual reading circled and labelled, so values at the
+same moment line up down the screen. The numbers shown are ones the
+satellite really sent - the nearest sample, not an interpolation between
+two.
+
+Each panel scales itself to what is **in the window**, not to the whole
+record, and says its range in its heading. That is the point of a plot
+like this: you are looking at the shape of a stretch, and a panel scaled
+to four months of history would flatten a pass into a line.
+
+**What is deliberately not plotted.** A field whose value in a given
+beacon is the subsystem's marker for "no reading" is dropped rather than
+drawn. There are several such markers and they are all numbers: the
+blob's `-9999` and `-99999`, a dead thermistor's `32767` centidegrees,
+the MPI's `-99` for "not active", `0xFFFF` for a battery-pack status it
+could not read, and - the one that matters most - a **zero battery
+voltage**, which is what both the firmware and the blob leave behind when
+the EPS does not answer, on two beacons in three. Plotted as numbers
+those would be spikes to 327 C and a battery that spends most of its life
+flat. Dropped, a gap in the curve means the satellite had nothing to tell
+us, which is the truth.
+
+Frames whose decode went wrong are left out entirely: Reed-Solomon giving
+up, a failed CSP CRC, or either magic field damaged. `packet_browser`
+makes the opposite trade on purpose - a marginal beacon is worth showing
+an operator - but a series is read as numbers, and of the basic beacons
+in the current store 130 are the right length and pass their CRC while
+holding noise, each of which puts a spike of twenty million degrees
+through a temperature curve.
+
+`e` writes the visible window to `telemetry.csv` in the working
+directory: one row per beacon, one column per plotted field, `basic` or
+`ext` in the second column, and an empty cell where a field had no
+reading. `F5` re-reads the database, `q` quits. Read-only on the database
+and safe to run while a receiver fills it.
 
 ### `cam_reconstruct`
 
@@ -2270,6 +2433,59 @@ When no `camera_capture` command is on record the capture time is not known, and
 the globe falls back to **where the satellite was when the picture was first
 downloaded** - a different place on a different pass. The panel's heading says
 which it is showing: `Ground track at capture` or `Ground track at downlink`.
+
+**Which way it was looking.** When an extended beacon near the moment carries an
+attitude, the globe also draws **where the camera was pointed**: a pale green
+ray from the satellite down to the point on the Earth the nadir face was aimed
+at, a cross on that point, and two short spokes at the dot for the body's X and
+Y axes, which say how the satellite was rolled about that look. The caption
+under the disc reads it out - *"looking 34 deg off nadir, 22 deg left, at 51.2 N
+112.8 W"* - and says `past the limb, off the Earth` instead, with the ray
+dashed, when the face was aimed above the horizon. The nadir face is the one the
+ADCS's nadir sensor is on, which is the boom camera itself, so at a level
+attitude the ray goes straight down and the picture is of the ground below.
+
+No ray is drawn when there is no attitude to draw, which is the common case: it
+needs an extended beacon within two minutes of the moment **and** the ADCS to
+have been in an estimation mode that computes an attitude. The satellite turns
+at a few tenths of a degree a second in those modes, so a beacon a minute away
+is still worth using - the caption adds `(beacon +45s)` whenever it was more
+than half a minute off, so you can judge it. The frames the geometry works in,
+and the one assumption in it we have not confirmed against flight data, are
+spelled out at the top of `src/orbit/attitude.h`.
+
+**Zoom in and the dot becomes the satellite.** Past about 3x the dot fades out
+and a model of FrontierSat fades in, turned the way the satellite was turned:
+the 3U body with solar cells down its long faces, the MPI's entrance slit across
+the ram face, the colour camera and one of the two ADCS cameras as barrels on
+the nadir face, the other ADCS camera opposite them, and the composite lattice
+boom stowed as a roll beside the camera - it has not been deployed, so that is
+how it is drawn. The nadir face is in its own colour, so which way the satellite
+is looking reads at a glance, and the faces are lit from where the Sun stood,
+the same as the Earth below.
+
+It is **not to scale** - a 34 cm satellite at the globe's own scale is a
+ten-thousandth of a pixel - so it is drawn at a fixed size on screen whatever
+the zoom. It is a symbol of where the satellite is and how it is turned, and it
+is built in code (`utils/sat_model.c`) from the dimensions and the layout of the
+team's own interactive model at <https://www.calgarytospace.ca/cts-sat-1>,
+rather than imported from the CAD: that way the body axes are exact by
+construction, which is the whole point of drawing it.
+
+**Solid means measured; an outline means assumed.** With an attitude from a
+beacon the model is drawn filled. Without one, the orbit still says where the
+satellite is and which way it is going, so the model is drawn in the orbit frame
+- nadir down, ram forward - as a **wireframe**, with the caption `no attitude on
+record here -- shown nadir-pointing, ram forward`. The two can never be mistaken
+for one another, which is the point: an outline is not a claim.
+
+The capture list takes the mouse as well as the keyboard: **scroll over it to
+run through the list, and click a row to open that picture**. Scrolling is
+yours, not the selection's - the list is pulled back only far enough to keep the
+selected picture in view, so scrolling away to look at the rest of it stays
+where you put it, and a thumb down the right edge shows where you are whenever
+there is more list than room. That is the same handling `mpi_viewer`'s
+experiment list has, so the two read alike.
 
 Keys: `Up`/`Down` change picture, **`o` opens the picture in the desktop's
 image viewer** (Preview on macOS, the `xdg-open` default on Linux) via a copy
@@ -2567,9 +2783,37 @@ track round the far side of the globe are drawn faintly rather than dropped, so
 a pass that goes over the horizon still reads as one arc. Under the disc is the
 sub-satellite latitude, longitude and altitude for the image being shown.
 
+**Which way it was facing.** When an extended beacon within two minutes of the
+moment under the playback head carries an attitude, the globe also draws it: a
+pale green ray from the satellite to the point on the Earth the nadir face was
+aimed at, a cross on that point, and short spokes for the body's X and Y axes.
+The caption under the disc reads *"looking 12 deg off nadir, 4 deg right, at
+50.9 N 114.3 W"*, or says the look went past the limb. Because the head moves
+through the recording, the ray moves with it - which is how you see whether the
+satellite held its attitude across the sweep or was still turning.
+
+Zoomed past about 3x the dot becomes a model of FrontierSat, turned the way the
+satellite was turned; for an MPI recording the face to watch is the **ram face**,
+since that is where the instrument's entrance slit is, and the model marks it.
+The model, what it is and is not, and the difference between a solid one and a
+wireframe, are described under
+[`frontiersat_camera_viewer`](#frontiersat_camera_viewer); `src/orbit/attitude.h`
+has the frames it all works in.
+
 **Drag the globe to turn it; scroll (or pinch) over it to zoom**, up to 16x. An
 ordinary drag turns the globe about its own middle, which is the plain way to
 look around.
+
+A drag moves the surface under the cursor about a pixel for a pixel at zoom 1,
+and reaches further the further in you are zoomed - four times as far at 16x,
+where the panel spans only eight degrees of arc and a one-for-one drag would
+take fifteen of them to cross the disc. It also drags the same speed sideways as
+up and down, which it did not always: turning a globe about its own axis moves
+the surface under the cursor by only the cosine of the latitude, so the view
+used to crawl sideways at a third speed at 70 degrees and a sixth at 80. That is
+most of where this satellite's ground track goes, so the cosine is divided back
+out (floored near the poles, where turning the globe about its axis moves
+nothing under the cursor at all and no compensation can help).
 
 **Press with two fingers and slide and it turns about the satellite instead.**
 On a Mac trackpad that gesture is the secondary click, so it arrives as a
@@ -3732,6 +3976,8 @@ build/modem_iq_selftest
 build/modem_fsk_selftest
 build/sw_nco_selftest
 build/beacon_cts1_selftest
+build/beacon_series_selftest
+build/attitude_selftest         # needs sgp4sdp4
 build/csp_selftest
 build/biquad_selftest
 build/fir_decim_selftest
@@ -3747,7 +3993,7 @@ build/pursuit_selftest          # no extra deps
 build/unit_test_runner          # optional ncurses aggregator
 ```
 
-(That is a representative subset; the build produces all 31.)
+(That is a representative subset; the build produces all 49.)
 `unit_test_runner` discovers every `*_selftest` binary under `build/`
 and renders a collapsible group view of the TAP output, so a single
 launch runs the whole suite. It is skipped if ncurses is absent, in
@@ -3844,6 +4090,26 @@ durable part is that the formatter is now exercised directly by
 output), empty and hex payloads, and the real send path. Those
 assertions were confirmed to fail on the pre-fix code before the fix
 landed - a test that cannot fail proves nothing.
+
+A second example, and a reminder that a field nobody reads is a bug
+waiting for a reader. `update_satellite_position` ended by asking
+sgp4sdp4 for the ground station's inertial position and writing it into
+`satellite_ephem.position` - the satellite's own position vector, which
+it had finished with. Everything the function reports (azimuth,
+elevation, range, range-rate, the sub-satellite point) is computed
+before that line, so nothing was ever wrong on screen, and the state
+vector it left behind - a satellite apparently 6367 km from the centre
+of the Earth, which is *inside* it - went unnoticed for months because
+nothing looked at it. Then the pointing overlay needed a state vector to
+work out which way the satellite was facing, and every look came out
+"past the limb, off the Earth" at angles that could not possibly miss.
+The fix points the call at the observer's own field and hands it a
+Julian date rather than minutes-since-epoch; `prediction_selftest` now
+checks that the position vector's magnitude agrees with the altitude the
+same call reports, and that converting the observer's vector back to a
+place on the Earth lands on the observatory - which pins the time
+argument too, since a wrong one rotates the vector without changing its
+length.
 
 ### What isn't covered
 
