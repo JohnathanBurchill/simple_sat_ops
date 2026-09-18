@@ -716,6 +716,17 @@ target_include_directories(beacon_series_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(beacon_series_selftest PRIVATE m)
 list(APPEND SSO_TARGETS beacon_series_selftest)
 
+# Pointing-geometry selftest (src/orbit/attitude.c): the orbit frame, the
+# body axes the ADCS's three angles put it in, and where the nadir face's
+# look meets the ground. The viewers draw a line to that point, so a sign
+# error here draws a confident line at the wrong place on the Earth.
+# Round-trips the geodetic conversion against sgp4sdp4's own inverse.
+add_executable(attitude_selftest unit_tests/attitude_selftest.c
+               src/orbit/attitude.c)
+target_include_directories(attitude_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(attitude_selftest PRIVATE ${SGP4SDP4_LIB} m)
+list(APPEND SSO_TARGETS attitude_selftest)
+
 # Operator keyboard table selftest. Links only keybindings.c; the kb_act_*
 # action bodies (which would drag in tracking / SDR / ncurses) are stubbed in
 # the test itself, so this exercises the table integrity + dispatch lock
