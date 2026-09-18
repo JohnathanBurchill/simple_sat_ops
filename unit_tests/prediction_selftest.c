@@ -64,6 +64,7 @@
 #include <sgp4sdp4.h>
 
 #define check(cond, what) tap_ok((cond), (what))
+#define checkf(cond, ...)  tap_okf((cond), __VA_ARGS__)
 
 // Fixture file holds two real, checksum-valid 3-line TLEs, frozen here
 // (not pulled from TLEs/) so the test is reproducible across TLE refreshes:
@@ -142,14 +143,20 @@ static void prep_propagator(prediction_t *pred)
 //   - a dropped Degrees() (radians reported as degrees, off by ~57x).
 // A range-only band check sees none of those.
 //
-// We MUST re-propagate rather than read pred->satellite_ephem.position
-// back: update_satellite_position reuses that field as scratch for the
-// observer position at its tail (the Calculate_User_PosVel call), so on
-// return it holds the observer's ECI position, not the satellite's. Re-
-// calling SGP4/SDP4 with the stored (already unit-converted) TLE at the
-// same minutes_since_epoch reproduces the exact state update used, since
-// the propagator is deterministic given select_ephemeris's one-time init
-// (the same reason the pass-finder can call it in a tight loop).
+// The oracle re-propagates rather than reading
+// pred->satellite_ephem.position back, which keeps it independent of the
+// code under test. It also used to be the only way: until the pointing
+// overlay needed a state vector, update_satellite_position ended by
+// writing the *observer's* inertial position into that field, so on
+// return it held the wrong thing entirely. That is fixed, and
+// test_update_satellite_position now checks the field directly -- but
+// re-propagating is still the right thing for an oracle to do.
+//
+// Re-calling SGP4/SDP4 with the stored (already unit-converted) TLE at
+// the same minutes_since_epoch reproduces the exact state update used,
+// since the propagator is deterministic given select_ephemeris's
+// one-time init (the same reason the pass-finder can call it in a tight
+// loop).
 //
 // Tolerances: range, range-rate and azimuth are untouched by atmospheric
 // refraction and match to rounding. Calculate_Obs ADDS a Meeus refraction
@@ -343,6 +350,56 @@ static void test_update_satellite_position(const char *tles_path)
           "sub-satellite latitude in (-90, 90)");
     check(pred.satellite_ephem.longitude > -180.0 && pred.satellite_ephem.longitude < 360.0,
           "sub-satellite longitude in (-180, 360)");
+
+    // The satellite's inertial position vector has to survive the call.
+    // It used to not: the last thing update_satellite_position did was
+    // ask sgp4sdp4 for the *observer's* inertial position and write it
+    // into satellite_ephem.position, leaving the satellite apparently
+    // 6367 km from the centre of the Earth -- inside it. Nothing read
+    // that field at the time, so nothing complained, until a viewer
+    // wanted the state vector to work out which way the satellite was
+    // facing. The magnitude is checked against the altitude the same
+    // call reports, which comes from the pre-overwrite value, so the
+    // two have to agree or one of them is wrong.
+    {
+        const vector_t *p = &pred.satellite_ephem.position;
+        const double rn = sqrt(p->x * p->x + p->y * p->y + p->z * p->z);
+        // xkmper (6378.135) at the equator down to ~6357 at the poles,
+        // so the altitude pins the radius to about 21 km either way.
+        const double want = 6367.5 + pred.satellite_ephem.altitude_km;
+        checkf(fabs(rn - want) < 25.0,
+               "position vector magnitude %.1f km matches the reported "
+               "altitude (%.1f km, so about %.1f km from the centre)",
+               rn, pred.satellite_ephem.altitude_km, want);
+        checkf(rn > 6371.0,
+               "and the satellite is outside the Earth, not %.1f km inside it",
+               6371.0 - rn);
+        // The observer's own inertial position is where it belongs, and
+        // is a ground station's distance from the centre.
+        vector_t o = pred.observer_ephem.position;
+        const double on = sqrt(o.x * o.x + o.y * o.y + o.z * o.z);
+        checkf(fabs(on - 6367.0) < 25.0,
+               "the observer's inertial position is its own field, %.1f km "
+               "from the centre", on);
+        // And it points at the observatory. Converting it back to a
+        // place on the Earth has to give the coordinates it was built
+        // from -- which pins the sidereal time the conversion was done
+        // at, where the magnitude above cannot: a wrong time rotates
+        // the vector without changing its length, and puts the ground
+        // station at some other longitude entirely.
+        geodetic_t back = {0};
+        Calculate_LatLonAlt(jul_epoch, &o, &back);
+        double blat = back.lat * 180.0 / M_PI;
+        double blon = back.lon * 180.0 / M_PI;
+        while (blon > 180.0) blon -= 360.0;
+        checkf(fabs(blat - RAO_LATITUDE) < 1e-3,
+               "and back at the observatory's latitude, %.4f deg", blat);
+        checkf(fabs(blon - RAO_LONGITUDE) < 1e-3,
+               "and its longitude, %.4f deg (wants %.4f)",
+               blon, RAO_LONGITUDE);
+        checkf(fabs(back.alt - RAO_ALTITUDE / 1000.0) < 1e-3,
+               "and its altitude, %.4f km", back.alt);
+    }
 
     // Independent topocentric cross-check at three points spanning the orbit
     // (~4600 s period), so the oracle is exercised at distinct geometries.

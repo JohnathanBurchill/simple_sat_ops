@@ -213,8 +213,28 @@ void update_satellite_position(prediction_t *prediction, double jul_utc)
     prediction->satellite_ephem.longitude = Degrees(prediction->satellite_ephem.position_geodetic.lon);
     prediction->satellite_ephem.altitude_km = prediction->satellite_ephem.position_geodetic.alt;
     prediction->satellite_ephem.speed_km_s = prediction->satellite_ephem.velocity.w;
-    // Assumes ground station (not in a car, drone, balloon, plane, satellite, etc.)
-    Calculate_User_PosVel(prediction->minutes_since_epoch, &prediction->observer_ephem.position_geodetic, &prediction->satellite_ephem.position, &prediction->observer_ephem.velocity);
+    // The observer's own inertial position and velocity, from its fixed
+    // geodetic place and the Earth's rotation. Assumes a ground station
+    // (not in a car, drone, balloon, plane, satellite, etc.).
+    //
+    // Two things used to be wrong here, and both mattered once anything
+    // read these vectors. The output position was aimed at
+    // satellite_ephem.position, so every call ended by overwriting the
+    // satellite's inertial position with the ground station's -- which
+    // left it at a magnitude of about 6367 km, below the Earth's own
+    // radius, and made any geometry built on it nonsense. Nothing read
+    // it at the time, so nothing showed. And the first argument is a
+    // time, used for sidereal angle; it was given minutes-since-epoch
+    // instead of the Julian date, which put the observer at a more or
+    // less random longitude.
+    //
+    // Everything above this line is computed from the satellite's own
+    // position before this call, so the satellite's az/el/range and its
+    // ground track were never affected.
+    Calculate_User_PosVel(jul_utc,
+                          &prediction->observer_ephem.position_geodetic,
+                          &prediction->observer_ephem.position,
+                          &prediction->observer_ephem.velocity);
 
     return;
 }
