@@ -21,6 +21,7 @@
 #include "beacon_cts1.h"
 
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -243,22 +244,15 @@ static void fmt_epoch_ms(uint64_t ms_in, char *out, size_t outn)
     strftime(out, outn, "%Y-%m-%dT%H:%M:%SZ", &tm);
 }
 
-void beacon_print(FILE *fp, const char *ts,
-                  const uint8_t *payload, size_t len)
+// The lines for the 130 bytes the basic and the extended beacon share.
+// label is the word each line is tagged with -- "beacon" or
+// "beacon_ext" -- so an extended beacon's block reads as its own rather
+// than as a basic beacon with extra lines after it.
+static void beacon_print_common(FILE *fp, const char *prefix,
+                                const char *label,
+                                const COMMS_beacon_basic_packet_t *bp)
 {
-    (void)len;
-    // memcpy into a stack-allocated struct so this works regardless of
-    // payload alignment in the caller.
-    COMMS_beacon_basic_packet_t b;
-    memcpy(&b, payload, sizeof b);
-
-    // ts == NULL -> flat output ("beacon: ...") for callers like rx_decode
-    // that don't decorate lines with timestamps. ts != NULL -> "[ts] beacon: ..."
-    // matching decode_loop's emit_frame style.
-    char prefix[64];
-    if (ts != NULL) snprintf(prefix, sizeof prefix, "[%s] ", ts);
-    else prefix[0] = '\0';
-
+    const COMMS_beacon_basic_packet_t b = *bp;
     char eps_mode_buf[8], state_buf[8];
     char uptime_buf[24], since_uplink_buf[24], epoch_buf[32];
     fmt_ms_clock(b.uptime_ms, uptime_buf, sizeof uptime_buf);
@@ -274,21 +268,21 @@ void beacon_print(FILE *fp, const char *ts,
     cts1_sanitise_text((const uint8_t *) b.satellite_name, 4,
                        name_buf, sizeof name_buf, NULL);
     fprintf(fp,
-            "%sbeacon: name=\"%s\" state=%s eps_mode=%s fs_mounted=%u count=%u\n",
-            prefix, name_buf,
+            "%s%s: name=\"%s\" state=%s eps_mode=%s fs_mounted=%u count=%u\n",
+            prefix, label, name_buf,
             cts1_state_str(b.cts1_operation_state, state_buf, sizeof state_buf),
             eps_mode_str(b.eps_mode_enum, eps_mode_buf, sizeof eps_mode_buf),
             (unsigned)b.is_fs_mounted,
             (unsigned)b.total_beacon_count_since_boot);
 
     fprintf(fp,
-            "%sbeacon: uptime=%s since_uplink=%s epoch=%s\n",
-            prefix, uptime_buf, since_uplink_buf, epoch_buf);
+            "%s%s: uptime=%s since_uplink=%s epoch=%s\n",
+            prefix, label, uptime_buf, since_uplink_buf, epoch_buf);
 
     char t0[16], t1[16], obc[16];
     fprintf(fp,
-            "%sbeacon: batt=%.3fV %u%% temps=%s/%s obc=%s\n",
-            prefix,
+            "%s%s: batt=%.3fV %u%% temps=%s/%s obc=%s\n",
+            prefix, label,
             b.eps_battery_voltage_mV / 1000.0,
             (unsigned)b.eps_battery_percent,
             fmt_cC_i16(t0,  sizeof t0,  b.eps_battery_temperature_0_cC),
@@ -296,8 +290,8 @@ void beacon_print(FILE *fp, const char *ts,
             fmt_cC_i32(obc, sizeof obc, b.obc_temperature_cC));
 
     fprintf(fp,
-            "%sbeacon: pcu in/out=%.2fW/%.2fW avg=%.2fW/%.2fW faults=%d channels=0x%x\n",
-            prefix,
+            "%s%s: pcu in/out=%.2fW/%.2fW avg=%.2fW/%.2fW faults=%d channels=0x%x\n",
+            prefix, label,
             b.eps_total_pcu_power_input_cW / 100.0,
             b.eps_total_pcu_power_output_cW / 100.0,
             b.eps_total_avg_pcu_power_input_cW / 100.0,
@@ -307,8 +301,8 @@ void beacon_print(FILE *fp, const char *ts,
 
     char reboot_buf[8], rbf_buf[8], eps_reset_buf[8];
     fprintf(fp,
-            "%sbeacon: tcmd queued=%u pending=%u reboot=%s eps_reset=%s rbf=%s antenna=%u\n",
-            prefix,
+            "%s%s: tcmd queued=%u pending=%u reboot=%s eps_reset=%s rbf=%s antenna=%u\n",
+            prefix, label,
             (unsigned)b.total_tcmd_queued_count,
             (unsigned)b.pending_queued_tcmd_count,
             reboot_reason_str(b.reboot_reason, reboot_buf, sizeof reboot_buf),
@@ -319,8 +313,8 @@ void beacon_print(FILE *fp, const char *ts,
 
     char rf_buf[8], time_buf[8], gnss_buf[8];
     fprintf(fp,
-            "%sbeacon: rf_switch=%s time_sync=%s gnss_rx_mode=%s\n",
-            prefix,
+            "%s%s: rf_switch=%s time_sync=%s gnss_rx_mode=%s\n",
+            prefix, label,
             rf_switch_mode_str(b.active_rf_switch_control_mode,
                                rf_buf, sizeof rf_buf),
             time_sync_source_str(b.last_time_sync_source_enum,
@@ -329,8 +323,8 @@ void beacon_print(FILE *fp, const char *ts,
 
     char mpi_rx_buf[8], mpi_tx_buf[8], mpi_stop_buf[8];
     fprintf(fp,
-            "%sbeacon: mpi rx=%s tx=%s last_stop=%s\n",
-            prefix,
+            "%s%s: mpi rx=%s tx=%s last_stop=%s\n",
+            prefix, label,
             mpi_rx_mode_str(b.mpi_rx_mode_enum,
                             mpi_rx_buf, sizeof mpi_rx_buf),
             mpi_transceiver_str(b.mpi_transceiver_state_enum,
@@ -346,7 +340,29 @@ void beacon_print(FILE *fp, const char *ts,
     cts1_sanitise_text((const uint8_t *) b.friendly_message,
                        COMMS_BEACON_FRIENDLY_MESSAGE_SIZE,
                        msg, sizeof msg, NULL);
-    fprintf(fp, "%sbeacon: msg=\"%s\"\n", prefix, msg);
+    fprintf(fp, "%s%s: msg=\"%s\"\n", prefix, label, msg);
+}
+
+// Build the "[ts] " tag every line in a block carries. ts == NULL gives
+// flat output for callers like rx_decode that don't decorate lines with
+// timestamps; ts != NULL matches decode_loop's emit_frame style.
+static void beacon_prefix(const char *ts, char *out, size_t outn)
+{
+    if (ts != NULL) snprintf(out, outn, "[%s] ", ts);
+    else            out[0] = '\0';
+}
+
+void beacon_print(FILE *fp, const char *ts,
+                  const uint8_t *payload, size_t len)
+{
+    (void)len;
+    // memcpy into a stack-allocated struct so this works regardless of
+    // payload alignment in the caller.
+    COMMS_beacon_basic_packet_t b;
+    memcpy(&b, payload, sizeof b);
+    char prefix[64];
+    beacon_prefix(ts, prefix, sizeof prefix);
+    beacon_print_common(fp, prefix, "beacon", &b);
 }
 
 int beacon_basic_summary(const uint8_t *payload, size_t len,
@@ -598,6 +614,9 @@ void cts1_rx_panel_summary(const uint8_t *packet, size_t len,
         case COMMS_PACKET_TYPE_BEACON_BASIC:
             beacon_basic_summary(packet, len, out, out_size);
             break;
+        case COMMS_PACKET_TYPE_BEACON_EXTENDED:
+            beacon_ext_summary(packet, len, out, out_size);
+            break;
         case COMMS_PACKET_TYPE_TCMD_RESPONSE:
             tcmd_response_summary(packet, len, out, out_size);
             break;
@@ -649,6 +668,433 @@ void bulk_file_print(FILE *fp, const char *ts,
     fputc('\n', fp);
 }
 
+// ---- the extended (blob) beacon -------------------------------------------
+
+int beacon_is_extended(const uint8_t *payload, size_t len)
+{
+    if (payload == NULL) return 0;
+    // 198 is the bare struct; 202 is the same with the 4-byte CSP CRC32
+    // trailer left on (--csp-crc32 is opt-in, and a corrupt trailer stays
+    // in the payload either way).
+    if (len != sizeof(COMMS_beacon_extended_packet_t)
+     && len != sizeof(COMMS_beacon_extended_packet_t)
+              + COMMS_CSP_CRC32_TRAILER_BYTES) return 0;
+    if (payload[0] != COMMS_PACKET_TYPE_BEACON_EXTENDED) return 0;
+    // One of the two magic fields has to be intact. Requiring both would
+    // throw away a beacon rescued with a single bad byte; requiring
+    // neither would let 198 bytes of anything starting with 0x20 in.
+    const int name_ok = (memcmp(payload + 1, "CTS1", 4) == 0);
+    const size_t end_off = offsetof(COMMS_beacon_extended_packet_t, end_message);
+    const int end_ok = (payload[end_off] == ' ' && payload[end_off + 1] == 'X');
+    return name_ok || end_ok;
+}
+
+int beacon_magic_intact(const uint8_t *payload, size_t len)
+{
+    if (payload == NULL) return 0;
+    // Both structs put satellite_name at byte 1 and end_message at the
+    // same offset, so one test serves both kinds.
+    const size_t end_off = offsetof(COMMS_beacon_basic_packet_t, end_message);
+    const int is_ext   = beacon_is_extended(payload, len);
+    const int is_basic = beacon_is_basic(payload, len);
+    if (!is_ext && !is_basic) return 0;
+    if (memcmp(payload + 1, "CTS1", 4) != 0) return 0;
+    if (is_ext) {
+        // " X" and then a digit: the blob version. beacon_ext_version
+        // returns 0 for anything else.
+        return beacon_ext_version(payload, len) > 0;
+    }
+    return memcmp(payload + end_off, "END", 3) == 0;
+}
+
+int beacon_ext_version(const uint8_t *payload, size_t len)
+{
+    if (!beacon_is_extended(payload, len)) return 0;
+    const size_t end_off = offsetof(COMMS_beacon_extended_packet_t, end_message);
+    if (payload[end_off] != ' ' || payload[end_off + 1] != 'X') return 0;
+    const uint8_t d = payload[end_off + 2];
+    if (d < '0' || d > '9') return 0;
+    return d - '0';
+}
+
+void beacon_ext_adcs_state(const uint8_t p[6], beacon_ext_adcs_state_t *out)
+{
+    if (out == NULL) return;
+    memset(out, 0, sizeof *out);
+    if (p == NULL) return;
+
+    // The blob zeroes the whole packet before filling it and leaves
+    // these six bytes alone when the ADCS does not answer, so all-zero
+    // means "not reported". A genuinely idle ADCS reports estimation
+    // mode 0 with run mode 0 and no units enabled, which is the same six
+    // zero bytes -- so this reads as not reported too. That is the safe
+    // way round: it hides nothing an operator would act on (an ADCS
+    // sitting in mode 0 with everything off), and it stops a failed
+    // query from being drawn as a real attitude.
+    if (p[0] == 0 && p[1] == 0 && p[2] == 0
+     && p[3] == 0 && p[4] == 0 && p[5] == 0) return;
+    out->reported = 1;
+
+    out->estimation_mode = p[0] & 0x0F;
+    out->control_mode    = (p[0] >> 4) & 0x0F;
+
+    out->run_mode   = p[1] & 0x03;
+    out->asgp4_mode = (p[1] >> 2) & 0x03;
+    out->cubecontrol_signal_enabled = (p[1] >> 4) & 1;
+    out->cubecontrol_motor_enabled  = (p[1] >> 5) & 1;
+    out->cubesense1_enabled         = (p[1] >> 6) & 1;
+    out->cubesense2_enabled         = (p[1] >> 7) & 1;
+
+    out->cubewheel1_enabled      =  p[2]       & 1;
+    out->cubewheel2_enabled      = (p[2] >> 1) & 1;
+    out->cubewheel3_enabled      = (p[2] >> 2) & 1;
+    out->cubestar_enabled        = (p[2] >> 3) & 1;
+    out->gps_receiver_enabled    = (p[2] >> 4) & 1;
+    out->gps_lna_power_enabled   = (p[2] >> 5) & 1;
+    out->motor_driver_enabled    = (p[2] >> 6) & 1;
+    out->sun_above_local_horizon = (p[2] >> 7) & 1;
+
+    out->cubesense1_comm_error           =  p[3]       & 1;
+    out->cubesense2_comm_error           = (p[3] >> 1) & 1;
+    out->cubecontrol_signal_comm_error   = (p[3] >> 2) & 1;
+    out->cubecontrol_motor_comm_error    = (p[3] >> 3) & 1;
+    out->cubewheel1_comm_error           = (p[3] >> 4) & 1;
+    out->cubewheel2_comm_error           = (p[3] >> 5) & 1;
+    out->cubewheel3_comm_error           = (p[3] >> 6) & 1;
+    out->cubestar_comm_error             = (p[3] >> 7) & 1;
+
+    out->magnetometer_range_error          =  p[4]       & 1;
+    out->cam1_sram_overcurrent_detected    = (p[4] >> 1) & 1;
+    out->cam1_3v3_overcurrent_detected     = (p[4] >> 2) & 1;
+    out->cam1_sensor_busy_error            = (p[4] >> 3) & 1;
+    out->cam1_sensor_detection_error       = (p[4] >> 4) & 1;
+    out->sun_sensor_range_error            = (p[4] >> 5) & 1;
+    out->cam2_sram_overcurrent_detected    = (p[4] >> 6) & 1;
+    out->cam2_3v3_overcurrent_detected     = (p[4] >> 7) & 1;
+
+    out->cam2_sensor_busy_error          =  p[5]       & 1;
+    out->cam2_sensor_detection_error     = (p[5] >> 1) & 1;
+    out->nadir_sensor_range_error        = (p[5] >> 2) & 1;
+    out->rate_sensor_range_error         = (p[5] >> 3) & 1;
+    out->wheel_speed_range_error         = (p[5] >> 4) & 1;
+    out->coarse_sun_sensor_error         = (p[5] >> 5) & 1;
+    out->startracker_match_error         = (p[5] >> 6) & 1;
+    out->startracker_overcurrent_detected = (p[5] >> 7) & 1;
+}
+
+int beacon_ext_attitude_is_valid(const uint8_t *payload, size_t len)
+{
+    if (!beacon_is_extended(payload, len)) return 0;
+    COMMS_beacon_extended_packet_t b;
+    memcpy(&b, payload, sizeof b);
+    beacon_ext_adcs_state_t st;
+    beacon_ext_adcs_state(b.adcs_current_state_1, &st);
+    if (!st.reported) return 0;
+    return (st.estimation_mode >= 3 && st.estimation_mode <= 6);
+}
+
+static const char *adcs_estimation_mode_str(uint8_t v, char *buf, size_t bufn)
+{
+    switch (v) {
+        case 0: return "NONE";
+        case 1: return "MEMS_RATE";
+        case 2: return "MAG_RATE";
+        case 3: return "MAG_RATE_PITCH";
+        case 4: return "MAG_SUN_TRIAD";
+        case 5: return "FULL_EKF";
+        case 6: return "GYRO_EKF";
+        case 7: return "USER";
+    }
+    snprintf(buf, bufn, "%u", v);
+    return buf;
+}
+
+static const char *adcs_control_mode_str(uint8_t v, char *buf, size_t bufn)
+{
+    switch (v) {
+        case 0:  return "NONE";
+        case 1:  return "DETUMBLE";
+        case 2:  return "Y_THOMSON";
+        case 3:  return "Y_WHEEL_ACQ";
+        case 4:  return "Y_WHEEL_STEADY";
+        case 5:  return "XYZ_WHEEL";
+        case 6:  return "SUN_TRACK";
+        case 7:  return "TARGET_TRACK";
+        case 8:  return "VFAST_DETUMBLE";
+        case 9:  return "FAST_DETUMBLE";
+        case 10: return "USER_1";
+        case 11: return "USER_2";
+        case 12: return "STOP_WHEELS";
+        case 13: return "USER_CODED";
+        case 14: return "SUN_TRACK_1AX";
+        case 15: return "TARGET_TRACK_1AX";
+    }
+    snprintf(buf, bufn, "%u", v);
+    return buf;
+}
+
+static const char *adcs_run_mode_str(uint8_t v, char *buf, size_t bufn)
+{
+    switch (v) {
+        case 0: return "OFF";
+        case 1: return "ENABLED";
+        case 2: return "TRIGGERED";
+        case 3: return "SIM";
+    }
+    snprintf(buf, bufn, "%u", v);
+    return buf;
+}
+
+// The MPI temperature field carries three sentinels in place of a
+// reading: -99 when the MPI was not active, -98 and -97 for errors.
+static const char *fmt_mpi_temp(char *buf, size_t cap, int8_t v)
+{
+    if (v == -99)                  snprintf(buf, cap, "inactive");
+    else if (v == -98 || v == -97) snprintf(buf, cap, "err%d", (int)v);
+    else                           snprintf(buf, cap, "%dC", (int)v);
+    return buf;
+}
+
+// The blob's own placeholder for a field whose EPS query failed. Same
+// idea as fmt_cC_i16's INT16_MAX check, different sentinel: the blob
+// pre-fills -9999 and only overwrites it when the EPS answers.
+static const char *fmt_ext_i16(char *buf, size_t cap, int16_t v,
+                               double scale, const char *unit)
+{
+    if (v == -9999) snprintf(buf, cap, "n/a");
+    else            snprintf(buf, cap, "%.*f%s",
+                             scale < 1.0 ? 2 : 0, v * scale, unit);
+    return buf;
+}
+
+void beacon_ext_print(FILE *fp, const char *ts,
+                      const uint8_t *payload, size_t len)
+{
+    (void)len;
+    COMMS_beacon_extended_packet_t b;
+    memcpy(&b, payload, sizeof b);
+    char prefix[64];
+    beacon_prefix(ts, prefix, sizeof prefix);
+
+    // The shared 130 bytes, read exactly as a basic beacon. Safe to
+    // alias: the two structs are asserted to agree up to end_message.
+    COMMS_beacon_basic_packet_t basic;
+    memcpy(&basic, payload, sizeof basic);
+    beacon_print_common(fp, prefix, "beacon_ext", &basic);
+
+    const int ver = beacon_ext_version(payload, len);
+    char mpi_t[16];
+    fprintf(fp,
+            "%sbeacon_ext: blob=v%d osc=%uMHz obc_adc_batt=%.3fV "
+            "mpi_last_temp=%s\n",
+            prefix, ver,
+            (unsigned)b.obc_active_oscillator_MHz,
+            b.obc_adc_battery_voltage_mV / 1000.0,
+            fmt_mpi_temp(mpi_t, sizeof mpi_t, b.mpi_last_temperature_C));
+
+    // The four solar-panel conditioning channels, one line each, so a
+    // channel that has stopped producing is easy to pick out.
+    const int16_t chv[4] = { b.eps_pcu_ch0_volt_in_mppt_mV,
+                             b.eps_pcu_ch1_volt_in_mppt_mV,
+                             b.eps_pcu_ch2_volt_in_mppt_mV,
+                             b.eps_pcu_ch3_volt_in_mppt_mV };
+    const int16_t chi[4] = { b.eps_pcu_ch0_curr_in_mppt_mA,
+                             b.eps_pcu_ch1_curr_in_mppt_mA,
+                             b.eps_pcu_ch2_curr_in_mppt_mA,
+                             b.eps_pcu_ch3_curr_in_mppt_mA };
+    const int16_t cho[4] = { b.eps_pcu_ch0_curr_ou_mppt_mA,
+                             b.eps_pcu_ch1_curr_ou_mppt_mA,
+                             b.eps_pcu_ch2_curr_ou_mppt_mA,
+                             b.eps_pcu_ch3_curr_ou_mppt_mA };
+    for (int i = 0; i < 4; i++) {
+        char v[16], ci[16], co[16];
+        fprintf(fp, "%sbeacon_ext: solar ch%d in=%s cur_in=%s cur_out=%s\n",
+                prefix, i,
+                fmt_ext_i16(v,  sizeof v,  chv[i], 0.001, "V"),
+                fmt_ext_i16(ci, sizeof ci, chi[i], 1.0,   "mA"),
+                fmt_ext_i16(co, sizeof co, cho[i], 1.0,   "mA"));
+    }
+
+    // Battery pack status. The heater bit is the one worth calling out
+    // by name: it explains a sudden draw with nothing else running.
+    const uint16_t bp = b.eps_battery_pack_status_bitfield;
+    char netp[16], distp[16];
+    fprintf(fp,
+            "%sbeacon_ext: batt_pack=0x%04x%s%s%s avg_net=%s avg_distributed=%s\n",
+            prefix, (unsigned)bp,
+            (bp == 0xFFFF) ? " (n/a)" : "",
+            (bp != 0xFFFF && (bp & 0x1000)) ? " heater=on" : "",
+            (bp != 0xFFFF && (bp & 0x8000)) ? " pack=enabled" : "",
+            fmt_ext_i16(netp,  sizeof netp,  b.eps_total_avg_net_battery_power_cW,
+                        0.01, "W"),
+            fmt_ext_i16(distp, sizeof distp, b.eps_total_avg_power_distributed_cW,
+                        0.01, "W"));
+
+    beacon_ext_adcs_state_t st;
+    beacon_ext_adcs_state(b.adcs_current_state_1, &st);
+    if (!st.reported) {
+        fprintf(fp, "%sbeacon_ext: adcs did not answer "
+                    "(state, sun sensors, field and attitude all unset)\n",
+                prefix);
+        return;
+    }
+
+    char est[16], ctl[20], run[12];
+    fprintf(fp,
+            "%sbeacon_ext: adcs run=%s control=%s estimation=%s asgp4=%u "
+            "sun_up=%d\n",
+            prefix,
+            adcs_run_mode_str(st.run_mode, run, sizeof run),
+            adcs_control_mode_str(st.control_mode, ctl, sizeof ctl),
+            adcs_estimation_mode_str(st.estimation_mode, est, sizeof est),
+            (unsigned)st.asgp4_mode, st.sun_above_local_horizon);
+
+    fprintf(fp,
+            "%sbeacon_ext: adcs enabled: ctrl_sig=%d ctrl_motor=%d "
+            "cs1=%d cs2=%d wheels=%d%d%d star=%d gps=%d lna=%d motor=%d\n",
+            prefix,
+            st.cubecontrol_signal_enabled, st.cubecontrol_motor_enabled,
+            st.cubesense1_enabled, st.cubesense2_enabled,
+            st.cubewheel1_enabled, st.cubewheel2_enabled, st.cubewheel3_enabled,
+            st.cubestar_enabled, st.gps_receiver_enabled,
+            st.gps_lna_power_enabled, st.motor_driver_enabled);
+
+    // Faults, named, and only when there are some -- a clean ADCS
+    // shouldn't cost a line saying so in the middle of a pass.
+    {
+        char faults[320];
+        int fp2 = 0;
+        #define FAULT(cond, name) \
+            if (cond) fp2 += snprintf(faults + fp2, sizeof faults - fp2, \
+                                      "%s%s", fp2 ? " " : "", name)
+        FAULT(st.cubesense1_comm_error,         "cs1_comm");
+        FAULT(st.cubesense2_comm_error,         "cs2_comm");
+        FAULT(st.cubecontrol_signal_comm_error, "ctrl_sig_comm");
+        FAULT(st.cubecontrol_motor_comm_error,  "ctrl_motor_comm");
+        FAULT(st.cubewheel1_comm_error,         "wheel1_comm");
+        FAULT(st.cubewheel2_comm_error,         "wheel2_comm");
+        FAULT(st.cubewheel3_comm_error,         "wheel3_comm");
+        FAULT(st.cubestar_comm_error,           "star_comm");
+        FAULT(st.magnetometer_range_error,      "mag_range");
+        FAULT(st.sun_sensor_range_error,        "sun_range");
+        FAULT(st.nadir_sensor_range_error,      "nadir_range");
+        FAULT(st.rate_sensor_range_error,       "rate_range");
+        FAULT(st.wheel_speed_range_error,       "wheel_speed_range");
+        FAULT(st.coarse_sun_sensor_error,       "css");
+        FAULT(st.cam1_sram_overcurrent_detected, "cam1_sram_oc");
+        FAULT(st.cam1_3v3_overcurrent_detected,  "cam1_3v3_oc");
+        FAULT(st.cam1_sensor_busy_error,         "cam1_busy");
+        FAULT(st.cam1_sensor_detection_error,    "cam1_detect");
+        FAULT(st.cam2_sram_overcurrent_detected, "cam2_sram_oc");
+        FAULT(st.cam2_3v3_overcurrent_detected,  "cam2_3v3_oc");
+        FAULT(st.cam2_sensor_busy_error,         "cam2_busy");
+        FAULT(st.cam2_sensor_detection_error,    "cam2_detect");
+        FAULT(st.startracker_match_error,        "star_match");
+        FAULT(st.startracker_overcurrent_detected, "star_oc");
+        #undef FAULT
+        if (fp2 > 0)
+            fprintf(fp, "%sbeacon_ext: adcs faults: %s\n", prefix, faults);
+    }
+
+    fprintf(fp,
+            "%sbeacon_ext: css 1-7,9=%u %u %u %u %u %u %u %u\n",
+            prefix,
+            (unsigned)b.adcs_raw_css_1, (unsigned)b.adcs_raw_css_2,
+            (unsigned)b.adcs_raw_css_3, (unsigned)b.adcs_raw_css_4,
+            (unsigned)b.adcs_raw_css_5, (unsigned)b.adcs_raw_css_6,
+            (unsigned)b.adcs_raw_css_7, (unsigned)b.adcs_raw_css_9);
+
+    // Field in microtesla (1 count = 10 nT) with its magnitude, and the
+    // rates in degrees per second.
+    const double bx = b.adcs_magnetic_field_x_T_en8 / 100.0;
+    const double by = b.adcs_magnetic_field_y_T_en8 / 100.0;
+    const double bz = b.adcs_magnetic_field_z_T_en8 / 100.0;
+    fprintf(fp,
+            "%sbeacon_ext: mag body=%.2f %.2f %.2f uT |B|=%.2f uT\n",
+            prefix, bx, by, bz, sqrt(bx * bx + by * by + bz * bz));
+
+    fprintf(fp,
+            "%sbeacon_ext: rates mems_norm=%.2f est=%.2f %.2f %.2f deg/s\n",
+            prefix,
+            b.adcs_angular_rate_norm_cdeg_per_sec / 100.0,
+            b.adcs_estimated_rate_x_cdeg_per_sec / 100.0,
+            b.adcs_estimated_rate_y_cdeg_per_sec / 100.0,
+            b.adcs_estimated_rate_z_cdeg_per_sec / 100.0);
+
+    if (beacon_ext_attitude_is_valid(payload, len)) {
+        fprintf(fp,
+                "%sbeacon_ext: attitude roll=%.2f pitch=%.2f yaw=%.2f deg "
+                "(body wrt orbit frame)\n",
+                prefix,
+                b.adcs_estimated_roll_angle_cdeg / 100.0,
+                b.adcs_estimated_pitch_angle_cdeg / 100.0,
+                b.adcs_estimated_yaw_angle_cdeg / 100.0);
+    } else {
+        fprintf(fp,
+                "%sbeacon_ext: attitude not estimated in mode %s "
+                "(angles only filled in modes 3-6)\n",
+                prefix, adcs_estimation_mode_str(st.estimation_mode,
+                                                 est, sizeof est));
+    }
+}
+
+int beacon_ext_summary(const uint8_t *payload, size_t len,
+                       char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return 0;
+    out[0] = '\0';
+    if (!beacon_is_extended(payload, len)) return 0;
+    COMMS_beacon_extended_packet_t b;
+    memcpy(&b, payload, sizeof b);
+
+    char state_buf[8], eps_buf[8], obc_buf[16], up_buf[24];
+    const char *state_str = cts1_state_str(b.cts1_operation_state,
+                                           state_buf, sizeof state_buf);
+    const char *eps_str   = eps_mode_str  (b.eps_mode_enum,
+                                           eps_buf,   sizeof eps_buf);
+    fmt_cC_i32  (obc_buf, sizeof obc_buf, b.obc_temperature_cC);
+    fmt_ms_clock(b.uptime_ms,             up_buf,    sizeof up_buf);
+    char name[5];
+    cts1_sanitise_text((const uint8_t *) b.satellite_name, 4,
+                       name, sizeof name, NULL);
+
+    // The attitude is what an extended beacon is for, so it goes in the
+    // one line even when there is none to show -- what mode the ADCS was
+    // estimating in is itself the answer to "why no attitude".
+    beacon_ext_adcs_state_t st;
+    beacon_ext_adcs_state(b.adcs_current_state_1, &st);
+    char att[80];
+    if (!st.reported) {
+        snprintf(att, sizeof att, "adcs=silent");
+    } else if (beacon_ext_attitude_is_valid(payload, len)) {
+        char ctl[20];
+        snprintf(att, sizeof att, "%s rpy=%.1f/%.1f/%.1f",
+                 adcs_control_mode_str(st.control_mode, ctl, sizeof ctl),
+                 b.adcs_estimated_roll_angle_cdeg / 100.0,
+                 b.adcs_estimated_pitch_angle_cdeg / 100.0,
+                 b.adcs_estimated_yaw_angle_cdeg / 100.0);
+    } else {
+        char ctl[20], est[16];
+        snprintf(att, sizeof att, "%s est=%s",
+                 adcs_control_mode_str(st.control_mode, ctl, sizeof ctl),
+                 adcs_estimation_mode_str(st.estimation_mode,
+                                          est, sizeof est));
+    }
+
+    int n = snprintf(out, out_size,
+        "%s X%d st=%s eps=%s batt=%.2fV/%u%% obc=%s up=%s cnt=%u %s "
+        "rate=%.2fdeg/s",
+        name, beacon_ext_version(payload, len), state_str, eps_str,
+        b.eps_battery_voltage_mV / 1000.0,
+        (unsigned) b.eps_battery_percent,
+        obc_buf, up_buf,
+        (unsigned) b.total_beacon_count_since_boot,
+        att,
+        b.adcs_angular_rate_norm_cdeg_per_sec / 100.0);
+    if (n < 0) { out[0] = '\0'; return 0; }
+    return (n < (int) out_size) ? n : (int) out_size - 1;
+}
+
 void cts1_packet_print(FILE *fp, const char *ts,
                        const uint8_t *payload, size_t len)
 {
@@ -658,6 +1104,10 @@ void cts1_packet_print(FILE *fp, const char *ts,
     // anchors (length, seq/max_seq) are strong enough.
     if (beacon_is_basic(payload, len)) {
         beacon_print(fp, ts, payload, len);
+        return;
+    }
+    if (beacon_is_extended(payload, len)) {
+        beacon_ext_print(fp, ts, payload, len);
         return;
     }
     if (tcmd_response_is(payload, len)) {

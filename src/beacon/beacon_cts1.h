@@ -54,6 +54,20 @@
 #define COMMS_PACKET_TYPE_TCMD_RESPONSE     0x04
 #define COMMS_PACKET_TYPE_BULK_FILE_DOWNLINK 0x10
 
+// The extended beacon. This type is not in the flight firmware's own
+// enum: it comes from the extended-beacon blob, a small position-
+// independent program uplinked into the satellite's filesystem and run
+// with exec_blob_from_fs, which sends a beacon carrying the fields the
+// built-in one leaves out -- the ADCS state and attitude, and the EPS
+// per-channel solar-panel measurements.
+//
+//   https://github.com/CalgaryToSpace/CTS-SAT-1-OBC-Firmware
+//   misc_tools/exec_blob/extended_beacon_blob/extended_beacon_blob_main.c
+//
+// The blob reschedules itself, so once started it beacons at its own
+// interval until a reboot or agenda_delete_by_name(exec_blob_from_fs).
+#define COMMS_PACKET_TYPE_BEACON_EXTENDED   0x20
+
 // Lead token cts1_rx_panel_summary writes ahead of the summary text when a
 // frame's Reed-Solomon block was uncorrectable (rs_errs == -2): the recovered
 // bytes are garbage, so parsed telemetry would mislead. The panel renderer
@@ -233,6 +247,270 @@ typedef struct {
 _Static_assert(sizeof(COMMS_bulk_file_downlink_packet_t) == 200,
                "bulk_file struct must be 200 packed bytes (5 header + 195 data)");
 
+#pragma pack(push, 1)
+
+// Verbatim from the extended-beacon blob (see the packet-type comment
+// above for the path). The first 130 bytes are the basic beacon field
+// for field -- the blob duplicates that struct so an extended beacon
+// can be read as a basic one with extra fields on the end -- and
+// end_message carries " X2", " X3" or " X4" in place of the basic
+// beacon's "END", which is how the blob version shows on the wire.
+//
+// Every version of the blob so far has this same layout; v3 and v4
+// only fixed how the satellite works out the values it puts in it (v4
+// corrects the MPI temperature average for negative temperatures, and
+// counts the running telecommand in pending_queued_tcmd_count). So one
+// decoder reads all three, and beacon_ext_version tells them apart for
+// the operator's benefit rather than to pick a layout.
+typedef struct {
+    uint8_t packet_type; // Always COMMS_PACKET_TYPE_BEACON_EXTENDED
+
+    char satellite_name[4]; // 4 bytes: "CTS1" :)
+
+    uint8_t active_rf_switch_antenna; // Either 1 or 2.
+    uint8_t active_rf_switch_control_mode; // Enum: COMMS_rf_switch_control_mode_enum_t
+    uint32_t uptime_ms;
+
+    uint32_t duration_since_last_uplink_ms;
+    uint64_t unix_epoch_time_ms;
+    uint8_t last_time_sync_source_enum; // Enum: TIME_sync_source_enum_t
+
+    uint8_t is_fs_mounted;
+
+    uint16_t total_tcmd_queued_count;
+    uint16_t pending_queued_tcmd_count;
+
+    uint32_t total_beacon_count_since_boot;
+
+    uint8_t eps_mode_enum; // 0=startup, 1=nominal, 2=safety, 3=emergency_low_power
+    uint8_t eps_reset_cause_enum; // 0=power_on, 1=watchdog, 2=commanded, 3=control_system_reset, 4=emergency_low_power
+    uint32_t eps_uptime_sec;
+    uint16_t eps_error_code;
+    uint16_t eps_battery_voltage_mV;
+    uint8_t eps_battery_percent;
+    int16_t eps_battery_temperature_0_cC; // Defective in core FW; fixed in the blob.
+    int16_t eps_battery_temperature_1_cC;
+    int32_t eps_total_fault_count;
+    uint32_t eps_enabled_channels_bitfield;
+    int32_t eps_total_pcu_power_input_cW;
+    int32_t eps_total_pcu_power_output_cW;
+    int32_t eps_total_avg_pcu_power_input_cW;
+    int32_t eps_total_avg_pcu_power_output_cW;
+
+    int32_t obc_temperature_cC;
+
+    uint8_t reboot_reason; // Enum: STM32_reset_cause_t
+
+    uint8_t cts1_operation_state; // Enum: CTS1_operation_state_enum_t
+    uint8_t rbf_pin_state; // Enum: OBC_rbf_state_enum_t
+
+    uint8_t mpi_rx_mode_enum; // Enum: MPI_rx_mode_enum_t
+    uint8_t mpi_transceiver_state_enum; // Enum: MPI_transceiver_state_enum_t
+
+    uint8_t mpi_last_reason_for_stopping_enum; // Enum: MPI_reason_for_stopping_active_mode_enum_t
+
+    uint8_t gnss_uart_interrupt_enabled;
+
+    uint8_t gnss_rx_mode_enum; // Enum: GNSS_rx_mode_enum_t
+
+    char friendly_message[COMMS_BEACON_FRIENDLY_MESSAGE_SIZE];
+
+    char end_message[4]; // " X2", " X3" or " X4" (the blob version)
+
+    // ====== END OF BASIC BEACON PACKET (DUPLICATED) ========
+
+    // Active oscillator frequency, in MHz. 16 = the internal clock (HSI,
+    // imprecise), 25 = the external one (HSE, precise).
+    uint8_t obc_active_oscillator_MHz;
+
+    // Battery voltage as the OBC's own ADC reads it. Useful when the EPS
+    // fails to report its battery voltage, which it often does.
+    int16_t obc_adc_battery_voltage_mV;
+
+    // Average temperature of the MPI over the last stretch it was
+    // active. -99 = inactive; -98 and -97 are error codes.
+    int8_t mpi_last_temperature_C;
+
+    // Instantaneous solar-panel measurements, one set per conditioning
+    // channel. The PCU output voltages are left out: they track the
+    // battery rail closely enough to say nothing extra.
+    int16_t eps_pcu_ch0_volt_in_mppt_mV;
+    int16_t eps_pcu_ch0_curr_in_mppt_mA;
+    int16_t eps_pcu_ch0_curr_ou_mppt_mA;
+    int16_t eps_pcu_ch1_volt_in_mppt_mV;
+    int16_t eps_pcu_ch1_curr_in_mppt_mA;
+    int16_t eps_pcu_ch1_curr_ou_mppt_mA;
+    int16_t eps_pcu_ch2_volt_in_mppt_mV;
+    int16_t eps_pcu_ch2_curr_in_mppt_mA;
+    int16_t eps_pcu_ch2_curr_ou_mppt_mA;
+    int16_t eps_pcu_ch3_volt_in_mppt_mV;
+    int16_t eps_pcu_ch3_curr_in_mppt_mA;
+    int16_t eps_pcu_ch3_curr_ou_mppt_mA;
+
+    // Battery pack status (EPS FW ICD Table 3-18). Bits 0..3 are the
+    // per-cell under-voltage flags, 4..7 the over-voltage ones, 8..11
+    // say a cell is balancing, bit 12 that the heater is on, and bit 15
+    // that the pack is enabled.
+    uint16_t eps_battery_pack_status_bitfield;
+
+    // EPS power balance, running average.
+    int16_t eps_total_avg_net_battery_power_cW;
+    int16_t eps_total_avg_power_distributed_cW;
+
+    // ADCS telemetry 132: run mode, control mode, estimation mode and
+    // some forty enabled/error flags, packed into six bytes. All six
+    // zero means the ADCS did not answer -- the blob zeroes the packet
+    // before filling it and leaves these alone on a failed query.
+    // beacon_ext_adcs_state unpacks it.
+    uint8_t adcs_current_state_1[6];
+
+    // Raw ADCS coarse sun sensor readings. 8 and 10 are unused and so
+    // are not sent.
+    uint8_t adcs_raw_css_1;
+    uint8_t adcs_raw_css_2;
+    uint8_t adcs_raw_css_3;
+    uint8_t adcs_raw_css_4;
+    uint8_t adcs_raw_css_5;
+    uint8_t adcs_raw_css_6;
+    uint8_t adcs_raw_css_7;
+    uint8_t adcs_raw_css_9;
+
+    // ADCS magnetic field vector (telemetry 151), satellite body frame,
+    // calibrated by the ADCS. 1 count = 10 nT, so microtesla = count/100.
+    int16_t adcs_magnetic_field_x_T_en8;
+    int16_t adcs_magnetic_field_y_T_en8;
+    int16_t adcs_magnetic_field_z_T_en8;
+
+    // Magnitude of the MEMS rate sensor's angular rates (from telemetry
+    // 155), in hundredths of a degree per second.
+    uint16_t adcs_angular_rate_norm_cdeg_per_sec;
+
+    // ADCS estimated angular rates (telemetry 147), hundredths of a
+    // degree per second. In estimation mode 1 these are the MEMS rates
+    // as read; otherwise they are estimated.
+    int16_t adcs_estimated_rate_x_cdeg_per_sec;
+    int16_t adcs_estimated_rate_y_cdeg_per_sec;
+    int16_t adcs_estimated_rate_z_cdeg_per_sec;
+
+    // ADCS estimated attitude angles (telemetry 146), hundredths of a
+    // degree, of the body frame with respect to the orbit frame. Only
+    // populated in estimation modes 3 through 6 -- see
+    // beacon_ext_attitude_is_valid.
+    int16_t adcs_estimated_roll_angle_cdeg;
+    int16_t adcs_estimated_pitch_angle_cdeg;
+    int16_t adcs_estimated_yaw_angle_cdeg;
+
+} COMMS_beacon_extended_packet_t;
+
+#pragma pack(pop)
+
+_Static_assert(sizeof(COMMS_beacon_extended_packet_t) == 198,
+               "extended beacon struct must be 198 packed bytes; check "
+               "pragma pack and field types against the blob");
+
+// The first 130 bytes of an extended beacon are a basic beacon, so the
+// two structs have to agree field for field up to end_message. A size
+// mismatch on the shared part is the cheap half of that check.
+_Static_assert(offsetof(COMMS_beacon_extended_packet_t, obc_active_oscillator_MHz)
+               == sizeof(COMMS_beacon_basic_packet_t),
+               "the extended beacon's extra fields must begin exactly where "
+               "the basic beacon ends");
+
+// The unpacked form of adcs_current_state_1. Field names and bit
+// positions from ADCS_current_state_1_struct_t and
+// ADCS_pack_to_current_state_1_struct in the flight firmware
+// (firmware/Core/{Inc,Src}/adcs_drivers/).
+typedef struct {
+    // Zero when all six packed bytes were zero, which is how the blob
+    // leaves them when the ADCS did not answer its query. Everything
+    // else in here is then meaningless.
+    int reported;
+
+    uint8_t estimation_mode;   // ADCS_estimation_mode_enum_t, 0..7
+    uint8_t control_mode;      // ADCS_control_mode_enum_t, 0..15
+    uint8_t run_mode;          // 0=off, 1=enabled, 2=triggered, 3=simulation
+    uint8_t asgp4_mode;        // 0=off, 1=trigger, 2=background, 3=augment
+
+    // Which units are powered.
+    int cubecontrol_signal_enabled, cubecontrol_motor_enabled;
+    int cubesense1_enabled, cubesense2_enabled;
+    int cubewheel1_enabled, cubewheel2_enabled, cubewheel3_enabled;
+    int cubestar_enabled;
+    int gps_receiver_enabled, gps_lna_power_enabled;
+    int motor_driver_enabled;
+    int sun_above_local_horizon;
+
+    // Units that failed to talk to the ADCS control computer.
+    int cubesense1_comm_error, cubesense2_comm_error;
+    int cubecontrol_signal_comm_error, cubecontrol_motor_comm_error;
+    int cubewheel1_comm_error, cubewheel2_comm_error, cubewheel3_comm_error;
+    int cubestar_comm_error;
+
+    // Sensors reading outside their range, and camera faults.
+    int magnetometer_range_error;
+    int cam1_sram_overcurrent_detected, cam1_3v3_overcurrent_detected;
+    int cam1_sensor_busy_error, cam1_sensor_detection_error;
+    int sun_sensor_range_error;
+    int cam2_sram_overcurrent_detected, cam2_3v3_overcurrent_detected;
+    int cam2_sensor_busy_error, cam2_sensor_detection_error;
+    int nadir_sensor_range_error, rate_sensor_range_error;
+    int wheel_speed_range_error, coarse_sun_sensor_error;
+    int startracker_match_error, startracker_overcurrent_detected;
+} beacon_ext_adcs_state_t;
+
+// Sniff test: 1 if the bytes look like an extended beacon. Anchors are
+// the length (198, or 202 with the CSP CRC32 trailer), the packet-type
+// byte, and either "CTS1" in satellite_name or " X" leading
+// end_message -- one of the two magic fields is enough, so a bit error
+// in either still routes the packet to this decoder.
+int beacon_is_extended(const uint8_t *payload, size_t len);
+
+// 1 if the beacon's two magic fields are exactly what they should be:
+// "CTS1" in satellite_name, and "END" or " X<n>" in end_message
+// according to which beacon it is. Works on either kind.
+//
+// This is a stricter test than the sniffs, and deliberately a separate
+// one. The sniffs are length-anchored on purpose, so that a beacon
+// rescued with a bit error still reaches the operator's panel, where a
+// wrong field is obvious against the ones either side of it and a
+// missing beacon is not. A tool that reads the numbers rather than
+// showing them -- a plot, a pointing direction -- wants the other
+// trade: 130 of the 21458 basic beacons in the operational store pass
+// the length sniff with both magic fields destroyed, and each one puts
+// a spike of 20 million degrees through a temperature curve.
+int beacon_magic_intact(const uint8_t *payload, size_t len);
+
+// Which version of the blob sent it: 2, 3 or 4 from end_message's
+// " X<n>", or 0 if that field says something else. The layout is the
+// same either way; this is for the operator.
+int beacon_ext_version(const uint8_t *payload, size_t len);
+
+// Unpack adcs_current_state_1 into named fields. `packed` is the six
+// bytes out of the packet.
+void beacon_ext_adcs_state(const uint8_t packed[6],
+                           beacon_ext_adcs_state_t *out);
+
+// 1 if the packet's estimated attitude angles mean anything. The ADCS
+// only fills them in estimation modes 3 through 6 (the two rate filters
+// with pitch estimation, the sun-magnetometer triad, and the two Kalman
+// filters); in the others the ADCS reports zeros, which would otherwise
+// read as a satellite pointing perfectly at nadir. A packet whose ADCS
+// state never arrived is not valid either.
+int beacon_ext_attitude_is_valid(const uint8_t *payload, size_t len);
+
+// Format the extended beacon as a block of "[ts] beacon_ext: ..." lines
+// to fp: the basic beacon's own lines first (the shared 130 bytes read
+// the same way), then the extra ones. ts semantics match beacon_print.
+void beacon_ext_print(FILE *fp, const char *ts,
+                      const uint8_t *payload, size_t len);
+
+// One-line summary for the operator's RX panel, in the shape of
+// beacon_basic_summary's but with the attitude and ADCS mode on the
+// end. Returns bytes written, or 0 if the payload is not an extended
+// beacon.
+int beacon_ext_summary(const uint8_t *payload, size_t len,
+                       char *out, size_t out_size);
+
 // Sniff test: returns 1 if the bytes look like a basic beacon packet.
 // Three magic anchors (length, packet_type, "CTS1" name, "END\0" trailer)
 // keep the false-positive rate on random bytes around 2^-72.
@@ -338,7 +616,8 @@ size_t cts1_sanitise_text(const uint8_t *data, size_t data_len,
 // marker instead of parsed telemetry, for every type. Otherwise it
 // delegates to beacon_basic_summary / tcmd_response_summary /
 // log_message_summary by type, leaving out an empty string for types with
-// no parser (peripheral / bulk / unknown). rs_errs of -1 (RS off) or >= 0
+// no parser (peripheral / bulk / unknown), and to beacon_ext_summary for
+// the extended (blob) beacon. rs_errs of -1 (RS off) or >= 0
 // (corrected, frame valid) take the normal parse path -- only the
 // uncorrectable sentinel is suppressed.
 void cts1_rx_panel_summary(const uint8_t *packet, size_t len,
