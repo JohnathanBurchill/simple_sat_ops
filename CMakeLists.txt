@@ -932,9 +932,14 @@ if (OPENSSL_FOUND)
     target_link_sso_core(tcmd_import)
     list(APPEND SSO_TARGETS tcmd_import)
 
-    # Curses TUI sibling of packet_query.
+    # Curses TUI sibling of packet_query. Links beacon_cts1 so it can
+    # decode the extended (blob) beacon out of the stored bytes: the
+    # rows recorded before the ground station knew that packet type are
+    # in the database as "unknown" with no decoded text, and this tool
+    # never writes to the database, so it decodes them as it loads them.
     if (NCURSES_FOUND)
         add_executable(packet_browser utils/packet_browser.c utils/cam_jpeg.c
+                       src/beacon/beacon_cts1.c
                        src/ui/ui_textfield.c)
         target_compile_definitions(packet_browser PRIVATE
             PACKET_BROWSER_HAVE_NCURSES)

@@ -57,6 +57,7 @@
 */
 
 #include "argparse.h"
+#include "beacon_cts1.h"
 #include "browser_timefmt.h"
 #include "cam_jpeg.h"
 #include "packet_db.h"
@@ -123,14 +124,15 @@ typedef struct {
     double geom_az_deg, geom_el_deg;
     double geom_range_km, geom_range_rate_km_s, geom_doppler_hz;
     char   session_dir[256];
-    char summary[2048];
+    char summary[3072];
     int      payload_len;   // full payload length
     uint8_t *payload;       // full payload, malloc'd per row (freed on reload/exit)
 } row_t;
 
 // Type cycle: NULL means "all", otherwise filter on packet_type_name.
+// "beacon_ext" is the odd one out -- see BEACON_EXT_PREDICATE below.
 static const char *const TYPE_CYCLE[] = {
-    NULL, "beacon", "tcmd_response", "log", "bulk_file"
+    NULL, "beacon", "beacon_ext", "tcmd_response", "log", "bulk_file"
 };
 static const int TYPE_CYCLE_N = sizeof TYPE_CYCLE / sizeof TYPE_CYCLE[0];
 
@@ -236,6 +238,7 @@ static double  g_station_cache_alt = 0.0;
 enum {
     PAIR_BAR    = 1,
     PAIR_BEACON,
+    PAIR_BEACON_EXT,
     PAIR_TCMD,
     PAIR_LOG,
     PAIR_BULK,
@@ -243,6 +246,7 @@ enum {
     PAIR_SEL,
     PAIR_SEL_ERR,
     PAIR_SEL_BEACON,
+    PAIR_SEL_BEACON_EXT,
     PAIR_SEL_TCMD,
     PAIR_SEL_LOG,
     PAIR_SEL_BULK,
@@ -370,6 +374,31 @@ static const char *origin_filter(void)
     return ORIGIN_CYCLE[origin_idx];
 }
 
+// Extended beacons that were decoded before the ground station knew
+// about them are in the database as type "unknown", because nothing
+// recognised a packet type of 0x20 at the time -- and there are tens of
+// thousands of them, one every half minute of every pass since the blob
+// was first uplinked. Rather than rewrite those rows, the type filter
+// picks them out the way beacon_is_extended does: by length, by the
+// packet-type byte, and by one of the two magic fields. The offsets are
+// 1-based here because that is what SQLite's substr wants, and the
+// literals are blobs because a blob never compares equal to a text
+// string in SQLite however alike they look.
+//
+//   198 bytes, or 202 with the CSP CRC32 trailer left on
+//   byte 1        = 0x20               (COMMS_PACKET_TYPE_BEACON_EXTENDED)
+//   bytes 2..5    = "CTS1"             (satellite_name), or
+//   bytes 127,128 = " X"               (end_message's blob version tag)
+//
+// fill_row relabels those rows as beacon_ext once they are loaded, so
+// everything downstream -- the colour, the type column, the decoded
+// text -- sees them as what they are.
+#define BEACON_EXT_PREDICATE \
+    "(packet_type_name = 'beacon_ext' OR (" \
+    "length(payload) IN (198, 202) AND substr(payload, 1, 1) = x'20' AND (" \
+    "substr(payload, 2, 4) = x'43545331' OR substr(payload, 127, 2) = x'2058'" \
+    ")))"
+
 // The column list every row query selects, in the order fill_row()
 // reads them. Shared by the main filter query and the command-group
 // query so both feed the same row_t loader.
@@ -459,6 +488,34 @@ static void fill_row(sqlite3_stmt *stmt, row_t *r)
         }
     }
 
+    // An extended beacon stored before the ground station could name
+    // one: relabel it, and decode it here. The database has its bytes
+    // but no decoded text, and re-decoding every old row into the
+    // database would mean writing to it -- which this tool deliberately
+    // never does. Decoding on the way in costs one pass over 198 bytes
+    // per row and gives the reader the same text a freshly received
+    // extended beacon carries.
+    if (beacon_is_extended(r->payload, (size_t) r->payload_len)) {
+        r->packet_type = COMMS_PACKET_TYPE_BEACON_EXTENDED;
+        snprintf(r->type_name, sizeof r->type_name, "beacon_ext");
+        if (r->satellite[0] == '\0')
+            snprintf(r->satellite, sizeof r->satellite, "CTS1");
+        if (r->summary[0] == '\0') {
+            FILE *mem = fmemopen(r->summary, sizeof r->summary, "w");
+            if (mem != NULL) {
+                beacon_ext_print(mem, NULL, r->payload,
+                                 (size_t) r->payload_len);
+                fflush(mem);
+                long pos = ftell(mem);
+                if (pos < 0) pos = 0;
+                if ((size_t) pos >= sizeof r->summary)
+                    pos = (long) sizeof r->summary - 1;
+                r->summary[pos] = '\0';
+                fclose(mem);
+            }
+        }
+    }
+
     trim_tcmd_crc_trailer(r);
 }
 
@@ -473,7 +530,7 @@ static void run_query(sqlite3 *db)
 {
     sqlite3_int64 prev_id = (n_rows > 0) ? rows[sel].id : -1;
 
-    char sql[1024];
+    char sql[2048];
     // Clamp off after each append: snprintf returns the would-be length, so a
     // truncated write leaves off past sizeof sql, and the next "sizeof sql -
     // off" (size_t) would wrap huge and sql + off go out of bounds.
@@ -485,10 +542,15 @@ static void run_query(sqlite3 *db)
     const char *param_text[5] = {0};
     char like_pattern[256];
     if (type_filter() != NULL) {
-        off += snprintf(sql + off, sizeof sql - off,
-                        " AND packet_type_name = ?%d", n_params + 1);
+        if (strcmp(type_filter(), "beacon_ext") == 0) {
+            off += snprintf(sql + off, sizeof sql - off,
+                            " AND " BEACON_EXT_PREDICATE);
+        } else {
+            off += snprintf(sql + off, sizeof sql - off,
+                            " AND packet_type_name = ?%d", n_params + 1);
+            param_text[n_params++] = type_filter();
+        }
         if (off > (int) sizeof sql) off = (int) sizeof sql;
-        param_text[n_params++] = type_filter();
     }
     if (origin_filter() != NULL) {
         off += snprintf(sql + off, sizeof sql - off,
@@ -1290,6 +1352,7 @@ static int color_for_type(const char *name)
 {
     if (!g_have_color || name == NULL) return 0;
     if (strcmp(name, "beacon") == 0)         return PAIR_BEACON;
+    if (strcmp(name, "beacon_ext") == 0)     return PAIR_BEACON_EXT;
     if (strcmp(name, "tcmd_response") == 0)  return PAIR_TCMD;
     if (strcmp(name, "log") == 0)            return PAIR_LOG;
     if (strcmp(name, "bulk_file") == 0)      return PAIR_BULK;
@@ -1399,6 +1462,8 @@ static void draw_list(int list_top, int list_h, int cols)
         } else {
             switch (color) {
                 case PAIR_BEACON: sel_pair = PAIR_SEL_BEACON; break;
+                case PAIR_BEACON_EXT:
+                                  sel_pair = PAIR_SEL_BEACON_EXT; break;
                 case PAIR_TCMD:   sel_pair = PAIR_SEL_TCMD;   break;
                 case PAIR_LOG:    sel_pair = PAIR_SEL_LOG;    break;
                 case PAIR_BULK:   sel_pair = PAIR_SEL_BULK;   break;
@@ -1890,6 +1955,30 @@ static int prompt_export_filename(int rows_total, int cols, char *buf, size_t bu
     return result == 1 ? 1 : 0;
 }
 
+// How many rows the detail pane would need to show all of row r: the
+// separator, the header, the metadata lines, and the decoded body
+// wrapped to the window's width. Used to decide the split between the
+// list and the detail pane, so a packet with a long decoded body gets
+// the room to show it. Two rows of payload dump are asked for on top,
+// since a detail pane with no bytes at all in it reads as broken.
+static int detail_rows_needed(const row_t *r, int cols)
+{
+    int n = 3;                                   // separator, header, metadata
+    if (r->has_offset) n++;
+    if (r->has_geom)   n++;
+    if (strcmp(r->origin, "satnogs") == 0) n++;  // the station line
+    int wrap_w = cols - 2;
+    if (wrap_w < 1) wrap_w = 1;
+    for (const char *p = r->summary; *p != '\0'; ) {
+        const char *eol = strchr(p, '\n');
+        int len = eol ? (int)(eol - p) : (int)strlen(p);
+        n += (len / wrap_w) + 1;                 // a blank line still takes one
+        if (eol == NULL) break;
+        p = eol + 1;
+    }
+    return n + 2;
+}
+
 static void draw_detail(int top_y, int height, int cols)
 {
     move(top_y, 0);
@@ -2004,10 +2093,22 @@ static void draw_detail(int top_y, int height, int cols)
     // as many physical rows as it needs rather than truncated at the
     // right edge — the tcmd_response text in particular routinely runs
     // past the screen width.
+    //
+    // When there is more of it than the pane can hold, the last row
+    // says how much was left off rather than the text just stopping —
+    // an extended beacon's block runs to twenty-odd lines and its ADCS
+    // and attitude come at the end, so silently clipping would hide
+    // exactly the part worth reading. draw_detail's caller sizes the
+    // pane to fit where it can (see the layout in main).
     const char *p = r->summary;
     int wrap_w = cols - 2;
     if (wrap_w < 1) wrap_w = 1;
+    // Where the line being drawn began. The note below goes on the last
+    // row of the pane, covering whatever was drawn there, so that line
+    // counts among the ones left off.
+    const char *line_start = p;
     while (*p != '\0' && y < max_y) {
+        line_start = p;
         const char *eol = strchr(p, '\n');
         int n = eol ? (int)(eol - p) : (int)strlen(p);
         int off = 0;
@@ -2019,8 +2120,26 @@ static void draw_detail(int top_y, int height, int cols)
             y++;
             off += chunk;
         } while (off < n && y < max_y);
-        if (!eol) break;
+        if (!eol) { p += strlen(p); break; }
         p = eol + 1;
+    }
+    if (*p != '\0') {
+        // The note lands on the pane's last row, so the line drawn
+        // there is about to be covered: count it as left off too.
+        if (y >= max_y) p = line_start;
+        int left = 1;
+        for (const char *q = p; *q != '\0'; q++) if (*q == '\n') left++;
+        if (p[strlen(p) - 1] == '\n') left--;
+        char note[80];
+        snprintf(note, sizeof note,
+                 "... %d more line%s of decoded body (a taller window shows them)",
+                 left, left == 1 ? "" : "s");
+        int ny = (y < max_y) ? y : max_y - 1;
+        move(ny, 0); clrtoeol();
+        if (g_have_color) attron(A_DIM);
+        mvaddnstr(ny, 2, note, cols - 2);
+        if (g_have_color) attroff(A_DIM);
+        y = ny + 1;
     }
 
     // Payload dump filling the rest of the detail pane, in the operator's
@@ -2265,8 +2384,15 @@ int main(int argc, char **argv)
         // terminal supports it; fall back to COLOR_WHITE on
         // 8/16-colour terminals where there's no gray slot.
         short sel_bg = (COLORS >= 256) ? 240 : COLOR_WHITE;
+        short ext_fg = (COLORS >= 256) ? 111 : COLOR_BLUE;
         init_pair(PAIR_BAR,    COLOR_WHITE,   COLOR_BLUE);
         init_pair(PAIR_BEACON, COLOR_CYAN,    -1);
+        // The extended beacon reads as a beacon but is a different
+        // packet, so it gets a neighbouring colour rather than a
+        // contrasting one: a light steel blue from the 256-colour ramp
+        // where there is one, since plain COLOR_BLUE is too dark to
+        // read on the black background most terminals come with.
+        init_pair(PAIR_BEACON_EXT, ext_fg, -1);
         init_pair(PAIR_TCMD,   COLOR_YELLOW,  -1);
         init_pair(PAIR_LOG,    COLOR_GREEN,   -1);
         init_pair(PAIR_BULK,   COLOR_MAGENTA, -1);
@@ -2276,6 +2402,7 @@ int main(int argc, char **argv)
         // Per-type selection pairs preserve the row's type-colour
         // foreground while applying the highlight background.
         init_pair(PAIR_SEL_BEACON, COLOR_CYAN,    sel_bg);
+        init_pair(PAIR_SEL_BEACON_EXT, ext_fg, sel_bg);
         init_pair(PAIR_SEL_TCMD,   COLOR_YELLOW,  sel_bg);
         init_pair(PAIR_SEL_LOG,    COLOR_GREEN,   sel_bg);
         init_pair(PAIR_SEL_BULK,   COLOR_MAGENTA, sel_bg);
@@ -2294,6 +2421,22 @@ int main(int argc, char **argv)
         if (avail < 6) avail = 6;
         int list_h     = avail / 2;
         if (list_h < 4) list_h = 4;
+        // An even split suits most packets, whose decoded body is a
+        // line or eight. An extended beacon's runs to twenty-odd, and
+        // its ADCS state and attitude come last, so on an ordinary
+        // terminal an even split would cut off the part worth reading.
+        // Give the detail pane what it needs for the selected row, down
+        // to leaving the list its own minimum — enough rows to still
+        // browse by, so a long packet cannot squeeze the list away.
+        if (n_rows > 0 && sel >= 0 && sel < n_rows) {
+            int want = detail_rows_needed(&rows[sel], cols);
+            if (want > avail - list_h) {
+                const int list_floor = (avail >= 20) ? 8 : 4;
+                int give = avail - want;
+                if (give < list_floor) give = list_floor;
+                if (give < list_h) list_h = give;
+            }
+        }
         int detail_top = header_h + list_h;
         int detail_h   = rows_total - footer_h - detail_top;
 
