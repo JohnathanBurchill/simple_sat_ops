@@ -966,8 +966,38 @@ void globe_input(globe_t *g, int x, int y, int w, int h)
         Vector2 before = {0};
         if (g->drag_pivot) globe_anchor_at(g, w, dh, &before);
         double R = globe_radius(w, dh, g->zoom);
-        g->lon0 -= (double) (m.x - g->drag_at.x) * (180.0 / M_PI) / R;
-        g->lat0 += (double) (m.y - g->drag_at.y) * (180.0 / M_PI) / R;
+
+        // Dividing the drag by the disc's radius alone moves the surface
+        // one pixel per pixel dragged -- which is the right feel, and is
+        // what the vertical drag does. The horizontal one does not,
+        // because turning the globe about its own axis moves the surface
+        // under the cursor by only cos(latitude) as much: at 70 degrees
+        // a third of the way, at 80 a sixth. This satellite's orbit is
+        // very nearly polar and both viewers frame the globe on its
+        // track, so the view sits at high latitude most of the time and
+        // the globe would barely drag sideways while dragging up and
+        // down perfectly well. Divide the cosine back out.
+        //
+        // With a floor, because the compensation runs away at the pole:
+        // there, turning the globe about its axis moves nothing under
+        // the cursor at all, and no amount of dividing fixes that. 0.2
+        // caps the help at five times, which is reached at 78 degrees.
+        double clat = cos(g->lat0 * (M_PI / 180.0));
+        if (clat < 0.2) clat = 0.2;
+
+        // And a drag reaches further the further in the view is zoomed.
+        // At one pixel of surface per pixel of drag, crossing a
+        // zoomed-in view takes as many drags as it takes panel widths,
+        // and this panel is 270 px wide -- at the far end of the zoom
+        // that is fifteen drags to cross the disc. The square root
+        // leaves the feel at zoom 1 alone and gives four times the reach
+        // at 16x, where the panel spans eight degrees of arc.
+        const double speed = sqrt(g->zoom);
+
+        g->lon0 -= (double) (m.x - g->drag_at.x)
+                 * (180.0 / M_PI) * speed / (R * clat);
+        g->lat0 += (double) (m.y - g->drag_at.y)
+                 * (180.0 / M_PI) * speed / R;
         if (g->lat0 >  89.9) g->lat0 =  89.9;
         if (g->lat0 < -89.9) g->lat0 = -89.9;
         g->lon0 = fmod(g->lon0 + 180.0, 360.0);
