@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`e408b71` (2026-09-17). This is a working draft.
+`c90c489` (2026-09-18). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2248,20 +2248,32 @@ bursts; open each from one of its own chunks.
 The beacons as curves. `packet_query` and `packet_browser` show you one
 packet at a time; this shows one *quantity* over as much of the mission as
 you like. It reads every beacon in the packet database - both kinds - and
-plots any of their telemetry fields against time, one stacked panel per
-field, so a question like "was the battery colder on the passes where a
-solar channel dropped out" is a matter of ticking two boxes.
+plots any of their telemetry fields against time in a stack of panels,
+so a question like "was the battery colder on the passes where a solar
+channel dropped out" is a matter of ticking two boxes.
 
 ```sh
 telemetry_browser                                    # default database
 telemetry_browser --db=/FrontierSat/packet_db.sqlite
-telemetry_browser --fields=batt_v,obc_t,solar1_i     # open on these
+telemetry_browser --fields=batt_v,obc_t,solar1_i     # one panel each
+telemetry_browser --fields=batt_v+obc_t,pcu_in       # + shares a panel
 telemetry_browser --help                             # every field, by name
 ```
 
 It opens on the most recent pass with the battery voltage, solar power in
-and computer temperature plotted, which is the one screen that says
-whether the satellite is well.
+and computer temperature in three panels, which is the one screen that
+says whether the satellite is well.
+
+**Panels.** The slider above the panels (or `-` and `=`) sets how many
+there are, from one to eight, and their sizes depend on that setting
+alone: adding a series never reshuffles the screen. Panels hidden by
+sliding the count down keep what they hold and come back when it goes up.
+**Click a panel to give it the focus**; the field list then adds to and
+takes from that panel. A panel holds up to six series. Those in the same
+unit as the first share the **left axis**; the first series in a
+different unit takes the **right axis**, with its name at the right of
+the panel's heading; a third unit is refused, since it would have no
+axis to read off.
 
 **The field list** on the left is grouped by subsystem - power,
 temperature, solar array, housekeeping, ADCS, attitude - and each row
@@ -2269,9 +2281,19 @@ shows the field's key, which is also the name `--fields` takes and the
 column heading in the CSV. Fields marked **`ext`** come only from the
 extended beacon, so those series exist for the stretch of the mission
 where the blob has been running and stop where it was not. Up and down
-move the cursor, `space` plots or unplots, `a` takes the whole group the
-cursor is in, `n` clears them all. Eight panels is the limit; past that
-each is too short to read anything off.
+move the cursor; `space`, `enter` or a click on a row adds the field to
+the focused panel or takes it out. The markers show the focused panel: a
+filled square in the series' colour for a field in it, a hollow bright
+one for a field in some other panel. `a` adds the cursor's whole group
+to the focused panel, as far as its axes and room allow, and `n` empties
+it.
+
+**Follow mode** (`f`, marked "follow" at the top of the list) turns the
+focused panel into a viewer for the list cursor: it shows just the field
+under the cursor and changes the moment the cursor moves, so walking the
+list with the arrows looks at every field in turn. Click another panel
+to follow in that one instead; `f` again leaves the last field shown in
+place.
 
 **Time.** The axis is real time, and the beacons arrive in clumps: a few
 minutes of them per pass, then hours of nothing. So **no line is drawn
@@ -2282,15 +2304,16 @@ use left and right to pan, scroll to zoom about the pointer, and **`g`
 puts the whole record in view**. The heading above the panels says what
 window is on screen and how wide it is; the moment under the pointer is
 called out there too, with a vertical line down every panel and each
-series' nearest actual reading circled and labelled, so values at the
-same moment line up down the screen. The numbers shown are ones the
+series' nearest actual reading circled, its value shown in the panel
+heading in place of the unit, so values at the same moment line up down
+the screen. The numbers shown are ones the
 satellite really sent - the nearest sample, not an interpolation between
 two.
 
-Each panel scales itself to what is **in the window**, not to the whole
-record, and says its range in its heading. That is the point of a plot
-like this: you are looking at the shape of a stretch, and a panel scaled
-to four months of history would flatten a pass into a line.
+Each axis of each panel scales itself to what is **in the window**, not
+to the whole record. That is the point of a plot like this: you are
+looking at the shape of a stretch, and a panel scaled to four months of
+history would flatten a pass into a line.
 
 **What is deliberately not plotted.** A field whose value in a given
 beacon is the subsystem's marker for "no reading" is dropped rather than
@@ -2313,10 +2336,11 @@ holding noise, each of which puts a spike of twenty million degrees
 through a temperature curve.
 
 `e` writes the visible window to `telemetry.csv` in the working
-directory: one row per beacon, one column per plotted field, `basic` or
-`ext` in the second column, and an empty cell where a field had no
-reading. `F5` re-reads the database, `q` quits. Read-only on the database
-and safe to run while a receiver fills it.
+directory: one row per beacon, one column per field on screen (once,
+however many panels it is in), `basic` or `ext` in the second column,
+and an empty cell where a field had no reading. `F5` re-reads the
+database, `q` quits. Read-only on the database and safe to run while a
+receiver fills it.
 
 ### `cam_reconstruct`
 

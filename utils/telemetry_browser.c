@@ -4,10 +4,19 @@
 
     The beacons as curves. A small raylib GUI that reads every beacon in
     the packet database -- the satellite's own and the extended-beacon
-    blob's -- and plots any of its telemetry fields against time, one
-    stacked panel per field, so a question like "was the battery colder
-    on the passes where the solar array dropped out" is a matter of
-    ticking two boxes.
+    blob's -- and plots any of its telemetry fields against time in a
+    stack of panels, so a question like "was the battery colder on the
+    passes where the solar array dropped out" is a matter of ticking two
+    boxes.
+
+    Panels: how many there are is set with the slider (or - and =), and
+    their sizes depend on that alone. Click a panel to give it the
+    focus; space or a click in the list adds the field to that panel or
+    takes it out. Fields in the same unit share the panel's left axis;
+    a field in a second unit gets the right axis, and a third unit is
+    refused. In follow mode (f) the focused panel shows just the field
+    under the list cursor, so walking the list is a way of looking at
+    each field in turn.
 
     The field list on the left is the catalogue in src/beacon/
     beacon_series.c, grouped by subsystem. Fields the basic beacon does
@@ -31,10 +40,12 @@
     clock the rest of these tools use.
 
     Keys:
-      up/down      move in the field list        space/enter  plot or unplot it
+      click panel  focus it                      - =          fewer / more panels
+      up/down      move in the field list        space/enter  add to / take from
+      f            follow mode                                the focused panel
       left/right   pan through time              scroll       zoom about the cursor
-      [ ]          previous / next pass          a            all of a group
-      g            the whole record in view      n            none
+      [ ]          previous / next pass          a            a group, into the panel
+      g            the whole record in view      n            empty the focused panel
       e            write the visible window to telemetry.csv
       F5           re-read the database          q            quit
 
@@ -45,8 +56,9 @@
 
     With no --db the default store is used ($SSO_PACKET_DB, else the
     FrontierSat root's packet_db.sqlite). --fields opens with those
-    field keys plotted instead of the default few; the key of each field
-    is the first word of its row in the list.
+    field keys plotted instead of the default few, one panel per comma,
+    with keys joined by + sharing a panel (batt_v+obc_t,pcu_in); the
+    key of each field is the first word of its row in the list.
 
     Copyright (C) 2026  Johnathan K Burchill
 
@@ -116,11 +128,6 @@ int main(int argc, char **argv)
 // narrowest and widest the window can be zoomed.
 #define PASS_PAD_MS   (4.0 * 60.0 * 1000.0)
 #define MIN_SPAN_MS   (10.0 * 1000.0)
-
-// How many series can be plotted at once. More than about six panels
-// makes each one too short to read anything off, so the limit is a
-// kindness as much as an allocation.
-#define MAX_PLOTS 8
 
 // One beacon: when it arrived and its bytes. The whole payload is kept
 // rather than the fields pulled out at load time, so ticking a new
@@ -335,10 +342,30 @@ static int load_samples(const char *db_path)
 
 // ---- the view --------------------------------------------------------------
 
-// Which fields are plotted, in the order they were picked, and where
-// the list cursor sits. plots holds indices into BEACON_SERIES_FIELDS.
-static int    g_plot[MAX_PLOTS];
-static int    g_nplot = 0;
+// The panels. How many are on screen is the slider's setting, and their
+// sizes follow from that alone -- adding a series never reflows the
+// screen. A panel holds several series; those sharing the first one's
+// unit read off the left axis, those in a second unit off the right,
+// and a third unit is refused because it would have no axis to read.
+// Panels past the slider's setting keep what they hold, so sliding the
+// count down and back up loses nothing.
+#define MAX_PANELS    8
+#define MAX_PER_PANEL 6
+
+typedef struct {
+    int field[MAX_PER_PANEL];   // indices into BEACON_SERIES_FIELDS
+    int n;
+} panel_t;
+
+static panel_t g_panel[MAX_PANELS];
+static int     g_npanel = 3;
+static int     g_focus  = 0;
+
+// Follow mode: the focused panel shows whatever field the list cursor
+// is on, so walking the list with the arrows is a way of looking at
+// every field in turn.
+static int     g_follow = 0;
+
 static int    g_cursor = 0;
 static float  g_list_scroll = 0.0f;
 
@@ -348,27 +375,76 @@ static double g_t0 = 0.0, g_t1 = 0.0;
 static char   g_status[200] = "";
 static float  g_status_left = 0.0f;
 
-static int is_plotted(int field_idx)
+static void set_status(float secs, const char *msg)
 {
-    for (int i = 0; i < g_nplot; i++) if (g_plot[i] == field_idx) return 1;
-    return 0;
+    snprintf(g_status, sizeof g_status, "%s", msg);
+    g_status_left = secs;
 }
 
-static void toggle_plot(int field_idx)
+// Where field k sits in panel p, or -1.
+static int panel_slot(const panel_t *p, int k)
 {
-    for (int i = 0; i < g_nplot; i++) {
-        if (g_plot[i] != field_idx) continue;
-        for (int k = i; k + 1 < g_nplot; k++) g_plot[k] = g_plot[k + 1];
-        g_nplot--;
-        return;
+    for (int i = 0; i < p->n; i++) if (p->field[i] == k) return i;
+    return -1;
+}
+
+// The panel's two units: the first series' is the left axis, the first
+// series in any other unit is the right. NULL when there is none.
+static void panel_units(const panel_t *p, const char **left, const char **right)
+{
+    *left = NULL;
+    *right = NULL;
+    for (int i = 0; i < p->n; i++) {
+        const char *u = BEACON_SERIES_FIELDS[p->field[i]].unit;
+        if (*left == NULL) *left = u;
+        else if (strcmp(u, *left) != 0 && *right == NULL) *right = u;
     }
-    if (g_nplot >= MAX_PLOTS) {
-        snprintf(g_status, sizeof g_status,
-                 "%d panels is as many as will fit; unpick one first", MAX_PLOTS);
-        g_status_left = 4.0f;
-        return;
+}
+
+static const char *unit_name(const char *u)
+{
+    return u[0] ? u : "count";
+}
+
+// Add field k to panel p. Returns 1 if it went in.
+static int panel_add(panel_t *p, int k)
+{
+    if (panel_slot(p, k) >= 0) return 1;
+    if (p->n >= MAX_PER_PANEL) {
+        char msg[120];
+        snprintf(msg, sizeof msg, "%d series is as many as one panel takes",
+                 MAX_PER_PANEL);
+        set_status(4.0f, msg);
+        return 0;
     }
-    g_plot[g_nplot++] = field_idx;
+    const char *l, *r;
+    panel_units(p, &l, &r);
+    const char *u = BEACON_SERIES_FIELDS[k].unit;
+    if (l != NULL && r != NULL && strcmp(u, l) != 0 && strcmp(u, r) != 0) {
+        char msg[160];
+        snprintf(msg, sizeof msg,
+                 "this panel's axes are %s and %s; %s needs a panel of its own",
+                 unit_name(l), unit_name(r), unit_name(u));
+        set_status(5.0f, msg);
+        return 0;
+    }
+    p->field[p->n++] = k;
+    return 1;
+}
+
+static void panel_toggle(panel_t *p, int k)
+{
+    const int i = panel_slot(p, k);
+    if (i < 0) { panel_add(p, k); return; }
+    for (int j = i; j + 1 < p->n; j++) p->field[j] = p->field[j + 1];
+    p->n--;
+}
+
+// Put the cursor's field alone in the focused panel (follow mode).
+static void follow_cursor(void)
+{
+    g_panel[g_focus].n = 1;
+    g_panel[g_focus].field[0] = g_cursor;
 }
 
 static void view_all(void)
@@ -410,10 +486,23 @@ static int current_pass(void)
     return best;
 }
 
+// The first sample at or after t. The samples are in time order, and
+// with a dozen series on screen each walking the whole record every
+// frame, starting at the window instead matters.
+static int first_at(double t)
+{
+    int lo = 0, hi = g_n;
+    while (lo < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (g_s[mid].ts_ms < t) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
 // ---- plotting --------------------------------------------------------------
 
-// The colours the panels cycle through. Chosen to stay apart on the
-// dark background and to read in the cursor line beside each other.
+// The colours a panel's series take, by their place in it. Chosen to
+// stay apart on the dark background and to read beside each other.
 static const Color SERIES_C[] = {
     { 120, 200, 255, 255 },   // pale blue
     { 255, 180,  90, 255 },   // amber
@@ -424,6 +513,13 @@ static const Color SERIES_C[] = {
     { 255, 140, 130, 255 },   // salmon
     { 140, 230, 230, 255 },   // cyan
 };
+#define SERIES_NC ((int) (sizeof SERIES_C / sizeof SERIES_C[0]))
+
+// Room either side of every panel for its axis labels. The same on all
+// of them, with or without a right axis, so one moment is at one x all
+// the way down the screen.
+#define PAD_L 58
+#define PAD_R 58
 
 // A rounded step for the y axis: 1, 2 or 5 times a power of ten, the
 // largest that still gives at least two labelled lines.
@@ -439,41 +535,35 @@ static double nice_step(double span, int want)
     return 10.0 * mag;
 }
 
-// Draw one field's panel. Returns 1 if anything was in view.
-static int draw_panel(const bs_field_t *f, Color c, int x, int y, int w, int h,
-                      int have_cursor, double cursor_ms)
+// Where panel i of n sits between top and top + h.
+static void panel_rect(int i, int n, int top, int h, int *y, int *ph)
 {
-    DrawRectangle(x, y, w, h, (Color){ 26, 26, 32, 255 });
-    DrawRectangleLines(x, y, w, h, (Color){ 52, 52, 62, 255 });
+    const int gap = 6;
+    const int each = (h - gap * (n - 1)) / n;
+    *y = top + i * (each + gap);
+    *ph = each;
+}
 
-    const int pad_l = 58, pad_r = 10, pad_t = 17, pad_b = 4;
-    const int px = x + pad_l, py = y + pad_t;
-    const int pw = w - pad_l - pad_r, ph = h - pad_t - pad_b;
-    if (pw < 10 || ph < 10) return 0;
-
-    // One pass over the samples in the window to find the range. Doing
-    // it per frame keeps the scaling honest as the window moves -- the
-    // point of a plot like this is to see the shape of what is in view,
-    // not of the whole four months.
+// The range of every series in p with unit u, over the window, padded
+// so the curve does not touch the panel's edges. Returns how many
+// samples it saw.
+static int axis_range(const panel_t *p, const char *u, int i0, int i1,
+                      double *lo_out, double *hi_out)
+{
     double lo = 1e300, hi = -1e300;
-    int    seen = 0;
-    for (int i = 0; i < g_n; i++) {
-        if (g_s[i].ts_ms < g_t0 || g_s[i].ts_ms > g_t1) continue;
-        double v = 0.0;
-        if (!beacon_series_value(f, g_s[i].payload, g_s[i].len, &v)) continue;
-        if (v < lo) lo = v;
-        if (v > hi) hi = v;
-        seen++;
+    int seen = 0;
+    for (int k = 0; k < p->n; k++) {
+        const bs_field_t *f = &BEACON_SERIES_FIELDS[p->field[k]];
+        if (strcmp(f->unit, u) != 0) continue;
+        for (int i = i0; i < i1; i++) {
+            double v = 0.0;
+            if (!beacon_series_value(f, g_s[i].payload, g_s[i].len, &v)) continue;
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+            seen++;
+        }
     }
-
-    char head[160];
-    if (seen == 0) {
-        snprintf(head, sizeof head, "%s  (%s)  -- nothing in this window",
-                 f->label, f->unit[0] ? f->unit : "count");
-        draw_text(head, x + 8, y + 3, 12, GRAY);
-        return 0;
-    }
-
+    if (seen == 0) return 0;
     // A flat series would otherwise be a line on the axis with no
     // scale; give it a little room either side so the value reads.
     if (hi - lo < 1e-9) {
@@ -485,98 +575,148 @@ static int draw_panel(const bs_field_t *f, Color c, int x, int y, int w, int h,
         lo -= pad;
         hi += pad;
     }
+    *lo_out = lo;
+    *hi_out = hi;
+    return seen;
+}
+
+// The labelled lines of one axis. The left axis draws its grid across
+// the panel; the right one only ticks its edge, since two grids on one
+// panel are a mesh nobody can read.
+static void draw_axis(double lo, double hi, int px, int py, int pw, int ph,
+                      int right)
+{
+    const double step = nice_step(hi - lo, 3);
+    // Enough decimals for the step to show, and no more.
+    const int dp = step >= 10.0 ? 0 : step >= 1.0 ? 1 : step >= 0.1 ? 2 : 3;
+    for (double gv = ceil(lo / step) * step; gv <= hi; gv += step) {
+        const int gy = py + ph - (int) ((double) ph * (gv - lo) / (hi - lo));
+        if (gy < py || gy > py + ph) continue;
+        char lab[32];
+        snprintf(lab, sizeof lab, "%.*f", dp, gv);
+        if (right) {
+            DrawLine(px + pw - 5, gy, px + pw, gy, (Color){ 90, 90, 100, 255 });
+            draw_text(lab, px + pw + 6, gy - 5, 11, GRAY);
+        } else {
+            DrawLine(px, gy, px + pw, gy, (Color){ 44, 44, 54, 255 });
+            draw_text(lab, px - 6 - text_width(lab, 11), gy - 5, 11, GRAY);
+        }
+    }
+}
+
+// Draw one panel and every series in it.
+static void draw_panel(const panel_t *p, int x, int y, int w, int h,
+                       int have_cursor, double cursor_ms)
+{
+    DrawRectangle(x, y, w, h, (Color){ 26, 26, 32, 255 });
+    DrawRectangleLines(x, y, w, h, (Color){ 52, 52, 62, 255 });
+
+    const int pad_t = 17, pad_b = 4;
+    const int px = x + PAD_L, py = y + pad_t;
+    const int pw = w - PAD_L - PAD_R, ph = h - pad_t - pad_b;
+    if (pw < 10 || ph < 10) return;
+
+    if (p->n == 0) {
+        draw_text("empty: click here, then pick fields on the left",
+                  x + 8, y + 3, 12, (Color){ 90, 90, 100, 255 });
+        return;
+    }
+
+    // The range is found per frame from what is in the window, which
+    // keeps the scaling honest as the window moves -- the point of a
+    // plot like this is to see the shape of what is in view, not of
+    // the whole four months.
+    const int i0 = first_at(g_t0), i1 = first_at(g_t1 + 1e-3);
+    const char *ul, *ur;
+    panel_units(p, &ul, &ur);
+    double llo = 0, lhi = 1, rlo = 0, rhi = 1;
+    const int lseen = axis_range(p, ul, i0, i1, &llo, &lhi);
+    const int rseen = ur ? axis_range(p, ur, i0, i1, &rlo, &rhi) : 0;
+    if (lseen) draw_axis(llo, lhi, px, py, pw, ph, 0);
+    if (rseen) draw_axis(rlo, rhi, px, py, pw, ph, 1);
 
     #define SX(t) (px + (int) ((double) pw * ((t) - g_t0) / (g_t1 - g_t0)))
-    #define SY(v) (py + ph - (int) ((double) ph * ((v) - lo) / (hi - lo)))
 
-    // The y grid, labelled on the left.
-    const double step = nice_step(hi - lo, 3);
-    for (double gv = ceil(lo / step) * step; gv <= hi; gv += step) {
-        const int gy = SY(gv);
-        if (gy < py || gy > py + ph) continue;
-        DrawLine(px, gy, px + pw, gy, (Color){ 44, 44, 54, 255 });
-        char lab[32];
-        // Enough decimals for the step to show, and no more.
-        const int dp = step >= 10.0 ? 0 : step >= 1.0 ? 1 : step >= 0.1 ? 2 : 3;
-        snprintf(lab, sizeof lab, "%.*f", dp, gv);
-        draw_text(lab, x + pad_l - 6 - text_width(lab, 11), gy - 5, 11, GRAY);
-    }
+    // The headings run in from the left for the left axis and in from
+    // the right for the right one, so which axis a series reads off is
+    // where its name is.
+    int hx_l = x + 8, hx_r = x + w - 8;
+    for (int k = 0; k < p->n; k++) {
+        const bs_field_t *f = &BEACON_SERIES_FIELDS[p->field[k]];
+        const Color c = SERIES_C[k % SERIES_NC];
+        const int on_right = ur != NULL && strcmp(f->unit, ur) == 0;
+        const double lo = on_right ? rlo : llo, hi = on_right ? rhi : lhi;
+        const int axis_seen = on_right ? rseen : lseen;
+        #define SY(v) (py + ph - (int) ((double) ph * ((v) - lo) / (hi - lo)))
 
-    // The series. A dot per sample, and a line between neighbours close
-    // enough in time to belong to the same pass.
-    int    have_prev = 0;
-    double prev_t = 0.0;
-    Vector2 prev = {0};
-    for (int i = 0; i < g_n; i++) {
-        const double t = g_s[i].ts_ms;
-        if (t < g_t0 || t > g_t1) { have_prev = 0; continue; }
-        double v = 0.0;
-        if (!beacon_series_value(f, g_s[i].payload, g_s[i].len, &v)) {
-            have_prev = 0;
-            continue;
-        }
-        const Vector2 p = { (float) SX(t), (float) SY(v) };
-        if (have_prev && t - prev_t <= GAP_MS)
-            DrawLineEx(prev, p, 1.6f, c);
-        // At four months in one window the dots merge into a band, which
-        // is the right picture; when zoomed into a pass they are the
-        // individual beacons.
-        if (pw > 0 && (double) pw / (double) seen > 3.0)
-            DrawCircleV(p, 2.0f, c);
-        prev = p;
-        prev_t = t;
-        have_prev = 1;
-    }
-
-    // The heading: the field, its unit, and the range in view.
-    snprintf(head, sizeof head, "%s  (%s)      %.3g to %.3g",
-             f->label, f->unit[0] ? f->unit : "count", lo, hi);
-    draw_text(head, x + 8, y + 3, 12, c);
-
-    // The cursor's own value: the sample nearest it, so the number
-    // shown is one the satellite actually sent rather than an
-    // interpolation between two of them.
-    if (have_cursor) {
-        int best = -1;
-        double bestd = 1e300, bestv = 0.0;
-        for (int i = 0; i < g_n; i++) {
-            if (g_s[i].ts_ms < g_t0 || g_s[i].ts_ms > g_t1) continue;
+        // The series. A dot per sample, and a line between neighbours
+        // close enough in time to belong to the same pass.
+        int    have_prev = 0, seen = 0, best = -1;
+        double prev_t = 0.0, bestd = 1e300, bestv = 0.0;
+        Vector2 prev = {0};
+        for (int i = i0; i < i1 && axis_seen; i++) {
             double v = 0.0;
-            if (!beacon_series_value(f, g_s[i].payload, g_s[i].len, &v)) continue;
-            const double d = fabs(g_s[i].ts_ms - cursor_ms);
+            if (!beacon_series_value(f, g_s[i].payload, g_s[i].len, &v)) {
+                have_prev = 0;
+                continue;
+            }
+            seen++;
+            const double t = g_s[i].ts_ms;
+            const Vector2 q = { (float) SX(t), (float) SY(v) };
+            if (have_prev && t - prev_t <= GAP_MS) DrawLineEx(prev, q, 1.6f, c);
+            prev = q;
+            prev_t = t;
+            have_prev = 1;
+            const double d = fabs(t - cursor_ms);
             if (d < bestd) { bestd = d; best = i; bestv = v; }
         }
-        if (best >= 0) {
-            const Vector2 p = { (float) SX(g_s[best].ts_ms),
-                                (float) SY(bestv) };
-            DrawCircleLines((int) p.x, (int) p.y, 5.0f, RAYWHITE);
-            char val[48];
-            snprintf(val, sizeof val, "%.4g %s", bestv, f->unit);
-            const int tw = text_width(val, 12);
-            int vx = (int) p.x + 8;
-            if (vx + tw + 6 > x + w) vx = (int) p.x - 8 - tw;
-            DrawRectangle(vx - 3, (int) p.y - 8, tw + 6, 16,
-                          (Color){ 18, 18, 22, 210 });
-            draw_text(val, vx, (int) p.y - 6, 12, RAYWHITE);
+        // At four months in one window the dots would merge into a
+        // band; zoomed into a pass they are the individual beacons.
+        if (seen > 0 && (double) pw / (double) seen > 3.0) {
+            for (int i = i0; i < i1; i++) {
+                double v = 0.0;
+                if (!beacon_series_value(f, g_s[i].payload, g_s[i].len, &v)) continue;
+                DrawCircleV((Vector2){ (float) SX(g_s[i].ts_ms), (float) SY(v) },
+                            2.0f, c);
+            }
         }
+
+        // The heading: the field and its unit, and at the cursor the
+        // reading nearest it -- one the satellite actually sent rather
+        // than an interpolation between two.
+        char head[120];
+        if (seen == 0)
+            snprintf(head, sizeof head, "%s (%s): none here", f->label,
+                     unit_name(f->unit));
+        else if (have_cursor && best >= 0)
+            snprintf(head, sizeof head, "%s  %.4g %s", f->label, bestv, f->unit);
+        else
+            snprintf(head, sizeof head, "%s (%s)", f->label, unit_name(f->unit));
+        const int tw = text_width(head, 12);
+        const Color hc = seen ? c : GRAY;
+        if (on_right) { hx_r -= tw; draw_text(head, hx_r, y + 3, 12, hc); hx_r -= 18; }
+        else          { draw_text(head, hx_l, y + 3, 12, hc); hx_l += tw + 18; }
+
+        if (have_cursor && best >= 0)
+            DrawCircleLines(SX(g_s[best].ts_ms), SY(bestv), 5.0f, RAYWHITE);
+        #undef SY
     }
     #undef SX
-    #undef SY
-    return 1;
 }
 
 // ---- export ----------------------------------------------------------------
 
 // The visible window, as one CSV row per beacon and one column per
-// plotted field. A field with no reading in that beacon is left empty
-// rather than filled with a zero.
-static int export_csv(const char *path)
+// field on screen, each once however many panels it is in. A field
+// with no reading in that beacon is left empty rather than filled with
+// a zero.
+static int export_csv(const char *path, const int *cols, int ncol)
 {
     FILE *fp = fopen(path, "w");
     if (fp == NULL) return -1;
     fprintf(fp, "ts_utc,beacon");
-    for (int k = 0; k < g_nplot; k++)
-        fprintf(fp, ",%s", BEACON_SERIES_FIELDS[g_plot[k]].key);
+    for (int k = 0; k < ncol; k++)
+        fprintf(fp, ",%s", BEACON_SERIES_FIELDS[cols[k]].key);
     fputc('\n', fp);
 
     long rows = 0;
@@ -585,9 +725,9 @@ static int export_csv(const char *path)
         char ts[32];
         fmt_utc(g_s[i].ts_ms, ts, sizeof ts);
         fprintf(fp, "%sZ,%s", ts, g_s[i].is_ext ? "ext" : "basic");
-        for (int k = 0; k < g_nplot; k++) {
+        for (int k = 0; k < ncol; k++) {
             double v = 0.0;
-            if (beacon_series_value(&BEACON_SERIES_FIELDS[g_plot[k]],
+            if (beacon_series_value(&BEACON_SERIES_FIELDS[cols[k]],
                                     g_s[i].payload, g_s[i].len, &v))
                 fprintf(fp, ",%.6g", v);
             else
@@ -624,11 +764,13 @@ int main(int argc, char **argv)
         else if (strncmp(argv[i], "--fields=", 9) == 0) fields_arg = argv[i] + 9;
         else if (strcmp(argv[i], "--help") == 0) {
             printf("Usage: telemetry_browser [--db=<packet_db.sqlite>]"
-                   " [--fields=<key,key,...>]\n"
+                   " [--fields=<key+key,key,...>]\n"
                    "Plot FrontierSat's beacon telemetry against time, out of"
                    " the packet DB.\n"
                    "Both beacons are read: the satellite's own and the"
-                   " extended-beacon blob's.\n\n"
+                   " extended-beacon blob's.\n"
+                   "--fields gives one panel per comma; keys joined by + share"
+                   " a panel.\n\n"
                    "Fields (key -- what it is):\n");
             bs_group_t last = (bs_group_t) -1;
             for (size_t k = 0; k < BEACON_SERIES_FIELD_N; k++) {
@@ -661,6 +803,37 @@ int main(int argc, char **argv)
         db_path = db_default;
     }
 
+    // What to open with: the operator's pick, or a few fields that say
+    // most about the satellite's health in one screen.
+    char fbuf[512];
+    snprintf(fbuf, sizeof fbuf, "%s",
+             fields_arg != NULL ? fields_arg : "batt_v,pcu_in,obc_t");
+    g_npanel = 0;
+    char *save_p = NULL;
+    for (char *pt = strtok_r(fbuf, ",", &save_p); pt != NULL;
+         pt = strtok_r(NULL, ",", &save_p)) {
+        if (g_npanel == MAX_PANELS) {
+            fprintf(stderr, "telemetry_browser: at most %d panels\n", MAX_PANELS);
+            return 1;
+        }
+        panel_t *p = &g_panel[g_npanel++];
+        char *save_f = NULL;
+        for (char *tok = strtok_r(pt, "+", &save_f); tok != NULL;
+             tok = strtok_r(NULL, "+", &save_f)) {
+            const bs_field_t *f = beacon_series_find(tok);
+            if (f == NULL) {
+                fprintf(stderr, "telemetry_browser: no field '%s'"
+                                " (--help lists them)\n", tok);
+                return 1;
+            }
+            if (!panel_add(p, (int) (f - BEACON_SERIES_FIELDS))) {
+                fprintf(stderr, "telemetry_browser: %s: %s\n", tok, g_status);
+                return 1;
+            }
+        }
+    }
+    if (g_npanel == 0) g_npanel = 1;
+
     fprintf(stderr, "telemetry_browser: reading beacons from %s ...\n", db_path);
     if (load_samples(db_path) < 0) return 1;
     if (g_n == 0) {
@@ -670,27 +843,6 @@ int main(int argc, char **argv)
     fprintf(stderr, "telemetry_browser: %d beacons (%d basic, %d extended)"
                     " over %d passes.\n", g_n, g_nb, g_nx, g_npass);
 
-    // What to open with: the operator's pick, or a few fields that say
-    // most about the satellite's health in one screen.
-    if (fields_arg != NULL) {
-        char buf[512];
-        snprintf(buf, sizeof buf, "%s", fields_arg);
-        for (char *tok = strtok(buf, ","); tok != NULL; tok = strtok(NULL, ",")) {
-            const bs_field_t *f = beacon_series_find(tok);
-            if (f == NULL) {
-                fprintf(stderr, "telemetry_browser: no field '%s'"
-                                " (--help lists them)\n", tok);
-                return 1;
-            }
-            toggle_plot((int) (f - BEACON_SERIES_FIELDS));
-        }
-    } else {
-        const char *opening[] = { "batt_v", "pcu_in", "obc_t" };
-        for (size_t i = 0; i < sizeof opening / sizeof opening[0]; i++) {
-            const bs_field_t *f = beacon_series_find(opening[i]);
-            if (f != NULL) toggle_plot((int) (f - BEACON_SERIES_FIELDS));
-        }
-    }
     // Open on the last pass: the freshest telemetry is what an operator
     // coming off a pass wants to see, and the whole record is one key
     // away.
@@ -703,35 +855,70 @@ int main(int argc, char **argv)
     g_font_loaded = load_ui_font();
 
     float rep_up = 0, rep_down = 0, rep_left = 0, rep_right = 0;
+    int   slider_drag = 0;
 
     while (!WindowShouldClose()) {
         const int sw = GetScreenWidth(), sh = GetScreenHeight();
         const int plot_x = LEFT_W + 10;
         const int plot_w = sw - plot_x - 12;
-        const int plot_top = 44;
+        const int plot_top = 62;
         const int plot_bot = sh - FOOTER_H - 20;   // room for the time axis
         const int plot_h = plot_bot - plot_top;
+        // Where time runs, inside every panel's axis margins.
+        const int data_x = plot_x + PAD_L;
+        const int data_w = plot_w - PAD_L - PAD_R;
+
+        // The panel-count slider, top right above the panels.
+        const int sl_w = 160, sl_x = plot_x + plot_w - sl_w - 10, sl_y = 16;
 
         // ---- input ----
         const Vector2 m = GetMousePosition();
         const int over_plots = m.x >= plot_x && m.x < plot_x + plot_w
                             && m.y >= plot_top && m.y < plot_bot;
         const int over_list = m.x < LEFT_W;
+        const int cursor_before = g_cursor;
 
         if (key_repeat(KEY_DOWN, &rep_down)
             && g_cursor < (int) BEACON_SERIES_FIELD_N - 1) g_cursor++;
         if (key_repeat(KEY_UP, &rep_up) && g_cursor > 0) g_cursor--;
-        if (IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_ENTER))
-            toggle_plot(g_cursor);
-        if (IsKeyPressed(KEY_N)) g_nplot = 0;
-        if (IsKeyPressed(KEY_A)) {
-            // Every field of the group the cursor is in, as far as the
-            // panel limit allows.
-            const bs_group_t grp = BEACON_SERIES_FIELDS[g_cursor].group;
-            g_nplot = 0;
-            for (size_t k = 0; k < BEACON_SERIES_FIELD_N && g_nplot < MAX_PLOTS; k++)
-                if (BEACON_SERIES_FIELDS[k].group == grp) g_plot[g_nplot++] = (int) k;
+        if (!g_follow && (IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_ENTER)))
+            panel_toggle(&g_panel[g_focus], g_cursor);
+        if (IsKeyPressed(KEY_F)) {
+            g_follow = !g_follow;
+            if (g_follow) follow_cursor();
         }
+        if (IsKeyPressed(KEY_N)) g_panel[g_focus].n = 0;
+        if (IsKeyPressed(KEY_A) && !g_follow) {
+            // Every field of the group the cursor is in, into the
+            // focused panel, as far as its axes and room allow.
+            const bs_group_t grp = BEACON_SERIES_FIELDS[g_cursor].group;
+            int left_out = 0;
+            for (size_t k = 0; k < BEACON_SERIES_FIELD_N; k++)
+                if (BEACON_SERIES_FIELDS[k].group == grp
+                    && !panel_add(&g_panel[g_focus], (int) k)) left_out++;
+            if (left_out) {
+                char msg[120];
+                snprintf(msg, sizeof msg, "%d of the group left out: no axis"
+                         " or no room for them in this panel", left_out);
+                set_status(5.0f, msg);
+            }
+        }
+
+        // The number of panels: the slider, or - and =.
+        if (IsKeyPressed(KEY_MINUS) && g_npanel > 1) g_npanel--;
+        if (IsKeyPressed(KEY_EQUAL) && g_npanel < MAX_PANELS) g_npanel++;
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)
+            && m.x >= sl_x - 8 && m.x <= sl_x + sl_w + 8
+            && m.y >= sl_y - 8 && m.y <= sl_y + 12) slider_drag = 1;
+        if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) slider_drag = 0;
+        if (slider_drag) {
+            const float fr = (m.x - (float) sl_x) / (float) sl_w;
+            int n = 1 + (int) lroundf(fr * (float) (MAX_PANELS - 1));
+            if (n < 1) n = 1;
+            if (n > MAX_PANELS) n = MAX_PANELS;
+            g_npanel = n;
+        }
+        if (g_focus >= g_npanel) g_focus = g_npanel - 1;
 
         // Panning and zooming in time.
         const double span = g_t1 - g_t0;
@@ -742,11 +929,20 @@ int main(int argc, char **argv)
         if (IsKeyPressed(KEY_G)) view_all();
 
         if (over_plots) {
+            // A click gives the panel under it the focus: the one the
+            // list adds to and takes from.
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                for (int i = 0; i < g_npanel; i++) {
+                    int py, ph;
+                    panel_rect(i, g_npanel, plot_top, plot_h, &py, &ph);
+                    if (m.y >= py && m.y < py + ph) g_focus = i;
+                }
+            }
             const float wheel = GetMouseWheelMove();
             if (wheel != 0.0f) {
                 // Zoom about the pointer, so the moment under it stays
                 // under it.
-                const double frac = (double) (m.x - plot_x) / (double) plot_w;
+                const double frac = (double) (m.x - data_x) / (double) data_w;
                 const double at = g_t0 + span * frac;
                 const double k = exp(-0.18 * (double) wheel);
                 double ns = span * k;
@@ -756,13 +952,14 @@ int main(int argc, char **argv)
             }
             if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
                 const Vector2 d = GetMouseDelta();
-                const double per_px = span / (double) plot_w;
+                const double per_px = span / (double) data_w;
                 g_t0 -= (double) d.x * per_px;
                 g_t1 -= (double) d.x * per_px;
             }
         }
         if (over_list) g_list_scroll -= GetMouseWheelMove() * 3.0f * ROW_H;
-        if (over_list && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        if (over_list && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)
+            && m.y >= plot_top) {
             const int row = (int) ((m.y - plot_top + g_list_scroll) / ROW_H);
             // The rows carry group headings between them, so the hit
             // test walks the same layout the drawing does.
@@ -773,39 +970,54 @@ int main(int argc, char **argv)
                     last = BEACON_SERIES_FIELDS[k].group;
                     yy++;
                 }
-                if (yy == row) { g_cursor = (int) k; toggle_plot((int) k); break; }
+                if (yy == row) {
+                    g_cursor = (int) k;
+                    if (!g_follow) panel_toggle(&g_panel[g_focus], (int) k);
+                    break;
+                }
                 yy++;
             }
         }
+        if (g_follow && g_cursor != cursor_before) follow_cursor();
 
         if (IsKeyPressed(KEY_E)) {
-            if (g_nplot == 0) {
-                snprintf(g_status, sizeof g_status,
-                         "nothing to write: pick a field first");
+            // Every field on screen, once each, in panel order.
+            int cols[MAX_PANELS * MAX_PER_PANEL];
+            int ncol = 0;
+            for (int i = 0; i < g_npanel; i++)
+                for (int j = 0; j < g_panel[i].n; j++) {
+                    int dup = 0;
+                    for (int c = 0; c < ncol; c++)
+                        if (cols[c] == g_panel[i].field[j]) dup = 1;
+                    if (!dup) cols[ncol++] = g_panel[i].field[j];
+                }
+            char msg[160];
+            if (ncol == 0) {
+                snprintf(msg, sizeof msg, "nothing to write: pick a field first");
             } else {
-                const int rows = export_csv("telemetry.csv");
+                const int rows = export_csv("telemetry.csv", cols, ncol);
                 if (rows < 0)
-                    snprintf(g_status, sizeof g_status,
-                             "could not write telemetry.csv");
+                    snprintf(msg, sizeof msg, "could not write telemetry.csv");
                 else
-                    snprintf(g_status, sizeof g_status,
+                    snprintf(msg, sizeof msg,
                              "wrote telemetry.csv: %d beacons, %d field%s",
-                             rows, g_nplot, g_nplot == 1 ? "" : "s");
+                             rows, ncol, ncol == 1 ? "" : "s");
             }
-            g_status_left = 6.0f;
+            set_status(6.0f, msg);
         }
         if (IsKeyPressed(KEY_F5)) {
             const double save0 = g_t0, save1 = g_t1;
             const int got = load_samples(db_path);
+            char msg[160];
             if (got > 0) {
                 g_t0 = save0; g_t1 = save1;
-                snprintf(g_status, sizeof g_status,
+                snprintf(msg, sizeof msg,
                          "reloaded: %d beacons (%d basic, %d extended)",
                          g_n, g_nb, g_nx);
             } else {
-                snprintf(g_status, sizeof g_status, "reload found no beacons");
+                snprintf(msg, sizeof msg, "reload found no beacons");
             }
-            g_status_left = 6.0f;
+            set_status(6.0f, msg);
         }
         if (IsKeyPressed(KEY_Q)) break;
         if (g_status_left > 0.0f) g_status_left -= GetFrameTime();
@@ -824,11 +1036,14 @@ int main(int argc, char **argv)
         BeginDrawing();
         ClearBackground((Color){ 18, 18, 22, 255 });
 
-        // The field list.
+        // The field list. Its markers are the focused panel's: a filled
+        // square in the series' colour for a field in it, a hollow one
+        // for a field in some other panel on screen.
+        const panel_t *fp = &g_panel[g_focus];
         DrawRectangle(0, 0, LEFT_W, sh, (Color){ 28, 28, 34, 255 });
         draw_text("Telemetry fields", 12, 10, 18, RAYWHITE);
-        draw_text(TextFormat("%d/%d", g_nplot, MAX_PLOTS),
-                  LEFT_W - 52, 14, 12, GRAY);
+        if (g_follow)
+            draw_text("follow", LEFT_W - 56, 14, 12, (Color){ 255, 190, 90, 255 });
 
         BeginScissorMode(0, plot_top - 4, LEFT_W, sh - FOOTER_H - plot_top + 4);
         {
@@ -842,22 +1057,23 @@ int main(int argc, char **argv)
                               (Color){ 120, 150, 190, 255 });
                     y += ROW_H;
                 }
-                const int on = is_plotted((int) k);
+                const int slot = panel_slot(fp, (int) k);
+                int elsewhere = 0;
+                for (int i = 0; i < g_npanel; i++)
+                    if (i != g_focus && panel_slot(&g_panel[i], (int) k) >= 0)
+                        elsewhere = 1;
                 if ((int) k == g_cursor)
-                    DrawRectangle(0, y, LEFT_W, ROW_H, (Color){ 44, 70, 110, 255 });
-                // The marker doubles as the series colour, so a panel
-                // and its row are tied together by eye.
-                if (on) {
-                    int slot = 0;
-                    for (int i = 0; i < g_nplot; i++) if (g_plot[i] == (int) k) slot = i;
-                    DrawRectangle(8, y + 5, 8, 8,
-                                  SERIES_C[slot % (int) (sizeof SERIES_C
-                                                         / sizeof SERIES_C[0])]);
-                } else {
-                    DrawRectangleLines(8, y + 5, 8, 8, (Color){ 90, 90, 100, 255 });
-                }
+                    DrawRectangle(0, y, LEFT_W, ROW_H,
+                                  g_follow ? (Color){ 110, 76, 30, 255 }
+                                           : (Color){ 44, 70, 110, 255 });
+                if (slot >= 0)
+                    DrawRectangle(8, y + 5, 8, 8, SERIES_C[slot % SERIES_NC]);
+                else
+                    DrawRectangleLines(8, y + 5, 8, 8,
+                                       elsewhere ? (Color){ 170, 170, 185, 255 }
+                                                 : (Color){ 70, 70, 80, 255 });
                 draw_text(f->key, 24, y + 3, 12,
-                          on ? RAYWHITE : (Color){ 170, 170, 180, 255 });
+                          slot >= 0 ? RAYWHITE : (Color){ 170, 170, 180, 255 });
                 if (f->ext_only)
                     draw_text("ext", LEFT_W - 30, y + 4, 10,
                               (Color){ 120, 160, 200, 255 });
@@ -877,40 +1093,45 @@ int main(int argc, char **argv)
             char d[120];
             snprintf(d, sizeof d, "%s%s%s%s", f->label,
                      f->unit[0] ? "  (" : "", f->unit, f->unit[0] ? ")" : "");
-            draw_text(d, 12, 27, 12, (Color){ 150, 150, 160, 255 });
+            draw_text(d, 12, 32, 12, (Color){ 150, 150, 160, 255 });
+        }
+
+        // The slider: one stop per panel count.
+        {
+            draw_text("panels", sl_x - 58, sl_y - 5, 12, GRAY);
+            DrawRectangle(sl_x, sl_y, sl_w, 3, (Color){ 70, 70, 80, 255 });
+            for (int n = 1; n <= MAX_PANELS; n++) {
+                const int tx = sl_x + sl_w * (n - 1) / (MAX_PANELS - 1);
+                DrawRectangle(tx - 1, sl_y - 3, 2, 9, (Color){ 90, 90, 100, 255 });
+            }
+            const int kx = sl_x + sl_w * (g_npanel - 1) / (MAX_PANELS - 1);
+            DrawCircle(kx, sl_y + 1, 7.0f, (Color){ 120, 200, 255, 255 });
+            char nlab[8];
+            snprintf(nlab, sizeof nlab, "%d", g_npanel);
+            draw_text(nlab, sl_x + sl_w + 12, sl_y - 5, 12, RAYWHITE);
         }
 
         // The plots.
-        const int have_cursor = over_plots;
+        const int have_cursor = over_plots && m.x >= data_x && m.x < data_x + data_w;
         const double cursor_ms = g_t0 + (g_t1 - g_t0)
-                               * (double) (m.x - plot_x) / (double) plot_w;
-        if (g_nplot == 0) {
-            draw_text("Pick a field on the left (space) to plot it.",
-                      plot_x + 10, plot_top + 12, 14, GRAY);
-        } else {
-            const int gap = 6;
-            const int each = (plot_h - gap * (g_nplot - 1)) / g_nplot;
-            for (int i = 0; i < g_nplot; i++) {
-                const int py = plot_top + i * (each + gap);
-                draw_panel(&BEACON_SERIES_FIELDS[g_plot[i]],
-                           SERIES_C[i % (int) (sizeof SERIES_C
-                                               / sizeof SERIES_C[0])],
-                           plot_x, py, plot_w, each, have_cursor, cursor_ms);
-            }
-            // The cursor, drawn over every panel at once so values at
-            // the same moment line up down the screen.
-            if (have_cursor) {
-                DrawLine((int) m.x, plot_top, (int) m.x, plot_bot,
-                         (Color){ 255, 255, 255, 60 });
-            }
+                               * (double) (m.x - data_x) / (double) data_w;
+        for (int i = 0; i < g_npanel; i++) {
+            int py, ph;
+            panel_rect(i, g_npanel, plot_top, plot_h, &py, &ph);
+            draw_panel(&g_panel[i], plot_x, py, plot_w, ph, have_cursor, cursor_ms);
         }
+        // The cursor, drawn over every panel at once so values at the
+        // same moment line up down the screen.
+        if (have_cursor)
+            DrawLine((int) m.x, plot_top, (int) m.x, plot_bot,
+                     (Color){ 255, 255, 255, 60 });
 
         // The time axis under the panels: a handful of labelled ticks.
         {
-            const int ticks = plot_w / 130;
+            const int ticks = data_w / 130;
             for (int i = 0; i <= ticks; i++) {
                 const double t = g_t0 + (g_t1 - g_t0) * (double) i / (double) (ticks ? ticks : 1);
-                const int tx = plot_x + plot_w * i / (ticks ? ticks : 1);
+                const int tx = data_x + data_w * i / (ticks ? ticks : 1);
                 DrawLine(tx, plot_bot, tx, plot_bot + 4, (Color){ 90, 90, 100, 255 });
                 char lab[32];
                 fmt_utc_short(t, lab, sizeof lab);
@@ -952,9 +1173,10 @@ int main(int argc, char **argv)
             draw_text(g_status, 12, sh - FOOTER_H + 7, 12,
                       (Color){ 255, 210, 130, 255 });
         } else {
-            draw_text("up/down field   space plot   a group   n none   "
-                      "drag/left/right pan   scroll zoom   [ ] pass   "
-                      "g all   e csv   F5 reload   q quit",
+            draw_text("click panel focus   up/down field   space add/remove   "
+                      "f follow   a group   n clear   - = panels   "
+                      "drag pan   scroll zoom   [ ] pass   g all   e csv   "
+                      "F5 reload   q quit",
                       12, sh - FOOTER_H + 7, 12, (Color){ 140, 140, 150, 255 });
         }
 
