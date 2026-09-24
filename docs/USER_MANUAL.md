@@ -1266,7 +1266,10 @@ or, having started with the gate, override it.
 
 The `A` modal lists the commands, lets the operator set per-pass
 parameters (power, repeats, delay), and ticks the same three TX
-safety gates. Once running, each tick checks whether the next
+safety gates. Below allow-tx, a **loop** checkbox makes the run wrap
+back to the first command once the whole file has been sent, and send
+it again. It keeps looping until you stop it or the pass ends (LOS).
+Each wrap is logged as `auto-tcmd-loop`. Once running, each tick checks whether the next
 command's `@tsexec=` has arrived. If it has, the command is staged
 into the same `tx-request` slot the compose modal uses. The TX
 dispatch is async (submit + poll), so the rotator, redraw, IPC, and

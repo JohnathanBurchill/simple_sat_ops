@@ -223,7 +223,7 @@ int auto_tcmd_progress(tx_t *tx, int *sent, int *total, const char **label) {
     const auto_tcmd_t *a = &tx->auto_tcmd;
     if (!tx->auto_tcmd_active || a->state == AUTO_STATE_SETUP) return 0;
     *sent  = a->sends_total;
-    *total = a->n_commands * a->repeats_total;
+    *total = a->n_commands * a->repeats_total * (a->loops_done + 1);
     *label = auto_tcmd_state_label(a->state);
     return 1;
 }
@@ -232,7 +232,7 @@ int auto_field_is_text(auto_tcmd_field_t f) {
     return f == AUTO_F_POWER || f == AUTO_F_REPEATS || f == AUTO_F_INTERVAL;
 }
 static int auto_field_is_toggle(auto_tcmd_field_t f) {
-    return f == AUTO_F_ALLOW_TX;
+    return f == AUTO_F_ALLOW_TX || f == AUTO_F_LOOP;
 }
 
 static char *auto_field_buf(auto_tcmd_t *a, auto_tcmd_field_t f, size_t *cap) {
@@ -316,6 +316,7 @@ static void auto_field_end(auto_tcmd_t *a) {
 }
 static void auto_field_toggle(auto_tcmd_t *a) {
     if (a->focus == AUTO_F_ALLOW_TX) a->allow_tx = !a->allow_tx;
+    if (a->focus == AUTO_F_LOOP)     a->loop     = !a->loop;
 }
 
 // Render helper — single inverse-cursor text-field cell, same shape as
@@ -401,13 +402,23 @@ static void auto_tcmd_draw(state_t *state) {
     if (!running_ro && a->focus == AUTO_F_ALLOW_TX) wattroff(w, A_REVERSE);
     mvw_printf_clip(w, 7, 7, "allow-tx  (required to key the PA)");
 
-    mvw_printf_clip(w, 9, 2, "State:    %s", auto_tcmd_state_label(a->state));
+    snprintf(tg, sizeof tg, "[%c]", a->loop ? 'x' : ' ');
+    if (!running_ro && a->focus == AUTO_F_LOOP) wattron(w, A_REVERSE);
+    mvwprintw(w, 8, 2, "%s", tg);
+    if (!running_ro && a->focus == AUTO_F_LOOP) wattroff(w, A_REVERSE);
+    if (a->loop && a->loops_done > 0)
+        mvw_printf_clip(w, 8, 7, "loop  (send the whole file again when done; "
+                        "%d pass(es) complete)", a->loops_done);
+    else
+        mvw_printf_clip(w, 8, 7, "loop  (send the whole file again when done)");
+
+    mvw_printf_clip(w, 10, 2, "State:    %s", auto_tcmd_state_label(a->state));
     if (a->n_commands > 0) {
         int rt = a->repeats_total > 0 ? a->repeats_total : 0;
         char tx_spent[16], tx_total[16];
         fmt_minsec(a->tx_seconds_spent, tx_spent, sizeof tx_spent);
         fmt_minsec(a->tx_seconds_total, tx_total, sizeof tx_total);
-        mvw_printf_clip(w, 10, 2,
+        mvw_printf_clip(w, 11, 2,
                   "Progress: cmd %d/%d   send %d/%d   total sent: %d   "
                   "(elapsed %s / ~%s)",
                   a->cmd_idx + (a->state == AUTO_STATE_RUNNING ? 1 : 0),
@@ -416,11 +427,11 @@ static void auto_tcmd_draw(state_t *state) {
                   a->sends_total,
                   tx_spent, tx_total);
     } else {
-        mvw_printf_clip(w, 10, 2, "Progress: (no commands loaded)");
+        mvw_printf_clip(w, 11, 2, "Progress: (no commands loaded)");
     }
-    mvw_printf_clip(w, 11, 2, "Last sent: %s",
+    mvw_printf_clip(w, 12, 2, "Last sent: %s",
                     a->last_sent[0] ? a->last_sent : "-");
-    mvw_printf_clip(w, 12, 2, "Status:    %s",
+    mvw_printf_clip(w, 13, 2, "Status:    %s",
                     a->status_msg[0] ? a->status_msg : "-");
 
     // Outcome of the most recent serviced burst. The modal covers the bottom
@@ -428,9 +439,9 @@ static void auto_tcmd_draw(state_t *state) {
     // command reached the air or was rejected (no B210 / dry-run / ...). A
     // NOT-SENT line is drawn bold so a silently-rejecting run can't pass for a
     // transmitting one. See tx_burst_service_request.
-    mvw_printf_clip(w, 13, 2, "Last burst:");
+    mvw_printf_clip(w, 14, 2, "Last burst:");
     if (state->tx.last_burst_outcome[0] == '\0') {
-        mvw_printf_clip(w, 13, 13, "(none yet)");
+        mvw_printf_clip(w, 14, 13, "(none yet)");
     } else if (state->tx.last_burst_on_air) {
         // air    = submit -> done (the half-duplex burst itself)
         // held   = staging -> done (what actually gates the next auto-tcmd send)
@@ -442,35 +453,35 @@ static void auto_tcmd_draw(state_t *state) {
             snprintf(pstr, sizeof pstr, "%.2f", state->tx.last_send_period_s);
         else
             snprintf(pstr, sizeof pstr, "--");
-        mvw_printf_clip(w, 13, 13,
+        mvw_printf_clip(w, 14, 13,
                  "on air - %.30s  air=%.2f held=%.2f period=%s s",
                  state->tx.last_burst_outcome,
                  state->tx.last_burst_wall_s,
                  state->tx.last_burst_slot_s, pstr);
     } else {
         wattron(w, A_BOLD);
-        mvw_printf_clip(w, 13, 13, "NOT SENT - %.80s",
+        mvw_printf_clip(w, 14, 13, "NOT SENT - %.80s",
                   state->tx.last_burst_outcome);
         wattroff(w, A_BOLD);
     }
 
     if (a->state == AUTO_STATE_RUNNING) {
-        mvw_printf_clip(w, 14, 2,
+        mvw_printf_clip(w, 15, 2,
                   "Running - s stops   Esc interrupts (pause/abort)");
     } else if (a->state == AUTO_STATE_PAUSE_PROMPT) {
         wattron(w, A_BOLD);
-        mvw_printf_clip(w, 14, 2,
+        mvw_printf_clip(w, 15, 2,
                   "INTERRUPT:  P pause (resume later)   A abort   "
                   "Esc keep running");
         wattroff(w, A_BOLD);
     } else if (a->state == AUTO_STATE_RESUME_PROMPT) {
         wattron(w, A_BOLD);
-        mvw_printf_clip(w, 14, 2,
+        mvw_printf_clip(w, 15, 2,
                   "PAUSED:  R resume from here   S start over   "
                   "Esc keep paused");
         wattroff(w, A_BOLD);
     } else {
-        mvw_printf_clip(w, 14, 2,
+        mvw_printf_clip(w, 15, 2,
                   "Tab focus  Space toggle  Enter start  Esc cancel");
     }
 
@@ -518,7 +529,7 @@ void auto_tcmd_refresh(state_t *state) {
 
 // Create the modal window. Returns 1 on success, 0 if newwin failed.
 static int auto_tcmd_make_window(state_t *state) {
-    int h = 17, ww = 110;
+    int h = 18, ww = 110;
     if (h > LINES) h = LINES;
     if (ww > COLS) ww = COLS;
     if (ww < 60)  ww = (COLS < 60) ? COLS : 60;
@@ -727,6 +738,8 @@ static int auto_tcmd_start(state_t *state) {
     a->cmd_idx       = 0;
     a->repeat_idx    = 0;
     a->sends_total   = 0;
+    a->loops_done       = 0;
+    a->loop_start_sends = 0;
     a->tx_seconds_spent = 0.0;
     // Wall-clock estimate for the whole run. auto_tcmd_tick spaces sends
     // by max(interval, burst): it waits `interval` measured from the start of
@@ -741,6 +754,9 @@ static int auto_tcmd_start(state_t *state) {
         a->tx_seconds_total += slot * (double) repeats;
         last_burst = burst;
     }
+    // A looping run restarts a pass one interval after its last send, so
+    // each pass costs the full sum; only the run's final send drops its tail.
+    a->pass_seconds = a->tx_seconds_total;
     if (a->n_commands > 0 && interval > last_burst)
         a->tx_seconds_total -= (interval - last_burst);
     a->start_ns      = ts_now_ns();
@@ -752,15 +768,15 @@ static int auto_tcmd_start(state_t *state) {
                  a->n_commands, repeats, interval);
     } else {
         snprintf(a->status_msg, sizeof a->status_msg,
-                 "running: %d cmds x %d repeats, %.2f s interval",
-                 a->n_commands, repeats, interval);
+                 "running: %d cmds x %d repeats, %.2f s interval%s",
+                 a->n_commands, repeats, interval, a->loop ? ", looping" : "");
     }
     {
         char det[256];
         snprintf(det, sizeof det,
                  "n_commands=%d repeats=%d interval_s=%.2f "
-                 "allow_tx=%d power=%.100s file=\"%.100s\"",
-                 a->n_commands, repeats, interval, a->allow_tx,
+                 "allow_tx=%d loop=%d power=%.100s file=\"%.100s\"",
+                 a->n_commands, repeats, interval, a->allow_tx, a->loop,
                  a->power, a->file_path);
         sso_audit_event("auto-tcmd-start", det);
     }
@@ -847,6 +863,9 @@ static void auto_tcmd_restart(state_t *state) {
     a->cmd_idx          = 0;
     a->repeat_idx       = 0;
     a->sends_total      = 0;
+    a->tx_seconds_total -= a->pass_seconds * (double) a->loops_done;
+    a->loops_done       = 0;
+    a->loop_start_sends = 0;
     a->tx_seconds_spent = 0.0;
     a->start_ns         = now;
     a->next_send_ns     = now;
@@ -1017,6 +1036,26 @@ void auto_tcmd_tick(state_t *state) {
                  "stopped: pass over (elevation %.1f deg)", el);
         auto_tcmd_draw(state);
         return;
+    }
+
+    // Loop mode: wrap to the top and send the whole file again. A pass that
+    // keyed nothing (every line skipped) would wrap forever without a send,
+    // so that ends the run as done instead.
+    if (a->cmd_idx >= a->n_commands && a->loop
+        && a->sends_total > a->loop_start_sends) {
+        a->cmd_idx          = 0;
+        a->repeat_idx       = 0;
+        a->loops_done++;
+        a->loop_start_sends = a->sends_total;
+        a->tx_seconds_total += a->pass_seconds;
+        snprintf(a->status_msg, sizeof a->status_msg,
+                 "looping: pass %d complete, starting pass %d",
+                 a->loops_done, a->loops_done + 1);
+        char det[128];
+        snprintf(det, sizeof det, "loops_done=%d sends_total=%d",
+                 a->loops_done, a->sends_total);
+        auto_tcmd_log(state, "auto-tcmd-loop", det);
+        auto_tcmd_draw(state);
     }
 
     if (a->cmd_idx >= a->n_commands) {
