@@ -569,7 +569,7 @@ static int auto_tcmd_reload(state_t *state) {
              "%.*s", (int)(sizeof state->tx.auto_tcmd.file_path - 1),
              state->tx.auto_tcmd_file_path);
     snprintf(state->tx.auto_tcmd.power,   sizeof state->tx.auto_tcmd.power,   "80.0");
-    snprintf(state->tx.auto_tcmd.repeats, sizeof state->tx.auto_tcmd.repeats, "3");
+    snprintf(state->tx.auto_tcmd.repeats, sizeof state->tx.auto_tcmd.repeats, "1");
     snprintf(state->tx.auto_tcmd.interval_s, sizeof state->tx.auto_tcmd.interval_s, "1.0");
     state->tx.auto_tcmd.allow_tx = 0;
     state->tx.auto_tcmd.focus    = AUTO_F_POWER;
