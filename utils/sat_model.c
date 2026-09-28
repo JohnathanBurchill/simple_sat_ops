@@ -75,14 +75,14 @@ static const Color C_EDGE      = { 225, 230, 240, 110 };
 typedef struct {
     double  v[4][3];
     Color   c;
-} quad_t;
+} mesh_quad_t;
 
 // Enough for the body, three barrels, the boom roll and the patches.
 #define MAX_QUADS 64
 
 typedef struct {
-    quad_t q[MAX_QUADS];
-    int    n;
+    mesh_quad_t q[MAX_QUADS];
+    int         n;
 } mesh_t;
 
 static void add_quad(mesh_t *m, Color c,
@@ -90,7 +90,7 @@ static void add_quad(mesh_t *m, Color c,
                      const double d[3], const double e[3])
 {
     if (m->n >= MAX_QUADS) return;
-    quad_t *q = &m->q[m->n++];
+    mesh_quad_t *q = &m->q[m->n++];
     memcpy(q->v[0], a, 3 * sizeof(double));
     memcpy(q->v[1], b, 3 * sizeof(double));
     memcpy(q->v[2], d, 3 * sizeof(double));
@@ -244,7 +244,7 @@ void sat_model_draw(const globe_proj_t *pr,
     int nout = 0;
 
     for (int i = 0; i < mesh.n; i++) {
-        const quad_t *q = &mesh.q[i];
+        const mesh_quad_t *q = &mesh.q[i];
 
         // Body metres into the Earth-fixed world, through the body axes.
         double w[4][3];
