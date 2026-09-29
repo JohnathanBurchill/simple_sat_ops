@@ -727,6 +727,17 @@ static int sim_start(sim_t *out, int can_reach_info_level)
     // Hold the slave open in the parent too, so the pty survives the
     // driver closing it between probes.
     int keep = open(slave, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    // Linux hands out a new pty with echo on (macOS doesn't), so the sim
+    // would read back its own lines and take the digits in them for
+    // log-level commands, burying the driver's real one. A USB board
+    // never hears its own output; make the pty raw from the start.
+    if (keep >= 0) {
+        struct termios raw;
+        if (tcgetattr(keep, &raw) == 0) {
+            cfmakeraw(&raw);
+            tcsetattr(keep, TCSANOW, &raw);
+        }
+    }
     fcntl(master, F_SETFL, O_NONBLOCK);
     pid_t pid = fork();
     if (pid < 0) { close(master); if (keep >= 0) close(keep); return -1; }
