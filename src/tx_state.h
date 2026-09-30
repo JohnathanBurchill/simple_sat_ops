@@ -82,6 +82,7 @@ typedef enum {
     AUTO_F_REPEATS,
     AUTO_F_INTERVAL,
     AUTO_F_ALLOW_TX,
+    AUTO_F_LOOP,
     AUTO_F_COUNT,
 } auto_tcmd_field_t;
 
@@ -120,6 +121,9 @@ typedef struct auto_tcmd {
     // floor at run start (AUTO_TCMD_MIN_INTERVAL_S).
     char interval_s[12];
     int  allow_tx;
+    // When set, a run that reaches the end of the file wraps to the first
+    // command and sends the whole file again, until stopped or LOS.
+    int  loop;
     auto_tcmd_field_t focus;
     int               cursors[AUTO_F_COUNT];
 
@@ -133,6 +137,9 @@ typedef struct auto_tcmd {
     long   start_ns;       // wall-clock at run start, for elapsed TX time
     long   pause_ns;       // ts_now_ns() when paused; shifts start_ns on resume
     int    sends_total;    // running tally — every queued burst
+    int    loops_done;     // full passes through the file completed (loop mode)
+    int    loop_start_sends; // sends_total when the current pass began
+    double pass_seconds;   // wall-clock estimate for one pass through the file
     // On-air seconds accumulated and total (AX100/9600/preroll math).
     double tx_seconds_spent;
     double tx_seconds_total;
