@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`c90c489` (2026-09-18). This is a working draft.
+`590e760` (2026-09-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -3827,10 +3827,18 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   `decode_inspector --live` at a pass that is still being recorded
   across the room. `HOST` and `REMOTE_ROOT` override the target.
 * **`antenna_cam.sh`** — a small always-on-top window showing the RAO
-  antenna webcam, run from the operator's laptop connected over SSH (the 
-  remote `ffmpeg` repackages the camera's native MJPEG, no transcode). 
-  `--with-timelapse=N` branches off a sped-up MP4 written when you close 
-  the viewer. Run it from your laptop, not on the ground machine.
+  antenna webcam, run from the operator's laptop connected over SSH (the
+  remote `ffmpeg` repackages the camera's native MJPEG, no transcode).
+  `--with-timelapse=N` branches off a sped-up MP4 written when you close
+  the viewer. **Run it on your own laptop, not inside the SSH session on
+  the ground machine.** It opens the video window locally and reaches out
+  to the ground station itself, so running it on the far side asks that
+  host to SSH back to itself and draw a window on a screen it doesn't
+  have. It now refuses to start when it detects an SSH session and says
+  so, rather than failing obscurely with `Hostname rao not found` (the
+  `rao` alias lives in your laptop's `~/.ssh/config` and doesn't exist on
+  the ground station). Set `ANTENNA_CAM_ALLOW_REMOTE=1` to override, which
+  only makes sense with a forwarded display.
 
 ### Audio and sky plots
 
