@@ -215,7 +215,7 @@
 
     Read-only on the DB. Press F5 to re-read it and rebuild the experiment list.
 
-    A single file: given --file=<path> to an MPI science-data file (one that
+    A single file: given --file <path> to an MPI science-data file (one that
     mpi_reconstruct wrote, or one copied off the satellite) the viewer shows just
     that file as its one experiment, built the same way as one from the DB but
     from a single chunk covering the whole file. F5 then re-reads the file. The
@@ -225,7 +225,7 @@
     nothing for d to re-download.
 
     Usage:
-      mpi_viewer [--db=<packet_db.sqlite>] [--file=<mpi_file>] [--list]
+      mpi_viewer [--db=<packet_db.sqlite>] [--file <mpi_file>] [--list]
       mpi_viewer --help
 
     With no --db the default store is used ($SSO_PACKET_DB, else the FrontierSat
@@ -2742,11 +2742,11 @@ static int position_on_a_monitor(int x, int y)
 // Parsed command-line configuration. parse_args() fills this; main() reads it.
 typedef struct {
     const char *db_path;    // --db=, else NULL for the default store
-    const char *file_path;  // --file=, else NULL to list the DB's experiments
+    const char *file_path;  // --file, else NULL to list the DB's experiments
     int         list_only;  // --list
 } mv_args_t;
 
-// Option column width: the widest label below ("--file=<path>") + a small
+// Option column width: the widest label below ("--file <path>") + a small
 // margin. See src/cli/argparse.h for the parse_args convention.
 #define OPTW 15
 
@@ -2771,10 +2771,28 @@ static int parse_args(mv_args_t *a, int argc, char **argv, int help)
             else a->db_path = arg + 5;
             matched = 1;
         }
-        if (strncmp(arg, "--file=", 7) == 0 || help) {
-            if (help) parse_help_line(OPTW, "--file=<path>", "show this one MPI science-data file instead of the DB's experiments");
-            else a->file_path = arg + 7;
+        // A filename option takes the space form (--file <path>) so the shell
+        // expands ~ and TAB-completes the path; the --file=<path> spelling is
+        // rejected with a hint, as simple_sat_ops does for its own.
+        if (strcmp(arg, "--file") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--file <path>", "show this one MPI science-data file instead of the DB's experiments");
+            else {
+                // arg is argv[t + 1]; its value is the next token,
+                // argv[t + 2]. Consume it and step t past it.
+                if (t + 2 >= argc) {
+                    fprintf(stderr, "mpi_viewer: --file: missing <path>\n");
+                    return PARSE_ERROR;
+                }
+                a->file_path = argv[t + 2];
+                ++t;
+            }
             matched = 1;
+        }
+        if (strncmp(arg, "--file=", 7) == 0) {
+            fprintf(stderr,
+                "mpi_viewer: --file=<path> is not accepted; "
+                "use `--file <path>` (TAB-completes the filename)\n");
+            return PARSE_ERROR;
         }
         if (strcmp(arg, "--list") == 0 || help) {
             if (help) parse_help_line(OPTW, "--list", "print what each experiment reconstructed to and exit, no window");
@@ -2797,7 +2815,7 @@ static int parse_args(mv_args_t *a, int argc, char **argv, int help)
         printf("\nInspect MPI science imagery reconstructed from the packet DB. The\n"
                "left panel lists MPI experiments, newest first; F5 re-reads the DB.\n"
                "\n"
-               "Given --file= -- a file mpi_reconstruct wrote, or a science file\n"
+               "Given --file -- a file mpi_reconstruct wrote, or a science file\n"
                "straight off the satellite -- it shows that one file instead of the\n"
                "DB's experiments, and F5 re-reads the file. The DB (--db, else the\n"
                "default) is then only read for the globe's TLEs and attitudes. A\n"
