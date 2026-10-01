@@ -215,17 +215,18 @@
 
     Read-only on the DB. Press F5 to re-read it and rebuild the experiment list.
 
-    A single file: given the path of an MPI science-data file (one mpi_reconstruct
-    wrote, or one copied off the satellite) the viewer shows just that file as its
-    one experiment, built the same way as one from the DB but from a single chunk
-    covering the whole file. F5 then re-reads the file. The DB is still read, if
-    there is one, for the globe's TLEs and attitudes. A file on disk does not
-    record which bytes never arrived -- mpi_reconstruct leaves them as its fill
-    value -- so every byte counts as received and there is nothing for d to
-    re-download.
+    A single file: given --file=<path> to an MPI science-data file (one that
+    mpi_reconstruct wrote, or one copied off the satellite) the viewer shows just
+    that file as its one experiment, built the same way as one from the DB but
+    from a single chunk covering the whole file. F5 then re-reads the file. The
+    DB is still read, if there is one, for the globe's TLEs and attitudes. A file
+    on disk does not record which bytes never arrived -- mpi_reconstruct leaves
+    them as its fill value -- so every byte counts as received and there is
+    nothing for d to re-download.
 
     Usage:
-      mpi_viewer [--db=<packet_db.sqlite>] [--list] [<mpi_file>]
+      mpi_viewer [--db=<packet_db.sqlite>] [--file=<mpi_file>] [--list]
+      mpi_viewer --help
 
     With no --db the default store is used ($SSO_PACKET_DB, else the FrontierSat
     root's packet_db.sqlite).
@@ -250,6 +251,7 @@
 #include <raylib.h>
 
 #include "adcs_mag.h"
+#include "argparse.h"
 #include "bulk_size.h"
 #include "packet_db.h"
 #include "prediction.h"
@@ -2737,60 +2739,111 @@ static int position_on_a_monitor(int x, int y)
 
 // ---- main ------------------------------------------------------------------
 
+// Parsed command-line configuration. parse_args() fills this; main() reads it.
+typedef struct {
+    const char *db_path;    // --db=, else NULL for the default store
+    const char *file_path;  // --file=, else NULL to list the DB's experiments
+    int         list_only;  // --list
+} mv_args_t;
+
+// Option column width: the widest label below ("--file=<path>") + a small
+// margin. See src/cli/argparse.h for the parse_args convention.
+#define OPTW 15
+
+// Parse argv into *a (help == HELP_OFF), or print one right-aligned help line
+// per option and return (help != HELP_OFF). Each option is one self-contained
+// block whose test carries "|| help", so help mode falls through and prints
+// them all.
+static int parse_args(mv_args_t *a, int argc, char **argv, int help)
+{
+    int ntokens = help ? 1 : argc - 1;
+    for (int t = 0; t < ntokens; ++t) {
+        const char *arg = help ? "" : argv[t + 1];
+        int matched = 0;
+
+        if (strcmp(arg, "--help") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--help", "show this help, with the key-binding reference, and exit");
+            else { parse_args(a, argc, argv, HELP_BRIEF); return PARSE_HELP; }
+            matched = 1;
+        }
+        if (strncmp(arg, "--db=", 5) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--db=<path>", "packet DB path (default $SSO_PACKET_DB, else <root>/packet_db.sqlite)");
+            else a->db_path = arg + 5;
+            matched = 1;
+        }
+        if (strncmp(arg, "--file=", 7) == 0 || help) {
+            if (help) parse_help_line(OPTW, "--file=<path>", "show this one MPI science-data file instead of the DB's experiments");
+            else a->file_path = arg + 7;
+            matched = 1;
+        }
+        if (strcmp(arg, "--list") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--list", "print what each experiment reconstructed to and exit, no window");
+            else a->list_only = 1;
+            matched = 1;
+        }
+        if ((strcmp(arg, "-V") == 0 || strcmp(arg, "--version") == 0) || help) {
+            if (help) parse_help_line(OPTW, "-V, --version", "print version and exit");
+            // -V is handled in main via sso_version_handle before parsing.
+            matched = 1;
+        }
+
+        if (!matched && !help) {
+            fprintf(stderr, "mpi_viewer: unknown option '%s' (try --help)\n", arg);
+            return PARSE_ERROR;
+        }
+    }
+    // The notes and key-binding reference, after the option lines.
+    if (help) {
+        printf("\nInspect MPI science imagery reconstructed from the packet DB. The\n"
+               "left panel lists MPI experiments, newest first; F5 re-reads the DB.\n"
+               "\n"
+               "Given --file= -- a file mpi_reconstruct wrote, or a science file\n"
+               "straight off the satellite -- it shows that one file instead of the\n"
+               "DB's experiments, and F5 re-reads the file. The DB (--db, else the\n"
+               "default) is then only read for the globe's TLEs and attitudes. A\n"
+               "file records no missing bytes, so every byte counts as received and\n"
+               "d has nothing to re-download.\n"
+               "\n"
+               "Keys:\n"
+               "  b          show the cleaned imagery -- the instrument's own background\n"
+               "             subtraction undone, every frame detrended across its own\n"
+               "             edge pixels, and a sliding local background put in place\n"
+               "             of the instrument's\n"
+               "  shift-B    while cleaning is on, stop after an earlier one of those steps\n"
+               "  n          how many images the sliding background is taken over\n"
+               "  e          combine those images by median or mean\n"
+               "  d          write the selected experiment's missing data as re-download\n"
+               "             telecommands, for simple_sat_ops --tc-file\n"
+               "  t          tag the experiment on show as a favourite\n"
+               "  shift-T    show the favourites only\n"
+               "  g          put the globe back to the whole Earth on the whole track\n"
+               "  F5         re-read the DB (or the file)\n"
+               "\n"
+               "Under the list is the lit Earth with the recording's ground track on\n"
+               "it, from the DB's own TLEs; drag it to turn it and scroll over it to\n"
+               "zoom. A two-finger press and slide turns it about the satellite\n"
+               "instead of about its own middle.\n"
+               "\n"
+               "Which experiment was open, where the playhead sat, every view\n"
+               "setting and the favourites are kept in\n"
+               "~/.local/state/simple_sat_ops/mpi_viewer.state and picked up next\n"
+               "time; delete that file to come back up on the defaults.\n");
+    }
+    return help ? PARSE_HELP : PARSE_OK;
+}
+
 int main(int argc, char **argv)
 {
     if (sso_version_handle(argc, argv, "mpi_viewer")) return 0;
 
-    const char *db_arg = NULL;
-    const char *file_arg = NULL;
-    int list_only = 0;
-    for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--db=", 5) == 0) db_arg = argv[i] + 5;
-        else if (strcmp(argv[i], "--list") == 0) list_only = 1;
-        else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: mpi_viewer [--db=<packet_db.sqlite>] [--list] [<mpi_file>]\n"
-                   "Inspect MPI science imagery reconstructed from the packet DB.\n"
-                   "The left panel lists MPI experiments, newest first; F5 re-reads the DB.\n"
-                   "t tags the experiment on show as a favourite and shift-T shows\n"
-                   "the favourites only.\n"
-                   "Given an <mpi_file> -- one mpi_reconstruct wrote, or a science\n"
-                   "file straight off the satellite -- it shows that one file\n"
-                   "instead of the DB's experiments, and F5 re-reads the file. The\n"
-                   "DB (--db, else the default) is then only read for the globe's\n"
-                   "TLEs and attitudes. A file records no missing bytes, so every\n"
-                   "byte counts as received and d has nothing to re-download.\n"
-                   "Press b to show the cleaned imagery -- the instrument's own\n"
-                   "background subtraction undone, every frame detrended across its\n"
-                   "own edge pixels, and a sliding local background put in place of\n"
-                   "the instrument's -- and shift-B, while it is on, to stop after an\n"
-                   "earlier one of those steps. n sets how many images the sliding\n"
-                   "one is taken over, and e whether they are combined by median or\n"
-                   "mean.\n"
-                   "Press d to write the selected experiment's missing data as\n"
-                   "re-download telecommands, for simple_sat_ops --tc-file.\n"
-                   "Under the list is the lit Earth with the recording's ground\n"
-                   "track on it, from the DB's own TLEs; drag it to turn it and\n"
-                   "scroll over it to zoom. A two-finger press and slide turns\n"
-                   "it about the satellite instead of about its own middle, and\n"
-                   "g puts the view back to the whole Earth on the whole track.\n"
-                   "--list prints what each experiment reconstructed to and exits,\n"
-                   "without opening a window.\n"
-                   "Which experiment was open, where the playhead sat, every view\n"
-                   "setting and the favourites are kept in\n"
-                   "~/.local/state/simple_sat_ops/mpi_viewer.state and picked up\n"
-                   "next time; delete that file to come back up on the defaults.\n");
-            return 0;
-        } else if (argv[i][0] != '-' && file_arg == NULL) {
-            file_arg = argv[i];
-        } else if (argv[i][0] != '-') {
-            fprintf(stderr, "mpi_viewer: only one MPI file at a time (got '%s' and '%s')\n",
-                    file_arg, argv[i]);
-            return 1;
-        } else {
-            fprintf(stderr, "mpi_viewer: unknown option '%s' (try --help)\n", argv[i]);
-            return 1;
-        }
+    mv_args_t args = {0};
+    switch (parse_args(&args, argc, argv, HELP_OFF)) {
+        case PARSE_HELP:  return 0;   // help already printed to stdout
+        case PARSE_ERROR: return 1;   // message already printed to stderr
     }
+    const char *db_arg = args.db_path;
+    const char *file_arg = args.file_path;
+    int list_only = args.list_only;
 
     char db_default[1024];
     const char *db_path = db_arg;
