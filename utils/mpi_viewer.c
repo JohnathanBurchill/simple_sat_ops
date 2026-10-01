@@ -156,7 +156,9 @@
     panel, with the times of its two ends read out in UTC and the span between
     them. It measures the recording, not the screen: the ends are the capture
     times of the frames nearest those two bytes, so a stretch that never came
-    down costs no time, the same way it takes up no columns.
+    down costs no time, the same way it takes up no columns. The two ends' byte
+    offsets in the file are read out beside the times -- rough, to the column
+    -- and on their own where the frames there carry no time.
 
     Where it was: under the experiment list is the Earth, NASA's Blue Marble
     wrapped on a sphere and lit from where the Sun actually stood while the MPI
@@ -2403,6 +2405,20 @@ static void build_whereogram(const view_t *v, const experiment_t *s,
     *out_lo = lo; *out_hi = hi;
 }
 
+// A file offset with thousands separators, "204,288", for the whereogram's
+// readout: six- and seven-digit offsets are hard to read as one run of digits.
+static void fmt_offset(long off, char *out, size_t n)
+{
+    char digits[32];
+    int nd = snprintf(digits, sizeof digits, "%ld", off < 0 ? 0 : off);
+    size_t o = 0;
+    for (int i = 0; i < nd && o + 1 < n; i++) {
+        if (i > 0 && (nd - i) % 3 == 0 && o + 2 < n) out[o++] = ',';
+        out[o++] = digits[i];
+    }
+    out[o] = '\0';
+}
+
 // Where a file offset falls along the whereogram's horizontal axis, and the
 // offset a column stands for -- the two directions of the same mapping, used to
 // place the playback head and to turn a pointer position back into an image.
@@ -3664,14 +3680,30 @@ int main(int argc, char **argv)
                               (Color){ 255, 255, 255, 40 });
                 DrawLine(rx0, ay, rx0, ay + ch, RAYWHITE);
                 DrawLine(rx1, ay, rx1, ay + ch, RAYWHITE);
+                // Where in the file the two ends sit, to the column: a column
+                // stands for a run of frames, so these are rough, but they are
+                // the offsets a re-download of that stretch would start from.
+                // Shown even where no time came down, since an offset needs
+                // no clock. No "~" to mark them as rough: at this size it reads
+                // as a minus sign.
+                long ba = cov_anchor, bb = here;
+                if (bb < ba) { long t = ba; ba = bb; bb = t; }
+                char oa[32], ob[32], bytes[80];
+                fmt_offset(ba, oa, sizeof oa);
+                fmt_offset(bb, ob, sizeof ob);
+                if (ba == bb) snprintf(bytes, sizeof bytes, "byte %s", oa);
+                else          snprintf(bytes, sizeof bytes, "bytes %s to %s", oa, ob);
                 double ta = time_at_byte(s, cov_anchor), tb = time_at_byte(s, here);
-                if (ta >= 0.0 && tb >= 0.0) {
-                    if (tb < ta) { double t = ta; ta = tb; tb = t; }
-                    char t0[16], t1[16], sp[32];
-                    fmt_tod_ms(ta, t0, sizeof t0);
-                    fmt_tod_ms(tb, t1, sizeof t1);
-                    fmt_span(tb - ta, sp, sizeof sp);
-                    const char *lab = TextFormat("%s to %s UTC   %s", t0, t1, sp);
+                {
+                    const char *lab = bytes;
+                    if (ta >= 0.0 && tb >= 0.0) {
+                        if (tb < ta) { double t = ta; ta = tb; tb = t; }
+                        char t0[16], t1[16], sp[32];
+                        fmt_tod_ms(ta, t0, sizeof t0);
+                        fmt_tod_ms(tb, t1, sizeof t1);
+                        fmt_span(tb - ta, sp, sizeof sp);
+                        lab = TextFormat("%s to %s UTC   %s   %s", t0, t1, sp, bytes);
+                    }
                     int tw = text_width(lab, 13);
                     int lx = (rx0 + rx1) / 2 - tw / 2;
                     if (lx < ax) lx = ax;
@@ -3688,7 +3720,7 @@ int main(int argc, char **argv)
 
         // help footer
         const char *help =
-            "Up/Down experiment   Left/Right image   drag whereogram: scrub + time span"
+            "Up/Down experiment   Left/Right image   drag whereogram: scrub + time/byte span"
             "   globe: drag turns, two-finger press-drag turns about the satellite, scroll zooms, g resets"
             "   Space play/pause   ,/. speed   f steps/sweep   s zoom   a scale"
             "   z/x min  c/v max   m colour map   b clean  B step   n bg window   e median/mean"
