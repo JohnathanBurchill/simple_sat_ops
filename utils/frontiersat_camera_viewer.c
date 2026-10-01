@@ -57,6 +57,15 @@
     the globe falls back to where the satellite was when the picture was first
     downloaded -- a different place entirely, which the panel's heading says.
 
+    The list runs newest picture first. f tags the picture on show as a
+    favourite (a gold star in the list and after the title), and v switches the
+    list between every picture and the favourites alone. The favourites, that
+    switch, and the picture last looked at are kept in
+    ~/.local/state/simple_sat_ops/frontiersat_camera_viewer.state, so the next
+    run opens where this one left off. Pictures are remembered by the moment
+    they belong to (the stamp their exported JPEG is named with), not by their
+    place in the list, so a new picture arriving at the top moves nothing.
+
     Read-only on the DB. Press F5 to re-read it and rebuild the capture list.
 
     Usage:
@@ -88,6 +97,7 @@
 #include "cam_jpeg.h"
 #include "packet_db.h"
 #include "sat_globe.h"
+#include "sso_paths.h"
 #include "sso_version.h"
 
 #include <math.h>
@@ -199,6 +209,11 @@ typedef struct {
 
 // One picture, merged from every session that downloaded it.
 typedef struct {
+    // What the viewer remembers the picture by between runs: the moment
+    // it belongs to (capture, else first downlink) as "20260820_072204",
+    // the same stamp its exported JPEG is named with.
+    char     id[24];
+    int      fav;                      // tagged as a favourite
     char     sat_path[MAX_PATH_LEN];   // "camera/2026-08-20.img", or ""
     double   t_capture_ms;             // when the camera took it, -1 if unknown
     double   t_first_ms;               // when the first pass downloaded it
@@ -507,6 +522,20 @@ static void free_captures(capture_t *caps, int n)
     free(caps);
 }
 
+// The moment a picture belongs to: when it was taken, or failing that when the
+// first pass downloaded it.
+static double capture_moment(const capture_t *c)
+{
+    return c->t_capture_ms > 0 ? c->t_capture_ms : c->t_first_ms;
+}
+
+static int by_newest_first(const void *a, const void *b)
+{
+    double ta = capture_moment((const capture_t *) a);
+    double tb = capture_moment((const capture_t *) b);
+    return (ta < tb) - (ta > tb);
+}
+
 // Split the camera packets into download sessions, merge the sessions that
 // downloaded the same picture, and build one capture per picture. Returns the
 // capture count and fills *out (caller frees via free_captures).
@@ -599,11 +628,14 @@ static int build_captures(const chunk_t *cs, int n, const camcmd_t *cmds, int nc
         c.t_capture_ms = capture_time_of(c.sat_path, cmds, ncmds);
         if (c.t_capture_ms > 0) fmt_utc_s(c.t_capture_ms, c.capture_utc, sizeof c.capture_utc);
         fmt_utc_s(c.t_first_ms, c.first_utc, sizeof c.first_utc);
+        fmt_stamp(capture_moment(&c), c.id, sizeof c.id);
         caps[nout++] = c;
     }
 
     free(idx);
     free_sessions(ss, ns);
+    // Newest picture at the top of the list, oldest at the bottom.
+    qsort(caps, (size_t) nout, sizeof *caps, by_newest_first);
     *out = caps;
     return nout;
 }
@@ -710,6 +742,25 @@ static void draw_text(const char *s, int x, int y, int size, Color c)
         DrawText(s, x, y, size, c);
 }
 
+// The favourite mark: a five-pointed star centred on (cx, cy), r the radius
+// of its points. Each of the ten slices is drawn in both windings, since
+// raylib drops a triangle whose corners come in the order it culls.
+#define FAV_GOLD ((Color){ 240, 196, 64, 255 })
+
+static void draw_star(int cx, int cy, float r, Color col)
+{
+    Vector2 o = { (float) cx, (float) cy }, p[11];
+    for (int k = 0; k <= 10; k++) {
+        float a = -PI / 2.0f + (float) k * PI / 5.0f;
+        float rr = (k % 2) ? r * 0.42f : r;
+        p[k] = (Vector2){ o.x + rr * cosf(a), o.y + rr * sinf(a) };
+    }
+    for (int k = 0; k < 10; k++) {
+        DrawTriangle(o, p[k], p[k + 1], col);
+        DrawTriangle(o, p[k + 1], p[k], col);
+    }
+}
+
 // Fire once on press, then rapidly while the key is held (after a short delay).
 // *cooldown carries the time until the next repeat -- pass one float per key.
 static int key_repeat(int key, float *cooldown)
@@ -774,9 +825,7 @@ static void zoom_at_cursor(const capture_t *c, int px, int py, int pw, int ph,
 // when the first pass downloaded it.
 static void jpeg_name(const capture_t *c, char *out, size_t n)
 {
-    char stamp[24];
-    fmt_stamp(c->t_capture_ms > 0 ? c->t_capture_ms : c->t_first_ms, stamp, sizeof stamp);
-    snprintf(out, n, "fs_boomcam_%s.jpg", stamp);
+    snprintf(out, n, "fs_boomcam_%s.jpg", c->id);
 }
 
 // Write a capture's JPEG to `path`. Returns 0, or -1 with the reason in
@@ -840,6 +889,121 @@ static void open_in_system_viewer(const capture_t *c, char *status, size_t nstat
     else snprintf(status, nstatus, "opened %s", name);
 }
 
+// ---- what the viewer remembers between runs --------------------------------
+//
+// A short text file of key=value lines:
+//
+//   selected=20260820_072204
+//   favourites_only=1
+//   favourite=20260601_181502
+//   favourite=20260820_072204
+//
+// Pictures are named by their id (see capture_t), so the file means the same
+// thing whichever database is open and however the list is ordered. The
+// favourites are kept as names, not as flags on the open list, so a favourite
+// that this database does not hold is carried over untouched rather than
+// forgotten the next time the file is written.
+
+#define STATE_RELPATH ".local/state/simple_sat_ops/frontiersat_camera_viewer.state"
+#define MAX_FAVOURITES 512
+
+typedef struct {
+    char selected[24];
+    int  favourites_only;
+    char fav[MAX_FAVOURITES][24];
+    int  nfav;
+} viewer_state_t;
+
+static int state_path(char *out, size_t n)
+{
+    const char *home = getenv("HOME");
+    if (home == NULL || home[0] == '\0') return -1;
+    int w = snprintf(out, n, "%s/%s", home, STATE_RELPATH);
+    return (w > 0 && (size_t) w < n) ? 0 : -1;
+}
+
+static int state_find_fav(const viewer_state_t *s, const char *id)
+{
+    for (int k = 0; k < s->nfav; k++)
+        if (strcmp(s->fav[k], id) == 0) return k;
+    return -1;
+}
+
+// A missing or unreadable file is a first run: everything starts empty.
+static void state_load(viewer_state_t *s)
+{
+    memset(s, 0, sizeof *s);
+    char path[1024];
+    if (state_path(path, sizeof path) != 0) return;
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return;
+    char line[128];
+    while (fgets(line, sizeof line, f) != NULL) {
+        line[strcspn(line, "\r\n")] = '\0';
+        char *eq = strchr(line, '=');
+        if (eq == NULL) continue;
+        *eq = '\0';
+        const char *val = eq + 1;
+        if (strcmp(line, "selected") == 0)
+            snprintf(s->selected, sizeof s->selected, "%s", val);
+        else if (strcmp(line, "favourites_only") == 0)
+            s->favourites_only = atoi(val) != 0;
+        else if (strcmp(line, "favourite") == 0 && val[0] != '\0'
+                 && s->nfav < MAX_FAVOURITES && state_find_fav(s, val) < 0)
+            snprintf(s->fav[s->nfav++], sizeof s->fav[0], "%s", val);
+    }
+    fclose(f);
+}
+
+// Written to a temporary name and renamed over the old file, so a crash
+// part-way through never leaves the favourites half written. Returns 0, or -1
+// when the file could not be written (the viewer carries on regardless).
+static int state_save(const viewer_state_t *s)
+{
+    char path[1024], tmp[1100];
+    if (state_path(path, sizeof path) != 0) return -1;
+    if (sso_mkdir_p_for_file(path) != 0) return -1;
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (f == NULL) return -1;
+    fprintf(f, "# frontiersat_camera_viewer: the last picture looked at and the favourites\n");
+    fprintf(f, "selected=%s\n", s->selected);
+    fprintf(f, "favourites_only=%d\n", s->favourites_only);
+    for (int k = 0; k < s->nfav; k++) fprintf(f, "favourite=%s\n", s->fav[k]);
+    int bad = ferror(f);
+    if (fclose(f) != 0) bad = 1;
+    if (bad || rename(tmp, path) != 0) { remove(tmp); return -1; }
+    return 0;
+}
+
+static void mark_favourites(capture_t *caps, int n, const viewer_state_t *s)
+{
+    for (int k = 0; k < n; k++) caps[k].fav = state_find_fav(s, caps[k].id) >= 0;
+}
+
+// The rows the list shows, as capture indices: every picture, or only the
+// favourites. Returns the row count.
+static int build_rows(const capture_t *caps, int n, int favourites_only, int *rows)
+{
+    int nr = 0;
+    for (int k = 0; k < n; k++)
+        if (!favourites_only || caps[k].fav) rows[nr++] = k;
+    return nr;
+}
+
+// The row a capture sits on, or -1 when the list is not showing it.
+static int row_of(const int *rows, int nrows, int cap)
+{
+    for (int r = 0; r < nrows; r++) if (rows[r] == cap) return r;
+    return -1;
+}
+
+static int capture_by_id(const capture_t *caps, int n, const char *id)
+{
+    for (int k = 0; k < n; k++) if (strcmp(caps[k].id, id) == 0) return k;
+    return -1;
+}
+
 // ---- main ------------------------------------------------------------------
 
 int main(int argc, char **argv)
@@ -852,7 +1016,9 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--help") == 0) {
             printf("Usage: frontiersat_camera_viewer [--db=<packet_db.sqlite>]\n"
                    "Look at FrontierSat's boom-camera pictures rebuilt from the packet DB.\n"
-                   "The left panel lists captures, one row per picture; F5 re-reads the DB.\n");
+                   "The left panel lists captures, newest first, one row per picture; F5 re-reads the DB.\n"
+                   "f tags a favourite, v shows the favourites only. Favourites, that choice\n"
+                   "and the last picture viewed are kept in ~/" STATE_RELPATH ".\n");
             return 0;
         } else {
             fprintf(stderr, "frontiersat_camera_viewer: unknown option '%s' (try --help)\n", argv[i]);
@@ -908,7 +1074,21 @@ int main(int argc, char **argv)
 
     const int LEFT_W = 340;
 
-    int sel = 0;
+    // What the last run left: the picture it was on, whether it was showing
+    // only the favourites, and the favourites themselves. A picture that
+    // has gone (another database, say) falls back to the newest.
+    viewer_state_t vs;
+    state_load(&vs);
+    mark_favourites(caps, ncaps, &vs);
+    int *rows = (int *) malloc((size_t) ncaps * sizeof(int));
+    if (rows == NULL) { fprintf(stderr, "frontiersat_camera_viewer: out of memory\n"); return 1; }
+    int nrows = build_rows(caps, ncaps, vs.favourites_only, rows);
+    if (nrows == 0) {
+        vs.favourites_only = 0;
+        nrows = build_rows(caps, ncaps, 0, rows);
+    }
+    int sel = capture_by_id(caps, ncaps, vs.selected);
+    if (sel < 0 || row_of(rows, nrows, sel) < 0) sel = rows[0];
     // How the picture is being looked at: 1 is the whole picture fitted to the
     // pane, pan is how far it has been dragged from the middle. Both go back
     // to the start with every change of picture.
@@ -968,11 +1148,62 @@ int main(int argc, char **argv)
             if (over_list) list_px -= GetMouseWheelMove() * (float) row_h;
             if (over_list && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 int r = (int) ((lm.y - (float) list_top + list_px) / (float) row_h);
-                if (r >= 0 && r < ncaps && r != sel) { sel = r; moved = 1; }
+                if (r >= 0 && r < nrows && rows[r] != sel) { sel = rows[r]; moved = 1; }
             }
         }
-        if (key_repeat(KEY_DOWN, &rep_down) && sel < ncaps - 1) { sel++; moved = 1; }
-        if (key_repeat(KEY_UP, &rep_up)     && sel > 0)         { sel--; moved = 1; }
+        // Up and Down step through the rows on show, so with the
+        // favourites filter on they skip from favourite to favourite.
+        int srow = row_of(rows, nrows, sel);
+        if (key_repeat(KEY_DOWN, &rep_down) && srow < nrows - 1) { sel = rows[srow + 1]; moved = 1; }
+        if (key_repeat(KEY_UP, &rep_up)     && srow > 0)         { sel = rows[srow - 1]; moved = 1; }
+
+        // f tags or untags the picture on show. With only the favourites
+        // on show, untagging one takes it off the list, so the selection
+        // moves to the row that slid into its place -- and untagging the
+        // last one goes back to the whole list rather than to an empty one.
+        if (IsKeyPressed(KEY_F)) {
+            int k = state_find_fav(&vs, caps[sel].id);
+            if (k >= 0) {
+                memmove(vs.fav[k], vs.fav[k + 1], (size_t) (vs.nfav - k - 1) * sizeof vs.fav[0]);
+                vs.nfav--;
+                snprintf(status, sizeof status, "taken off the favourites");
+            } else if (vs.nfav < MAX_FAVOURITES) {
+                snprintf(vs.fav[vs.nfav++], sizeof vs.fav[0], "%s", caps[sel].id);
+                snprintf(status, sizeof status, "added to the favourites");
+            } else {
+                snprintf(status, sizeof status, "favourites full (%d)", MAX_FAVOURITES);
+            }
+            mark_favourites(caps, ncaps, &vs);
+            nrows = build_rows(caps, ncaps, vs.favourites_only, rows);
+            if (nrows == 0) {
+                vs.favourites_only = 0;
+                nrows = build_rows(caps, ncaps, 0, rows);
+                snprintf(status, sizeof status, "no favourites left; showing every picture");
+            }
+            if (row_of(rows, nrows, sel) < 0) {
+                sel = rows[srow < nrows ? srow : nrows - 1];
+                moved = 1;
+            }
+            last_sel = -1;
+            if (state_save(&vs) != 0) snprintf(status, sizeof status, "could not write the state file");
+            status_left = 6.0f;
+        }
+        // v switches between every picture and only the favourites.
+        if (IsKeyPressed(KEY_V)) {
+            int want = !vs.favourites_only;
+            if (want && build_rows(caps, ncaps, 1, rows) == 0) {
+                snprintf(status, sizeof status, "no favourites yet -- f tags the picture on show");
+            } else {
+                vs.favourites_only = want;
+                snprintf(status, sizeof status, want ? "showing the favourites only"
+                                                     : "showing every picture");
+                if (state_save(&vs) != 0) snprintf(status, sizeof status, "could not write the state file");
+            }
+            nrows = build_rows(caps, ncaps, vs.favourites_only, rows);
+            if (row_of(rows, nrows, sel) < 0) { sel = rows[0]; moved = 1; }
+            last_sel = -1;
+            status_left = 6.0f;
+        }
         if (moved) { c = &caps[sel]; zoom = 1.0f; pan = (Vector2){ 0, 0 }; }
 
         // Scroll or pinch over the picture to zoom, drag it to move it about.
@@ -1001,12 +1232,26 @@ int main(int argc, char **argv)
         if (IsKeyPressed(KEY_F5)) {
             capture_t *nc = NULL;
             int nn = reload_captures(db_path, &nc);
-            if (nn > 0) {
+            int *nr = nn > 0 ? (int *) realloc(rows, (size_t) nn * sizeof(int)) : NULL;
+            if (nr != NULL) {
+                // Stay on the same picture, found by name: a new picture at
+                // the top of the list moves every row below it down one.
+                char keep[24];
+                snprintf(keep, sizeof keep, "%s", caps[sel].id);
                 unload_textures(caps, ncaps);
                 free_captures(caps, ncaps);
                 caps = nc; ncaps = nn;
+                rows = nr;
                 build_textures(caps, ncaps);
-                if (sel >= ncaps) sel = ncaps - 1;
+                mark_favourites(caps, ncaps, &vs);
+                nrows = build_rows(caps, ncaps, vs.favourites_only, rows);
+                if (nrows == 0) {
+                    vs.favourites_only = 0;
+                    nrows = build_rows(caps, ncaps, 0, rows);
+                }
+                sel = capture_by_id(caps, ncaps, keep);
+                if (sel < 0 || row_of(rows, nrows, sel) < 0) sel = rows[0];
+                last_sel = -1;
                 c = &caps[sel];
                 zoom = 1.0f;
                 pan = (Vector2){ 0, 0 };
@@ -1033,13 +1278,19 @@ int main(int argc, char **argv)
         // Pull the list back to the selected row when the selection moves,
         // and keep whatever the reader scrolled to when it does not.
         if (sel != last_sel) {
-            float want_top = (float) (sel * row_h);
+            float want_top = (float) (row_of(rows, nrows, sel) * row_h);
             if (list_px > want_top) list_px = want_top;
             if (list_px < want_top + (float) row_h - (float) list_h)
                 list_px = want_top + (float) row_h - (float) list_h;
+            // Remembered as it changes, so a killed window still opens on
+            // this picture next time.
+            if (strcmp(vs.selected, caps[sel].id) != 0) {
+                snprintf(vs.selected, sizeof vs.selected, "%s", caps[sel].id);
+                state_save(&vs);
+            }
             last_sel = sel;
         }
-        float list_max = (float) (ncaps * row_h - list_h);
+        float list_max = (float) (nrows * row_h - list_h);
         if (list_max < 0.0f) list_max = 0.0f;
         if (list_px > list_max) list_px = list_max;
         if (list_px < 0.0f) list_px = 0.0f;
@@ -1069,14 +1320,19 @@ int main(int argc, char **argv)
 
         // left: capture list
         DrawRectangle(0, 0, LEFT_W, sh, (Color){ 28, 28, 34, 255 });
-        draw_text("Camera captures", 12, 10, 18, RAYWHITE);
-        draw_text(TextFormat("%d", ncaps), LEFT_W - 40, 14, 12, GRAY);
+        draw_text(vs.favourites_only ? "Favourites" : "Camera captures", 12, 10, 18, RAYWHITE);
+        {
+            const char *count = vs.favourites_only ? TextFormat("%d of %d", nrows, ncaps)
+                                                   : TextFormat("%d", ncaps);
+            draw_text(count, LEFT_W - 12 - 8 * (int) strlen(count), 14, 12, GRAY);
+        }
         // A row half off the bottom is cut at the globe's edge rather than
         // drawn over it.
         BeginScissorMode(0, list_top, LEFT_W, list_h);
-        for (int si = 0; si < ncaps; si++) {
+        for (int r = 0; r < nrows; r++) {
+            int si = rows[r];
             capture_t *cc = &caps[si];
-            int y = list_top + si * row_h - (int) list_px;
+            int y = list_top + r * row_h - (int) list_px;
             if (y + row_h < list_top || y > list_top + list_h) continue;
             if (si == sel) DrawRectangle(0, y, LEFT_W, row_h, (Color){ 44, 70, 110, 255 });
             double pct = 100.0 * (double) cc->recovered / (double) cc->size;
@@ -1089,12 +1345,13 @@ int main(int argc, char **argv)
             draw_text(TextFormat("%.1f KB  %.0f%%  %ld sentences",
                                  cc->jpg_len / 1024.0, pct, cc->st.sentences_present),
                       10, y + 23, 12, GRAY);
+            if (cc->fav) draw_star(LEFT_W - 22, y + row_h / 2, 8, FAV_GOLD);
         }
         EndScissorMode();
         // A thumb down the right edge, only while there is more list than
         // room -- the same one mpi_viewer's experiment list carries.
         if (list_max > 0.0f) {
-            float frac = (float) list_h / (float) (ncaps * row_h);
+            float frac = (float) list_h / (float) (nrows * row_h);
             int th = (int) ((float) list_h * frac);
             if (th < 20) th = 20;
             int ty = list_top + (int) ((float) (list_h - th) * list_px / list_max);
@@ -1107,9 +1364,17 @@ int main(int argc, char **argv)
                        c->t_capture_ms > 0 ? "Ground track at capture"
                                            : "Ground track at downlink");
 
-        // right: title
-        draw_text(c->sat_path[0] ? c->sat_path : "(satellite file unknown)",
-                  rx, 12, 20, RAYWHITE);
+        // right: title, with the star after it when this is a favourite
+        {
+            const char *title = c->sat_path[0] ? c->sat_path : "(satellite file unknown)";
+            draw_text(title, rx, 12, 20, RAYWHITE);
+            if (c->fav) {
+                int tw = g_ui_font_loaded
+                       ? (int) MeasureTextEx(g_ui_font, title, 20, g_ui_font_spacing).x
+                       : MeasureText(title, 20);
+                draw_star(rx + tw + 18, 22, 9, FAV_GOLD);
+            }
+        }
         if (c->t_capture_ms > 0)
             draw_text(TextFormat("taken %s UTC", c->capture_utc), rx, 40, 17,
                       (Color){ 120, 220, 160, 255 });
@@ -1180,11 +1445,14 @@ int main(int argc, char **argv)
         // help footer
         draw_text("Up/Down capture   scroll or pinch zoom   drag to move   "
                   "globe: drag turns, scroll zooms, g resets   "
-                  "o open   s save jpeg   F5 refresh   q quit",
+                  "f favourite   v favourites only   o open   s save jpeg   F5 refresh   q quit",
                   12, sh - 22, 12, (Color){ 150, 150, 160, 255 });
 
         EndDrawing();
     }
+
+    snprintf(vs.selected, sizeof vs.selected, "%s", caps[sel].id);
+    state_save(&vs);
 
     globe_free(&globe);
     beacon_attitude_free();
@@ -1192,6 +1460,7 @@ int main(int argc, char **argv)
     if (g_ui_font_loaded) UnloadFont(g_ui_font);
     CloseWindow();
 
+    free(rows);
     free_captures(caps, ncaps);
     return 0;
 }

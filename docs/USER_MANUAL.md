@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`590e760` (2026-09-30). This is a working draft.
+`d99baf4` (2026-09-30). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2514,7 +2514,29 @@ where you put it, and a thumb down the right edge shows where you are whenever
 there is more list than room. That is the same handling `mpi_viewer`'s
 experiment list has, so the two read alike.
 
-Keys: `Up`/`Down` change picture, **`o` opens the picture in the desktop's
+**The list runs newest first**, the most recent picture at the top and the
+oldest at the bottom, ordered by when each was taken (or, with no
+`camera_capture` command on record, when it was first downloaded).
+
+**Favourites.** `f` tags the picture on show as a favourite, and `f` again
+untags it; a favourite carries a gold star in the list and after its title.
+`v` switches the list between every picture and **the favourites only** - the
+heading then reads `Favourites`, with `3 of 14` beside it, and `Up`/`Down` step
+from favourite to favourite. Untagging a picture while only the favourites are
+showing drops it from the list and moves on to the next one; untagging the last
+goes back to the whole list rather than leaving it empty.
+
+**It remembers where you were.** The favourites, whether the list is showing
+only them, and the picture last looked at are kept in
+`~/.local/state/simple_sat_ops/frontiersat_camera_viewer.state`, written each
+time one of them changes, so the next run opens on the same picture with the
+same list. A picture is remembered by the moment it belongs to - the same stamp
+its exported JPEG is named with - not by its place in the list, so a new
+picture arriving at the top moves nothing, and a favourite the open database
+does not hold is kept in the file rather than forgotten.
+
+Keys: `Up`/`Down` change picture, `f` tags a favourite, `v` shows the
+favourites only, **`o` opens the picture in the desktop's
 image viewer** (Preview on macOS, the `xdg-open` default on Linux) via a copy
 in the temporary directory - for a look in whatever viewer you already keep
 your pictures in. `s` saves the JPEG to
