@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`d99baf4` (2026-09-30). This is a working draft.
+`d83cb2a` (2026-10-01). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2672,10 +2672,21 @@ count, and how many packets were set aside for a corrupted offset - then exits
 without opening a window. It answers "how much of this do we actually have?"
 from a terminal or over ssh, and is the same reconstruction the GUI shows.
 
-Each row of the experiment list carries the recording's **duration in minutes**,
-right-justified on the date line - the span from the `mpi_start` marker to the
-last marker inside the recording window, which is how long the MPI actually ran
-rather than how long it was commanded for.
+**The list runs newest first**, the most recent recording at the top. Each row
+carries the recording's **duration in minutes**, right-justified on the date
+line - the span from the `mpi_start` marker to the last marker inside the
+recording window, which is how long the MPI actually ran rather than how long it
+was commanded for.
+
+**Favourites.** `t` tags the experiment on show as a favourite, and `t` again
+untags it; a favourite carries a gold star in the list and beside its name in
+the aux panel. `shift-T` switches the list between every experiment and **the
+favourites only** - the heading then reads `Favourites`, with `2 of 5` beside
+it, and `Up`/`Down` step from favourite to favourite. Untagging one while only
+the favourites are showing drops it from the list and moves on to the next;
+untagging the last goes back to the whole list rather than leaving it empty.
+These are `t` rather than the `f` and `v` that `frontiersat_camera_viewer` uses,
+since here `f` and `v` already set the frames per sweep and the manual DN window.
 
 The grouping and the timing both come from JSON markers the flight firmware
 writes into each science file: a `{"mpi_start":...,"timestamp_ms":N}` header at
@@ -2902,13 +2913,17 @@ resolution once it settles.
 
 **What it remembers between sessions.** On exit the viewer writes
 `~/.local/state/simple_sat_ops/mpi_viewer.state` - which experiment was open,
-where the playhead sat in it, the cleaning stage and its window and estimator,
-the colour map, the colour scale and its manual DN window, the playback speed,
+where the playhead sat in it, the favourites and whether the list shows only
+them, the cleaning stage and its window and estimator, the colour map, the colour scale and its manual DN window, the playback speed,
 the frames-per-sweep override, the zoom, the globe's view (where it faces, its
 zoom and where the disc sits), and the size and place of the window -
 and reads it back at startup, printing a line naming what it resumed. The
-experiment is matched by its start time, so a database that no longer holds it
-opens on the first one with the view settings still restored. It is plain
+favourites are also written the moment they change, so a window that is killed
+rather than closed still keeps them. The open experiment and the favourites are
+matched by start time, so a new experiment arriving at the top of the list moves
+nothing, a favourite this database does not hold stays in the file, and a
+database that no longer holds the open experiment opens on the newest one with
+the view settings still restored. It is plain
 `key = value` text: edit it by hand, or delete it to come back up on the
 defaults. Every value is range-checked on the way in, and a key the file does
 not carry keeps its built-in default, so a file written by another build is
@@ -2922,6 +2937,7 @@ window (hold `Shift` for coarse steps), `m` cycles the colour map, `b` toggles
 the cleaned imagery and `shift-B` moves between its steps, `n` sets how many
 images its background is taken over and `e` switches that between median and
 mean,
+`t` tags a favourite and `shift-T` shows the favourites only,
 `d` writes
 the re-download
 telecommands (below), **`F5` re-reads the database** and rebuilds the

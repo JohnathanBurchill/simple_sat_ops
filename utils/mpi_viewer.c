@@ -176,6 +176,12 @@
     frontiersat_camera_viewer. The experiment list above it scrolls -- with the
     wheel, or by clicking a row to select it.
 
+    The list runs newest experiment first. t tags the experiment on show as a
+    favourite (a gold star in the list and beside its name in the aux panel),
+    and shift-T switches the list between every experiment and the favourites
+    alone. Favourites are remembered by start time, so new experiments arriving
+    at the top move nothing, and are written to the state file as they change.
+
     Between sessions: on exit the viewer writes which experiment was open, where
     the playhead sat, and every view setting to
     ~/.local/state/simple_sat_ops/mpi_viewer.state, and reads it back at
@@ -1183,6 +1189,12 @@ static int load_experiments_from_db(sqlite3 *db, experiment_t **out)
             }
         }
     }
+    // Built oldest first; the list shows the newest at the top.
+    for (int a = 0, b = nout - 1; a < b; a++, b--) {
+        experiment_t t = exps[a];
+        exps[a] = exps[b];
+        exps[b] = t;
+    }
     free(cmds);
     bulk_size_free(&sizes);
     free(uidx); free(seen); free(ord); free(exp_hint);
@@ -1891,6 +1903,26 @@ static int text_width(const char *s, int size)
     return MeasureText(s, size);
 }
 
+// The favourite mark: a five-pointed star centred on (cx, cy), r the radius
+// of its points -- the same one frontiersat_camera_viewer's list carries. Each
+// of the ten slices is drawn in both windings, since raylib drops a triangle
+// whose corners come in the order it culls.
+#define FAV_GOLD ((Color){ 240, 196, 64, 255 })
+
+static void draw_star(int cx, int cy, float r, Color col)
+{
+    Vector2 o = { (float) cx, (float) cy }, p[11];
+    for (int k = 0; k <= 10; k++) {
+        float a = -PI / 2.0f + (float) k * PI / 5.0f;
+        float rr = (k % 2) ? r * 0.42f : r;
+        p[k] = (Vector2){ o.x + rr * cosf(a), o.y + rr * sinf(a) };
+    }
+    for (int k = 0; k < 10; k++) {
+        DrawTriangle(o, p[k], p[k + 1], col);
+        DrawTriangle(o, p[k + 1], p[k], col);
+    }
+}
+
 // Fire once on press, then rapidly while the key is held (after a short delay).
 // *cooldown carries the time until the next repeat -- pass one float per key.
 static int key_repeat(int key, float *cooldown)
@@ -2361,6 +2393,43 @@ typedef struct {
     int x, y, w, h;
 } geom_t;
 
+// The favourite experiments, by start time (experiment_t.utc), and whether the
+// list is showing only them. Kept as names rather than as flags on the open
+// list, so a favourite this database does not hold is carried over untouched
+// rather than forgotten the next time the file is written.
+#define MAX_FAVOURITES 256
+
+typedef struct {
+    char fav[MAX_FAVOURITES][24];
+    int  nfav;
+    int  only;
+} favs_t;
+
+static int fav_find(const favs_t *fv, const char *utc)
+{
+    for (int k = 0; k < fv->nfav; k++)
+        if (strcmp(fv->fav[k], utc) == 0) return k;
+    return -1;
+}
+
+// The rows the list shows, as experiment indices: every experiment, or only
+// the favourites. Returns the row count.
+static int build_rows(const experiment_t *exps, int nexp, const favs_t *fv,
+                      int only, int *rows)
+{
+    int nr = 0;
+    for (int k = 0; k < nexp; k++)
+        if (!only || fav_find(fv, exps[k].utc) >= 0) rows[nr++] = k;
+    return nr;
+}
+
+// The row an experiment sits on, or -1 when the list is not showing it.
+static int row_of(const int *rows, int nrows, int e)
+{
+    for (int r = 0; r < nrows; r++) if (rows[r] == e) return r;
+    return -1;
+}
+
 static int state_path(char *out, size_t cap)
 {
     const char *home = getenv("HOME");
@@ -2384,10 +2453,10 @@ static int clamp_int(int x, int lo, int hi)
     return x < lo ? lo : x > hi ? hi : x;
 }
 
-// Read the saved state into v, sel_utc (the experiment that was open) and g.
+// Read the saved state into v, sel_utc (the experiment that was open), g and fv.
 // Anything the file does not carry is left as the caller set it.
 static void load_state(view_t *v, char *sel_utc, size_t utc_cap, geom_t *g,
-                       globe_t *gl)
+                       globe_t *gl, favs_t *fv)
 {
     char path[1024];
     if (state_path(path, sizeof path) != 0) return;
@@ -2402,6 +2471,11 @@ static void load_state(view_t *v, char *sel_utc, size_t utc_cap, geom_t *g,
         int n = atoi(val);
         if (strcmp(key, "experiment") == 0)
             snprintf(sel_utc, utc_cap, "%s", val);
+        else if (strcmp(key, "favourite") == 0 && val[0] != '\0'
+                 && fv->nfav < MAX_FAVOURITES && fav_find(fv, val) < 0)
+            snprintf(fv->fav[fv->nfav++], sizeof fv->fav[0], "%s", val);
+        else if (strcmp(key, "favourites_only") == 0)
+            fv->only = n != 0;
         else if (strcmp(key, "image") == 0)
             v->img_pos = n < 0 ? 0 : n;
         else if (strcmp(key, "playing") == 0)
@@ -2464,17 +2538,22 @@ static void load_state(view_t *v, char *sel_utc, size_t utc_cap, geom_t *g,
     if (v->dn_max <= v->dn_min) v->dn_max = v->dn_min + 1;
 }
 
-// Write the state back. Best effort: a session that cannot write its state was
-// still a good session, so nothing here is reported.
-static void save_state(const view_t *v, const experiment_t *s, const geom_t *g,
-                       const globe_t *gl)
+// Write the state back: on exit, and whenever the favourites change, so a
+// killed window does not lose them. Written to a temporary name and renamed
+// over the old file, so a crash part-way through never leaves it half written.
+// Returns 0, or -1 when the file could not be written; the caller decides
+// whether that is worth saying.
+static int save_state(const view_t *v, const experiment_t *s, const geom_t *g,
+                      const globe_t *gl, const favs_t *fv)
 {
-    char path[1024];
-    if (state_path(path, sizeof path) != 0) return;
-    if (sso_mkdir_p_for_file(path) != 0) return;
-    FILE *f = fopen(path, "w");
-    if (f == NULL) return;
-    fprintf(f, "# mpi_viewer session state -- written on exit, read at startup.\n");
+    char path[1024], tmp[1100];
+    if (state_path(path, sizeof path) != 0) return -1;
+    if (sso_mkdir_p_for_file(path) != 0) return -1;
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (f == NULL) return -1;
+    fprintf(f, "# mpi_viewer session state -- written on exit and when a favourite\n");
+    fprintf(f, "# changes, read at startup.\n");
     fprintf(f, "# Delete this file to come back up on the defaults.\n");
     if (s->sat_path[0] != '\0') fprintf(f, "# file = %s\n", s->sat_path);
     fprintf(f, "experiment = %s\n", s->utc);
@@ -2500,7 +2579,12 @@ static void save_state(const view_t *v, const experiment_t *s, const geom_t *g,
     fprintf(f, "window_h = %d\n", g->h);
     fprintf(f, "window_x = %d\n", g->x);
     fprintf(f, "window_y = %d\n", g->y);
-    fclose(f);
+    fprintf(f, "favourites_only = %d\n", fv->only);
+    for (int k = 0; k < fv->nfav; k++) fprintf(f, "favourite = %s\n", fv->fav[k]);
+    int bad = ferror(f);
+    if (fclose(f) != 0) bad = 1;
+    if (bad || rename(tmp, path) != 0) { remove(tmp); return -1; }
+    return 0;
 }
 
 // The experiment the last session had open, found by its start time. Returns
@@ -2545,7 +2629,9 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--help") == 0) {
             printf("Usage: mpi_viewer [--db=<packet_db.sqlite>] [--list]\n"
                    "Inspect MPI science imagery reconstructed from the packet DB.\n"
-                   "The left panel lists MPI experiments; F5 re-reads the DB.\n"
+                   "The left panel lists MPI experiments, newest first; F5 re-reads the DB.\n"
+                   "t tags the experiment on show as a favourite and shift-T shows\n"
+                   "the favourites only.\n"
                    "Press b to show the cleaned imagery -- the instrument's own\n"
                    "background subtraction undone, every frame detrended across its\n"
                    "own edge pixels, and a sliding local background put in place of\n"
@@ -2562,10 +2648,10 @@ int main(int argc, char **argv)
                    "g puts the view back to the whole Earth on the whole track.\n"
                    "--list prints what each experiment reconstructed to and exits,\n"
                    "without opening a window.\n"
-                   "Which experiment was open, where the playhead sat and every\n"
-                   "view setting are kept in ~/.local/state/simple_sat_ops/\n"
-                   "mpi_viewer.state and picked up next time; delete that file to\n"
-                   "come back up on the defaults.\n");
+                   "Which experiment was open, where the playhead sat, every view\n"
+                   "setting and the favourites are kept in\n"
+                   "~/.local/state/simple_sat_ops/mpi_viewer.state and picked up\n"
+                   "next time; delete that file to come back up on the defaults.\n");
             return 0;
         } else {
             fprintf(stderr, "mpi_viewer: unknown option '%s' (try --help)\n", argv[i]);
@@ -2636,9 +2722,22 @@ int main(int argc, char **argv)
     globe_t globe = {0};
     globe.zoom = 1.0;
     char sel_utc[24] = "";
-    load_state(&v, sel_utc, sizeof sel_utc, &geom, &globe);
+    favs_t fv;
+    memset(&fv, 0, sizeof fv);
+    load_state(&v, sel_utc, sizeof sel_utc, &geom, &globe, &fv);
     int saved_img = v.img_pos, saved_play = v.playing;
+    // The rows the list shows: every experiment, or only the favourites. A
+    // favourites-only list with none of them in this database shows them all.
+    int *rows = (int *) malloc((size_t) nexp * sizeof(int));
+    if (rows == NULL) { fprintf(stderr, "mpi_viewer: out of memory\n"); return 1; }
+    int nrows = build_rows(exps, nexp, &fv, fv.only, rows);
+    if (nrows == 0) {
+        fv.only = 0;
+        nrows = build_rows(exps, nexp, &fv, 0, rows);
+    }
     int resumed = find_experiment(exps, nexp, sel_utc);
+    if (resumed >= 0 && row_of(rows, nrows, resumed) < 0) resumed = -1;
+    v.sel = rows[0];
     if (resumed >= 0) v.sel = resumed;
     // A saved globe view belongs to the experiment it was saved for. Opening on
     // a different one frames that one's own track instead.
@@ -2750,16 +2849,19 @@ int main(int argc, char **argv)
             if (over) list_px -= GetMouseWheelMove() * (float) row_h;
             if (over && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 int r = (int) ((m.y - (float) list_top + list_px) / (float) row_h);
-                if (r >= 0 && r < nexp && r != v.sel) {
-                    v.sel = r;
+                if (r >= 0 && r < nrows && rows[r] != v.sel) {
+                    v.sel = rows[r];
                     select_experiment(&v, &exps[v.sel]);
                     s = &exps[v.sel];
                 }
             }
         }
 
-        if (key_repeat(KEY_DOWN, &rep_down) && v.sel < nexp - 1) { v.sel++; select_experiment(&v, &exps[v.sel]); s = &exps[v.sel]; }
-        if (key_repeat(KEY_UP, &rep_up)     && v.sel > 0)        { v.sel--; select_experiment(&v, &exps[v.sel]); s = &exps[v.sel]; }
+        // Up and Down step through the rows on show, so with only the
+        // favourites showing they skip from favourite to favourite.
+        int srow = row_of(rows, nrows, v.sel);
+        if (key_repeat(KEY_DOWN, &rep_down) && srow < nrows - 1) { v.sel = rows[srow + 1]; select_experiment(&v, &exps[v.sel]); s = &exps[v.sel]; }
+        if (key_repeat(KEY_UP, &rep_up)     && srow > 0)         { v.sel = rows[srow - 1]; select_experiment(&v, &exps[v.sel]); s = &exps[v.sel]; }
         if (key_repeat(KEY_RIGHT, &rep_right) && v.img_pos < v.n_img - 1) v.img_pos++;
         if (key_repeat(KEY_LEFT, &rep_left)   && v.img_pos > 0)           v.img_pos--;
         if (IsKeyPressed(KEY_SPACE)) v.playing = !v.playing;
@@ -2810,6 +2912,59 @@ int main(int argc, char **argv)
             if (v.clean_stage != CLEAN_OFF) set_clean(&v, s, v.clean_stage);
             cov_valid = 0;
         }
+        // t tags or untags the experiment on show as a favourite; shift-T
+        // switches the list between every experiment and the favourites only.
+        // With only the favourites showing, untagging one takes it off the
+        // list, so the selection moves to the row that slid into its place --
+        // and untagging the last one goes back to the whole list rather than
+        // to an empty one.
+        int favs_changed = 0;
+        if (IsKeyPressed(KEY_T)) {
+            int shifted = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+            int want_only = fv.only;
+            if (shifted) {
+                want_only = !fv.only;
+                if (want_only && build_rows(exps, nexp, &fv, 1, rows) == 0) {
+                    snprintf(status, sizeof status,
+                             "no favourites yet -- t tags the experiment on show");
+                    want_only = 0;
+                } else {
+                    snprintf(status, sizeof status, want_only ? "showing the favourites only"
+                                                              : "showing every experiment");
+                    favs_changed = 1;
+                }
+            } else {
+                int k = fav_find(&fv, s->utc);
+                if (k >= 0) {
+                    memmove(fv.fav[k], fv.fav[k + 1], (size_t) (fv.nfav - k - 1) * sizeof fv.fav[0]);
+                    fv.nfav--;
+                    snprintf(status, sizeof status, "taken off the favourites");
+                    favs_changed = 1;
+                } else if (fv.nfav < MAX_FAVOURITES) {
+                    snprintf(fv.fav[fv.nfav++], sizeof fv.fav[0], "%s", s->utc);
+                    snprintf(status, sizeof status, "added to the favourites");
+                    favs_changed = 1;
+                } else {
+                    snprintf(status, sizeof status, "favourites full (%d)", MAX_FAVOURITES);
+                }
+            }
+            fv.only = want_only;
+            nrows = build_rows(exps, nexp, &fv, fv.only, rows);
+            if (nrows == 0) {
+                fv.only = 0;
+                nrows = build_rows(exps, nexp, &fv, 0, rows);
+                snprintf(status, sizeof status, "no favourites left; showing every experiment");
+            }
+            // Switching to the favourites from one that is not opens the
+            // newest of them; untagging moves to the row below.
+            if (row_of(rows, nrows, v.sel) < 0) {
+                v.sel = rows[shifted ? 0 : srow < nrows ? srow : nrows - 1];
+                select_experiment(&v, &exps[v.sel]);
+                s = &exps[v.sel];
+            }
+            last_sel = -1;
+            status_left = 6.0f;
+        }
         if (IsKeyPressed(KEY_S)) { v.zoom = v.zoom == 2 ? 4 : v.zoom == 4 ? 8 : v.zoom == 8 ? 16 : 2; }
         if (IsKeyPressed(KEY_A)) v.scale_mode = (v.scale_mode + 1) % 3;
         if (IsKeyPressed(KEY_D)) {
@@ -2830,18 +2985,33 @@ int main(int argc, char **argv)
         // F5: re-read the DB and rebuild the experiment list, preserving the
         // current selection, image position and view settings where possible.
         if (IsKeyPressed(KEY_F5)) {
-            int save_sel = v.sel, save_img = v.img_pos, save_play = v.playing;
+            int save_img = v.img_pos, save_play = v.playing;
             experiment_t *ne = NULL;
             int nn = reload_experiments(db_path, &ne);
-            if (nn > 0) {
+            int *nr = nn > 0 ? (int *) realloc(rows, (size_t) nn * sizeof(int)) : NULL;
+            if (nr != NULL) {
+                // Stay on the same experiment, found by its start time: a new
+                // one at the top of the list moves every row below it down one.
+                char keep[24];
+                snprintf(keep, sizeof keep, "%s", exps[v.sel].utc);
                 free_experiments(exps, nexp);
                 exps = ne; nexp = nn;
-                if (save_sel >= nexp) save_sel = nexp - 1;
-                v.sel = save_sel;
+                rows = nr;
+                nrows = build_rows(exps, nexp, &fv, fv.only, rows);
+                if (nrows == 0) {
+                    fv.only = 0;
+                    nrows = build_rows(exps, nexp, &fv, 0, rows);
+                }
+                v.sel = find_experiment(exps, nexp, keep);
+                int same = v.sel >= 0 && row_of(rows, nrows, v.sel) >= 0;
+                if (!same) v.sel = rows[0];
+                last_sel = -1;
                 select_experiment(&v, &exps[v.sel]);
-                if (save_img >= v.n_img) save_img = v.n_img ? v.n_img - 1 : 0;
-                v.img_pos = save_img;
-                v.playing = save_play;
+                if (same) {
+                    if (save_img >= v.n_img) save_img = v.n_img ? v.n_img - 1 : 0;
+                    v.img_pos = save_img;
+                    v.playing = save_play;
+                }
                 s = &exps[v.sel];
                 cov_valid = 0;   // the reloaded experiment needs a fresh whereogram
                 globe_load_tles(db_path);
@@ -2850,6 +3020,15 @@ int main(int argc, char **argv)
             } else if (ne != NULL) {
                 free_experiments(ne, nn);
             }
+        }
+        // The favourites are written as they change, so a killed window keeps
+        // them; the rest of the state goes with them, as it stands now.
+        if (favs_changed) {
+            Vector2 wp = GetWindowPosition();
+            geom.x = (int) wp.x; geom.y = (int) wp.y;
+            geom.w = GetScreenWidth(); geom.h = GetScreenHeight();
+            if (save_state(&v, s, &geom, &globe, &fv) != 0)
+                snprintf(status, sizeof status, "could not write the state file");
         }
         if (IsKeyPressed(KEY_M)) v.cmap = (v.cmap + 1) % N_CMAPS;
         // g: the globe back to how it opens -- framed on the whole track, the
@@ -2866,13 +3045,13 @@ int main(int argc, char **argv)
         // Pull the list back to the selected row when the selection moves, and
         // keep whatever the reader scrolled to when it does not.
         if (v.sel != last_sel) {
-            float want_top = (float) (v.sel * row_h);
+            float want_top = (float) (row_of(rows, nrows, v.sel) * row_h);
             if (list_px > want_top) list_px = want_top;
             if (list_px < want_top + (float) row_h - (float) list_h)
                 list_px = want_top + (float) row_h - (float) list_h;
             last_sel = v.sel;
         }
-        float list_max = (float) (nexp * row_h - list_h);
+        float list_max = (float) (nrows * row_h - list_h);
         if (list_max < 0.0f) list_max = 0.0f;
         if (list_px > list_max) list_px = list_max;
         if (list_px < 0.0f) list_px = 0.0f;
@@ -2935,16 +3114,21 @@ int main(int argc, char **argv)
 
         // left: experiment list
         DrawRectangle(0, 0, LEFT_W, GetScreenHeight(), (Color){ 28, 28, 34, 255 });
-        draw_text("MPI experiments", 12, 10, 18, RAYWHITE);
-        draw_text(TextFormat("%d run%s", nexp, nexp == 1 ? "" : "s"), LEFT_W - 78, 14, 12, GRAY);
+        draw_text(fv.only ? "Favourites" : "MPI experiments", 12, 10, 18, RAYWHITE);
+        {
+            const char *count = fv.only ? TextFormat("%d of %d", nrows, nexp)
+                                        : TextFormat("%d run%s", nexp, nexp == 1 ? "" : "s");
+            draw_text(count, LEFT_W - 12 - text_width(count, 12), 14, 12, GRAY);
+        }
         // The rows are clipped to the list's own height rather than the
         // window's, so a row half off the bottom is cut at the globe's edge
         // instead of drawn over it.
         BeginScissorMode(0, list_top, LEFT_W, list_h);
         int first = (int) (list_px / (float) row_h);
         if (first < 0) first = 0;
-        for (int si = first; si < nexp; si++) {
-            int y = list_top + si * row_h - (int) list_px;
+        for (int r = first; r < nrows; r++) {
+            int si = rows[r];
+            int y = list_top + r * row_h - (int) list_px;
             if (y >= list_top + list_h) break;
             experiment_t *ss = &exps[si];
             if (si == v.sel) DrawRectangle(0, y, LEFT_W, row_h, (Color){ 44, 70, 110, 255 });
@@ -2960,11 +3144,12 @@ int main(int argc, char **argv)
             draw_text(TextFormat("%.0f KB  %.0f%%  %d frames",
                                  ss->size / 1024.0, pct, ss->nframes),
                       10, y + 23, 12, GRAY);
+            if (fav_find(&fv, ss->utc) >= 0) draw_star(LEFT_W - 18, y + 29, 7, FAV_GOLD);
         }
         EndScissorMode();
         // A thumb down the right edge, only while there is more list than room.
         if (list_max > 0.0f) {
-            float frac = (float) list_h / (float) (nexp * row_h);
+            float frac = (float) list_h / (float) (nrows * row_h);
             int th = (int) ((float) list_h * frac);
             if (th < 20) th = 20;
             int ty = list_top + (int) ((float) (list_h - th) * list_px / list_max);
@@ -3031,7 +3216,12 @@ int main(int argc, char **argv)
             draw_text(TextFormat("pixels        : %d .. %d", s->buf[o + 16], s->buf[o + 17]), ax, ay, 15, LIGHTGRAY); ay += 20;
             draw_text(TextFormat("integration   : %d", be16(s->buf, o + 18)), ax, ay, 15, LIGHTGRAY); ay += 26;
         } else { ay += 20; }
-        draw_text(TextFormat("experiment    : %s UTC", s->utc), ax, ay, 15, LIGHTGRAY); ay += 20;
+        draw_text(TextFormat("experiment    : %s UTC", s->utc), ax, ay, 15, LIGHTGRAY);
+        if (fav_find(&fv, s->utc) >= 0) {
+            const char *el = TextFormat("experiment    : %s UTC", s->utc);
+            draw_star(ax + text_width(el, 15) + 12, ay + 8, 7, FAV_GOLD);
+        }
+        ay += 20;
         draw_text(TextFormat("satellite file: %s", s->sat_path[0] ? s->sat_path : "unknown"),
                   ax, ay, 15, LIGHTGRAY); ay += 20;
         draw_text(TextFormat("targets/sweep : %d", v.n_targets), ax, ay, 15, LIGHTGRAY); ay += 20;
@@ -3266,7 +3456,7 @@ int main(int argc, char **argv)
             "   globe: drag turns, two-finger press-drag turns about the satellite, scroll zooms, g resets"
             "   Space play/pause   ,/. speed   f steps/sweep   s zoom   a scale"
             "   z/x min  c/v max   m colour map   b clean  B step   n bg window   e median/mean"
-            "   d re-download commands   F5 refresh  q quit";
+            "   t favourite  T favourites only   d re-download commands   F5 refresh  q quit";
         draw_text(help, 12, GetScreenHeight() - 22, 12, (Color){ 150, 150, 160, 255 });
 
         EndDrawing();
@@ -3277,7 +3467,7 @@ int main(int argc, char **argv)
     Vector2 wpos = GetWindowPosition();
     geom.x = (int) wpos.x; geom.y = (int) wpos.y;
     geom.w = GetScreenWidth(); geom.h = GetScreenHeight();
-    save_state(&v, &exps[v.sel], &geom, &globe);
+    save_state(&v, &exps[v.sel], &geom, &globe, &fv);
 
     UnloadTexture(tex);
     globe_free(&globe);
@@ -3286,6 +3476,7 @@ int main(int argc, char **argv)
     if (g_ui_font_loaded) UnloadFont(g_ui_font);
     CloseWindow();
 
+    free(rows);
     free_experiments(exps, nexp);
     free(v.fr_img);
     free_clean(&v);
