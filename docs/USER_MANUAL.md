@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`d83cb2a` (2026-10-01). This is a working draft.
+`c2b8f7b` (2026-10-01). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2707,10 +2707,14 @@ that 20 KB block finished filling on the satellite, so a frame's time is
 interpolated by its byte position between the surrounding footers. An image's
 time is the time of its first frame, shown in green above the picture.
 
-The 20 KB flush is not frame-aligned, so once per ~20 KB a footer is spliced
-into the middle of a frame; that one frame reads as a garbage row. The viewer
-drops any frame whose body overlaps a marker, which removes the routine periodic
-artifact (roughly one frame in 134).
+The 20 KB flush is not frame-aligned, so once per ~20 KB (roughly one frame in
+134) a footer is written into the middle of a frame. The firmware still writes
+the whole frame either side of it, so the viewer cuts the footer out and joins
+the two halves, and the frame is kept. The frame's own CRC-16 is the check: a
+joined frame that fails it is dropped. That happens when the firmware lost data
+at that flush (the frame counter jumps across the footer) and for the last frame
+of a recording, which the stop cuts short. `--list` reports how many frames were
+rejoined, kept and dropped for each experiment.
 
 **What the picture's axes are.** Up the image is the 65 CCD pixels, the
 direction the ions arrived from. Across it is the inner-dome bias in the order
@@ -2782,8 +2786,8 @@ window is clipped where it runs off either end of the recording) and subtracts
 the result, pixel by pixel, from every frame of the image.
 
 Only frames fit to stand as a sample go into that window: every byte of them
-arrived, **the frame's own CCITT CRC-16 checks out**, and no JSON marker was
-spliced into them. That CRC is the instrument's own word on the frame and covers
+arrived and **the frame's own CCITT CRC-16 checks out** (for a frame with a
+JSON footer cut out of it, over the joined bytes). That CRC is the instrument's own word on the frame and covers
 exactly the bytes being read, which the CSP CRC32 on a packet does not - a frame
 is assembled from whatever packets its bytes happened to land in. Across the
 08-09 recording it catches 127 bad frames where the packet CRC flagged only 71.

@@ -32,11 +32,14 @@
     sync happens to land on it. Instead we locate EVERY occurrence of the sync
     word 0C FF FF 0C; each one starts a 152-byte frame wherever it sits.
 
-    Artifact removal: the 20480-byte flush is not frame-aligned, so once per
-    ~20 KB a ~150-byte JSON footer is spliced into the middle of a frame. That
-    frame's sync word is still found, but its 152 bytes read JSON text plus
-    shifted pixels -- a garbage row. We drop any frame whose body overlaps a
-    marker blob (~1 frame per 134), which removes the routine periodic artifact.
+    Marker splices: the 20480-byte flush is not frame-aligned, so once per
+    ~20 KB (~1 frame in 134) a ~150-byte JSON footer lands in the middle of a
+    frame. Read straight off the file, that frame is JSON text plus shifted
+    pixels -- a garbage row. But the firmware writes the whole frame either side
+    of the footer, so we cut the footer out and join the two halves, and the
+    frame comes back intact. Its own CRC is the check: a joined frame that
+    fails it (data the firmware lost at the flush, or the last frame of a
+    recording, cut short by the stop) is dropped.
 
     Each frame carries aux/housekeeping fields then a strip of image pixels, and
     the two are one frame apart: the pixels were integrated during the previous
@@ -363,8 +366,11 @@ typedef struct {
     int     *fr_scan;        // inner dome scan index (byte 13) per frame
     int     *fr_tv;          // inner dome target voltage (bytes 11-12) per frame
     double  *fr_ts;          // capture time (unix ms) per frame, -1 if unknown
-    int     *fr_bad;         // 1 if the frame body overlaps a JSON marker (drop it)
+    uint8_t *fr_bytes;       // each frame's 152 bytes, any JSON marker spliced into it cut out
+    int     *fr_bad;         // 1 if the frame is dropped: it runs past EOF, or a rejoined frame fails its CRC
+    int     *fr_spliced;     // 1 if a JSON marker was cut out of the frame
     int     *fr_unver;       // 1 if any of the frame's bytes came from a failed-CRC packet
+    int     *fr_gap;         // 1 if any of the frame's bytes never came down
 } experiment_t;
 
 // Release one experiment's buffers. Split out of free_experiments because a
@@ -376,6 +382,7 @@ static void free_experiment(experiment_t *e)
     free(e->fr_off); free(e->fr_ctr);
     free(e->fr_scan); free(e->fr_tv);
     free(e->fr_ts); free(e->fr_bad); free(e->fr_unver);
+    free(e->fr_bytes); free(e->fr_spliced); free(e->fr_gap);
 }
 
 // Little-endian uint32 file offset out of a bulk_file payload.
@@ -389,6 +396,35 @@ static long bulk_offset(const uint8_t *pl)
 static int be16(const uint8_t *buf, long i)
 {
     return (buf[i] << 8) | buf[i + 1];
+}
+
+// Frame k's 152 bytes, read with any JSON marker the firmware wrote into the
+// middle of it cut out -- so read a frame's contents through this, not
+// straight out of the file buffer at its offset.
+static const uint8_t *frame_at(const experiment_t *s, int k)
+{
+    return s->fr_bytes + (long) k * FRAME_STRIDE;
+}
+
+// The CCITT CRC-16 the instrument puts in the last two bytes of every frame,
+// over the 150 bytes before them (avr-libc's _crc_ccitt_update seeded 0xFFFF,
+// most significant byte first -- calculateTelemetryCrc in the flight
+// MPITelemetry.c). This is the instrument's own word on whether the frame
+// arrived intact, and it covers exactly the bytes being read -- which the CSP
+// CRC32 on a packet does not, a frame being assembled from whatever packets its
+// bytes happened to land in. Measured, it passes on 3611 of 3611 whole frames
+// of the 2026-07-21 recording and 9025 of 9027 of the 2026-08-09 one.
+static int frame_crc_ok(const experiment_t *s, int k)
+{
+    const uint8_t *f = frame_at(s, k);
+    uint16_t crc = 0xFFFF;
+    for (int i = 0; i < FRAME_STRIDE - 2; i++) {
+        uint8_t t = f[i] ^ (uint8_t) (crc & 0xFF);
+        t ^= (uint8_t) (t << 4);
+        crc = (uint16_t) ((crc >> 8) ^ ((uint16_t) t << 8)
+                          ^ ((uint16_t) t << 3) ^ ((uint16_t) t >> 4));
+    }
+    return crc == (uint16_t) be16(f, FRAME_STRIDE - 2);
 }
 
 // "2026-08-09 22:08:04.123" (UTC) from a unix-ms timestamp.
@@ -920,19 +956,17 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
     out->fr_ts   = (double *) malloc((size_t) n * sizeof(double));
     out->fr_bad  = (int *) calloc((size_t) n, sizeof(int));
     out->fr_unver = (int *) calloc((size_t) n, sizeof(int));
+    out->fr_gap  = (int *) calloc((size_t) n, sizeof(int));
+    out->fr_spliced = (int *) calloc((size_t) n, sizeof(int));
+    out->fr_bytes = (uint8_t *) calloc((size_t) n, FRAME_STRIDE);
     if (out->fr_ctr == NULL || out->fr_scan == NULL || out->fr_tv == NULL
-        || out->fr_ts == NULL || out->fr_bad == NULL || out->fr_unver == NULL) {
+        || out->fr_ts == NULL || out->fr_bad == NULL || out->fr_unver == NULL
+        || out->fr_gap == NULL || out->fr_spliced == NULL || out->fr_bytes == NULL) {
         free(out->fr_ctr); free(out->fr_scan); free(out->fr_tv);
         free(out->fr_ts); free(out->fr_bad); free(out->fr_unver);
+        free(out->fr_gap); free(out->fr_spliced); free(out->fr_bytes);
         free(offs); free(buf); free(present); free(verified);
         return 0;
-    }
-    for (int k = 0; k < n; k++) {
-        long o = offs[k];
-        out->fr_ctr[k]  = be16(buf, o + 4);
-        out->fr_scan[k] = buf[o + SCAN_IDX_OFF];
-        out->fr_tv[k]   = be16(buf, o + 11);
-        out->fr_ts[k]   = -1.0;
     }
 
     long recovered = 0, unverified = 0;
@@ -944,19 +978,55 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
     out->recovered = recovered;
     out->unverified = unverified;
 
-    // A frame is suspect if any byte of it came from a packet whose CRC failed:
-    // those bytes were placed on an offset nothing vouches for, and their
-    // contents were never checked either.
-    for (int k = 0; k < n; k++) {
-        long o = offs[k];
-        for (long b = o; b < o + FRAME_STRIDE && b < size; b++)
-            if (present[b] && !verified[b]) { out->fr_unver[k] = 1; break; }
-    }
-
-    // Locate the JSON markers in the merged stream. They give both the
-    // (offset -> time) curve and the byte spans to drop straddling frames.
+    // Locate the JSON markers in the merged stream. They give the (offset ->
+    // time) curve, and the byte spans to cut out of the frames they land in.
     long *mo = NULL; double *mt = NULL;
     int nm = scan_markers(buf, size, max_ts, &mo, &mt);
+    long *ms = (long *) malloc((size_t) (nm > 0 ? nm : 1) * sizeof(long));
+    long *me = (long *) malloc((size_t) (nm > 0 ? nm : 1) * sizeof(long));
+    if (ms == NULL || me == NULL) nm = 0;
+    for (int m = 0; m < nm; m++) marker_span(buf, size, mo[m], &ms[m], &me[m]);
+
+    // Read each frame's 152 bytes. The 20480-byte flush is not frame-aligned,
+    // so once per ~20 KB the firmware writes a JSON marker into the middle of a
+    // frame -- but it writes the whole frame either side of it, so cutting the
+    // marker out and joining the two halves gives the frame back intact. A frame
+    // that would run past the end of the file once the marker is cut out cannot
+    // be read whole and is dropped. The frames and the markers both run up the
+    // file in order, so one pass over the markers serves every frame.
+    int m0 = 0;
+    for (int k = 0; k < n; k++) {
+        long o = offs[k];
+        while (m0 < nm && me[m0] <= o) m0++;
+        uint8_t *f = out->fr_bytes + (long) k * FRAME_STRIDE;
+        long p = o;
+        int m = m0;
+        for (int i = 0; i < FRAME_STRIDE; i++, p++) {
+            for (; m < nm && ms[m] <= p; m++)
+                if (p < me[m]) { p = me[m]; out->fr_spliced[k] = 1; }
+            if (p >= size) { out->fr_bad[k] = 1; break; }
+            f[i] = buf[p];
+            // A byte that never came down reads as zero; one from a packet
+            // whose CRC failed was placed on an offset nothing vouches for.
+            if (!present[p]) out->fr_gap[k] = 1;
+            else if (!verified[p]) out->fr_unver[k] = 1;
+        }
+        out->fr_ctr[k]  = be16(f, 4);
+        out->fr_scan[k] = f[SCAN_IDX_OFF];
+        out->fr_tv[k]   = be16(f, 11);
+        out->fr_ts[k]   = -1.0;
+
+        // The firmware sometimes loses data at a flush, and then the half after
+        // the marker belongs to a later frame (the frame counter jumps across
+        // it); the last frame of a recording is cut short by the stop. Either
+        // way the joined frame fails its own CRC, so a rejoined frame that
+        // came down whole and fails it is dropped. One with bytes missing
+        // cannot be checked and is kept, like any other frame with a gap.
+        if (out->fr_spliced[k] && !out->fr_bad[k] && !out->fr_gap[k]
+            && !frame_crc_ok(out, k))
+            out->fr_bad[k] = 1;
+    }
+    free(ms); free(me);
 
     // Experiment start = the earliest marker time within a recording window of
     // the marker cluster's centre (rejects a bit-flipped low outlier). Falls
@@ -1003,17 +1073,6 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
             out->fr_ts[k] = interp_time(coff, cts, cn, offs[k]);
     }
     free(coff); free(cts);
-
-    // Drop frames whose 152-byte body overlaps a marker blob (the mid-frame JSON
-    // splice that causes the routine per-20 KB artifact).
-    for (int m = 0; m < nm; m++) {
-        long ms, me;
-        marker_span(buf, size, mo[m], &ms, &me);
-        for (int k = 0; k < n; k++) {
-            long fo = offs[k];
-            if (fo < me && fo + FRAME_STRIDE > ms) out->fr_bad[k] = 1;
-        }
-    }
 
     free(mo); free(mt);
     return 1;
@@ -1516,43 +1575,19 @@ static double estimate_bg(double *v, int n, int use_mean)
 static int frame_level(const experiment_t *s, int k)
 {
     int p[NPIX];
-    long base = s->fr_off[k] + PIX_START;
-    for (int j = 0; j < NPIX; j++) p[j] = be16(s->buf, base + j * 2);
+    const uint8_t *f = frame_at(s, k);
+    for (int j = 0; j < NPIX; j++) p[j] = be16(f, PIX_START + j * 2);
     return median_int(p, NPIX);
-}
-
-// The CCITT CRC-16 the instrument puts in the last two bytes of every frame,
-// over the 150 bytes before them (avr-libc's _crc_ccitt_update seeded 0xFFFF,
-// most significant byte first -- calculateTelemetryCrc in the flight
-// MPITelemetry.c). This is the instrument's own word on whether the frame
-// arrived intact, and it covers exactly the bytes being read -- which the CSP
-// CRC32 on a packet does not, a frame being assembled from whatever packets its
-// bytes happened to land in. Measured, it passes on 3611 of 3611 whole frames
-// of the 2026-07-21 recording and 9025 of 9027 of the 2026-08-09 one.
-static int frame_crc_ok(const experiment_t *s, int k)
-{
-    const uint8_t *f = s->buf + s->fr_off[k];
-    uint16_t crc = 0xFFFF;
-    for (int i = 0; i < FRAME_STRIDE - 2; i++) {
-        uint8_t t = f[i] ^ (uint8_t) (crc & 0xFF);
-        t ^= (uint8_t) (t << 4);
-        crc = (uint16_t) ((crc >> 8) ^ ((uint16_t) t << 8)
-                          ^ ((uint16_t) t << 3) ^ ((uint16_t) t >> 4));
-    }
-    return crc == (uint16_t) be16(s->buf, s->fr_off[k] + FRAME_STRIDE - 2);
 }
 
 // Whether frame k is fit to stand as a background sample. Every byte of it has
 // to have arrived -- a byte that never came down reads as zero, and zero is not
-// a measurement of no signal -- its own CRC has to check out, and it must not
-// be one of the frames a JSON marker was spliced into. A frame that fails any
-// of this is left out of the window rather than averaged in.
+// a measurement of no signal -- its own CRC has to check out, and it must be
+// readable whole to begin with. A frame that fails any of this is left out of
+// the window rather than averaged in.
 static int bg_sample_ok(const experiment_t *s, int k)
 {
-    if (s->fr_bad[k]) return 0;
-    long b1 = s->fr_off[k] + FRAME_STRIDE;
-    for (long b = s->fr_off[k]; b < b1; b++)
-        if (!s->present[b]) return 0;
+    if (s->fr_bad[k] || s->fr_gap[k]) return 0;
     return frame_crc_ok(s, k);
 }
 
@@ -1640,12 +1675,12 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
     for (int k = 0; k < nf; k++) {
         if (nx < nkey && keys[nx] == k) { cur = k; nx++; }
         if (s->fr_bad[k]) continue;
-        long src = s->fr_off[k] + PIX_START;
-        long bg = cur >= 0 ? s->fr_off[cur] + PIX_START : -1;
+        const uint8_t *src = frame_at(s, k);
+        const uint8_t *bg = cur >= 0 ? frame_at(s, cur) : NULL;
         for (int j = 0; j < NPIX; j++) {
-            double p = be16(s->buf, src + j * 2);
-            if (bg >= 0 && cur != k)
-                p += (double) be16(s->buf, bg + j * 2) - CLEAN_PEDESTAL;
+            double p = be16(src, PIX_START + j * 2);
+            if (bg != NULL && cur != k)
+                p += (double) be16(bg, PIX_START + j * 2) - CLEAN_PEDESTAL;
             pix[(long) k * NPIX + j] = (float) p;
         }
         ok[k] = 1;
@@ -1781,7 +1816,7 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
 static double pix_val(const view_t *v, const experiment_t *s, int k, int j)
 {
     if (v->clean_stage != CLEAN_OFF) return v->clean_pix[(long) k * NPIX + j];
-    return be16(s->buf, s->fr_off[k] + PIX_START + j * 2);
+    return be16(frame_at(s, k), PIX_START + j * 2);
 }
 
 // Whether frame k has anything to show in the current mode. Cleaning needs a
@@ -2698,6 +2733,16 @@ int main(int argc, char **argv)
             for (int f = 0; f < e->nframes; f++) if (e->fr_unver[f]) nunver++;
             if (nunver > 0) printf(" (%d touch unverified bytes)", nunver);
             printf("\n");
+            int nspl = 0, nspl_kept = 0;
+            for (int f = 0; f < e->nframes; f++) {
+                if (!e->fr_spliced[f]) continue;
+                nspl++;
+                if (!e->fr_bad[f]) nspl_kept++;
+            }
+            if (nspl > 0)
+                printf("  rejoined  : %d frame(s) with a JSON marker cut out, %d kept, "
+                       "%d dropped (incomplete or failed CRC)\n",
+                       nspl, nspl_kept, nspl - nspl_kept);
             if (e->dropped > 0)
                 printf("  dropped   : %ld packet(s) with an off-grid or past-the-end offset\n",
                        e->dropped);
@@ -3205,16 +3250,16 @@ int main(int argc, char **argv)
         int ay = iy;
         draw_text("Aux data", ax, ay, 18, RAYWHITE); ay += 26;
         if (rep_frame >= 0) {
-            long o = s->fr_off[rep_frame];
-            draw_text(TextFormat("frame counter : %d", be16(s->buf, o + 4)),  ax, ay, 15, LIGHTGRAY); ay += 20;
-            draw_text(TextFormat("temperature   : %d (raw ADC)", be16(s->buf, o + 6)), ax, ay, 15, LIGHTGRAY); ay += 20;
-            draw_text(TextFormat("firmware ver  : %d", s->buf[o + 8]),        ax, ay, 15, LIGHTGRAY); ay += 20;
-            draw_text(TextFormat("camera CCD ADC: %d", be16(s->buf, o + 9)),  ax, ay, 15, LIGHTGRAY); ay += 20;
-            draw_text(TextFormat("dome target V : %d", be16(s->buf, o + 11)), ax, ay, 15, LIGHTGRAY); ay += 20;
-            draw_text(TextFormat("scan index    : %d", s->buf[o + 13]),       ax, ay, 15, LIGHTGRAY); ay += 20;
-            draw_text(TextFormat("dome ADC read : %d", be16(s->buf, o + 14)), ax, ay, 15, LIGHTGRAY); ay += 20;
-            draw_text(TextFormat("pixels        : %d .. %d", s->buf[o + 16], s->buf[o + 17]), ax, ay, 15, LIGHTGRAY); ay += 20;
-            draw_text(TextFormat("integration   : %d", be16(s->buf, o + 18)), ax, ay, 15, LIGHTGRAY); ay += 26;
+            const uint8_t *f = frame_at(s, rep_frame);
+            draw_text(TextFormat("frame counter : %d", be16(f, 4)),  ax, ay, 15, LIGHTGRAY); ay += 20;
+            draw_text(TextFormat("temperature   : %d (raw ADC)", be16(f, 6)), ax, ay, 15, LIGHTGRAY); ay += 20;
+            draw_text(TextFormat("firmware ver  : %d", f[8]),        ax, ay, 15, LIGHTGRAY); ay += 20;
+            draw_text(TextFormat("camera CCD ADC: %d", be16(f, 9)),  ax, ay, 15, LIGHTGRAY); ay += 20;
+            draw_text(TextFormat("dome target V : %d", be16(f, 11)), ax, ay, 15, LIGHTGRAY); ay += 20;
+            draw_text(TextFormat("scan index    : %d", f[13]),       ax, ay, 15, LIGHTGRAY); ay += 20;
+            draw_text(TextFormat("dome ADC read : %d", be16(f, 14)), ax, ay, 15, LIGHTGRAY); ay += 20;
+            draw_text(TextFormat("pixels        : %d .. %d", f[16], f[17]), ax, ay, 15, LIGHTGRAY); ay += 20;
+            draw_text(TextFormat("integration   : %d", be16(f, 18)), ax, ay, 15, LIGHTGRAY); ay += 26;
         } else { ay += 20; }
         draw_text(TextFormat("experiment    : %s UTC", s->utc), ax, ay, 15, LIGHTGRAY);
         if (fav_find(&fv, s->utc) >= 0) {
