@@ -36,6 +36,7 @@ typedef struct last_state {
     char   sat[64];
     double az;
     double el;
+    int    rot_pos_known;
     long   freq_hz;
     double doppler;
     char   tle[256];
@@ -45,6 +46,7 @@ typedef struct last_state {
     int    in_pass;
     int    tracking;
     int    has_rot;
+    int    rot_activity;
     double jul;
     char   idesg[9];
     double epoch_min;

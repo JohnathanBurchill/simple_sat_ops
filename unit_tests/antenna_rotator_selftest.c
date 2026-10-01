@@ -1058,6 +1058,75 @@ static void test_home_leg2_echo_rejection(void)
           "real feedback wound the wrong way (positive unwind) does not fire");
 }
 
+// --------------------------------------------------------- activity status
+
+static antenna_rotator_t activity_fixture(double target_az, double target_el,
+                                          double az, double el,
+                                          int position_known)
+{
+    antenna_rotator_t r = {0};
+    r.target_azimuth   = target_az;
+    r.target_elevation = target_el;
+    r.azimuth           = az;
+    r.elevation          = el;
+    r.position_known    = position_known;
+    return r;
+}
+
+static void test_activity_status(void)
+{
+    fprintf(stderr, "activity_status (target vs actual):\n");
+
+    antenna_rotator_t r = activity_fixture(45.0, 20.0, 45.0, 20.0, 0);
+    check(antenna_rotator_activity_status(&r)
+              == ANTENNA_ROTATOR_ACTIVITY_CONNECTION_FAILURE,
+          "position unknown -> CONNECTION_FAILURE regardless of az/el");
+
+    r = activity_fixture(45.0, 20.0, 45.0, 20.0, 1);
+    check(antenna_rotator_activity_status(&r) == ANTENNA_ROTATOR_ACTIVITY_IDLE,
+          "target == actual (not home) -> IDLE");
+
+    r = activity_fixture(0.3, -0.2, 0.0, 0.0, 1);
+    check(antenna_rotator_activity_status(&r) == ANTENNA_ROTATOR_ACTIVITY_IDLE_AT_HOME,
+          "target and actual both within tolerance of 0,0 -> IDLE_AT_HOME");
+
+    r = activity_fixture(90.0, 30.0, 45.0, 20.0, 1);
+    check(antenna_rotator_activity_status(&r) == ANTENNA_ROTATOR_ACTIVITY_JOGGING,
+          "target far from actual, target not home -> JOGGING");
+
+    r = activity_fixture(0.0, 0.0, 45.0, 20.0, 1);
+    check(antenna_rotator_activity_status(&r) == ANTENNA_ROTATOR_ACTIVITY_RETURNING_HOME,
+          "target far from actual, target is 0,0 -> RETURNING_HOME");
+
+    // Mid a two-step unwind: target_azimuth briefly holds the intermediate
+    // waypoint, not the final home target -- home_pending_final_az +
+    // homing_in_progress must still be recognized as "returning".
+    r = activity_fixture(180.0, 0.0, 300.0, 0.0, 1);
+    r.homing_in_progress    = 1;
+    r.home_pending_final_az = 0.0;
+    check(antenna_rotator_activity_status(&r) == ANTENNA_ROTATOR_ACTIVITY_RETURNING_HOME,
+          "two-step unwind mid-leg (target=mid waypoint) -> still RETURNING_HOME");
+
+    // Same mid-leg geometry but the final leg is NOT home -- must not be
+    // misclassified as returning just because homing_in_progress is set.
+    r = activity_fixture(180.0, 0.0, 300.0, 0.0, 1);
+    r.homing_in_progress    = 1;
+    r.home_pending_final_az = 90.0;
+    check(antenna_rotator_activity_status(&r) == ANTENNA_ROTATOR_ACTIVITY_JOGGING,
+          "two-step unwind toward a non-home final leg -> JOGGING");
+
+    check(strcmp(antenna_rotator_activity_name(ANTENNA_ROTATOR_ACTIVITY_CONNECTION_FAILURE),
+                 "Connection Failure") == 0, "name: Connection Failure");
+    check(strcmp(antenna_rotator_activity_name(ANTENNA_ROTATOR_ACTIVITY_RETURNING_HOME),
+                 "Returning to 0,0") == 0, "name: Returning to 0,0");
+    check(strcmp(antenna_rotator_activity_name(ANTENNA_ROTATOR_ACTIVITY_JOGGING),
+                 "Jogging") == 0, "name: Jogging");
+    check(strcmp(antenna_rotator_activity_name(ANTENNA_ROTATOR_ACTIVITY_IDLE_AT_HOME),
+                 "Sitting Idle at 0,0") == 0, "name: Sitting Idle at 0,0");
+    check(strcmp(antenna_rotator_activity_name(ANTENNA_ROTATOR_ACTIVITY_IDLE),
+                 "Sitting Idle") == 0, "name: Sitting Idle");
+}
+
 int main(void)
 {
     test_wrap_to_pm180();
@@ -1080,5 +1149,6 @@ int main(void)
     test_seed_from_status();
     test_set_unwrapped_state_update();
     test_pass_simulation_flip_baseline();
+    test_activity_status();
     return tap_done();
 }

@@ -36,6 +36,14 @@
 
 typedef struct antenna_rotator_async antenna_rotator_async_t;
 
+// Tolerance (ms since the last GOOD STATUS reply) beyond which a cached
+// az/el reading must no longer be presented as the rotator's current
+// pointing -- callers should gate their display/broadcast of az/el on
+// out_stale_ms <= this, re-checked every time, rather than trusting a
+// once-good reading indefinitely (a pulled cable or a wedged controller
+// must surface as "unknown", not as a frozen last value).
+#define ANTENNA_ROTATOR_STATUS_STALE_MS 1500
+
 // Spawn the worker. `rot` is borrowed — the caller continues to own its
 // lifetime, and the worker only touches `rot->fd` / `rot->connected` (it
 // never writes to the target / wrap fields, which stay single-threaded on
