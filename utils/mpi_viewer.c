@@ -215,8 +215,17 @@
 
     Read-only on the DB. Press F5 to re-read it and rebuild the experiment list.
 
+    A single file: given the path of an MPI science-data file (one mpi_reconstruct
+    wrote, or one copied off the satellite) the viewer shows just that file as its
+    one experiment, built the same way as one from the DB but from a single chunk
+    covering the whole file. F5 then re-reads the file. The DB is still read, if
+    there is one, for the globe's TLEs and attitudes. A file on disk does not
+    record which bytes never arrived -- mpi_reconstruct leaves them as its fill
+    value -- so every byte counts as received and there is nothing for d to
+    re-download.
+
     Usage:
-      mpi_viewer [--db=<packet_db.sqlite>] [--list]
+      mpi_viewer [--db=<packet_db.sqlite>] [--list] [<mpi_file>]
 
     With no --db the default store is used ($SSO_PACKET_DB, else the FrontierSat
     root's packet_db.sqlite).
@@ -348,6 +357,7 @@ typedef struct {
     char     utc[24];        // experiment start time "2026-07-21 17:23:00" (UTC)
     double   t_start_ms;     // experiment start (unix ms) from the mpi_start marker
     char     sat_path[MPI_SAT_PATH_LEN];  // the file on the satellite, "" if unknown
+    char     src_file[256];  // the local file it was read from, "" when it came from the DB
     double   t_first_recv_ms;// receive time of this experiment's earliest packet
     double   t_last_recv_ms; // receive time of its latest packet
     double   t_end_ms;       // last marker time (unix ms); recording end
@@ -1294,6 +1304,81 @@ static int reload_experiments(const char *db_path, experiment_t **out)
     int nexp = load_experiments_from_db(db, out);
     sqlite3_close(db);
     return nexp;
+}
+
+// Load one MPI science-data file from disk -- a file mpi_reconstruct wrote, or
+// one copied straight off the satellite -- as a single experiment. It goes
+// through the same build as a DB experiment, as one verified chunk spanning the
+// whole file, so frame finding, marker timing and the JSON-splice drop all
+// apply unchanged. A file on disk carries no record of which bytes never came
+// down (mpi_reconstruct leaves them as its fill value), so every byte counts as
+// present. Returns the count, 1 or 0 (caller frees via free_experiments).
+static int load_experiment_from_file(const char *path, experiment_t **out)
+{
+    *out = NULL;
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        fprintf(stderr, "mpi_viewer: cannot open %s\n", path);
+        return 0;
+    }
+    long size = -1;
+    if (fseek(f, 0, SEEK_END) == 0) size = ftell(f);
+    if (size < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "mpi_viewer: cannot read %s\n", path);
+        fclose(f);
+        return 0;
+    }
+    if (size > BULK_FILE_MAX_PLAUSIBLE) {
+        fprintf(stderr, "mpi_viewer: %s is %ld bytes, larger than any MPI file "
+                        "the satellite can send\n", path, size);
+        fclose(f);
+        return 0;
+    }
+    uint8_t *data = (uint8_t *) malloc((size_t) (size > 0 ? size : 1));
+    if (data == NULL || (long) fread(data, 1, (size_t) size, f) != size) {
+        fprintf(stderr, "mpi_viewer: cannot read %s\n", path);
+        free(data); fclose(f);
+        return 0;
+    }
+    fclose(f);
+
+    // There is no receive time to bound the markers with, so the clock does:
+    // a recording cannot have been made after the file holding it was read.
+    double now_ms = (double) time(NULL) * 1000.0;
+    chunk_t c = {0};
+    c.ts_ms = now_ms;
+    c.off = 0;
+    c.crc_ok = 1;
+    c.dlen = size;
+    c.has_sync = 1;
+    c.data = data;
+    int idx = 0;
+
+    experiment_t *exps = (experiment_t *) malloc(sizeof *exps);
+    int n = 0;
+    if (exps != NULL
+        && build_experiment(&c, &idx, 1, 0, now_ms + 3600000.0, size, 1, &exps[0])) {
+        exps[0].size_from_log = 0;
+        snprintf(exps[0].src_file, sizeof exps[0].src_file, "%s", path);
+        n = 1;
+    } else {
+        fprintf(stderr, "mpi_viewer: %s does not look like MPI science data "
+                        "(needs >= %d bytes and the 0C FF FF 0C sync word at least "
+                        "%d times)\n", path, MPI_MIN_FILE_BYTES, MPI_MIN_SYNC);
+        free(exps);
+        exps = NULL;
+    }
+    free(data);
+    *out = exps;
+    return n;
+}
+
+// Load from the file when one was named, else from the DB.
+static int load_experiments(const char *file_path, const char *db_path,
+                            experiment_t **out)
+{
+    if (file_path != NULL) return load_experiment_from_file(file_path, out);
+    return reload_experiments(db_path, out);
 }
 
 // ---- target-voltage setpoints ----------------------------------------------
@@ -2657,16 +2742,23 @@ int main(int argc, char **argv)
     if (sso_version_handle(argc, argv, "mpi_viewer")) return 0;
 
     const char *db_arg = NULL;
+    const char *file_arg = NULL;
     int list_only = 0;
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--db=", 5) == 0) db_arg = argv[i] + 5;
         else if (strcmp(argv[i], "--list") == 0) list_only = 1;
         else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: mpi_viewer [--db=<packet_db.sqlite>] [--list]\n"
+            printf("Usage: mpi_viewer [--db=<packet_db.sqlite>] [--list] [<mpi_file>]\n"
                    "Inspect MPI science imagery reconstructed from the packet DB.\n"
                    "The left panel lists MPI experiments, newest first; F5 re-reads the DB.\n"
                    "t tags the experiment on show as a favourite and shift-T shows\n"
                    "the favourites only.\n"
+                   "Given an <mpi_file> -- one mpi_reconstruct wrote, or a science\n"
+                   "file straight off the satellite -- it shows that one file\n"
+                   "instead of the DB's experiments, and F5 re-reads the file. The\n"
+                   "DB (--db, else the default) is then only read for the globe's\n"
+                   "TLEs and attitudes. A file records no missing bytes, so every\n"
+                   "byte counts as received and d has nothing to re-download.\n"
                    "Press b to show the cleaned imagery -- the instrument's own\n"
                    "background subtraction undone, every frame detrended across its\n"
                    "own edge pixels, and a sliding local background put in place of\n"
@@ -2688,6 +2780,12 @@ int main(int argc, char **argv)
                    "~/.local/state/simple_sat_ops/mpi_viewer.state and picked up\n"
                    "next time; delete that file to come back up on the defaults.\n");
             return 0;
+        } else if (argv[i][0] != '-' && file_arg == NULL) {
+            file_arg = argv[i];
+        } else if (argv[i][0] != '-') {
+            fprintf(stderr, "mpi_viewer: only one MPI file at a time (got '%s' and '%s')\n",
+                    file_arg, argv[i]);
+            return 1;
         } else {
             fprintf(stderr, "mpi_viewer: unknown option '%s' (try --help)\n", argv[i]);
             return 1;
@@ -2697,18 +2795,25 @@ int main(int argc, char **argv)
     char db_default[1024];
     const char *db_path = db_arg;
     if (db_path == NULL) {
-        if (packet_db_default_path(db_default, sizeof db_default) != 0) {
+        if (packet_db_default_path(db_default, sizeof db_default) == 0)
+            db_path = db_default;
+        else if (file_arg == NULL) {
             fprintf(stderr, "mpi_viewer: no DB path (set $SSO_PACKET_DB or pass --db=)\n");
             return 1;
         }
-        db_path = db_default;
+        // With a file to show, the DB is only for the globe; without one the
+        // globe just has no track.
     }
 
-    fprintf(stderr, "mpi_viewer: reconstructing MPI experiments from %s ...\n", db_path);
+    if (file_arg != NULL)
+        fprintf(stderr, "mpi_viewer: reading MPI science data from %s ...\n", file_arg);
+    else
+        fprintf(stderr, "mpi_viewer: reconstructing MPI experiments from %s ...\n", db_path);
     experiment_t *exps = NULL;
-    int nexp = reload_experiments(db_path, &exps);
+    int nexp = load_experiments(file_arg, db_path, &exps);
     if (nexp == 0) {
-        fprintf(stderr, "mpi_viewer: no MPI science-data experiments found.\n");
+        if (file_arg == NULL)
+            fprintf(stderr, "mpi_viewer: no MPI science-data experiments found.\n");
         return 1;
     }
     fprintf(stderr, "mpi_viewer: %d MPI experiment%s.\n", nexp, nexp == 1 ? "" : "s");
@@ -2717,10 +2822,13 @@ int main(int argc, char **argv)
         for (int k = 0; k < nexp; k++) {
             const experiment_t *e = &exps[k];
             printf("%s UTC  %s  (%.1f min)\n", e->utc,
-                   e->sat_path[0] ? e->sat_path : "(file not in the command log)",
+                   e->sat_path[0] ? e->sat_path
+                   : e->src_file[0] ? "(local file)" : "(file not in the command log)",
                    (e->t_end_ms - e->t_start_ms) / 60000.0);
+            if (e->src_file[0] != '\0') printf("  read from : %s\n", e->src_file);
             printf("  file      : %ld bytes (%s)\n", e->size,
-                   e->size_from_log
+                   e->src_file[0] != '\0' ? "length of the file on disk"
+                   : e->size_from_log
                        ? (e->size_exact ? "satellite-reported length"
                                         : "satellite-reported minimum")
                        : "largest offset received -- a lower bound");
@@ -2823,12 +2931,12 @@ int main(int argc, char **argv)
     // read once here; the track itself is built the first time round the loop,
     // when the experiment on screen is settled.
     globe_load_map(&globe, "mpi_viewer");
-    if (globe_load_tles(db_path) == 0)
+    if (db_path == NULL || globe_load_tles(db_path) == 0)
         fprintf(stderr, "mpi_viewer: no FrontierSat TLEs in the DB; "
                         "the globe will show no ground track\n");
     // The attitudes the extended beacons carry, for drawing which way the
     // satellite was facing as the recording ran.
-    beacon_attitude_load(db_path);
+    if (db_path != NULL) beacon_attitude_load(db_path);
 
     // Where the experiment list is scrolled to, in pixels. Scrolling is the
     // reader's, not the selection's: the list is pulled back to the selected
@@ -3013,7 +3121,12 @@ int main(int argc, char **argv)
         if (IsKeyPressed(KEY_S)) { v.zoom = v.zoom == 2 ? 4 : v.zoom == 4 ? 8 : v.zoom == 8 ? 16 : 2; }
         if (IsKeyPressed(KEY_A)) v.scale_mode = (v.scale_mode + 1) % 3;
         if (IsKeyPressed(KEY_D)) {
-            export_redownload(s, db_path, status, sizeof status);
+            if (s->src_file[0] != '\0')
+                snprintf(status, sizeof status,
+                         "a file on disk does not say which bytes never came down; "
+                         "run mpi_reconstruct for re-download commands");
+            else
+                export_redownload(s, db_path, status, sizeof status);
             status_left = 8.0f;
         }
         if (IsKeyPressed(KEY_R)) v.scale_mode = SCALE_AUTO_IMAGE;
@@ -3032,7 +3145,7 @@ int main(int argc, char **argv)
         if (IsKeyPressed(KEY_F5)) {
             int save_img = v.img_pos, save_play = v.playing;
             experiment_t *ne = NULL;
-            int nn = reload_experiments(db_path, &ne);
+            int nn = load_experiments(file_arg, db_path, &ne);
             int *nr = nn > 0 ? (int *) realloc(rows, (size_t) nn * sizeof(int)) : NULL;
             if (nr != NULL) {
                 // Stay on the same experiment, found by its start time: a new
@@ -3059,8 +3172,10 @@ int main(int argc, char **argv)
                 }
                 s = &exps[v.sel];
                 cov_valid = 0;   // the reloaded experiment needs a fresh whereogram
-                globe_load_tles(db_path);
-                beacon_attitude_load(db_path);
+                if (db_path != NULL) {
+                    globe_load_tles(db_path);
+                    beacon_attitude_load(db_path);
+                }
                 globe.track_key[0] = '\0';   // and a fresh ground track
             } else if (ne != NULL) {
                 free_experiments(ne, nn);
@@ -3267,8 +3382,13 @@ int main(int argc, char **argv)
             draw_star(ax + text_width(el, 15) + 12, ay + 8, 7, FAV_GOLD);
         }
         ay += 20;
-        draw_text(TextFormat("satellite file: %s", s->sat_path[0] ? s->sat_path : "unknown"),
-                  ax, ay, 15, LIGHTGRAY); ay += 20;
+        if (s->src_file[0] != '\0')
+            draw_text(TextFormat("local file    : %s", GetFileName(s->src_file)),
+                      ax, ay, 15, LIGHTGRAY);
+        else
+            draw_text(TextFormat("satellite file: %s", s->sat_path[0] ? s->sat_path : "unknown"),
+                      ax, ay, 15, LIGHTGRAY);
+        ay += 20;
         draw_text(TextFormat("targets/sweep : %d", v.n_targets), ax, ay, 15, LIGHTGRAY); ay += 20;
         draw_text(TextFormat("columns/image : %d %s  (filled %d)",
                              v.ncols, v.fpi_override ? "(fixed)" : "(auto)", cols_present),
