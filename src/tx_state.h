@@ -137,9 +137,9 @@ typedef struct auto_tcmd {
     long   start_ns;       // wall-clock at run start, for elapsed TX time
     long   pause_ns;       // ts_now_ns() when paused; shifts start_ns on resume
     int    sends_total;    // running tally — every queued burst
-    int    loops_done;     // full passes through the file completed (loop mode)
-    int    loop_start_sends; // sends_total when the current pass began
-    double pass_seconds;   // wall-clock estimate for one pass through the file
+    int    loops_done;     // times the whole file was sent and wrapped (loop mode)
+    int    loop_start_sends; // sends_total when the current loop began
+    double loop_seconds;   // wall-clock estimate for sending the whole file once
     // On-air seconds accumulated and total (AX100/9600/preroll math).
     double tx_seconds_spent;
     double tx_seconds_total;
