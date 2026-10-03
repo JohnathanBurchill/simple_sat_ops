@@ -1264,6 +1264,21 @@ else()
     message(STATUS "libcrypto not found; uplink_test and rx_decode will not be built.")
 endif()
 
+# When the satellite's SatNOGS observations either side of now start,
+# coloured by whether stations received frames from them. Lists an hour
+# at a time and, like satnogs_browser, reaches the network only through a
+# script: scripts/satnogs_list_hour.sh. Needs nothing but ncurses.
+if (NCURSES_FOUND)
+    add_executable(satnogs_passes utils/satnogs_passes.c)
+    target_compile_definitions(satnogs_passes PRIVATE
+        SATNOGS_PASSES_HAVE_NCURSES)
+    target_include_directories(satnogs_passes PRIVATE ${NCURSES_INCLUDE_DIRS})
+    target_link_directories(satnogs_passes PRIVATE ${NCURSES_LIBRARY_DIRS})
+    target_link_libraries(satnogs_passes PRIVATE ${NCURSES_LIBRARIES})
+    target_link_sso_core(satnogs_passes)
+    list(APPEND SSO_TARGETS satnogs_passes)
+endif()
+
 # ----- SDR pre-flight probe (no OpenSSL / ncurses needed) --------------------
 #
 # `sdr_probe` reports which UHD device and antenna ports simple_sat_ops
@@ -1547,6 +1562,7 @@ set(SSO_OPERATOR_SCRIPTS
     scripts/plot_sky_pass.py
     scripts/plot_sky_pass.sh
     scripts/rx_record.sh
+    scripts/satnogs_list_hour.sh
     scripts/satnogs_pull.sh
     scripts/scan_iq.py
     scripts/sso_admin.sh

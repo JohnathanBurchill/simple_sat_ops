@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`c2b8f7b` (2026-10-01). This is a working draft.
+`f92a707` (2026-10-01). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -3840,6 +3840,58 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   before and after. It sets
   its own `umask` to 0002, since the archive is a shared setgid tree
   that cron writes as another user.
+* **`satnogs_passes`** — a quick look at whether the satellite is still
+  transmitting and whether the SatNOGS network is still scheduled to
+  listen. It shows when the satellite's SatNOGS observations either side
+  of now start, five minutes to a cell: each cell is the start of a
+  five-minute slot, UTC and local side by side, and how many
+  observations begin in it. Slots with none are left out. The cells read
+  down and then across like a timetable, in only as many columns as they
+  need. The window is the last 6 hours and the next 6 (`--back=` and
+  `--ahead=`, in hours, up to 48 between them). A `now` rule cuts in
+  where the past ends; a slot already under way counts as past. Green is
+  a slot in which some station received at least one frame (SatNOGS's
+  own count of what it demodulated), white a past slot in which none
+  did, and cyan one still to come. It reads nothing from this station's
+  packet database. It opens scrolled so the `now` rule is in view;
+  `h`/`l` scroll a column, `n` comes back to now, and `r` re-lists the
+  whole window from SatNOGS.
+
+  It lists an hour at a time through `satnogs_list_hour.sh`, starting
+  with the hour holding now and working outward, so the passes
+  nearest now are on screen within a few seconds. Hours rather than
+  days because FrontierSat draws about 600 observations a day across
+  the network: a day is 23 listing requests at nearly three seconds
+  each, an hour one to three. The second line of the screen says how
+  many hours are listed and how old the oldest listing is. An hour
+  listed more than 12 hours after it ended is final and is never asked
+  about again. The hour holding now and the one before it are re-listed
+  every 15 minutes, because SatNOGS's frame counts climb while stations
+  upload; any other hour is re-listed once its listing is older than
+  `--ttl` (default 120 minutes).
+
+  `satnogs_list_hour.sh` is a separate script so that `satnogs_pull.sh`,
+  which the cron job runs, stays untouched. It still shares that
+  script's archive: it takes the same lock, so the two never run at
+  once, and writes each request to the same `.api_stats.txt`, so there
+  is one count of what this address has spent. Its query reaches 20
+  minutes past the hour and keeps only the passes that start inside it,
+  because the API's `end` filter keeps only observations that have
+  ended by then, and a pass running over the top of the hour would
+  otherwise fall out of both hours. A `satnogs_pull.sh --cache-day`
+  listing has the same gap at midnight. `--list-script=` points
+  `satnogs_passes` at a copy that isn't on the PATH, such as the one in
+  the repository's `scripts/`.
+
+  A listing only starts when it fits inside half the hour's request
+  ceiling, counting what the cron run and anything else has already
+  spent from the archive's tally, and the screen says `waiting for
+  request budget` when it doesn't. A re-list you ask for with `r` may go
+  up to 90% of the ceiling. A listing that fails, or that the cron run's
+  lock turns away, is left for 10 minutes before it is tried again. With
+  the archive's API token the ceiling is 240 an hour and the window
+  fills in a minute or two; without one it is 60, and the window can
+  take more than an hour to fill.
 * **`decode_passes.sh`** — walk a directory tree, find every `.wav` and
   `.ogg`, run `rx_replay` on each (resampling `.ogg` first), and
   summarize what decoded. Beacons print as readable telemetry; anything
