@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`f92a707` (2026-10-01). This is a working draft.
+`efcb764` (2026-10-02). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -3844,15 +3844,23 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   transmitting and whether the SatNOGS network is still scheduled to
   listen. It shows when the satellite's SatNOGS observations either side
   of now start, five minutes to a cell: each cell is the start of a
-  five-minute slot, UTC and local side by side, and how many
-  observations begin in it. Slots with none are left out. The cells read
-  down and then across like a timetable, in only as many columns as they
-  need. The window is the last 6 hours and the next 6 (`--back=` and
-  `--ahead=`, in hours, up to 48 between them). A `now` rule cuts in
-  where the past ends; a slot already under way counts as past. Green is
-  a slot in which some station received at least one frame (SatNOGS's
-  own count of what it demodulated), white a past slot in which none
-  did, and cyan one still to come. It reads nothing from this station's
+  five-minute slot, UTC and local side by side, how many stations, and
+  how many observations begin in it. Slots with none are left out. The
+  cells read down and then across like a timetable, in only as many
+  columns as they need. The window is the last 6 hours and the next 6
+  (`--back=` and `--ahead=`, in hours, up to 48 between them). A `now`
+  rule cuts in where the past ends; a slot already under way counts as
+  past. Behind the rule the `stations` column is how many stations got
+  at least one frame out of the slot (SatNOGS's own count of what it
+  demodulated), so a past slot booked by twenty stations that none of
+  them heard reads `stations 0`, `obs 20`. Ahead of the rule it is how
+  many stations have booked the slot; a station books one observation
+  per pass, so the observation count is left blank there rather than
+  repeat it. A station with two observations in one slot counts once.
+  Green is a slot in which some station received a frame, white a past
+  slot in which none did, and cyan one still to come. The counts in a
+  slot just gone climb for a while as stations upload. It reads nothing
+  from this station's
   packet database. It opens scrolled so the `now` rule is in view;
   `h`/`l` scroll a column, `n` comes back to now, and `r` re-lists the
   whole window from SatNOGS.

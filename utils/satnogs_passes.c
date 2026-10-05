@@ -3,15 +3,19 @@
     Simple Satellite Operations  utils/satnogs_passes.c
 
     Curses grid of when the satellite's SatNOGS observations around now
-    start, five minutes to a cell -- UTC and local side by side, and how
-    many observations begin in that slot -- filling columns top to bottom
-    and left to right like a timetable. A line cuts in where the past
-    ends and the schedule begins. Green is a slot in which some station
-    received at least one frame -- SatNOGS's own count of what it
-    demodulated -- white a past slot in which none did, and cyan one
-    still to come. It is there to answer two questions at a glance: is
-    the satellite still transmitting, and is the network still
-    scheduled to listen. It reads nothing of this station's own.
+    start, five minutes to a cell -- UTC and local side by side, how
+    many stations, and how many observations begin in that slot --
+    filling columns top to bottom and left to right like a timetable. A
+    line cuts in where the past ends and the schedule begins. Behind it
+    the stations are the ones that got at least one frame out of the
+    pass -- SatNOGS's own count of what it demodulated -- and ahead of
+    it they are the ones that have booked it; a station books one
+    observation per pass, so the observation count is left blank there.
+    Green is a slot in which some station received a frame, white a
+    past slot in which none did, and cyan one still to come. It is
+    there to answer two questions at a glance: is the satellite still
+    transmitting, and is the network still scheduled to listen. It
+    reads nothing of this station's own.
 
     The frame counts climb while stations upload, so the hour holding now
     and the one before it are re-listed every quarter of an hour.
@@ -113,15 +117,17 @@ int main(int argc, char **argv)
 // few dozen, from stations all over the network, and what is worth
 // seeing is when the satellite was being heard, not each station.
 #define BIN_S           300
-// A cell is "HH:MM  HH:MM  nn" -- UTC, local, how many observations
-// start in those five minutes -- and the gap after it.
-#define CELL_W          17
+// A cell is "HH:MM  HH:MM  stations  obs" -- UTC, local, how many
+// stations, how many observations start in those five minutes -- and
+// the gap after it.
+#define CELL_W          27
 #define CELL_GAP        3
 
 enum { PAIR_BAR = 1, PAIR_HEARD, PAIR_PAST, PAIR_AHEAD, PAIR_WARN };
 
 typedef struct {
     long   id;
+    long   station;     // SatNOGS ground station id
     time_t t_start;
     time_t t_end;
     int    n_frames;    // frames SatNOGS demodulated from it
@@ -131,7 +137,8 @@ typedef struct {
 typedef struct {
     time_t t0;
     int    n;
-    int    heard;       // how many of them have at least one frame
+    int    stations;        // distinct stations among them
+    int    stations_heard;  // of those, with at least one frame
 } bin_t;
 
 // One UTC hour the window touches, and what is known about its listing.
@@ -299,8 +306,8 @@ static int cmp_obs_start(const void *a, const void *b)
 
 // Read every hour cache in the window into g_rows, keeping the
 // observations that overlap the window. Of the columns
-// satnogs_list_hour.sh writes, these are the ones used: id, start, end
-// and, last, the count of frames SatNOGS demodulated.
+// satnogs_list_hour.sh writes, these are the ones used: id, start, end,
+// station id and, last, the count of frames SatNOGS demodulated.
 static void load_rows(time_t now)
 {
     g_n_rows = 0;
@@ -325,6 +332,7 @@ static void load_rows(time_t now)
             if (o.id <= 0 || o.t_start == (time_t)-1) continue;
             if (o.t_end == (time_t)-1) o.t_end = o.t_start;
             if (o.t_end < lo || o.t_start > hi) continue;
+            o.station = strtol(fld[5], NULL, 10);
             o.n_frames = (int)strtol(fld[9], NULL, 10);
             g_rows[g_n_rows++] = o;
         }
@@ -335,17 +343,29 @@ static void load_rows(time_t now)
     g_n_past = 0;
     while (g_n_past < g_n_rows && g_rows[g_n_past].t_start <= now) g_n_past++;
 
-    // The rows are in start order, so each bin is a run of them.
+    // The rows are in start order, so each bin is a run of them. A
+    // station is counted once per bin however many observations it
+    // has in it, and once among the heard if any of them has a frame.
     g_n_bins = 0;
+    int first = 0;
     for (int i = 0; i < g_n_rows; i++) {
         time_t t0 = g_rows[i].t_start / BIN_S * BIN_S;
         if (g_n_bins == 0 || g_bins[g_n_bins - 1].t0 != t0) {
             bin_t b = {0};
             b.t0 = t0;
             g_bins[g_n_bins++] = b;
+            first = i;
         }
-        g_bins[g_n_bins - 1].n++;
-        if (g_rows[i].n_frames > 0) g_bins[g_n_bins - 1].heard++;
+        bin_t *b = &g_bins[g_n_bins - 1];
+        b->n++;
+        int seen = 0, seen_heard = 0;
+        for (int j = first; j < i; j++) {
+            if (g_rows[j].station != g_rows[i].station) continue;
+            seen = 1;
+            if (g_rows[j].n_frames > 0) seen_heard = 1;
+        }
+        if (!seen) b->stations++;
+        if (g_rows[i].n_frames > 0 && !seen_heard) b->stations_heard++;
     }
     // A bin under way counts as begun: some of its passes are, and the
     // line goes after it.
@@ -664,7 +684,7 @@ static void draw_grid(int top_row, int height, int cols, time_t now)
     localtime_r(&now, &ntm);
     strftime(tz, sizeof tz, "%Z", &ntm);
     char head[64];
-    snprintf(head, sizeof head, "%-5s  %-5s  %3s", "UTC", tz, "obs");
+    snprintf(head, sizeof head, "%-5s  %-5s  %8s  %3s", "UTC", tz, "stations", "obs");
     for (int c = 0; c < shown; c++)
         put(top_row, c * (CELL_W + CELL_GAP), CELL_W, A_BOLD, head);
     top_row++;
@@ -698,16 +718,22 @@ static void draw_grid(int top_row, int height, int cols, time_t now)
             if (i >= g_n_bins) break;
             const bin_t *b = &g_bins[i];
 
-            char utc[16], loc[16], cell[40];
+            // Behind the line the stations are the ones that heard the
+            // pass; ahead of it, the ones that have booked it, where
+            // the observation count would only say the same again.
+            int ahead = i >= g_n_past_bins;
+            char utc[16], loc[16], obs[16] = "", cell[64];
             struct tm tm;
             strftime(utc, sizeof utc, "%H:%M", gmtime_r(&b->t0, &tm));
             strftime(loc, sizeof loc, "%H:%M", localtime_r(&b->t0, &tm));
-            snprintf(cell, sizeof cell, "%s  %s  %3d", utc, loc, b->n);
+            if (!ahead) snprintf(obs, sizeof obs, "%d", b->n);
+            snprintf(cell, sizeof cell, "%s  %s  %8d  %3s", utc, loc,
+                     ahead ? b->stations : b->stations_heard, obs);
 
             int attr;
-            if (i >= g_n_past_bins) attr = attr_for(PAIR_AHEAD);
-            else if (b->heard)      attr = attr_for(PAIR_HEARD) | A_BOLD;
-            else                 attr = attr_for(PAIR_PAST);
+            if (ahead)                   attr = attr_for(PAIR_AHEAD);
+            else if (b->stations_heard)  attr = attr_for(PAIR_HEARD) | A_BOLD;
+            else                         attr = attr_for(PAIR_PAST);
             put(y, x, CELL_W, attr, cell);
         }
     }
