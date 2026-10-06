@@ -1329,6 +1329,30 @@ if (SGP4SDP4_LIB)
     target_link_libraries(tle_keps PRIVATE ${SGP4SDP4_LIB} m)
     list(APPEND SSO_TARGETS tle_keps)
 
+    # When FrontierSat crosses the cusp, the nightside auroral oval and the
+    # subauroral (STEVE) zone: SGP4 positions turned into quasi-dipole
+    # latitude and MLT by tracing IGRF-14 field lines (magcoords.c). The
+    # default TLE comes from the packet database when sqlite3 is present.
+    add_executable(region_crossings apps/region_crossings.c
+                   src/orbit/magcoords.c src/orbit/prediction.c
+                   src/orbit/oem.c src/orbit/tle_csv.c src/ipc/sso_paths.c)
+    target_link_libraries(region_crossings PRIVATE ${SGP4SDP4_LIB} m)
+    if (SQLITE3_FOUND)
+        target_compile_definitions(region_crossings PRIVATE WITH_SQLITE3)
+        target_include_directories(region_crossings PRIVATE ${SQLITE3_INCLUDE_DIRS})
+        target_link_directories(region_crossings PRIVATE ${SQLITE3_LIBRARY_DIRS})
+        target_link_libraries(region_crossings PRIVATE ${SQLITE3_LIBRARIES})
+    endif()
+    list(APPEND SSO_TARGETS region_crossings)
+
+    # IGRF-14 field, quasi-dipole coordinates and MLT against IRI's IGRF,
+    # apexpy and a dipole-only closed form. Pure math; no SGP4.
+    add_executable(magcoords_selftest
+                   unit_tests/magcoords_selftest.c src/orbit/magcoords.c)
+    target_include_directories(magcoords_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+    target_link_libraries(magcoords_selftest PRIVATE m)
+    list(APPEND SSO_TARGETS magcoords_selftest)
+
     # TLE from a single GNSS position/velocity state vector. ECEF->inertial,
     # a two-body solve for a guess, then an SGP4 differential correction so
     # the elements reproduce the state under this build's own propagator.

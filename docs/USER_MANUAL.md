@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`efcb764` (2026-10-02). This is a working draft.
+`5c17a8a` (2026-10-05). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -149,6 +149,7 @@ manual can go back on the shelf where it belongs.
     - [`tle_keps`](#tle_keps)
     - [`tle_compare`](#tle_compare)
     - [`conjunction`](#conjunction)
+    - [`region_crossings`](#region_crossings)
     - [`gnss_reports`](#gnss_reports)
     - [`tle_from_state`](#tle_from_state)
 12. [Uploading the orbit to the space safety database](#uploading-the-orbit-to-the-space-safety-database)
@@ -752,7 +753,7 @@ Which targets actually build depends on what the host has:
 |------------|---------------------|
 | always | `radio_ctl`, `rs_selftest`, `fm_preview`, `agenda_check` |
 | OpenSSL / libcrypto | `uplink_test`, `rx_decode`, `packet_query`, `packet_browser`, `tcmd_browser`, `satnogs_browser`, `tcmd_import` |
-| SGP4SDP4 | `next_in_queue`, `lifetime`, `tle_keps`, `conjunction`, `prediction_selftest`, `pursuit_selftest` |
+| SGP4SDP4 | `next_in_queue`, `lifetime`, `tle_keps`, `conjunction`, `region_crossings`, `magcoords_selftest`, `prediction_selftest`, `pursuit_selftest` |
 | UHD (B210) | `b210_rx_capture`, `b210_gain_sweep`, `tx_frame_sdr`, `sdr_probe` |
 | librtlsdr | RTL-SDR RX-only backend in `simple_sat_ops` (on by default; auto-disables if absent) |
 | libusb | USB-serial clone detection in the UHD backend (a UHD dependency, so normally already present) |
@@ -957,6 +958,7 @@ review it, or take apart what it recorded.
 | Summarize a TLE's orbital elements (keps) | [`tle_keps`](#tle_keps) |
 | Tell apart two close catalog objects, or build a TLE from a downlinked fix | [`tle_compare`](#tle_compare) / [`tle_from_state`](#tle_from_state) |
 | Screen two satellites for a close approach (conjunction) | [`conjunction`](#conjunction) |
+| See when FrontierSat crosses the cusp, the nightside aurora or the STEVE zone | [`region_crossings`](#region_crossings) |
 | Sanity-check a command list before you send it | [`agenda_check`](#agenda-review-agenda_check) |
 | Plot a telemetry field over days or months | [`telemetry_browser`](#telemetry_browser) |
 | Pull frames out of a recorded capture offline | [Offline analysis tools](#offline-analysis-tools) |
@@ -3264,6 +3266,85 @@ to render `conjunction.png`; if gnuplot is not installed it leaves the script
 and data so you can render them by hand. `--plot-out=<path>` sets the output
 base, `--plot-window-sec=<s>` the half-window shown (default 90 s).
 
+### `region_crossings`
+
+Lists the UTC intervals when FrontierSat is predicted to cross three regions
+of interest to space physics: the dayside **cusp**, the nightside **auroral**
+oval, and the pre-midnight **subauroral** zone where STEVE is seen. Each region
+is a band of magnetic latitude, in either hemisphere, inside a window of
+magnetic local time (MLT):
+
+| Region | \|Magnetic latitude\| | MLT | Why |
+|--------|-----------------------|-----|-----|
+| `cusp` | 70-80 deg | 09-15 | the cusp proper peaks at noon; the window takes in the cleft and tilt or IMF-driven shifts |
+| `aurora` | 62-72 deg | 18-06 | the quiet-to-moderate nightside oval |
+| `STEVE` | 55-62 deg | 18-24 | STEVE sits near 60 deg, pre-midnight, about an hour after substorm onset (Gallardo-Lacourt et al., 2018) |
+
+These are typical edges, not a model of the day's activity: the oval and the
+subauroral zone move equatorward as activity rises. Every edge is an option.
+
+```sh
+# The next 24 hours
+region_crossings
+
+# One UTC day, past or future
+region_crossings --day=2026-10-06
+
+# An explicit range, and a wider dayside window for the cusp
+region_crossings --start=2026-10-08T06:00 --stop=2026-10-08T18:00 --cusp-mlt=8,16
+
+# A storm-time oval and subauroral zone
+region_crossings --aurora-mlat=58,70 --steve-mlat=50,58
+
+# Any satellite in a TLE file
+region_crossings $TLES/science.tle --sat="SWARM A"
+```
+
+Each row is one crossing:
+
+```
+Start (UTC)          Stop        Dur  Region  Hemi  Alt km   LT h  MLT h  Lat start/end  MLat start/end
+2026-10-06 06:43:01  06:45:53   2:52  cusp    N        506    8.3    9.6    73.1   81.4    70.0   80.0
+2026-10-06 06:53:15  06:55:54   2:39  aurora  N        507   23.8   23.2    65.4   55.7    72.0   62.0
+2026-10-06 06:55:54  06:57:43   1:49  STEVE   N        506   23.5   23.0    55.7   48.9    62.0   55.0
+```
+
+The altitude, local time and MLT are means over the crossing (the times as
+circular means, so a crossing that spans midnight averages correctly). The
+latitude and magnetic latitude are the values at the start and the end. A
+crossing that starts or stops part-way through a band entered or left it
+through the MLT window instead; one already under way at the window's edge is
+cut there. Local time is local solar time from the subsolar point.
+
+**Magnetic coordinates.** Magnetic latitude is quasi-dipole (QD) latitude at
+the satellite's own altitude, and MLT is computed from the apex longitude --
+the coordinates apexpy and the Swarm products use. Both come from tracing the
+IGRF-14 field line from the satellite up to its apex (`src/orbit/magcoords.c`),
+so the lopsided real field is handled properly. A centred dipole would put the
+55-80 deg band edges up to 6 deg off in the north and 7 deg in the south. IGRF-14
+is defined for 2025-2030; outside that the tool says so and extrapolates.
+
+**Which TLE.** With no file, it takes the FrontierSat TLE (catalog 69015) from
+the packet database whose epoch is nearest the middle of the window, so a past
+day uses that day's elements and a forecast uses the newest. The header prints
+the epoch and how far it lies outside the window; a forecast is only as good
+as the TLE's age allows.
+
+**Scan step.** The orbit is sampled every `--step` seconds (default 10) and
+each region edge is refined to half a second. A visit shorter than the step can
+be missed, which matters only for brief grazes of an MLT edge. A day takes a
+few seconds.
+
+**Validation.** `magcoords_selftest` checks the IGRF field against IRI-2026's
+independent Fortran IGRF (within 0.02 nT), the tracer against the closed-form
+apex of a pure dipole (within 0.001 deg), and QD latitude, apex longitude and
+MLT against apexpy 2.1.1. apexpy's own tracer takes fixed steps of about
+1000 km and lands 0.1 percent high on a pure dipole, so the agreement there is
+a few hundredths of a degree. Over one day of crossings (6 October 2026, 160
+start and stop points) the tool's QD latitude matched apexpy's fitted
+coordinates to 0.035 deg on average, at worst 0.11 deg (where apexpy's fit,
+not the trace, is off), and MLT to 18 s on average, at worst one minute.
+
 ### `gnss_reports`
 
 Reassembles the satellite's GNSS telecommand responses out of the packet
@@ -4130,7 +4211,7 @@ build/pursuit_selftest          # no extra deps
 build/unit_test_runner          # optional ncurses aggregator
 ```
 
-(That is a representative subset; the build produces all 49.)
+(That is a representative subset; the build produces all 50.)
 `unit_test_runner` discovers every `*_selftest` binary under `build/`
 and renders a collapsible group view of the TAP output, so a single
 launch runs the whole suite. It is skipped if ncurses is absent, in
