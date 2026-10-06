@@ -60,6 +60,8 @@
 #define SEC_PER_DAY         86400.0
 // Boundary times are refined by bisection to this, in seconds
 #define REFINE_S            0.5
+// Warn when any part of the window is further than this from the TLE epoch
+#define TLE_MAX_AGE_DAYS    7.0
 
 typedef struct {
     const char *name;
@@ -535,12 +537,21 @@ int main(int argc, char **argv)
     fmt_utc(jd0, 1, t0, sizeof t0);
     fmt_utc(jd1, 1, t1, sizeof t1);
     fmt_utc(jd_epoch, 1, te, sizeof te);
-    double off = (jd_epoch < jd0) ? jd0 - jd_epoch : (jd_epoch > jd1 ? jd_epoch - jd1 : 0.0);
     printf("%s region crossings, %s to %s UTC\n", c.pred.satellite_ephem.tle.sat_name, t0, t1);
-    printf("TLE epoch %s UTC (%s)", te, tle_src);
-    if (off > 0.0)
-        printf(", %.1f days %s the window", off, jd_epoch < jd0 ? "before" : "after");
-    printf("\n");
+    printf("TLE epoch: %s UTC, ", te);
+    if (jd_epoch < jd0)
+        printf("%.1f days before the window starts", jd0 - jd_epoch);
+    else if (jd_epoch > jd1)
+        printf("%.1f days after the window ends", jd_epoch - jd1);
+    else
+        printf("inside the window");
+    printf(" (%s)\n", tle_src);
+    // How far the TLE is propagated to reach the far end of the window,
+    // forward or back: SGP4 accuracy falls off with that distance.
+    double reach = fmax(fabs(jd1 - jd_epoch), fabs(jd0 - jd_epoch));
+    if (reach > TLE_MAX_AGE_DAYS)
+        printf("WARNING: the window reaches %.1f days from the TLE epoch (more than %.0f);"
+               " crossing times lose accuracy as a TLE ages.\n", reach, TLE_MAX_AGE_DAYS);
     if (year < IGRF_YEAR_FIRST || year > IGRF_YEAR_LAST)
         printf("Note: %.1f is outside IGRF-14's %.0f-%.0f span; the field is extrapolated.\n",
                year, IGRF_YEAR_FIRST, IGRF_YEAR_LAST);

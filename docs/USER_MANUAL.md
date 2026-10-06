@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`5c17a8a` (2026-10-05). This is a working draft.
+`1b56e55` (2026-10-06). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -3326,9 +3326,16 @@ is defined for 2025-2030; outside that the tool says so and extrapolates.
 
 **Which TLE.** With no file, it takes the FrontierSat TLE (catalog 69015) from
 the packet database whose epoch is nearest the middle of the window, so a past
-day uses that day's elements and a forecast uses the newest. The header prints
-the epoch and how far it lies outside the window; a forecast is only as good
-as the TLE's age allows.
+day uses that day's elements and a forecast uses the newest. The second line
+of the output gives the TLE epoch and how far it lies from the window. A
+warning follows when any part of the window is more than 7 days from the
+epoch, forward or back, since SGP4 accuracy falls off with a TLE's age:
+
+```
+FrontierSat region crossings, 2026-10-06 13:13:44 to 2026-10-16 13:13:44 UTC
+TLE epoch: 2026-10-05 22:30:27 UTC, 0.6 days before the window starts (packet database tle id 428)
+WARNING: the window reaches 10.6 days from the TLE epoch (more than 7); crossing times lose accuracy as a TLE ages.
+```
 
 **Scan step.** The orbit is sampled every `--step` seconds (default 10) and
 each region edge is refined to half a second. A visit shorter than the step can
