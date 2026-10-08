@@ -155,6 +155,11 @@
 
 set -uo pipefail
 export LC_ALL=C
+# The archive is shared: the cron job runs this as one account and an
+# operator's satnogs_browser runs it as another, both through the group
+# that owns the archive. Files and directories made group-writable let
+# each pick up where the other left off.
+umask 002
 
 # Timestamped logging. The script is built for unattended cron use with
 # stdout/stderr appended to a log file, so every lifecycle line carries a
@@ -904,7 +909,14 @@ NOW_EPOCH_STATS="$(date -u +%s)"
 API_WINDOW_START=$((NOW_EPOCH_STATS - 3600))
 API_LAST_HOUR=0
 AUDIO_LAST_HOUR=0
-STATS_TMP="$(mktemp -t satnogs_pull_stats_XXXXXX)"
+# The trimmed copy is made beside the tally, so it takes the archive's
+# group, and opened up to that group, because mktemp makes files only
+# their owner can use. Once moved into place it is appended to by
+# whichever account runs next, and an owner-only tally locks the other
+# one out.
+STATS_TMP="$(mktemp "$OUT/.api_stats.XXXXXX")"
+chmod 664 "$STATS_TMP"
+add_cleanup "rm -f \"$STATS_TMP\""
 if [[ -s "$STATS_FILE" ]]; then
     # Keep only records inside the trailing hour; drop stale or malformed
     # lines (this also retires the old cumulative-mean file format). A

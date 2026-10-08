@@ -41,6 +41,9 @@
 
 set -uo pipefail
 export LC_ALL=C
+# Shared with the cron job's satnogs_pull.sh, which runs as another
+# account: keep what this writes into the archive group-writable.
+umask 002
 
 NORAD_ID="69015"
 : "${FRONTIERSAT_ROOT:=$([[ -d /FrontierSat ]] && echo /FrontierSat || echo "$HOME/FrontierSat")}"
