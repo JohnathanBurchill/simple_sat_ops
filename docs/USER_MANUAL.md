@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`a3b3bc3` (2026-10-08). This is a working draft.
+`949b9f1` (2026-10-09). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2483,6 +2483,26 @@ than half a minute off, so you can judge it. The frames the geometry works in,
 and the one assumption in it we have not confirmed against flight data, are
 spelled out at the top of `src/orbit/attitude.h`.
 
+**What the picture covered.** With an attitude on hand, **`p` outlines the
+picture on the globe**: the camera's 49 x 38 degree field of view (measured
+from the Earth's limb in the 6 August picture) traced out from the satellite
+along the way it was facing, to where it meets the ground. Straight down from
+500 km that is a box about 460 x 350 km centred on the cross; tilted off nadir
+it stretches into a keystone, the far edge much longer than the near one, and
+any part of the picture that looked past the limb is left open. `p` again
+turns it off. A picture with no attitude near it gets no outline, and the
+status line says so - an outline projected from an assumed attitude would be a
+confident box in the wrong place.
+
+Which way the picture sits on the satellite has **not been measured yet**, so
+the outline assumes the camera frame lies on the body frame: picture right
+along body +X (the ram face), picture down along body +Y, so not mirrored. The
+**top edge is drawn heavier** and **a dot marks the top-left corner**, so
+comparing the outline with the picture shows at once whether that assumption
+holds; the caption adds `heavy edge: picture top (assumed)` while the outline
+is up. When the mounting is known it is one line to change, in
+`draw_satellite` in `utils/sat_globe.c`.
+
 **Zoom in and the dot becomes the satellite.** Past about 3x the dot fades out
 and a model of FrontierSat fades in, turned the way the satellite was turned:
 the 3U body with solar cells down its long faces, the MPI's entrance slit across
@@ -2543,7 +2563,8 @@ image viewer** (Preview on macOS, the `xdg-open` default on Linux) via a copy
 in the temporary directory - for a look in whatever viewer you already keep
 your pictures in. `s` saves the JPEG to
 the working directory as `fs_boomcam_<capture time>.jpg`, `g` resets the globe,
-**`F5` re-reads the database** and rebuilds the list, and `q` quits. Read-only
+`p` outlines the picture on it, **`F5` re-reads the database** and rebuilds
+the list, and `q` quits. Read-only
 on the database and safe to run while a receiver is filling it.
 
 ### `mpi_reconstruct`

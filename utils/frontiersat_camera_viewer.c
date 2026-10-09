@@ -56,6 +56,9 @@
     no camera_capture command is on record the capture time is not known, and
     the globe falls back to where the satellite was when the picture was first
     downloaded -- a different place entirely, which the panel's heading says.
+    When an extended beacon near the moment carries an attitude, p outlines
+    on the globe the patch of ground the picture covered: the camera's field
+    of view projected from the satellite along the way it was facing.
 
     The list runs newest picture first. f tags the picture on show as a
     favourite (a gold star in the list and after the title), and v switches the
@@ -181,6 +184,13 @@ extern void  sso_install_pinch_monitor(void);
 // track either side, enough to say which way the satellite was going and where
 // it had come from without wrapping the arc round the whole Earth.
 #define CAM_TRACK_HALF_MS (5.0 * 60.0 * 1000.0)
+
+// The camera's field of view across the picture and down it, for the outline
+// of what it covered that p draws on the globe. Measured from the curve of the
+// Earth's limb in the 2026-08-06 picture: a focal length of about 705 pixels
+// over the 640 x 480 frame. No lens distortion is allowed for.
+#define CAM_FOV_ACROSS_DEG 49.0
+#define CAM_FOV_DOWN_DEG   38.0
 
 // The help line along the bottom of the window runs the full width, so the
 // left column stops above it.
@@ -1058,6 +1068,8 @@ int main(int argc, char **argv)
     // once here; the track itself is built the first time round the loop.
     globe_t globe = {0};
     globe.zoom = GLOBE_ZOOM_MIN;
+    globe.fov_across_deg = CAM_FOV_ACROSS_DEG;
+    globe.fov_down_deg   = CAM_FOV_DOWN_DEG;
     globe_set_font(g_ui_font, g_ui_font_loaded, g_ui_font_spacing);
     globe_load_map(&globe, "frontiersat_camera_viewer");
     if (globe_load_tles(db_path) == 0)
@@ -1269,6 +1281,19 @@ int main(int argc, char **argv)
         // g: the globe back to how it opens -- the whole Earth, framed on the
         // track -- from wherever turning and zooming left it.
         if (IsKeyPressed(KEY_G)) globe_reset_view(&globe);
+        // p: the outline of what the picture covered, on the globe or off.
+        // It needs an attitude to project, so say when this picture has none.
+        if (IsKeyPressed(KEY_P)) {
+            globe.show_fov = !globe.show_fov;
+            if (!globe.show_fov)
+                snprintf(status, sizeof status, "picture outline off");
+            else if (globe.att.have)
+                snprintf(status, sizeof status, "picture outline on");
+            else
+                snprintf(status, sizeof status,
+                         "picture outline on -- no attitude on record for this one");
+            status_left = 6.0f;
+        }
         if (IsKeyPressed(KEY_Q)) break;
         if (status_left > 0.0f) status_left -= GetFrameTime();
 
@@ -1444,7 +1469,7 @@ int main(int argc, char **argv)
 
         // help footer
         draw_text("Up/Down capture   scroll or pinch zoom   drag to move   "
-                  "globe: drag turns, scroll zooms, g resets   "
+                  "globe: drag turns, scroll zooms, g resets, p outlines picture   "
                   "f favourite   v favourites only   o open   s save jpeg   F5 refresh   q quit",
                   12, sh - 22, 12, (Color){ 150, 150, 160, 255 });
 

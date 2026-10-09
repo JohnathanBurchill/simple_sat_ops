@@ -131,6 +131,12 @@ Vector2 globe_project_world(const globe_proj_t *pr, const double p[3],
 #define GLOBE_AXIS_KM      500.0
 #define GLOBE_RAY_SAMPLES  24
 
+// How many pieces each edge of a picture's footprint is drawn in. The
+// edge is a straight line in the picture but a curve on the ground --
+// more so the further off nadir the camera was looking -- so it is
+// traced a ray at a time, the same as the look direction is.
+#define GLOBE_FOV_SAMPLES  16
+
 // The satellite's attitude at the moment on screen, as the extended
 // beacons report it. The caller looks up the beacon nearest the moment
 // and fills this in; a zeroed one means there is nothing to draw, which
@@ -210,6 +216,17 @@ typedef struct {
     // over the track as a ray down to the ground and a small set of
     // body axes at the dot.
     globe_attitude_t att;
+
+    // The camera on the nadir face, for outlining what its picture
+    // covered on the ground: the full field of view across the picture
+    // and down it, in degrees. A viewer with no picture to place
+    // (mpi_viewer) leaves them at zero and nothing is outlined.
+    double fov_across_deg, fov_down_deg;
+
+    // The caller's toggle for that outline. It is drawn only with an
+    // attitude from a beacon: a footprint projected from an assumed
+    // attitude would be a confident box in the wrong place.
+    int    show_fov;
 } globe_t;
 
 // Draw the panel's text with the caller's font. Without this the panel falls

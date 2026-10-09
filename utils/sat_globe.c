@@ -315,6 +315,7 @@ static void map_sample(const globe_t *g, int lv, double u, double v, double out[
 // leaves the globe drawn as a plain sphere rather than not drawn at all.
 int globe_load_map(globe_t *g, const char *tool)
 {
+
     const char *home = getenv("HOME");
     const char *xdg = getenv("XDG_DATA_HOME");
     char cands[5][1024];
@@ -691,14 +692,68 @@ static void draw_satellite(const globe_t *g, const globe_proj_t *pr,
         DrawCircleLines((int) pt.x, (int) pt.y, 9.0f,
                         (Color){ 150, 240, 170, 140 });
     }
+
+    // What the picture covered, when the caller asks: the edge of the
+    // camera's field of view traced out to where it meets the Earth.
+    // Each point of the edge is one ray through a pinhole camera looking
+    // along body +Z, so an off-nadir look comes out as the stretched,
+    // keystoned shape the picture really covered. Where a ray passes the
+    // limb that piece of the edge is sky, and is left out.
+    //
+    // Which way the picture sits on the body has not been measured yet.
+    // It is taken here as the camera frame lying on the body frame:
+    // picture right along body +X, picture down along body +Y, out
+    // through the lens along +Z -- the usual right-handed camera frame,
+    // so the picture is not mirrored. Change it here when the mounting
+    // is known. The top edge is drawn heavier and a dot marks the top
+    // left corner, which together say how the picture is turned and
+    // whether it is flipped.
+    const int footprint = g->show_fov && g->fov_across_deg > 0.0
+                          && g->fov_down_deg > 0.0;
+    if (footprint) {
+        const double tu = tan(0.5 * g->fov_across_deg * (M_PI / 180.0));
+        const double tv = tan(0.5 * g->fov_down_deg   * (M_PI / 180.0));
+        // The corners in picture coordinates, right and down, going round
+        // from the top left; edge 0 is the top.
+        static const double cu[5] = { -1.0,  1.0, 1.0, -1.0, -1.0 };
+        static const double cv[5] = { -1.0, -1.0, 1.0,  1.0, -1.0 };
+        for (int e = 0; e < 4; e++) {
+            Vector2 last = {0};
+            int last_ok = 0;
+            for (int i = 0; i <= GLOBE_FOV_SAMPLES; i++) {
+                const double s = (double) i / (double) GLOBE_FOV_SAMPLES;
+                const double right = (cu[e] + s * (cu[e + 1] - cu[e])) * tu;
+                const double down  = (cv[e] + s * (cv[e + 1] - cv[e])) * tv;
+                double d[3];
+                for (int k = 0; k < 3; k++)
+                    d[k] = f.bz[k] + right * f.bx[k] + down * f.by[k];
+                const double dn = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                for (int k = 0; k < 3; k++) d[k] /= dn;
+                double t = 0.0;
+                const int ok = attitude_ray_sphere(r, d, ATTITUDE_EARTH_MEAN_KM, &t);
+                if (ok) {
+                    double p[3];
+                    for (int k = 0; k < 3; k++) p[k] = r[k] + t * d[k];
+                    PROJECT(p);
+                    if (last_ok)
+                        DrawLineEx(last, pt, e == 0 ? 3.0f : 1.5f,
+                                   hidden ? (Color){ 150, 240, 170, 70 } : GLOBE_POINT_C);
+                    if (e == 0 && i == 0 && !hidden)
+                        DrawCircleV(pt, 3.5f, GLOBE_POINT_C);
+                    last = pt;
+                }
+                last_ok = ok;
+            }
+        }
+    }
     #undef PROJECT
 
-    // The caption, as two lines: the panel is only as wide as the column
-    // it sits in (270 px in both viewers), and one line of this runs
-    // half as wide again as that. Off-nadir leads, since it is the
-    // number that says whether the picture is of the ground below or of
-    // the horizon, then which side of the track it was looking, then
-    // where that landed.
+    // The caption, as two lines (three with the footprint): the panel
+    // is only as wide as the column it sits in (270 px in both viewers),
+    // and one line of this runs half as wide again as that. Off-nadir
+    // leads, since it is the number that says whether the picture is of
+    // the ground below or of the horizon, then which side of the track it
+    // was looking, then where that landed.
     //
     // The age is worth a word only when the beacon was not close to the
     // moment; inside half a minute the satellite has barely turned.
@@ -716,10 +771,13 @@ static void draw_satellite(const globe_t *g, const globe_proj_t *pr,
     } else {
         snprintf(where, sizeof where, "looking past the limb");
     }
-    snprintf(note, note_n, "%.0f deg off nadir, %.0f %s%s\n%s",
+    // With the footprint up, a third line says how to read it and that
+    // the way the picture sits on the body is assumed.
+    snprintf(note, note_n, "%.0f deg off nadir, %.0f %s%s\n%s%s",
              f.off_nadir_deg, fabs(f.cross_track_deg),
              f.cross_track_deg >= 0.0 ? "left" : "right",
-             age, where);
+             age, where,
+             footprint ? "\nheavy edge: picture top (assumed)" : "");
 }
 
 // Ray-cast the lit sphere into g->pix and hand it to the texture. One ray per
@@ -895,7 +953,7 @@ void globe_draw(globe_t *g, int x, int y, int w, int h, double now_ms,
     // enough in, and the ray to what it was looking at when a beacon
     // says which way it was facing. Inside the scissor with the track,
     // since the ray can run well off the disc.
-    char att_note[130] = "";
+    char att_note[176] = "";
     if (have_now) {
         globe_proj_t pr = { .R = R, .ox = g->ox, .oy = g->oy,
                             .x = x, .y = dy, .w = w, .h = dh };
@@ -919,10 +977,13 @@ void globe_draw(globe_t *g, int x, int y, int w, int h, double now_ms,
     // The attitude caption, its lines stacked upward from just above the
     // sub-satellite point so they read down the panel in order.
     if (att_note[0] != '\0') {
-        const char *line[2] = { att_note, NULL };
-        char *nl = strchr(att_note, '\n');
-        if (nl != NULL) { *nl = '\0'; line[1] = nl + 1; }
-        const int nlines = (line[1] != NULL) ? 2 : 1;
+        const char *line[3] = { att_note, NULL, NULL };
+        int nlines = 1;
+        for (char *nl = strchr(att_note, '\n'); nl != NULL && nlines < 3;
+             nl = strchr(nl + 1, '\n')) {
+            *nl = '\0';
+            line[nlines++] = nl + 1;
+        }
         for (int i = 0; i < nlines; i++) {
             const int ly = y + h - 24 - (nlines - i) * 21;
             const int tw = text_width(line[i], 12);
