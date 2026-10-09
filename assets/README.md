@@ -16,3 +16,7 @@ plain blue sphere).
   Public domain (NASA imagery carries no copyright). Reduced here from the
   published 2048 x 1024 JPEG to a 256-colour PNG, which the globe samples on
   the CPU; equirectangular, longitude 180 W at the left edge.
+
+  The same map at 21600 x 10800, for the globe zoomed in, is too big to keep
+  here: `scripts/fetch_globe_tiles.sh` downloads it and cuts it into tiles in
+  `~/.local/share/simple_sat_ops/globe_tiles/` instead.

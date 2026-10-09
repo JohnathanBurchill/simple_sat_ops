@@ -2953,6 +2953,18 @@ track and lighting still work. The disc is ray-cast on the CPU rather than drawn
 as a 3D model, coarse while you are turning it and at the screen's own
 resolution once it settles.
 
+**Sharper zoomed in.** The 2048-pixel map has just the detail the whole-Earth
+view needs; zoomed in, each of its pixels is a blocky 20 km square. Run
+`scripts/fetch_globe_tiles.sh` once and the globe switches, as you zoom, to the
+same Blue Marble at up to 21600 x 10800 (about 1.9 km to the pixel), so the
+colours carry straight on and only the detail changes. The script downloads
+NASA's 182 MB TIFF, cuts it into square JPEG tiles at four sizes, and puts them
+in `~/.local/share/simple_sat_ops/globe_tiles/` (or under `$XDG_DATA_HOME`),
+where both viewers look; it needs `curl` and ImageMagick. Only the tiles the
+view needs are read, as it needs them, and at most 110 MB of them are held at
+once. Without the tiles the viewer says so on the terminal at startup and the
+globe stays at the 2048-pixel map however far in you go.
+
 **What it remembers between sessions.** On exit the viewer writes
 `~/.local/state/simple_sat_ops/mpi_viewer.state` - which experiment was open,
 where the playhead sat in it, the favourites and whether the list shows only
@@ -4147,6 +4159,11 @@ also [First-run setup](#first-run-setup).
   of that bootstrap: `setup` installs the `/etc/` tmpfiles/udev/logrotate
   snippets, `add-operator` creates a Unix account in `sso-ops` and drops
   in an SSH key, and `verify` smoke-tests an account.
+* **`fetch_globe_tiles.sh`** — once on any machine that runs
+  `mpi_viewer` or `frontiersat_camera_viewer`: download NASA's Blue
+  Marble at 21600 x 10800 and cut it into the tiles the globe draws from
+  when it is zoomed in (see [`mpi_viewer`](#mpi_viewer)). Needs `curl`
+  and ImageMagick; the tiles go in `~/.local/share/simple_sat_ops/`.
 
 ## Testing and validation
 

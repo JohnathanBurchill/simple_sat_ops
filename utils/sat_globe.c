@@ -310,11 +310,186 @@ static void map_sample(const globe_t *g, int lv, double u, double v, double out[
     }
 }
 
+// ---- the detail tiles ------------------------------------------------------
+//
+// The zoomed-in map (see GLOBE_TILE_DIR in sat_globe.h): one process has one
+// set of tiles, so like the TLE table they are kept here rather than in each
+// globe_t. A tile is read the first time a render needs one of its texels,
+// into whichever slot was read longest ago.
+
+typedef struct {
+    int            level, index;   // the tile it holds; level -1 when empty
+    unsigned char *rgb;            // GLOBE_TILE_PX square, RGB
+    unsigned       used;           // the render that last read it
+} tileslot_t;
+
+static char       g_tile_dir[1024];
+static int        g_tile_have[GLOBE_TILE_LEVELS];
+// Per level, per tile: the slot holding it, -1 when it is not in memory, -2
+// when it would not load (so a missing file is tried once, not once a pixel).
+static short     *g_tile_slot[GLOBE_TILE_LEVELS];
+static tileslot_t g_slots[GLOBE_TILE_SLOTS];
+static unsigned   g_render_id;
+
+// Width of tiled level k; level 0 is the coarsest.
+static int tile_level_w(int k)
+{
+    return GLOBE_TILE_TOP_W >> (GLOBE_TILE_LEVELS - 1 - k);
+}
+
+static void tiles_free(void)
+{
+    for (int k = 0; k < GLOBE_TILE_LEVELS; k++) {
+        free(g_tile_slot[k]);
+        g_tile_slot[k] = NULL;
+        g_tile_have[k] = 0;
+    }
+    for (int s = 0; s < GLOBE_TILE_SLOTS; s++) {
+        free(g_slots[s].rgb);
+        g_slots[s].rgb = NULL;
+        g_slots[s].level = -1;
+    }
+}
+
+// Find the tiles: the first data directory with any level in it, a level
+// counting when its first and last tiles are both there. Returns how many
+// levels were found.
+static int tiles_find(const char *tool)
+{
+    tiles_free();
+    const char *home = getenv("HOME");
+    const char *xdg = getenv("XDG_DATA_HOME");
+    char xdg_dir[1024] = "", home_dir[1024] = "";
+    if (xdg != NULL && xdg[0] != '\0')
+        snprintf(xdg_dir, sizeof xdg_dir, "%s/simple_sat_ops/%s", xdg, GLOBE_TILE_DIR);
+    if (home != NULL && home[0] != '\0')
+        snprintf(home_dir, sizeof home_dir, "%s/.local/share/simple_sat_ops/%s", home, GLOBE_TILE_DIR);
+    const char *cands[2] = { xdg_dir, home_dir };
+
+    for (int i = 0; i < 2; i++) {
+        if (cands[i][0] == '\0') continue;
+        int found = 0;
+        for (int k = 0; k < GLOBE_TILE_LEVELS; k++) {
+            const int cols = tile_level_w(k) / GLOBE_TILE_PX;
+            const int ntiles = cols * (cols / 2);
+            char first[1100], last[1100];
+            snprintf(first, sizeof first, "%s/%d/0.jpg", cands[i], tile_level_w(k));
+            snprintf(last, sizeof last, "%s/%d/%d.jpg", cands[i], tile_level_w(k), ntiles - 1);
+            if (!FileExists(first) || !FileExists(last)) continue;
+            g_tile_slot[k] = malloc((size_t) ntiles * sizeof *g_tile_slot[k]);
+            if (g_tile_slot[k] == NULL) continue;
+            for (int t = 0; t < ntiles; t++) g_tile_slot[k][t] = -1;
+            g_tile_have[k] = 1;
+            found++;
+        }
+        if (found > 0) {
+            snprintf(g_tile_dir, sizeof g_tile_dir, "%s", cands[i]);
+            return found;
+        }
+    }
+    fprintf(stderr, "%s: no globe detail tiles; zoomed in, the globe stays at "
+                    "the %s map (scripts/fetch_globe_tiles.sh fetches them)\n",
+            tool, GLOBE_MAP_FILE);
+    return 0;
+}
+
+// The tiled level to draw from when 360 degrees of longitude spans need
+// pixels: the coarsest with a texel to the pixel, else the finest there is.
+// -1 when there are no tiles.
+static int tiles_level_for(double need)
+{
+    int best = -1;
+    for (int k = 0; k < GLOBE_TILE_LEVELS; k++) {
+        if (!g_tile_have[k]) continue;
+        best = k;
+        if ((double) tile_level_w(k) >= need) break;
+    }
+    return best;
+}
+
+// Read tile idx of level k into a slot. Returns the slot, or -1 when it
+// cannot: the file would not load, or every slot holds a tile this same
+// render has already read -- evicting one of those would have the render
+// reload tiles in a circle, so the pixel falls back to the whole-Earth map.
+static int tile_load(int k, int idx)
+{
+    int s = -1;
+    for (int i = 0; i < GLOBE_TILE_SLOTS; i++) {
+        if (g_slots[i].level < 0) { s = i; break; }
+        if (g_slots[i].used == g_render_id) continue;
+        if (s < 0 || g_slots[i].used < g_slots[s].used) s = i;
+    }
+    if (s < 0) return -1;
+
+    char path[1100];
+    snprintf(path, sizeof path, "%s/%d/%d.jpg", g_tile_dir, tile_level_w(k), idx);
+    Image im = LoadImage(path);
+    if (im.data == NULL || im.width != GLOBE_TILE_PX || im.height != GLOBE_TILE_PX) {
+        UnloadImage(im);
+        g_tile_slot[k][idx] = -2;
+        return -1;
+    }
+    ImageFormat(&im, PIXELFORMAT_UNCOMPRESSED_R8G8B8);
+    const size_t bytes = (size_t) GLOBE_TILE_PX * GLOBE_TILE_PX * 3;
+    if (g_slots[s].rgb == NULL) g_slots[s].rgb = malloc(bytes);
+    if (g_slots[s].rgb == NULL) { UnloadImage(im); return -1; }
+    memcpy(g_slots[s].rgb, im.data, bytes);
+    UnloadImage(im);
+
+    if (g_slots[s].level >= 0) g_tile_slot[g_slots[s].level][g_slots[s].index] = -1;
+    g_slots[s].level = k;
+    g_slots[s].index = idx;
+    g_tile_slot[k][idx] = (short) s;
+    return s;
+}
+
+// One texel of tiled level k, its tile read in if need be. NULL when the tile
+// cannot be had.
+static const unsigned char *tile_texel(int k, int x, int y)
+{
+    const int T = GLOBE_TILE_PX;
+    const int idx = (y / T) * (tile_level_w(k) / T) + x / T;
+    int s = g_tile_slot[k][idx];
+    if (s == -2) return NULL;
+    if (s < 0 && (s = tile_load(k, idx)) < 0) return NULL;
+    g_slots[s].used = g_render_id;
+    return g_slots[s].rgb + ((size_t) (y % T) * T + (size_t) (x % T)) * 3;
+}
+
+// map_sample's bilinear lookup on tiled level k, the four texels fetched one
+// at a time since they can straddle a tile edge. Returns 0 when one of them
+// cannot be had, for the caller to fall back on the whole-Earth map.
+static int tile_sample(int k, double u, double v, double out[3])
+{
+    const int W = tile_level_w(k), H = W / 2;
+    double fx = u * W - 0.5, fy = v * H - 0.5;
+    int x0 = (int) floor(fx), y0 = (int) floor(fy);
+    double tx = fx - x0, ty = fy - y0;
+    int x1 = ((x0 + 1) % W + W) % W;
+    x0 = (x0 % W + W) % W;
+    int y1 = y0 + 1;
+    if (y0 < 0) y0 = 0; else if (y0 > H - 1) y0 = H - 1;
+    if (y1 < 0) y1 = 0; else if (y1 > H - 1) y1 = H - 1;
+    const unsigned char *p00 = tile_texel(k, x0, y0);
+    const unsigned char *p10 = tile_texel(k, x1, y0);
+    const unsigned char *p01 = tile_texel(k, x0, y1);
+    const unsigned char *p11 = tile_texel(k, x1, y1);
+    if (p00 == NULL || p10 == NULL || p01 == NULL || p11 == NULL) return 0;
+    for (int c = 0; c < 3; c++) {
+        double top = p00[c] + (p10[c] - p00[c]) * tx;
+        double bot = p01[c] + (p11[c] - p01[c]) * tx;
+        out[c] = top + (bot - top) * ty;
+    }
+    return 1;
+}
+
 // Load the equirectangular world map and halve it a few times over. Looked for
 // the same places as the bundled font. Returns 0 if none of them had it, which
 // leaves the globe drawn as a plain sphere rather than not drawn at all.
+// The detail tiles for zooming in are looked for here too.
 int globe_load_map(globe_t *g, const char *tool)
 {
+    tiles_find(tool);
 
     const char *home = getenv("HOME");
     const char *xdg = getenv("XDG_DATA_HOME");
@@ -813,6 +988,13 @@ static void globe_render(globe_t *g, int w, int h, int ss)
     int lv = 0;
     while (lv + 1 < g->nlv && (double) g->lv[lv + 1].w >= 2.0 * M_PI * R) lv++;
 
+    // Closer in than that map has texels for, the detail tiles take over.
+    // Any pixel whose tile cannot be had still gets the map.
+    int tk = -1;
+    if (2.0 * M_PI * R > (g->nlv > 0 ? (double) g->lv[0].w : 0.0))
+        tk = tiles_level_for(2.0 * M_PI * R);
+    g_render_id++;
+
     double e[3], n[3], o[3], sun[3];
     globe_basis(g->lat0, g->lon0, e, n, o);
     ll_vec(g->sun_lat, g->sun_lon, sun);
@@ -835,7 +1017,8 @@ static void globe_render(globe_t *g, int w, int h, int ss)
             double vv = 0.5 - asin(pz) / M_PI;
 
             double rgb[3];
-            map_sample(g, lv, u, vv, rgb);
+            if (tk < 0 || !tile_sample(tk, u, vv, rgb))
+                map_sample(g, lv, u, vv, rgb);
 
             // Lambert, but with the terminator softened over a few degrees so
             // it does not come out as a hard line the way a bare dot product
@@ -1087,5 +1270,6 @@ void globe_free(globe_t *g)
     g->pix = NULL;
     if (g->tex.id != 0) UnloadTexture(g->tex);
     free_tle_rows();
+    tiles_free();
 }
 

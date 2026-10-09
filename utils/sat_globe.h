@@ -62,6 +62,22 @@
 #define GLOBE_MAP_LEVELS  5
 #define GLOBE_MAP_FILE    "nasa_blue_marble_2048.png"
 
+// Zoomed in past what that map can show, the globe draws from the same Blue
+// Marble at up to 21600 x 10800 instead, which scripts/fetch_globe_tiles.sh
+// downloads and cuts into square JPEG tiles: a level per halving, each in its
+// own directory named for its width, the tiles numbered row by row from the
+// top left -- globe_tiles/21600/0.jpg is the corner at 90 N 180 W. They live
+// in the data directory ($XDG_DATA_HOME/simple_sat_ops/, else
+// ~/.local/share/simple_sat_ops/), and are read only as the view needs them.
+// At most GLOBE_TILE_SLOTS are held at once (110 MB), which is enough for the
+// worst case: a view over a pole, where every column of tiles meets. Without
+// them the globe stays at the map above however far in it is zoomed.
+#define GLOBE_TILE_DIR    "globe_tiles"
+#define GLOBE_TILE_PX     675
+#define GLOBE_TILE_TOP_W  21600
+#define GLOBE_TILE_LEVELS 4         // 2700, 5400, 10800 and 21600 across
+#define GLOBE_TILE_SLOTS  80
+
 // How much of the panel the globe fills at zoom 1, and the zoom limits.
 #define GLOBE_FILL        0.47
 #define GLOBE_ZOOM_MIN    1.0
