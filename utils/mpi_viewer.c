@@ -202,8 +202,10 @@
     answer to whichever offset field was worst corrupted. One chunk claiming
     offset 2051784 sized the 2026-07-21 experiment at 2051979 bytes, and a file
     that is complete showed as 27% recovered with a re-download list demanding
-    1.5 MB that does not exist. The length is read out of the satellite's own
-    "Bulk downlink complete" log lines instead.
+    1.5 MB that does not exist. The length is read out of what the satellite
+    itself reports instead: its "Bulk downlink complete" log lines, and the
+    JSON replies of the download-start, MPI-analysis and file-map blobs, which
+    name the file and its size even when no download ever reached the end.
 
     An offset field is only as good as the packet carrying it, and the same CSP
     CRC32 covers both, so only CRC-verified chunks are trusted to say where they
@@ -686,11 +688,14 @@ fail:
 //   CTS1+exec_blob_from_fs(blobs/bulk_downlink_start_v2.blob,0,mpi_data/...;0;0)@...
 //   CTS1+comms_bulk_file_downlink_start(mpi_data/2026-08-08.mpi,160485,1170)@...
 //
-// so the file on the satellite is just the "mpi_data/....mpi" token in the text,
-// and the command started a recording rather than a download when
-// "mpi_enable_active_mode(" appears. This is best-effort: a download commanded
-// from elsewhere, or a store with no sent_tcmd table, simply leaves an
-// experiment's path blank and the export writes a placeholder instead.
+// so the file on the satellite is just the "....mpi" token in the text, and the
+// command started a recording rather than a download when
+// "mpi_enable_active_mode(" appears. The firmware writes a recording to exactly
+// the path it is given, so the token may or may not have a directory: the
+// 2026-10 recordings were named "2026-10-05_102334Z.mpi" and live at the top of
+// the file system. This is best-effort: a download commanded from elsewhere, or
+// a store with no sent_tcmd table, simply leaves an experiment's path blank and
+// the export writes a placeholder instead.
 
 typedef struct {
     double ts_ms;
@@ -698,20 +703,26 @@ typedef struct {
     int    is_record;
 } mpicmd_t;
 
-// Copy the "mpi_data/....mpi" token out of a command into `path`. Returns 1 on
-// success. The token ends at the argument separator (',' in the direct form,
-// ';' in the blob form) or the closing parenthesis.
+// Copy the "....mpi" token out of a command into `path`. Returns 1 on success.
+// The token is an argument, so it starts after '(' or the separator before it
+// (',' in the direct form, ';' in the blob form) and ends at the next separator
+// or the closing parenthesis.
 static int extract_mpi_path(const char *text, char *path, size_t n)
 {
-    const char *s = strstr(text, "mpi_data/");
-    if (s == NULL) return 0;
-    size_t k = 0;
-    while (s[k] != '\0' && s[k] != ',' && s[k] != ';' && s[k] != ')' && k < n - 1) k++;
-    // s starts with "mpi_data/", so k is at least 9 and this test is in bounds.
-    if (strncmp(s + k - 4, ".mpi", 4) != 0) return 0;   // not a science file
-    memcpy(path, s, k);
-    path[k] = '\0';
-    return 1;
+    for (const char *s = strstr(text, ".mpi"); s != NULL; s = strstr(s + 1, ".mpi")) {
+        const char *end = s + 4;
+        if (*end != ',' && *end != ';' && *end != ')') continue;   // e.g. ".mpi_x"
+        const char *start = s;
+        while (start > text && start[-1] != '(' && start[-1] != ','
+               && start[-1] != ';') start--;
+        size_t k = (size_t) (end - start);
+        // ".mpi" alone is not a file name.
+        if (k <= 4 || k >= n) continue;
+        memcpy(path, start, k);
+        path[k] = '\0';
+        return 1;
+    }
+    return 0;
 }
 
 // Load every MPI-related telecommand, oldest first. Returns the count (0 if the
@@ -722,7 +733,7 @@ static int load_mpi_commands(sqlite3 *db, mpicmd_t **out)
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
             "SELECT ts_sent_ms, command_text FROM sent_tcmd "
-            "WHERE command_text LIKE '%mpi_data/%' ORDER BY ts_sent_ms",
+            "WHERE command_text LIKE '%.mpi%' ORDER BY ts_sent_ms",
             -1, &st, NULL) != SQLITE_OK)
         return 0;
 
@@ -749,35 +760,55 @@ static int load_mpi_commands(sqlite3 *db, mpicmd_t **out)
     return n;
 }
 
-// Read every bulk-downlink log line the satellite sent into the size table, so
-// each experiment's file can be reconstructed against its real length instead
-// of against the largest offset that happened to arrive. Missing or unreadable
-// log packets are not an error: an experiment whose file is not named there
-// falls back to sizing itself from its chunks.
-static void load_bulk_log(sqlite3 *db, bulk_size_table_t *sizes)
+// Feed the payload of every row `sql` selects (reception time in unix ms, then
+// payload) to the size table.
+static void feed_sizes(sqlite3 *db, const char *sql, bulk_size_table_t *sizes)
 {
-    // Log packets are packet_type 3; both lines of interest mention "downl",
-    // which keeps the scan off the rest of the log traffic.
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db,
-            "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload "
-            "FROM packet WHERE packet_type = 3 AND payload LIKE '%downl%' "
-            "ORDER BY ts_received, id", -1, &st, NULL) != SQLITE_OK)
-        return;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return;
 
     while (sqlite3_step(st) == SQLITE_ROW) {
         const void *pl = sqlite3_column_blob(st, 1);
         int pl_len = sqlite3_column_bytes(st, 1);
         if (pl == NULL || pl_len <= 0) continue;
-        // A log payload is raw bytes, not a C string, and holds anything at all
-        // once RS has failed on it, so copy it out NUL-terminated first.
+        // A payload is raw bytes, not a C string: a reply opens with a binary
+        // header full of zero bytes, and a log line holds anything at all once
+        // RS has failed on it. Copy it out with the zeros blanked so the text
+        // after them can still be searched.
         char text[512];
         int m = pl_len < (int) sizeof text - 1 ? pl_len : (int) sizeof text - 1;
         memcpy(text, pl, (size_t) m);
+        for (int i = 0; i < m; i++)
+            if (text[i] == '\0') text[i] = ' ';
         text[m] = '\0';
         bulk_size_feed(sizes, text, sqlite3_column_double(st, 0));
     }
     sqlite3_finalize(st);
+}
+
+// Read everything the satellite said about how long its files are into the size
+// table, so each experiment's file can be reconstructed against its real length
+// instead of against the largest offset that happened to arrive. Missing or
+// unreadable packets are not an error: an experiment whose file is not named
+// there falls back to sizing itself from its chunks.
+static void load_bulk_log(sqlite3 *db, bulk_size_table_t *sizes)
+{
+    // Log packets are packet_type 3; both lines of interest mention "downl",
+    // which keeps the scan off the rest of the log traffic.
+    feed_sizes(db,
+        "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload "
+        "FROM packet WHERE packet_type = 3 AND payload LIKE '%downl%' "
+        "ORDER BY ts_received, id", sizes);
+
+    // Blob replies that name a file and its length (bulk_size.h) are telecommand
+    // responses, packet_type 4. A flipped digit in one reads exactly like a real
+    // length, so only replies whose CRC32 checked out are believed. instr()
+    // rather than LIKE, which would stop at the reply header's first zero byte.
+    feed_sizes(db,
+        "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload "
+        "FROM packet WHERE packet_type = 4 AND crc_status = 1 "
+        "AND instr(payload, CAST('\"file\":\"' AS BLOB)) > 0 "
+        "ORDER BY ts_received, id", sizes);
 }
 
 // Name the file an experiment was written to. The recording command carries the

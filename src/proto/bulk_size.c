@@ -128,6 +128,39 @@ int bulk_parse_start(const char *text, bulk_start_t *out)
     return 1;
 }
 
+int bulk_parse_reported(const char *text, bulk_reported_t *out)
+{
+    if (text == NULL) return 0;
+    const char *s = strstr(text, "\"file\":\"");
+    if (s == NULL) return 0;
+    s += strlen("\"file\":\"");
+
+    bulk_reported_t rec = {0};
+    if (!scan_path(s, "\"", rec.path, sizeof rec.path)) return 0;
+    s += strlen(rec.path);
+    if (*s != '"') return 0;
+
+    // The download-start reply calls it "file_size", the MPI analysis and the
+    // file map call it "size". Neither key is a substring of the other, since
+    // "size" is searched for with its opening quote.
+    const char *fs = strstr(s, "\"file_size\":");
+    const char *sz = strstr(s, "\"size\":");
+    if (fs != NULL && (sz == NULL || fs < sz))
+        s = fs + strlen("\"file_size\":");
+    else if (sz != NULL)
+        s = sz + strlen("\"size\":");
+    else
+        return 0;
+
+    rec.size = scan_num(&s);
+    // A number that runs into the end of the text was cut off by the end of the
+    // packet, and reads short.
+    if (rec.size < 0 || (*s != ',' && *s != '}')) return 0;
+
+    *out = rec;
+    return 1;
+}
+
 // The table's row for `path`, appending one if it is new. NULL if out of memory.
 static bulk_size_entry_t *entry_for(bulk_size_table_t *t, const char *path)
 {
@@ -148,8 +181,26 @@ static bulk_size_entry_t *entry_for(bulk_size_table_t *t, const char *path)
     return e;
 }
 
+// An exact length settles the question; a lower bound only ever raises it.
+static void note_size(bulk_size_entry_t *e, long size, int exact)
+{
+    if (exact && !e->exact) {
+        e->size = size;
+        e->exact = 1;
+    } else if (exact == e->exact && size > e->size) {
+        e->size = size;
+    }
+}
+
 void bulk_size_feed(bulk_size_table_t *t, const char *text, double ts_ms)
 {
+    bulk_reported_t rp = {0};
+    if (bulk_parse_reported(text, &rp)) {
+        bulk_size_entry_t *e = (rp.size > 0) ? entry_for(t, rp.path) : NULL;
+        if (e != NULL) note_size(e, rp.size, 1);
+        return;
+    }
+
     bulk_start_t st = {0};
     if (bulk_parse_start(text, &st)) {
         bulk_size_entry_t *e = entry_for(t, st.path);
@@ -184,15 +235,7 @@ void bulk_size_feed(bulk_size_table_t *t, const char *text, double ts_ms)
     // allowance ran out. Two caps apply: the one the ground asked for, and the
     // firmware's own, which binds even when the ground asked for the whole file.
     long cap = (count > 0 && count < BULK_SIZE_FIRMWARE_CAP) ? count : BULK_SIZE_FIRMWARE_CAP;
-    int exact = (cp.bytes < cap);
-
-    // An exact length settles the question; a lower bound only ever raises it.
-    if (exact && !e->exact) {
-        e->size = size;
-        e->exact = 1;
-    } else if (exact == e->exact && size > e->size) {
-        e->size = size;
-    }
+    note_size(e, size, cp.bytes < cap);
 }
 
 long bulk_size_lookup(const bulk_size_table_t *t, const char *path, int *exact)

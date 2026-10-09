@@ -420,6 +420,33 @@ static int load_bulk_log(sqlite3 *db, bulk_size_table_t *sizes,
     sqlite3_finalize(st);
     *out = evs;
     *out_n = n;
+
+    // Blob replies that name a file and its length (bulk_size.h) are telecommand
+    // responses, packet_type 4. A flipped digit in one reads exactly like a real
+    // length, so only replies whose CRC32 checked out are believed. instr()
+    // rather than LIKE, which would stop at the reply header's first zero byte.
+    st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload "
+            "FROM packet WHERE packet_type = 4 AND crc_status = 1 "
+            "AND instr(payload, CAST('\"file\":\"' AS BLOB)) > 0 "
+            "ORDER BY ts_received, id", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const void *pl = sqlite3_column_blob(st, 1);
+        int pl_len = sqlite3_column_bytes(st, 1);
+        if (pl == NULL || pl_len <= 0) continue;
+        // The reply's binary header holds zero bytes; blank them so the JSON
+        // after them can be searched.
+        char text[512];
+        int m = pl_len < (int) sizeof text - 1 ? pl_len : (int) sizeof text - 1;
+        memcpy(text, pl, (size_t) m);
+        for (int i = 0; i < m; i++)
+            if (text[i] == '\0') text[i] = ' ';
+        text[m] = '\0';
+        bulk_size_feed(sizes, text, sqlite3_column_double(st, 0));
+    }
+    sqlite3_finalize(st);
     return 0;
 }
 
@@ -881,7 +908,7 @@ int main(int argc, char **argv)
                        size, known_size, sat_path);
             else
                 printf("  file      : %ld bytes (largest offset received -- a LOWER bound;\n"
-                       "              no bulk-downlink log line gives this file's length)\n", size);
+                       "              nothing the satellite sent gives this file's length)\n", size);
             printf("  recovered : %ld of %ld bytes (%.1f%%); data spans offset %ld .. %ld\n",
                    present_bytes, size,
                    100.0 * (double) present_bytes / (double) size, min_off, size);

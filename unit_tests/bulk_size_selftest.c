@@ -3,8 +3,8 @@
     Simple Satellite Operations  unit_tests/bulk_size_selftest.c
 
     Exercises src/proto/bulk_size.c: reading a downlinked file's true length
-    out of the satellite's log stream, and telling a real bulk-file chunk
-    offset from a bit-flipped one.
+    out of the satellite's log stream and blob replies, and telling a real
+    bulk-file chunk offset from a bit-flipped one.
 
     The log lines below are verbatim from the packet store (the 2026-07-21 MPI
     file), including the garbled ones, so the parser is measured against what
@@ -67,6 +67,28 @@ static const char *L_START_GARBLED =
 static const char *L_UNRELATED =
     "\x03""1784762950000+0000294508_E [S:LFS:INFO]: Successfully opened file: "
     "mpi_data/2026-07-21.mpi ";
+
+// Blob replies, from the first '{' to the end of the packet. Each packet ends
+// mid-field, as the real ones do.
+#define OCT5_PATH "2026-10-05_102334Z.mpi"
+
+static const char *R_ANALYZE =
+    "{\"action\":\"analyze_mpi_data_v1\",\"file\":\"2026-10-05_102334Z.mpi\","
+    "\"sha256\":\"3c21af5818447c9d255c42eaed2a2717e91c5b33c739eb73758a66bfbb97cb8c\","
+    "\"size\":783449,\"frame_count\":5121,\"valid_frame_";
+
+static const char *R_DOWNLINK_START =
+    "{\"action\":\"bulk_downlink_start_blob\",\"file\":\"mpi_data/2026-07-21.mpi\","
+    "\"file_size\":556728,"
+    "\"sha256\":\"90F2E0EF01921ECC4393901DF7DCDCC9EEEC7CA18B4BA934A90DF26E0CBD94D7\","
+    "\"offset\":0,\"length\":5";
+
+// The same reply after an uncorrectable RS block; its CRC failed.
+static const char *R_GARBLED =
+    "{\"action\":\"bulk_downlink_start_blob\",\"file\":\"cameza/2026-08-20.img\","
+    "\"f\xe9le_size\":49993,"
+    "\"sha256\":\"3E0390E6E7C7A734C1230A6E0EBA439136E5E3CAE10B06BCF703vAB232D1\x05""9\xc5""3\","
+    "\"offset\":0,:length\":4999\x83`\xc0""c";
 
 // ---- line parsing ------------------------------------------------------
 
@@ -158,8 +180,98 @@ static void test_parse_start_rejects(void)
 
 // ---- the table ---------------------------------------------------------
 
+static void test_parse_reported(void)
+{
+    bulk_reported_t r = {0};
+    tap_ok(bulk_parse_reported(R_ANALYZE, &r) == 1, "the MPI analysis reply parses");
+    tap_okf(strcmp(r.path, OCT5_PATH) == 0, "its file is read (got '%s')", r.path);
+    tap_okf(r.size == 783449, "its \"size\" is read (got %ld, want 783449)", r.size);
+
+    memset(&r, 0, sizeof r);
+    tap_ok(bulk_parse_reported(R_DOWNLINK_START, &r) == 1, "the download-start reply parses");
+    tap_okf(strcmp(r.path, MPI_PATH) == 0, "its file is read (got '%s')", r.path);
+    tap_okf(r.size == 556728, "its \"file_size\" is read (got %ld, want 556728)", r.size);
+}
+
+static void test_parse_reported_rejects(void)
+{
+    bulk_reported_t r = {0};
+    tap_ok(bulk_parse_reported(R_GARBLED, &r) == 0,
+           "a reply whose size key was corrupted is not a length");
+    tap_ok(bulk_parse_reported(NULL, &r) == 0, "NULL text is not a reply");
+    tap_ok(bulk_parse_reported(L_COMPLETE_FULL, &r) == 0, "a log line is not a reply");
+    // The packet ending inside the number would make 783449 read as 7834.
+    tap_ok(bulk_parse_reported("{\"file\":\"a.mpi\",\"size\":7834", &r) == 0,
+           "a number cut off by the end of the packet is rejected");
+    tap_ok(bulk_parse_reported("{\"file\":\"a.mpi\",\"sha256\":\"00\"}", &r) == 0,
+           "a reply with no size is not a length");
+    tap_ok(bulk_parse_reported("{\"file\":\"\",\"size\":10,", &r) == 0,
+           "a reply with an empty file name is rejected");
+    tap_ok(bulk_parse_reported("{\"file\":\"a.mpi\",\"size\":99999999,", &r) == 0,
+           "an implausibly large size is rejected");
+    // A size that comes before the file belongs to something else.
+    tap_ok(bulk_parse_reported("{\"size\":10,\"file\":\"a.mpi\",\"x\":1}", &r) == 0,
+           "a size ahead of the file name is not that file's");
+}
+
 // Sequences below use round unix-ms values; only the differences matter.
 #define T0 1784756000000.0
+
+static void test_reply_alone_gives_an_exact_length(void)
+{
+    // The 2026-10-05 case: no download's complete line ever came down, and the
+    // analysis reply is the only statement of the length.
+    bulk_size_table_t t = {0};
+    bulk_size_feed(&t, R_ANALYZE, T0);
+
+    int exact = 0;
+    long sz = bulk_size_lookup(&t, OCT5_PATH, &exact);
+    tap_okf(sz == 783449, "a reply gives the length (got %ld, want 783449)", sz);
+    tap_ok(exact == 1, "a reply's length is exact");
+    bulk_size_free(&t);
+}
+
+static void test_reply_settles_a_lower_bound(void)
+{
+    // A capped download says only "at least 371085"; the reply says how long.
+    // Either order must end at the reply's exact length.
+    bulk_size_table_t t = {0};
+    bulk_size_feed(&t, L_START_CAPPED, T0);
+    bulk_size_feed(&t, L_COMPLETE_CAPPED, T0 + 60000.0);
+    bulk_size_feed(&t, R_DOWNLINK_START, T0 + 120000.0);
+
+    int exact = 0;
+    long sz = bulk_size_lookup(&t, MPI_PATH, &exact);
+    tap_okf(sz == 556728 && exact == 1,
+            "a reply replaces an earlier lower bound (got %ld exact %d)", sz, exact);
+    bulk_size_free(&t);
+
+    t = (bulk_size_table_t) {0};
+    bulk_size_feed(&t, R_DOWNLINK_START, T0);
+    bulk_size_feed(&t, L_START_CAPPED, T0 + 60000.0);
+    bulk_size_feed(&t, L_COMPLETE_CAPPED, T0 + 120000.0);
+
+    exact = 0;
+    sz = bulk_size_lookup(&t, MPI_PATH, &exact);
+    tap_okf(sz == 556728 && exact == 1,
+            "a later lower bound does not undo a reply (got %ld exact %d)", sz, exact);
+    bulk_size_free(&t);
+}
+
+static void test_reply_does_not_disturb_a_pending_start(void)
+{
+    // Replies arrive between a download's start line and its complete line. A
+    // reply about another file must not break that pairing.
+    bulk_size_table_t t = {0};
+    bulk_size_feed(&t, L_START_307125, T0);
+    bulk_size_feed(&t, R_ANALYZE, T0 + 1000.0);
+    bulk_size_feed(&t, L_COMPLETE_PARTIAL, T0 + 60000.0);
+
+    long sz = bulk_size_lookup(&t, MPI_PATH, NULL);
+    tap_okf(sz == 556728, "start + bytes still pairs across a reply (got %ld, want 556728)", sz);
+    tap_okf(bulk_size_lookup(&t, OCT5_PATH, NULL) == 783449, "and the reply's file has its own length");
+    bulk_size_free(&t);
+}
 
 static void test_size_from_full_download(void)
 {
@@ -386,6 +498,8 @@ int main(void)
     test_parse_complete_rejects();
     test_parse_start();
     test_parse_start_rejects();
+    test_parse_reported();
+    test_parse_reported_rejects();
     test_size_from_full_download();
     test_size_from_partial_download();
     test_capped_download_is_only_a_lower_bound();
@@ -394,6 +508,9 @@ int main(void)
     test_exact_beats_a_later_lower_bound();
     test_stale_start_is_not_paired();
     test_paths_do_not_bleed();
+    test_reply_alone_gives_an_exact_length();
+    test_reply_settles_a_lower_bound();
+    test_reply_does_not_disturb_a_pending_start();
     test_grid_learns_both_real_downloads();
     test_grid_ignores_unverified_offsets_when_learning();
     test_grid_admits_a_stray_landing_on_a_real_residue();

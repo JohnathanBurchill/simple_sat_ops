@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`1b56e55` (2026-10-06). This is a working draft.
+`a3b3bc3` (2026-10-08). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2605,6 +2605,21 @@ whole file was asked for -- only puts a **floor** under the length, and is
 reported as a minimum and never used to truncate. Whichever way the number was
 arrived at, the printed line says so.
 
+Several blobs also state the length outright in the JSON they reply with - the
+download-start blob itself, the on-board MPI analysis and the file map:
+
+```
+{"action":"bulk_downlink_start_blob","file":"mpi_data/2026-07-21.mpi","file_size":556728,...
+{"action":"analyze_mpi_data_v1","file":"2026-10-05_102334Z.mpi","sha256":"...","size":783449,...
+```
+
+That is the file's exact length when the blob ran, whether or not any download
+ever reached the end, and it is read from every such reply whose CRC checked
+out (a flipped digit in a failed one reads exactly like a real length). It is
+the only statement of the length for a file none of whose downloads' "complete"
+lines came down: the 2026-10-05 recording was otherwise known only as the
+243165 bytes that had arrived, against a real 783449.
+
 **Only CRC-verified packets are trusted with an offset.** A packet's offset
 field is covered by the same CSP CRC32 as its data, so a packet that passed its
 CRC says where it belongs and one that failed does not. The split is stark: of
@@ -2983,8 +2998,8 @@ than the panel is wide, and they are averaged.
 
 The line beneath gives the received percentage, how much is still missing, and
 where the file's length came from - the satellite's own byte count for that file,
-a satellite-reported minimum, or (when the log never named it) the largest offset
-received. That last case is the only one where the percentage is measured against
+a satellite-reported minimum, or (when nothing the satellite sent named it) the
+largest offset received. That last case is the only one where the percentage is measured against
 a guess; see `mpi_reconstruct` above for how the length is established.
 
 A **small white bracket** just under the whereogram - an upright at each end of
@@ -3044,9 +3059,11 @@ firmware's 1,000,000-byte per-command limit is split. The commands carry no
 pass plan needs it.
 
 The name of the file on the satellite comes from the `sent_tcmd` command log:
-the `mpi_enable_active_mode(mpi_data/...)` sent when the recording started,
-falling back to whatever download command was flown while the experiment's
-packets were coming down. When neither is in the log the commands still carry
+the `mpi_enable_active_mode(...)` sent when the recording started, falling back
+to whatever download command was flown while the experiment's packets were
+coming down. The firmware writes a recording to exactly the path it is given,
+so the name may sit under `mpi_data/` or at the top of the file system, as the
+2026-10 recordings (`2026-10-05_102334Z.mpi`) do. When neither is in the log the commands still carry
 the right offsets but the path is written as `<file_path>` for you to fill in,
 and the viewer says so. The aux panel shows the resolved name as `satellite
 file`.

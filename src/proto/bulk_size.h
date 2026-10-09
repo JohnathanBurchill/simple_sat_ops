@@ -43,6 +43,17 @@
 // byte cap. Pairing it with the start line that preceded it recovers the length
 // in the other cases too: the 2026-08-28 pull of the same file started at
 // 307125 and reported 249603 bytes, and 307125 + 249603 = 556728 exactly.
+//
+// Several blobs also state the length outright, in the JSON they reply with:
+//
+//   {"action":"bulk_downlink_start_blob","file":"mpi_data/2026-07-21.mpi","file_size":556728,...
+//   {"action":"analyze_mpi_data_v1","file":"2026-10-05_102334Z.mpi","sha256":"...","size":783449,...
+//
+// That is the file's length when the blob ran, whether or not any download of
+// it ever reached the end. It is the only way to learn how long a file is when
+// no download's "complete" line came down: none did for the 2026-10-05 MPI
+// recording, whose length was otherwise known only as the 243165 bytes that had
+// arrived.
 
 #include <stddef.h>
 
@@ -72,7 +83,7 @@
 typedef struct {
     char path[BULK_SIZE_PATH_LEN];   // file on the satellite
     long size;                       // best known length in bytes
-    int  exact;                      // a download that reached EOF reported it
+    int  exact;                      // a download that reached EOF, or a reply, reported it
     long pend_start;                 // start offset of the download in flight, -1 if none
     long pend_count;                 // its byte cap, 0 for "to the end of the file"
     double pend_ms;                  // when that start line was received
@@ -99,6 +110,12 @@ typedef struct {
     long count;   // 0 means "to the end of the file"
 } bulk_start_t;
 
+// Everything a JSON reply naming a file and its length says.
+typedef struct {
+    char path[BULK_SIZE_PATH_LEN];
+    long size;
+} bulk_reported_t;
+
 // Pull one record out of a log packet's text. Both return 1 on a match, 0
 // otherwise. Log packets are routinely garbled by uncorrectable RS blocks, so
 // both insist on the whole literal shape of the line and on plausible numbers,
@@ -106,13 +123,21 @@ typedef struct {
 int bulk_parse_complete(const char *text, bulk_complete_t *out);
 int bulk_parse_start(const char *text, bulk_start_t *out);
 
-// Feed every log packet's text, oldest first, with its reception time in unix
-// ms. Order matters only for pairing a "complete" with its own start line.
+// Pull the file and its length out of a blob's JSON reply: the "file" value and
+// the first "file_size" or "size" after it. Returns 1 on a match, 0 otherwise.
+// A number that does not end at the next field (the packet cut it off) is not a
+// length. The text cannot show a flipped digit, so the caller must feed only
+// replies whose CRC32 checked out.
+int bulk_parse_reported(const char *text, bulk_reported_t *out);
+
+// Feed every log packet's text, and every CRC-verified telecommand reply's,
+// oldest first, with its reception time in unix ms. Order matters only for
+// pairing a "complete" with its own start line.
 void bulk_size_feed(bulk_size_table_t *t, const char *text, double ts_ms);
 
-// The satellite-reported length of `path`, or 0 if nothing in the log said.
-// *exact, when given, comes back 1 if a download that ran to the end of the
-// file reported the length and 0 if it is only a lower bound.
+// The satellite-reported length of `path`, or 0 if nothing fed in said.
+// *exact, when given, comes back 1 if a reply or a download that ran to the end
+// of the file reported the length and 0 if it is only a lower bound.
 long bulk_size_lookup(const bulk_size_table_t *t, const char *path, int *exact);
 
 void bulk_size_free(bulk_size_table_t *t);
