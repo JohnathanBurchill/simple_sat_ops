@@ -282,7 +282,7 @@ This is the "how it works" chapter. You can run a pass without reading
 it, the way you can drive a car without knowing what the engine does. But
 knowing what each stage does is exactly what lets you tell a weak pass
 from a broken one, and read the panels instead of just watching them.
-Skip the equations on a first pass if you like; the prose carries the
+Skip the equations on a first read if you like; the prose carries the
 argument and the math is there for when you want it.
 
 Decoding is the satellite's encoding run backwards. To get a few
@@ -679,7 +679,7 @@ Where each stage runs in the live receiver:
 | Session glue, WAV capture, dedup, database | `src/pipeline/rx_session.c`, `src/db/packet_db.c` |
 | Operator UI and IPC | `apps/main.c` |
 
-For offline work `rx_replay` runs the same chain in two passes: a fast
+For offline work `rx_replay` runs the same chain in two stages: a fast
 sync search sweeps the whole capture and collects ASM candidate
 timestamps, then the heavier decoder runs on tight windows anchored at
 each candidate, which is far quicker than slicing the whole file at
@@ -1920,7 +1920,7 @@ rx_replay <iq-or-wav-path> [--rate=<Hz>] [--lo-shift-khz=<N>] [--viterbi] [--tle
 with `--lo-shift-khz=` and set the sample rate with `--rate=`.)
 
 The input format is picked from the extension: `.iq` is headerless
-int16 I/Q (the two-pass IQ decoder); `.raw` is headerless S16_LE PCM;
+int16 I/Q (the two-stage IQ decoder, `--two-pass`); `.raw` is headerless S16_LE PCM;
 `.ogg` is a SatNOGS audio recording (see below); anything else is read
 as a `.wav`.
 
