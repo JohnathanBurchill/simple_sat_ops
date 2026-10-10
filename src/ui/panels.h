@@ -105,11 +105,18 @@ typedef struct {
     const  char *viewers;    // comma-separated viewer names, or "(none)"
     double carrier_hz;
     int    have_rotator;     // 1 -> render az/el block; 0 -> "not initialized"
+    int    rot_pos_known;    // 1 -> current_az/current_el reflect a recent
+                              // real STATUS reply; 0 -> no reply yet, or the
+                              // last one has gone stale -- render "?"
+                              // instead of a fabricated/frozen value
     double current_az;
     double current_el;
     double target_az;
     double target_el;
     int    flip;
+    const char *rot_activity;  // "Jogging" / "Returning to 0,0" /
+                                // "Sitting Idle" / "Sitting Idle at 0,0" /
+                                // "Connection Failure"; NULL -> line skipped
     // HMAC keyfile display. Only the operator process fills these; the
     // viewer leaves status == HMAC_DISPLAY_UNSET so the row is skipped.
     const char           *hmac_path;
