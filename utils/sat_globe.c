@@ -875,14 +875,15 @@ static void draw_satellite(const globe_t *g, const globe_proj_t *pr,
     // keystoned shape the picture really covered. Where a ray passes the
     // limb that piece of the edge is sky, and is left out.
     //
-    // Which way the picture sits on the body has not been measured yet.
-    // It is taken here as the camera frame lying on the body frame:
-    // picture right along body +X, picture down along body +Y, out
-    // through the lens along +Z -- the usual right-handed camera frame,
-    // so the picture is not mirrored. Change it here when the mounting
-    // is known. The top edge is drawn heavier and a dot marks the top
-    // left corner, which together say how the picture is turned and
-    // whether it is flipped.
+    // The camera frame lies on the body frame: picture right along body
+    // +X, picture down along body +Y, out through the lens along +Z --
+    // the usual right-handed camera frame, so the picture is not
+    // mirrored. Checked against the pictures in October 2026: an antenna
+    // on the -X face shows at the lower left of every one, and the ground
+    // in them matches the map turned, not flipped. That rules out a half
+    // turn or a mirror image, though not an error of a few degrees. The
+    // top edge is drawn heavier and a dot marks the top left corner,
+    // which together say how the picture is turned.
     const int footprint = g->show_fov && g->fov_across_deg > 0.0
                           && g->fov_down_deg > 0.0;
     if (footprint) {
@@ -946,13 +947,12 @@ static void draw_satellite(const globe_t *g, const globe_proj_t *pr,
     } else {
         snprintf(where, sizeof where, "looking past the limb");
     }
-    // With the footprint up, a third line says how to read it and that
-    // the way the picture sits on the body is assumed.
+    // With the footprint up, a third line says how to read it.
     snprintf(note, note_n, "%.0f deg off nadir, %.0f %s%s\n%s%s",
              f.off_nadir_deg, fabs(f.cross_track_deg),
              f.cross_track_deg >= 0.0 ? "left" : "right",
              age, where,
-             footprint ? "\nheavy edge: picture top (assumed)" : "");
+             footprint ? "\nheavy edge: picture top" : "");
 }
 
 // Ray-cast the lit sphere into g->pix and hand it to the texture. One ray per

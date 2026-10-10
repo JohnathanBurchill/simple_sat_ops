@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`949b9f1` (2026-10-09). This is a working draft.
+`da874d8` (2026-10-09). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2494,14 +2494,14 @@ turns it off. A picture with no attitude near it gets no outline, and the
 status line says so - an outline projected from an assumed attitude would be a
 confident box in the wrong place.
 
-Which way the picture sits on the satellite has **not been measured yet**, so
-the outline assumes the camera frame lies on the body frame: picture right
-along body +X (the ram face), picture down along body +Y, so not mirrored. The
-**top edge is drawn heavier** and **a dot marks the top-left corner**, so
-comparing the outline with the picture shows at once whether that assumption
-holds; the caption adds `heavy edge: picture top (assumed)` while the outline
-is up. When the mounting is known it is one line to change, in
-`draw_satellite` in `utils/sat_globe.c`.
+The camera frame lies on the body frame: picture right along body +X (the ram
+face), picture down along body +Y, so not mirrored. This was checked against
+the pictures themselves in October 2026: an antenna on the satellite's -X face
+shows at the lower left of every picture, and the ground in them matches the
+map turned, not flipped. That rules out a half turn or a mirror image, though
+not an error of a few degrees. The **top edge is drawn heavier** and **a dot
+marks the top-left corner**, so the outline shows which way the picture is
+turned; the caption adds `heavy edge: picture top` while the outline is up.
 
 **Zoom in and the dot becomes the satellite.** Past about 3x the dot fades out
 and a model of FrontierSat fades in, turned the way the satellite was turned:
