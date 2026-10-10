@@ -99,6 +99,20 @@ int main(int argc, char **argv)
 #include <ncurses.h>
 #include <sqlite3.h>
 
+// The mouse wheel reaches ncurses as button 4 (up) and button 5 (down),
+// but button 5 only exists in mouse version 2. macOS's own ncurses is
+// version 1: it reports wheel-up and cannot report wheel-down at all, so
+// there the wheel is left off rather than scrolling one way only. Clicks
+// work on both.
+#ifdef BUTTON5_PRESSED
+#define WHEEL_UP   BUTTON4_PRESSED
+#define WHEEL_DOWN BUTTON5_PRESSED
+#else
+#define WHEEL_UP   0
+#define WHEEL_DOWN 0
+#endif
+#define WHEEL_LINES 3
+
 #define MAX_ROWS 1000
 
 typedef struct {
@@ -2368,6 +2382,11 @@ int main(int argc, char **argv)
     nonl();
     keypad(stdscr, TRUE);
     nodelay(stdscr, TRUE);
+    // A row is selected on the button press. mouseinterval(0) turns off
+    // ncurses' click detection, so the press arrives at once rather than
+    // after a wait to see whether it becomes a click.
+    mousemask(BUTTON1_PRESSED | WHEEL_UP | WHEEL_DOWN, NULL);
+    mouseinterval(0);
     // A lone Esc is also the first byte of every arrow/function-key
     // escape sequence, so ncurses waits ESCDELAY (default 1000 ms) for a
     // continuation before reporting a bare Esc. That made Esc-to-back /
@@ -2491,6 +2510,23 @@ int main(int argc, char **argv)
                 break;
             case 'g': case KEY_HOME:  recon_scroll = 0;                  break;
             case 'G': case KEY_END:   recon_scroll = recon_len;          break;
+            case KEY_MOUSE: {
+                MEVENT mevent;
+                if (getmouse(&mevent) == OK) {
+                    if (mevent.bstate & WHEEL_UP) {
+                        for (int i = 0; i < WHEEL_LINES; i++) {
+                            if (payload_view == PV_ASCII) recon_scroll = recon_text_prev(recon_scroll, cols);
+                            else recon_scroll -= bpr;
+                        }
+                    } else if (mevent.bstate & WHEEL_DOWN) {
+                        for (int i = 0; i < WHEEL_LINES; i++) {
+                            if (payload_view == PV_ASCII) recon_scroll = recon_text_next(recon_scroll, cols);
+                            else recon_scroll += bpr;
+                        }
+                    }
+                }
+                break;
+            }
             case 'e': {
                 char nm[256];
                 snprintf(nm, sizeof nm, "%s", recon_name);
@@ -2678,6 +2714,35 @@ int main(int argc, char **argv)
                 // ncurses already updated LINES/COLS; the next loop
                 // iteration redraws.
                 break;
+            case KEY_MOUSE: {
+                MEVENT mevent;
+                if (getmouse(&mevent) == OK) {
+                    int data_top = header_h + 1;
+                    int data_h   = list_h - 1;
+                    if (mevent.bstate & (WHEEL_UP | WHEEL_DOWN)) {
+                        // Wheel scroll moves the viewport, keeping sel
+                        // clamped into it (same convention as Ctrl-E/Ctrl-Y).
+                        if (mevent.bstate & WHEEL_UP) {
+                            for (int i = 0; i < WHEEL_LINES && top > 0; i++) {
+                                top--;
+                                if (sel >= top + data_h) sel = top + data_h - 1;
+                            }
+                        } else {
+                            for (int i = 0; i < WHEEL_LINES && top < n_rows - 1; i++) {
+                                top++;
+                                if (sel < top) sel = top;
+                            }
+                        }
+                    } else if ((mevent.bstate & BUTTON1_PRESSED)
+                               && mevent.y >= data_top && mevent.y < data_top + data_h) {
+                        int ridx = top + (mevent.y - data_top);
+                        if (ridx >= 0 && ridx < n_rows) {
+                            sel = ridx;
+                        }
+                    }
+                }
+                break;
+            }
             }
         }
 
