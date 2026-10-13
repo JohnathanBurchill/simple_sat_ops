@@ -178,7 +178,7 @@ void Scale_Vector(double k, vector_t *v);
 double Dot(vector_t *v1, vector_t *v2);
 double Angle(vector_t *v1, vector_t *v2);
 void Cross(vector_t *v1, vector_t *v2, vector_t *v3);
-void Normalize(vector_t *v);
+void Vec_Normalize(vector_t *v);
 double AcTan(double sinx, double cosx);
 double FMod2p(double x);
 double Modulus(double arg1, double arg2);

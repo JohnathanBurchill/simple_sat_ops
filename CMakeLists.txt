@@ -501,10 +501,10 @@ if (RAYLIB_FOUND)
     target_include_directories(live_waterfall PRIVATE ${RAYLIB_INCLUDE_DIRS})
     target_link_directories(live_waterfall PRIVATE ${RAYLIB_LIBRARY_DIRS})
     target_link_libraries(live_waterfall PRIVATE waterfall_core ${RAYLIB_LIBRARIES} m)
-    # Homebrew's raylib.pc on macOS doesn't list the Cocoa / OpenGL /
-    # IOKit frameworks the static lib pulls in (and the dylib variant
-    # isn't always installed). Add them explicitly on Darwin; harmless
-    # on Linux where these frameworks don't exist (the find_library
+    # raylib.pc on macOS doesn't list the Cocoa / OpenGL / IOKit /
+    # QuartzCore frameworks the static lib pulls in (QuartzCore since
+    # raylib 6.0's GLFW). Add them explicitly on Darwin; harmless on
+    # Linux where these frameworks don't exist (the find_library
     # below returns NOTFOUND-suffixed strings which we filter out).
     if (APPLE)
         target_link_libraries(live_waterfall PRIVATE
@@ -512,7 +512,8 @@ if (RAYLIB_FOUND)
             "-framework OpenGL"
             "-framework IOKit"
             "-framework CoreVideo"
-            "-framework Foundation")
+            "-framework Foundation"
+            "-framework QuartzCore")
     endif()
     list(APPEND SSO_TARGETS live_waterfall)
 
@@ -541,7 +542,8 @@ if (RAYLIB_FOUND)
             "-framework OpenGL"
             "-framework IOKit"
             "-framework CoreVideo"
-            "-framework Foundation")
+            "-framework Foundation"
+            "-framework QuartzCore")
     endif()
     list(APPEND SSO_TARGETS decode_inspector)
 
@@ -571,7 +573,8 @@ if (RAYLIB_FOUND)
             "-framework OpenGL"
             "-framework IOKit"
             "-framework CoreVideo"
-            "-framework Foundation")
+            "-framework Foundation"
+            "-framework QuartzCore")
     endif()
     list(APPEND SSO_TARGETS mpi_viewer)
 
@@ -609,7 +612,8 @@ if (RAYLIB_FOUND)
             "-framework OpenGL"
             "-framework IOKit"
             "-framework CoreVideo"
-            "-framework Foundation")
+            "-framework Foundation"
+            "-framework QuartzCore")
     endif()
     list(APPEND SSO_TARGETS frontiersat_camera_viewer)
 
@@ -635,7 +639,8 @@ if (RAYLIB_FOUND)
             "-framework OpenGL"
             "-framework IOKit"
             "-framework CoreVideo"
-            "-framework Foundation")
+            "-framework Foundation"
+            "-framework QuartzCore")
     endif()
     list(APPEND SSO_TARGETS telemetry_browser)
 else()
