@@ -560,7 +560,7 @@ if (RAYLIB_FOUND)
                    utils/sat_model.c
                    utils/beacon_attitude.c src/proto/bulk_size.c
                    src/proto/adcs_mag.c src/orbit/prediction.c src/orbit/oem.c
-                   src/orbit/attitude.c src/beacon/beacon_cts1.c)
+                   src/orbit/attitude.c src/beacon/beacon_cts1.c src/orbit/bestxyz.c)
     target_include_directories(mpi_viewer PRIVATE ${RAYLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(mpi_viewer PRIVATE ${RAYLIB_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(mpi_viewer PRIVATE ${RAYLIB_LIBRARIES} ${OPENSSL_LIBRARIES}
@@ -592,7 +592,7 @@ if (RAYLIB_FOUND)
                            utils/beacon_attitude.c
                            src/proto/adcs_mag.c
                            src/orbit/prediction.c src/orbit/oem.c
-                           src/orbit/attitude.c src/beacon/beacon_cts1.c)
+                           src/orbit/attitude.c src/beacon/beacon_cts1.c src/orbit/bestxyz.c)
     if (APPLE)
         # Same trackpad-pinch shim decode_inspector uses: raylib/GLFW drop
         # NSEventTypeMagnify, so an NSEvent monitor collects it for us.
@@ -623,7 +623,7 @@ if (RAYLIB_FOUND)
     # field sits where in a beacon; beacon_cts1.c reads the packets.
     # Needs sqlite3 via packet_db, and no orbit maths at all.
     add_executable(telemetry_browser utils/telemetry_browser.c
-                   src/beacon/beacon_cts1.c src/beacon/beacon_series.c)
+                   src/beacon/beacon_cts1.c src/orbit/bestxyz.c src/beacon/beacon_series.c)
     target_include_directories(telemetry_browser PRIVATE
         ${RAYLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(telemetry_browser PRIVATE
@@ -711,7 +711,7 @@ list(APPEND SSO_TARGETS resample_selftest)
 # pinned at sat-1-rc3; a silent regression here shows up as wrong
 # fields on the operator panel during a pass.
 add_executable(beacon_cts1_selftest unit_tests/beacon_cts1_selftest.c
-               src/beacon/beacon_cts1.c)
+               src/beacon/beacon_cts1.c src/orbit/bestxyz.c)
 target_include_directories(beacon_cts1_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(beacon_cts1_selftest PRIVATE m)
 list(APPEND SSO_TARGETS beacon_cts1_selftest)
@@ -722,7 +722,7 @@ list(APPEND SSO_TARGETS beacon_cts1_selftest)
 # says, so a wrong offset draws a wrong curve with nothing to give it
 # away. Checked against the same real extended beacon.
 add_executable(beacon_series_selftest unit_tests/beacon_series_selftest.c
-               src/beacon/beacon_series.c src/beacon/beacon_cts1.c)
+               src/beacon/beacon_series.c src/beacon/beacon_cts1.c src/orbit/bestxyz.c)
 target_include_directories(beacon_series_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(beacon_series_selftest PRIVATE m)
 list(APPEND SSO_TARGETS beacon_series_selftest)
@@ -917,7 +917,7 @@ if (OPENSSL_FOUND)
                    src/dsp/modem_iq.c src/dsp/modem_viterbi.c
                    src/proto/ax100.c src/proto/rs.c src/proto/golay24.c
                    src/proto/csp.c src/proto/hmac_keyfile.c
-                   src/beacon/beacon_cts1.c src/pipeline/decode_loop.c)
+                   src/beacon/beacon_cts1.c src/orbit/bestxyz.c src/pipeline/decode_loop.c)
     target_include_directories(rx_decode PRIVATE ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(rx_decode PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(rx_decode PRIVATE ${OPENSSL_LIBRARIES} m)
@@ -934,6 +934,17 @@ if (OPENSSL_FOUND)
     target_link_sso_core(packet_query)
     list(APPEND SSO_TARGETS packet_query)
 
+    # File the DB's "unknown" rows under the packet types the decoder knows
+    # now (cts1_classify), since re-decoding never replaces a stored row.
+    add_executable(packet_refile utils/packet_refile.c src/beacon/beacon_cts1.c
+                   src/orbit/bestxyz.c src/proto/gnss_frag.c)
+    target_include_directories(packet_refile PRIVATE ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(packet_refile PRIVATE ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(packet_refile PRIVATE ${OPENSSL_LIBRARIES} m)
+    target_link_packet_db(packet_refile)
+    target_link_sso_core(packet_refile)
+    list(APPEND SSO_TARGETS packet_refile)
+
     # Reassemble + CRC-check the GNSS telecommand responses (NovAtel logs).
     add_executable(gnss_reports utils/gnss_reports.c src/orbit/bestxyz.c src/proto/gnss_frag.c)
     target_include_directories(gnss_reports PRIVATE ${OPENSSL_INCLUDE_DIRS})
@@ -942,6 +953,17 @@ if (OPENSSL_FOUND)
     target_link_packet_db(gnss_reports)
     target_link_sso_core(gnss_reports)
     list(APPEND SSO_TARGETS gnss_reports)
+
+    # List the GNSS ring blob's downlinked BESTXYZB fixes (packet type 0x30)
+    # and compare each with SGP4 from the TLE in force.
+    add_executable(gnss_ring utils/gnss_ring.c src/orbit/bestxyz.c src/proto/gnss_frag.c
+                   src/orbit/prediction.c src/orbit/oem.c)
+    target_include_directories(gnss_ring PRIVATE ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(gnss_ring PRIVATE ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(gnss_ring PRIVATE ${OPENSSL_LIBRARIES} ${SGP4SDP4_LIB} m)
+    target_link_packet_db(gnss_ring)
+    target_link_sso_core(gnss_ring)
+    list(APPEND SSO_TARGETS gnss_ring)
 
     # Reassemble an MPI science-data file from its bulk_file packets, the MPI
     # counterpart to cam_reconstruct and gnss_reports. gnss_frag.c is reused for
@@ -998,7 +1020,7 @@ if (OPENSSL_FOUND)
     # never writes to the database, so it decodes them as it loads them.
     if (NCURSES_FOUND)
         add_executable(packet_browser utils/packet_browser.c utils/cam_jpeg.c
-                       src/beacon/beacon_cts1.c
+                       src/beacon/beacon_cts1.c src/orbit/bestxyz.c
                        src/ui/ui_textfield.c)
         target_compile_definitions(packet_browser PRIVATE
             PACKET_BROWSER_HAVE_NCURSES)
@@ -1015,7 +1037,7 @@ if (OPENSSL_FOUND)
         # Command explorer over the sent_tcmd table (mirror of
         # packet_browser). Links beacon_cts1 for tcmd_response decoding.
         add_executable(tcmd_browser utils/tcmd_browser.c
-                       src/beacon/beacon_cts1.c
+                       src/beacon/beacon_cts1.c src/orbit/bestxyz.c
                        src/ui/ui_textfield.c)
         target_compile_definitions(tcmd_browser PRIVATE
             TCMD_BROWSER_HAVE_NCURSES)
@@ -1058,7 +1080,7 @@ if (OPENSSL_FOUND)
                    src/dsp/sw_nco.c src/dsp/iq_burst.c src/dsp/frame_rssi.c
                    src/proto/ax100.c src/proto/rs.c src/proto/golay24.c
                    src/proto/csp.c src/proto/hmac_keyfile.c
-                   src/beacon/beacon_cts1.c src/pipeline/rx_tui.c
+                   src/beacon/beacon_cts1.c src/orbit/bestxyz.c src/pipeline/rx_tui.c
                    src/orbit/tle_csv.c)
     target_include_directories(rx_replay PRIVATE ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(rx_replay PRIVATE ${OPENSSL_LIBRARY_DIRS})
@@ -1451,7 +1473,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
                    src/proto/agenda_line.c
                    src/proto/tcmd_lint.c src/proto/tcmd_spec.c
                    src/proto/sso_pseudo.c
-                   src/beacon/beacon_cts1.c
+                   src/beacon/beacon_cts1.c src/orbit/bestxyz.c
                    src/orbit/tle_csv.c
                    src/dsp/biquad.c src/dsp/monitor_squelch.c)
     target_include_directories(simple_sat_ops PRIVATE

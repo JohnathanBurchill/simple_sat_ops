@@ -669,20 +669,8 @@ void decode_loop_record_packet(const char *ts,
     int          ptype       = 0;
     const char  *ptype_name  = NULL;
     const char  *satellite   = NULL;
-    if (csp_ok) {
-        if (beacon_is_basic(payload, payload_len)) {
-            ptype = 0x01; ptype_name = "beacon"; satellite = "CTS1";
-        } else if (beacon_is_extended(payload, payload_len)) {
-            ptype = COMMS_PACKET_TYPE_BEACON_EXTENDED;
-            ptype_name = "beacon_ext"; satellite = "CTS1";
-        } else if (tcmd_response_is(payload, payload_len)) {
-            ptype = 0x04; ptype_name = "tcmd_response";
-        } else if (log_message_is(payload, payload_len)) {
-            ptype = 0x03; ptype_name = "log";
-        } else if (bulk_file_is(payload, payload_len)) {
-            ptype = 0x10; ptype_name = "bulk_file";
-        }
-    }
+    if (csp_ok)
+        ptype = cts1_classify(payload, payload_len, &ptype_name, &satellite);
     int recognized = (ptype_name != NULL);
 
     // Tally recognized types. Before the DB-null check so the run
@@ -696,6 +684,8 @@ void decode_loop_record_packet(const char *ts,
             case 0x04: g_stats.tcmd_response++; break;
             case 0x03: g_stats.log_message++;   break;
             case 0x10: g_stats.bulk_file++;     break;
+            case COMMS_PACKET_TYPE_GNSS_BESTXYZB_SAMPLE:
+                       g_stats.gnss_ring++;     break;
             default: break;
         }
     } else {
@@ -719,19 +709,9 @@ void decode_loop_record_packet(const char *ts,
     // so the column stays NULL.
     char summary_buf[3072];
     const char *summary = NULL;
-    if (recognized) {
-        FILE *mem = fmemopen(summary_buf, sizeof summary_buf, "w");
-        if (mem != NULL) {
-            cts1_packet_print(mem, NULL, payload, payload_len);
-            fflush(mem);
-            long pos = ftell(mem);
-            if (pos < 0) pos = 0;
-            if ((size_t)pos >= sizeof summary_buf) pos = sizeof summary_buf - 1;
-            summary_buf[pos] = '\0';
-            fclose(mem);
-            summary = summary_buf[0] ? summary_buf : NULL;
-        }
-    }
+    if (recognized && cts1_packet_summary(summary_buf, sizeof summary_buf,
+                                          payload, payload_len) > 0)
+        summary = summary_buf;
 
     // ts_received uses the ISO-8601 form when emit_frame's caller
     // produces one (rx_live / b210_rx_tx / rx_decode). rx_replay

@@ -8,6 +8,11 @@
     Python to_dict() produced, plus the GPS-week/seconds epoch, the
     message CRC, and the leading-wrapper and corruption paths.
 
+    The binary BESTXYZB parser is checked on two samples FrontierSat's GNSS
+    ring blob sent down on 2026-10-13. The receiver's own CRC proves the
+    framing, and the fix's size, speed and timing are checked against the
+    orbit and the reception time, which a wrong field offset would break.
+
     Exit status: 0 = all tests passed, non-zero = failure.
 
     Copyright (C) 2026  Johnathan K Burchill
@@ -27,6 +32,7 @@
 #include "tap.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 #define check(cond, what) tap_ok((cond), (what))
@@ -123,10 +129,132 @@ static void test_wrapper_and_errors(void)
           "header without ';' rejected");
 }
 
+// Two GNSS ring-blob packets (type 0x30) as received, from the packet
+// database: one type byte, the 16-bit downlink sequence number and ring
+// position, then the 144-byte BESTXYZB log. RING_FIX holds the fix taken at
+// 2026-10-13T21:03:08Z and arrived at 21:46:40.624Z; SGP4 from the TLE then
+// in force put the satellite within 0.63 km of the fix. RING_WARMUP is from
+// just after the receiver was switched on, before it had a solution.
+static const char *RING_FIX =
+    "3002150900AA44121CF10000207000000097B48809306DD10E00000002CF44FA"
+    "430000000010000000D997697AC2644BC1C0DAEC89545A42C1697CE5EABB6854"
+    "C1C623833F97588A3F02A7F53F00000000080000005DC71782DFDAB6C0BB3B6F"
+    "DF8C0D9AC0141EF516DE4CB24025D7123D7C01033DAC536E3D00000000000000"
+    "000000000000000000271F1F1E00063533FD56DDC6";
+static const char *RING_WARMUP =
+    "303E159601AA44121CF100002070000000A4788809D8B1C10E00004802CF44FA"
+    "4301000000000000000000000000000000000000000000000000000000000000"
+    "0000000000000000000000000001000000000000000000000000000000000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "00000000000000000000000000000000003EB2CA11";
+
+#define RING_HDR 5      // type byte, sequence number, ring position
+#define RING_LEN 149
+
+static size_t unhex(const char *s, unsigned char *out, size_t cap)
+{
+    size_t n = 0;
+    for (; s[0] && s[1] && n < cap; s += 2) {
+        unsigned v = 0;
+        sscanf(s, "%2x", &v);
+        out[n++] = (unsigned char) v;
+    }
+    return n;
+}
+
+static void test_binary_fields(void)
+{
+    unsigned char pkt[RING_LEN];
+    check(unhex(RING_FIX, pkt, sizeof pkt) == RING_LEN, "fixture is one 149-byte packet");
+
+    bestxyz_t b;
+    char err[160];
+    check(bestxyzb_parse(pkt + RING_HDR, RING_LEN - RING_HDR, &b, err, sizeof err) == 0,
+          "parse the downlinked BESTXYZB");
+    // The receiver computed this CRC over the header and body; matching it
+    // means the header and body lengths were read correctly.
+    check(b.crc_present == 1 && b.crc_ok == 1, "receiver CRC matches");
+    check(b.crc_read == 0xc6dd56fdu, "CRC read from the trailing four bytes");
+
+    check(b.gps_week == 2440, "GPS week");
+    check(approx(b.gps_sow, 248606.0, 1e-6), "GPS seconds of week");
+    check(strcmp(b.time_status, "FINESTEERING") == 0, "time status 180");
+    check(strcmp(b.pos_sol_status, "SOL_COMPUTED") == 0, "position solution status 0");
+    check(strcmp(b.pos_type, "SINGLE") == 0, "position type 16");
+    check(approx(b.pos[0], -3590532.9563, 1e-3), "ECEF X");
+    check(approx(b.pos[1], -2405545.0775, 1e-3), "ECEF Y");
+    check(approx(b.pos[2], -5350127.6703, 1e-3), "ECEF Z");
+    check(approx(b.pos_sigma[0], 1.024529, 1e-5), "X sigma");
+    check(approx(b.pos_sigma[2], 1.919159, 1e-5), "Z sigma");
+    check(strcmp(b.vel_sol_status, "SOL_COMPUTED") == 0, "velocity solution status");
+    check(strcmp(b.vel_type, "DOPPLER_VELOCITY") == 0, "velocity type 8");
+    check(approx(b.vel[0], -5850.8731, 1e-3), "ECEF VX");
+    check(approx(b.vel[2], 4684.8675, 1e-3), "ECEF VZ");
+    check(approx(b.vel_sigma[1], 0.031984, 1e-5), "VY sigma");
+    check(b.num_sv == 39 && b.num_sol_sv == 31, "39 satellites tracked, 31 used");
+
+    // Checks that do not lean on the values above. FrontierSat flies a
+    // near-circular orbit about 500 km up, so the fix sits 6700-7000 km
+    // from the Earth's centre, moves at 7.0-7.8 km/s in the Earth-fixed
+    // frame, and its velocity is almost square to its position (the Earth's
+    // rotation adds only a component perpendicular to the position).
+    double r = sqrt(b.pos[0] * b.pos[0] + b.pos[1] * b.pos[1] + b.pos[2] * b.pos[2]);
+    double v = sqrt(b.vel[0] * b.vel[0] + b.vel[1] * b.vel[1] + b.vel[2] * b.vel[2]);
+    double rv = (b.pos[0] * b.vel[0] + b.pos[1] * b.vel[1] + b.pos[2] * b.vel[2]) / (r * v);
+    check(r > 6.7e6 && r < 7.0e6, "position is at orbit radius");
+    check(v > 7.0e3 && v < 7.8e3, "velocity is orbital speed");
+    check(fabs(rv) < 0.01, "velocity is square to the position");
+
+    // The fix was taken before the packet came down. The blob sends a random
+    // run from its ring of the latest 500 fixes, 10 s apart while the
+    // receiver is on (sunlight only), so a sample is at most a few hours old.
+    int y, mo, d, h, mi;
+    double s;
+    bestxyz_gps_to_utc(b.gps_week, b.gps_sow, BESTXYZ_DEFAULT_LEAP_SECONDS,
+                       &y, &mo, &d, &h, &mi, &s);
+    double fix_s = h * 3600.0 + mi * 60.0 + s;
+    double rx_s = 21 * 3600.0 + 46 * 60.0 + 40.624;
+    check(y == 2026 && mo == 10 && d == 13, "fix is on the reception day");
+    check(fix_s < rx_s && rx_s - fix_s < 3 * 3600.0, "fix precedes reception by under 3 h");
+
+    // The warm-up sample: no solution yet, so the enumerations differ.
+    check(unhex(RING_WARMUP, pkt, sizeof pkt) == RING_LEN, "warm-up fixture is 149 bytes");
+    check(bestxyzb_parse(pkt + RING_HDR, RING_LEN - RING_HDR, &b, err, sizeof err) == 0
+          && b.crc_ok == 1, "parse the warm-up sample, CRC matches");
+    check(strcmp(b.time_status, "COARSESTEERING") == 0, "time status 120");
+    check(strcmp(b.pos_sol_status, "INSUFFICIENT_OBS") == 0, "position solution status 1");
+    check(strcmp(b.pos_type, "NONE") == 0, "position type 0");
+    check(b.gps_week == 2440 && approx(b.gps_sow, 247575.0, 1e-6), "warm-up GPS time");
+}
+
+static void test_binary_errors(void)
+{
+    unsigned char pkt[RING_LEN];
+    unhex(RING_FIX, pkt, sizeof pkt);
+    unsigned char *m = pkt + RING_HDR;
+    size_t n = RING_LEN - RING_HDR;
+    bestxyz_t b;
+    char err[160];
+
+    // A flipped body byte still parses but fails the CRC.
+    m[40] ^= 0x01;
+    check(bestxyzb_parse(m, n, &b, err, sizeof err) == 0 && b.crc_ok == 0,
+          "flipped body byte fails the CRC");
+    m[40] ^= 0x01;
+
+    check(bestxyzb_parse(m, n - 1, &b, err, sizeof err) == -1, "one byte short is rejected");
+    check(bestxyzb_parse(pkt, n, &b, err, sizeof err) == -1, "missing sync is rejected");
+    // Message ID 42 is BESTPOS: the same framing, a different body.
+    m[4] = 42;
+    check(bestxyzb_parse(m, n, &b, err, sizeof err) == -1, "another log ID is rejected");
+}
+
 int main(void)
 {
     test_fields();
     test_epoch();
     test_wrapper_and_errors();
+    test_binary_fields();
+    test_binary_errors();
     return tap_done();
 }

@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`da874d8` (2026-10-09). This is a working draft.
+`dec177f` (2026-10-13). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -139,6 +139,7 @@ manual can go back on the shelf where it belongs.
     - [`beacon_detect`](#beacon_detect)
     - [`fm_preview`](#fm_preview)
     - [`packet_query` and `packet_browser`](#packet_query-and-packet_browser)
+    - [`packet_refile`](#packet_refile)
     - [`telemetry_browser`](#telemetry_browser)
     - [`cam_reconstruct`](#cam_reconstruct)
     - [`frontiersat_camera_viewer`](#frontiersat_camera_viewer)
@@ -151,6 +152,7 @@ manual can go back on the shelf where it belongs.
     - [`conjunction`](#conjunction)
     - [`region_crossings`](#region_crossings)
     - [`gnss_reports`](#gnss_reports)
+    - [`gnss_ring`](#gnss_ring)
     - [`tle_from_state`](#tle_from_state)
 12. [Uploading the orbit to the space safety database](#uploading-the-orbit-to-the-space-safety-database)
     - [The workflow](#the-workflow)
@@ -2248,6 +2250,35 @@ telecommand (`@tssent`) the download began. A download split
 across a long pause, or across separate commands, reconstructs as separate
 bursts; open each from one of its own chunks.
 
+### `packet_refile`
+
+Files the packet DB's `unknown` rows under the packet types the decoder knows
+now. The decoder names a packet's type when it stores the packet. A frame it
+doesn't recognize is stored as type 0, `unknown`, with no decoded text. When
+the ground station learns a new type, the rows stored before that stay
+`unknown`. Decoding the old recordings again doesn't change them either,
+because the DB keeps the first row it stored for each payload. The extended
+beacon (`0x20`, from July 2026) and the GNSS ring samples (`0x30`, from
+August) were both stored this way until the decoder learned them.
+
+`packet_refile` runs the decoder's own classifier over every `unknown` row.
+For each row it now recognizes, it sets what a fresh decode would store: the
+type, its name, the satellite (when empty), and the decoded summary. Rows it
+still can't name stay `unknown`. These include the receiver hearing our own
+uplink, and frames whose type byte or anchor bytes took bit errors. Running
+it again changes nothing, so run it after any update that teaches the
+decoder a new packet type, on every copy of the DB. It writes in short
+transactions, so a decoder writing to the same DB only waits a moment.
+
+```sh
+cp -p /FrontierSat/packet_db.sqlite /FrontierSat/packet_db.sqlite.bak   # optional backup
+packet_refile --dry-run    # how many rows, by type
+packet_refile              # file them
+```
+
+On 2026-10-13 it filed 58,302 of 100,071 `unknown` rows: 23,297 extended
+beacons and 35,005 ring samples, in under two seconds.
+
 ### `telemetry_browser`
 
 The beacons as curves. `packet_query` and `packet_browser` show you one
@@ -3429,6 +3460,56 @@ gnss_reports --since=7d
 A `BESTXYZA` whose status reads `SOL_COMPUTED` is a real position fix;
 `INSUFFICIENT_OBS` means the receiver could not see enough satellites to
 solve. Those computed fixes are what feed the orbit upload below.
+
+### `gnss_ring`
+
+Lists the GNSS fixes that the ring blob (`gnss_bestxyzb_ring_v2`) sends
+down, and compares each with the TLE. While the blob runs, it samples the
+receiver about every 10 s whenever the receiver is on, keeps the latest 500
+samples on the satellite, and on every run sends a random run of them down
+as packet type `0x30`, one binary `BESTXYZB` log per packet. Since the blob
+started, most of FrontierSat's fixes have arrived this way. The packet DB
+files them as `gnss_ring`, but `gnss_reports` and `gnss_opm` read only
+telecommand responses and firehose files, so they don't see them. Rows
+stored before the decoder knew this type are `unknown` until
+[`packet_refile`](#packet_refile) has been run, so `gnss_ring` finds the
+packets by their first byte, whatever type they were filed under. It checks
+each log's NovAtel CRC. It keeps one copy of each fix, because the blob sends the same
+sample many times and several stations hear it. It prints one line per fix,
+in time order.
+
+Each line gives:
+
+- the fix time (UTC), and the GPS week and seconds;
+- the receiver's time status and solution status;
+- the Earth-fixed position, its 1-sigma, and the velocity;
+- the number of satellites tracked and used;
+- a comparison with SGP4, in the last four columns.
+
+The comparison uses the newest TLE in the DB's `tle` table whose epoch is at
+or before the fix. The four columns are the TLE's age in hours, then the fix
+minus SGP4 in radial, along-track and cross-track metres. A short tally goes
+to stderr, including the median distance from SGP4. The columns are
+space-separated under a `#` header line, so the output goes straight into
+gnuplot or awk.
+
+The options:
+
+- By default only `SOL_COMPUTED` fixes are listed. `--all` adds the samples
+  taken just after the receiver was switched on, before it had a solution.
+- `--since` and `--until` select by fix time.
+- `--catalog=<n>` compares with another object's TLEs, and `--no-tle` skips
+  the comparison.
+
+```sh
+gnss_ring --since=24h
+gnss_ring --since=2026-10-13 --all
+gnss_ring --no-tle > fixes.txt
+```
+
+The distance from SGP4 is mostly the TLE's own error, which grows with its
+age: a few hundred metres for a TLE less than a day old. It does not measure
+the receiver.
 
 ### `mag_reports`
 

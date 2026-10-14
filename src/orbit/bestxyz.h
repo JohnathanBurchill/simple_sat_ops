@@ -6,7 +6,9 @@
     position/velocity solution FrontierSat's GNSS receiver returns in a
     telecommand response. Pure C, no external library: the equivalent of
     the team's novatel_edie Python snippet, just enough of it to recover
-    the state vector and its time so tle_from_state can build a TLE.
+    the state vector and its time so tle_from_state can build a TLE. The
+    binary form of the same log (BESTXYZB), which the GNSS ring blob
+    downlinks, parses into the same struct.
 
     Copyright (C) 2026  Johnathan K Burchill
 
@@ -63,6 +65,16 @@ typedef struct {
 // success returns 0 and fills *out; on failure returns -1 and writes a
 // short reason into err (when errsz > 0).
 int bestxyz_parse(const char *text, bestxyz_t *out, char *err, size_t errsz);
+
+// Parse a binary BESTXYZB log (message ID 241): msg points at the AA 44 12
+// sync bytes and len counts the bytes available from there. The receiver's
+// enumerations are turned into the names the ASCII log uses (a value the
+// table doesn't know comes out as its number). Returns 0 and fills *out,
+// with the CRC verdict in crc_ok, when the frame is a whole BESTXYZB log;
+// returns -1 with a short reason in err otherwise. The GNSS ring blob
+// downlinks its samples in this form.
+int bestxyzb_parse(const unsigned char *msg, size_t len, bestxyz_t *out,
+                   char *err, size_t errsz);
 
 // One parsed NovAtel TIMEA log. BESTXYZA carries no receiver clock offset,
 // so the offset that ties the solution epoch to true GPS time lives here

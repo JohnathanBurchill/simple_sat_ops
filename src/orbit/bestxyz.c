@@ -201,6 +201,109 @@ int bestxyz_parse(const char *text, bestxyz_t *out, char *err, size_t errsz)
 #undef FAIL
 }
 
+// ---- binary BESTXYZB parse --------------------------------------------------
+
+// NovAtel enumerations (OEM7 Commands and Logs Reference Manual) that the
+// binary log carries as numbers and the ASCII log spells out.
+typedef struct { unsigned v; const char *name; } enum_name_t;
+
+static const enum_name_t TIME_STATUS[] = {
+    {20, "UNKNOWN"}, {60, "APPROXIMATE"}, {80, "COARSEADJUSTING"},
+    {100, "COARSE"}, {120, "COARSESTEERING"}, {130, "FREEWHEELING"},
+    {140, "FINEADJUSTING"}, {160, "FINE"}, {170, "FINEBACKUPSTEERING"},
+    {180, "FINESTEERING"}, {200, "SATTIME"},
+};
+
+static const enum_name_t SOL_STATUS[] = {
+    {0, "SOL_COMPUTED"}, {1, "INSUFFICIENT_OBS"}, {2, "NO_CONVERGENCE"},
+    {3, "SINGULARITY"}, {4, "COV_TRACE"}, {5, "TEST_DIST"}, {6, "COLD_START"},
+    {7, "V_H_LIMIT"}, {8, "VARIANCE"}, {9, "RESIDUALS"},
+    {13, "INTEGRITY_WARNING"}, {18, "PENDING"}, {19, "INVALID_FIX"},
+    {20, "UNAUTHORIZED"}, {22, "INVALID_RATE"},
+};
+
+static const enum_name_t POS_TYPE[] = {
+    {0, "NONE"}, {1, "FIXEDPOS"}, {2, "FIXEDHEIGHT"}, {8, "DOPPLER_VELOCITY"},
+    {16, "SINGLE"}, {17, "PSRDIFF"}, {18, "WAAS"}, {19, "PROPAGATED"},
+    {32, "L1_FLOAT"}, {34, "NARROW_FLOAT"}, {48, "L1_INT"}, {49, "WIDE_INT"},
+    {50, "NARROW_INT"}, {68, "PPP_CONVERGING"}, {69, "PPP"},
+};
+
+// The enum's name, or the bare number when the table doesn't know it.
+static void enum_name(const enum_name_t *t, size_t n, unsigned v,
+                      char *out, size_t outn)
+{
+    for (size_t i = 0; i < n; ++i)
+        if (t[i].v == v) { snprintf(out, outn, "%s", t[i].name); return; }
+    snprintf(out, outn, "%u", v);
+}
+
+static uint16_t rd_u16(const unsigned char *p) { return (uint16_t) (p[0] | p[1] << 8); }
+static uint32_t rd_u32(const unsigned char *p)
+{
+    return (uint32_t) p[0] | (uint32_t) p[1] << 8 | (uint32_t) p[2] << 16 | (uint32_t) p[3] << 24;
+}
+// The receiver writes IEEE-754 little-endian, as the hosts we build on are.
+static double rd_f64(const unsigned char *p) { double v; memcpy(&v, p, 8); return v; }
+static double rd_f32(const unsigned char *p) { float v; memcpy(&v, p, 4); return (double) v; }
+
+#define BESTXYZB_MSG_ID   241
+#define BESTXYZB_BODY_LEN 112
+
+int bestxyzb_parse(const unsigned char *msg, size_t len, bestxyz_t *out,
+                   char *err, size_t errsz)
+{
+    memset(out, 0, sizeof *out);
+#define FAIL(m) do { if (errsz) snprintf(err, errsz, "%s", (m)); return -1; } while (0)
+
+    if (len < 10) FAIL("too short for a NovAtel binary header");
+    if (msg[0] != 0xAA || msg[1] != 0x44 || msg[2] != 0x12)
+        FAIL("no NovAtel binary sync (AA 44 12)");
+    size_t hdr = msg[3];
+    if (hdr < 28) FAIL("binary header shorter than 28 bytes");
+    if (rd_u16(msg + 4) != BESTXYZB_MSG_ID) FAIL("not a BESTXYZB log (message ID != 241)");
+    size_t body = rd_u16(msg + 8);
+    if (body < BESTXYZB_BODY_LEN) FAIL("BESTXYZB body shorter than 112 bytes");
+    if (len < hdr + body + 4) FAIL("BESTXYZB log truncated");
+
+    // The CRC covers the header and body (sync bytes included) and follows them.
+    out->crc_calc = bestxyz_novatel_crc32(msg, hdr + body);
+    out->crc_read = rd_u32(msg + hdr + body);
+    out->crc_present = 1;
+    out->crc_ok = (out->crc_calc == out->crc_read);
+
+    enum_name(TIME_STATUS, sizeof TIME_STATUS / sizeof TIME_STATUS[0], msg[13],
+              out->time_status, sizeof out->time_status);
+    out->gps_week = rd_u16(msg + 14);
+    out->gps_sow = rd_u32(msg + 16) / 1000.0;
+
+    const unsigned char *b = msg + hdr;
+    enum_name(SOL_STATUS, sizeof SOL_STATUS / sizeof SOL_STATUS[0], rd_u32(b),
+              out->pos_sol_status, sizeof out->pos_sol_status);
+    enum_name(POS_TYPE, sizeof POS_TYPE / sizeof POS_TYPE[0], rd_u32(b + 4),
+              out->pos_type, sizeof out->pos_type);
+    for (int k = 0; k < 3; ++k) {
+        out->pos[k] = rd_f64(b + 8 + 8 * k);
+        out->pos_sigma[k] = rd_f32(b + 32 + 4 * k);
+    }
+    enum_name(SOL_STATUS, sizeof SOL_STATUS / sizeof SOL_STATUS[0], rd_u32(b + 44),
+              out->vel_sol_status, sizeof out->vel_sol_status);
+    enum_name(POS_TYPE, sizeof POS_TYPE / sizeof POS_TYPE[0], rd_u32(b + 48),
+              out->vel_type, sizeof out->vel_type);
+    for (int k = 0; k < 3; ++k) {
+        out->vel[k] = rd_f64(b + 52 + 8 * k);
+        out->vel_sigma[k] = rd_f32(b + 76 + 4 * k);
+    }
+    // b + 88 is the 4-byte base station ID, b + 96 the differential age.
+    out->vel_latency = rd_f32(b + 92);
+    out->sol_age = rd_f32(b + 100);
+    out->num_sv = b[104];
+    out->num_sol_sv = b[105];
+
+    return 0;
+#undef FAIL
+}
+
 // ---- TIMEA parse ------------------------------------------------------------
 
 // TIMEA layout: the header matches every NovAtel log (name through ';'),

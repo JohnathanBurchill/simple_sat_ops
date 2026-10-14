@@ -132,7 +132,7 @@ typedef struct {
 // Type cycle: NULL means "all", otherwise filter on packet_type_name.
 // "beacon_ext" is the odd one out -- see BEACON_EXT_PREDICATE below.
 static const char *const TYPE_CYCLE[] = {
-    NULL, "beacon", "beacon_ext", "tcmd_response", "log", "bulk_file"
+    NULL, "beacon", "beacon_ext", "tcmd_response", "log", "bulk_file", "gnss_ring"
 };
 static const int TYPE_CYCLE_N = sizeof TYPE_CYCLE / sizeof TYPE_CYCLE[0];
 

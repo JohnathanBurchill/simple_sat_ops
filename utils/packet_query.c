@@ -148,7 +148,7 @@ static int parse_args(packet_query_args_t *a, int argc, char **argv, int help)
             matched = 1;
         }
         if (starts_with(arg, "--type=") || help) {
-            if (help) parse_help_line(OPTW, "--type=<name|0xNN>", "beacon|log|tcmd_response|bulk_file|0xNN");
+            if (help) parse_help_line(OPTW, "--type=<name|0xNN>", "beacon|beacon_ext|log|tcmd_response|bulk_file|gnss_ring|0xNN");
             else a->type_arg = arg + 7;
             matched = 1;
         }
@@ -301,7 +301,9 @@ static int parse_type_filter(const char *spec,
     if (strcmp(spec, "beacon") == 0
         || strcmp(spec, "log") == 0
         || strcmp(spec, "tcmd_response") == 0
-        || strcmp(spec, "bulk_file") == 0) {
+        || strcmp(spec, "bulk_file") == 0
+        || strcmp(spec, "beacon_ext") == 0
+        || strcmp(spec, "gnss_ring") == 0) {
         *out_name = spec;
         return 0;
     }
@@ -472,8 +474,8 @@ int main(int argc, char **argv)
     int type_byte = -1;
     if (type_arg != NULL && parse_type_filter(type_arg, &type_name, &type_byte) != 0) {
         fprintf(stderr,
-                "packet_query: bad --type=%s (use beacon|log|tcmd_response|"
-                "bulk_file|0xNN)\n", type_arg);
+                "packet_query: bad --type=%s (use beacon|beacon_ext|log|tcmd_response|"
+                "bulk_file|gnss_ring|0xNN)\n", type_arg);
         return 1;
     }
 

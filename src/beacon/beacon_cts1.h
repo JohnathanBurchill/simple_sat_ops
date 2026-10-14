@@ -68,6 +68,15 @@
 // interval until a reboot or agenda_delete_by_name(exec_blob_from_fs).
 #define COMMS_PACKET_TYPE_BEACON_EXTENDED   0x20
 
+// A GNSS fix from the GNSS ring blob (gnss_bestxyzb_ring_blob in the same
+// misc_tools/exec_blob directory), which samples the receiver and keeps the
+// latest samples in a ring of files. Each packet is the type byte, a 16-bit
+// downlink sequence number, a 16-bit ring position (both little-endian),
+// then the receiver's 144-byte binary BESTXYZB log.
+#define COMMS_PACKET_TYPE_GNSS_BESTXYZB_SAMPLE 0x30
+#define COMMS_GNSS_RING_HEADER_LEN  5
+#define COMMS_GNSS_RING_PACKET_LEN  (COMMS_GNSS_RING_HEADER_LEN + 144)
+
 // Lead token cts1_rx_panel_summary writes ahead of the summary text when a
 // frame's Reed-Solomon block was uncorrectable (rs_errs == -2): the recovered
 // bytes are garbage, so parsed telemetry would mislead. The panel renderer
@@ -590,14 +599,41 @@ int bulk_file_is(const uint8_t *payload, size_t len);
 void bulk_file_print(FILE *fp, const char *ts,
                      const uint8_t *payload, size_t len);
 
-// Type-aware dispatcher. Tries the length-based beacon/tcmd_response
-// sniffs first (those are robust to a corrupted packet_type byte
-// because their lengths are unique enough), then falls back to a
-// packet_type byte switch for log_message / bulk_file (whose lengths
-// overlap). Prints nothing if no decoder matches; the caller's hex/
-// ascii dump (gated by the headers toggle) still shows the bytes.
+// 1 if the payload is a GNSS ring-blob sample: 149 bytes (153 with the
+// CSP CRC32 trailer), type byte 0x30, and either the BESTXYZB sync bytes
+// or its header length and message ID intact.
+int gnss_ring_is(const uint8_t *payload, size_t len);
+
+// The sample's sequence number and ring position, the fix time (UTC),
+// receiver status, Earth-fixed position, sigma and velocity, and whether
+// the receiver's CRC matches.
+void gnss_ring_print(FILE *fp, const char *ts,
+                     const uint8_t *payload, size_t len);
+
+// Name the firmware packet type of a CSP-stripped payload. Returns the
+// type byte to store (0 when no recognizer matches) and sets *name to the
+// packet DB's packet_type_name ("beacon", "beacon_ext", "tcmd_response",
+// "log", "bulk_file", "gnss_ring"; NULL when unknown) and *satellite to
+// "CTS1" for the beacons (NULL otherwise). Either pointer may be NULL.
+// The length-anchored sniffs run first: the beacons and tcmd_response
+// survive a corrupted packet_type byte because their other anchors
+// (length, seq/max_seq) are strong enough. The decoder and packet_refile
+// both file packets through this, so they always agree.
+int cts1_classify(const uint8_t *payload, size_t len,
+                  const char **name, const char **satellite);
+
+// Type-aware dispatcher: prints the packet through the printer for the
+// type cts1_classify names. Prints nothing if no decoder matches; the
+// caller's hex/ascii dump (gated by the headers toggle) still shows the
+// bytes.
 void cts1_packet_print(FILE *fp, const char *ts,
                        const uint8_t *payload, size_t len);
+
+// cts1_packet_print into buf (NUL-terminated, clipped to cap), the text the
+// packet DB keeps in decoded_summary. Returns the length written; 0 when
+// the type is unknown.
+size_t cts1_packet_summary(char *buf, size_t cap,
+                           const uint8_t *payload, size_t len);
 
 // Sanitise a byte buffer into a printable C string: strip trailing
 // NULs, replace any other non-printable byte with '.', clip to outn-1.
