@@ -2,9 +2,9 @@
 
     Simple Satellite Operations  utils/cam_jpeg.c
 
-    Decode the JPEG carried by a boom-camera file, and histogram-equalize a
-    decoded picture for display. See cam_jpeg.h for the camera-file
-    (START_CAM sentence) format.
+    Decode the JPEG carried by a boom-camera file, and filter a decoded
+    picture for display (histogram equalization, colours stretched to full
+    scale). See cam_jpeg.h for the camera-file (START_CAM sentence) format.
 
     Copyright (C) 2026  Johnathan K Burchill
 
@@ -214,5 +214,23 @@ void cam_jpeg_equalize_rgb8(uint8_t *rgb, long npix)
             int v = p[c] + d;
             p[c] = (uint8_t) (v < 0 ? 0 : v > 255 ? 255 : v);
         }
+    }
+}
+
+void cam_jpeg_stretch_rgb8(uint8_t *rgb, long npix)
+{
+    for (int c = 0; c < 3; c++) {
+        int lo = 255, hi = 0;
+        for (long i = 0; i < npix; i++) {
+            int v = rgb[3 * i + c];
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+        if (hi <= lo) continue;
+        // Level v goes to 255 (v - lo) / (hi - lo), rounded.
+        int span = hi - lo;
+        uint8_t map[256] = {0};
+        for (int v = lo; v <= hi; v++) map[v] = (uint8_t) ((255 * (v - lo) + span / 2) / span);
+        for (long i = 0; i < npix; i++) rgb[3 * i + c] = map[rgb[3 * i + c]];
     }
 }

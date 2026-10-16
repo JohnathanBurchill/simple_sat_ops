@@ -248,8 +248,10 @@ typedef struct {
     uint8_t *jpg;
     long     jpg_len;
     Texture2D tex;
-    // The same picture histogram-equalized, which e shows instead.
+    // The same picture histogram-equalized (e) and with its colours
+    // stretched to full scale (c).
     Texture2D tex_eq;
+    Texture2D tex_st;
     int      tex_ok;
     int      img_w, img_h;
 } capture_t;
@@ -688,10 +690,11 @@ static int reload_captures(const char *db_path, capture_t **out)
 
 // ---- textures --------------------------------------------------------------
 
-// Decode each capture's JPEG into a texture, and a histogram-equalized copy
-// beside it so that e flips between the two at no cost. A picture with too
-// many missing bytes can fail to decode; that capture keeps tex_ok = 0 and the
-// viewer says so instead of drawing it. Must run after InitWindow.
+// Decode each capture's JPEG into a texture, with a histogram-equalized and a
+// colour-stretched copy beside it, so that e and c switch between them at no
+// cost. A picture with too many missing bytes can fail to decode; that capture
+// keeps tex_ok = 0 and the viewer says so instead of drawing it. Must run
+// after InitWindow.
 static void build_textures(capture_t *caps, int n)
 {
     for (int k = 0; k < n; k++) {
@@ -703,7 +706,13 @@ static void build_textures(capture_t *caps, int n)
             c->tex = LoadTextureFromImage(im);
             SetTextureFilter(c->tex, TEXTURE_FILTER_BILINEAR);
             ImageFormat(&im, PIXELFORMAT_UNCOMPRESSED_R8G8B8);
-            cam_jpeg_equalize_rgb8((uint8_t *) im.data, (long) im.width * im.height);
+            long npix = (long) im.width * im.height;
+            Image st = ImageCopy(im);
+            cam_jpeg_stretch_rgb8((uint8_t *) st.data, npix);
+            c->tex_st = LoadTextureFromImage(st);
+            SetTextureFilter(c->tex_st, TEXTURE_FILTER_BILINEAR);
+            UnloadImage(st);
+            cam_jpeg_equalize_rgb8((uint8_t *) im.data, npix);
             c->tex_eq = LoadTextureFromImage(im);
             SetTextureFilter(c->tex_eq, TEXTURE_FILTER_BILINEAR);
             c->tex_ok = 1;
@@ -720,6 +729,7 @@ static void unload_textures(capture_t *caps, int n)
         if (!caps[k].tex_ok) continue;
         UnloadTexture(caps[k].tex);
         UnloadTexture(caps[k].tex_eq);
+        UnloadTexture(caps[k].tex_st);
         caps[k].tex_ok = 0;
     }
 }
@@ -1046,7 +1056,8 @@ int main(int argc, char **argv)
             printf("Usage: frontiersat_camera_viewer [--db=<packet_db.sqlite>]\n"
                    "Look at FrontierSat's boom-camera pictures rebuilt from the packet DB.\n"
                    "The left panel lists captures, newest first, one row per picture; F5 re-reads the DB.\n"
-                   "e shows the picture histogram-equalized, or as received.\n"
+                   "e shows the picture histogram-equalized, c with its colours stretched to\n"
+                   "full scale; the same key again shows it as received.\n"
                    "f tags a favourite, v shows the favourites only. Favourites, that choice\n"
                    "and the last picture viewed are kept in ~/" STATE_RELPATH ".\n");
             return 0;
@@ -1127,10 +1138,10 @@ int main(int argc, char **argv)
     float zoom = 1.0f;
     Vector2 pan = { 0, 0 };
     int dragging = 0;
-    // Whether the picture is shown histogram-equalized (e). It stays as set
-    // from one picture to the next, and every run opens on the pictures as
-    // received.
-    int equalize = 0;
+    // How the picture is shown: as received, histogram-equalized (e) or with
+    // its colours stretched (c). It stays as set from one picture to the
+    // next, and every run opens on the pictures as received.
+    enum { SHOW_AS_RECEIVED, SHOW_EQUALIZED, SHOW_STRETCHED } show = SHOW_AS_RECEIVED;
     char status[160] = "";
     float status_left = 0.0f;
     float rep_up = 0, rep_down = 0;
@@ -1263,12 +1274,17 @@ int main(int argc, char **argv)
             }
         }
 
-        // e: the picture histogram-equalized, or as received. Only the
-        // screen changes; s and o still hand over the JPEG as received.
-        if (IsKeyPressed(KEY_E)) {
-            equalize = !equalize;
-            snprintf(status, sizeof status, equalize ? "showing the picture histogram-equalized"
-                                                     : "showing the picture as received");
+        // e: the picture histogram-equalized; c: its colours stretched to
+        // full scale. One filter at a time, and the same key again goes back
+        // to the picture as received. Only the screen changes; s and o still
+        // hand over the JPEG as received.
+        if (IsKeyPressed(KEY_E) || IsKeyPressed(KEY_C)) {
+            int want = IsKeyPressed(KEY_E) ? SHOW_EQUALIZED : SHOW_STRETCHED;
+            show = show == want ? SHOW_AS_RECEIVED : want;
+            snprintf(status, sizeof status, "%s",
+                     show == SHOW_EQUALIZED ? "showing the picture histogram-equalized"
+                     : show == SHOW_STRETCHED ? "showing the picture with its colours stretched"
+                     : "showing the picture as received");
             status_left = 6.0f;
         }
         if (IsKeyPressed(KEY_S)) { save_jpeg(c, status, sizeof status); status_left = 6.0f; }
@@ -1447,16 +1463,19 @@ int main(int argc, char **argv)
             Rectangle dst = picture_dst(c, px, py, pw, ph, zoom, &pan);
             shown_scale = dst.width / (float) c->img_w;
             BeginScissorMode(px, py, pw, ph);
-            DrawTexturePro(equalize ? c->tex_eq : c->tex, src, dst, (Vector2){ 0, 0 }, 0.0f, WHITE);
+            Texture2D pic = show == SHOW_EQUALIZED ? c->tex_eq
+                          : show == SHOW_STRETCHED ? c->tex_st : c->tex;
+            DrawTexturePro(pic, src, dst, (Vector2){ 0, 0 }, 0.0f, WHITE);
             EndScissorMode();
-            // Said above the corner of the pane for as long as it is on,
-            // since an equalized picture is not what the camera recorded.
-            if (equalize) {
-                const char *eq = "histogram equalized";
-                int ew = g_ui_font_loaded
-                       ? (int) MeasureTextEx(g_ui_font, eq, 15, g_ui_font_spacing).x
-                       : MeasureText(eq, 15);
-                draw_text(eq, px + pw - ew, 42, 15, FAV_GOLD);
+            // Said above the corner of the pane for as long as a filter is
+            // on, since the picture on show is not what the camera recorded.
+            if (show != SHOW_AS_RECEIVED) {
+                const char *label = show == SHOW_EQUALIZED ? "histogram equalized"
+                                                           : "colours stretched to full scale";
+                int lw = g_ui_font_loaded
+                       ? (int) MeasureTextEx(g_ui_font, label, 15, g_ui_font_spacing).x
+                       : MeasureText(label, 15);
+                draw_text(label, px + pw - lw, 42, 15, FAV_GOLD);
             }
         } else {
             draw_text("JPEG will not decode -- too many bytes missing.",
@@ -1509,7 +1528,7 @@ int main(int argc, char **argv)
         }
 
         // help footer
-        draw_text("Up/Down capture   scroll or pinch zoom   drag to move   e equalize   "
+        draw_text("Up/Down capture   scroll or pinch zoom   drag to move   e equalize   c stretch colours   "
                   "globe: drag turns, scroll zooms, g resets, p outlines picture   "
                   "f favourite   v favourites only   o open   s save jpeg   F5 refresh   q quit",
                   12, sh - 22, 12, (Color){ 150, 150, 160, 255 });

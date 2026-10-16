@@ -22,7 +22,10 @@
     It also covers cam_jpeg_equalize_rgb8, the viewer's histogram
     equalization, against values worked by hand from the textbook mapping:
     the darkest-level offset, rounding, brightness-only shifting that keeps a
-    pixel's colour, clamping at 255, and a picture of one brightness.
+    pixel's colour, clamping at 255, and a picture of one brightness. And
+    cam_jpeg_stretch_rgb8, colours stretched to full scale: each colour on
+    its own range, rounding, a colour already at full range, and a colour
+    holding one value.
 
     Exit status: 0 = all tests passed, non-zero = failure.
 
@@ -206,6 +209,34 @@ int main(void)
         cam_jpeg_equalize_rgb8(px, 3);
         tap_ok(memcmp(px, want, sizeof want) == 0,
                "a picture of one brightness is left as it is");
+    }
+
+    // --- colours stretched to full scale --------------------------------
+    // Expected values are round(255 (v - lo) / (hi - lo)) per colour.
+
+    // Each colour on its own range: red 50..150 and green 10..30 put their
+    // middle values at 127.5, rounded up to 128; blue 200..210 has nothing
+    // in the middle. One range shared by the three (10..210) would put the
+    // first pixel's red at 51, not 0.
+    {
+        uint8_t px[] = { 50, 10, 200,  100, 20, 200,  150, 30, 210 };
+        const uint8_t want[] = { 0, 0, 0,  128, 128, 0,  255, 255, 255 };
+        cam_jpeg_stretch_rgb8(px, 3);
+        tap_okf(memcmp(px, want, sizeof want) == 0,
+                "colours stretched separately (got %d,%d,%d / %d,%d,%d / %d,%d,%d)",
+                px[0], px[1], px[2], px[3], px[4], px[5], px[6], px[7], px[8]);
+    }
+
+    // A colour already spanning 0..255 comes back unchanged, and a colour
+    // holding one value (green 90, blue 7) has no range to stretch and is
+    // left as it is.
+    {
+        uint8_t px[] = { 0, 90, 7,  77, 90, 7,  255, 90, 7 };
+        const uint8_t want[] = { 0, 90, 7,  77, 90, 7,  255, 90, 7 };
+        cam_jpeg_stretch_rgb8(px, 3);
+        tap_okf(memcmp(px, want, sizeof want) == 0,
+                "full-range red and one-valued green, blue unchanged (got %d,%d,%d)",
+                px[3], px[4], px[5]);
     }
 
     return tap_done();

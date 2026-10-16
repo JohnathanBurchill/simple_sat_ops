@@ -2,8 +2,9 @@
 
     Simple Satellite Operations  utils/cam_jpeg.h
 
-    Decode the JPEG carried by a boom-camera file, and histogram-equalize a
-    decoded picture for display (frontiersat_camera_viewer's e key).
+    Decode the JPEG carried by a boom-camera file, and the two display filters
+    frontiersat_camera_viewer offers on a decoded picture: histogram
+    equalization (e) and stretching its colours to full scale (c).
 
     The flight firmware (CTS-SAT-1, tag sat-1-rc3) writes a captured JPEG to a
     file that begins with the text header "START_CAM:\n" and then a run of fixed
@@ -78,5 +79,13 @@ uint8_t *cam_jpeg_decode(const uint8_t *file, long len, uint8_t fill,
 // unchanged until a channel reaches 0 or 255. A picture of one brightness
 // throughout is left as it is.
 void cam_jpeg_equalize_rgb8(uint8_t *rgb, long npix);
+
+// Stretch each colour of a decoded picture to full scale, in place: red,
+// green and blue are each mapped linearly from their own darkest value to 0
+// and their own brightest to 255. `rgb` holds `npix` pixels of 8-bit red,
+// green, blue. Stretching the three separately also removes a colour cast,
+// since every colour ends up spanning the same range. A colour holding one
+// value throughout is left as it is.
+void cam_jpeg_stretch_rgb8(uint8_t *rgb, long npix);
 
 #endif
