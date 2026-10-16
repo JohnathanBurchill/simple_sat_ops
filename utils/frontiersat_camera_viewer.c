@@ -167,6 +167,14 @@ extern void  sso_install_pinch_monitor(void);
 #define MATCH_MIN_BYTES      256
 #define MATCH_MAX_MISMATCH   0.35
 
+// The test only looks at the image data, from sentence 21 on. Every picture
+// opens with the same JPEG tables -- in all 16 pictures from 2026-06-01 to
+// 2026-10-11 the image data starts at JPEG byte 589, inside sentence 21 -- so
+// two different pictures agree there. A 2026-10-16 download whose only bytes
+// in common with the 2026-07-23 one lay in the tables (95% agreement over 390
+// bytes) was merged into it before this cut-off existed.
+#define MATCH_FIRST_OFFSET   (CAM_HEADER_LEN + 21 * CAM_SENTENCE_LEN)
+
 // How far back of a session's start a bulk-download command may sit and still
 // be taken as the command that triggered it.
 #define CMD_LOOKBACK_MS (3.0 * 60.0 * 60.0 * 1000.0)
@@ -402,14 +410,14 @@ static long reassemble(const chunk_t *cs, const int *idx, int nidx,
     return size;
 }
 
-// Compare two sessions over the bytes both recovered. Fills *n_compared and
-// *n_differ.
+// Compare two sessions over the image-data bytes both recovered. Fills
+// *n_compared and *n_differ.
 static void compare_sessions(const session_t *a, const session_t *b,
                              long *n_compared, long *n_differ)
 {
     long lim = a->size < b->size ? a->size : b->size;
     long cmp = 0, differ = 0;
-    for (long k = 0; k < lim; k++) {
+    for (long k = MATCH_FIRST_OFFSET; k < lim; k++) {
         if (!a->present[k] || !b->present[k]) continue;
         cmp++;
         if (a->buf[k] != b->buf[k]) differ++;

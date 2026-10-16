@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`dec177f` (2026-10-13). This is a working draft.
+`70f8955` (2026-10-13). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2450,9 +2450,14 @@ check would have accepted.
 
 Those packets are then split into download sessions by reception time, and
 sessions of the same picture are merged. Two sessions are the same picture when
-the bytes they both carry agree: different pictures disagree on about four
-bytes in five, the same picture on at most one in five, its only disagreements
-coming from packets Reed-Solomon could not correct. The ground station's
+the image-data bytes they both carry agree: different pictures disagree on
+about four bytes in five, the same picture on at most one in five, its only
+disagreements coming from packets Reed-Solomon could not correct. The
+comparison starts at sentence 21 (file offset 1418), where the image data
+begins. Every picture opens with the same JPEG tables, so two different
+pictures agree byte for byte before that point. Until 2026-10-16 the viewer
+compared those bytes too, which merged the Sep 1, Oct 11 09:55 and Oct 16
+pictures into the Jul 23 row. The ground station's
 command log settles the case content cannot - a follow-up pass that re-fetched
 only the ranges the first pass missed shares no bytes at all with it, but both
 commands name the same file on the satellite.
