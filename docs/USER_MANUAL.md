@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`70f8955` (2026-10-13). This is a working draft.
+`ab53fca` (2026-10-16). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2593,7 +2593,25 @@ its exported JPEG is named with - not by its place in the list, so a new
 picture arriving at the top moves nothing, and a favourite the open database
 does not hold is kept in the file rather than forgotten.
 
-Keys: `Up`/`Down` change picture, `f` tags a favourite, `v` shows the
+**`e` shows the picture histogram-equalized.** Its brightness is spread so
+that the darkest level present becomes black, the brightest white, and the
+levels between take room in proportion to how many pixels hold them. The
+colour is left alone, because all three channels of a pixel move by the same
+amount. `histogram equalized` shows in gold above the picture's top right
+corner while it is on. The setting stays as you move from picture to picture,
+and every run opens on the pictures as received. It changes only the screen:
+`s` and `o` still hand over the JPEG as received.
+
+It helps most on a picture with a real range of brightness: on the Aug 6 limb
+it brings out the cloud structure. A dark frame is another matter. The
+night-mode pictures of Sep 5, Jul 23 and Oct 11 use only 5 to 9 brightness
+levels between 12 and 20, and the Sep 4 town-lights picture has 83 % of its
+pixels at level 0 and 15 % at level 1. Equalizing spreads those few levels
+across the whole range, so the JPEG's compression blocks, a level or two
+apart, become large grey and white squares. What shows then is the compression, not
+the scene.
+
+Keys: `Up`/`Down` change picture, `e` equalizes, `f` tags a favourite, `v` shows the
 favourites only, **`o` opens the picture in the desktop's
 image viewer** (Preview on macOS, the `xdg-open` default on Linux) via a copy
 in the temporary directory - for a look in whatever viewer you already keep

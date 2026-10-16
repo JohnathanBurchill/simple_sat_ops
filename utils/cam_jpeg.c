@@ -2,8 +2,9 @@
 
     Simple Satellite Operations  utils/cam_jpeg.c
 
-    Decode the JPEG carried by a boom-camera file. See cam_jpeg.h for the
-    camera-file (START_CAM sentence) format.
+    Decode the JPEG carried by a boom-camera file, and histogram-equalize a
+    decoded picture for display. See cam_jpeg.h for the camera-file
+    (START_CAM sentence) format.
 
     Copyright (C) 2026  Johnathan K Burchill
 
@@ -173,4 +174,45 @@ uint8_t *cam_jpeg_decode(const uint8_t *file, long len, uint8_t fill,
     }
     if (out_len != NULL) *out_len = image_size;
     return img;
+}
+
+// BT.601 luma in integers. The weights 77, 150 and 29 add up to 256, so a grey
+// pixel's luma is its own level.
+static int luma601(const uint8_t *p)
+{
+    return (77 * p[0] + 150 * p[1] + 29 * p[2] + 128) >> 8;
+}
+
+void cam_jpeg_equalize_rgb8(uint8_t *rgb, long npix)
+{
+    long hist[256] = {0};
+    for (long i = 0; i < npix; i++) hist[luma601(rgb + 3 * i)]++;
+
+    // The textbook mapping: level v goes to 255 (cdf(v) - cdf_min) /
+    // (npix - cdf_min), rounded, where cdf(v) counts the pixels at or below v
+    // and cdf_min is cdf at the darkest level present.
+    long cdf[256], run = 0, cdf_min = -1;
+    for (int v = 0; v < 256; v++) {
+        run += hist[v];
+        cdf[v] = run;
+        if (cdf_min < 0 && hist[v] > 0) cdf_min = run;
+    }
+    long span = npix - cdf_min;
+    if (span <= 0) return;
+    int map[256];
+    for (int v = 0; v < 256; v++) {
+        long above = cdf[v] - cdf_min;
+        if (above < 0) above = 0;
+        map[v] = (int) ((255 * above + span / 2) / span);
+    }
+
+    for (long i = 0; i < npix; i++) {
+        uint8_t *p = rgb + 3 * i;
+        int y = luma601(p);
+        int d = map[y] - y;
+        for (int c = 0; c < 3; c++) {
+            int v = p[c] + d;
+            p[c] = (uint8_t) (v < 0 ? 0 : v > 255 ? 255 : v);
+        }
+    }
 }

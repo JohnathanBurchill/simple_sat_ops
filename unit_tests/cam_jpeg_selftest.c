@@ -19,6 +19,11 @@
       - a sentence that arrives AFTER the 0xFACE end-marker (out of order, and
         the sentinel must not stop the scan or be placed as image data).
 
+    It also covers cam_jpeg_equalize_rgb8, the viewer's histogram
+    equalization, against values worked by hand from the textbook mapping:
+    the darkest-level offset, rounding, brightness-only shifting that keeps a
+    pixel's colour, clamping at 255, and a picture of one brightness.
+
     Exit status: 0 = all tests passed, non-zero = failure.
 
     Copyright (C) 2026  Johnathan K Burchill
@@ -151,6 +156,57 @@ int main(void)
            "empty input returns NULL");
     tap_ok(cam_jpeg_decode((const uint8_t *) "no sentences here", 17, 0, NULL, NULL) == NULL,
            "input with no '@' sentences returns NULL");
+
+    // --- histogram equalization ---------------------------------------
+    // Expected values are worked by hand from the textbook mapping,
+    // round(255 (cdf(v) - cdf_min) / (npix - cdf_min)), with BT.601 luma.
+
+    // Grey levels 10, 10, 20, 30: cdf 2, 3, 4 and cdf_min 2, so they go to
+    // 0, 0, 128 (127.5 rounded up) and 255. Two pixels share the darkest
+    // level, which catches a cdf_min taken as 1.
+    {
+        uint8_t g[] = { 10, 10, 10,  10, 10, 10,  20, 20, 20,  30, 30, 30 };
+        const uint8_t want[] = { 0, 0, 0,  0, 0, 0,  128, 128, 128,  255, 255, 255 };
+        cam_jpeg_equalize_rgb8(g, 4);
+        tap_ok(memcmp(g, want, sizeof want) == 0,
+               "grey 10,10,20,30 equalize to 0,0,128,255");
+    }
+
+    // A coloured pixel moves by its brightness and keeps its colour.
+    // (60,20,10) has luma (77*60 + 150*20 + 29*10 + 128) >> 8 = 31; with grey
+    // 10 below it and grey 240 above, the levels go to 0, 128 and 255, so all
+    // three channels rise by 97. Equalizing each channel on its own would
+    // put red at 128, and an equal-weight brightness (30) would move them 98.
+    {
+        uint8_t px[] = { 10, 10, 10,  60, 20, 10,  240, 240, 240 };
+        const uint8_t want[] = { 0, 0, 0,  157, 117, 107,  255, 255, 255 };
+        cam_jpeg_equalize_rgb8(px, 3);
+        tap_okf(memcmp(px, want, sizeof want) == 0,
+                "(60,20,10) between grey 10 and 240 becomes (157,117,107) (got %d,%d,%d)",
+                px[3], px[4], px[5]);
+    }
+
+    // A channel pushed past 255 stops there rather than wrapping. (250,200,200)
+    // has luma 215 and is the brightest level, so it goes to 255 and every
+    // channel rises by 40: red would be 290, which wraps to 34 in 8 bits.
+    {
+        uint8_t px[] = { 0, 0, 0,  250, 200, 200 };
+        const uint8_t want[] = { 0, 0, 0,  255, 240, 240 };
+        cam_jpeg_equalize_rgb8(px, 2);
+        tap_okf(memcmp(px, want, sizeof want) == 0,
+                "(250,200,200) beside black becomes (255,240,240) (got %d,%d,%d)",
+                px[3], px[4], px[5]);
+    }
+
+    // One brightness throughout has nothing to spread (npix - cdf_min is 0)
+    // and comes back untouched.
+    {
+        uint8_t px[] = { 90, 40, 30,  90, 40, 30,  90, 40, 30 };
+        const uint8_t want[] = { 90, 40, 30,  90, 40, 30,  90, 40, 30 };
+        cam_jpeg_equalize_rgb8(px, 3);
+        tap_ok(memcmp(px, want, sizeof want) == 0,
+               "a picture of one brightness is left as it is");
+    }
 
     return tap_done();
 }

@@ -2,7 +2,8 @@
 
     Simple Satellite Operations  utils/cam_jpeg.h
 
-    Decode the JPEG carried by a boom-camera file.
+    Decode the JPEG carried by a boom-camera file, and histogram-equalize a
+    decoded picture for display (frontiersat_camera_viewer's e key).
 
     The flight firmware (CTS-SAT-1, tag sat-1-rc3) writes a captured JPEG to a
     file that begins with the text header "START_CAM:\n" and then a run of fixed
@@ -66,5 +67,16 @@ int cam_jpeg_is_camera_file(const uint8_t *buf, long len);
 // sentences found, or out of memory).
 uint8_t *cam_jpeg_decode(const uint8_t *file, long len, uint8_t fill,
                          cam_jpeg_stats_t *stats, long *out_len);
+
+// Histogram-equalize a decoded picture's brightness in place, leaving its
+// colours alone. `rgb` holds `npix` pixels of 8-bit red, green, blue.
+// Brightness is the luma the JPEG itself codes (0.299 R + 0.587 G + 0.114 B,
+// ITU-R BT.601). Each brightness level moves to its place in the cumulative
+// histogram, so the darkest level present becomes 0, the brightest 255, and the
+// levels between spread out by how many pixels hold them. A pixel's three
+// channels all move by the same amount, which keeps its JPEG chroma (Cb, Cr)
+// unchanged until a channel reaches 0 or 255. A picture of one brightness
+// throughout is left as it is.
+void cam_jpeg_equalize_rgb8(uint8_t *rgb, long npix);
 
 #endif
