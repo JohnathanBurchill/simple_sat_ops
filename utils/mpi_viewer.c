@@ -41,6 +41,14 @@
     fails it (data the firmware lost at the flush, or the last frame of a
     recording, cut short by the stop) is dropped.
 
+    Every other frame is held to its CRC too, and one that fails it is not
+    drawn, in the image or the whereogram. Most of those sit beside a downlink
+    packet that never came down, so part of the frame reads as zeros; the rest
+    carry bytes from a packet whose CSP CRC failed. Drawn, they were the
+    one-column streaks through the whereogram and the image columns that stood
+    hundreds to tens of thousands of DN off their neighbours -- 55 of the 1266
+    frames of the 2026-10-20 19:21 recording.
+
     Each frame carries aux/housekeeping fields then a strip of image pixels, and
     the two are one frame apart: the pixels were integrated during the previous
     frame's slot, while the aux fields are stamped when the frame is packed, by
@@ -70,9 +78,21 @@
     the order it was flown means left to right is earliest to latest, the same
     direction as the whereogram below, so an image reads as the stretch of
     whereogram its playback head is sitting on rather than as a mirror of it,
-    and consecutive images tile that recording with nothing left over. A new
-    image begins one frame past a multiple of the scan period, which the scan
-    index (aux byte 13) counts off. The tool plays the images back like a movie, grayscale, with
+    and consecutive images tile that recording with nothing left over.
+
+    Which image a frame belongs in comes from the frame counter (aux bytes
+    4-5), which steps by exactly one a frame: a frame's counter less its column
+    is the counter of its sweep's first frame, the same for every frame of that
+    sweep, so each frame finds its own image whichever of its neighbours came
+    down. Until 2026-10-21 a new image began only at the frame that starts a
+    sweep, and when that one frame was missing the next sweep -- or ten of them,
+    across a download hole -- ran on into the image before and was drawn over
+    its columns. A counter that steps back starts a new image too: it starts
+    again from zero when the instrument restarts, as it does once near the
+    start of eight of the first thirteen recordings, so no image takes frames
+    from both sides of the restart.
+
+    The tool plays the images back like a movie, grayscale, with
     an adjustable DN range and nearest-neighbour zoom, and shows the aux data
     beside each image -- that aux belonging, as above, to the frame after the
     one the pixels were taken in.
@@ -327,7 +347,6 @@ int main(int argc, char **argv)
 #define FRAME_STRIDE   152   // bytes per frame (sync .. last pixel)
 #define PIX_START      20    // first pixel byte within a frame
 #define NPIX           65    // big-endian uint16 pixels per frame
-#define SCAN_IDX_OFF   13    // inner dome scan index byte (the image row)
 #define MAX_FPI        64    // largest scan period we render
 
 // The 0 V background frame's target-voltage setpoint. It carries no ion signal
@@ -365,11 +384,10 @@ typedef struct {
     int      nframes;        // number of sync words found
     long    *fr_off;         // byte offset of each frame's sync word
     int     *fr_ctr;         // running counter (bytes 4-5) per frame
-    int     *fr_scan;        // inner dome scan index (byte 13) per frame
     int     *fr_tv;          // inner dome target voltage (bytes 11-12) per frame
     double  *fr_ts;          // capture time (unix ms) per frame, -1 if unknown
     uint8_t *fr_bytes;       // each frame's 152 bytes, any JSON marker spliced into it cut out
-    int     *fr_bad;         // 1 if the frame is dropped: it runs past EOF, or a rejoined frame fails its CRC
+    int     *fr_bad;         // 1 if the frame is dropped: it runs past EOF, or fails its own CRC
     int     *fr_spliced;     // 1 if a JSON marker was cut out of the frame
     int     *fr_unver;       // 1 if any of the frame's bytes came from a failed-CRC packet
     int     *fr_gap;         // 1 if any of the frame's bytes never came down
@@ -382,7 +400,7 @@ static void free_experiment(experiment_t *e)
 {
     free(e->buf); free(e->present); free(e->verified);
     free(e->fr_off); free(e->fr_ctr);
-    free(e->fr_scan); free(e->fr_tv);
+    free(e->fr_tv);
     free(e->fr_ts); free(e->fr_bad); free(e->fr_unver);
     free(e->fr_bytes); free(e->fr_spliced); free(e->fr_gap);
 }
@@ -982,7 +1000,6 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
     }
     out->fr_off = offs;
     out->fr_ctr  = (int *) malloc((size_t) n * sizeof(int));
-    out->fr_scan = (int *) malloc((size_t) n * sizeof(int));
     out->fr_tv   = (int *) malloc((size_t) n * sizeof(int));
     out->fr_ts   = (double *) malloc((size_t) n * sizeof(double));
     out->fr_bad  = (int *) calloc((size_t) n, sizeof(int));
@@ -990,10 +1007,10 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
     out->fr_gap  = (int *) calloc((size_t) n, sizeof(int));
     out->fr_spliced = (int *) calloc((size_t) n, sizeof(int));
     out->fr_bytes = (uint8_t *) calloc((size_t) n, FRAME_STRIDE);
-    if (out->fr_ctr == NULL || out->fr_scan == NULL || out->fr_tv == NULL
+    if (out->fr_ctr == NULL || out->fr_tv == NULL
         || out->fr_ts == NULL || out->fr_bad == NULL || out->fr_unver == NULL
         || out->fr_gap == NULL || out->fr_spliced == NULL || out->fr_bytes == NULL) {
-        free(out->fr_ctr); free(out->fr_scan); free(out->fr_tv);
+        free(out->fr_ctr); free(out->fr_tv);
         free(out->fr_ts); free(out->fr_bad); free(out->fr_unver);
         free(out->fr_gap); free(out->fr_spliced); free(out->fr_bytes);
         free(offs); free(buf); free(present); free(verified);
@@ -1043,18 +1060,16 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
             else if (!verified[p]) out->fr_unver[k] = 1;
         }
         out->fr_ctr[k]  = be16(f, 4);
-        out->fr_scan[k] = f[SCAN_IDX_OFF];
         out->fr_tv[k]   = be16(f, 11);
         out->fr_ts[k]   = -1.0;
 
-        // The firmware sometimes loses data at a flush, and then the half after
-        // the marker belongs to a later frame (the frame counter jumps across
-        // it); the last frame of a recording is cut short by the stop. Either
-        // way the joined frame fails its own CRC, so a rejoined frame that
-        // came down whole and fails it is dropped. One with bytes missing
-        // cannot be checked and is kept, like any other frame with a gap.
-        if (out->fr_spliced[k] && !out->fr_bad[k] && !out->fr_gap[k]
-            && !frame_crc_ok(out, k))
+        // A frame whose own CRC fails is dropped. Most of these have bytes
+        // that never came down, which read as zeros; others carry bytes from a
+        // packet whose CSP CRC failed. A rejoined frame fails it too when the
+        // firmware lost data at the flush, so that the half after the marker
+        // belongs to a later frame (the frame counter jumps across it), and
+        // the last frame of a recording fails it, being cut short by the stop.
+        if (!out->fr_bad[k] && !frame_crc_ok(out, k))
             out->fr_bad[k] = 1;
     }
     free(ms); free(me);
@@ -1454,13 +1469,22 @@ static void apply_scan(view_t *v, const experiment_t *s)
     v->ncols = v->fpi;
 }
 
-// Assign every frame to an image. Frames are in file order; the image boundary
-// comes from the inner-dome scan index (the clean per-frame step counter) -- a
-// new image begins one frame past a multiple of fpi, at the raw frame that
-// carries the 0 V dwell's pixels -- while the column within the image comes
-// from the target voltage (see col_of). Corrupt frames (an off-grid target
-// voltage, a JSON-straddle body, a missing predecessor) and the partial leading
-// sweep are dropped (fr_img < 0).
+// Assign every frame to an image, one image per sweep, in file order. The
+// column within the image comes from the target voltage (see col_of); the
+// sweep comes from the frame counter, which steps by exactly one a frame, so a
+// frame's counter less its column is the counter of its sweep's first frame
+// and names the sweep. Every frame of a sweep works that out for itself, so a
+// sweep whose first frame never came down is still one image, and the next
+// sweep does not run on into it.
+//
+// A counter that steps back also starts a new image, even onto a sweep name
+// already seen. The counter starts again from zero when the instrument
+// restarts, and the sweeps after it reach the counters the sweeps before it
+// had; and the 2026-09-17 recording sends a second, different frame for
+// counters it has already used. Either way the frame is not the one already
+// drawn in that column, and must not be drawn over it.
+//
+// Frames that are dropped, or whose column cannot be told, get fr_img < 0.
 static void rebuild_image_list(view_t *v, const experiment_t *s)
 {
     free(v->fr_img);
@@ -1469,20 +1493,19 @@ static void rebuild_image_list(view_t *v, const experiment_t *s)
     v->fr_img = (int *) malloc((size_t) s->nframes * sizeof(int));
     if (v->fr_img == NULL) return;
 
-    int img = 0, started = 0;
+    int n = 0, prev_ctr = 0, cur_first = 0;
     for (int k = 0; k < s->nframes; k++) {
-        if (s->fr_bad[k] || col_of(v, s, k) < 0) { v->fr_img[k] = -2; continue; }   // corrupt frame
-        int sc = s->fr_scan[k];
-        int boundary = (sc >= 0 && sc < 4 * v->fpi && sc % v->fpi == 1);
-        if (!started) {
-            if (boundary) { started = 1; v->fr_img[k] = 0; }
-            else v->fr_img[k] = -1;      // partial leading sweep, before the first boundary
-            continue;
-        }
-        if (boundary) img++;
-        v->fr_img[k] = img;
+        int col = s->fr_bad[k] ? -1 : col_of(v, s, k);
+        if (col < 0) { v->fr_img[k] = -1; continue; }
+        int ctr = s->fr_ctr[k];
+        int first = (ctr - col) & 0xFFFF;
+        // The step from the frame before, taken round the 16-bit wrap.
+        int step = ((ctr - prev_ctr + 0x8000) & 0xFFFF) - 0x8000;
+        if (n == 0 || step <= 0 || first != cur_first) { n++; cur_first = first; }
+        prev_ctr = ctr;
+        v->fr_img[k] = n - 1;
     }
-    v->n_img = started ? img + 1 : 0;
+    v->n_img = n;
     if (v->img_pos >= v->n_img) v->img_pos = v->n_img ? v->n_img - 1 : 0;
 }
 
@@ -1814,10 +1837,11 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
     free(first);
 
     // Take it off, and put the instrument's own offset back on. A frame the
-    // image list dropped is cleaned too, on the background of the image it sits
-    // in: its aux was corrupt, which says nothing about its pixels, and leaving
-    // it out would open a hole in the whereogram that no gap in the data
-    // accounts for.
+    // image list left out is cleaned too, on the background of the image it
+    // sits in: what it lacks is a column -- the frame before it is missing, or
+    // its voltage is off the grid -- which says nothing about its pixels, and
+    // leaving it out would open a hole in the whereogram that no gap in the
+    // data accounts for.
     int last = -1;
     for (int k = 0; k < nf; k++) {
         if (!ok[k]) continue;
@@ -2252,7 +2276,8 @@ static Color cmap_color(int map, unsigned char val)
 // visible at all. Those columns are painted in the background colour -- a
 // colour map has no value that means "no data", and the darkest end of one
 // would read as a real, low measurement -- and are marked instead by the red
-// rule drawn above the panel.
+// rule drawn above the panel. So is a column whose frame came down but was
+// dropped for failing its own CRC, which is blank for the same reason.
 //
 // Several frames share a column once a recording is longer than the panel is
 // wide, and they are averaged. Taking the brightest instead lets the one
@@ -2298,7 +2323,10 @@ static void build_whereogram(const view_t *v, const experiment_t *s,
             for (long b = b0; b < b1; b++)
                 if (!s->present[b]) { gap = 1; break; }
 
+            // A frame dropped for failing its own CRC is marked the same way
+            // as bytes that never came down: either way nothing here is drawn.
             int k = at[q];
+            if (k >= 0 && s->fr_bad[k]) gap = 1;
             if (k < 0 || s->fr_bad[k] || !frame_shown(v, s, k)) continue;
             for (int j = 0; j < NPIX; j++) sum[j] += pix_val(v, s, k, j);
             nsum++;
@@ -2760,9 +2788,13 @@ int main(int argc, char **argv)
                    e->size - e->recovered);
             printf("  unverified: %ld bytes from packets whose CRC failed\n", e->unverified);
             printf("  frames    : %d", e->nframes);
-            int nunver = 0;
-            for (int f = 0; f < e->nframes; f++) if (e->fr_unver[f]) nunver++;
+            int nunver = 0, nbad = 0;
+            for (int f = 0; f < e->nframes; f++) {
+                if (e->fr_unver[f]) nunver++;
+                if (e->fr_bad[f]) nbad++;
+            }
             if (nunver > 0) printf(" (%d touch unverified bytes)", nunver);
+            if (nbad > 0) printf(", %d dropped (their own CRC fails, or cut short)", nbad);
             printf("\n");
             int nspl = 0, nspl_kept = 0;
             for (int f = 0; f < e->nframes; f++) {
@@ -2882,7 +2914,7 @@ int main(int argc, char **argv)
     Texture2D cov_tex = {0};
     int cov_w = 0, cov_valid = 0;
     unsigned cov_sig = 0;
-    unsigned char *wg_missing = NULL;   // per column: some of its bytes never came down
+    unsigned char *wg_missing = NULL;   // per column: some of its bytes never came down, or a frame was dropped
     int wg_lo = -1, wg_hi = -1;         // the DN window its colours were built for
     // Set while the pointer is scrubbing the whereogram, so a press that
     // began there keeps control until the button is let go -- and a press that
@@ -3415,9 +3447,10 @@ int main(int argc, char **argv)
                 DrawRectangleLines(ax - 1, ay - 1, cw + 2, ch + 2, (Color){ 70, 70, 80, 255 });
 
                 // A red rule above the panel over every stretch that never came
-                // down. Those columns are painted in the background colour, and
-                // background is not a reading -- without the rule there would be
-                // nothing to tell "no data" from "nothing arriving".
+                // down, or came down but was dropped for failing its CRC. Those
+                // columns are painted in the background colour, and background
+                // is not a reading -- without the rule there would be nothing
+                // to tell "no data" from "nothing arriving".
                 for (int c = 0; c < cov_w; c++) {
                     if (!wg_missing[c]) continue;
                     int x = ax + c * cw / cov_w;

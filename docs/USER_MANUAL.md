@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`664dd50` (2026-10-16). This is a working draft.
+`59d5880` (2026-10-16). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2772,7 +2772,8 @@ mpi_viewer --list                       # print what each experiment reconstruct
 `--list` prints one block per experiment - the on-satellite file, how long the
 recording ran, its length and where that number came from, the recovered and
 missing byte counts, how much rests on packets whose CRC failed, the frame
-count, and how many packets were set aside for a corrupted offset - then exits
+count and how many frames were dropped for failing their own CRC, and how many
+packets were set aside for a corrupted offset - then exits
 without opening a window. It answers "how much of this do we actually have?"
 from a terminal or over ssh, and is the same reconstruction the GUI shows.
 
@@ -2820,6 +2821,16 @@ at that flush (the frame counter jumps across the footer) and for the last frame
 of a recording, which the stop cuts short. `--list` reports how many frames were
 rejoined, kept and dropped for each experiment.
 
+Every other frame is held to its CRC-16 too, and **a frame that fails it is not
+drawn**, in the image or the whereogram. Most of those sit beside a downlink
+packet that never came down, so part of the frame reads as zeros; the rest
+carry bytes from a packet whose CSP CRC failed. Drawn, they were one-column
+streaks through the whereogram and image columns standing hundreds to tens of
+thousands of DN off their neighbours - 55 of the 1266 frames of the 2026-10-20
+19:21 recording, which was then 72% downloaded. The ones beside a hole come
+back when the hole is filled, which the `d` re-download export already asks
+for.
+
 **What the picture's axes are.** Up the image is the 65 CCD pixels, the
 direction the ions arrived from. Across it is the inner-dome bias in the order
 the sweep was flown: 0 V at the far left, then increasingly negative bias to the
@@ -2840,6 +2851,19 @@ rest of the sweep. The far-right column is the
 other frame of the dwell: 0 V read again with the background taken off it, which
 is the residue the subtraction leaves. Because every frame of the sweep is
 drawn, consecutive images tile the recording with nothing left over.
+
+**Which image a frame goes in** comes from its frame counter (aux bytes 4-5),
+which steps by exactly one a frame. A frame's counter less its column is the
+counter of its sweep's first frame, the same for every frame of the sweep, so
+each frame finds its own image whichever of its neighbours came down, and an
+image with a hole in the download beside it just has columns missing. Until
+2026-10-21 a new image began only at the frame that starts a sweep, so when
+that one frame was missing the next sweep - or ten of them, across a download
+hole - ran on into the image before and was drawn over its columns, which read
+as large jumps between neighbouring columns. A counter that steps back starts a
+new image too: the instrument starts counting again from zero when it
+restarts, which eight of the first thirteen recordings do once, near the start,
+so no image takes frames from both sides of the restart.
 
 Note that a frame's pixels and its aux fields are one frame apart: the pixels
 were integrated during the previous frame's slot, while the aux is stamped when
@@ -3092,7 +3116,9 @@ for a fixed run of frame-sized slices, so a stretch that never came down takes u
 its own width instead of being closed up. Those columns are painted in the
 window's background colour - a colour map has no value meaning "no data", and its
 darkest end would read as a real, low measurement - and a **red rule above the
-panel** marks them. Several frames share a column once a recording is longer
+panel** marks them. The rule also marks a column whose frame came down but was
+dropped for failing its own CRC, which is blank for the same reason. Several
+frames share a column once a recording is longer
 than the panel is wide, and they are averaged.
 
 The line beneath gives the received percentage, how much is still missing, and
