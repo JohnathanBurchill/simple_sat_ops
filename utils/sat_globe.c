@@ -726,16 +726,16 @@ static double model_strength(double zoom)
 
 // The satellite itself, over the track: the model of it turned the way
 // it was turned, once the view is close enough in to make room, and --
-// when a beacon says which way it was facing -- the ray from it down to
-// the point on the ground its nadir face was aimed at. Writes the
-// caption the panel prints under the disc into note.
+// when a beacon or log record says which way it was facing -- the ray
+// from it down to the point on the ground its nadir face was aimed at.
+// Writes the caption the panel prints under the disc into note.
 //
 // The ray is a straight line through space, so it is sampled and drawn
 // piecewise -- a single line between the two end points would cut
 // through the Earth on a zoomed-in view instead of lying on it.
 //
 // Two ways the body frame can be arrived at, and they are never drawn
-// alike. With an attitude from a beacon, the model is solid and the ray
+// alike. With an attitude on record, the model is solid and the ray
 // is drawn. Without one, the satellite's own orbit still says where it
 // is and which way it is going, so the model is drawn in the orbit frame
 // -- nadir down, ram forward -- as an outline, and the caption says the
@@ -931,8 +931,9 @@ static void draw_satellite(const globe_t *g, const globe_proj_t *pr,
     // the ground below or of the horizon, then which side of the track it
     // was looking, then where that landed.
     //
-    // The age is worth a word only when the beacon was not close to the
-    // moment; inside half a minute the satellite has barely turned.
+    // The age is worth a word only when the beacon or log record was not
+    // close to the moment; inside half a minute the satellite has barely
+    // turned. Which of the two it was always is, on the second line.
     char age[24] = "";
     if (fabs(g->att.age_s) >= 30.0) {
         snprintf(age, sizeof age, "  %+.0fs", g->att.age_s);
@@ -948,10 +949,10 @@ static void draw_satellite(const globe_t *g, const globe_proj_t *pr,
         snprintf(where, sizeof where, "looking past the limb");
     }
     // With the footprint up, a third line says how to read it.
-    snprintf(note, note_n, "%.0f deg off nadir, %.0f %s%s\n%s%s",
+    snprintf(note, note_n, "%.0f deg off nadir, %.0f %s%s\n%s  (%s)%s",
              f.off_nadir_deg, fabs(f.cross_track_deg),
              f.cross_track_deg >= 0.0 ? "left" : "right",
-             age, where,
+             age, where, g->att.from_log ? "ADCS log" : "beacon",
              footprint ? "\nheavy edge: picture top" : "");
 }
 
@@ -1133,9 +1134,9 @@ void globe_draw(globe_t *g, int x, int y, int w, int h, double now_ms,
         }
     }
     // The satellite itself: the model of it when the view is close
-    // enough in, and the ray to what it was looking at when a beacon
-    // says which way it was facing. Inside the scissor with the track,
-    // since the ray can run well off the disc.
+    // enough in, and the ray to what it was looking at when a beacon or
+    // log record says which way it was facing. Inside the scissor with
+    // the track, since the ray can run well off the disc.
     char att_note[176] = "";
     if (have_now) {
         globe_proj_t pr = { .R = R, .ox = g->ox, .oy = g->oy,

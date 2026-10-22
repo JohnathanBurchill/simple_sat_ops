@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`59d5880` (2026-10-16). This is a working draft.
+`45112f3` (2026-10-21). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2499,25 +2499,44 @@ the globe falls back to **where the satellite was when the picture was first
 downloaded** - a different place on a different pass. The panel's heading says
 which it is showing: `Ground track at capture` or `Ground track at downlink`.
 
-**Which way it was looking.** When an extended beacon near the moment carries an
-attitude, the globe also draws **where the camera was pointed**: a pale green
-ray from the satellite down to the point on the Earth the nadir face was aimed
-at, a cross on that point, and two short spokes at the dot for the body's X and
-Y axes, which say how the satellite was rolled about that look. The caption
-under the disc reads it out - *"looking 34 deg off nadir, 22 deg left, at 51.2 N
-112.8 W"* - and says `past the limb, off the Earth` instead, with the ray
-dashed, when the face was aimed above the horizon. The nadir face is the one the
+**Which way it was looking.** When an attitude is on record near the moment -
+from an extended beacon, or from the ADCS's own SD-card log - the globe also
+draws **where the camera was pointed**: a pale green ray from the satellite down
+to the point on the Earth the nadir face was aimed at, a cross on that point,
+and two short spokes at the dot for the body's X and Y axes, which say how the
+satellite was rolled about that look. The caption under the disc reads it out
+on two lines - *"34 deg off nadir, 22 left"* and *"looking at 51.2 N 112.8 W
+(beacon)"* - and says `looking past the limb` instead, with the ray dashed, when
+the face was aimed above the horizon. The word in brackets says where the
+attitude came from: `beacon` or `ADCS log`. The nadir face is the one the
 ADCS's nadir sensor is on, which is the boom camera itself, so at a level
 attitude the ray goes straight down and the picture is of the ground below.
 
 No ray is drawn when there is no attitude to draw, which is the common case: it
-needs an extended beacon within two minutes of the moment **and** the ADCS to
-have been in an estimation mode that computes an attitude. The satellite turns
-at a few tenths of a degree a second in those modes, so a beacon a minute away
-is still worth using - the caption adds `(beacon +45s)` whenever it was more
-than half a minute off, so you can judge it. The frames the geometry works in,
-and the one assumption in it we have not confirmed against flight data, are
-spelled out at the top of `src/orbit/attitude.h`.
+needs an extended beacon or a log record within two minutes of the moment
+**and** the ADCS to have been in an estimation mode that computes an attitude.
+A beacon is only heard while the satellite is over a ground station; a log
+covers whatever stretch the team asked the ADCS to log, and only once its file
+has been downloaded. The satellite turns at a few tenths of a degree a second in
+those modes, so an attitude a minute away is still worth using - the first line
+adds the offset, `+45s`, whenever it was more than half a minute off, so you can
+judge it. The frames the geometry works in, and the one assumption in it we have
+not confirmed against flight data, are spelled out at the top of
+`src/orbit/attitude.h`.
+
+**Where the log attitudes come from.** The viewers read every ADCS SD-card log
+(`ADCS/log_XXXX.TLM`) in the packet database that records the estimated-angles
+frame. A downloaded chunk does not say which file it belongs to, so a log is put
+back together by its content. Its first chunk holds the log's mask and its first
+record's time, the records are exactly periodic, and a chunk belongs to the log
+when every record time inside it falls on the log's schedule. Only chunks whose
+packet CRC checked out are used, so a log whose first chunk never came down
+cannot be read, and the record that finishes in a file's short last chunk is
+lost. When the log also records the ADCS state frame, a record counts only if
+the estimator was in a mode that computes the angles, as for a beacon; without
+it, a record whose three angles all read exactly zero is taken as not
+estimated. A log record's time is the ADCS's own clock, which the team sets from
+the OBC's.
 
 **What the picture covered.** With an attitude on hand, **`p` outlines the
 picture on the globe**: the camera's 49 x 38 degree field of view (measured
@@ -2975,14 +2994,26 @@ track round the far side of the globe are drawn faintly rather than dropped, so
 a pass that goes over the horizon still reads as one arc. Under the disc is the
 sub-satellite latitude, longitude and altitude for the image being shown.
 
-**Which way it was facing.** When an extended beacon within two minutes of the
-moment under the playback head carries an attitude, the globe also draws it: a
-pale green ray from the satellite to the point on the Earth the nadir face was
-aimed at, a cross on that point, and short spokes for the body's X and Y axes.
-The caption under the disc reads *"looking 12 deg off nadir, 4 deg right, at
-50.9 N 114.3 W"*, or says the look went past the limb. Because the head moves
-through the recording, the ray moves with it - which is how you see whether the
-satellite held its attitude across the sweep or was still turning.
+**Which way it was facing.** When an extended beacon or an ADCS SD-card log
+record within two minutes of the moment under the playback head carries an
+attitude, the globe also draws it: a pale green ray from the satellite to the
+point on the Earth the nadir face was aimed at, a cross on that point, and short
+spokes for the body's X and Y axes. The caption under the disc reads *"12 deg
+off nadir, 4 right"* and *"looking at 50.9 N 114.3 W (ADCS log)"*, or says the
+look went past the limb; the word in brackets names the source. Because the head
+moves through the recording, the ray moves with it - which is how you see
+whether the satellite held its attitude across the sweep or was still turning.
+
+The MPI is run out of sight of the ground stations, so a beacon almost never
+falls within two minutes of a recording, and **an SD-card log spanning the
+recording is the only way to get its attitude**. Of the recordings to date only
+the 2026-10-05 10:23 run has one: the team's 08:01-10:30 UTC log, every 10 s,
+covers all of it. For future runs, have the agenda start a log a minute before
+the run and stop it a minute after, then download it; a mask with the estimated
+angles, estimated rates, ADCS state, measured field and model field
+(`00 02 00 58 08 00 00 00 00 00`) at one record a second is about 6.5 KB for a
+3-minute window. How the viewer reads the logs is described under
+[`frontiersat_camera_viewer`](#frontiersat_camera_viewer).
 
 Zoomed past about 3x the dot becomes a model of FrontierSat, turned the way the
 satellite was turned; for an MPI recording the face to watch is the **ram face**,

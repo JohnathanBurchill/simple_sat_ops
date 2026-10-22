@@ -153,11 +153,12 @@ Vector2 globe_project_world(const globe_proj_t *pr, const double p[3],
 // traced a ray at a time, the same as the look direction is.
 #define GLOBE_FOV_SAMPLES  16
 
-// The satellite's attitude at the moment on screen, as the extended
-// beacons report it. The caller looks up the beacon nearest the moment
-// and fills this in; a zeroed one means there is nothing to draw, which
-// is the usual case (the ADCS only estimates an attitude in four of its
-// eight modes, and only the extended-beacon blob downlinks it at all).
+// The satellite's attitude at the moment on screen, as an extended beacon
+// or the ADCS's own SD-card log reports it. The caller looks up the
+// attitude nearest the moment and fills this in; a zeroed one means there
+// is nothing to draw, which is the usual case (the ADCS only estimates an
+// attitude in four of its eight modes, the beacons are only heard over a
+// ground station, and a log only covers what the team chose to log).
 typedef struct {
     int    have;
 
@@ -165,12 +166,16 @@ typedef struct {
     // respect to the orbit frame.
     double roll_deg, pitch_deg, yaw_deg;
 
-    // How far the beacon that carried them sat from the moment being
-    // drawn, in seconds, and which way. The satellite turns at a
-    // fraction of a degree a second, so a beacon a minute away still
-    // says roughly where it was looking -- but the reader should be
-    // told, so the panel prints it.
+    // How far the beacon or log record that carried them sat from the
+    // moment being drawn, in seconds, and which way. The satellite turns
+    // at a fraction of a degree a second, so one a minute away still says
+    // roughly where it was looking -- but the reader should be told, so
+    // the panel prints it.
     double age_s;
+
+    // 1 if they came from the SD-card log, 0 from a beacon. The caption
+    // names which.
+    int    from_log;
 } globe_attitude_t;
 
 typedef struct {
@@ -228,9 +233,9 @@ typedef struct {
     // so the first track built does not frame itself over it.
     int     keep_view;
 
-    // Where the satellite was looking, when a beacon says so. Drawn
-    // over the track as a ray down to the ground and a small set of
-    // body axes at the dot.
+    // Where the satellite was looking, when a beacon or the ADCS's
+    // SD-card log says so. Drawn over the track as a ray down to the
+    // ground and a small set of body axes at the dot.
     globe_attitude_t att;
 
     // The camera on the nadir face, for outlining what its picture
@@ -240,7 +245,7 @@ typedef struct {
     double fov_across_deg, fov_down_deg;
 
     // The caller's toggle for that outline. It is drawn only with an
-    // attitude from a beacon: a footprint projected from an assumed
+    // attitude on record: a footprint projected from an assumed
     // attitude would be a confident box in the wrong place.
     int    show_fov;
 } globe_t;
@@ -278,8 +283,8 @@ int globe_subpoint(const globe_t *g, double unix_ms,
 // Tell the panel which way the satellite was facing, so it can draw
 // what the nadir face was looking at. Pass NULL, or a globe_attitude_t
 // with have == 0, to draw nothing -- which is what a moment with no
-// extended beacon near it, or one whose ADCS was not estimating an
-// attitude, should do.
+// extended beacon or log record near it, or one whose ADCS was not
+// estimating an attitude, should do.
 void globe_set_attitude(globe_t *g, const globe_attitude_t *att);
 
 // Drag turns the globe, the wheel (or two fingers) zooms it. Call it with the

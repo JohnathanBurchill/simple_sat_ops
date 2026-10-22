@@ -2889,8 +2889,10 @@ int main(int argc, char **argv)
     if (globe_load_tles(db_path) == 0)
         fprintf(stderr, "mpi_viewer: no FrontierSat TLEs in the DB; "
                         "the globe will show no ground track\n");
-    // The attitudes the extended beacons carry, for drawing which way the
-    // satellite was facing as the recording ran.
+    // The attitudes the extended beacons and the ADCS's SD-card logs carry,
+    // for drawing which way the satellite was facing as the recording ran.
+    // The MPI is run out of sight of the ground stations, so a log that
+    // spans the recording is usually the only record of it.
     beacon_attitude_load(db_path);
 
     // Where the experiment list is scrolled to, in pixels. Scrolling is the
@@ -3268,10 +3270,10 @@ int main(int argc, char **argv)
         if (globe_h > 0) {
             double dot_ms = frame_time >= 0 ? frame_time : s->t_start_ms;
             // Which way the satellite was facing at the moment the
-            // playback head is on, from the nearest extended beacon
-            // that carried an attitude. Looked up every frame, since
-            // the head moves through the recording; it is a bisect over
-            // a few thousand moments, so it costs nothing.
+            // playback head is on, from the nearest extended beacon or
+            // log record that carried an attitude. Looked up every frame,
+            // since the head moves through the recording; it is a bisect
+            // over a few tens of thousands of moments, so it costs nothing.
             globe_attitude_t att = {0};
             beacon_attitude_nearest(dot_ms, BEACON_ATTITUDE_MAX_AGE_S, &att);
             globe_set_attitude(&globe, &att);

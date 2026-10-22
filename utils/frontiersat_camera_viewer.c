@@ -56,9 +56,10 @@
     no camera_capture command is on record the capture time is not known, and
     the globe falls back to where the satellite was when the picture was first
     downloaded -- a different place entirely, which the panel's heading says.
-    When an extended beacon near the moment carries an attitude, p outlines
-    on the globe the patch of ground the picture covered: the camera's field
-    of view projected from the satellite along the way it was facing.
+    When an extended beacon or ADCS log record near the moment carries an
+    attitude, p outlines on the globe the patch of ground the picture
+    covered: the camera's field of view projected from the satellite along
+    the way it was facing.
 
     The list runs newest picture first. f tags the picture on show as a
     favourite (a gold star in the list and after the title), and v switches the
@@ -1106,9 +1107,9 @@ int main(int argc, char **argv)
     if (globe_load_tles(db_path) == 0)
         fprintf(stderr, "frontiersat_camera_viewer: no FrontierSat TLEs in the "
                         "DB; the globe will show no ground track\n");
-    // The attitudes the extended beacons carry, for drawing which way
-    // the camera was facing. A mission whose blob has never run has
-    // none, and the globe then shows the ground track on its own.
+    // The attitudes the extended beacons and the ADCS's SD-card logs
+    // carry, for drawing which way the camera was facing. With neither
+    // near the moment, the globe shows the ground track on its own.
     beacon_attitude_load(db_path);
 
 #ifdef __APPLE__
@@ -1378,8 +1379,9 @@ int main(int argc, char **argv)
             globe_set_track(&globe, track_key,
                             dot_ms - CAM_TRACK_HALF_MS, dot_ms + CAM_TRACK_HALF_MS);
             // Which way it was facing when the shutter went, from the
-            // nearest extended beacon that carried an attitude. Most
-            // pictures have none -- the blob has to have been running,
+            // nearest extended beacon or log record that carried an
+            // attitude. Most pictures have none -- the blob has to have
+            // been running, or a log covering the moment been downloaded,
             // and the ADCS has to have been estimating -- and then the
             // globe draws the track without a pointing direction.
             globe_attitude_t att = {0};

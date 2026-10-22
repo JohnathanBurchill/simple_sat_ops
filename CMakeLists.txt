@@ -351,6 +351,15 @@ add_executable(bulk_size_selftest
 target_include_directories(bulk_size_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS bulk_size_selftest)
 
+# ADCS SD-card log self-test: reading a log's header, frame layout and record
+# times, and telling a chunk of a log from a chunk of anything else by its
+# record schedule. Feeds the attitudes the viewers' globe draws.
+add_executable(adcs_sdlog_selftest
+               unit_tests/adcs_sdlog_selftest.c src/proto/adcs_sdlog.c)
+target_include_directories(adcs_sdlog_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(adcs_sdlog_selftest PRIVATE m)
+list(APPEND SSO_TARGETS adcs_sdlog_selftest)
+
 # Boom-camera JPEG decode self-test: sentence parsing, gap/partial recovery,
 # retransmit dedup, out-of-order placement (shared by cam_reconstruct and
 # packet_browser's "save camera JPEG").
@@ -558,7 +567,7 @@ if (RAYLIB_FOUND)
     # into) and the vendored library.
     add_executable(mpi_viewer utils/mpi_viewer.c utils/sat_globe.c
                    utils/sat_model.c
-                   utils/beacon_attitude.c src/proto/bulk_size.c
+                   utils/beacon_attitude.c src/proto/adcs_sdlog.c src/proto/bulk_size.c
                    src/proto/adcs_mag.c src/orbit/prediction.c src/orbit/oem.c
                    src/orbit/attitude.c src/beacon/beacon_cts1.c src/orbit/bestxyz.c)
     target_include_directories(mpi_viewer PRIVATE ${RAYLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
@@ -589,7 +598,7 @@ if (RAYLIB_FOUND)
     # adcs_mag.c for the TLE epochs, and the vendored library.
     set(CAMERA_VIEWER_SRCS utils/frontiersat_camera_viewer.c utils/cam_jpeg.c
                            utils/sat_globe.c utils/sat_model.c
-                           utils/beacon_attitude.c
+                           utils/beacon_attitude.c src/proto/adcs_sdlog.c
                            src/proto/adcs_mag.c
                            src/orbit/prediction.c src/orbit/oem.c
                            src/orbit/attitude.c src/beacon/beacon_cts1.c src/orbit/bestxyz.c)

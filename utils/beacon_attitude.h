@@ -3,25 +3,34 @@
     Simple Satellite Operations  utils/beacon_attitude.h
 
     Which way the satellite was facing at a given moment, out of the
-    extended beacons in the packet database.
+    extended beacons and the ADCS's SD-card logs in the packet database.
 
     The extended-beacon blob downlinks the ADCS's estimated attitude
     angles every half minute or so while it is running, and the ADCS
-    fills those angles in four of its eight estimation modes. So the
-    record is a scatter of moments rather than a continuous history:
-    this loads every one that carries a usable attitude, and answers
-    "what was the nearest one to this moment, and how far away was it".
+    fills those angles in four of its eight estimation modes. But a
+    beacon is only heard while the satellite is over a ground station,
+    and the MPI is run where none can hear it. The SD-card log fills
+    that in: the ADCS records the angles on board at a fixed period
+    (when the team asks for that frame), and the log comes down later as
+    an ADCS/log_XXXX.TLM file, put back together here from its bulk_file
+    packets (see adcs_sdlog.h). Either way the record is a scatter of
+    moments rather than a continuous history: this loads every one that
+    carries a usable attitude, and answers "what was the nearest one to
+    this moment, how far away was it, and which kind was it".
 
     Used by the two raylib viewers to draw the pointing direction over
     the globe -- frontiersat_camera_viewer for the moment a picture was
     taken, mpi_viewer for wherever the playback head is in a recording.
 
-    Timekeeping: the moments are ground reception times
+    Timekeeping: a beacon's moment is its ground reception time
     (packet.ts_received), not the satellite's own clock. The beacon
     carries that clock too, but it runs off the EPS real-time clock and
     drifts -- tens of seconds at a time have been seen -- whereas the
-    ground clock is good to well under a second and is what everything
-    else in these viewers is keyed on.
+    ground clock is good to well under a second. A log record's moment
+    is the ADCS's own clock, because nothing on the ground saw it. The
+    team sets that clock from the OBC's (adcs_synchronize_unix_time, most
+    days since 2026-10-17), and the OBC's is what the MPI's and the
+    camera's times are kept on anyway.
 
     Copyright (C) 2026  Johnathan K Burchill
 
@@ -52,10 +61,10 @@
 // caption says how old the beacon was whenever it is not close.
 #define BEACON_ATTITUDE_MAX_AGE_S 120.0
 
-// Read every extended beacon with a usable attitude out of the packet
-// database, ordered in time. Returns how many were found, or -1 if the
-// database could not be read. Calling it again reloads, which is what
-// a viewer's reload key should do.
+// Read every extended beacon and SD-card log record with a usable
+// attitude out of the packet database, ordered in time. Returns how many
+// were found, or -1 if the database could not be read. Calling it again
+// reloads, which is what a viewer's reload key should do.
 int beacon_attitude_load(const char *db_path);
 
 // The attitude nearest unix_ms, if one lies within max_age_s of it.
