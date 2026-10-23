@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`119a141` (2026-10-22). This is a working draft.
+`11071cf` (2026-10-22). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2460,7 +2460,12 @@ the body turned to mush - which the older "does it start with START_CAM"
 check would have accepted.
 
 Those packets are then split into download sessions by reception time, and
-sessions of the same picture are merged. Two sessions are the same picture when
+sessions of the same picture are merged. A session is also cut where the
+picture's sentence count, which every sentence declares, changes: two
+pictures downloaded back to back arrive with no gap between them, and before
+2026-10-22 the second picture's session swallowed the first one's packets.
+A single damaged packet's wrong count does not cut a session; the next packet
+has to agree with it. Two sessions are the same picture when
 the image-data bytes they both carry agree: different pictures disagree on
 about four bytes in five, the same picture on at most one in five, its only
 disagreements coming from packets Reed-Solomon could not correct. The

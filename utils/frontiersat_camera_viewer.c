@@ -24,7 +24,10 @@
     "START_CAM:" header survived but whose body is mush.
 
     Grouping (captures, not downloads): the camera packets are first split into
-    download sessions by reception time, then sessions of the SAME picture are
+    download sessions by reception time, and again wherever the sentence count
+    the packets declare changes -- one picture's download straight after
+    another's, as on 2026-10-22 at 23:22, when the 15:07 picture's packets were
+    filed under the 15:44 picture's. Then sessions of the SAME picture are
     merged. Two sessions are the same picture when the bytes they both carry
     agree -- different pictures disagree on about four bytes in five, the same
     picture on at most one in five (its only disagreements come from packets
@@ -164,7 +167,9 @@ extern void  sso_install_pinch_monitor(void);
 // The firmware paces a download at about four packets a second, so a five
 // minute hole means the download stopped and (usually) a later pass restarted
 // it; sessions are merged back into pictures below anyway, so splitting too
-// eagerly here costs nothing.
+// eagerly here costs nothing. A run is also cut where the declared sentence
+// count changes (confirmed_total), since a gap alone does not separate two
+// pictures downloaded back to back.
 #define SESSION_GAP_MS  (5.0 * 60.0 * 1000.0)
 
 // Same-picture test. Two sessions are compared over the bytes they both
@@ -217,6 +222,7 @@ typedef struct {
     int      rs;
     long     dlen;
     uint8_t *data;
+    long     total;             // sentence count its sentences declare, -1 if unreadable
 } chunk_t;
 
 // One download session: the camera packets received in one uninterrupted run,
@@ -329,6 +335,41 @@ static int chunk_is_camera(long off, const uint8_t *d, long n)
            && (double) plausible / (double) n >= CAM_MIN_HEX_FRACTION;
 }
 
+// The picture's sentence count, as declared by the sentences that start in a
+// camera packet: the TTTT after each on-grid '@'. Every sentence of a picture
+// carries the same count, so it tells two pictures apart (unless they happen
+// to be the same length). A packet that failed its checksum can carry a
+// wrong count, so the packet's sentences vote; with no clear winner, or no
+// count readable at all, the result is -1.
+static long chunk_declared_total(long off, const uint8_t *d, long n)
+{
+    long vals[4];
+    int nv = 0;
+    for (long j = 0; j + 9 <= n && nv < 4; j++) {
+        if (d[j] != '@') continue;
+        long phase = ((off + j - CAM_HEADER_LEN) % CAM_SENTENCE_LEN + CAM_SENTENCE_LEN)
+                     % CAM_SENTENCE_LEN;
+        if (phase != 0) continue;
+        long v = 0;
+        int ok = 1;
+        for (int k = 5; k < 9 && ok; k++) {
+            int c = d[j + k];
+            if (!is_hex_digit(c)) ok = 0;
+            else v = v * 16 + (c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10);
+        }
+        if (ok) vals[nv++] = v;
+    }
+    long best = -1;
+    int best_n = 0, tied = 0;
+    for (int a = 0; a < nv; a++) {
+        int c = 0;
+        for (int b = 0; b < nv; b++) if (vals[b] == vals[a]) c++;
+        if (c > best_n) { best_n = c; best = vals[a]; tied = 0; }
+        else if (c == best_n && vals[a] != best) tied = 1;
+    }
+    return tied ? -1 : best;
+}
+
 // ---- DB load / reassembly --------------------------------------------------
 
 // Load every bulk_file packet that looks like camera data, oldest first.
@@ -369,6 +410,7 @@ static int load_camera_chunks(sqlite3 *db, chunk_t **out, int *out_n)
         c->off   = off;
         c->rs    = sqlite3_column_int(st, 2);
         c->dlen  = dlen;
+        c->total = chunk_declared_total(off, pl + BULK_FILE_HEADER_SIZE, dlen);
         c->data  = (uint8_t *) malloc((size_t) dlen);
         if (c->data == NULL) { fprintf(stderr, "out of memory\n"); goto fail; }
         memcpy(c->data, pl + BULK_FILE_HEADER_SIZE, (size_t) dlen);
@@ -565,6 +607,17 @@ static int by_newest_first(const void *a, const void *b)
     return (ta < tb) - (ta > tb);
 }
 
+// Packet k's declared sentence count, when the next packet in the same run
+// that declares one agrees with it; otherwise -1. One damaged packet's wrong
+// count is never confirmed, so it cannot split a session on its own.
+static long confirmed_total(const chunk_t *cs, int n, int k)
+{
+    if (cs[k].total < 0) return -1;
+    for (int m = k + 1; m < n && cs[m].ts_ms - cs[m - 1].ts_ms <= SESSION_GAP_MS; m++)
+        if (cs[m].total >= 0) return cs[m].total == cs[k].total ? cs[k].total : -1;
+    return -1;
+}
+
 // Split the camera packets into download sessions, merge the sessions that
 // downloaded the same picture, and build one capture per picture. Returns the
 // capture count and fills *out (caller frees via free_captures).
@@ -574,12 +627,20 @@ static int build_captures(const chunk_t *cs, int n, const camcmd_t *cmds, int nc
     *out = NULL;
     if (n == 0) return 0;
 
-    // Sessions: runs of packets no more than SESSION_GAP_MS apart.
+    // Sessions: runs of packets no more than SESSION_GAP_MS apart, cut again
+    // where the picture's declared sentence count changes -- one picture's
+    // download following straight on from another's.
     session_t *ss = NULL;
     int ns = 0;
     for (int i = 0; i < n; ) {
         int j = i;
-        while (j + 1 < n && cs[j + 1].ts_ms - cs[j].ts_ms <= SESSION_GAP_MS) j++;
+        long picture = confirmed_total(cs, n, i);
+        while (j + 1 < n && cs[j + 1].ts_ms - cs[j].ts_ms <= SESSION_GAP_MS) {
+            long t = confirmed_total(cs, n, j + 1);
+            if (t >= 0 && picture >= 0 && t != picture) break;
+            if (picture < 0) picture = t;
+            j++;
+        }
         session_t *t = (session_t *) realloc(ss, (size_t) (ns + 1) * sizeof *ss);
         if (t == NULL) { free_sessions(ss, ns); return 0; }
         ss = t;
