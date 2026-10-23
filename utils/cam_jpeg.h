@@ -52,6 +52,8 @@ typedef struct {
     long image_bytes;        // n_sentences * 28 (size of the returned buffer)
     long recovered_bytes;    // image bytes actually filled from sentences
     int  saw_end_sentinel;   // the 0xFACE end-marker sentence was seen
+    long header_supplied;    // header bytes taken from the standard header, 0 if
+                             // the picture's own arrived whole and clean
 } cam_jpeg_stats_t;
 
 // True if `buf` looks like a boom-camera file (starts with "START_CAM:").
@@ -62,6 +64,13 @@ int cam_jpeg_is_camera_file(const uint8_t *buf, long len);
 // other non-hex byte, and are simply skipped (a sentence partly eaten by a gap
 // still contributes its intact leading bytes). Still-missing image bytes are
 // set to `fill` so the JPEG stays byte-aligned for a tolerant decoder.
+//
+// Every boom-camera picture opens with the same 589-byte JPEG header (tables,
+// frame and scan headers). When a picture's own header is incomplete or
+// damaged but what did arrive agrees with that standard header, the standard
+// header replaces it, so a picture whose first sentences were lost still
+// decodes; stats->header_supplied counts the bytes it put in. Those bytes are
+// not counted in recovered_bytes or sentences_present.
 //
 // Returns a malloc'd buffer of the reconstructed image (caller frees), with its
 // length in *out_len, and fills *stats when non-NULL. Returns NULL on error (no

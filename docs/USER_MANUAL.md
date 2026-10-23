@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`eb81a77` (2026-10-22). This is a working draft.
+`119a141` (2026-10-22). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2407,6 +2407,17 @@ snapped out to whole 195-byte download chunks and printed as a ready-to-send
 path written into those commands. Missing packets are not an error - the
 tool always writes the best image it has and exits success.
 
+**A lost JPEG header is put back.** The first 21 sentences of a camera file
+hold the JPEG header - the quantization and Huffman tables and the frame and
+scan headers - and without it no decoder will open the picture. Every picture
+the camera has sent has had the same 589-byte header (all 19 downloaded with
+it whole, June 1 to October 22, in all three camera modes), so when a file's
+own header is incomplete or damaged but what did arrive agrees with that
+standard header, the decoder puts the standard one in. The run says so on a
+`jpeg header :` line, and the recovered-byte counts still cover only what
+actually came down. A header that mostly disagrees with the standard one is
+left as it arrived.
+
 Once those chunks come back down they land as new `bulk_file` packets in the
 packet database. **`--patch=<id,id,...>` together with `--db=<packet_db.sqlite>`
 folds them in**: each named `bulk_file` packet's data is laid over the
@@ -2472,6 +2483,14 @@ The panel under the picture reports bytes and sentences recovered, whether the
 end marker arrived, the decoded JPEG size and dimensions, and the passes the
 download took. A picture too badly holed to decode says so rather than showing
 a broken image; `s` still saves the partial file for another decoder to try.
+
+A picture whose first sentences never came down still shows: the decoder puts
+in the standard JPEG header every camera picture shares (see `cam_reconstruct`
+above), and the `jpeg` line ends `standard header` when it did. The
+2026-10-22 15:44 picture over Singapore was the first to need it - no clean
+copy of its first 1365 file bytes came down on either download pass. The header only
+covers the tables; when image data right after it is lost too, as in the Oct
+16 picture, the picture opens but is scrambled from the gap onward.
 
 The picture zooms and moves under the mouse: scroll the wheel or pinch the
 trackpad over it to zoom about the pointer, and drag it to move it around.

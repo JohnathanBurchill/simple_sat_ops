@@ -1840,8 +1840,9 @@ static int recon_save_cam_jpeg(const char *path)
     double pct = st.image_bytes ? 100.0 * (double) st.recovered_bytes
                                        / (double) st.image_bytes : 0.0;
     snprintf(recon_status, sizeof recon_status,
-             "saved JPEG %ld bytes to %s  (%ld/%ld sentences, %.0f%% recovered)",
-             jlen, path, st.sentences_present, st.n_sentences, pct);
+             "saved JPEG %ld bytes to %s  (%ld/%ld sentences, %.0f%% recovered%s)",
+             jlen, path, st.sentences_present, st.n_sentences, pct,
+             st.header_supplied ? ", standard header" : "");
     return 0;
 }
 

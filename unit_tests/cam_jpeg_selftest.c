@@ -19,6 +19,12 @@
       - a sentence that arrives AFTER the 0xFACE end-marker (out of order, and
         the sentinel must not stop the scan or be placed as image data).
 
+    The standard JPEG header the decoder supplies when a picture's own is lost
+    or damaged is checked against a real picture's header (the first 22
+    sentences of the 2026-06-01 picture, below): restored byte for byte when
+    sentences 0-20 are lost, a wrong byte corrected, never counted as received,
+    and a header mostly unlike it left as it came.
+
     It also covers cam_jpeg_equalize_rgb8, the viewer's histogram
     equalization, against values worked by hand from the textbook mapping:
     the darkest-level offset, rounding, brightness-only shifting that keeps a
@@ -50,6 +56,38 @@
 #include <stdlib.h>
 
 #define DB CAM_JPEG_SENTENCE_DATA_BYTES   // 28
+
+// The first 22 sentences of camera/2026-06-01_capture.img, the boom camera's
+// first picture, as downloaded: the JPEG header fills sentences
+// 0 to 20 and the first byte of sentence 21, where the image data begins. A
+// different picture from the one cam_jpeg.c copied its standard header from,
+// so the header tests below also check that the two pictures' headers agree.
+static const char real_head[] =
+    "START_CAM:\n"
+    "@00000174FFD8FFDB0084000D09090B0A080D0B0A0B0E0E0D0F13201513121213\r\n"
+    "@00010174271C1E17202E2931302E292D2C333A4A3E333646372C2D405741464C\r\n"
+    "@000201744E525352323E5A615A50604A51524F010E0E0E131113261515264F35\r\n"
+    "@000301742D354F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F\r\n"
+    "@000401744F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4F4FFFC401A2\r\n"
+    "@000501740000010501010101010100000000000000000102030405060708090A\r\n"
+    "@000601740B100002010303020403050504040000017D01020300041105122131\r\n"
+    "@00070174410613516107227114328191A1082342B1C11552D1F0243362728209\r\n"
+    "@000801740A161718191A25262728292A3435363738393A434445464748494A53\r\n"
+    "@000901745455565758595A636465666768696A737475767778797A8384858687\r\n"
+    "@000A017488898A92939495969798999AA2A3A4A5A6A7A8A9AAB2B3B4B5B6B7B8\r\n"
+    "@000B0174B9BAC2C3C4C5C6C7C8C9CAD2D3D4D5D6D7D8D9DAE1E2E3E4E5E6E7E8\r\n"
+    "@000C0174E9EAF1F2F3F4F5F6F7F8F9FA01000301010101010101010100000000\r\n"
+    "@000D017400000102030405060708090A0B110002010204040304070504040001\r\n"
+    "@000E01740277000102031104052131061241510761711322328108144291A1B1\r\n"
+    "@000F0174C109233352F0156272D10A162434E125F11718191A262728292A3536\r\n"
+    "@001001743738393A434445464748494A535455565758595A636465666768696A\r\n"
+    "@00110174737475767778797A82838485868788898A92939495969798999AA2A3\r\n"
+    "@00120174A4A5A6A7A8A9AAB2B3B4B5B6B7B8B9BAC2C3C4C5C6C7C8C9CAD2D3D4\r\n"
+    "@00130174D5D6D7D8D9DAE2E3E4E5E6E7E8E9EAF2F3F4F5F6F7F8F9FAFFC00011\r\n"
+    "@001401740801E0028003012200021101031101FFDA000C03010002110311003F\r\n"
+    "@0015017400E7DC5446A66435091CD7421094D634A4D464D520109A61A76690D3\r\n";
+#define REAL_HEAD_HEADER_BYTES 589
+#define REAL_SENTENCE_AT(k) (11 + 67 * (k))
 
 // Append a sentence header "@IIIITTTT" then `nbytes` of value `val` as hex.
 // If `gap` is non-zero, the hex stops short with a run of '?' (a lost tail)
@@ -159,6 +197,74 @@ int main(void)
            "empty input returns NULL");
     tap_ok(cam_jpeg_decode((const uint8_t *) "no sentences here", 17, 0, NULL, NULL) == NULL,
            "input with no '@' sentences returns NULL");
+
+    // --- the standard header ------------------------------------------
+    // The reference is the 2026-06-01 picture's own header, decoded from the
+    // sentences it arrived in. It must open with the JPEG start-of-image
+    // marker and carry the start-of-scan marker at byte 575, or the fixture
+    // is not the header it claims to be.
+    {
+        long rlen = (long) strlen(real_head);
+        cam_jpeg_stats_t rst;
+        long rjlen = 0;
+        uint8_t *ref = cam_jpeg_decode((const uint8_t *) real_head, rlen, 0x00, &rst, &rjlen);
+        tap_ok(ref != NULL && rjlen > REAL_HEAD_HEADER_BYTES
+               && ref[0] == 0xFF && ref[1] == 0xD8 && ref[575] == 0xFF && ref[576] == 0xDA,
+               "real header decodes: start-of-image at 0, start-of-scan at 575");
+        tap_okf(rst.header_supplied == 0,
+                "a header that arrived whole is left alone (supplied %ld)", rst.header_supplied);
+
+        char f[sizeof real_head];
+
+        // Sentences 0 to 20 lost: the header comes back byte for byte, and
+        // the counts still say only sentence 21 arrived.
+        memcpy(f, real_head, sizeof real_head);
+        memset(f + REAL_SENTENCE_AT(0), '?', (size_t) (REAL_SENTENCE_AT(21) - REAL_SENTENCE_AT(0)));
+        cam_jpeg_stats_t st1;
+        long l1 = 0;
+        uint8_t *o1 = cam_jpeg_decode((const uint8_t *) f, rlen, 0x00, &st1, &l1);
+        tap_ok(o1 != NULL && ref != NULL && memcmp(o1, ref, REAL_HEAD_HEADER_BYTES) == 0,
+               "header lost with sentences 0-20 is restored byte for byte");
+        tap_okf(st1.header_supplied == REAL_HEAD_HEADER_BYTES - 1,
+                "588 header bytes supplied, byte 588 arrived in sentence 21 (got %ld)",
+                st1.header_supplied);
+        tap_okf(st1.recovered_bytes == DB && st1.sentences_present == 1,
+                "supplied bytes are not counted as received (got %ld bytes, %ld sentences)",
+                st1.recovered_bytes, st1.sentences_present);
+        free(o1);
+
+        // Only sentence 1 arrived, with one hex digit wrong, as a packet
+        // that failed its checksum can leave it: the wrong byte is replaced
+        // along with the missing ones.
+        memcpy(f, real_head, sizeof real_head);
+        memset(f + REAL_SENTENCE_AT(0), '?', (size_t) (REAL_SENTENCE_AT(1) - REAL_SENTENCE_AT(0)));
+        memset(f + REAL_SENTENCE_AT(2), '?', (size_t) (REAL_SENTENCE_AT(21) - REAL_SENTENCE_AT(2)));
+        char *digit = f + REAL_SENTENCE_AT(1) + 9;
+        *digit = (*digit == '0') ? '1' : '0';
+        cam_jpeg_stats_t st2;
+        uint8_t *o2 = cam_jpeg_decode((const uint8_t *) f, rlen, 0x00, &st2, NULL);
+        tap_ok(o2 != NULL && ref != NULL && memcmp(o2, ref, REAL_HEAD_HEADER_BYTES) == 0,
+               "a damaged byte in a partial header is corrected too");
+        tap_okf(st2.header_supplied == 561,
+                "561 bytes supplied: 560 missing plus 1 wrong (got %ld)", st2.header_supplied);
+        free(o2);
+
+        // Sentences 0 to 9 all 0x11 and the rest intact: 280 of the 589
+        // header bytes disagree, so this is not the standard header and it
+        // must come through as it arrived.
+        memcpy(f, real_head, sizeof real_head);
+        for (int k = 0; k < 10; k++)
+            memset(f + REAL_SENTENCE_AT(k) + 9, '1', 2 * DB);
+        cam_jpeg_stats_t st3;
+        uint8_t *o3 = cam_jpeg_decode((const uint8_t *) f, rlen, 0x00, &st3, NULL);
+        int kept = o3 != NULL;
+        for (int b = 0; kept && b < 10 * DB; b++) if (o3[b] != 0x11) kept = 0;
+        tap_okf(kept && st3.header_supplied == 0,
+                "a header mostly unlike the standard one is not replaced (supplied %ld)",
+                st3.header_supplied);
+        free(o3);
+        free(ref);
+    }
 
     // --- histogram equalization ---------------------------------------
     // Expected values are worked by hand from the textbook mapping,

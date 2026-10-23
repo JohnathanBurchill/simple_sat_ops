@@ -36,6 +36,12 @@
     Merging matters: on the current store it takes seven of the nine pictures
     to every byte recovered, where the best single pass had left holes.
 
+    A picture whose first sentences never arrived has no JPEG header, but
+    every picture so far has had the same one, so the decoder (cam_jpeg.c)
+    puts that standard header in and the picture still shows. The info line
+    under the picture then reads "standard header". The 2026-10-22 15:44
+    picture was the first that needed it.
+
     The command log (the sent_tcmd table) also names the file on the satellite
     and, through the camera_capture command that made it, when the picture was
     taken -- which the file itself does not record. Both are best-effort: a
@@ -1499,9 +1505,10 @@ int main(int argc, char **argv)
                                                                  c->st.partial_sentences) : "",
                              c->st.saw_end_sentinel ? ", end marker" : ""),
                   rx, iy + 20, 15, LIGHTGRAY);
-        draw_text(TextFormat("jpeg         : %ld bytes%s", c->jpg_len,
+        draw_text(TextFormat("jpeg         : %ld bytes%s%s", c->jpg_len,
                              c->tex_ok ? TextFormat("  %d x %d", c->img_w, c->img_h)
-                                       : "  (does not decode)"),
+                                       : "  (does not decode)",
+                             c->st.header_supplied ? ", standard header" : ""),
                   rx, iy + 40, 15, LIGHTGRAY);
 
         draw_text(TextFormat("packets      : %d", c->chunks), col2, iy, 15, LIGHTGRAY);
