@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`45112f3` (2026-10-21). This is a working draft.
+`eb81a77` (2026-10-22). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -3105,7 +3105,7 @@ not carry keeps its built-in default, so a file written by another build is
 still worth reading.
 
 Keys: `Up`/`Down` change experiment, `Left`/`Right` scrub images (or click or
-drag the whereogram to scrub, which also rules off the time it spans), `Space` plays/pauses, `,`/`.`
+drag the whereogram to scrub, which also rules off the time it spans, and scroll over it to zoom), `Space` plays/pauses, `,`/`.`
 set the playback speed, `f` cycles frames-per-image (auto/8/16), `s` zoom, `a` cycles the colour scale (auto-image / auto-experiment
 / manual), `r` resets it to auto-image, `z`/`x` and `c`/`v` move the manual DN
 window (hold `Shift` for coarse steps), `m` cycles the colour map, `b` toggles
@@ -3150,7 +3150,18 @@ darkest end would read as a real, low measurement - and a **red rule above the
 panel** marks them. The rule also marks a column whose frame came down but was
 dropped for failing its own CRC, which is blank for the same reason. Several
 frames share a column once a recording is longer
-than the panel is wide, and they are averaged.
+than the panel is wide, and they are averaged - so on a whole recording the
+whereogram cannot look like the image under its head: at a 780-pixel panel the
+2026-10-20 recordings put 2.3 frames in each pixel, 2026-07-21 4.7 and
+2026-08-09 12, which blends the image's sixteen bias voltages two to twelve at a
+time and folds frames of the images either side into its end columns.
+**Scrolling over the whereogram zooms it** in and out about the playback head,
+as far as three sweeps - the image on screen and one either side of it - and
+while zoomed the stretch on show stays centred on the head as you play or step.
+From one pixel a frame the stretch under the head is the image itself, colour
+for colour. The panel's top right says how many frames go into each pixel, or
+how many pixels each frame gets. Choosing another experiment goes back out to
+the whole recording.
 
 The line beneath gives the received percentage, how much is still missing, and
 where the file's length came from - the satellite's own byte count for that file,
@@ -3161,14 +3172,16 @@ a guess; see `mpi_reconstruct` above for how the length is established.
 A **small white bracket** just under the whereogram - an upright at each end of
 the image's bytes and a rule joining them, open at the top - marks the stretch
 of recording the image on screen was built from, so you can see where in the
-recording you are as you scrub or play. The two uprights point up at the first
-and last frames, placed to the pixel rather than rounded out to whole columns,
-and sitting below the panel the bracket hides no columns at all - unlike the box
-this once was, drawn around the same span, which at that width was nearly all
-outline and covered the little it enclosed. The bracket is as wide as the image
-really is and no wider - a pixel or three on a long recording - and is only
-opened out when the span comes to less than the two uprights need to stand apart
-at all.
+recording you are as you scrub or play. The two uprights stand under the first
+and last columns the image's frames were drawn into, placed by the same mapping
+that drew them, so the bracket holds the image's columns exactly. (Until
+2026-10-22 the two used different roundings, and the left upright sat a pixel
+early on up to a third of the images.) Sitting below the panel, the bracket
+hides no columns at all - unlike the box this once was, drawn around the same
+span, which at that width was nearly all outline and covered the little it
+enclosed. The bracket is as wide as the image really is and no wider - a pixel
+or three on a long recording - and is only opened out when the span comes to
+less than the two uprights need to stand apart at all.
 **Clicking jumps to the image at that moment**, and **dragging scrubs** - the
 picture follows the pointer for as long as the button is held, so you can run
 through an experiment by hand and stop where something looks interesting. Either
@@ -3181,16 +3194,19 @@ that data - but nothing vouches for them.
 
 **`m` cycles the colour map** - grey, ion (the blue-to-orange these spectra are
 usually shown in), viridis, inferno - and applies to both the image and the
-whereogram. (`c` was already taken by the manual DN maximum.) The colour scale
-control is the same `a` as the image's, but auto means something different for
-each: the image scales to the image, while the whereogram scales over the whole
-whereogram, since scaling a picture of the entire recording to one image of it
-would flicker while scrubbing and leave one column not comparable with the next.
-The range used is printed at the panel's right, and it is a 1st-to-95th
-percentile rather than the plain extremes - a handful of corrupt readings reach
-the ends of the 16-bit range, and pixel 64 of every frame carries something
-around 32000 where the other 64 sit near 2010, so the extremes flatten the whole
-picture into a featureless rectangle.
+whereogram. (`c` was already taken by the manual DN maximum.) **The whereogram
+uses the image's colour scale**, whatever `a` has it on - the DN window the aux
+panel prints - so a frame is the same colour in both. In auto-image mode that
+means the whereogram is recoloured with every image; auto-experiment holds it
+steady. Both auto modes take the **1st to 99th percentile** of the pixels
+rather than the plain extremes, which let one pixel set the window for all the
+rest: across the images of the 2026-10-20 19:21 recording the extremes put the
+top anywhere from 2124 to 23421 DN. Auto-experiment counts only the frames that
+are drawn; a frame that fails its own CRC used to count too, and its zeros and
+corrupt words stretched the window to 0 .. 65391 and painted the whole recording
+one colour. (Until 2026-10-22 the whereogram scaled on its own terms, the 1st to
+95th percentile of its averaged columns, so in neither auto mode did its colours
+agree with the image's.)
 
 **Press `d` to write the re-download telecommands** for the selected
 experiment. An experiment is only as complete as the passes that carried it, and

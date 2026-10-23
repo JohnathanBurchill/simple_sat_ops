@@ -168,7 +168,13 @@
     from, hence the name. Five times as wide as it is high. Its horizontal axis
     is the file rather than the frames in hand, so a stretch that never came
     down takes its own width instead of being closed up, and is marked by a red
-    rule above the panel. m cycles the colour map, which the image shares.
+    rule above the panel. m cycles the colour map, which the image shares, and
+    the colour scale is the image's too -- whatever DN window the image on
+    screen is drawn with -- so a frame is the same colour in both. Several
+    frames share a pixel once the recording is longer than the panel is wide,
+    and they are averaged; the wheel over the panel zooms in on the playback
+    head, down to three sweeps, and from one pixel a frame on the stretch under
+    the head is the image itself.
 
     Time ruler: a press on the whereogram jumps to that moment in the recording
     and dragging scrubs, and while the button is down the drag also measures.
@@ -1885,24 +1891,42 @@ static int frame_shown(const view_t *v, const experiment_t *s, int k)
     return v->clean_pix != NULL && v->clean_ok[k];
 }
 
-// Per-experiment DN extent over all present pixels (for auto-session scaling).
+// The DN window both auto scales use, sorting the n values handed in: their
+// 1st to 99th percentile. The plain minimum and maximum let one pixel set the
+// window for every other: across the images of the 2026-10-20 19:21 recording
+// they put the top anywhere from 2124 to 23421 DN, and over the whole of it
+// they ran 0 .. 65391, which paints every frame one colour. The percentiles
+// step past the few extreme pixels to the range the readings occupy -- about
+// 1740 .. 2420 on that recording cleaned, where the bulk sits at 2000.
+static void auto_window(double *val, long n, int *lo, int *hi)
+{
+    double mn = 0, mx = 1;
+    if (n > 0) {
+        qsort(val, (size_t) n, sizeof *val, cmp_double);
+        mn = val[(n - 1) / 100];
+        mx = val[(n - 1) * 99 / 100];
+    }
+    *lo = (int) floor(mn);
+    *hi = (int) ceil(mx);
+    if (*hi <= *lo) *hi = *lo + 1;
+}
+
+// Per-experiment DN window (for auto-experiment scaling), over the frames that
+// are drawn: a frame that fails its own CRC is in neither the image nor the
+// whereogram, so it has no say in their colours. Its missing bytes read as
+// zeros and its corrupt ones as anything, which is where the 0 .. 65391 came
+// from.
 static void compute_session_extent(view_t *v, const experiment_t *s)
 {
-    double mn = 0, mx = 0;
-    int any = 0;
-    for (int k = 0; k < s->nframes; k++) {
-        if (!frame_shown(v, s, k)) continue;
-        for (int j = 0; j < NPIX; j++) {
-            double p = pix_val(v, s, k, j);
-            if (!any || p < mn) mn = p;
-            if (!any || p > mx) mx = p;
-            any = 1;
+    double *val = (double *) malloc((size_t) s->nframes * NPIX * sizeof *val);
+    long n = 0;
+    if (val != NULL)
+        for (int k = 0; k < s->nframes; k++) {
+            if (s->fr_bad[k] || !frame_shown(v, s, k)) continue;
+            for (int j = 0; j < NPIX; j++) val[n++] = pix_val(v, s, k, j);
         }
-    }
-    if (!any) { mn = 0; mx = 1; }
-    v->sess_min = (int) floor(mn);
-    v->sess_max = (int) ceil(mx);
-    if (v->sess_max <= v->sess_min) v->sess_max = v->sess_min + 1;
+    auto_window(val, n, &v->sess_min, &v->sess_max);
+    free(val);
 }
 
 // Move to a cleaning stage and rebuild what it needs. The manual DN window
@@ -2264,7 +2288,39 @@ static Color cmap_color(int map, unsigned char val)
 // the bracket is the image's own span, not a fixed size.
 #define WG_HEAD_H      5
 #define WG_HEAD_MIN_W  2
-//
+
+// Zooming the whereogram with the wheel: how far one notch goes, and how close
+// it goes -- three sweeps, the image on screen and one either side of it, which
+// on any panel worth drawing is well past one pixel a frame.
+#define WG_ZOOM_RATE     0.25
+#define WG_ZOOM_SWEEPS   3
+
+// The panel columns [*c0, *c1) slot q of the file is drawn across, on a panel w
+// columns wide showing the n slots from q0. A slot gets one column when there
+// are more slots than columns and a run of them when there are fewer, and the
+// runs tile the panel. The whereogram is built through this and the playback
+// head placed through it, so the head brackets exactly the columns the image's
+// frames went into. (They once used two different roundings, and the head sat
+// a pixel left of the image's first frame on up to a third of the images.) A
+// slot left of the stretch maps left of the panel, so keep q >= q0.
+static void wg_cols_of_slot(long q, long q0, long n, int w, int *c0, int *c1)
+{
+    q -= q0;
+    *c0 = (int) (q * w / n);
+    *c1 = (int) ((q + 1) * w / n);
+    if (*c1 <= *c0) *c1 = *c0 + 1;
+}
+
+// The other direction, for turning a pointer position back into an image: the
+// file offset of a slot drawn in column col -- the last of them, when several
+// share it.
+static long wg_byte_of_col(long q0, long n, int w, int col)
+{
+    if (col < 0) col = 0;
+    if (col > w - 1) col = w - 1;
+    return (q0 + ((long) (col + 1) * n - 1) / w) * FRAME_STRIDE;
+}
+
 // The whole recording at a glance: every frame a column of its 65 pixels, time
 // running left to right, arrival direction up the vertical axis. It is the
 // spectrum the MPI actually measured, so it doubles as the map of the file --
@@ -2279,128 +2335,78 @@ static Color cmap_color(int map, unsigned char val)
 // rule drawn above the panel. So is a column whose frame came down but was
 // dropped for failing its own CRC, which is blank for the same reason.
 //
-// Several frames share a column once a recording is longer than the panel is
-// wide, and they are averaged. Taking the brightest instead lets the one
-// brightest frame in each column stand for all of them, which at ten frames a
-// column paints a picture of the outliers rather than of the data.
+// Several frames share a column once the stretch on the panel is longer than
+// the panel is wide, and they are averaged. Taking the brightest instead lets
+// the one brightest frame in each column stand for all of them, which at ten
+// frames a column paints a picture of the outliers rather than of the data.
+// Averaged, the whereogram cannot look like the image under its head -- the
+// image's sixteen bias voltages are blended two to twelve at a time, and the
+// columns at its two ends take in frames of the images either side -- which is
+// what the wheel is for: zoomed in to a pixel or more a frame, each frame has
+// columns of its own and the stretch under the head is the image itself.
 //
-// The colour scale works the same way as the image's, but on the whereogram's
-// own terms: auto here means over the whole whereogram, since scaling a picture
-// of the whole recording to one image of it would make it flicker while
-// scrubbing and would leave one column not comparable with the next. Pass
-// lo >= hi to scale automatically; *out_lo / *out_hi report the range used.
+// The panel shows the n slots of the file from slot q0: all of them, or the
+// stretch the wheel has zoomed in on.
+//
+// The colours are the image's: the DN window lo .. hi is the one the image on
+// screen was drawn with, whichever scale picked it, so a frame shows in the
+// same colour in both. Scaling the whereogram on its own terms -- it once took
+// the 1st to 95th percentile of its averaged columns -- left the two never
+// agreeing in either auto mode.
 static void build_whereogram(const view_t *v, const experiment_t *s,
                              int cmap, int lo, int hi,
                              Color *pix, int w, unsigned char *missing,
-                             int *out_lo, int *out_hi)
+                             long q0, long n)
 {
-    long nslot = s->size / FRAME_STRIDE;
-    if (nslot < 1) nslot = 1;
-
-    // Which frame, if any, begins in each frame-sized slice of the file.
-    int *at = (int *) malloc((size_t) nslot * sizeof *at);
-    double *val = (double *) malloc((size_t) w * NPIX * sizeof *val);
-    if (at == NULL || val == NULL) { free(at); free(val); return; }
-    for (long q = 0; q < nslot; q++) at[q] = -1;
+    // Which frame, if any, begins in each frame-sized slice of the stretch.
+    int *at = (int *) malloc((size_t) n * sizeof *at);
+    double *val = (double *) calloc((size_t) w * NPIX, sizeof *val);
+    int *nsum = (int *) calloc((size_t) w, sizeof *nsum);
+    if (at == NULL || val == NULL || nsum == NULL) { free(at); free(val); free(nsum); return; }
+    for (long q = 0; q < n; q++) at[q] = -1;
     for (int k = 0; k < s->nframes; k++) {
-        long q = s->fr_off[k] / FRAME_STRIDE;
-        if (q >= 0 && q < nslot) at[q] = k;
+        long q = s->fr_off[k] / FRAME_STRIDE - q0;
+        if (q >= 0 && q < n) at[q] = k;
     }
+    memset(missing, 0, (size_t) w);
 
-    // First pass: what each column reads, averaged over the frames in it.
-    for (int c = 0; c < w; c++) {
-        long q0 = (long) c * nslot / w;
-        long q1 = (long) (c + 1) * nslot / w;
-        if (q1 <= q0) q1 = q0 + 1;
-        if (q1 > nslot) q1 = nslot;
+    // First pass: add each slice into the columns it is drawn across.
+    for (long q = 0; q < n; q++) {
+        int c0, c1;
+        wg_cols_of_slot(q0 + q, q0, n, w, &c0, &c1);
 
-        double sum[NPIX] = {0};
-        int nsum = 0, gap = 0;
+        int gap = 0;
+        long b0 = (q0 + q) * FRAME_STRIDE, b1 = b0 + FRAME_STRIDE;
+        if (b1 > s->size) b1 = s->size;
+        for (long b = b0; b < b1; b++)
+            if (!s->present[b]) { gap = 1; break; }
 
-        for (long q = q0; q < q1; q++) {
-            long b0 = q * FRAME_STRIDE, b1 = b0 + FRAME_STRIDE;
-            if (b1 > s->size) b1 = s->size;
-            for (long b = b0; b < b1; b++)
-                if (!s->present[b]) { gap = 1; break; }
-
-            // A frame dropped for failing its own CRC is marked the same way
-            // as bytes that never came down: either way nothing here is drawn.
-            int k = at[q];
-            if (k >= 0 && s->fr_bad[k]) gap = 1;
-            if (k < 0 || s->fr_bad[k] || !frame_shown(v, s, k)) continue;
-            for (int j = 0; j < NPIX; j++) sum[j] += pix_val(v, s, k, j);
-            nsum++;
+        // A frame dropped for failing its own CRC is marked the same way as
+        // bytes that never came down: either way nothing here is drawn.
+        int k = at[q];
+        if (k >= 0 && s->fr_bad[k]) gap = 1;
+        int use = k >= 0 && !s->fr_bad[k] && frame_shown(v, s, k);
+        for (int c = c0; c < c1 && c < w; c++) {
+            if (gap) missing[c] = 1;
+            if (!use) continue;
+            for (int j = 0; j < NPIX; j++) val[(long) j * w + c] += pix_val(v, s, k, j);
+            nsum[c]++;
         }
-
-        missing[c] = (unsigned char) gap;
-        for (int j = 0; j < NPIX; j++)
-            val[(long) j * w + c] = nsum > 0 ? sum[j] / nsum : WG_NONE;
     }
     free(at);
 
-    // Auto scaling is over the whole whereogram -- but over what it holds, not
-    // over its two most extreme samples. Taking the plain minimum and maximum
-    // gave 0 .. 49296 and painted a flat blue rectangle, because a few corrupt
-    // readings reach the ends of the 16-bit range. The 1st and 95th percentile
-    // step past those and leave the range the readings actually occupy. They
-    // are read off the sorted values rather
-    // than a histogram of them, because a cleaned column is a fraction and can
-    // land outside the 16-bit range a histogram would have to cover.
-    if (lo >= hi) {
-        double *sorted = (double *) malloc((size_t) w * NPIX * sizeof *sorted);
-        long n = 0;
-        if (sorted != NULL)
-            for (long i = 0; i < (long) w * NPIX; i++)
-                if (val[i] != WG_NONE) sorted[n++] = val[i];
-        double mn = 0, mx = 1;
-        if (n > 0) {
-            qsort(sorted, (size_t) n, sizeof *sorted, cmp_double);
-            mn = sorted[(n - 1) / 100];
-            mx = sorted[(n - 1) * 95 / 100];
-        }
-        free(sorted);
-        lo = (int) floor(mn);
-        hi = (int) ceil(mx);
-    }
+    // Second pass: average and paint it.
     if (hi <= lo) hi = lo + 1;
-
-    // Second pass: paint it.
-    for (long i = 0; i < (long) w * NPIX; i++) {
-        double p = val[i];
-        if (p == WG_NONE) { pix[i] = MPI_BG; continue; }
-        int g = p <= lo ? 0 : p >= hi ? 255 : (int) (255.0 * (p - lo) / (hi - lo));
-        pix[i] = cmap_color(cmap, (unsigned char) g);
-    }
+    for (int c = 0; c < w; c++)
+        for (int j = 0; j < NPIX; j++) {
+            long i = (long) j * w + c;
+            if (nsum[c] == 0) { pix[i] = MPI_BG; continue; }
+            double p = val[i] / nsum[c];
+            int g = p <= lo ? 0 : p >= hi ? 255 : (int) (255.0 * (p - lo) / (hi - lo));
+            pix[i] = cmap_color(cmap, (unsigned char) g);
+        }
     free(val);
-    *out_lo = lo; *out_hi = hi;
-}
-
-// Where a file offset falls along the whereogram's horizontal axis, and the
-// offset a column stands for -- the two directions of the same mapping, used to
-// place the playback head and to turn a pointer position back into an image.
-//
-// The head is placed in panel pixels rather than in whole columns, so its two
-// ends point at where the image's first and last frames actually sit rather
-// than at the columns that happen to contain them. Nothing is pulled back
-// inside the panel either, so passing the byte one past a span gives that
-// span's exclusive right edge, which is where the head's far upright goes.
-static int wg_x_of_byte(const experiment_t *s, int w, long byte)
-{
-    long nslot = s->size / FRAME_STRIDE;
-    if (nslot < 1) nslot = 1;
-    long q = byte / FRAME_STRIDE;
-    if (q < 0) q = 0;
-    if (q > nslot) q = nslot;
-    return (int) (q * w / nslot);
-}
-
-static long wg_byte_of_col(const experiment_t *s, int w, int col)
-{
-    long nslot = s->size / FRAME_STRIDE;
-    if (nslot < 1) nslot = 1;
-    if (col < 0) col = 0;
-    if (col > w - 1) col = w - 1;
-    return ((long) col * nslot / w) * FRAME_STRIDE;
+    free(nsum);
 }
 
 // The capture time of the frame nearest a byte of the recording, in unix ms,
@@ -2423,22 +2429,21 @@ static double time_at_byte(const experiment_t *s, long byte)
     return best_t;
 }
 
-// The byte range the currently shown image was reconstructed from, so the
-// whereogram can mark where in the recording you are looking. Returns 0 if the
-// image has no frames.
-static int image_byte_span(const view_t *v, const experiment_t *s, int img,
-                           long *out_b0, long *out_b1)
+// The frame-sized slots of the file, first and last, that the currently shown
+// image was reconstructed from, so the whereogram can mark where in the
+// recording you are looking. Returns 0 if the image has no frames.
+static int image_slot_span(const view_t *v, const experiment_t *s, int img,
+                           long *out_q0, long *out_q1)
 {
-    long b0 = -1, b1 = -1;
+    long q0 = -1, q1 = -1;
     for (int k = 0; k < s->nframes; k++) {
         if (v->fr_img == NULL || v->fr_img[k] != img) continue;
-        long o = s->fr_off[k];
-        if (b0 < 0 || o < b0) b0 = o;
-        if (b1 < 0 || o + FRAME_STRIDE > b1) b1 = o + FRAME_STRIDE;
+        long q = s->fr_off[k] / FRAME_STRIDE;
+        if (q0 < 0 || q < q0) q0 = q;
+        if (q1 < 0 || q > q1) q1 = q;
     }
-    if (b0 < 0) return 0;
-    if (b1 > s->size) b1 = s->size;
-    *out_b0 = b0; *out_b1 = b1;
+    if (q0 < 0) return 0;
+    *out_q0 = q0; *out_q1 = q1;
     return 1;
 }
 
@@ -2911,13 +2916,19 @@ int main(int argc, char **argv)
     float status_left = 0.0f;
 
     // The whereogram: one texture column per run of frames, NPIX rows, rebuilt
-    // when the experiment, the colour map, the scale or the panel width change.
+    // when the experiment, the colour map, the scale, the stretch on show or
+    // the panel width change.
     Color    *cov_pix = NULL;
     Texture2D cov_tex = {0};
     int cov_w = 0, cov_valid = 0;
     unsigned cov_sig = 0;
     unsigned char *wg_missing = NULL;   // per column: some of its bytes never came down, or a frame was dropped
-    int wg_lo = -1, wg_hi = -1;         // the DN window its colours were built for
+    // How much of the recording the whereogram shows, in frame-sized slots:
+    // 0 for all of it, else the stretch the wheel has zoomed in on, centred on
+    // the playback head from wg_q0. Zooming is per experiment, so picking
+    // another one (wg_sel) goes back out to the whole of it.
+    long wg_span = 0, wg_q0 = 0;
+    int wg_sel = -1;
     // Set while the pointer is scrubbing the whereogram, so a press that
     // began there keeps control until the button is let go -- and a press that
     // began anywhere else never takes it. cov_anchor is the byte the press
@@ -3180,21 +3191,15 @@ int main(int argc, char **argv)
         int lo = v.dn_min, hi = v.dn_max;
         if (v.scale_mode == SCALE_AUTO_SESSION) { lo = v.sess_min; hi = v.sess_max; }
         else if (v.scale_mode == SCALE_AUTO_IMAGE) {
-            double mn = 0, mx = 0;
-            int any = 0;
-            for (int k = 0; k < s->nframes; k++) {
+            // An image holds one frame a column, so at most MAX_FPI of them.
+            double vals[MAX_FPI * NPIX];
+            long n = 0;
+            for (int k = 0; k < s->nframes && n + NPIX <= MAX_FPI * NPIX; k++) {
                 if (v.fr_img == NULL || v.fr_img[k] != v.img_pos) continue;
                 if (!frame_shown(&v, s, k)) continue;
-                for (int j = 0; j < NPIX; j++) {
-                    double p = pix_val(&v, s, k, j);
-                    if (!any || p < mn) mn = p;
-                    if (!any || p > mx) mx = p;
-                    any = 1;
-                }
+                for (int j = 0; j < NPIX; j++) vals[n++] = pix_val(&v, s, k, j);
             }
-            if (!any) { mn = 0; mx = 1; }
-            lo = (int) floor(mn); hi = (int) ceil(mx);
-            if (hi <= lo) hi = lo + 1;
+            auto_window(vals, n, &lo, &hi);
         }
 
         // ---- rasterise the image into the grayscale texture ----
@@ -3395,41 +3400,71 @@ int main(int argc, char **argv)
         // is time and 65 pixels is all the other one ever has.
         ay += 8;
         draw_text("Whereogram  (arrival direction against time)", ax, ay, 18, RAYWHITE);
-        if (wg_hi > wg_lo) {
-            const char *wr = TextFormat("DN %d .. %d", wg_lo, wg_hi);
-            draw_text(wr, GetScreenWidth() - 20 - text_width(wr, 13), ay + 5, 13, GRAY);
-        }
+        int title_y = ay;
         ay += 24;
         int cw = GetScreenWidth() - ax - 20;
         int avail_h = GetScreenHeight() - 74 - ay;
         if (cw > avail_h * 5) cw = avail_h * 5;
         int ch = cw / 5;
         if (cw >= 80 && ch >= 20) {
-            // Same scale control as the image: a manual window is taken as
-            // given, and either auto mode scales the whereogram over the whole
-            // whereogram. Scaling it to the shown image instead would make it
-            // flicker while scrubbing and stop one column being comparable
-            // with the next.
-            int wlo = v.scale_mode == SCALE_MANUAL ? v.dn_min : 0;
-            int whi = v.scale_mode == SCALE_MANUAL ? v.dn_max : 0;
+            // The stretch on show. The wheel over the panel zooms in and out,
+            // and the stretch stays centred on the playback head -- except
+            // while a scrub is under way, which has to read the pointer against
+            // the panel it pressed on, not one sliding along under it.
+            long nslot = s->size / FRAME_STRIDE;
+            if (nslot < 1) nslot = 1;
+            if (v.sel != wg_sel) { wg_span = 0; wg_sel = v.sel; }
+            {
+                Vector2 m = GetMousePosition();
+                int over = m.x >= ax && m.x < ax + cw && m.y >= ay && m.y < ay + ch;
+                float wheel = over && !cov_drag ? GetMouseWheelMove() : 0.0f;
+                if (wheel != 0.0f) {
+                    long span = wg_span > 0 ? wg_span : nslot;
+                    span = (long) ((double) span * exp(-WG_ZOOM_RATE * (double) wheel));
+                    long closest = (long) WG_ZOOM_SWEEPS * v.ncols;
+                    if (span < closest) span = closest;
+                    wg_span = span >= nslot ? 0 : span;
+                }
+            }
+            long span = wg_span > 0 ? wg_span : nslot;
+            long hq0 = 0, hq1 = 0;
+            int has_head = v.n_img > 0 && image_slot_span(&v, s, v.img_pos, &hq0, &hq1);
+            if (wg_span == 0) wg_q0 = 0;
+            else if (!cov_drag && has_head) wg_q0 = (hq0 + hq1 + 1) / 2 - span / 2;
+            if (wg_q0 > nslot - span) wg_q0 = nslot - span;
+            if (wg_q0 < 0) wg_q0 = 0;
+
+            // How many frames to a pixel: past one, the frames are averaged
+            // and the stretch under the head cannot look like the image.
+            const char *zr = span > cw
+                ? TextFormat("%s%.1f frames per pixel", wg_span ? "zoomed  " : "",
+                             (double) span / cw)
+                : TextFormat("%s%.1f pixels per frame", wg_span ? "zoomed  " : "",
+                             (double) cw / span);
+            draw_text(zr, GetScreenWidth() - 20 - text_width(zr, 13), title_y + 5, 13, GRAY);
+
             // What the built pixels depend on: any change here rebuilds them.
+            // The window is the image's, so in auto-image mode the whereogram
+            // is recoloured with every image -- which is what keeps a frame the
+            // same colour in both.
             unsigned sig = (unsigned) v.sel;
             sig = sig * 31u + (unsigned) v.cmap;
-            sig = sig * 31u + (unsigned) v.scale_mode;
             sig = sig * 31u + (unsigned) v.clean_stage;
             sig = sig * 31u + (unsigned) v.clean_win;
             sig = sig * 31u + (unsigned) v.clean_mean;
             sig = sig * 31u + (unsigned) v.fpi;
-            if (v.scale_mode == SCALE_MANUAL)
-                sig = sig * 31u + (unsigned) (v.dn_min ^ (v.dn_max << 3));
+            sig = sig * 31u + (unsigned) lo;
+            sig = sig * 31u + (unsigned) hi;
+            sig = sig * 31u + (unsigned) wg_q0;
+            sig = sig * 31u + (unsigned) span;
             if (cw != cov_w) {
                 Color *np = (Color *) realloc(cov_pix, (size_t) cw * NPIX * sizeof *cov_pix);
                 unsigned char *nm = (unsigned char *) realloc(wg_missing, (size_t) cw);
                 if (np != NULL && nm != NULL) {
                     cov_pix = np; wg_missing = nm; cov_w = cw;
                     if (cov_tex.id != 0) UnloadTexture(cov_tex);
-                    build_whereogram(&v, s, v.cmap, wlo, whi, cov_pix, cov_w, wg_missing,
-                                     &wg_lo, &wg_hi);
+                    build_whereogram(&v, s, v.cmap, lo, hi, cov_pix, cov_w, wg_missing,
+                                     wg_q0, span);
                     cov_sig = sig; cov_valid = 1;
                     Image ci = { .data = cov_pix, .width = cov_w, .height = NPIX,
                                  .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
@@ -3437,8 +3472,8 @@ int main(int argc, char **argv)
                     SetTextureFilter(cov_tex, TEXTURE_FILTER_POINT);
                 }
             } else if (!cov_valid || cov_sig != sig) {
-                build_whereogram(&v, s, v.cmap, wlo, whi, cov_pix, cov_w, wg_missing,
-                                 &wg_lo, &wg_hi);
+                build_whereogram(&v, s, v.cmap, lo, hi, cov_pix, cov_w, wg_missing,
+                                 wg_q0, span);
                 cov_sig = sig; cov_valid = 1;
                 UpdateTexture(cov_tex, cov_pix);
             }
@@ -3470,15 +3505,21 @@ int main(int argc, char **argv)
                 // around the span, which on a panel holding a whole recording
                 // was nearly all outline and covered the little it enclosed.
                 //
-                // Both ends are placed in panel pixels rather than rounded out
-                // to whole columns, so the bracket is as wide as the image
-                // really is and no wider -- a pixel or three on a long
-                // recording. It is only opened out when the span comes to less
-                // than the two uprights need to stand apart at all.
-                long pb0 = 0, pb1 = 0;
-                if (v.n_img > 0 && image_byte_span(&v, s, v.img_pos, &pb0, &pb1)) {
-                    int x0 = ax + wg_x_of_byte(s, cw, pb0);
-                    int x1 = ax + wg_x_of_byte(s, cw, pb1);
+                // The uprights stand under the first and last columns the
+                // image's frames were drawn into -- placed by the same mapping
+                // that drew them -- so the bracket is as wide as the image
+                // really is and no wider: a pixel or three on a long recording.
+                // It is only opened out when the span comes to less than the
+                // two uprights need to stand apart at all, and cut at the
+                // panel's edge when a scrub on a zoomed panel runs the image
+                // part way off it.
+                if (has_head && hq1 >= wg_q0 && hq0 < wg_q0 + span) {
+                    int c0, c1, d0, d1;
+                    wg_cols_of_slot(hq0 < wg_q0 ? wg_q0 : hq0, wg_q0, span, cov_w, &c0, &d0);
+                    wg_cols_of_slot(hq1 >= wg_q0 + span ? wg_q0 + span - 1 : hq1,
+                                    wg_q0, span, cov_w, &d1, &c1);
+                    int x0 = ax + c0 * cw / cov_w;
+                    int x1 = ax + c1 * cw / cov_w - 1;
                     if (x1 - x0 < WG_HEAD_MIN_W) {
                         int mid = (x0 + x1) / 2;
                         x0 = mid - WG_HEAD_MIN_W / 2;
@@ -3513,7 +3554,8 @@ int main(int argc, char **argv)
                 Vector2 m = GetMousePosition();
                 if (m.x >= ax && m.x < ax + cw && m.y >= ay && m.y < ay + ch) {
                     cov_drag = 1;
-                    cov_anchor = wg_byte_of_col(s, cov_w, ((int) m.x - ax) * cov_w / cw);
+                    cov_anchor = wg_byte_of_col(wg_q0, span, cov_w,
+                                                ((int) m.x - ax) * cov_w / cw);
                 }
             }
             if (cov_drag && v.n_img > 0) {
@@ -3521,7 +3563,7 @@ int main(int argc, char **argv)
                 int mx = (int) m.x - ax;
                 if (mx < 0) mx = 0;
                 if (mx > cw - 1) mx = cw - 1;
-                long here = wg_byte_of_col(s, cov_w, mx * cov_w / cw);
+                long here = wg_byte_of_col(wg_q0, span, cov_w, mx * cov_w / cw);
                 int img = image_nearest_byte(&v, s, here);
                 if (img >= 0) { v.img_pos = img; v.playing = 0; }
 
@@ -3532,7 +3574,9 @@ int main(int argc, char **argv)
                 // times of the frames nearest those two bytes -- so a stretch
                 // where nothing came down costs no time, the same way it takes
                 // up no columns.
-                int rx0 = ax + wg_x_of_byte(s, cw, cov_anchor);
+                int ac0, ac1;
+                wg_cols_of_slot(cov_anchor / FRAME_STRIDE, wg_q0, span, cov_w, &ac0, &ac1);
+                int rx0 = ax + ac0 * cw / cov_w;
                 int rx1 = ax + mx;
                 if (rx1 < rx0) { int t = rx0; rx0 = rx1; rx1 = t; }
                 DrawRectangle(rx0, ay, rx1 - rx0 < 1 ? 1 : rx1 - rx0, ch,
@@ -3563,7 +3607,7 @@ int main(int argc, char **argv)
 
         // help footer
         const char *help =
-            "Up/Down experiment   Left/Right image   drag whereogram: scrub + time span"
+            "Up/Down experiment   Left/Right image   drag whereogram: scrub + time span, wheel zooms"
             "   globe: drag turns, two-finger press-drag turns about the satellite, scroll zooms, g resets"
             "   Space play/pause   ,/. speed   f steps/sweep   s zoom   a scale"
             "   z/x min  c/v max   m colour map   b clean  B step   n bg window   e median/mean"
