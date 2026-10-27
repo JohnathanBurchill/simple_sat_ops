@@ -20,6 +20,7 @@
 
 #include "antenna_rotator_async.h"
 #include "antenna_rotator.h"
+#include "sso_action_log.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -95,6 +96,9 @@ static void *rotator_worker(void *arg)
 {
     antenna_rotator_async_t *ar = (antenna_rotator_async_t *) arg;
     double last_status_attempt = 0.0;
+    // Last STATUS outcome, for logging link loss / recovery once per
+    // transition rather than on every 0.5 s poll. -1 = no reply yet.
+    int    last_status_ok = -1;
 
     for (;;) {
         // Wait for: stop, an incoming request, or the status period to
@@ -133,18 +137,40 @@ static void *rotator_worker(void *arg)
         // read the (now-stale) snapshot without waiting.
         if (do_stop) {
             double az = 0.0, el = 0.0;
-            (void) antenna_rotator_command(ar->rot,
-                                           ANTENNA_ROTATOR_STOP, &az, &el);
+            int rc = antenna_rotator_command(ar->rot,
+                                             ANTENNA_ROTATOR_STOP, &az, &el);
+            if (rc == ANTENNA_ROTATOR_OK) {
+                sso_action_log("rot", "STOP (stopped at az=%.1f el=%.1f)", az, el);
+            } else {
+                sso_action_log("rot", "STOP failed (rc=%d)", rc);
+            }
         }
         if (do_set) {
             double az = set_az, el = set_el;
-            (void) antenna_rotator_command(ar->rot,
-                                           ANTENNA_ROTATOR_SET, &az, &el);
+            int rc = antenna_rotator_command(ar->rot,
+                                             ANTENNA_ROTATOR_SET, &az, &el);
+            sso_action_log("rot", "SET az=%.1f el=%.1f%s", set_az, set_el,
+                           rc == ANTENNA_ROTATOR_OK ? "" : " failed");
         }
         if (do_status) {
             double az = 0.0, el = 0.0;
             int rc = antenna_rotator_command(ar->rot,
                                              ANTENNA_ROTATOR_STATUS, &az, &el);
+            // Logged off-lock: the UI thread reads the snapshot under mu.
+            int ok = (rc == ANTENNA_ROTATOR_OK);
+            if (ok != last_status_ok) {
+                if (ok) {
+                    // Only a recovery is news; the first good reply is
+                    // logged by bring-up as "rotator connected".
+                    if (last_status_ok == 0) {
+                        sso_action_log("rot", "status OK again az=%.1f el=%.1f",
+                                       az, el);
+                    }
+                } else {
+                    sso_action_log("rot", "status read failed (rc=%d)", rc);
+                }
+                last_status_ok = ok;
+            }
             double mono = now_mono_s();
             pthread_mutex_lock(&ar->mu);
             last_status_attempt = mono;

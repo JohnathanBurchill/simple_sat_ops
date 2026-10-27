@@ -22,6 +22,7 @@
 #include "state.h"
 
 #include "prediction.h"
+#include "sso_action_log.h"
 #include "sso_audit.h"
 #include "sso_paths.h"
 #include "tle_io.h"
@@ -241,6 +242,18 @@ static int find_nearby_pass_folder(const char *parent_dir,
     return (n > 0 && (size_t) n < out_path_cap) ? 0 : -1;
 }
 
+// Start this pass's actions.log in the folder just set up; anything logged
+// during startup is written out ahead of this line.
+static void pass_action_log_open(state_t *state, const char *mode)
+{
+    if (sso_action_log_set_dir(state->op.pass_folder) != 0) {
+        fprintf(stderr, "simple_sat_ops: cannot open %s/actions.log: %s\n",
+                state->op.pass_folder, strerror(errno));
+        return;
+    }
+    sso_action_log("pass", "folder %s (%s)", state->op.pass_folder, mode);
+}
+
 // build /FrontierSat/Operations/<yyyymmdd>/<hhmmLT>/. Stashes the
 // result in state->op.pass_folder so ipc_broadcast_state can publish it on
 // every tick.
@@ -264,6 +277,7 @@ void setup_pass_folder(state_t *state, double jul_utc_now)
                      "mode=inherited path=\"%.500s\"", state->op.pass_folder);
             sso_audit_event("pass-folder", det);
         }
+        pass_action_log_open(state, "inherited");
         return;
     }
     // --testing: bench run, not a pass. Land the folder under the
@@ -306,6 +320,7 @@ void setup_pass_folder(state_t *state, double jul_utc_now)
                      "mode=testing path=\"%.500s\"", state->op.pass_folder);
             sso_audit_event("pass-folder", det);
         }
+        pass_action_log_open(state, "testing");
         return;
     }
     minutes_until_visible(&state->track.prediction, jul_utc_now,
@@ -403,6 +418,7 @@ void setup_pass_folder(state_t *state, double jul_utc_now)
                  "mode=aos path=\"%.500s\"", state->op.pass_folder);
         sso_audit_event("pass-folder", det);
     }
+    pass_action_log_open(state, "aos");
 }
 
 // Sample the upcoming pass on a local prediction_t copy and render a

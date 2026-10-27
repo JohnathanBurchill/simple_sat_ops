@@ -25,15 +25,18 @@
 #include "auto_tcmd.h"       // auto_tcmd_progress
 #include "ipc_fill.h"        // ipc_fill_state_prediction
 #include "panels.h"          // rx_panel_collect_local, rx_panel_data_t
+#include "sso_action_log.h"
 #include "sso_audit.h"
 #include "sso_ipc.h"
 #include "sso_operator.h"
+#include "sso_version.h"     // sso_version_string
 #include "tui.h"             // tui_install_yield_handler
 #include "viewer.h"          // read_operator_pid
 
 #include <stdio.h>
 #include <stdlib.h>          // EXIT_FAILURE
 #include <string.h>
+#include <unistd.h>          // getpid
 
 // Cap on the number of connected clients listed in the roster broadcast.
 #define SSO_IPC_MAX_CLIENTS_FOR_ROSTER 16
@@ -210,6 +213,9 @@ void ipc_on_event(sso_ipc_server_t *srv, sso_client_id_t id,
         return;
     }
     if (evt->type != SSO_EVT_HELLO) return;
+    sso_action_log("ipc", "viewer connected user=%s role=%s",
+                   evt->from[0] ? evt->from : "?",
+                   evt->role[0] ? evt->role : "viewer");
     sso_event_t welcome;
     sso_event_init(&welcome, SSO_EVT_WELCOME);
     snprintf(welcome.from, sizeof(welcome.from), "%s",
@@ -325,6 +331,11 @@ int ipc_operator_startup(state_t *state, int argc, char **argv)
             if (off >= sizeof argv_buf) { off = sizeof argv_buf - 1; break; }
         }
         sso_audit_event("argv", argv_buf);
+        sso_action_log("app", "start simple_sat_ops %s user=%s pid=%d mode=%s",
+                       sso_version_string(),
+                       state->op.operator_user, (int) getpid(),
+                       state->app.control_mode ? "operator" : "standalone");
+        sso_action_log("app", "argv: %s", argv_buf);
     }
     if (state->app.control_mode) {
         // Refuse if another simple_sat_ops --control is already
@@ -360,6 +371,8 @@ int ipc_operator_startup(state_t *state, int argc, char **argv)
                      "existing_user=%s existing_pid=%d",
                      who, (int) op_pid);
             sso_audit_event("control-refused", det);
+            sso_action_log("app", "--control refused: operator already "
+                           "running (user=%s)", who);
             return EXIT_FAILURE;
         }
 
