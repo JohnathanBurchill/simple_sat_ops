@@ -65,7 +65,14 @@
 // attitude out of the packet database, ordered in time. Returns how many
 // were found, or -1 if the database could not be read. Calling it again
 // reloads, which is what a viewer's reload key should do.
-int beacon_attitude_load(const char *db_path);
+//
+// With a cache name, the attitudes from more than a week ago come out of
+// that cache (viewer_cache.h) and only the packets of the last week or so,
+// and those added since the cache was written, are read from the
+// database; rebuild reads everything from the database and writes the
+// cache afresh. Each viewer passes a name of its own, the cache being
+// tied to the binary that wrote it. NULL reads everything, every time.
+int beacon_attitude_load(const char *db_path, const char *cache_name, int rebuild);
 
 // The attitude nearest unix_ms, if one lies within max_age_s of it.
 // Fills *out and returns 1; returns 0 and zeroes *out when there is

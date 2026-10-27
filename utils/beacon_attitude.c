@@ -24,6 +24,7 @@
 #include "adcs_sdlog.h"
 #include "beacon_cts1.h"
 #include "bulk_size.h"
+#include "viewer_cache.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -68,13 +69,22 @@ static att_row_t *new_row(void)
     return r;
 }
 
+// In time order, and ties broken on everything else, so that two copies of
+// one attitude -- a log record both in the cache and rebuilt from a packet
+// in the window -- land side by side and compare equal.
 static int cmp_row(const void *a, const void *b)
 {
-    double x = ((const att_row_t *) a)->ts_ms, y = ((const att_row_t *) b)->ts_ms;
-    return (x > y) - (x < y);
+    const att_row_t *p = (const att_row_t *) a, *q = (const att_row_t *) b;
+    if (p->ts_ms != q->ts_ms) return (p->ts_ms > q->ts_ms) - (p->ts_ms < q->ts_ms);
+    if (p->from_log != q->from_log) return p->from_log - q->from_log;
+    if (p->roll_deg != q->roll_deg) return (p->roll_deg > q->roll_deg) - (p->roll_deg < q->roll_deg);
+    if (p->pitch_deg != q->pitch_deg) return (p->pitch_deg > q->pitch_deg) - (p->pitch_deg < q->pitch_deg);
+    return (p->yaw_deg > q->yaw_deg) - (p->yaw_deg < q->yaw_deg);
 }
 
-static int load_beacons(sqlite3 *db)
+// Every extended beacon, or with `since` (an ISO time as ts_received writes
+// it) those received from then on plus every row newer than after_id.
+static int load_beacons(sqlite3 *db, const char *since, long long after_id)
 {
     // The same shape test beacon_is_extended makes, pushed into SQL so
     // the scan does not haul every packet in the database across the
@@ -84,18 +94,26 @@ static int load_beacons(sqlite3 *db)
     // BEACON_EXT_PREDICATE, which this mirrors. The blob literals are
     // "CTS1" and " X"; a blob never compares equal to a text string in
     // SQLite, so they have to be written as hex.
-    const char *sql =
-        "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload "
-        "FROM packet "
-        "WHERE length(payload) IN (198, 202) "
-        "  AND substr(payload, 1, 1) = x'20' "
-        "  AND (substr(payload, 2, 4) = x'43545331' "
-        "       OR substr(payload, 127, 2) = x'2058') "
+#define BEACON_SHAPE \
+        "WHERE length(payload) IN (198, 202) " \
+        "  AND substr(payload, 1, 1) = x'20' " \
+        "  AND (substr(payload, 2, 4) = x'43545331' " \
+        "       OR substr(payload, 127, 2) = x'2058') " \
         "  AND rs_errs != -2 AND crc_status != 0 "
-        "ORDER BY ts_received";
+    const char *sql = since == NULL
+        ? "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload "
+          "FROM packet " BEACON_SHAPE "ORDER BY ts_received"
+        : "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload "
+          "FROM packet " BEACON_SHAPE "AND (ts_received >= ?1 OR id > ?2) "
+          "ORDER BY ts_received";
+#undef BEACON_SHAPE
 
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    if (since != NULL) {
+        sqlite3_bind_text(st, 1, since, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, after_id);
+    }
 
     while (sqlite3_step(st) == SQLITE_ROW) {
         const uint8_t *pl = (const uint8_t *) sqlite3_column_blob(st, 1);
@@ -154,18 +172,36 @@ typedef struct {
     uint8_t d[SDLOG_CHUNK_MAX];
 } sd_chunk_t;
 
-// Every bulk_file chunk whose CRC32 checked out. A verified packet had its
-// 4-byte CRC trailer stripped on the way into the database, so what
-// follows the 5-byte header is all file data.
-static int load_chunks(sqlite3 *db, sd_chunk_t **out)
+// A log the database holds the start of, and its period once a vote has
+// settled it (0 until then). Kept in the cache, since the chunk that names a
+// log -- the one at offset 0 -- may have come down before the window a start
+// with a cache reads.
+typedef struct {
+    adcs_sdlog_t h;
+    long         period;
+} sd_log_t;
+
+// Every bulk_file chunk whose CRC32 checked out, or with `since` those
+// received from then on plus every row newer than after_id. A verified
+// packet had its 4-byte CRC trailer stripped on the way into the database,
+// so what follows the 5-byte header is all file data.
+static int load_chunks(sqlite3 *db, const char *since, long long after_id,
+                       sd_chunk_t **out)
 {
     *out = NULL;
-    const char *sql =
-        "SELECT payload FROM packet "
-        "WHERE packet_type = ? AND crc_status = 1 AND rs_errs != -2";
+    const char *sql = since == NULL
+        ? "SELECT payload FROM packet "
+          "WHERE packet_type = ?3 AND crc_status = 1 AND rs_errs != -2"
+        : "SELECT payload FROM packet "
+          "WHERE packet_type = ?3 AND crc_status = 1 AND rs_errs != -2 "
+          "AND (ts_received >= ?1 OR id > ?2)";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
-    sqlite3_bind_int(st, 1, COMMS_PACKET_TYPE_BULK_FILE_DOWNLINK);
+    sqlite3_bind_int(st, 3, COMMS_PACKET_TYPE_BULK_FILE_DOWNLINK);
+    if (since != NULL) {
+        sqlite3_bind_text(st, 1, since, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, after_id);
+    }
 
     sd_chunk_t *cs = NULL;
     int n = 0, cap = 0;
@@ -280,20 +316,27 @@ static void read_records(const adcs_sdlog_t *log, long period,
     }
 }
 
-static void load_sd_logs(sqlite3 *db)
+// The records of every log the chunks load_chunks picks out belong to. *logs
+// holds the logs already known (from the cache) on the way in, and every log
+// known on the way out, with the period of each once it is settled.
+static void load_sd_logs(sqlite3 *db, const char *since, long long after_id,
+                         sd_log_t **logs, int *nlogs)
 {
     sd_chunk_t *cs = NULL;
-    int nc = load_chunks(db, &cs);
-    adcs_sdlog_t *logs = (adcs_sdlog_t *) malloc((size_t) (nc > 0 ? nc : 1) * sizeof *logs);
-    int *mine = (int *) malloc((size_t) (nc > 0 ? nc : 1) * sizeof *mine);
-    if (cs == NULL || logs == NULL || mine == NULL) {
-        free(cs); free(logs); free(mine);
+    int nc = load_chunks(db, since, after_id, &cs);
+    if (cs == NULL) return;
+    int nl = *nlogs;
+    sd_log_t *ls = (sd_log_t *) realloc(*logs, (size_t) (nl + nc) * sizeof *ls);
+    int *mine = (int *) malloc((size_t) nc * sizeof *mine);
+    if (ls == NULL || mine == NULL) {
+        free(cs); free(mine);
+        if (ls != NULL) *logs = ls;
         return;
     }
+    *logs = ls;
 
     // The logs: every chunk at offset 0 that reads as the start of one that
     // records the estimated angles, once each.
-    int nl = 0;
     for (int k = 0; k < nc; k++) {
         adcs_sdlog_t h;
         if (cs[k].off != 0) continue;
@@ -301,18 +344,24 @@ static void load_sd_logs(sqlite3 *db)
         if (adcs_sdlog_frame_offset(&h, ADCS_SDLOG_FRAME_EST_ANGLES) < 0) continue;
         int seen = 0;
         for (int l = 0; l < nl && !seen; l++)
-            seen = logs[l].t0 == h.t0 && memcmp(logs[l].mask, h.mask, ADCS_SDLOG_MASK_LEN) == 0;
-        if (!seen) logs[nl++] = h;
+            seen = ls[l].h.t0 == h.t0 && memcmp(ls[l].h.mask, h.mask, ADCS_SDLOG_MASK_LEN) == 0;
+        if (!seen) {
+            ls[nl].h = h;
+            ls[nl].period = 0;
+            nl++;
+        }
     }
+    *nlogs = nl;
 
     for (int l = 0; l < nl; l++) {
-        long period = log_period(&logs[l], cs, nc);
+        if (ls[l].period == 0) ls[l].period = log_period(&ls[l].h, cs, nc);
+        long period = ls[l].period;
         if (period == 0) continue;
 
         int nm = 0;
         long end = 0;
         for (int k = 0; k < nc; k++) {
-            if (adcs_sdlog_chunk_fits(&logs[l], period, cs[k].off,
+            if (adcs_sdlog_chunk_fits(&ls[l].h, period, cs[k].off,
                                       cs[k].d, (size_t) cs[k].len) <= 0)
                 continue;
             mine[nm++] = k;
@@ -327,17 +376,65 @@ static void load_sd_logs(sqlite3 *db)
                 memcpy(buf + c->off, c->d, (size_t) c->len);
                 memset(have + c->off, 1, (size_t) c->len);
             }
-            read_records(&logs[l], period, buf, have, end);
+            read_records(&ls[l].h, period, buf, have, end);
         }
         free(buf);
         free(have);
     }
     free(cs);
-    free(logs);
     free(mine);
 }
 
-int beacon_attitude_load(const char *db_path)
+// ---- the cache ---------------------------------------------------------
+//
+// The attitudes from before the cutoff, and every log known, so that a start
+// with a cache reads only the last week or so out of the database. Unlike a
+// picture, an attitude is a single moment, so whatever the window brings in
+// is simply added: an old log downloaded again only repeats records the
+// cache has, and those copies are dropped.
+
+static void write_cache(const char *name, const char *db_path, double cutoff_ms,
+                        long long max_id, const sd_log_t *logs, int nlogs)
+{
+    viewer_cache_info_t info = { .cutoff_ms = cutoff_ms, .max_id = max_id };
+    viewer_cache_writer_t w;
+    if (viewer_cache_create(&w, name, db_path, &info) != 0) {
+        fprintf(stderr, "beacon_attitude: cannot write the cache %s\n", name);
+        return;
+    }
+    // In time order, so what goes in is the run of rows before the cutoff.
+    int n = 0;
+    while (n < g_n && g_rows[n].ts_ms < cutoff_ms) n++;
+    viewer_cache_write(&w, &n, sizeof n);
+    viewer_cache_write(&w, g_rows, (size_t) n * sizeof *g_rows);
+    viewer_cache_write(&w, &nlogs, sizeof nlogs);
+    viewer_cache_write(&w, logs, (size_t) nlogs * sizeof *logs);
+    if (viewer_cache_commit(&w) != 0)
+        fprintf(stderr, "beacon_attitude: cannot write the cache %s\n", w.path);
+}
+
+// The rows and logs an open cache holds, into g_rows and *logs. Returns 0, or
+// -1 (with nothing loaded) if the file is damaged.
+static int read_cache(FILE *f, sd_log_t **logs, int *nlogs)
+{
+    int n = 0, nl = 0;
+    if (viewer_cache_read(f, &n, sizeof n) != 0 || n < 0 || n > 100000000) return -1;
+    att_row_t *rows = (att_row_t *) viewer_cache_read_alloc(f, (size_t) n * sizeof *rows);
+    if (rows == NULL) return -1;
+    if (viewer_cache_read(f, &nl, sizeof nl) != 0 || nl < 0 || nl > 1000000) {
+        free(rows);
+        return -1;
+    }
+    sd_log_t *ls = (sd_log_t *) viewer_cache_read_alloc(f, (size_t) nl * sizeof *ls);
+    if (ls == NULL) { free(rows); return -1; }
+    g_rows = rows;
+    g_n = g_cap = n;
+    *logs = ls;
+    *nlogs = nl;
+    return 0;
+}
+
+int beacon_attitude_load(const char *db_path, const char *cache_name, int rebuild)
 {
     beacon_attitude_free();
     if (db_path == NULL) return -1;
@@ -353,16 +450,54 @@ int beacon_attitude_load(const char *db_path)
     }
     sqlite3_busy_timeout(db, 5000);
 
-    if (load_beacons(db) != 0) {
+    // Read before the packets are, so a row that lands during the load is
+    // looked at again next time rather than never.
+    long long max_id = viewer_cache_db_max_id(db);
+    double cutoff = viewer_cache_now_ms() - VIEWER_CACHE_SETTLED_MS;
+    viewer_cache_info_t ci = {0};
+    sd_log_t *logs = NULL;
+    int nlogs = 0, cached = 0;
+    if (cache_name != NULL && !rebuild && max_id >= 0) {
+        FILE *f = viewer_cache_open(cache_name, db_path, max_id, &ci);
+        if (f != NULL) {
+            cached = read_cache(f, &logs, &nlogs) == 0;
+            fclose(f);
+        }
+    }
+
+    char since[32];
+    const char *window = NULL;
+    if (cached) {
+        viewer_cache_iso(ci.cutoff_ms - VIEWER_CACHE_MARGIN_MS, since, sizeof since);
+        window = since;
+    }
+    if (load_beacons(db, window, ci.max_id) != 0) {
         sqlite3_close(db);
+        beacon_attitude_free();
+        free(logs);
         return -1;
     }
-    load_sd_logs(db);
+    load_sd_logs(db, window, ci.max_id, &logs, &nlogs);
     sqlite3_close(db);
 
-    // The beacons come out of the query in time order and the logs one log
-    // at a time; the lookup bisects, so the two are put in one order.
+    // The beacons come out of the query in time order, the logs one log at a
+    // time and the cache's rows ahead of both; the lookup bisects, so they
+    // are put in one order, and the copies the window shares with the cache
+    // are dropped.
     if (g_n > 1) qsort(g_rows, (size_t) g_n, sizeof *g_rows, cmp_row);
+    int m = 0;
+    for (int k = 0; k < g_n; k++) {
+        if (m > 0 && cmp_row(&g_rows[m - 1], &g_rows[k]) == 0) continue;
+        g_rows[m++] = g_rows[k];
+    }
+    g_n = m;
+
+    // Written afresh after a full read, and once the cutoff has fallen a day
+    // behind a week ago, to move it up.
+    if (cache_name != NULL && max_id >= 0
+        && (!cached || cutoff - ci.cutoff_ms >= VIEWER_CACHE_ROLL_MS))
+        write_cache(cache_name, db_path, cutoff, max_id, logs, nlogs);
+    free(logs);
     return g_n;
 }
 

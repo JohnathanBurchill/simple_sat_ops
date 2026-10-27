@@ -243,8 +243,21 @@
 
     Read-only on the DB. Press F5 to re-read it and rebuild the experiment list.
 
+    The cache: a recording that started more than a week ago is not put
+    together again at every start. It is kept, as built, in
+    ~/.cache/simple_sat_ops/mpi_viewer.cache (utils/viewer_cache.h has the
+    rules), and only the rest is rebuilt, from the last week or so of packets
+    and whatever the DB has gained since the cache was written. A download of
+    an old recording that comes in later -- a re-download of its holes, say --
+    is not folded in by itself: the viewer says, above the help line, how
+    many such downloads it has left out, and shift-F5 (or --rebuild-cache)
+    rebuilds every recording from the whole DB and writes the cache afresh.
+    The attitudes the globe draws keep a cache of their own beside it, by the
+    same rules. A new build of the viewer starts with a full rebuild, and
+    deleting the cache files is always safe.
+
     Usage:
-      mpi_viewer [--db=<packet_db.sqlite>] [--list]
+      mpi_viewer [--db=<packet_db.sqlite>] [--list] [--rebuild-cache]
 
     With no --db the default store is used ($SSO_PACKET_DB, else the FrontierSat
     root's packet_db.sqlite).
@@ -276,6 +289,7 @@
 #include "sat_globe.h"
 #include "sso_paths.h"
 #include "sso_version.h"
+#include "viewer_cache.h"
 
 #include <ctype.h>
 #include <float.h>
@@ -361,6 +375,7 @@ int main(int argc, char **argv)
 #define MPI_BACKGROUND_TV  65535
 
 typedef struct {
+    long long id;       // the packet's row in the DB
     double   ts_ms;
     long     off;
     int      rs;
@@ -377,6 +392,7 @@ typedef struct {
     char     sat_path[MPI_SAT_PATH_LEN];  // the file on the satellite, "" if unknown
     double   t_first_recv_ms;// receive time of this experiment's earliest packet
     double   t_last_recv_ms; // receive time of its latest packet
+    long long max_id;        // the newest of its packets' DB rows
     double   t_end_ms;       // last marker time (unix ms); recording end
     uint8_t *buf;            // reconstructed bytes (all passes merged)
     uint8_t *present;        // 1 where a real byte landed
@@ -640,16 +656,28 @@ static double interp_time(const long *off, const double *ts, int n, long x)
 
 // Load every bulk_file chunk with a sane offset, oldest first (mirrors
 // mpi_reconstruct's loader). Returns 0 on success.
-static int load_chunks(sqlite3 *db, chunk_t **out, int *out_n)
+// Every bulk_file packet, or with `since` (an ISO time as ts_received writes
+// it) only those received from then on plus every row newer than after_id --
+// the part a start with a cache has to rebuild.
+static int load_chunks(sqlite3 *db, const char *since, long long after_id,
+                       chunk_t **out, int *out_n)
 {
-    const char *sql =
-        "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, "
-        "       ts_received, payload, rs_errs, crc_status "
-        "FROM packet WHERE packet_type=16 ORDER BY ts_received, id";
+    const char *sql = since == NULL
+        ? "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, "
+          "       ts_received, payload, rs_errs, crc_status, id "
+          "FROM packet WHERE packet_type=16 ORDER BY ts_received, id"
+        : "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, "
+          "       ts_received, payload, rs_errs, crc_status, id "
+          "FROM packet WHERE packet_type=16 AND (ts_received >= ?1 OR id > ?2) "
+          "ORDER BY ts_received, id";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
         fprintf(stderr, "mpi_viewer: query failed: %s\n", sqlite3_errmsg(db));
         return -1;
+    }
+    if (since != NULL) {
+        sqlite3_bind_text(st, 1, since, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, after_id);
     }
 
     chunk_t *cs = NULL;
@@ -677,6 +705,7 @@ static int load_chunks(sqlite3 *db, chunk_t **out, int *out_n)
         }
         chunk_t *c = &cs[n];
         memset(c, 0, sizeof *c);
+        c->id    = sqlite3_column_int64(st, 5);
         c->ts_ms = sqlite3_column_double(st, 0);
         c->off   = off;
         c->rs    = sqlite3_column_int(st, 3);
@@ -999,10 +1028,12 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
     out->nframes = n;
     out->t_first_recv_ms = cs[idx[0]].ts_ms;
     out->t_last_recv_ms  = cs[idx[0]].ts_ms;
+    out->max_id = cs[idx[0]].id;
     for (int j = 1; j < nidx; j++) {
         double t = cs[idx[j]].ts_ms;
         if (t < out->t_first_recv_ms) out->t_first_recv_ms = t;
         if (t > out->t_last_recv_ms)  out->t_last_recv_ms  = t;
+        if (cs[idx[j]].id > out->max_id) out->max_id = cs[idx[j]].id;
     }
     out->fr_off = offs;
     out->fr_ctr  = (int *) malloc((size_t) n * sizeof(int));
@@ -1141,13 +1172,15 @@ typedef struct {
     int    exp;      // assigned experiment id, -1 until clustered
 } burst_t;
 
-// Load all experiments from an open DB. Returns the experiment count and fills
+// Load the experiments from an open DB: all of them, or with `since` those the
+// packets load_chunks picks out make. Returns the experiment count and fills
 // *out (caller frees via free_experiments).
-static int load_experiments_from_db(sqlite3 *db, experiment_t **out)
+static int load_experiments_from_db(sqlite3 *db, const char *since, long long after_id,
+                                    experiment_t **out)
 {
     *out = NULL;
     chunk_t *cs = NULL; int n = 0;
-    if (load_chunks(db, &cs, &n) != 0 || n == 0) { free(cs); return 0; }
+    if (load_chunks(db, since, after_id, &cs, &n) != 0 || n == 0) { free(cs); return 0; }
 
     // Newest packet receive time bounds plausible marker timestamps: a capture
     // cannot be downlinked before it happens, so a later timestamp is a bit-flip.
@@ -1331,11 +1364,123 @@ static void free_experiments(experiment_t *exps, int nexp)
     free(exps);
 }
 
-// Open the DB read-only, load experiments, close. Returns the count (0 on any
-// failure). Used at startup and on manual refresh (F5).
-static int reload_experiments(const char *db_path, experiment_t **out)
+// ---- the cache -------------------------------------------------------------
+//
+// Recordings that started more than a week before the cache was written are
+// kept in it, as built, and the rest are rebuilt from the DB at every start
+// (see viewer_cache.h for the policy). An experiment goes into the file as
+// its struct followed by every array it points to; reading one back puts
+// fresh arrays where the writer's pointers were.
+
+#define MPI_CACHE_NAME "mpi_viewer"
+// The attitudes keep a cache of their own (beacon_attitude.h).
+#define MPI_ATTITUDE_CACHE_NAME "mpi_viewer_attitude"
+
+// What a load says about where its experiments came from, for the viewer to
+// pass on.
+typedef struct {
+    int    from_cache;   // experiments read out of the cache
+    int    newer;        // newer downloads of cached recordings left out
+    double cutoff_ms;    // the cache holds recordings started before this
+} load_note_t;
+
+static void write_cache(const char *db_path, const experiment_t *exps, int nexp,
+                        double cutoff_ms, long long max_id)
+{
+    viewer_cache_info_t info = { .cutoff_ms = cutoff_ms, .max_id = max_id };
+    viewer_cache_writer_t w;
+    if (viewer_cache_create(&w, MPI_CACHE_NAME, db_path, &info) != 0) {
+        fprintf(stderr, "mpi_viewer: cannot write the cache; every start will rebuild\n");
+        return;
+    }
+    int n = 0;
+    for (int k = 0; k < nexp; k++) if (exps[k].t_start_ms < cutoff_ms) n++;
+    viewer_cache_write(&w, &n, sizeof n);
+    for (int k = 0; k < nexp; k++) {
+        const experiment_t *e = &exps[k];
+        if (e->t_start_ms >= cutoff_ms) continue;
+        size_t size = (size_t) e->size, nf = (size_t) e->nframes;
+        viewer_cache_write(&w, e, sizeof *e);
+        viewer_cache_write(&w, e->buf, size);
+        viewer_cache_write(&w, e->present, size);
+        viewer_cache_write(&w, e->verified, size);
+        viewer_cache_write(&w, e->fr_off, nf * sizeof *e->fr_off);
+        viewer_cache_write(&w, e->fr_ctr, nf * sizeof *e->fr_ctr);
+        viewer_cache_write(&w, e->fr_tv, nf * sizeof *e->fr_tv);
+        viewer_cache_write(&w, e->fr_ts, nf * sizeof *e->fr_ts);
+        viewer_cache_write(&w, e->fr_bytes, nf * FRAME_STRIDE);
+        viewer_cache_write(&w, e->fr_bad, nf * sizeof *e->fr_bad);
+        viewer_cache_write(&w, e->fr_spliced, nf * sizeof *e->fr_spliced);
+        viewer_cache_write(&w, e->fr_unver, nf * sizeof *e->fr_unver);
+        viewer_cache_write(&w, e->fr_gap, nf * sizeof *e->fr_gap);
+    }
+    if (viewer_cache_commit(&w) != 0)
+        fprintf(stderr, "mpi_viewer: cannot write the cache %s\n", w.path);
+}
+
+// The experiments in an open cache file. Returns the count, or -1 if the file
+// is damaged.
+static int read_cache(FILE *f, experiment_t **out)
 {
     *out = NULL;
+    int n = 0;
+    if (viewer_cache_read(f, &n, sizeof n) != 0 || n < 0 || n > 100000) return -1;
+    experiment_t *exps = (experiment_t *) calloc((size_t) (n > 0 ? n : 1), sizeof *exps);
+    if (exps == NULL) return -1;
+    for (int k = 0; k < n; k++) {
+        experiment_t *e = &exps[k];
+        if (viewer_cache_read(f, e, sizeof *e) != 0 || e->size < 0 || e->nframes < 0) {
+            memset(e, 0, sizeof *e);
+            free_experiments(exps, k);
+            return -1;
+        }
+        size_t size = (size_t) e->size, nf = (size_t) e->nframes;
+        e->buf        = viewer_cache_read_alloc(f, size);
+        e->present    = e->buf ? viewer_cache_read_alloc(f, size) : NULL;
+        e->verified   = e->present ? viewer_cache_read_alloc(f, size) : NULL;
+        e->fr_off     = e->verified ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_off) : NULL;
+        e->fr_ctr     = e->fr_off ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_ctr) : NULL;
+        e->fr_tv      = e->fr_ctr ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_tv) : NULL;
+        e->fr_ts      = e->fr_tv ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_ts) : NULL;
+        e->fr_bytes   = e->fr_ts ? viewer_cache_read_alloc(f, nf * FRAME_STRIDE) : NULL;
+        e->fr_bad     = e->fr_bytes ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_bad) : NULL;
+        e->fr_spliced = e->fr_bad ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_spliced) : NULL;
+        e->fr_unver   = e->fr_spliced ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_unver) : NULL;
+        e->fr_gap     = e->fr_unver ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_gap) : NULL;
+        if (e->fr_gap == NULL) {
+            free_experiments(exps, k + 1);
+            return -1;
+        }
+    }
+    *out = exps;
+    return n;
+}
+
+static int by_newest_start(const void *a, const void *b)
+{
+    double ta = ((const experiment_t *) a)->t_start_ms;
+    double tb = ((const experiment_t *) b)->t_start_ms;
+    return (ta < tb) - (ta > tb);
+}
+
+// A freshly built experiment is the same recording as a cached one when their
+// start times sit closer than the clustering pass ever lets two recordings be.
+static int is_cached(const experiment_t *e, const experiment_t *cached, int nc)
+{
+    for (int k = 0; k < nc; k++)
+        if (fabs(e->t_start_ms - cached[k].t_start_ms) <= MPI_EXP_GAP_MS) return 1;
+    return 0;
+}
+
+// Load the experiments to show: the cached ones and the rest rebuilt from the
+// DB, or with `rebuild` (or no usable cache) every one of them rebuilt, and the
+// cache written afresh. Returns the count (0 on any failure). Used at startup
+// and on F5 (shift-F5 rebuilds).
+static int load_experiments(const char *db_path, int rebuild, experiment_t **out,
+                            load_note_t *note)
+{
+    *out = NULL;
+    memset(note, 0, sizeof *note);
     sqlite3 *db = NULL;
     if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
         fprintf(stderr, "mpi_viewer: cannot open %s: %s\n",
@@ -1343,9 +1488,86 @@ static int reload_experiments(const char *db_path, experiment_t **out)
         if (db) sqlite3_close(db);
         return 0;
     }
-    int nexp = load_experiments_from_db(db, out);
+    // Read before the packets are, so a row that lands during the load is
+    // looked at again next time rather than never.
+    long long max_id = viewer_cache_db_max_id(db);
+    double cutoff = viewer_cache_now_ms() - VIEWER_CACHE_SETTLED_MS;
+
+    viewer_cache_info_t ci = {0};
+    experiment_t *cached = NULL;
+    int nc = -1;
+    FILE *cf = (rebuild || max_id < 0) ? NULL
+             : viewer_cache_open(MPI_CACHE_NAME, db_path, max_id, &ci);
+    if (cf != NULL) {
+        nc = read_cache(cf, &cached);
+        fclose(cf);
+    }
+
+    if (nc < 0) {
+        int n = load_experiments_from_db(db, NULL, 0, out);
+        sqlite3_close(db);
+        if (n > 0 && max_id >= 0) write_cache(db_path, *out, n, cutoff, max_id);
+        return n;
+    }
+
+    char since[32];
+    viewer_cache_iso(ci.cutoff_ms - VIEWER_CACHE_MARGIN_MS, since, sizeof since);
+    experiment_t *fresh = NULL;
+    int nf = load_experiments_from_db(db, since, ci.max_id, &fresh);
     sqlite3_close(db);
-    return nexp;
+
+    // A fresh experiment that started before the cutoff, or that is one of the
+    // cached recordings, is part of one the cache already holds: the
+    // stretch of its download that falls inside the window. Only packets
+    // the cache has not seen make it worth telling the operator about.
+    experiment_t *all = (experiment_t *) malloc((size_t) (nc + nf > 0 ? nc + nf : 1) * sizeof *all);
+    if (all == NULL) {
+        free_experiments(cached, nc);
+        free_experiments(fresh, nf);
+        return 0;
+    }
+    int n = 0;
+    for (int k = 0; k < nc; k++) all[n++] = cached[k];
+    for (int k = 0; k < nf; k++) {
+        if (fresh[k].t_start_ms >= ci.cutoff_ms && !is_cached(&fresh[k], cached, nc)) {
+            all[n++] = fresh[k];
+            continue;
+        }
+        if (fresh[k].max_id > ci.max_id) note->newer++;
+        free_experiment(&fresh[k]);
+    }
+    free(cached);
+    free(fresh);
+    qsort(all, (size_t) n, sizeof *all, by_newest_start);
+    note->from_cache = nc;
+    note->cutoff_ms = ci.cutoff_ms;
+
+    // Move the cutoff up to a week ago once it has fallen a day behind. The
+    // recordings that cross it were rebuilt whole just now, every packet of
+    // theirs having come down after they started. Held back while there are
+    // newer downloads the cache has not taken in, which moving the cutoff
+    // past them would forget.
+    if (note->newer == 0 && cutoff - ci.cutoff_ms >= VIEWER_CACHE_ROLL_MS) {
+        write_cache(db_path, all, n, cutoff, max_id);
+        note->from_cache = 0;
+        for (int k = 0; k < n; k++) if (all[k].t_start_ms < cutoff) note->from_cache++;
+        note->cutoff_ms = cutoff;
+    }
+    *out = all;
+    return n;
+}
+
+// The line that says the DB has downloads of cached recordings the cache has
+// not taken in; "" when it has none.
+static void newer_note(const load_note_t *note, char *out, size_t n)
+{
+    out[0] = '\0';
+    if (note->newer == 0) return;
+    char day[24];
+    fmt_utc_s(note->cutoff_ms, day, sizeof day);
+    day[10] = '\0';
+    snprintf(out, n, "%d newer download%s of recordings from before %s not shown: "
+             "shift-F5 rebuilds them", note->newer, note->newer == 1 ? "" : "s", day);
 }
 
 // ---- target-voltage setpoints ----------------------------------------------
@@ -2721,14 +2943,19 @@ int main(int argc, char **argv)
     if (sso_version_handle(argc, argv, "mpi_viewer")) return 0;
 
     const char *db_arg = NULL;
-    int list_only = 0;
+    int list_only = 0, rebuild = 0;
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--db=", 5) == 0) db_arg = argv[i] + 5;
         else if (strcmp(argv[i], "--list") == 0) list_only = 1;
+        else if (strcmp(argv[i], "--rebuild-cache") == 0) rebuild = 1;
         else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: mpi_viewer [--db=<packet_db.sqlite>] [--list]\n"
+            printf("Usage: mpi_viewer [--db=<packet_db.sqlite>] [--list] [--rebuild-cache]\n"
                    "Inspect MPI science imagery reconstructed from the packet DB.\n"
                    "The left panel lists MPI experiments, newest first; F5 re-reads the DB.\n"
+                   "Recordings that started more than a week ago come out of a cache in\n"
+                   "~/.cache/simple_sat_ops/ and are rebuilt only by shift-F5 or\n"
+                   "--rebuild-cache; the viewer says when the DB has newer downloads\n"
+                   "of them than the cache.\n"
                    "t tags the experiment on show as a favourite and shift-T shows\n"
                    "the favourites only.\n"
                    "Press b to show the cleaned imagery -- the instrument's own\n"
@@ -2770,12 +2997,18 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "mpi_viewer: reconstructing MPI experiments from %s ...\n", db_path);
     experiment_t *exps = NULL;
-    int nexp = reload_experiments(db_path, &exps);
+    load_note_t note;
+    int nexp = load_experiments(db_path, rebuild, &exps, &note);
     if (nexp == 0) {
         fprintf(stderr, "mpi_viewer: no MPI science-data experiments found.\n");
         return 1;
     }
-    fprintf(stderr, "mpi_viewer: %d MPI experiment%s.\n", nexp, nexp == 1 ? "" : "s");
+    fprintf(stderr, "mpi_viewer: %d MPI experiment%s", nexp, nexp == 1 ? "" : "s");
+    if (note.from_cache > 0) fprintf(stderr, ", %d of them from the cache", note.from_cache);
+    fprintf(stderr, ".\n");
+    char newer[160];
+    newer_note(&note, newer, sizeof newer);
+    if (newer[0]) fprintf(stderr, "mpi_viewer: %s.\n", newer);
 
     if (list_only) {
         for (int k = 0; k < nexp; k++) {
@@ -2898,7 +3131,7 @@ int main(int argc, char **argv)
     // for drawing which way the satellite was facing as the recording ran.
     // The MPI is run out of sight of the ground stations, so a log that
     // spans the recording is usually the only record of it.
-    beacon_attitude_load(db_path);
+    beacon_attitude_load(db_path, MPI_ATTITUDE_CACHE_NAME, rebuild);
 
     // Where the experiment list is scrolled to, in pixels. Scrolling is the
     // reader's, not the selection's: the list is pulled back to the selected
@@ -3105,10 +3338,13 @@ int main(int argc, char **argv)
         }
         // F5: re-read the DB and rebuild the experiment list, preserving the
         // current selection, image position and view settings where possible.
+        // Shift-F5 rebuilds the cached recordings too, and the cache with them.
         if (IsKeyPressed(KEY_F5)) {
+            int full = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
             int save_img = v.img_pos, save_play = v.playing;
             experiment_t *ne = NULL;
-            int nn = reload_experiments(db_path, &ne);
+            load_note_t nnote;
+            int nn = load_experiments(db_path, full, &ne, &nnote);
             int *nr = nn > 0 ? (int *) realloc(rows, (size_t) nn * sizeof(int)) : NULL;
             if (nr != NULL) {
                 // Stay on the same experiment, found by its start time: a new
@@ -3136,8 +3372,14 @@ int main(int argc, char **argv)
                 s = &exps[v.sel];
                 cov_valid = 0;   // the reloaded experiment needs a fresh whereogram
                 globe_load_tles(db_path);
-                beacon_attitude_load(db_path);
+                beacon_attitude_load(db_path, MPI_ATTITUDE_CACHE_NAME, full);
                 globe.track_key[0] = '\0';   // and a fresh ground track
+                note = nnote;
+                newer_note(&note, newer, sizeof newer);
+                snprintf(status, sizeof status, "%s: %d experiment%s",
+                         full ? "rebuilt from the whole DB" : "reloaded",
+                         nexp, nexp == 1 ? "" : "s");
+                status_left = 6.0f;
             } else if (ne != NULL) {
                 free_experiments(ne, nn);
             }
@@ -3601,9 +3843,12 @@ int main(int argc, char **argv)
             }
         }
 
-        // the d-export outcome, above the help footer
+        // the d-export or reload outcome, above the help footer; otherwise
+        // whether the cache is behind the DB, which stays up until rebuilt
         if (status_left > 0.0f)
             draw_text(status, 12, GetScreenHeight() - 42, 14, (Color){ 120, 220, 160, 255 });
+        else if (newer[0])
+            draw_text(newer, 12, GetScreenHeight() - 42, 14, (Color){ 240, 196, 64, 255 });
 
         // help footer
         const char *help =
@@ -3611,7 +3856,7 @@ int main(int argc, char **argv)
             "   globe: drag turns, two-finger press-drag turns about the satellite, scroll zooms, g resets"
             "   Space play/pause   ,/. speed   f steps/sweep   s zoom   a scale"
             "   z/x min  c/v max   m colour map   b clean  B step   n bg window   e median/mean"
-            "   t favourite  T favourites only   d re-download commands   F5 refresh  q quit";
+            "   t favourite  T favourites only   d re-download commands   F5 refresh  shift-F5 rebuild  q quit";
         draw_text(help, 12, GetScreenHeight() - 22, 12, (Color){ 150, 150, 160, 255 });
 
         EndDrawing();

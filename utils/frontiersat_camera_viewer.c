@@ -81,8 +81,21 @@
 
     Read-only on the DB. Press F5 to re-read it and rebuild the capture list.
 
+    The cache: a picture taken (or, with no capture command on record, first
+    downloaded) more than a week ago is not put together again at every
+    start. It is kept, as built, in
+    ~/.cache/simple_sat_ops/frontiersat_camera_viewer.cache
+    (utils/viewer_cache.h has the rules), and only the rest is rebuilt, from
+    the last week or so of packets and whatever the DB has gained since the
+    cache was written. A download of an old picture that comes in later is
+    not folded in by itself: the info panel says how many such downloads it
+    has left out, and shift-F5 (or --rebuild-cache) rebuilds every picture
+    from the whole DB and writes the cache afresh. The attitudes keep a cache
+    of their own beside it, by the same rules. A new build of the viewer
+    starts with a full rebuild, and deleting the cache files is always safe.
+
     Usage:
-      frontiersat_camera_viewer [--db=<packet_db.sqlite>]
+      frontiersat_camera_viewer [--db=<packet_db.sqlite>] [--rebuild-cache]
 
     With no --db the default store is used ($SSO_PACKET_DB, else the
     FrontierSat root's packet_db.sqlite).
@@ -112,6 +125,7 @@
 #include "sat_globe.h"
 #include "sso_paths.h"
 #include "sso_version.h"
+#include "viewer_cache.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -217,6 +231,7 @@ extern void  sso_install_pinch_monitor(void);
 #define FOOTER_H 28
 
 typedef struct {
+    long long id;               // the packet's row in the DB
     double   ts_ms;
     long     off;
     int      rs;
@@ -253,6 +268,7 @@ typedef struct {
     int      n_sessions;
     double   sess_ms[MAX_SESSIONS_SHOWN];
     int      chunks;
+    long long max_id;                  // the newest of its packets' DB rows
     uint8_t *buf;
     uint8_t *present;
     long     size;
@@ -374,15 +390,26 @@ static long chunk_declared_total(long off, const uint8_t *d, long n)
 
 // Load every bulk_file packet that looks like camera data, oldest first.
 // Returns 0 on success; the caller frees each chunk's data and the array.
-static int load_camera_chunks(sqlite3 *db, chunk_t **out, int *out_n)
+// The camera packets among every bulk_file packet, or with `since` (an ISO
+// time as ts_received writes it) among those received from then on plus every
+// row newer than after_id -- the part a start with a cache has to rebuild.
+static int load_camera_chunks(sqlite3 *db, const char *since, long long after_id,
+                              chunk_t **out, int *out_n)
 {
-    const char *sql =
-        "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload, rs_errs "
-        "FROM packet WHERE packet_type=16 ORDER BY ts_received, id";
+    const char *sql = since == NULL
+        ? "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload, rs_errs, id "
+          "FROM packet WHERE packet_type=16 ORDER BY ts_received, id"
+        : "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload, rs_errs, id "
+          "FROM packet WHERE packet_type=16 AND (ts_received >= ?1 OR id > ?2) "
+          "ORDER BY ts_received, id";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
         fprintf(stderr, "frontiersat_camera_viewer: query failed: %s\n", sqlite3_errmsg(db));
         return -1;
+    }
+    if (since != NULL) {
+        sqlite3_bind_text(st, 1, since, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, after_id);
     }
 
     chunk_t *cs = NULL;
@@ -406,6 +433,7 @@ static int load_camera_chunks(sqlite3 *db, chunk_t **out, int *out_n)
         }
         chunk_t *c = &cs[n];
         memset(c, 0, sizeof *c);
+        c->id    = sqlite3_column_int64(st, 3);
         c->ts_ms = sqlite3_column_double(st, 0);
         c->off   = off;
         c->rs    = sqlite3_column_int(st, 2);
@@ -463,19 +491,39 @@ static long reassemble(const chunk_t *cs, const int *idx, int nidx,
     return size;
 }
 
-// Compare two sessions over the image-data bytes both recovered. Fills
+// Compare two downloads over the image-data bytes both recovered. Fills
 // *n_compared and *n_differ.
-static void compare_sessions(const session_t *a, const session_t *b,
-                             long *n_compared, long *n_differ)
+static void compare_bytes(const uint8_t *abuf, const uint8_t *apresent, long asize,
+                          const uint8_t *bbuf, const uint8_t *bpresent, long bsize,
+                          long *n_compared, long *n_differ)
 {
-    long lim = a->size < b->size ? a->size : b->size;
+    long lim = asize < bsize ? asize : bsize;
     long cmp = 0, differ = 0;
     for (long k = MATCH_FIRST_OFFSET; k < lim; k++) {
-        if (!a->present[k] || !b->present[k]) continue;
+        if (!apresent[k] || !bpresent[k]) continue;
         cmp++;
-        if (a->buf[k] != b->buf[k]) differ++;
+        if (abuf[k] != bbuf[k]) differ++;
     }
     *n_compared = cmp; *n_differ = differ;
+}
+
+// Whether two downloads are of the same picture. Content decides when the two
+// share enough bytes to judge; otherwise the satellite file path from the
+// command log does, which is the only evidence for a follow-up pass that
+// fetched exactly the ranges the first pass missed. Content also has a veto:
+// if the shared bytes disagree these are different pictures, whatever the log
+// says.
+static int same_picture(const uint8_t *abuf, const uint8_t *apresent, long asize,
+                        const char *apath,
+                        const uint8_t *bbuf, const uint8_t *bpresent, long bsize,
+                        const char *bpath)
+{
+    long cmp = 0, differ = 0;
+    compare_bytes(abuf, apresent, asize, bbuf, bpresent, bsize, &cmp, &differ);
+    int judged = cmp >= MATCH_MIN_BYTES;
+    int contradicts = judged && (double) differ / (double) cmp > MATCH_MAX_MISMATCH;
+    int same_path = apath[0] != '\0' && strcmp(apath, bpath) == 0;
+    return !contradicts && (judged || same_path);
 }
 
 // ---- the ground station's command log --------------------------------------
@@ -659,21 +707,12 @@ static int build_captures(const chunk_t *cs, int n, const camcmd_t *cmds, int nc
         i = j + 1;
     }
 
-    // Merge sessions of the same picture. Content decides when the two share
-    // enough bytes to judge; otherwise the satellite file path from the command
-    // log does, which is the only evidence for a follow-up pass that fetched
-    // exactly the ranges the first pass missed. Content also has a veto: if the
-    // shared bytes disagree these are different pictures, whatever the log says.
+    // Merge sessions of the same picture (same_picture says how that is told).
     for (int a = 0; a < ns; a++) {
         for (int b = a + 1; b < ns; b++) {
-            long cmp = 0, differ = 0;
-            compare_sessions(&ss[a], &ss[b], &cmp, &differ);
-            int judged = cmp >= MATCH_MIN_BYTES;
-            int contradicts = judged && (double) differ / (double) cmp > MATCH_MAX_MISMATCH;
-            int same_path = ss[a].sat_path[0] != '\0'
-                            && strcmp(ss[a].sat_path, ss[b].sat_path) == 0;
-            int same = !contradicts && (judged || same_path);
-            if (!same) continue;
+            if (!same_picture(ss[a].buf, ss[a].present, ss[a].size, ss[a].sat_path,
+                              ss[b].buf, ss[b].present, ss[b].size, ss[b].sat_path))
+                continue;
             int ga = ss[a].grp, gb = ss[b].grp;
             int lo = ga < gb ? ga : gb, hi = ga < gb ? gb : ga;
             for (int k = 0; k < ns; k++) if (ss[k].grp == hi) ss[k].grp = lo;
@@ -705,6 +744,8 @@ static int build_captures(const chunk_t *cs, int n, const camcmd_t *cmds, int nc
 
         c.n_sessions = nsess;
         c.chunks = nidx;
+        for (int q = 0; q < nidx; q++)
+            if (cs[idx[q]].id > c.max_id) c.max_id = cs[idx[q]].id;
         c.size = reassemble(cs, idx, nidx, &c.buf, &c.present);
         if (c.size <= 0) { free(c.buf); free(c.present); continue; }
         for (long b = 0; b < c.size; b++) if (c.present[b]) c.recovered++;
@@ -730,21 +771,15 @@ static int build_captures(const chunk_t *cs, int n, const camcmd_t *cmds, int nc
     return nout;
 }
 
-// Open the DB read-only, build the capture list, close. Returns the count (0 on
-// any failure). Used at startup and on manual refresh (F5).
-static int reload_captures(const char *db_path, capture_t **out)
+// Build the capture list from an open DB: every picture, or with `since` the
+// ones the packets load_camera_chunks picks out make. Returns the count.
+static int captures_from_db(sqlite3 *db, const char *since, long long after_id,
+                            capture_t **out)
 {
     *out = NULL;
-    sqlite3 *db = NULL;
-    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-        fprintf(stderr, "frontiersat_camera_viewer: cannot open %s: %s\n",
-                db_path, db ? sqlite3_errmsg(db) : "open failed");
-        if (db) sqlite3_close(db);
-        return 0;
-    }
     chunk_t *cs = NULL;
     int n = 0, ncaps = 0;
-    if (load_camera_chunks(db, &cs, &n) == 0 && n > 0) {
+    if (load_camera_chunks(db, since, after_id, &cs, &n) == 0 && n > 0) {
         camcmd_t *cmds = NULL;
         int ncmds = load_camera_commands(db, &cmds);
         ncaps = build_captures(cs, n, cmds, ncmds, out);
@@ -752,8 +787,188 @@ static int reload_captures(const char *db_path, capture_t **out)
     }
     for (int k = 0; k < n; k++) free(cs[k].data);
     free(cs);
-    sqlite3_close(db);
     return ncaps;
+}
+
+// ---- the cache -------------------------------------------------------------
+//
+// Pictures taken (or, with no capture command on record, first downloaded)
+// more than a week before the cache was written are kept in it, as built,
+// and the rest are rebuilt from the DB at every start (see viewer_cache.h for
+// the policy). A capture goes into the file as its struct followed by its
+// file bytes, which of them arrived, and its JPEG; the textures are made
+// from the JPEG once the window is up, as for a capture built from the DB.
+
+#define CAM_CACHE_NAME "frontiersat_camera_viewer"
+// The attitudes keep a cache of their own (beacon_attitude.h).
+#define CAM_ATTITUDE_CACHE_NAME "frontiersat_camera_viewer_attitude"
+
+// What a load says about where its captures came from, for the viewer to
+// pass on.
+typedef struct {
+    int    from_cache;   // captures read out of the cache
+    int    newer;        // newer downloads of cached pictures left out
+    double cutoff_ms;    // the cache holds pictures from before this
+} load_note_t;
+
+static void write_cache(const char *db_path, const capture_t *caps, int n,
+                        double cutoff_ms, long long max_id)
+{
+    viewer_cache_info_t info = { .cutoff_ms = cutoff_ms, .max_id = max_id };
+    viewer_cache_writer_t w;
+    if (viewer_cache_create(&w, CAM_CACHE_NAME, db_path, &info) != 0) {
+        fprintf(stderr, "frontiersat_camera_viewer: cannot write the cache; "
+                        "every start will rebuild\n");
+        return;
+    }
+    int nc = 0;
+    for (int k = 0; k < n; k++) if (capture_moment(&caps[k]) < cutoff_ms) nc++;
+    viewer_cache_write(&w, &nc, sizeof nc);
+    for (int k = 0; k < n; k++) {
+        const capture_t *c = &caps[k];
+        if (capture_moment(c) >= cutoff_ms) continue;
+        viewer_cache_write(&w, c, sizeof *c);
+        viewer_cache_write(&w, c->buf, (size_t) c->size);
+        viewer_cache_write(&w, c->present, (size_t) c->size);
+        viewer_cache_write(&w, c->jpg, (size_t) c->jpg_len);
+    }
+    if (viewer_cache_commit(&w) != 0)
+        fprintf(stderr, "frontiersat_camera_viewer: cannot write the cache %s\n", w.path);
+}
+
+// The captures in an open cache file. Returns the count, or -1 if the file is
+// damaged.
+static int read_cache(FILE *f, capture_t **out)
+{
+    *out = NULL;
+    int n = 0;
+    if (viewer_cache_read(f, &n, sizeof n) != 0 || n < 0 || n > 100000) return -1;
+    capture_t *caps = (capture_t *) calloc((size_t) (n > 0 ? n : 1), sizeof *caps);
+    if (caps == NULL) return -1;
+    for (int k = 0; k < n; k++) {
+        capture_t *c = &caps[k];
+        if (viewer_cache_read(f, c, sizeof *c) != 0 || c->size < 0 || c->jpg_len < 0) {
+            memset(c, 0, sizeof *c);
+            free_captures(caps, k);
+            return -1;
+        }
+        // The writer's pointers and textures mean nothing here.
+        c->tex_ok = 0;
+        c->fav = 0;
+        c->buf = viewer_cache_read_alloc(f, (size_t) c->size);
+        c->present = c->buf ? viewer_cache_read_alloc(f, (size_t) c->size) : NULL;
+        c->jpg = c->present ? viewer_cache_read_alloc(f, (size_t) c->jpg_len) : NULL;
+        if (c->jpg == NULL) {
+            free_captures(caps, k + 1);
+            return -1;
+        }
+    }
+    *out = caps;
+    return n;
+}
+
+// Load the captures to show: the cached ones and the rest rebuilt from the
+// DB, or with `rebuild` (or no usable cache) every one of them rebuilt, and
+// the cache written afresh. Returns the count (0 on any failure). Used at
+// startup and on F5 (shift-F5 rebuilds).
+static int load_captures(const char *db_path, int rebuild, capture_t **out,
+                         load_note_t *note)
+{
+    *out = NULL;
+    memset(note, 0, sizeof *note);
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        fprintf(stderr, "frontiersat_camera_viewer: cannot open %s: %s\n",
+                db_path, db ? sqlite3_errmsg(db) : "open failed");
+        if (db) sqlite3_close(db);
+        return 0;
+    }
+    // Read before the packets are, so a row that lands during the load is
+    // looked at again next time rather than never.
+    long long max_id = viewer_cache_db_max_id(db);
+    double cutoff = viewer_cache_now_ms() - VIEWER_CACHE_SETTLED_MS;
+
+    viewer_cache_info_t ci = {0};
+    capture_t *cached = NULL;
+    int nc = -1;
+    FILE *cf = (rebuild || max_id < 0) ? NULL
+             : viewer_cache_open(CAM_CACHE_NAME, db_path, max_id, &ci);
+    if (cf != NULL) {
+        nc = read_cache(cf, &cached);
+        fclose(cf);
+    }
+
+    if (nc < 0) {
+        int n = captures_from_db(db, NULL, 0, out);
+        sqlite3_close(db);
+        if (n > 0 && max_id >= 0) write_cache(db_path, *out, n, cutoff, max_id);
+        return n;
+    }
+
+    char since[32];
+    viewer_cache_iso(ci.cutoff_ms - VIEWER_CACHE_MARGIN_MS, since, sizeof since);
+    capture_t *fresh = NULL;
+    int nf = captures_from_db(db, since, ci.max_id, &fresh);
+    sqlite3_close(db);
+
+    // A fresh capture from before the cutoff, or that is one of the cached
+    // pictures, is part of one the cache already holds: the stretch of its
+    // download that falls inside the window. Only packets the cache has not
+    // seen make it worth telling the operator about.
+    capture_t *all = (capture_t *) malloc((size_t) (nc + nf > 0 ? nc + nf : 1) * sizeof *all);
+    if (all == NULL) {
+        free_captures(cached, nc);
+        free_captures(fresh, nf);
+        return 0;
+    }
+    int n = 0;
+    for (int k = 0; k < nc; k++) all[n++] = cached[k];
+    for (int k = 0; k < nf; k++) {
+        capture_t *c = &fresh[k];
+        int known = 0;
+        for (int j = 0; j < nc && !known; j++)
+            known = same_picture(c->buf, c->present, c->size, c->sat_path,
+                                 cached[j].buf, cached[j].present, cached[j].size,
+                                 cached[j].sat_path);
+        if (!known && capture_moment(c) >= ci.cutoff_ms) {
+            all[n++] = *c;
+            continue;
+        }
+        if (c->max_id > ci.max_id) note->newer++;
+        free(c->buf); free(c->present); free(c->jpg);
+    }
+    free(cached);
+    free(fresh);
+    qsort(all, (size_t) n, sizeof *all, by_newest_first);
+    note->from_cache = nc;
+    note->cutoff_ms = ci.cutoff_ms;
+
+    // Move the cutoff up to a week ago once it has fallen a day behind. The
+    // pictures that cross it were rebuilt whole just now, every packet of
+    // theirs having come down after the picture was taken. Held back while
+    // there are newer downloads the cache has not taken in, which moving the
+    // cutoff past them would forget.
+    if (note->newer == 0 && cutoff - ci.cutoff_ms >= VIEWER_CACHE_ROLL_MS) {
+        write_cache(db_path, all, n, cutoff, max_id);
+        note->from_cache = 0;
+        for (int k = 0; k < n; k++) if (capture_moment(&all[k]) < cutoff) note->from_cache++;
+        note->cutoff_ms = cutoff;
+    }
+    *out = all;
+    return n;
+}
+
+// The line that says the DB has downloads of cached pictures the cache has not
+// taken in; "" when it has none.
+static void newer_note(const load_note_t *note, char *out, size_t n)
+{
+    out[0] = '\0';
+    if (note->newer == 0) return;
+    char day[24];
+    fmt_utc_s(note->cutoff_ms, day, sizeof day);
+    day[10] = '\0';
+    snprintf(out, n, "%d newer download%s of pictures from before %s not shown: "
+             "shift-F5 rebuilds them", note->newer, note->newer == 1 ? "" : "s", day);
 }
 
 // ---- textures --------------------------------------------------------------
@@ -1118,12 +1333,18 @@ int main(int argc, char **argv)
     if (sso_version_handle(argc, argv, "frontiersat_camera_viewer")) return 0;
 
     const char *db_arg = NULL;
+    int rebuild = 0;
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--db=", 5) == 0) db_arg = argv[i] + 5;
+        else if (strcmp(argv[i], "--rebuild-cache") == 0) rebuild = 1;
         else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: frontiersat_camera_viewer [--db=<packet_db.sqlite>]\n"
+            printf("Usage: frontiersat_camera_viewer [--db=<packet_db.sqlite>] [--rebuild-cache]\n"
                    "Look at FrontierSat's boom-camera pictures rebuilt from the packet DB.\n"
                    "The left panel lists captures, newest first, one row per picture; F5 re-reads the DB.\n"
+                   "Pictures taken more than a week ago come out of a cache in\n"
+                   "~/.cache/simple_sat_ops/ and are rebuilt only by shift-F5 or\n"
+                   "--rebuild-cache; the viewer says when the DB has newer downloads\n"
+                   "of them than the cache.\n"
                    "e shows the picture histogram-equalized, c with its colours stretched to\n"
                    "full scale; the same key again shows it as received.\n"
                    "f tags a favourite, v shows the favourites only. Favourites, that choice\n"
@@ -1148,13 +1369,19 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "frontiersat_camera_viewer: rebuilding camera captures from %s ...\n", db_path);
     capture_t *caps = NULL;
-    int ncaps = reload_captures(db_path, &caps);
+    load_note_t note;
+    int ncaps = load_captures(db_path, rebuild, &caps, &note);
     if (ncaps == 0) {
         fprintf(stderr, "frontiersat_camera_viewer: no boom-camera captures found.\n");
         return 1;
     }
-    fprintf(stderr, "frontiersat_camera_viewer: %d capture%s.\n",
+    fprintf(stderr, "frontiersat_camera_viewer: %d capture%s",
             ncaps, ncaps == 1 ? "" : "s");
+    if (note.from_cache > 0) fprintf(stderr, ", %d of them from the cache", note.from_cache);
+    fprintf(stderr, ".\n");
+    char newer[160];
+    newer_note(&note, newer, sizeof newer);
+    if (newer[0]) fprintf(stderr, "frontiersat_camera_viewer: %s.\n", newer);
 
     SetTraceLogLevel(LOG_NONE);
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
@@ -1177,7 +1404,7 @@ int main(int argc, char **argv)
     // The attitudes the extended beacons and the ADCS's SD-card logs
     // carry, for drawing which way the camera was facing. With neither
     // near the moment, the globe shows the ground track on its own.
-    beacon_attitude_load(db_path);
+    beacon_attitude_load(db_path, CAM_ATTITUDE_CACHE_NAME, rebuild);
 
 #ifdef __APPLE__
     sso_install_pinch_monitor();
@@ -1357,9 +1584,13 @@ int main(int argc, char **argv)
         }
         if (IsKeyPressed(KEY_S)) { save_jpeg(c, status, sizeof status); status_left = 6.0f; }
         if (IsKeyPressed(KEY_O)) { open_in_system_viewer(c, status, sizeof status); status_left = 6.0f; }
+        // F5 re-reads the DB; shift-F5 rebuilds the cached pictures too, and
+        // the cache with them.
         if (IsKeyPressed(KEY_F5)) {
+            int full = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
             capture_t *nc = NULL;
-            int nn = reload_captures(db_path, &nc);
+            load_note_t nnote;
+            int nn = load_captures(db_path, full, &nc, &nnote);
             int *nr = nn > 0 ? (int *) realloc(rows, (size_t) nn * sizeof(int)) : NULL;
             if (nr != NULL) {
                 // Stay on the same picture, found by name: a new picture at
@@ -1384,9 +1615,12 @@ int main(int argc, char **argv)
                 zoom = 1.0f;
                 pan = (Vector2){ 0, 0 };
                 globe_load_tles(db_path);
-                beacon_attitude_load(db_path);
+                beacon_attitude_load(db_path, CAM_ATTITUDE_CACHE_NAME, full);
                 globe.track_key[0] = 0;      // and a fresh ground track
-                snprintf(status, sizeof status, "reloaded: %d capture%s",
+                note = nnote;
+                newer_note(&note, newer, sizeof newer);
+                snprintf(status, sizeof status, "%s: %d capture%s",
+                         full ? "rebuilt from the whole DB" : "reloaded",
                          ncaps, ncaps == 1 ? "" : "s");
             } else {
                 if (nc != NULL) free_captures(nc, nn);
@@ -1577,8 +1811,12 @@ int main(int argc, char **argv)
                                          zoom <= 1.0f ? "  (whole picture)" : "")
                             : "zoom         : -",
                   col2, iy + 20, 15, LIGHTGRAY);
+        // The last action's outcome; otherwise whether the cache is behind
+        // the DB, which stays up until it is rebuilt.
         if (status_left > 0.0f)
             draw_text(status, col2, iy + 40, 15, (Color){ 120, 220, 160, 255 });
+        else if (newer[0])
+            draw_text(newer, col2, iy + 40, 15, (Color){ 240, 196, 64, 255 });
 
         {
             char line[256] = "";
@@ -1600,7 +1838,7 @@ int main(int argc, char **argv)
         // help footer
         draw_text("Up/Down capture   scroll or pinch zoom   drag to move   e equalize   c stretch colours   "
                   "globe: drag turns, scroll zooms, g resets, p outlines picture   "
-                  "f favourite   v favourites only   o open   s save jpeg   F5 refresh   q quit",
+                  "f favourite   v favourites only   o open   s save jpeg   F5 refresh   shift-F5 rebuild   q quit",
                   12, sh - 22, 12, (Color){ 150, 150, 160, 255 });
 
         EndDrawing();

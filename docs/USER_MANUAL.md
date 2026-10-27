@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`11071cf` (2026-10-22). This is a working draft.
+`7983f6a` (2026-10-22). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2448,6 +2448,7 @@ where the best single pass had left holes.
 ```sh
 frontiersat_camera_viewer                              # default database
 frontiersat_camera_viewer --db=/FrontierSat/packet_db.sqlite
+frontiersat_camera_viewer --rebuild-cache              # rebuild the cached older pictures too
 ```
 
 Camera packets are picked out of the `bulk_file` traffic by the camera file's
@@ -2673,8 +2674,30 @@ in the temporary directory - for a look in whatever viewer you already keep
 your pictures in. `s` saves the JPEG to
 the working directory as `fs_boomcam_<capture time>.jpg`, `g` resets the globe,
 `p` outlines the picture on it, **`F5` re-reads the database** and rebuilds
-the list, and `q` quits. Read-only
-on the database and safe to run while a receiver is filling it.
+the list, **`shift-F5` rebuilds the cached pictures too** (below), and `q`
+quits. Read-only on the database and safe to run while a receiver is filling
+it.
+
+**Older pictures come out of a cache.** A picture taken more than a week ago
+(or, with no `camera_capture` command on record, first downloaded more than a
+week ago) is not put together again at every start. It is kept as built in
+`~/.cache/simple_sat_ops/frontiersat_camera_viewer.cache` (under
+`$XDG_CACHE_HOME` when that is set), and each start or `F5` rebuilds only the
+rest. It reads the packets received from a day before the cache's cutoff
+onwards, plus any packet added to the database since the cache was written,
+whatever its time. A later download of an old picture is not folded in by
+itself. The info panel says in gold how many such downloads it has left out,
+for example `1 newer download of pictures from before 2026-10-20 not shown:
+shift-F5 rebuilds them`. `shift-F5`, or starting with `--rebuild-cache`,
+rebuilds every picture from the whole database and writes the cache afresh.
+Once the cutoff is a day behind "a week ago", a start moves it forward and
+rewrites the cache, so the rebuilt stretch stays about a week long. The
+attitudes the globe draws keep their own cache beside it, by the same rules.
+Those are single moments rather than pictures, so a late download of old
+attitudes is simply added. A newly built or installed viewer ignores the old
+cache and starts with a full rebuild, and deleting the cache files is always
+safe. On the 2026-10-26 store a start reads 19 of the 25 pictures from the
+cache.
 
 ### `mpi_reconstruct`
 
@@ -2810,6 +2833,7 @@ being taken.
 mpi_viewer                              # default database
 mpi_viewer --db=/FrontierSat/packet_db.sqlite
 mpi_viewer --list                       # print what each experiment reconstructed to
+mpi_viewer --rebuild-cache              # rebuild the cached older recordings too
 ```
 
 `--list` prints one block per experiment - the on-satellite file, how long the
@@ -3140,11 +3164,33 @@ mean,
 `d` writes
 the re-download
 telecommands (below), **`F5` re-reads the database** and rebuilds the
-list (keeping your selection and view settings), and `q` quits.
+list (keeping your selection and view settings), **`shift-F5` rebuilds the
+cached recordings too** (below), and `q` quits.
 The experiment list scrolls with the wheel and a row can be clicked to select
 it; dragging the globe below it turns it, `g` puts its view back to the whole
 Earth, and scrolling over the globe zooms it rather than scrolling the list.
 Read-only on the database and safe to run while a receiver is filling it.
+
+**Older recordings come out of a cache.** A recording that started more than a
+week ago is not put together again at every start. It is kept as built in
+`~/.cache/simple_sat_ops/mpi_viewer.cache` (under `$XDG_CACHE_HOME` when that
+is set), and each start or `F5` rebuilds only the rest. It reads the packets
+received from a day before the cache's cutoff onwards, plus any packet added
+to the database since the cache was written, whatever its time. A later
+download of an old recording, such as a re-download of its holes from a `d`
+export, is not folded in by itself. A gold line above the help footer says
+how many such downloads it has left out, for example `1 newer download of
+recordings from before 2026-10-20 not shown: shift-F5 rebuilds them`.
+`shift-F5`, or starting with `--rebuild-cache` (which `--list` honours too),
+rebuilds every recording from the whole database and writes the cache
+afresh. Once the cutoff is a day behind "a week ago", a start moves it
+forward and rewrites the cache, so the rebuilt stretch stays about a week
+long. The attitudes keep their own cache beside it, by the same rules. Those
+are single moments rather than recordings, so a late download of old
+attitudes is simply added. A newly built or installed viewer ignores the old
+cache and starts with a full rebuild, and deleting the cache files is always
+safe. On the 2026-10-26 store a start reads 11 of the 14 recordings from the
+cache, which is about 20 MB.
 
 **Where the pixels sit in a frame.** The 152-byte frame is 20 bytes of aux, then
 the 65 pixels as big-endian `uint16` in bytes 20..149, then a CCITT CRC-16 over

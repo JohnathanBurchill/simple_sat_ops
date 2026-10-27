@@ -566,7 +566,7 @@ if (RAYLIB_FOUND)
     # sgp4sdp4 where the Sun was, hence prediction.c (and oem.c, which it calls
     # into) and the vendored library.
     add_executable(mpi_viewer utils/mpi_viewer.c utils/sat_globe.c
-                   utils/sat_model.c
+                   utils/sat_model.c utils/viewer_cache.c
                    utils/beacon_attitude.c src/proto/adcs_sdlog.c src/proto/bulk_size.c
                    src/proto/adcs_mag.c src/orbit/prediction.c src/orbit/oem.c
                    src/orbit/attitude.c src/beacon/beacon_cts1.c src/orbit/bestxyz.c)
@@ -597,7 +597,7 @@ if (RAYLIB_FOUND)
     # where the Sun was, hence prediction.c (and oem.c, which it calls into),
     # adcs_mag.c for the TLE epochs, and the vendored library.
     set(CAMERA_VIEWER_SRCS utils/frontiersat_camera_viewer.c utils/cam_jpeg.c
-                           utils/sat_globe.c utils/sat_model.c
+                           utils/sat_globe.c utils/sat_model.c utils/viewer_cache.c
                            utils/beacon_attitude.c src/proto/adcs_sdlog.c
                            src/proto/adcs_mag.c
                            src/orbit/prediction.c src/orbit/oem.c
@@ -906,6 +906,20 @@ if (OPENSSL_FOUND AND SQLITE3_FOUND)
     target_link_packet_db(packet_db_selftest)
     target_link_sso_core(packet_db_selftest)
     list(APPEND SSO_TARGETS packet_db_selftest)
+endif()
+
+# viewer_cache selftest: the cache file mpi_viewer and
+# frontiersat_camera_viewer keep -- above all, that a cache for another
+# database, a replaced database, a damaged file or an unfinished write never
+# reads as a good cache.
+if (SQLITE3_FOUND)
+    add_executable(viewer_cache_selftest unit_tests/viewer_cache_selftest.c
+                   utils/viewer_cache.c src/ipc/sso_paths.c)
+    target_include_directories(viewer_cache_selftest PRIVATE
+        ${UNIT_TESTS_INCLUDE} ${CMAKE_SOURCE_DIR}/utils ${SQLITE3_INCLUDE_DIRS})
+    target_link_directories(viewer_cache_selftest PRIVATE ${SQLITE3_LIBRARY_DIRS})
+    target_link_libraries(viewer_cache_selftest PRIVATE ${SQLITE3_LIBRARIES})
+    list(APPEND SSO_TARGETS viewer_cache_selftest)
 endif()
 
 # ----- Optional: OpenSSL-dependent (libcrypto) ------------------------------
