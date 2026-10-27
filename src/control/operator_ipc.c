@@ -29,6 +29,7 @@
 #include "sso_audit.h"
 #include "sso_ipc.h"
 #include "sso_operator.h"
+#include "sso_version.h"     // sso_version_string
 #include "tui.h"             // tui_install_yield_handler
 #include "viewer.h"          // read_operator_pid
 
@@ -330,7 +331,8 @@ int ipc_operator_startup(state_t *state, int argc, char **argv)
             if (off >= sizeof argv_buf) { off = sizeof argv_buf - 1; break; }
         }
         sso_audit_event("argv", argv_buf);
-        sso_action_log("app", "start user=%s pid=%d mode=%s",
+        sso_action_log("app", "start simple_sat_ops %s user=%s pid=%d mode=%s",
+                       sso_version_string(),
                        state->op.operator_user, (int) getpid(),
                        state->app.control_mode ? "operator" : "standalone");
         sso_action_log("app", "argv: %s", argv_buf);

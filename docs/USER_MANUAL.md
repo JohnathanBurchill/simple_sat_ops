@@ -1246,10 +1246,10 @@ Times are UTC. It covers operator keys and `:` commands (with their
 result), the TX compose and auto-TCMD modals, every rotator SET/STOP sent
 to the controller (and when its status replies stop or come back),
 tracking on/off, the pass window opening and closing, homing, sky scans,
-recording start/stop, TX results, viewers connecting, and startup and
-shutdown. Lines from startup, before the pass folder exists, are written
-out first once it does. Restarting into the same pass folder appends to
-the same file.
+recording start/stop, TX results, viewers connecting, and startup (with
+the build version and command line) and shutdown. Lines from startup,
+before the pass folder exists, are written out first once it does.
+Restarting into the same pass folder appends to the same file.
 
 ### Colon-command prompt
 
