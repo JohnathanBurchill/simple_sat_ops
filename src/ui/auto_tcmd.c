@@ -408,7 +408,7 @@ static void auto_tcmd_draw(state_t *state) {
     if (!running_ro && a->focus == AUTO_F_LOOP) wattroff(w, A_REVERSE);
     if (a->loop && a->loops_done > 0)
         mvw_printf_clip(w, 8, 7, "loop  (send the whole file again when done; "
-                        "%d pass(es) complete)", a->loops_done);
+                        "%d loop(s) done)", a->loops_done);
     else
         mvw_printf_clip(w, 8, 7, "loop  (send the whole file again when done)");
 
@@ -754,9 +754,9 @@ static int auto_tcmd_start(state_t *state) {
         a->tx_seconds_total += slot * (double) repeats;
         last_burst = burst;
     }
-    // A looping run restarts a pass one interval after its last send, so
-    // each pass costs the full sum; only the run's final send drops its tail.
-    a->pass_seconds = a->tx_seconds_total;
+    // A looping run restarts the file one interval after its last send, so
+    // each loop costs the full sum; only the run's final send drops its tail.
+    a->loop_seconds = a->tx_seconds_total;
     if (a->n_commands > 0 && interval > last_burst)
         a->tx_seconds_total -= (interval - last_burst);
     a->start_ns      = ts_now_ns();
@@ -863,7 +863,7 @@ static void auto_tcmd_restart(state_t *state) {
     a->cmd_idx          = 0;
     a->repeat_idx       = 0;
     a->sends_total      = 0;
-    a->tx_seconds_total -= a->pass_seconds * (double) a->loops_done;
+    a->tx_seconds_total -= a->loop_seconds * (double) a->loops_done;
     a->loops_done       = 0;
     a->loop_start_sends = 0;
     a->tx_seconds_spent = 0.0;
@@ -1038,7 +1038,7 @@ void auto_tcmd_tick(state_t *state) {
         return;
     }
 
-    // Loop mode: wrap to the top and send the whole file again. A pass that
+    // Loop mode: wrap to the top and send the whole file again. A loop that
     // keyed nothing (every line skipped) would wrap forever without a send,
     // so that ends the run as done instead.
     if (a->cmd_idx >= a->n_commands && a->loop
@@ -1047,9 +1047,9 @@ void auto_tcmd_tick(state_t *state) {
         a->repeat_idx       = 0;
         a->loops_done++;
         a->loop_start_sends = a->sends_total;
-        a->tx_seconds_total += a->pass_seconds;
+        a->tx_seconds_total += a->loop_seconds;
         snprintf(a->status_msg, sizeof a->status_msg,
-                 "looping: pass %d complete, starting pass %d",
+                 "looping: loop %d done, starting loop %d",
                  a->loops_done, a->loops_done + 1);
         char det[128];
         snprintf(det, sizeof det, "loops_done=%d sends_total=%d",
