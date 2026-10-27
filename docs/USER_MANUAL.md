@@ -1230,6 +1230,27 @@ written this run, or `Errors logged in <file>` pointing straight at it
 (the check compares the log's size against its size at startup, so a
 reused pass folder won't give a false positive from an earlier run).
 
+**Every action is logged in the pass folder.** `actions.log` in the pass
+folder is a plain-text record of the pass, one dated line per event:
+
+```
+2026-10-27T14:03:22.123Z [ui]    key 'T': Track satellite
+2026-10-27T14:03:22.124Z [track] tracking on: FRONTIERSAT
+2026-10-27T14:07:51.502Z [track] rotator tracking engaged: max_el=62.4 flip=no
+2026-10-27T14:07:51.610Z [rot]   SET az=212.0 el=3.1
+2026-10-27T14:09:02.330Z [cmd]   :freq 437.5
+2026-10-27T14:09:02.331Z [cmd]   -> freq -> 437.500000 MHz
+```
+
+Times are UTC. It covers operator keys and `:` commands (with their
+result), the TX compose and auto-TCMD modals, every rotator SET/STOP sent
+to the controller (and when its status replies stop or come back),
+tracking on/off, the pass window opening and closing, homing, sky scans,
+recording start/stop, TX results, viewers connecting, and startup and
+shutdown. Lines from startup, before the pass folder exists, are written
+out first once it does. Restarting into the same pass folder appends to
+the same file.
+
 ### Colon-command prompt
 
 Press `:` to open a one-line command bar at the bottom. The prompt

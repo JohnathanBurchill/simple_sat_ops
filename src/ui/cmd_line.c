@@ -24,6 +24,7 @@
 #include "auto_tcmd.h"
 #include "live_waterfall.h"
 #include "spectrogram.h"
+#include "sso_action_log.h"
 #include "sso_audit.h"
 #include "sso_ipc.h"
 #include "tracking.h"
@@ -821,6 +822,7 @@ int cmd_handle_key(int key, state_t *state)
         snprintf(executed, sizeof executed, "%s", state->cmd.buf);
         state->cmd.active = 0;
         cmd_history_push(state, executed);
+        if (executed[0]) sso_action_log("cmd", ":%s", executed);
         cmd_dispatch(state);
         // Audit: one line per `:` command the operator pressed Enter on,
         // with the post-dispatch status so a reviewer sees both the
@@ -832,6 +834,9 @@ int cmd_handle_key(int key, state_t *state)
                      "input=\"%.100s\" result=\"%.150s\"",
                      executed, state->cmd.status);
             sso_audit_event("cmd", det);
+            if (state->cmd.status[0]) {
+                sso_action_log("cmd", "-> %s", state->cmd.status);
+            }
         }
         // After dispatch, state->cmd.status holds the result string. Mirror
         // both to viewers so they see exactly what the operator sees.

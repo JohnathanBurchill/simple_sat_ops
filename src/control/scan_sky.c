@@ -23,6 +23,7 @@
 
 #include "tracking.h"
 
+#include "sso_action_log.h"
 #include "sso_audit.h"
 
 #include <math.h>
@@ -185,6 +186,8 @@ void scan_sky_start(state_t *state)
             state->scan.n_targets, state->scan.step_deg, SCAN_DWELL_S,
             state->scan.csv_path[0] ? state->scan.csv_path : "(none)");
         sso_audit_event("scan-sky-start", det);
+        sso_action_log("scan", "sky scan start: %d targets, %.1f deg step",
+                       state->scan.n_targets, state->scan.step_deg);
     }
 }
 
@@ -207,6 +210,8 @@ void scan_sky_stop(state_t *state, const char *reason)
             "reason=\"%.60s\" completed=%d/%d",
             reason ? reason : "?", done_idx, total);
         sso_audit_event("scan-sky-stop", det);
+        sso_action_log("scan", "sky scan stop (%s): %d/%d targets",
+                       reason ? reason : "?", done_idx, total);
     }
 }
 

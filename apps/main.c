@@ -25,6 +25,7 @@
 #include "tr_switch.h"
 #include "state.h"
 #include "prediction.h"
+#include "sso_action_log.h"
 #include "sso_audit.h"
 #include "sso_ipc.h"
 #include "operator_audio.h"
@@ -306,6 +307,12 @@ int main(int argc, char **argv)
     // to be overpainted when the status column grew (issue #35).
     state.ui.keyboard_unlocked = 1;
 
+    sso_action_log("app", "operator UI up: sat=%s rotator=%s",
+                   state.track.prediction.satellite_ephem.tle.sat_name[0]
+                       ? state.track.prediction.satellite_ephem.tle.sat_name : "?",
+                   state.rot.antenna_rotator.antenna_should_be_controlled
+                       ? "under control" : "not controlled");
+
     double current_az = 0;
     double current_el = 0;
 
@@ -341,7 +348,11 @@ int main(int argc, char **argv)
     while (state.app.running) {
         // Ctrl-C / SIGTERM: leave the loop and run the normal teardown
         // (endwin, rotator home, device close) instead of dying raw.
-        if (tui_should_quit()) { state.app.running = 0; break; }
+        if (tui_should_quit()) {
+            sso_action_log("app", "quit on SIGINT/SIGTERM");
+            state.app.running = 0;
+            break;
+        }
         double t_now = monotonic_seconds();
         UTC_Calendar_Now(&utc, &tv);
         jul_utc = Julian_Date(&utc, &tv);
@@ -414,6 +425,10 @@ int main(int argc, char **argv)
                     sec_to_aos,
                     state.track.prediction.satellite_ephem.elevation);
                 sso_audit_event("rec-start", det);
+                sso_action_log("rx", "recording start (%s, AOS in %.0f s, el=%.1f)",
+                               visible ? "satellite up" : "preroll",
+                               sec_to_aos,
+                               state.track.prediction.satellite_ephem.elevation);
             } else if (active) {
                 if (visible) {
                     t_recording_close_at = 0.0;  // cancel any pending close
@@ -423,6 +438,7 @@ int main(int argc, char **argv)
                     rx_session_request_wav_stop(state.sdr.rx_session);
                     t_recording_close_at = 0.0;
                     sso_audit_event("rec-stop", "trigger=postroll-expired");
+                    sso_action_log("rx", "recording stop (postroll expired)");
                 }
             }
         }
@@ -583,6 +599,7 @@ int main(int argc, char **argv)
         if (tui_yield_requested()) {
             sso_audit_event("yield-requested",
                             "SIGUSR1 (--force takeover) — exiting");
+            sso_action_log("app", "yielding control to a force-claim (SIGUSR1)");
             state.app.running = 0;
         }
 
@@ -616,6 +633,8 @@ int main(int argc, char **argv)
             usleep(nap);
         }
     }
+
+    sso_action_log("app", "operator UI shutting down");
 
     // Tear down live-audio encoders (and clear the RX tap) while the RX
     // session is still open.
@@ -717,6 +736,9 @@ int main(int argc, char **argv)
     if (state.track.prediction.auto_sat) {
         free_passes();
     }
+
+    sso_action_log("app", "end");
+    sso_action_log_close();
 
     // Final line: tell the operator whether anything landed in the
     // redirected stderr log during the pass.

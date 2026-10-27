@@ -24,6 +24,7 @@
 #include "panels.h"          // draw_box, tx_drain_csi
 #include "agenda_line.h"
 #include "frontiersat.h"
+#include "sso_action_log.h"
 #include "sso_audit.h"
 #include "sso_pseudo.h"
 #include "sso_time.h"
@@ -174,26 +175,14 @@ static void auto_tcmd_free_commands(char **commands, int n) {
     free(commands);
 }
 
-// Record an auto-tcmd lifecycle event (start / pause / resume / abort /
-// restart) in two places, because interrupting a run breaks the pass
-// operations plan and the operator needs an after-the-fact trail:
+// Record an auto-tcmd lifecycle event (start / stop / pause / resume /
+// abort / restart / loop) in two places, because interrupting a run breaks
+// the pass operations plan and the operator needs an after-the-fact trail:
 //   1. /var/log/sso/runs.log via the shared audit log (sso_audit_event), and
-//   2. <pass_folder>/session.log, a plain timestamped line kept alongside
-//      tx.log in the pass's operation folder.
-// The session-log write is a no-op until the pass folder exists.
-static void auto_tcmd_log(state_t *state, const char *event, const char *detail) {
+//   2. the pass folder's actions.log (sso_action_log), alongside tx.log.
+static void auto_tcmd_log(const char *event, const char *detail) {
     sso_audit_event(event, detail);
-    if (state->op.pass_folder[0] == '\0') return;
-    char path[512];
-    snprintf(path, sizeof path, "%.500s/session.log", state->op.pass_folder);
-    FILE *fp = fopen(path, "a");
-    if (!fp) return;
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    char iso[40];
-    sso_iso_utc_from_ts(&ts, iso, sizeof iso);
-    fprintf(fp, "%s %s %s\n", iso, event, detail ? detail : "");
-    fclose(fp);
+    sso_action_log("tx", "%s %s", event, detail ? detail : "");
 }
 
 
@@ -634,6 +623,7 @@ void auto_tcmd_open(state_t *state) {
                  state->tx.auto_tcmd.repeat_idx, state->tx.auto_tcmd.repeats_total);
         if (!auto_tcmd_make_window(state)) return;
         state->tx.auto_tcmd_active = 1;
+        sso_action_log("ui", "auto-TCMD opened (paused run)");
         auto_tcmd_draw(state);
         return;
     }
@@ -649,10 +639,13 @@ void auto_tcmd_open(state_t *state) {
         return;
     }
     state->tx.auto_tcmd_active = 1;
+    sso_action_log("ui", "auto-TCMD opened (%d commands from %s)",
+                   state->tx.auto_tcmd.n_commands, state->tx.auto_tcmd_file_path);
     auto_tcmd_draw(state);
 }
 
 void auto_tcmd_close(tx_t *tx) {
+    sso_action_log("ui", "auto-TCMD closed");
     if (tx->auto_tcmd_win) {
         delwin(tx->auto_tcmd_win);
         tx->auto_tcmd_win = NULL;
@@ -778,7 +771,7 @@ static int auto_tcmd_start(state_t *state) {
                  "allow_tx=%d loop=%d power=%.100s file=\"%.100s\"",
                  a->n_commands, repeats, interval, a->allow_tx, a->loop,
                  a->power, a->file_path);
-        sso_audit_event("auto-tcmd-start", det);
+        auto_tcmd_log("auto-tcmd-start", det);
     }
     return 0;
 }
@@ -797,7 +790,7 @@ static void auto_tcmd_stop(state_t *state, const char *reason) {
                  "reason=\"%.100s\" sends_total=%d",
                  reason ? reason : "user",
                  a->sends_total);
-        sso_audit_event("auto-tcmd-stop", det);
+        auto_tcmd_log("auto-tcmd-stop", det);
     }
 }
 
@@ -818,7 +811,7 @@ static void auto_tcmd_pause(state_t *state) {
              "power=%.20s interval_s=%.2f file=\"%.100s\"",
              a->cmd_idx + 1, a->n_commands, a->repeat_idx, a->repeats_total,
              a->sends_total, a->power, a->interval_s_val, a->file_path);
-    auto_tcmd_log(state, "auto-tcmd-pause", det);
+    auto_tcmd_log("auto-tcmd-pause", det);
 }
 
 // 'A' from the interrupt prompt: abort outright (no resume). The modal
@@ -831,7 +824,7 @@ static void auto_tcmd_abort(state_t *state) {
     char det[160];
     snprintf(det, sizeof det, "cmd_idx=%d/%d sends_total=%d",
              a->cmd_idx + 1, a->n_commands, a->sends_total);
-    auto_tcmd_log(state, "auto-tcmd-abort", det);
+    auto_tcmd_log("auto-tcmd-abort", det);
 }
 
 // 'R' from the resume prompt: continue from where it left off. Shift the
@@ -852,7 +845,7 @@ static void auto_tcmd_resume(state_t *state) {
     snprintf(det, sizeof det, "cmd_idx=%d/%d repeat_idx=%d/%d sends_total=%d",
              a->cmd_idx + 1, a->n_commands, a->repeat_idx, a->repeats_total,
              a->sends_total);
-    auto_tcmd_log(state, "auto-tcmd-resume", det);
+    auto_tcmd_log("auto-tcmd-resume", det);
 }
 
 // 'S' from the resume prompt: start the whole list over from the top,
@@ -876,7 +869,7 @@ static void auto_tcmd_restart(state_t *state) {
     char det[160];
     snprintf(det, sizeof det, "n_commands=%d repeats=%d",
              a->n_commands, a->repeats_total);
-    auto_tcmd_log(state, "auto-tcmd-restart", det);
+    auto_tcmd_log("auto-tcmd-restart", det);
 }
 
 int auto_tcmd_handle_key(state_t *state, int key) {
@@ -1034,6 +1027,8 @@ void auto_tcmd_tick(state_t *state) {
         a->state = AUTO_STATE_PASS_OVER;
         snprintf(a->status_msg, sizeof a->status_msg,
                  "stopped: pass over (elevation %.1f deg)", el);
+        sso_action_log("tx", "auto-tcmd stopped: pass over (el=%.1f) after %d sends",
+                       el, a->sends_total);
         auto_tcmd_draw(state);
         return;
     }
@@ -1054,7 +1049,7 @@ void auto_tcmd_tick(state_t *state) {
         char det[128];
         snprintf(det, sizeof det, "loops_done=%d sends_total=%d",
                  a->loops_done, a->sends_total);
-        auto_tcmd_log(state, "auto-tcmd-loop", det);
+        auto_tcmd_log("auto-tcmd-loop", det);
         auto_tcmd_draw(state);
     }
 
@@ -1062,6 +1057,7 @@ void auto_tcmd_tick(state_t *state) {
         a->state = AUTO_STATE_DONE;
         snprintf(a->status_msg, sizeof a->status_msg,
                  "done: sent all %d command(s)", a->n_commands);
+        sso_action_log("tx", "auto-tcmd done: %d sends", a->sends_total);
         auto_tcmd_draw(state);
         return;
     }
