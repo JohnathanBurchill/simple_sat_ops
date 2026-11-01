@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`7983f6a` (2026-10-22). This is a working draft.
+`9b7128f` (2026-10-27). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2483,7 +2483,11 @@ The command log (the `sent_tcmd` table) also supplies the two labels the file
 itself does not carry: the satellite path, shown as the title, and **when the
 picture was taken**, read off the `camera_capture` command that made it and
 shown in green. Both are best-effort - a download commanded from another
-ground station leaves the row labelled by its download time instead.
+ground station leaves the row labelled by its download time instead. The
+times are when each command was set to run on board (its `@tsexec`), not when
+it went up: agendas are uploaded hours ahead, and before 2026-11-01 the
+viewer dated every picture from 2026-10-29 on by its upload, which put the
+globe on the wrong pass and lit it for the wrong hour.
 
 The panel under the picture reports bytes and sentences recovered, whether the
 end marker arrived, the decoded JPEG size and dimensions, and the passes the

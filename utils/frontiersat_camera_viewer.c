@@ -49,6 +49,10 @@
     and, through the camera_capture command that made it, when the picture was
     taken -- which the file itself does not record. Both are best-effort: a
     download commanded from another ground station leaves the row unlabelled.
+    The times are when each command was set to run on board (its @tsexec), not
+    when it went up: from 2026-10-29 the agendas went up hours ahead, and
+    dating pictures by the upload put the globe on the wrong side of the
+    Earth, lit for the wrong hour.
 
     Looking at the picture: scroll or pinch over it to zoom, and drag it to
     move it around. Zoom starts at -- and never goes below -- the whole picture
@@ -201,8 +205,8 @@ extern void  sso_install_pinch_monitor(void);
 // bytes) was merged into it before this cut-off existed.
 #define MATCH_FIRST_OFFSET   (CAM_HEADER_LEN + 21 * CAM_SENTENCE_LEN)
 
-// How far back of a session's start a bulk-download command may sit and still
-// be taken as the command that triggered it.
+// How far back of a session's start a bulk-download command may have run and
+// still be taken as the command that triggered it.
 #define CMD_LOOKBACK_MS (3.0 * 60.0 * 60.0 * 1000.0)
 
 // A merged capture must have at least this many camera sentences to be worth
@@ -539,9 +543,15 @@ static int same_picture(const uint8_t *abuf, const uint8_t *apresent, long asize
 // and the command is a capture rather than a download when "camera_capture("
 // appears. Everything here is best-effort: a download commanded elsewhere, or
 // a store with no sent_tcmd table at all, simply leaves the labels blank.
+//
+// Each command's time is when it ran on board: its @tsexec (tsexec_ms), or
+// the send time when it had none and so ran on arrival. Until 2026-10-26 the
+// agendas stamped @tssent with the run time too, so the send time served; from
+// 2026-10-29 @tssent is the real upload, and pictures are taken and fetched
+// one to ten hours after it.
 
 typedef struct {
-    double ts_ms;
+    double ts_ms;               // when the command ran on board (unix ms)
     char   path[MAX_PATH_LEN];
     int    is_capture;
 } camcmd_t;
@@ -561,15 +571,15 @@ static int extract_camera_path(const char *text, char *path, size_t n)
     return 1;
 }
 
-// Load every camera-related telecommand, oldest first. Returns the count (0 if
-// the table is absent, which is not an error).
+// Load every camera-related telecommand, in the order they ran. Returns the
+// count (0 if the table is absent, which is not an error).
 static int load_camera_commands(sqlite3 *db, camcmd_t **out)
 {
     *out = NULL;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
-            "SELECT ts_sent_ms, command_text FROM sent_tcmd "
-            "WHERE command_text LIKE '%camera/%' ORDER BY ts_sent_ms",
+            "SELECT COALESCE(tsexec_ms, ts_sent_ms) AS t_run, command_text FROM sent_tcmd "
+            "WHERE command_text LIKE '%camera/%' ORDER BY t_run",
             -1, &st, NULL) != SQLITE_OK)
         return 0;
 
@@ -596,7 +606,7 @@ static int load_camera_commands(sqlite3 *db, camcmd_t **out)
     return n;
 }
 
-// The file this session was downloading, from the last download command sent
+// The file this session was downloading, from the last download command run
 // before the session ended (and no longer than CMD_LOOKBACK_MS before it
 // started). Leaves sat_path empty when nothing matches.
 static void label_session(session_t *s, const camcmd_t *cmds, int ncmds)
@@ -612,8 +622,8 @@ static void label_session(session_t *s, const camcmd_t *cmds, int ncmds)
     if (best < 0) s->sat_path[0] = '\0';
 }
 
-// When the camera took `path`, from the camera_capture command that made it.
-// Returns -1 if the command log doesn't have it.
+// When the camera took `path`: when the camera_capture command that made it
+// ran. Returns -1 if the command log doesn't have it.
 static double capture_time_of(const char *path, const camcmd_t *cmds, int ncmds)
 {
     if (path == NULL || path[0] == '\0') return -1;
