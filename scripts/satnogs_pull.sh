@@ -20,32 +20,60 @@
 #       >> $HOME/var/log/sso/satnogs_pull.log 2>&1
 #
 # Courtesy & rate limits
-#   The SatNOGS Network API throttles per client: 60 requests/hour
-#   anonymous, 240/hour with an API token (see the libre.space thread
-#   "API and throttling: anonymous vs with API token", topic 12091). A
-#   token raises only the rate ceiling — observation data is public
-#   either way — so pass one with --api-token / $SATNOGS_API_TOKEN when
-#   polling often.
+#   The SatNOGS Network API throttles the observations endpoint at 60
+#   requests/hour anonymous, 240/hour with an API token (see the
+#   libre.space thread "API and throttling: anonymous vs with API
+#   token", topic 12091). A token raises only the rate ceiling —
+#   observation data is public either way — so pass one with
+#   --api-token / $SATNOGS_API_TOKEN when polling often.
 #
-#   Per run this script makes one list request, plus one detail GET for
-#   each new or still-pending observation; obs already in .fetched.txt
-#   are skipped without a detail GET. A quiet tick is a single request;
-#   a tick that catches a fresh pass is the list plus a detail GET per
-#   observation. Audio is pulled from object storage — a separate host
-#   the API throttle does not count. So 4-minute polling (15 runs/hour)
-#   for one satellite stays well under the anonymous 60/hour in steady
-#   state. A token gives 4x headroom for catch-up runs (a stale cursor
-#   walks the full --lookback-cap window, one detail GET per obs) and
-#   avoids 429s, whose curl --retry would otherwise multiply requests.
+#   Only the listing meets that ceiling. The endpoint installs its rate
+#   limit on the `list` action alone, so a request for one observation
+#   is not counted against it, and neither is the audio, which comes
+#   from object storage on another host. What this script spends against
+#   the ceiling, therefore, is one request per page of 25 observations
+#   in the window it asks for.
+#
+#   Audio being outside the API ceiling does not make it free. Pulling
+#   recordings hard is what got this station's address blocked in August
+#   2026, so downloads are tallied in the same file as the listings and
+#   reported beside them; watch that figure as well as the API one.
+#
+#   In steady state that is a single request per run: 4-minute polling
+#   is 15 requests an hour for one satellite, comfortably inside even
+#   the anonymous ceiling. The cost only grows when the window does —
+#   a busy satellite draws upwards of 50 SatNOGS observations an hour
+#   worldwide, so each hour the window reaches back is another two
+#   pages, and a catch-up run over a full day is around 50 requests.
 #   For many satellites at once, raise --rate-limit-ms, stagger the cron
 #   entries, or use a token.
 #
+#   That budget holds only while the cursor keeps advancing, and two
+#   bugs used to stop it — between them they got the ground station's
+#   IP blocked at the SatNOGS edge in August 2026, after three weeks at
+#   700-900 listings/hour against a 240/hour ceiling:
+#
+#     - An observation whose audio never arrived pinned the cursor to
+#       its start time forever, so every 4-minute tick re-listed the
+#       whole 24-hour window: about 50 pages a tick, 15 ticks an hour.
+#       --pending-max-age now writes such an obs off (default 2h).
+#     - curl --retry treats a 429 as retryable, so each throttled
+#       request became four. curl_api no longer retries at all; the
+#       next cron tick is the retry.
+#
+#   The `list reqs (last hr)` row in the run summary is the early
+#   warning. In steady state it should read in the low tens. If it
+#   climbs toward the ceiling, the cursor is stuck — check
+#   <out>/.latest_start.<norad>.txt against the current time before it
+#   turns into another block.
+#
 #   Each run ends with a `=== summary` table whose API rows report the
-#   accesses made this run (audio downloads excluded) and the accesses in
-#   the trailing 60 minutes against the ceiling — the same rolling hour the
-#   SatNOGS throttle counts, so a backfill burst ages out instead of
-#   poisoning the figure. The per-archive tally lives in
-#   <out>/.api_stats.txt; delete it to reset.
+#   list requests made this run and the list requests in the trailing 60
+#   minutes against the ceiling — the same rolling hour the SatNOGS
+#   throttle counts, so a backfill burst ages out instead of poisoning
+#   the figure — followed by the recordings fetched in that same hour.
+#   The per-archive tally lives in <out>/.api_stats.txt, one record per
+#   request as it is made; delete it to reset.
 #
 # Usage:
 #   satnogs_pull.sh [--norad-id=<n>] [options]
@@ -63,6 +91,13 @@
 #   --lookback-cap=<spec>   Floor on the resolved --since when it would
 #                           otherwise be older. Default 24h. Use 0 to
 #                           disable.
+#   --pending-max-age=<spec> How long an observation whose audio hasn't
+#                           been uploaded yet may hold the cursor back.
+#                           Default 2h. Past that the cursor moves on
+#                           and the obs is written off, so a recording
+#                           that never arrives can't pin every future
+#                           run to the same window. Use 0 to wait
+#                           indefinitely.
 #   --until=<spec>          Same syntax as --since (default: now)
 #   --status=<value>        Filter by SatNOGS observation status
 #                           (good|bad|failed|future|unknown). Default
@@ -72,6 +107,21 @@
 #                           naturally. The SatNOGS API only takes a
 #                           single status, not a CSV.
 #   --max=<n>               Cap total new downloads per run (default 200)
+#   --cache-day=<YYYY-MM-DD> List one UTC day into
+#                           <out>/.daycache/<norad>/<day>.tsv and
+#                           download nothing. This is what
+#                           satnogs_browser calls to fill its day view;
+#                           a day already listed costs no further
+#                           requests, however often it is browsed. The
+#                           cursor is neither read nor written, so
+#                           listing an old day cannot disturb the cron
+#                           job's position.
+#   --obs-ids=<n,n,...>     Download exactly these observations and
+#                           nothing else. The API's observation_id
+#                           filter takes a list, so a marked set costs
+#                           one listing page per 25 ids no matter how
+#                           far apart their passes are. Also leaves the
+#                           cursor alone.
 #   --tle-dir=<dir>         Override per-observation TLE with the newest
 #                           *.tle file in this directory (default
 #                           $HOME/FrontierSat/TLEs). Falls back to the
@@ -84,11 +134,17 @@
 #   --decode                On success, run decode_passes.sh against --out
 #   --rate-limit-ms=<n>     Sleep between HTTP calls (default 250)
 #   --user-agent=<str>      HTTP User-Agent (default "sso-satnogs-pull/1.0")
-#   --api-token=<str>       SatNOGS API token, sent as an Authorization
-#                           header on API requests (never on audio
-#                           downloads). Raises the throttle ceiling from
-#                           60 to 240 requests/hour. Defaults to
-#                           $SATNOGS_API_TOKEN.
+#   --api-token=<str>       SatNOGS Network API token, sent as an
+#                           Authorization header on listing requests
+#                           (never on audio downloads). Raises the
+#                           throttle ceiling from 60 to 240 listings an
+#                           hour. Falls back to $SATNOGS_API_TOKEN, then
+#                           to the first line of <out>/.api_token --
+#                           which is the one to use, since it is the
+#                           only place both cron and an operator's shell
+#                           look. Note it must be the *Network* token;
+#                           a SatNOGS DB token is a different thing and
+#                           is rejected with a 401.
 #   --decode-passes=<path>  Override decode_passes.sh location
 #   --db=<path>             Pass SSO_PACKET_DB into the --decode invocation
 #   --jobs=<n>              Parallel decode workers for --decode (passed
@@ -99,6 +155,11 @@
 
 set -uo pipefail
 export LC_ALL=C
+# The archive is shared: the cron job runs this as one account and an
+# operator's satnogs_browser runs it as another, both through the group
+# that owns the archive. Files and directories made group-writable let
+# each pick up where the other left off.
+umask 002
 
 # Timestamped logging. The script is built for unattended cron use with
 # stdout/stderr appended to a log file, so every lifecycle line carries a
@@ -142,6 +203,25 @@ USE_LOCAL_TLE=1
 # host or after the state file was wiped). Override with
 # --lookback-cap=<spec>; 0 disables the cap (use cursor verbatim).
 LOOKBACK_CAP_SPEC="24h"
+# How long an observation with no audio yet may hold the cursor back.
+# SatNOGS usually uploads within ~30 min of a pass ending, but an obs
+# whose recording never arrives (a station that dropped it, a `failed`
+# obs with nothing to upload) would otherwise pin the cursor forever
+# and make every tick re-walk the whole window. Past this age we stop
+# waiting and let the cursor move on. Two hours leaves plenty of room
+# for a late upload while keeping the worst-case window small: on a
+# satellite drawing 50 observations an hour, a cursor pinned two hours
+# back is five listing pages a tick, where six hours would be thirteen.
+# Override with --pending-max-age; 0 waits indefinitely.
+PENDING_MAX_AGE_SPEC="2h"
+# Browse-cache mode: list one UTC day into a tab-separated file under
+# <out>/.daycache/<norad>/ and download nothing. satnogs_browser reads
+# those files rather than the network, so a day it has already listed
+# is free to revisit.
+CACHE_DAY=""
+# Download exactly these observation ids, ignoring the time window
+# entirely. This is how the browser fetches a marked set.
+OBS_IDS=""
 
 usage() {
     sed -n '2,/^# Usage:/p' "$0" | sed 's/^# \{0,1\}//'
@@ -166,6 +246,9 @@ while [[ $# -gt 0 ]]; do
         --tle-dir=*)        TLE_DIR="${1#--tle-dir=}";;
         --no-local-tle)     USE_LOCAL_TLE=0;;
         --lookback-cap=*)   LOOKBACK_CAP_SPEC="${1#--lookback-cap=}";;
+        --pending-max-age=*) PENDING_MAX_AGE_SPEC="${1#--pending-max-age=}";;
+        --cache-day=*)      CACHE_DAY="${1#--cache-day=}";;
+        --obs-ids=*)        OBS_IDS="${1#--obs-ids=}";;
         -h|--help)          usage; exit 0;;
         *)                  echo "unknown arg: $1" >&2; usage >&2; exit 2;;
     esac
@@ -228,14 +311,39 @@ to_iso_utc() {
 # observations newer than what we already have.
 STATE_FILE="${OUT}/.latest_start.${NORAD_ID}.txt"
 
-# Per-archive API-access tally: one "<epoch> <calls>" record per run.
-# Records older than an hour age out each run, so the surviving sum is the
-# request count in the trailing 60 minutes — exactly the rolling hour the
-# SatNOGS throttle counts. Not keyed by NORAD ID: the throttle is per
-# client, not per satellite, and every run sharing this archive serialises
-# on the lock, so one shared file reflects the real rate even when several
-# satellites pull into the same --out. Delete it to reset.
+# Per-archive access tally: one "<epoch> <count> <kind>" record per
+# request, where kind is `list` for a throttled API listing and `audio`
+# for a downloaded recording. Records older than an hour age out each
+# run, so the surviving sums are the counts in the trailing 60 minutes —
+# the rolling hour the SatNOGS throttle counts. A record written before
+# the kind column existed has two fields and is read as a listing. Not
+# keyed by NORAD ID: what SatNOGS sees is per client, not per satellite,
+# and every run sharing this archive serialises on the lock, so one
+# shared file reflects the real rate even when several satellites pull
+# into the same --out. Delete it to reset.
 STATS_FILE="${OUT}/.api_stats.txt"
+
+# Count one request, written to the tally as it is made rather than
+# totalled up at the end of the run. Two things need that: a browser
+# watching the file sees the trailing-hour figures climb while a run is
+# still going, and a run that is cancelled or killed part way through
+# has still spent what it spent, so it has to be on disk already to be
+# counted against the hour. Runs on one archive serialise on the lock
+# above, so appending here cannot race the prune below.
+record_api_call() {
+    API_CALLS=$((API_CALLS + 1))
+    printf '%s 1 list\n' "$(date -u +%s)" >> "$STATS_FILE"
+}
+
+# Audio is not throttled by the API — it comes from object storage on
+# another host — but it is not free either: a run that pulled recordings
+# hard enough got this station's address blocked in August 2026. It is
+# counted here so the volume is visible while it is happening, rather
+# than being reconstructed from the archive afterwards.
+record_audio_fetch() {
+    AUDIO_FETCHES=$((AUDIO_FETCHES + 1))
+    printf '%s 1 audio\n' "$(date -u +%s)" >> "$STATS_FILE"
+}
 
 # Convert "YYYY-MM-DDTHH:MM:SSZ" to epoch (GNU and BSD date variants).
 iso_to_epoch() {
@@ -272,6 +380,33 @@ spec_to_seconds() {
         *) return 1;;
     esac
 }
+
+# The two browser modes each pin the query themselves, so neither one
+# consults the cursor. --cache-day bounds the window to one UTC day;
+# --obs-ids replaces the window with an explicit list.
+if [[ -n "$CACHE_DAY" && -n "$OBS_IDS" ]]; then
+    echo "error: --cache-day and --obs-ids do different things; pick one" >&2
+    exit 2
+fi
+if [[ -n "$CACHE_DAY" ]]; then
+    if ! DAY_START_EPOCH="$(iso_to_epoch "${CACHE_DAY}T00:00:00Z")"; then
+        echo "error: --cache-day wants YYYY-MM-DD, got '$CACHE_DAY'" >&2
+        exit 2
+    fi
+    SINCE_SPEC="$(epoch_to_iso "$DAY_START_EPOCH")"
+    UNTIL_SPEC="$(epoch_to_iso $((DAY_START_EPOCH + 86400)))"
+fi
+if [[ -n "$OBS_IDS" ]]; then
+    OBS_IDS="${OBS_IDS//[[:space:]]/}"
+    case "$OBS_IDS" in
+        *[!0-9,]* | ,* | *, | *,,*)
+            echo "error: --obs-ids wants a comma-separated list of numbers, got '$OBS_IDS'" >&2
+            exit 2;;
+    esac
+    # Unused by the query, which the id list fully determines, but the
+    # resolution below still wants something parseable.
+    SINCE_SPEC="1970-01-01T00:00:00Z"
+fi
 
 # Default --since: pick up from the cursor in the state file, but
 # clip to --lookback-cap so a stale / absent state file doesn't trigger
@@ -343,6 +478,28 @@ if [[ "$USE_LOCAL_TLE" -eq 1 && -d "$TLE_DIR" ]]; then
 fi
 [[ -n "$LOCAL_TLE" ]] && log "using local TLE $LOCAL_TLE"
 
+# Fall back to a token file when the environment has no token. The
+# token lives in two worlds -- crond's environment for the polling run,
+# an operator's shell for anything interactive -- and keeping it in one
+# file under the archive means both find the same one, instead of the
+# operator having to remember to export a value they cannot see. An
+# explicit --api-token still wins, then the environment, then this.
+if [[ -z "$API_TOKEN" && -r "${OUT}/.api_token" ]]; then
+    API_TOKEN="$(head -n 1 "${OUT}/.api_token" | tr -d '[:space:]')"
+    if [[ -n "$API_TOKEN" ]]; then
+        log "using the API token in ${OUT}/.api_token"
+        # A token is a credential; say so if the file is readable by
+        # everyone, since the archive itself is a shared tree.
+        PERMS="$(stat -f '%Lp' "${OUT}/.api_token" 2>/dev/null \
+                 || stat -c '%a' "${OUT}/.api_token" 2>/dev/null || echo "")"
+        # The last digit is the "other" field; 4 through 7 all include
+        # read.
+        case "$PERMS" in
+            *[4567]) logerr "warning: ${OUT}/.api_token is world-readable (mode $PERMS)";;
+        esac
+    fi
+fi
+
 # Build the comma-separated status filter into a jq selector and a URL
 # query fragment. If STATUS_FILTER is empty, accept everything.
 STATUS_QUERY=""
@@ -385,21 +542,32 @@ while IFS= read -r line; do
 done < "$FETCHED_FILE"
 
 API_BASE="https://network.satnogs.org/api/observations/"
-QUERY="norad_cat_id=${NORAD_ID}&start=${SINCE_ISO}"
-[[ -n "$UNTIL_ISO" ]]   && QUERY="${QUERY}&end=${UNTIL_ISO}"
-[[ -n "$STATUS_QUERY" ]] && QUERY="${QUERY}&${STATUS_QUERY}"
+if [[ -n "$OBS_IDS" ]]; then
+    # observation_id takes a list, so 25 marked observations come back
+    # in one page whether their passes are minutes or months apart.
+    QUERY="observation_id=${OBS_IDS}"
+else
+    QUERY="norad_cat_id=${NORAD_ID}&start=${SINCE_ISO}"
+    [[ -n "$UNTIL_ISO" ]]    && QUERY="${QUERY}&end=${UNTIL_ISO}"
+    [[ -n "$STATUS_QUERY" ]] && QUERY="${QUERY}&${STATUS_QUERY}"
+fi
 
 log "norad=${NORAD_ID}  since=${SINCE_ISO}${UNTIL_ISO:+  until=${UNTIL_ISO}}  status=${STATUS_FILTER:-any}  out=${OUT}"
 
 # API requests carry the token when one is set. curl strips the
 # Authorization header on a cross-host redirect, so -L can't leak it to
 # the object-storage host; audio downloads (curl_audio) never get it.
+# No --retry here, deliberately. curl treats a 429 as retryable, so a
+# throttled request would become four, pushing us further over the
+# ceiling exactly when we need to back off. The cron tick is the retry:
+# a failed list just ends the run and the next one picks it up. Audio
+# downloads keep their retries — they go to object storage, which the
+# API throttle doesn't count.
 curl_api() {
     local auth=()
     [[ -n "$API_TOKEN" ]] && auth=(-H "Authorization: Token ${API_TOKEN}")
     curl --silent --show-error --fail -L \
          --connect-timeout 10 --max-time 60 \
-         --retry 3 --retry-delay 2 \
          -H "User-Agent: ${USER_AGENT}" \
          -H "Accept: application/json" \
          ${auth[@]+"${auth[@]}"} \
@@ -456,15 +624,34 @@ next_url_from_headers() {
     ' "$PAGE_HDR"
 }
 
+# In --cache-day mode the day is written to a temporary file and moved
+# into place only once the whole walk succeeds, so a run interrupted
+# part way leaves whatever cache was there before rather than half a
+# day that looks complete.
+CACHE_FILE=""
+CACHE_TMP=""
+WALK_OK=1
+if [[ -n "$CACHE_DAY" ]]; then
+    CACHE_DIR="${OUT}/.daycache/${NORAD_ID}"
+    mkdir -p "$CACHE_DIR"
+    CACHE_FILE="${CACHE_DIR}/${CACHE_DAY}.tsv"
+    CACHE_TMP="$(mktemp -t satnogs_daycache_XXXXXX)"
+    add_cleanup "rm -f \"$CACHE_TMP\""
+fi
+
 URL="${API_BASE}?${QUERY}"
 COUNT_FETCHED=0
 COUNT_SKIPPED=0
 COUNT_FAILED=0
 COUNT_SEEN=0
-# API accesses made this run: list-page requests plus one detail GET per
-# new/pending observation. Audio downloads go to object storage on a
-# separate host the throttle doesn't count, so they're excluded.
+# List-page requests made this run. These are the ones the API throttle
+# counts: the observations endpoint applies its rate limit to the `list`
+# action alone. The audio does not go near that ceiling -- it comes from
+# object storage on another host -- but it is counted separately below,
+# because volume there is what got this station blocked once already.
 API_CALLS=0
+# Recordings fetched this run, tallied alongside the listings.
+AUDIO_FETCHES=0
 NEWEST_START=""
 # Earliest already-happened obs (start < now) we saw without an audio
 # payload yet. Used at the end to clamp the cursor so the next run's
@@ -472,6 +659,16 @@ NEWEST_START=""
 # newer pass's audio first.
 EARLIEST_PENDING_START=""
 NOW_ISO_FOR_PENDING="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# Oldest start time a pending (no-audio-yet) observation may have and
+# still hold the cursor back. Empty means no floor — wait forever.
+PENDING_FLOOR_ISO=""
+if ! PENDING_MAX_AGE_S="$(spec_to_seconds "$PENDING_MAX_AGE_SPEC")"; then
+    echo "error: bad --pending-max-age='$PENDING_MAX_AGE_SPEC'" >&2
+    exit 2
+fi
+if [[ "$PENDING_MAX_AGE_S" -gt 0 ]]; then
+    PENDING_FLOOR_ISO="$(epoch_to_iso $(( $(date -u +%s) - PENDING_MAX_AGE_S )))"
+fi
 if [[ -s "$STATE_FILE" ]]; then
     # Carry the existing cursor forward so a run that downloads nothing
     # still seeds the same state file value (no regressions on disk).
@@ -480,9 +677,10 @@ fi
 
 while [[ -n "$URL" && "$COUNT_FETCHED" -lt "$MAX_OBS" ]]; do
     log "GET $URL"
-    API_CALLS=$((API_CALLS + 1))
+    record_api_call
     if ! JSON="$(list_page "$URL")"; then
         logerr "API list request failed"
+        WALK_OK=0
         break
     fi
 
@@ -497,6 +695,31 @@ while [[ -n "$URL" && "$COUNT_FETCHED" -lt "$MAX_OBS" ]]; do
     N="$(echo "$RESULTS" | jq 'length')"
     if [[ "$N" -eq 0 ]]; then
         URL="$NEXT"
+        continue
+    fi
+
+    if [[ -n "$CACHE_DAY" ]]; then
+        # One tab-separated line per observation. An empty payload
+        # column means SatNOGS holds no audio for that pass, which is
+        # the whole question the browser's day view asks -- the listing
+        # answers it, so nothing downstream has to ask again. The last
+        # column counts the frames SatNOGS itself demodulated from the
+        # pass, which reads as a bulk download when it runs to dozens.
+        echo "$RESULTS" | jq -r '.[] | [
+                (.id | tostring),
+                (.start // ""),
+                (.end // ""),
+                (.status // ""),
+                (.waterfall_status // ""),
+                (.ground_station // "" | tostring),
+                (.station_name // ""),
+                (.max_altitude // "" | tostring),
+                (.payload // ""),
+                (.demoddata | length | tostring)
+            ] | @tsv' >> "$CACHE_TMP"
+        COUNT_SEEN=$((COUNT_SEEN + N))
+        URL="$NEXT"
+        polite_sleep
         continue
     fi
 
@@ -515,18 +738,13 @@ while [[ -n "$URL" && "$COUNT_FETCHED" -lt "$MAX_OBS" ]]; do
             continue
         fi
 
-        # The list endpoint's `payload` field carries only the directory
-        # URL (e.g. .../<obs-id>/), and other fields trickle in piecemeal
-        # over time. The detail endpoint returns the canonical audio URL
-        # plus the TLE block. One extra GET per new obs is cheap and
-        # avoids guessing at file names.
-        API_CALLS=$((API_CALLS + 1))
-        if ! OBS="$(curl_api "${API_BASE}${OBS_ID}/?format=json")"; then
-            echo "    !! detail fetch failed for obs $OBS_ID" >&2
-            COUNT_FAILED=$((COUNT_FAILED + 1))
-            polite_sleep
-            continue
-        fi
+        # Everything we need is already in the list record: the full
+        # audio URL in `payload`, the status, the station name and the
+        # three TLE lines. The list used to hand back only a directory
+        # URL, which is why this once fetched the detail endpoint for
+        # every observation -- one wasted request per new pass, on a
+        # listing that had already answered the question.
+        OBS="$OBS_LIST"
 
         STATUS="$(echo "$OBS"     | jq -r '.status // ""')"
         PAYLOAD="$(echo "$OBS"    | jq -r '.payload // ""')"
@@ -544,7 +762,13 @@ while [[ -n "$URL" && "$COUNT_FETCHED" -lt "$MAX_OBS" ]]; do
             # Only track obs whose pass should already be over; future
             # passes shouldn't hold the cursor back for hours/days.
             if [[ -n "$START" && "$START" < "$NOW_ISO_FOR_PENDING" ]]; then
-                if [[ -z "$EARLIEST_PENDING_START" || "$START" < "$EARLIEST_PENDING_START" ]]; then
+                if [[ -n "$PENDING_FLOOR_ISO" && "$START" < "$PENDING_FLOOR_ISO" ]]; then
+                    # Waited long enough. The recording isn't coming,
+                    # so stop letting this obs hold the cursor back —
+                    # otherwise every future run re-walks the window
+                    # from here and burns through the API throttle.
+                    echo "    .. giving up on obs $OBS_ID (start $START, still no audio)" >&2
+                elif [[ -z "$EARLIEST_PENDING_START" || "$START" < "$EARLIEST_PENDING_START" ]]; then
                     EARLIEST_PENDING_START="$START"
                 fi
             fi
@@ -617,6 +841,7 @@ while [[ -n "$URL" && "$COUNT_FETCHED" -lt "$MAX_OBS" ]]; do
         fi
 
         log "GET $PAYLOAD"
+        record_audio_fetch
         TMP="${AUDIO_FILE}.part"
         if curl_audio -o "$TMP" "$PAYLOAD"; then
             mv -f "$TMP" "$AUDIO_FILE"
@@ -651,35 +876,66 @@ if [[ -n "$EARLIEST_PENDING_START" ]]; then
     fi
 fi
 
-if [[ -n "$NEWEST_START" ]]; then
+if [[ -n "$CACHE_DAY" ]]; then
+    if [[ "$WALK_OK" -eq 1 ]]; then
+        # Sorted by start time so the browser renders in pass order
+        # without sorting, and moved into place in a single step.
+        SORTED="${CACHE_TMP}.sorted"
+        add_cleanup "rm -f \"$SORTED\""
+        sort -t "$(printf '\t')" -k2,2 "$CACHE_TMP" > "$SORTED"
+        mv -f "$SORTED" "$CACHE_FILE"
+        log "cached $COUNT_SEEN observations for $CACHE_DAY in $CACHE_FILE"
+    else
+        logerr "listing for $CACHE_DAY did not complete; cache left as it was"
+    fi
+fi
+
+# The cursor belongs to the polling run. Browsing an old day or
+# fetching a hand-picked set must not drag it backwards or shove it
+# forwards, so neither browser mode writes it.
+if [[ -n "$NEWEST_START" && -z "$CACHE_DAY" && -z "$OBS_IDS" ]]; then
     printf '%s\n' "$NEWEST_START" > "$STATE_FILE"
 fi
 
-# Roll this run's API accesses into the per-archive tally and total the
-# accesses in the trailing 60 minutes — the same rolling hour the SatNOGS
-# throttle counts (60/hour anonymous, 240 with a token). Keeping a window
-# of per-run records (rather than a cumulative mean) means a one-off
-# backfill burst ages out after an hour instead of inflating the figure
-# for the rest of the day. Safe to do here unlocked: the flock/mkdir lock
-# above serialises every run on this archive.
+# Total the accesses in the trailing 60 minutes — the same rolling hour
+# the SatNOGS throttle counts (60/hour anonymous, 240 with a token) — and
+# drop what has aged out of it. This run's own requests are already in the
+# file, written one at a time as they were made. Keeping a window of
+# records (rather than a cumulative mean) means a one-off backfill burst
+# ages out after an hour instead of inflating the figure for the rest of
+# the day. Safe to do here unlocked: the flock/mkdir lock above
+# serialises every run on this archive.
 NOW_EPOCH_STATS="$(date -u +%s)"
 API_WINDOW_START=$((NOW_EPOCH_STATS - 3600))
 API_LAST_HOUR=0
-STATS_TMP="$(mktemp -t satnogs_pull_stats_XXXXXX)"
+AUDIO_LAST_HOUR=0
+# The trimmed copy is made beside the tally, so it takes the archive's
+# group, and opened up to that group, because mktemp makes files only
+# their owner can use. Once moved into place it is appended to by
+# whichever account runs next, and an owner-only tally locks the other
+# one out.
+STATS_TMP="$(mktemp "$OUT/.api_stats.XXXXXX")"
+chmod 664 "$STATS_TMP"
+add_cleanup "rm -f \"$STATS_TMP\""
 if [[ -s "$STATS_FILE" ]]; then
     # Keep only records inside the trailing hour; drop stale or malformed
-    # lines (this also retires the old cumulative-mean file format).
-    while read -r ts calls _; do
+    # lines (this also retires the old cumulative-mean file format). A
+    # record with no kind column predates the audio tally and is a
+    # listing.
+    while read -r ts calls kind; do
         case "$ts"    in ''|*[!0-9]*) continue;; esac
         case "$calls" in ''|*[!0-9]*) continue;; esac
+        [[ -z "$kind" ]] && kind="list"
         if [[ "$ts" -ge "$API_WINDOW_START" ]]; then
-            printf '%s %s\n' "$ts" "$calls" >> "$STATS_TMP"
-            API_LAST_HOUR=$((API_LAST_HOUR + calls))
+            printf '%s %s %s\n' "$ts" "$calls" "$kind" >> "$STATS_TMP"
+            if [[ "$kind" == "audio" ]]; then
+                AUDIO_LAST_HOUR=$((AUDIO_LAST_HOUR + calls))
+            else
+                API_LAST_HOUR=$((API_LAST_HOUR + calls))
+            fi
         fi
     done < "$STATS_FILE"
 fi
-printf '%s %s\n' "$NOW_EPOCH_STATS" "$API_CALLS" >> "$STATS_TMP"
-API_LAST_HOUR=$((API_LAST_HOUR + API_CALLS))
 mv -f "$STATS_TMP" "$STATS_FILE"
 
 # Throttle ceiling for the trailing-hour figure: a token lifts it 60 -> 240.
@@ -694,9 +950,15 @@ log "done (norad ${NORAD_ID})"
     printf '    %-22s %s\n' "downloaded:"         "$COUNT_FETCHED"
     printf '    %-22s %s\n' "skipped:"            "$COUNT_SKIPPED"
     printf '    %-22s %s\n' "failed:"             "$COUNT_FAILED"
-    printf '    %-22s %s\n' "API calls (run):"    "$API_CALLS"
-    printf '    %-22s %s\n' "API calls (last hr):" "${API_LAST_HOUR} / ${API_CEILING}"
-    [[ -n "$NEWEST_START" ]] && printf '    %-22s %s\n' "cursor:" "$NEWEST_START"
+    printf '    %-22s %s\n' "list requests (run):" "$API_CALLS"
+    printf '    %-22s %s\n' "list reqs (last hr):" "${API_LAST_HOUR} / ${API_CEILING}"
+    printf '    %-22s %s\n' "audio got (last hr):" "$AUDIO_LAST_HOUR"
+    # Only the polling run has a cursor; the browser modes deliberately
+    # leave it alone, so printing one there would misdescribe what the
+    # run just did.
+    if [[ -n "$NEWEST_START" && -z "$CACHE_DAY" && -z "$OBS_IDS" ]]; then
+        printf '    %-22s %s\n' "cursor:" "$NEWEST_START"
+    fi
     printf '    %-22s %s\n' "archive:"            "$OUT"
 }
 

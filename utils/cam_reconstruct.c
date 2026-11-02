@@ -383,6 +383,9 @@ int main(int argc, char **argv)
         printf("sentences   : %ld of %ld present", st.sentences_present, st.n_sentences);
         if (st.partial_sentences) printf(" (%ld partial)", st.partial_sentences);
         printf("%s\n", st.saw_end_sentinel ? ", end-marker seen" : "");
+        if (st.header_supplied)
+            printf("jpeg header : %ld bytes lost or damaged, taken from the standard camera header\n",
+                   st.header_supplied);
         printf("image bytes : %ld recovered, %ld missing (%.1f%% recovered)\n",
                present_bytes, missing_bytes,
                image_size ? 100.0 * (double) present_bytes / (double) image_size : 0.0);

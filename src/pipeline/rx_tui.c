@@ -28,6 +28,7 @@
 #include "beacon_cts1.h"
 #include "csp.h"
 
+#include <math.h>
 #include <ncurses.h>
 #include <signal.h>
 #include <stdint.h>
@@ -159,6 +160,11 @@ static volatile sig_atomic_t g_quit_requested = 0;
 static int g_have_beacon = 0;
 static COMMS_beacon_basic_packet_t g_beacon;
 static char g_beacon_ts[40];
+// Set when the beacon on screen came from the extended-beacon blob, in
+// which case g_beacon_ext holds the whole of it -- its first 130 bytes
+// are the same fields g_beacon already carries.
+static int g_beacon_is_ext = 0;
+static COMMS_beacon_extended_packet_t g_beacon_ext;
 
 // Per-frame monotonic clock so the title-bar "age" value keeps ticking
 // even between observed frames.
@@ -207,6 +213,7 @@ static int g_other_count = 0;
 static struct {
     uint64_t total;
     uint64_t beacon;
+    uint64_t beacon_ext;   // of those: sent by the extended-beacon blob
     uint64_t tcmd;
     uint64_t other;
     uint64_t rs_uncorrectable;
@@ -416,7 +423,19 @@ static int draw_beacon_panel(int top, int left, int rows, int cols)
     int row   = top;
     int max   = top + rows;
 
-    put_label(row, left, right, "BEACON");
+    // The heading says which beacon is on screen: the satellite's own,
+    // or the extended-beacon blob's, with the blob version. They arrive
+    // interleaved -- a pass can carry both -- so the reader needs to
+    // know which one these numbers came out of.
+    if (g_have_beacon && g_beacon_is_ext) {
+        char blabel[32];
+        snprintf(blabel, sizeof blabel, "BEACON (blob v%d)",
+                 beacon_ext_version((const uint8_t *)&g_beacon_ext,
+                                    sizeof g_beacon_ext));
+        put_label(row, left, right, blabel);
+    } else {
+        put_label(row, left, right, "BEACON");
+    }
     row++;
 
     if (!g_have_beacon) {
@@ -550,6 +569,53 @@ static int draw_beacon_panel(int top, int left, int rows, int cols)
                  (unsigned)g_beacon.total_tcmd_queued_count,
                  (unsigned)g_beacon.pending_queued_tcmd_count);
         put_line(row++, left, right, buf);
+    }
+
+    // The extended beacon's own fields: what the ADCS was doing and,
+    // when it was estimating an attitude, what that attitude was. Two
+    // lines, because this panel shares the screen with the telecommand
+    // and frame panels and the rest of the extended beacon (the
+    // per-channel solar measurements, the sun sensors) is for looking
+    // over afterwards in packet_browser rather than during a pass.
+    if (g_beacon_is_ext) {
+        beacon_ext_adcs_state_t st;
+        beacon_ext_adcs_state(g_beacon_ext.adcs_current_state_1, &st);
+        if (row < max) put_label(row++, left + 2, right, "ADCS");
+        if (row < max) {
+            if (!st.reported) {
+                snprintf(buf, sizeof buf, "    (the ADCS did not answer)");
+            } else {
+                snprintf(buf, sizeof buf,
+                         "    run=%u control=%u estimation=%u  |B|=%.1fuT"
+                         "  rate=%.2fdeg/s",
+                         (unsigned)st.run_mode, (unsigned)st.control_mode,
+                         (unsigned)st.estimation_mode,
+                         sqrt((double)g_beacon_ext.adcs_magnetic_field_x_T_en8
+                                * g_beacon_ext.adcs_magnetic_field_x_T_en8
+                            + (double)g_beacon_ext.adcs_magnetic_field_y_T_en8
+                                * g_beacon_ext.adcs_magnetic_field_y_T_en8
+                            + (double)g_beacon_ext.adcs_magnetic_field_z_T_en8
+                                * g_beacon_ext.adcs_magnetic_field_z_T_en8)
+                             / 100.0,
+                         g_beacon_ext.adcs_angular_rate_norm_cdeg_per_sec
+                             / 100.0);
+            }
+            put_line(row++, left, right, buf);
+        }
+        if (row < max) {
+            if (beacon_ext_attitude_is_valid((const uint8_t *)&g_beacon_ext,
+                                             sizeof g_beacon_ext)) {
+                snprintf(buf, sizeof buf,
+                         "    attitude roll=%.1f pitch=%.1f yaw=%.1f deg",
+                         g_beacon_ext.adcs_estimated_roll_angle_cdeg / 100.0,
+                         g_beacon_ext.adcs_estimated_pitch_angle_cdeg / 100.0,
+                         g_beacon_ext.adcs_estimated_yaw_angle_cdeg / 100.0);
+            } else {
+                snprintf(buf, sizeof buf,
+                         "    attitude not estimated in this mode");
+            }
+            put_line(row++, left, right, buf);
+        }
     }
 
     if (row < max) put_label(row++, left + 2, right, "Message");
@@ -907,8 +973,10 @@ static void render(void)
     mvhline(rows - 1, 0, ' ', cols);
     char foot[300];
     snprintf(foot, sizeof foot,
-             " beacons=%llu  tcmd=%llu  other=%llu  uncorr=%llu  crc_mismatch=%llu",
+             " beacons=%llu (%llu ext)  tcmd=%llu  other=%llu  uncorr=%llu"
+             "  crc_mismatch=%llu",
              (unsigned long long)g_counters.beacon,
+             (unsigned long long)g_counters.beacon_ext,
              (unsigned long long)g_counters.tcmd,
              (unsigned long long)g_counters.other,
              (unsigned long long)g_counters.rs_uncorrectable,
@@ -1060,11 +1128,19 @@ void rx_tui_observe_frame(const char *ts,
     const uint8_t *payload = csp_ok ? packet + 4 : NULL;
     size_t payload_len = csp_ok ? packet_len - 4 : 0;
 
-    if (csp_ok && beacon_is_basic(payload, payload_len)) {
+    // The extended (blob) beacon begins with the basic beacon, field for
+    // field, so both fill the same panel. The extra fields are kept
+    // beside it and drawn as two more lines when the beacon on screen is
+    // an extended one.
+    int is_ext = csp_ok && beacon_is_extended(payload, payload_len);
+    if (csp_ok && (beacon_is_basic(payload, payload_len) || is_ext)) {
         memcpy(&g_beacon, payload, sizeof g_beacon);
+        g_beacon_is_ext = is_ext;
+        if (is_ext) memcpy(&g_beacon_ext, payload, sizeof g_beacon_ext);
         snprintf(g_beacon_ts, sizeof g_beacon_ts, "%s", ts ? ts : "?");
         g_have_beacon = 1;
         g_counters.beacon++;
+        if (is_ext) g_counters.beacon_ext++;
         // Activity ring: tag the bucket and update the running
         // beacon-interval average so the header line stays useful.
         act_b->beacons++;

@@ -54,11 +54,11 @@
 
 #ifdef __APPLE__
 // Trackpad pinch is delivered as NSEventTypeMagnify, which raylib/GLFW
-// don't forward. utils/decode_inspector_macos.m installs an NSEvent local
+// don't forward. utils/pinch_macos.m installs an NSEvent local
 // monitor that accumulates magnification deltas into this global; we
 // read & reset it each frame.
-extern float g_decode_inspector_pinch_delta;
-extern void  decode_inspector_install_pinch_monitor(void);
+extern float g_sso_pinch_delta;
+extern void  sso_install_pinch_monitor(void);
 #endif
 
 #include <ctype.h>
@@ -2107,7 +2107,7 @@ int main(int argc, char **argv)
     SetTargetFPS(60);
     SetExitKey(0);
 #ifdef __APPLE__
-    decode_inspector_install_pinch_monitor();
+    sso_install_pinch_monitor();
 #endif
     g_ui_font_loaded = load_ttf_from_known_paths();
 
@@ -2856,8 +2856,8 @@ int main(int argc, char **argv)
         // to whichever panel the cursor is over.
         float pinch = 0.0f;
 #ifdef __APPLE__
-        pinch = g_decode_inspector_pinch_delta;
-        g_decode_inspector_pinch_delta = 0.0f;
+        pinch = g_sso_pinch_delta;
+        g_sso_pinch_delta = 0.0f;
 #endif
         Vector2 wheel_v = GetMouseWheelMoveV();
         // Bottom slot: wf and decmode are mutually exclusive; whichever
@@ -5038,14 +5038,22 @@ int main(int argc, char **argv)
                         DrawLine(cx + 1, plot_y0, cx + 1, plot_y1 + 1, BLACK);
                         // Bright opaque guide line.
                         DrawLine(cx, plot_y0, cx, plot_y1 + 1, YELLOW);
+                        // The two arrowheads. raylib throws away a triangle
+                        // whose vertices go round the wrong way and draws
+                        // nothing at all, and which way is right depends on
+                        // where the apex sits: above its base the order is
+                        // apex, left, right; below it, apex, right, left.
+                        // Both of these were round the wrong way and neither
+                        // drew. Measured by rendering the orders off-screen
+                        // and counting pixels — 168 one way, 0 the other.
                         // Bottom arrowhead — apex inside the plot, base
                         // on the axis. 12 px × 14 px.
                         {
                             Vector2 apex = {(float) cx, (float)(plot_y1 - 1)};
                             Vector2 bl = {(float)(cx - 7), (float)(plot_y1 + 11)};
                             Vector2 br = {(float)(cx + 7), (float)(plot_y1 + 11)};
-                            DrawTriangle(apex, br, bl, YELLOW);
-                            DrawTriangleLines(apex, br, bl, BLACK);
+                            DrawTriangle(apex, bl, br, YELLOW);
+                            DrawTriangleLines(apex, bl, br, BLACK);
                         }
                         // Top arrowhead — apex pointing down into the
                         // plot, base just above the top border.
@@ -5053,8 +5061,8 @@ int main(int argc, char **argv)
                             Vector2 apex = {(float) cx, (float)(plot_y0 + 1)};
                             Vector2 bl = {(float)(cx - 7), (float)(plot_y0 - 11)};
                             Vector2 br = {(float)(cx + 7), (float)(plot_y0 - 11)};
-                            DrawTriangle(apex, bl, br, YELLOW);
-                            DrawTriangleLines(apex, bl, br, BLACK);
+                            DrawTriangle(apex, br, bl, YELLOW);
+                            DrawTriangleLines(apex, br, bl, BLACK);
                         }
                     }
                 }
@@ -6623,16 +6631,19 @@ int main(int argc, char **argv)
                         DrawLine(cx - 1, plot_y0, cx - 1, plot_y1 + 1, BLACK);
                         DrawLine(cx + 1, plot_y0, cx + 1, plot_y1 + 1, BLACK);
                         DrawLine(cx,     plot_y0, cx,     plot_y1 + 1, YELLOW);
+                        // Arrowheads, wound as at the cursor plot above: apex
+                        // above its base goes apex, left, right, and below it,
+                        // apex, right, left. The other way round draws nothing.
                         Vector2 ba = {(float) cx, (float)(plot_y1 - 1)};
                         Vector2 bl = {(float)(cx - 7), (float)(plot_y1 + 11)};
                         Vector2 br = {(float)(cx + 7), (float)(plot_y1 + 11)};
-                        DrawTriangle(ba, br, bl, YELLOW);
-                        DrawTriangleLines(ba, br, bl, BLACK);
+                        DrawTriangle(ba, bl, br, YELLOW);
+                        DrawTriangleLines(ba, bl, br, BLACK);
                         Vector2 ta = {(float) cx, (float)(plot_y0 + 1)};
                         Vector2 tl = {(float)(cx - 7), (float)(plot_y0 - 11)};
                         Vector2 tr = {(float)(cx + 7), (float)(plot_y0 - 11)};
-                        DrawTriangle(ta, tl, tr, YELLOW);
-                        DrawTriangleLines(ta, tl, tr, BLACK);
+                        DrawTriangle(ta, tr, tl, YELLOW);
+                        DrawTriangleLines(ta, tr, tl, BLACK);
                     }
                 }
                 int in_k_panel_now =

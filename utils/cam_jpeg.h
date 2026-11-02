@@ -2,7 +2,10 @@
 
     Simple Satellite Operations  utils/cam_jpeg.h
 
-    Decode the JPEG carried by a boom-camera file.
+    Decode the JPEG carried by a boom-camera file, the two display filters
+    frontiersat_camera_viewer offers on a decoded picture -- histogram
+    equalization (e) and stretching its colours to full scale (t) -- and the
+    brightness range its autoscale (a) shows the picture over.
 
     The flight firmware (CTS-SAT-1, tag sat-1-rc3) writes a captured JPEG to a
     file that begins with the text header "START_CAM:\n" and then a run of fixed
@@ -50,6 +53,8 @@ typedef struct {
     long image_bytes;        // n_sentences * 28 (size of the returned buffer)
     long recovered_bytes;    // image bytes actually filled from sentences
     int  saw_end_sentinel;   // the 0xFACE end-marker sentence was seen
+    long header_supplied;    // header bytes taken from the standard header, 0 if
+                             // the picture's own arrived whole and clean
 } cam_jpeg_stats_t;
 
 // True if `buf` looks like a boom-camera file (starts with "START_CAM:").
@@ -61,10 +66,45 @@ int cam_jpeg_is_camera_file(const uint8_t *buf, long len);
 // still contributes its intact leading bytes). Still-missing image bytes are
 // set to `fill` so the JPEG stays byte-aligned for a tolerant decoder.
 //
+// Every boom-camera picture opens with the same 589-byte JPEG header (tables,
+// frame and scan headers). When a picture's own header is incomplete or
+// damaged but what did arrive agrees with that standard header, the standard
+// header replaces it, so a picture whose first sentences were lost still
+// decodes; stats->header_supplied counts the bytes it put in. Those bytes are
+// not counted in recovered_bytes or sentences_present.
+//
 // Returns a malloc'd buffer of the reconstructed image (caller frees), with its
 // length in *out_len, and fills *stats when non-NULL. Returns NULL on error (no
 // sentences found, or out of memory).
 uint8_t *cam_jpeg_decode(const uint8_t *file, long len, uint8_t fill,
                          cam_jpeg_stats_t *stats, long *out_len);
+
+// Histogram-equalize a decoded picture's brightness in place, leaving its
+// colours alone. `rgb` holds `npix` pixels of 8-bit red, green, blue.
+// Brightness is the luma the JPEG itself codes (0.299 R + 0.587 G + 0.114 B,
+// ITU-R BT.601). Each brightness level moves to its place in the cumulative
+// histogram, so the darkest level present becomes 0, the brightest 255, and the
+// levels between spread out by how many pixels hold them. A pixel's three
+// channels all move by the same amount, which keeps its JPEG chroma (Cb, Cr)
+// unchanged until a channel reaches 0 or 255. A picture of one brightness
+// throughout is left as it is.
+void cam_jpeg_equalize_rgb8(uint8_t *rgb, long npix);
+
+// Stretch each colour of a decoded picture to full scale, in place: red,
+// green and blue are each mapped linearly from their own darkest value to 0
+// and their own brightest to 255. `rgb` holds `npix` pixels of 8-bit red,
+// green, blue. Stretching the three separately also removes a colour cast,
+// since every colour ends up spanning the same range. A colour holding one
+// value throughout is left as it is.
+void cam_jpeg_stretch_rgb8(uint8_t *rgb, long npix);
+
+// The brightness range to autoscale a decoded picture over: in *lo the 1st
+// percentile of its BT.601 luma and in *hi the 99th, as levels 0..255 -- the
+// values at places (npix - 1) / 100 and (npix - 1) * 99 / 100 of the sorted
+// brightnesses, the same rule mpi_viewer's autoscale uses. Ignoring the
+// darkest and brightest hundredth keeps a few hot pixels or town lights from
+// setting the range. The range is always at least one level wide: a picture
+// of one brightness v gets v to v + 1 (254 to 255 for white).
+void cam_jpeg_luma_window(const uint8_t *rgb, long npix, int *lo, int *hi);
 
 #endif

@@ -24,6 +24,9 @@
 #   SIZE     ffmpeg -video_size      (default: 640x480)
 #   TITLE    window title            (default: antenna-cam)
 #
+#   ANTENNA_CAM_ALLOW_REMOTE=1  skip the "you are in an ssh session"
+#                        refusal (only if you have a forwarded display)
+#
 # Examples:
 #   ./antenna_cam.sh
 #   ./antenna_cam.sh --with-timelapse=30
@@ -59,6 +62,28 @@ REMOTE="${1:-${REMOTE:-rao}}"
 DEV="${2:-${DEV:-/dev/video0}}"
 SIZE="${3:-${SIZE:-640x480}}"
 TITLE="${TITLE:-antenna-cam}"
+
+# This script belongs on the operator's laptop. It opens a video window
+# HERE and pulls the camera stream FROM the ground station over ssh, so
+# running it inside an ssh session on the ground station asks that host to
+# ssh back to itself and to draw a window on a machine with no screen. The
+# usual symptom is a bare "Hostname rao not found" -- the `rao` alias lives
+# in the laptop's ~/.ssh/config and doesn't exist on the ground station --
+# which says nothing about what actually went wrong. Say it plainly
+# instead. Set ANTENNA_CAM_ALLOW_REMOTE=1 if you really are forwarding a
+# display and know what you're doing. (Issue #63.)
+if [ -z "${ANTENNA_CAM_ALLOW_REMOTE:-}" ] \
+   && { [ -n "${SSH_CONNECTION:-}" ] || [ -n "${SSH_CLIENT:-}" ] \
+        || [ -n "${SSH_TTY:-}" ]; }; then
+    echo "antenna_cam: this looks like an ssh session on $(hostname)." >&2
+    echo "antenna_cam: run this on your own laptop, not on the ground" >&2
+    echo "antenna_cam:   station -- it opens the viewer window locally and" >&2
+    echo "antenna_cam:   ssh'es to '$REMOTE' itself to fetch the stream." >&2
+    echo "antenna_cam: log out of the ssh session and run it again there." >&2
+    echo "antenna_cam: (set ANTENNA_CAM_ALLOW_REMOTE=1 to override, e.g." >&2
+    echo "antenna_cam:   with a forwarded display.)" >&2
+    exit 2
+fi
 
 # Pick a local viewer. mpv gets first pick because --geometry lets us
 # anchor to the top-right corner; ffplay is the fallback.

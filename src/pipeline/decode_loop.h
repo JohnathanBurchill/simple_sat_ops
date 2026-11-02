@@ -262,9 +262,11 @@ typedef struct {
     long unrecognized;       // detected + stored, but no known type
                              // (CSP-valid -> "unknown", non-CSP -> "unparsed")
     long beacon;             // recognized, by type
+    long beacon_ext;         // the extended (blob) beacon
     long tcmd_response;
     long log_message;
     long bulk_file;
+    long gnss_ring;          // the GNSS ring blob's BESTXYZB samples
     // Packet-DB write outcome (only nonzero when a DB is configured).
     // A failed insert means the decoded packet was NOT stored and is lost
     // unless the run is retried, so a caller that writes a DB must treat

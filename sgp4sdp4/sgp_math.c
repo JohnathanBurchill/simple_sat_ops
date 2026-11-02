@@ -175,13 +175,15 @@ Cross(vector_t *v1, vector_t *v2 ,vector_t *v3)
 /*------------------------------------------------------------------*/
 
 /* Normalizes a vector */
+// Renamed from Normalize: raylib 6.0 exports its own Normalize, and the two
+// clash when a raylib tool that uses SGP4 links raylib statically.
   void
-Normalize( vector_t *v )
+Vec_Normalize( vector_t *v )
 {
   v->x /= v->w;
   v->y /= v->w;
   v->z /= v->w;
-} /*Procedure Normalize*/
+} /*Procedure Vec_Normalize*/
 
 /*------------------------------------------------------------------*/
 

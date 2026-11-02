@@ -302,7 +302,7 @@ static void run_round_trip(const rt_case_t *c)
     }
 
     // RS caps payload + HMAC at RS_K = 223.
-    uint8_t pkt[200];
+    uint8_t pkt[RS_K];
     size_t pkt_len = c->rs ? (RS_K - (c->hmac ? 4 : 0) - 16) : sizeof pkt;
     fill_pseudo(pkt, pkt_len, 0xd1ce0001u + (uint32_t)(uintptr_t)c);
 
