@@ -87,6 +87,8 @@ typedef struct viewer {
     double carrier_hz;
     double jul_utc;
     int    has_rotator;
+    int    rot_activity;   // antenna_rotator_activity_t ordinal, mirrored
+                            // verbatim from the operator's STATE/WELCOME
     char   tle_path[256];
     char   pass_folder[256];
     // Take-control confirmation. Press 'c' once to arm, 'y' within
@@ -167,6 +169,7 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
     s->rot.antenna_rotator.tracking                    = evt->tracking;
     s->rot.antenna_rotator.azimuth                     = evt->az;
     s->rot.antenna_rotator.elevation                   = evt->el;
+    s->rot.antenna_rotator.position_known              = evt->rot_pos_known;
     s->rot.antenna_rotator.target_azimuth              = evt->target_az;
     s->rot.antenna_rotator.target_elevation            = evt->target_el;
     s->rot.antenna_rotator.flip_mode_pass              = evt->flip;
@@ -176,6 +179,7 @@ static void viewer_on_event(sso_ipc_client_t *cli, const sso_event_t *evt,
     s->rot.have_antenna_rotator                        = evt->has_rotator;
 
     v->has_rotator = evt->has_rotator;
+    v->rot_activity = evt->rot_activity;
     v->jul_utc     = evt->jul_utc;
     v->carrier_hz  = (evt->doppler_hz != 0.0)
         ? (double)evt->freq_hz + evt->doppler_hz
@@ -414,10 +418,14 @@ static void viewer_render(viewer_t *v, int connected)
         sp.viewers       = viewers[0] ? viewers : "(none)";
         sp.carrier_hz    = v->carrier_hz;
         sp.have_rotator  = v->has_rotator;
+        sp.rot_pos_known = v->state.rot.antenna_rotator.position_known;
         sp.current_az    = v->state.rot.antenna_rotator.azimuth;
         sp.current_el    = v->state.rot.antenna_rotator.elevation;
         sp.target_az     = v->state.rot.antenna_rotator.target_azimuth;
         sp.target_el     = v->state.rot.antenna_rotator.target_elevation;
+        sp.rot_activity  = v->has_rotator
+            ? antenna_rotator_activity_name((antenna_rotator_activity_t) v->rot_activity)
+            : NULL;
         sp.flip          = v->state.rot.antenna_rotator.flip_mode_pass;
         render_status_panel(&sp, &srow, col);
 
