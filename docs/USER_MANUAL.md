@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`277d736` (2026-11-02). This is a working draft.
+`679f9ca` (2026-11-02). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -4409,6 +4409,18 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   `rao` alias lives in your laptop's `~/.ssh/config` and doesn't exist on
   the ground station). Set `ANTENNA_CAM_ALLOW_REMOTE=1` to override, which
   only makes sense with a forwarded display.
+* **`antenna_cam_dual.sh`** — both RAO antenna webcams side by side in
+  one window, with the capture time (UTC, from the ground station's
+  clock) burnt into the frame. Same laptop-only rule and SSH-session
+  refusal as `antenna_cam.sh`. Unlike that script it transcodes on the
+  ground station: the two MJPEG streams are decoded, stacked and
+  re-encoded as H.264 before crossing the SSH pipe, so keep an eye on
+  the ground machine's CPU if you run it during a pass. `DEV1`/`DEV2`
+  pick the cameras (default `/dev/video0` and `/dev/video2`; the
+  `/dev/v4l/by-id/` names survive a replug), `SIZE`/`FPS`/`BITRATE`
+  trade latency against load, and `VERBOSE=1` shows the raw ffmpeg and
+  mpv logs. Nothing is killed on the ground station: a busy camera
+  means someone else is watching, and ffmpeg says so.
 
 ### Audio and sky plots
 
