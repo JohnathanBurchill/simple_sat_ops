@@ -490,8 +490,8 @@ The live receiver chain in `simple_sat_ops`:
 | Operator UI / IPC                   | `main.c` |
 
 For offline replay of a captured `.iq`, `utils/rx_replay.c` runs the same
-chain in a two-pass form: pass 1 sweeps the whole file with a fast sync
-search and collects ASM candidate timestamps; pass 2 runs the heavier
+chain in two stages (`--two-pass`): stage 1 sweeps the whole file with a fast sync
+search and collects ASM candidate timestamps; stage 2 runs the heavier
 decoder on tight $\sim 0.4$ s windows anchored at each candidate. This is
 $\sim 10\times$ faster than slicing the file once with a wide window.
 
