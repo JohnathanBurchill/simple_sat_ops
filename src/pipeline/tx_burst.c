@@ -36,6 +36,7 @@
 #include "state.h"
 #include "rx_session.h"
 #include "tx_compose.h"     // emit_tx_event_local
+#include "sso_action_log.h"
 #include "sso_audit.h"
 #include "sso_ipc.h"        // SSO_TX_TEXT_MAX, SSO_EVT_TX_*
 #include "sso_time.h"       // ts_now_ns -- end-to-end burst timing
@@ -455,6 +456,12 @@ void tx_burst_service_request(state_t *state)
                              outcome ? outcome : "?", on_air, summary);
                 }
                 sso_audit_event("tx-result", det);
+                if (on_air) {
+                    sso_action_log("tx", "sent: %s", summary);
+                } else {
+                    sso_action_log("tx", "NOT sent (%s): %s",
+                                   outcome ? outcome : "?", summary);
+                }
             }
             state->tx.tx_request.pending = 0;
         }

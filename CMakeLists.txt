@@ -218,6 +218,7 @@ endif()
 set(SSO_CORE_SOURCES
     src/ipc/sso_paths.c
     src/ipc/sso_audit.c
+    src/ipc/sso_action_log.c
     src/ipc/sso_ipc_paths.c
     src/ipc/sso_dirwatch.c
     src/ipc/sso_ipc_codec.c
@@ -788,6 +789,14 @@ add_executable(base64_selftest
                unit_tests/base64_selftest.c src/ipc/sso_base64.c)
 target_include_directories(base64_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS base64_selftest)
+
+# Per-pass actions.log selftest: line format, holding startup lines until
+# the pass folder exists, and folder moves. See src/ipc/sso_action_log.c.
+add_executable(action_log_selftest
+               unit_tests/action_log_selftest.c src/ipc/sso_action_log.c)
+target_include_directories(action_log_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(action_log_selftest PRIVATE Threads::Threads)
+list(APPEND SSO_TARGETS action_log_selftest)
 
 # Ogg/Vorbis streaming-encoder selftest. Pins the "OggS" magic and decodes
 # the encoder's own bytes back through libsndfile (round-trip oracle). Builds

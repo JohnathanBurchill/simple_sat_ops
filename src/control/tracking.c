@@ -28,6 +28,7 @@
 #include "pursuit.h"
 #include "scan_sky.h"
 #include "cmd_line.h"
+#include "sso_action_log.h"
 #include "sso_audit.h"
 #include "tle_io.h"
 
@@ -45,10 +46,14 @@ int main_rotator_submit_set(rot_t *rot,
 {
     if (az_unwrapped < ANTENNA_ROTATOR_MINIMUM_AZIMUTH
         || az_unwrapped > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
+        sso_action_log("rot", "SET az=%.1f el=%.1f refused: azimuth limit",
+                       az_unwrapped, elevation);
         return ANTENNA_ROTATOR_AZIMUTH_LIMIT;
     }
     if (elevation < ANTENNA_ROTATOR_MINIMUM_ELEVATION
         || elevation > ANTENNA_ROTATOR_MAXIMUM_ELEVATION) {
+        sso_action_log("rot", "SET az=%.1f el=%.1f refused: elevation limit",
+                       az_unwrapped, elevation);
         return ANTENNA_ROTATOR_ELEVATION_LIMIT;
     }
     rot->antenna_rotator.target_azimuth_unwrapped = az_unwrapped;
@@ -244,6 +249,8 @@ void main_pursuit_build_plan(state_t *state, double jul_now)
                              a0, &state->rot.pursuit_track) != 0) {
         fprintf(stderr, "pursuit: track sampling failed; "
                         "falling back to aim-where-sat-is-now\n");
+        sso_action_log("track", "pursuit plan: track sampling failed, "
+                       "aiming at live position");
         main_pursuit_clear_plan(&state->rot);
         return;
     }
@@ -261,6 +268,8 @@ void main_pursuit_build_plan(state_t *state, double jul_now)
                             &state->rot.pursuit_plan) != 0) {
         fprintf(stderr, "pursuit: plan build failed; "
                         "falling back to aim-where-sat-is-now\n");
+        sso_action_log("track", "pursuit plan: build failed, "
+                       "aiming at live position");
         main_pursuit_clear_plan(&state->rot);
         return;
     }
@@ -272,6 +281,9 @@ void main_pursuit_build_plan(state_t *state, double jul_now)
                 "pursuit: plan max_err=%.1f deg > 30; disabled, "
                 "falling back to aim-where-sat-is-now\n",
                 state->rot.pursuit_plan.max_error_deg);
+        sso_action_log("track", "pursuit plan: max_err=%.1f deg > 30, "
+                       "aiming at live position",
+                       state->rot.pursuit_plan.max_error_deg);
         main_pursuit_clear_plan(&state->rot);
         return;
     }
@@ -281,6 +293,9 @@ void main_pursuit_build_plan(state_t *state, double jul_now)
             state->rot.pursuit_plan.n_waypoints,
             state->rot.pursuit_plan.max_error_deg, state->rot.pursuit_plan.mean_error_deg,
             state->rot.pursuit_plan.iterations_used);
+    sso_action_log("track", "pursuit plan: %zu waypoints, max_err=%.2f deg",
+                   state->rot.pursuit_plan.n_waypoints,
+                   state->rot.pursuit_plan.max_error_deg);
 }
 
 // Two paths point at the same TLE file? Canonicalise both with
@@ -406,6 +421,7 @@ int retarget_to_tle(state_t *state, const char *path)
     state->rot.antenna_rotator.flip_half          = 0;
 
     snprintf(state->track.target_tle_path, sizeof state->track.target_tle_path, "%s", path);
+    sso_action_log("track", "retarget -> %s (%s)", name, path);
     return RETARGET_OK;
 }
 
@@ -443,6 +459,18 @@ void start_tracking(state_t *state)
     state->rot.antenna_rotator.flip_decision_made = 0;
     state->rot.antenna_rotator.flip_half = 0;
     if (state->rot.antenna_rotator.fixed_target) {
+        sso_action_log("track", "tracking on: fixed target az=%.1f el=%.1f",
+                       state->rot.antenna_rotator.target_azimuth_unwrapped,
+                       state->rot.antenna_rotator.target_elevation);
+    } else {
+        sso_action_log("track", "tracking on: %s%s",
+                       state->track.prediction.satellite_ephem.tle.sat_name[0]
+                           ? state->track.prediction.satellite_ephem.tle.sat_name
+                           : "satellite",
+                       state->rot.antenna_rotator.antenna_is_under_control
+                           ? "" : " (rotator not under control)");
+    }
+    if (state->rot.antenna_rotator.fixed_target) {
         antenna_rotator_result = main_rotator_submit_set(&state->rot,
             state->rot.antenna_rotator.target_azimuth_unwrapped,
             state->rot.antenna_rotator.target_elevation);
@@ -456,6 +484,9 @@ void start_tracking(state_t *state)
 
 void stop_tracking(state_t *state)
 {
+    sso_action_log("track", "tracking off%s",
+                   state->rot.antenna_rotator.homing_in_progress
+                       ? " (home cancelled)" : "");
     state->track.satellite_tracking = 0;
     state->track.doppler_correction_enabled = 1;
     state->rot.antenna_rotator.antenna_is_under_control = 0;
@@ -496,6 +527,8 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
     // the last known target, and only fail if we have neither.
     if (main_rotator_refresh_targets_from_snapshot(&state->rot) != 0
         && !state->rot.antenna_rotator.unwrapped_target_valid) {
+        sso_action_log("rot", "point to az=%.1f el=%.1f failed: "
+                       "no rotator position", azimuth, elevation);
         return ANTENNA_ROTATOR_BAD_RESPONSE;
     }
 
@@ -521,6 +554,8 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
         cmd_set_status(&state->cmd, "home: already at %.1f, %.1f deg -- no move",
                        prev, state->rot.antenna_rotator.elevation);
         sso_audit_event("home", "already at target -- no move");
+        sso_action_log("rot", "point to az=%.1f el=%.1f: already there, no move",
+                       azimuth, elevation);
         return ANTENNA_ROTATOR_OK;
     }
 
@@ -534,6 +569,7 @@ int point_to_stationary_target(state_t *state, double azimuth, double elevation)
                  prev, final_az, delta,
                  (fabs(delta) > 180.0) ? "two-step unwind" : "direct");
         sso_audit_event("home", det);
+        sso_action_log("rot", "point to az=%.1f el=%.1f: %s", azimuth, elevation, det);
         cmd_set_status(&state->cmd, "home: %.1f -> %.1f, %+.1f deg %s (%s)",
                        prev, final_az, delta, delta < 0.0 ? "CCW" : "CW",
                        (fabs(delta) > 180.0) ? "unwind" : "direct");
@@ -656,6 +692,7 @@ void tracking_tick(state_t *state, double jul_utc, double t_now)
                 snprintf(det, sizeof det, "leg2 fired at az=%.1f -> %.1f",
                          current_az, final_az);
                 sso_audit_event("home", det);
+                sso_action_log("rot", "home %s", det);
             }
         }
         // --scan-sky: drives a sky grid one target at a time, dwelling
@@ -670,6 +707,8 @@ void tracking_tick(state_t *state, double jul_utc, double t_now)
                    < state->rot.antenna_rotator.tracking_prep_time_minutes) {
             if (!state->track.in_pass) {
                 state->track.in_pass = 1;
+                sso_action_log("track", "pass window open (AOS in %.1f min)",
+                               state->track.prediction.predicted_minutes_until_visible);
             }
             if (state->rot.antenna_rotator.antenna_should_be_controlled
                 && !state->rot.antenna_rotator.tracking) {
@@ -701,6 +740,11 @@ void tracking_tick(state_t *state, double jul_utc, double t_now)
                     }
                     state->rot.antenna_rotator.flip_decision_made = 1;
                     state->rot.antenna_rotator.tracking = 1;
+                    sso_action_log("track", "rotator tracking engaged: "
+                                   "max_el=%.1f flip=%s",
+                                   state->track.prediction.predicted_max_elevation,
+                                   state->rot.antenna_rotator.flip_mode_pass
+                                       ? "yes" : "no");
                     // Pre-sample the trajectory and ask the planner
                     // for a rate-feasible whole-pass aim sequence. On
                     // any failure (no calibration, planner unhappy,
@@ -716,6 +760,8 @@ void tracking_tick(state_t *state, double jul_utc, double t_now)
                 if (!state->rot.antenna_rotator.unwrapped_target_valid) {
                     if (main_rotator_refresh_targets_from_snapshot(&state->rot)
                         != 0) {
+                        sso_action_log("track", "rotator tracking dropped: "
+                                       "no rotator position");
                         state->rot.antenna_rotator.tracking = 0;
                         main_pursuit_clear_plan(&state->rot);
                     }
@@ -791,6 +837,9 @@ void tracking_tick(state_t *state, double jul_utc, double t_now)
                         || fabs(delta_el) >= MAX_DELTA_ELEVATION_DEGREES) {
                         if (next_az < ANTENNA_ROTATOR_MINIMUM_AZIMUTH
                             || next_az > ANTENNA_ROTATOR_MAXIMUM_AZIMUTH) {
+                            sso_action_log("track", "rotator tracking dropped: "
+                                           "az=%.1f outside rotator range",
+                                           next_az);
                             state->rot.antenna_rotator.tracking = 0;
                             main_pursuit_clear_plan(&state->rot);
                         } else {
@@ -811,8 +860,12 @@ void tracking_tick(state_t *state, double jul_utc, double t_now)
             if (state->track.in_pass) {
                 state->track.in_pass = 0;
                 jul_idle_start = jul_utc;
+                if (state->track.satellite_tracking) {
+                    sso_action_log("track", "pass window closed");
+                }
             }
             if (state->rot.antenna_rotator.tracking) {
+                sso_action_log("track", "rotator tracking released");
                 state->rot.antenna_rotator.tracking = 0;
                 state->rot.antenna_rotator.flip_mode_pass = 0;
                 state->rot.antenna_rotator.flip_decision_made = 0;

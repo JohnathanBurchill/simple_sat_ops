@@ -27,6 +27,7 @@
 #include "cmd_line.h"
 #include "prediction.h"
 #include "scan_sky.h"
+#include "sso_action_log.h"
 #include "sso_audit.h"
 #include "tracking.h"
 #include "tui.h"
@@ -34,6 +35,7 @@
 
 #include <ncurses.h>
 #include <stdio.h>
+#include <string.h>
 
 // --- Keyboard actions ---------------------------------------------
 //
@@ -84,20 +86,27 @@ void kb_act_reset(state_t *state, int key)
 // discards any queued repeats so a held key can't pile up moves.
 void kb_act_jog(state_t *state, int key)
 {
-    int result = 0;
-    state->track.satellite_tracking = 0;
-    state->rot.antenna_rotator.antenna_is_under_control = 0;
+    double delta = 0.0;
+    int    is_az = 1;
     switch (key) {
-        case '[': result = main_rotator_increase_azimuth(&state->rot,   -5.0); break;
-        case ']': result = main_rotator_increase_azimuth(&state->rot,    5.0); break;
-        case '{': result = main_rotator_increase_azimuth(&state->rot,   -1.0); break;
-        case '}': result = main_rotator_increase_azimuth(&state->rot,    1.0); break;
-        case ',': result = main_rotator_increase_elevation(&state->rot, -5.0); break;
-        case '.': result = main_rotator_increase_elevation(&state->rot,  5.0); break;
-        case '<': result = main_rotator_increase_elevation(&state->rot, -1.0); break;
-        case '>': result = main_rotator_increase_elevation(&state->rot,  1.0); break;
+        case '[': delta = -5.0; break;
+        case ']': delta =  5.0; break;
+        case '{': delta = -1.0; break;
+        case '}': delta =  1.0; break;
+        case ',': delta = -5.0; is_az = 0; break;
+        case '.': delta =  5.0; is_az = 0; break;
+        case '<': delta = -1.0; is_az = 0; break;
+        case '>': delta =  1.0; is_az = 0; break;
         default:  return;
     }
+    if (state->track.satellite_tracking) {
+        sso_action_log("ui", "manual jog: satellite tracking off");
+    }
+    sso_action_log("ui", "jog %s %+.0f deg", is_az ? "az" : "el", delta);
+    state->track.satellite_tracking = 0;
+    state->rot.antenna_rotator.antenna_is_under_control = 0;
+    int result = is_az ? main_rotator_increase_azimuth(&state->rot, delta)
+                       : main_rotator_increase_elevation(&state->rot, delta);
     if (result == ANTENNA_ROTATOR_OK) {
         state->rot.antenna_rotator.antenna_is_moving = 1;
     }
@@ -120,18 +129,43 @@ void kb_act_lock(state_t *state, int key)
 {
     (void) key;
     state->ui.keyboard_unlocked = !state->ui.keyboard_unlocked;
+    sso_action_log("ui", "keyboard %s",
+                   state->ui.keyboard_unlocked ? "unlocked" : "locked");
 }
 
 void kb_act_quit(state_t *state, int key)
 {
     (void) key;
     state->app.running = 0;
+    sso_action_log("ui", "quit requested");
 }
 
 void kb_act_cmdline(state_t *state, int key)
 {
     (void) key;
     cmd_enter(&state->cmd);
+}
+
+// Log an operator key against its keybindings row, before the action
+// runs, so the action's own lines (tracking, rotator SET, ...) follow it.
+// The ":" row is skipped -- the command is logged when Enter runs it --
+// and unbound keys are ignored, as dispatch ignores them.
+static void log_operator_key(const state_t *state, int key)
+{
+    if (key <= 0 || key > 255) return;
+    size_t n = 0;
+    const keybinding_t *table = keybindings_table(&n);
+    for (size_t i = 0; i < n; ++i) {
+        const keybinding_t *kb = &table[i];
+        if (!kb->keys || !strchr(kb->keys, key)) continue;
+        if (kb->flags & KB_HIDDEN) return;
+        if (!(kb->flags & KB_ALWAYS) && !state->ui.keyboard_unlocked) {
+            sso_action_log("ui", "key '%c' ignored: keyboard locked", key);
+        } else {
+            sso_action_log("ui", "key '%c': %s", key, kb->desc);
+        }
+        return;
+    }
 }
 
 // --- Router -------------------------------------------------------
@@ -161,6 +195,7 @@ void input_handle_keys(state_t *state)
     } else if (state->cmd.active) {
         cmd_handle_key(key, state);
     } else {
+        log_operator_key(state, key);
         keybindings_dispatch(state, key);
     }
 }

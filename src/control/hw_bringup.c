@@ -25,6 +25,7 @@
 #include "antenna_rotator_async.h"
 #include "pursuit.h"
 #include "rotator_calibrate.h"
+#include "sso_action_log.h"
 #include "tracking.h"          // main_rotator_refresh_targets_from_snapshot
 #include "tr_switch.h"
 #include "tr_switch_find.h"
@@ -93,6 +94,11 @@ int hw_rotator_open(state_t *state)
         || main_rotator_refresh_targets_from_snapshot(&state->rot) != 0) {
         fprintf(stderr, "Warning: could not read SPID position; "
                         "check that the Rot2ProG is in 'A' mode\n");
+        sso_action_log("rot", "rotator connected; position unknown");
+    } else {
+        sso_action_log("rot", "rotator connected at az=%.1f el=%.1f",
+                       state->rot.antenna_rotator.azimuth,
+                       state->rot.antenna_rotator.elevation);
     }
     if (state->rot.antenna_rotator.fixed_target) {
         state->rot.antenna_rotator.target_azimuth            = sav_az;
@@ -302,6 +308,7 @@ void hw_sdr_open(state_t *state)
                 "simple_sat_ops: B210 open failed — continuing without RF "
                 "(rotator + UI only). Pass --without-b210 to silence.\n");
             sso_audit_event("b210-open-failed", "");
+            sso_action_log("rx", "SDR open failed: continuing without RF");
         } else {
             fprintf(stderr,
                 "simple_sat_ops: SDR open at %.6f MHz (post-decim rate %.0f, "
@@ -317,6 +324,8 @@ void hw_sdr_open(state_t *state)
                     b210_rx_tx_core_actual_rate(core),
                     state->sdr.rx_lo_offset_hz);
                 sso_audit_event("b210-open", det);
+                sso_action_log("rx", "SDR open at %.6f MHz",
+                               b210_rx_tx_core_actual_freq(core) / 1e6);
             }
             rx_session_params_t rxp = {
                 .bit_rate          = 9600,
@@ -354,6 +363,7 @@ void hw_sdr_open(state_t *state)
                     "simple_sat_ops: --always-record on — WAV/IQ "
                     "capture started, pass gating disabled\n");
                 sso_audit_event("rec-start", "trigger=always-record");
+                sso_action_log("rx", "recording start (--always-record)");
             }
         }
     }

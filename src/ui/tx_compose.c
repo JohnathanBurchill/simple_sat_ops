@@ -23,6 +23,7 @@
 
 #include "panels.h"          // draw_box, tx_drain_csi
 #include "frontiersat.h"
+#include "sso_action_log.h"
 #include "sso_audit.h"
 #include "sso_ipc.h"
 #include "sso_pseudo.h"
@@ -492,6 +493,10 @@ static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, s
                  state->tx.tx_request.tx_gain_db,
                  c->payload);
         sso_audit_event("tx-commit", det);
+        sso_action_log("tx", "queued manual TX: \"%.200s\" (%zu B, %.6f MHz, %.1f dB)",
+                       c->payload, state->tx.tx_request.payload_len,
+                       state->tx.tx_request.tx_freq_hz / 1e6,
+                       state->tx.tx_request.tx_gain_db);
     }
     return 0;
 #else
@@ -560,6 +565,7 @@ void tx_compose_open(state_t *state) {
     tx_compose_draw(state, state->tx.tx_compose_win, &state->tx.tx_compose);
     state->tx.tx_compose_last_edit_ns = ts_now_ns();
     state->tx.tx_compose_active = 1;
+    sso_action_log("ui", "TX compose opened");
 }
 
 // Tear the modal down. Touchwin + refresh paints stdscr's cells back
@@ -591,6 +597,7 @@ int tx_compose_handle_key(state_t *state, int key) {
         if (translated >= 0) {
             key = translated;
         } else {
+            sso_action_log("ui", "TX compose cancelled");
             tx_compose_remember(state, c);
             return 0;
         }
@@ -601,10 +608,12 @@ int tx_compose_handle_key(state_t *state, int key) {
             snprintf(c->status_msg, sizeof c->status_msg,
                      "rejected: %.*s",
                      (int)(sizeof c->status_msg - 16), err);
+            sso_action_log("tx", "manual TX rejected: %s", err);
         } else if (tx_compose_commit(state, c, err, sizeof err) != 0) {
             snprintf(c->status_msg, sizeof c->status_msg,
                      "commit failed: %.*s",
                      (int)(sizeof c->status_msg - 20), err);
+            sso_action_log("tx", "manual TX not queued: %s", err);
         } else {
             tx_history_push(state, c->payload);
             tx_compose_remember(state, c);
