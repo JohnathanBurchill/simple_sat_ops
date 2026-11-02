@@ -108,8 +108,9 @@ static int expected_header(header_t *h, const char *name, const char *db_path,
     if (exe_identity(h) != 0) return -1;
     char full[PATH_MAX];
     const char *p = realpath(db_path, full) != NULL ? full : db_path;
-    if (strlen(p) >= sizeof h->db_path) return -1;
-    snprintf(h->db_path, sizeof h->db_path, "%s", p);
+    size_t plen = strlen(p);
+    if (plen >= sizeof h->db_path) return -1;
+    memcpy(h->db_path, p, plen + 1);
     if (info != NULL) h->info = *info;
     return 0;
 }
