@@ -4,7 +4,8 @@
 
     Decode the JPEG carried by a boom-camera file, and filter a decoded
     picture for display (histogram equalization, colours stretched to full
-    scale). See cam_jpeg.h for the camera-file (START_CAM sentence) format.
+    scale, the brightness range to autoscale over). See cam_jpeg.h for the
+    camera-file (START_CAM sentence) format.
 
     Copyright (C) 2026  Johnathan K Burchill
 
@@ -324,4 +325,28 @@ void cam_jpeg_stretch_rgb8(uint8_t *rgb, long npix)
         for (int v = lo; v <= hi; v++) map[v] = (uint8_t) ((255 * (v - lo) + span / 2) / span);
         for (long i = 0; i < npix; i++) rgb[3 * i + c] = map[rgb[3 * i + c]];
     }
+}
+
+void cam_jpeg_luma_window(const uint8_t *rgb, long npix, int *lo, int *hi)
+{
+    *lo = 0;
+    *hi = 255;
+    if (npix <= 0) return;
+    long hist[256] = {0};
+    for (long i = 0; i < npix; i++) hist[luma601(rgb + 3 * i)]++;
+
+    // The brightness at place k of the sorted list is the darkest level with
+    // more than k pixels at or below it.
+    long klo = (npix - 1) / 100, khi = (npix - 1) * 99 / 100;
+    long run = 0;
+    int l = -1, h = -1;
+    for (int v = 0; v < 256 && h < 0; v++) {
+        run += hist[v];
+        if (l < 0 && run > klo) l = v;
+        if (run > khi) h = v;
+    }
+    if (h <= l) h = l + 1;
+    if (h > 255) { l = 254; h = 255; }
+    *lo = l;
+    *hi = h;
 }

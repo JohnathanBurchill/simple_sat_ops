@@ -31,7 +31,9 @@
     pixel's colour, clamping at 255, and a picture of one brightness. And
     cam_jpeg_stretch_rgb8, colours stretched to full scale: each colour on
     its own range, rounding, a colour already at full range, and a colour
-    holding one value.
+    holding one value. And cam_jpeg_luma_window, the autoscale range: which
+    sorted places the percentiles land on, brightness as luma rather than a
+    single channel, and the one-level-wide range of a flat picture.
 
     Exit status: 0 = all tests passed, non-zero = failure.
 
@@ -343,6 +345,40 @@ int main(void)
         tap_okf(memcmp(px, want, sizeof want) == 0,
                 "full-range red and one-valued green, blue unchanged (got %d,%d,%d)",
                 px[3], px[4], px[5]);
+    }
+
+    // --- the autoscale brightness range ---------------------------------
+    // The 1st and 99th percentiles of BT.601 luma: the values at places
+    // (n - 1) / 100 and (n - 1) * 99 / 100 of the sorted brightnesses.
+
+    // 201 grey pixels, one at each level 0..200, sort to their own levels,
+    // so places 2 and 198 are levels 2 and 198. The darkest and brightest
+    // (0 and 200) would be the plain extremes; 1 and 197 are what counting
+    // "at or past the place" instead of "past it" gives.
+    {
+        uint8_t px[201 * 3];
+        for (int k = 0; k < 201; k++) px[3 * k] = px[3 * k + 1] = px[3 * k + 2] = (uint8_t) k;
+        int lo = -1, hi = -1;
+        cam_jpeg_luma_window(px, 201, &lo, &hi);
+        tap_okf(lo == 2 && hi == 198, "grey 0..200 autoscale over 2..198 (got %d..%d)", lo, hi);
+    }
+
+    // Pure red has luma (77 * 255 + 128) >> 8 = 77, not its brightest
+    // channel (255) or the mean of its three (85). A picture of one
+    // brightness gets a range one level wide above it.
+    {
+        uint8_t px[] = { 255, 0, 0,  255, 0, 0,  255, 0, 0 };
+        int lo = -1, hi = -1;
+        cam_jpeg_luma_window(px, 3, &lo, &hi);
+        tap_okf(lo == 77 && hi == 78, "pure red autoscales over 77..78 (got %d..%d)", lo, hi);
+    }
+
+    // All white has no level above it, so the range sits just below.
+    {
+        uint8_t px[] = { 255, 255, 255,  255, 255, 255 };
+        int lo = -1, hi = -1;
+        cam_jpeg_luma_window(px, 2, &lo, &hi);
+        tap_okf(lo == 254 && hi == 255, "all white autoscales over 254..255 (got %d..%d)", lo, hi);
     }
 
     return tap_done();

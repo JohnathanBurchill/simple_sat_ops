@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`9b7128f` (2026-10-27). This is a working draft.
+`9d2b759` (2026-11-01). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2626,14 +2626,15 @@ oldest at the bottom, ordered by when each was taken (or, with no
 
 **Favourites.** `f` tags the picture on show as a favourite, and `f` again
 untags it; a favourite carries a gold star in the list and after its title.
-`v` switches the list between every picture and **the favourites only** - the
+`shift-F` switches the list between every picture and **the favourites only** - the
 heading then reads `Favourites`, with `3 of 14` beside it, and `Up`/`Down` step
 from favourite to favourite. Untagging a picture while only the favourites are
 showing drops it from the list and moves on to the next one; untagging the last
 goes back to the whole list rather than leaving it empty.
 
 **It remembers where you were.** The favourites, whether the list is showing
-only them, and the picture last looked at are kept in
+only them, the brightness ranges set by hand (below), and the picture last
+looked at are kept in
 `~/.local/state/simple_sat_ops/frontiersat_camera_viewer.state`, written each
 time one of them changes, so the next run opens on the same picture with the
 same list. A picture is remembered by the moment it belongs to - the same stamp
@@ -2641,7 +2642,7 @@ its exported JPEG is named with - not by its place in the list, so a new
 picture arriving at the top moves nothing, and a favourite the open database
 does not hold is kept in the file rather than forgotten.
 
-**Two display filters: `e` equalizes the picture, `c` stretches its
+**Two display filters: `e` equalizes the picture, `t` stretches its
 colours.** One is on at a time, and the same key again goes back to the
 picture as received. While one is on, its name (`histogram equalized` or
 `colours stretched to full scale`) shows in gold above the picture's top right
@@ -2654,7 +2655,7 @@ still hand over the JPEG as received.
   between take room in proportion to how many pixels hold them. The colour is
   left alone, because all three channels of a pixel move by the same amount.
   On the Aug 6 limb it brings out the cloud structure.
-- **`c`, colours stretched to full scale.** Red, green and blue are each
+- **`t`, colours stretched to full scale.** Red, green and blue are each
   stretched on their own, linearly, from their darkest value to 0 and their
   brightest to 255. Because each colour gets its own stretch, a colour cast
   goes too: the pink Oct 6 picture (red 67 to 171, green 42 to 117, blue 62
@@ -2669,10 +2670,35 @@ Neither shows much in a dark night-mode frame. The pictures of Sep 5, Jul 23
 and Oct 11 use only 5 to 9 brightness levels between 12 and 20. Either filter
 spreads those few levels across the whole range, so the JPEG's compression
 blocks, a level or two apart, become large squares: grey and white with `e`,
-false colours with `c`. What shows then is the compression, not the scene.
+false colours with `t`. What shows then is the compression, not the scene.
 
-Keys: `Up`/`Down` change picture, `e` equalizes, `c` stretches colours, `f` tags a favourite, `v` shows the
-favourites only, **`o` opens the picture in the desktop's
+**The brightness range: `a` cycles it, `z` `x` `c` `v` set it by hand.** The
+picture is drawn over a range of brightness levels: the darkest level in the
+range shows as black, the brightest as white, and the levels between are spread
+evenly, with anything outside the range clipped. `a` cycles through three
+ranges, the same way `a` cycles the scale in `mpi_viewer`:
+
+- **full range**, 0 to 255, the picture as received. Every run opens here.
+- **autoscaled**: from the picture's 1st to its 99th percentile of brightness
+  (the BT.601 luma the JPEG codes), so the darkest and brightest hundredth of
+  the pixels, such as a few town lights, do not set the range.
+- **set by hand**: the picture's own range, which `z` `x` `c` `v` set.
+
+`z` and `x` lower and raise the darkest level shown, and `c` and `v` lower and
+raise the brightest: one level a press, eight with shift, repeating while
+held. They start from the range on show and switch to the range set by hand,
+so the first press moves the picture as you see it. **Each picture keeps its
+own range**, in the state file with the favourites, so it comes back when you
+return to that picture, in this run or the next. A picture with no range of its
+own shows its autoscale range while set by hand is selected. The range applies
+on top of `e` or `t`, all three colours alike. The info panel shows the range
+on show (`brightness   : 12 to 31, set by hand`), and while it is anything but
+the full range it is also named in gold above the picture's top right corner.
+Like the filters, it changes only the screen.
+
+Keys: `Up`/`Down` change picture, `e` equalizes, `t` stretches colours, `a`
+cycles the brightness range, `z`/`x` and `c`/`v` move its darkest and brightest
+levels, `f` tags a favourite, `shift-F` shows the favourites only, **`o` opens the picture in the desktop's
 image viewer** (Preview on macOS, the `xdg-open` default on Linux) via a copy
 in the temporary directory - for a look in whatever viewer you already keep
 your pictures in. `s` saves the JPEG to
@@ -2861,8 +2887,8 @@ favourites only** - the heading then reads `Favourites`, with `2 of 5` beside
 it, and `Up`/`Down` step from favourite to favourite. Untagging one while only
 the favourites are showing drops it from the list and moves on to the next;
 untagging the last goes back to the whole list rather than leaving it empty.
-These are `t` rather than the `f` and `v` that `frontiersat_camera_viewer` uses,
-since here `f` and `v` already set the frames per sweep and the manual DN window.
+These are `t` and `shift-T` rather than the `f` and `shift-F` that
+`frontiersat_camera_viewer` uses, since here `f` already sets the frames per sweep.
 
 The grouping and the timing both come from JSON markers the flight firmware
 writes into each science file: a `{"mpi_start":...,"timestamp_ms":N}` header at

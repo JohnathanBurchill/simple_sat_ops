@@ -59,6 +59,14 @@
     fitted to the pane, so scrolling back out always lands on the whole picture
     again, and a picture bigger than the pane cannot be dragged off the edge.
 
+    Brightness: a cycles the range of levels the picture is drawn over --
+    the full 0 to 255 as received, autoscaled to the picture's own 1st to
+    99th brightness percentiles, or set by hand. z and x lower and raise the
+    darkest level shown, c and v the brightest (shift for eight levels at a
+    time); they switch to the range set by hand, starting from the one on
+    show. Each picture keeps its own hand-set range, in the state file below.
+    A GPU shader does the mapping, so a change shows at once.
+
     Where it was taken: under the capture list is the Earth (utils/sat_globe.c,
     the same panel mpi_viewer carries), NASA's Blue Marble wrapped on a sphere
     and lit from where the Sun actually stood at that moment, so a picture taken
@@ -75,9 +83,10 @@
     the way it was facing.
 
     The list runs newest picture first. f tags the picture on show as a
-    favourite (a gold star in the list and after the title), and v switches the
-    list between every picture and the favourites alone. The favourites, that
-    switch, and the picture last looked at are kept in
+    favourite (a gold star in the list and after the title), and shift-F
+    switches the list between every picture and the favourites alone. The
+    favourites, that switch, the hand-set brightness ranges, and the picture
+    last looked at are kept in
     ~/.local/state/simple_sat_ops/frontiersat_camera_viewer.state, so the next
     run opens where this one left off. Pictures are remembered by the moment
     they belong to (the stamp their exported JPEG is named with), not by their
@@ -122,6 +131,7 @@
 */
 
 #include <raylib.h>
+#include <rlgl.h>
 
 #include "beacon_attitude.h"
 #include "cam_jpeg.h"
@@ -234,6 +244,15 @@ extern void  sso_install_pinch_monitor(void);
 // left column stops above it.
 #define FOOTER_H 28
 
+// How the picture is shown: as received, histogram-equalized (e) or with its
+// colours stretched (t).
+enum { SHOW_AS_RECEIVED, SHOW_EQUALIZED, SHOW_STRETCHED, SHOW_N };
+
+// The range of levels the picture is drawn over, which a cycles: the full
+// 0..255 as received, the picture's autoscale range, or its range set by hand
+// with z x c v.
+enum { RANGE_FIXED, RANGE_AUTO, RANGE_MANUAL, RANGE_N };
+
 typedef struct {
     long long id;               // the packet's row in the DB
     double   ts_ms;
@@ -282,9 +301,11 @@ typedef struct {
     long     jpg_len;
     Texture2D tex;
     // The same picture histogram-equalized (e) and with its colours
-    // stretched to full scale (c).
+    // stretched to full scale (t).
     Texture2D tex_eq;
     Texture2D tex_st;
+    // The autoscale range of each of the three, indexed by SHOW_*.
+    int      auto_lo[SHOW_N], auto_hi[SHOW_N];
     int      tex_ok;
     int      img_w, img_h;
 } capture_t;
@@ -984,8 +1005,9 @@ static void newer_note(const load_note_t *note, char *out, size_t n)
 // ---- textures --------------------------------------------------------------
 
 // Decode each capture's JPEG into a texture, with a histogram-equalized and a
-// colour-stretched copy beside it, so that e and c switch between them at no
-// cost. A picture with too many missing bytes can fail to decode; that capture
+// colour-stretched copy beside it, so that e and t switch between them at no
+// cost, and the autoscale range of each. A picture with too many missing
+// bytes can fail to decode; that capture
 // keeps tex_ok = 0 and the viewer says so instead of drawing it. Must run
 // after InitWindow.
 static void build_textures(capture_t *caps, int n)
@@ -1000,12 +1022,18 @@ static void build_textures(capture_t *caps, int n)
             SetTextureFilter(c->tex, TEXTURE_FILTER_BILINEAR);
             ImageFormat(&im, PIXELFORMAT_UNCOMPRESSED_R8G8B8);
             long npix = (long) im.width * im.height;
+            cam_jpeg_luma_window((const uint8_t *) im.data, npix,
+                                 &c->auto_lo[SHOW_AS_RECEIVED], &c->auto_hi[SHOW_AS_RECEIVED]);
             Image st = ImageCopy(im);
             cam_jpeg_stretch_rgb8((uint8_t *) st.data, npix);
+            cam_jpeg_luma_window((const uint8_t *) st.data, npix,
+                                 &c->auto_lo[SHOW_STRETCHED], &c->auto_hi[SHOW_STRETCHED]);
             c->tex_st = LoadTextureFromImage(st);
             SetTextureFilter(c->tex_st, TEXTURE_FILTER_BILINEAR);
             UnloadImage(st);
             cam_jpeg_equalize_rgb8((uint8_t *) im.data, npix);
+            cam_jpeg_luma_window((const uint8_t *) im.data, npix,
+                                 &c->auto_lo[SHOW_EQUALIZED], &c->auto_hi[SHOW_EQUALIZED]);
             c->tex_eq = LoadTextureFromImage(im);
             SetTextureFilter(c->tex_eq, TEXTURE_FILTER_BILINEAR);
             c->tex_ok = 1;
@@ -1229,21 +1257,33 @@ static void open_in_system_viewer(const capture_t *c, char *status, size_t nstat
 //   favourites_only=1
 //   favourite=20260601_181502
 //   favourite=20260820_072204
+//   brightness=20260904_051230 12 31
+//
+// A brightness line is a picture's range set by hand with z x c v: the
+// darkest and brightest levels shown, 0 <= low < high <= 255.
 //
 // Pictures are named by their id (see capture_t), so the file means the same
 // thing whichever database is open and however the list is ordered. The
-// favourites are kept as names, not as flags on the open list, so a favourite
-// that this database does not hold is carried over untouched rather than
+// favourites and ranges are kept as names, not as flags on the open list, so
+// one that this database does not hold is carried over untouched rather than
 // forgotten the next time the file is written.
 
 #define STATE_RELPATH ".local/state/simple_sat_ops/frontiersat_camera_viewer.state"
 #define MAX_FAVOURITES 512
+#define MAX_RANGES 512
+
+typedef struct {
+    char id[24];
+    int  lo, hi;
+} pic_range_t;
 
 typedef struct {
     char selected[24];
     int  favourites_only;
     char fav[MAX_FAVOURITES][24];
     int  nfav;
+    pic_range_t range[MAX_RANGES];
+    int  nrange;
 } viewer_state_t;
 
 static int state_path(char *out, size_t n)
@@ -1258,6 +1298,13 @@ static int state_find_fav(const viewer_state_t *s, const char *id)
 {
     for (int k = 0; k < s->nfav; k++)
         if (strcmp(s->fav[k], id) == 0) return k;
+    return -1;
+}
+
+static int state_find_range(const viewer_state_t *s, const char *id)
+{
+    for (int k = 0; k < s->nrange; k++)
+        if (strcmp(s->range[k].id, id) == 0) return k;
     return -1;
 }
 
@@ -1283,6 +1330,13 @@ static void state_load(viewer_state_t *s)
         else if (strcmp(line, "favourite") == 0 && val[0] != '\0'
                  && s->nfav < MAX_FAVOURITES && state_find_fav(s, val) < 0)
             snprintf(s->fav[s->nfav++], sizeof s->fav[0], "%s", val);
+        else if (strcmp(line, "brightness") == 0 && s->nrange < MAX_RANGES) {
+            pic_range_t r = {0};
+            if (sscanf(val, "%23s %d %d", r.id, &r.lo, &r.hi) == 3
+                && r.lo >= 0 && r.lo < r.hi && r.hi <= 255
+                && state_find_range(s, r.id) < 0)
+                s->range[s->nrange++] = r;
+        }
     }
     fclose(f);
 }
@@ -1298,10 +1352,13 @@ static int state_save(const viewer_state_t *s)
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "w");
     if (f == NULL) return -1;
-    fprintf(f, "# frontiersat_camera_viewer: the last picture looked at and the favourites\n");
+    fprintf(f, "# frontiersat_camera_viewer: the last picture looked at, the favourites\n"
+               "# and the brightness ranges set by hand\n");
     fprintf(f, "selected=%s\n", s->selected);
     fprintf(f, "favourites_only=%d\n", s->favourites_only);
     for (int k = 0; k < s->nfav; k++) fprintf(f, "favourite=%s\n", s->fav[k]);
+    for (int k = 0; k < s->nrange; k++)
+        fprintf(f, "brightness=%s %d %d\n", s->range[k].id, s->range[k].lo, s->range[k].hi);
     int bad = ferror(f);
     if (fclose(f) != 0) bad = 1;
     if (bad || rename(tmp, path) != 0) { remove(tmp); return -1; }
@@ -1336,6 +1393,54 @@ static int capture_by_id(const capture_t *caps, int n, const char *id)
     return -1;
 }
 
+// ---- brightness range ------------------------------------------------------
+
+// The range of levels picture c is drawn over, shown as `show`: 0..255 when
+// fixed, its autoscale range when auto, and its range set by hand when
+// manual -- or, until z x c v have set one, its autoscale range.
+static void shown_range(const capture_t *c, int show, int mode,
+                        const viewer_state_t *vs, int *lo, int *hi)
+{
+    *lo = 0;
+    *hi = 255;
+    if (mode == RANGE_FIXED) return;
+    int k = mode == RANGE_MANUAL ? state_find_range(vs, c->id) : -1;
+    *lo = k >= 0 ? vs->range[k].lo : c->auto_lo[show];
+    *hi = k >= 0 ? vs->range[k].hi : c->auto_hi[show];
+}
+
+// The shader that maps each colour linearly from the range's darkest level
+// (lo) to black and its brightest (hi) to white, clipping beyond. lo and hi
+// are in the texture's 0..1 units. GLSL 120 for a GL 2.1 context, 330
+// otherwise, as decode_inspector does.
+static Shader load_range_shader(void)
+{
+    static const char *FRAG_330 =
+        "#version 330\n"
+        "in vec2 fragTexCoord;\n"
+        "in vec4 fragColor;\n"
+        "uniform sampler2D texture0;\n"
+        "uniform float lo;\n"
+        "uniform float hi;\n"
+        "out vec4 finalColor;\n"
+        "void main() {\n"
+        "    vec4 t = texture(texture0, fragTexCoord);\n"
+        "    finalColor = vec4(clamp((t.rgb - lo) / (hi - lo), 0.0, 1.0), t.a) * fragColor;\n"
+        "}\n";
+    static const char *FRAG_120 =
+        "#version 120\n"
+        "varying vec2 fragTexCoord;\n"
+        "varying vec4 fragColor;\n"
+        "uniform sampler2D texture0;\n"
+        "uniform float lo;\n"
+        "uniform float hi;\n"
+        "void main() {\n"
+        "    vec4 t = texture2D(texture0, fragTexCoord);\n"
+        "    gl_FragColor = vec4(clamp((t.rgb - lo) / (hi - lo), 0.0, 1.0), t.a) * fragColor;\n"
+        "}\n";
+    return LoadShaderFromMemory(NULL, rlGetVersion() == RL_OPENGL_21 ? FRAG_120 : FRAG_330);
+}
+
 // ---- main ------------------------------------------------------------------
 
 int main(int argc, char **argv)
@@ -1355,10 +1460,14 @@ int main(int argc, char **argv)
                    "~/.cache/simple_sat_ops/ and are rebuilt only by shift-F5 or\n"
                    "--rebuild-cache; the viewer says when the DB has newer downloads\n"
                    "of them than the cache.\n"
-                   "e shows the picture histogram-equalized, c with its colours stretched to\n"
+                   "e shows the picture histogram-equalized, t with its colours stretched to\n"
                    "full scale; the same key again shows it as received.\n"
-                   "f tags a favourite, v shows the favourites only. Favourites, that choice\n"
-                   "and the last picture viewed are kept in ~/" STATE_RELPATH ".\n");
+                   "a cycles the brightness range: full (as received), autoscaled, set by hand.\n"
+                   "z/x lower/raise the darkest level shown, c/v the brightest (shift: 8 levels);\n"
+                   "they set this picture's own range and switch to it.\n"
+                   "f tags a favourite, shift-F shows the favourites only. Favourites, that\n"
+                   "choice, the hand-set ranges and the last picture viewed are kept in\n"
+                   "~/" STATE_RELPATH ".\n");
             return 0;
         } else {
             fprintf(stderr, "frontiersat_camera_viewer: unknown option '%s' (try --help)\n", argv[i]);
@@ -1399,6 +1508,9 @@ int main(int argc, char **argv)
     SetTargetFPS(60);
     g_ui_font_loaded = load_ui_font();
     build_textures(caps, ncaps);
+    Shader range_shader = load_range_shader();
+    int loc_lo = GetShaderLocation(range_shader, "lo");
+    int loc_hi = GetShaderLocation(range_shader, "hi");
 
     // The globe under the capture list. The map and the element sets are read
     // once here; the track itself is built the first time round the loop.
@@ -1444,12 +1556,18 @@ int main(int argc, char **argv)
     Vector2 pan = { 0, 0 };
     int dragging = 0;
     // How the picture is shown: as received, histogram-equalized (e) or with
-    // its colours stretched (c). It stays as set from one picture to the
-    // next, and every run opens on the pictures as received.
-    enum { SHOW_AS_RECEIVED, SHOW_EQUALIZED, SHOW_STRETCHED } show = SHOW_AS_RECEIVED;
+    // its colours stretched (t), and over which brightness range (a). Both
+    // stay as set from one picture to the next, and every run opens on the
+    // pictures as received.
+    int show = SHOW_AS_RECEIVED;
+    int range_mode = RANGE_FIXED;
+    // A range set by hand is written to the state file once z x c v are
+    // let go, not at every step while one is held.
+    int range_unsaved = 0;
     char status[160] = "";
     float status_left = 0.0f;
     float rep_up = 0, rep_down = 0;
+    float rep_z = 0, rep_x = 0, rep_c = 0, rep_v = 0;
     // Where the capture list is scrolled to, in pixels. The reader's, not
     // the selection's: it is pulled back only far enough to keep the
     // selected picture in view, so scrolling away to look at the rest of
@@ -1513,7 +1631,8 @@ int main(int argc, char **argv)
         // on show, untagging one takes it off the list, so the selection
         // moves to the row that slid into its place -- and untagging the
         // last one goes back to the whole list rather than to an empty one.
-        if (IsKeyPressed(KEY_F)) {
+        int shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+        if (IsKeyPressed(KEY_F) && !shift) {
             int k = state_find_fav(&vs, caps[sel].id);
             if (k >= 0) {
                 memmove(vs.fav[k], vs.fav[k + 1], (size_t) (vs.nfav - k - 1) * sizeof vs.fav[0]);
@@ -1540,8 +1659,8 @@ int main(int argc, char **argv)
             if (state_save(&vs) != 0) snprintf(status, sizeof status, "could not write the state file");
             status_left = 6.0f;
         }
-        // v switches between every picture and only the favourites.
-        if (IsKeyPressed(KEY_V)) {
+        // shift-F switches between every picture and only the favourites.
+        if (IsKeyPressed(KEY_F) && shift) {
             int want = !vs.favourites_only;
             if (want && build_rows(caps, ncaps, 1, rows) == 0) {
                 snprintf(status, sizeof status, "no favourites yet -- f tags the picture on show");
@@ -1579,11 +1698,11 @@ int main(int argc, char **argv)
             }
         }
 
-        // e: the picture histogram-equalized; c: its colours stretched to
+        // e: the picture histogram-equalized; t: its colours stretched to
         // full scale. One filter at a time, and the same key again goes back
         // to the picture as received. Only the screen changes; s and o still
         // hand over the JPEG as received.
-        if (IsKeyPressed(KEY_E) || IsKeyPressed(KEY_C)) {
+        if (IsKeyPressed(KEY_E) || IsKeyPressed(KEY_T)) {
             int want = IsKeyPressed(KEY_E) ? SHOW_EQUALIZED : SHOW_STRETCHED;
             show = show == want ? SHOW_AS_RECEIVED : want;
             snprintf(status, sizeof status, "%s",
@@ -1591,6 +1710,63 @@ int main(int argc, char **argv)
                      : show == SHOW_STRETCHED ? "showing the picture with its colours stretched"
                      : "showing the picture as received");
             status_left = 6.0f;
+        }
+        // a: the brightness range, full -> autoscaled -> set by hand -> full.
+        if (IsKeyPressed(KEY_A)) {
+            range_mode = (range_mode + 1) % RANGE_N;
+            snprintf(status, sizeof status, "%s",
+                     range_mode == RANGE_AUTO ? "brightness autoscaled, 1st to 99th percentile"
+                     : range_mode == RANGE_MANUAL ? "brightness set by hand: z/x darkest, c/v brightest"
+                     : "brightness over the full range, as received");
+            status_left = 6.0f;
+        }
+        // z and x lower and raise the darkest level shown, c and v the
+        // brightest, one level a step or eight with shift. They work on this
+        // picture's own range, starting from whatever range is on show, and
+        // switch to it.
+        {
+            int dz = key_repeat(KEY_Z, &rep_z), dx = key_repeat(KEY_X, &rep_x);
+            int dc = key_repeat(KEY_C, &rep_c), dv = key_repeat(KEY_V, &rep_v);
+            if ((dz || dx || dc || dv) && c->tex_ok) {
+                int lo, hi;
+                shown_range(c, show, range_mode, &vs, &lo, &hi);
+                int k = state_find_range(&vs, c->id);
+                if (k < 0 && vs.nrange < MAX_RANGES) {
+                    k = vs.nrange++;
+                    snprintf(vs.range[k].id, sizeof vs.range[k].id, "%s", c->id);
+                }
+                if (k < 0) {
+                    snprintf(status, sizeof status, "brightness ranges full (%d)", MAX_RANGES);
+                    status_left = 6.0f;
+                } else {
+                    pic_range_t *r = &vs.range[k];
+                    r->lo = lo;
+                    r->hi = hi;
+                    int step = shift ? 8 : 1;
+                    if (dz) r->lo -= step;
+                    if (dx) r->lo += step;
+                    if (r->lo < 0) r->lo = 0;
+                    if (r->lo > r->hi - 1) r->lo = r->hi - 1;
+                    if (dc) r->hi -= step;
+                    if (dv) r->hi += step;
+                    if (r->hi > 255) r->hi = 255;
+                    if (r->hi < r->lo + 1) r->hi = r->lo + 1;
+                    if (range_mode != RANGE_MANUAL) {
+                        snprintf(status, sizeof status, "brightness set by hand for this picture");
+                        status_left = 6.0f;
+                    }
+                    range_mode = RANGE_MANUAL;
+                    range_unsaved = 1;
+                }
+            }
+        }
+        if (range_unsaved && !IsKeyDown(KEY_Z) && !IsKeyDown(KEY_X)
+            && !IsKeyDown(KEY_C) && !IsKeyDown(KEY_V)) {
+            if (state_save(&vs) != 0) {
+                snprintf(status, sizeof status, "could not write the state file");
+                status_left = 6.0f;
+            }
+            range_unsaved = 0;
         }
         if (IsKeyPressed(KEY_S)) { save_jpeg(c, status, sizeof status); status_left = 6.0f; }
         if (IsKeyPressed(KEY_O)) { open_in_system_viewer(c, status, sizeof status); status_left = 6.0f; }
@@ -1771,6 +1947,9 @@ int main(int argc, char **argv)
         // the picture, in the pane above the info panel
         DrawRectangleLines(px - 1, py - 1, pw + 2, ph + 2, (Color){ 70, 70, 80, 255 });
         float shown_scale = 0.0f;
+        int range_lo, range_hi;
+        shown_range(c, show, range_mode, &vs, &range_lo, &range_hi);
+        int range_by_hand = range_mode == RANGE_MANUAL && state_find_range(&vs, c->id) >= 0;
         if (c->tex_ok) {
             Rectangle src = { 0, 0, (float) c->img_w, (float) c->img_h };
             Rectangle dst = picture_dst(c, px, py, pw, ph, zoom, &pan);
@@ -1778,13 +1957,27 @@ int main(int argc, char **argv)
             BeginScissorMode(px, py, pw, ph);
             Texture2D pic = show == SHOW_EQUALIZED ? c->tex_eq
                           : show == SHOW_STRETCHED ? c->tex_st : c->tex;
+            if (range_mode != RANGE_FIXED) {
+                float flo = (float) range_lo / 255.0f, fhi = (float) range_hi / 255.0f;
+                SetShaderValue(range_shader, loc_lo, &flo, SHADER_UNIFORM_FLOAT);
+                SetShaderValue(range_shader, loc_hi, &fhi, SHADER_UNIFORM_FLOAT);
+                BeginShaderMode(range_shader);
+            }
             DrawTexturePro(pic, src, dst, (Vector2){ 0, 0 }, 0.0f, WHITE);
+            if (range_mode != RANGE_FIXED) EndShaderMode();
             EndScissorMode();
-            // Said above the corner of the pane for as long as a filter is
-            // on, since the picture on show is not what the camera recorded.
-            if (show != SHOW_AS_RECEIVED) {
-                const char *label = show == SHOW_EQUALIZED ? "histogram equalized"
-                                                           : "colours stretched to full scale";
+            // Said above the corner of the pane for as long as a filter or
+            // a brightness range is on, since the picture on show is not
+            // what the camera recorded.
+            char label[96] = "";
+            if (show != SHOW_AS_RECEIVED)
+                snprintf(label, sizeof label, "%s", show == SHOW_EQUALIZED ? "histogram equalized"
+                                                    : "colours stretched to full scale");
+            if (range_mode != RANGE_FIXED)
+                snprintf(label + strlen(label), sizeof label - strlen(label),
+                         "%sbrightness %d to %d%s", label[0] ? ", " : "", range_lo, range_hi,
+                         range_by_hand ? " (by hand)" : " (auto)");
+            if (label[0]) {
                 int lw = g_ui_font_loaded
                        ? (int) MeasureTextEx(g_ui_font, label, 15, g_ui_font_spacing).x
                        : MeasureText(label, 15);
@@ -1821,12 +2014,18 @@ int main(int argc, char **argv)
                                          zoom <= 1.0f ? "  (whole picture)" : "")
                             : "zoom         : -",
                   col2, iy + 20, 15, LIGHTGRAY);
+        draw_text(TextFormat("brightness   : %d to %d, %s", range_lo, range_hi,
+                             range_mode == RANGE_FIXED ? "full range"
+                             : range_by_hand ? "set by hand"
+                             : range_mode == RANGE_AUTO ? "autoscaled"
+                             : "autoscaled until z x c v set it"),
+                  col2, iy + 40, 15, LIGHTGRAY);
         // The last action's outcome; otherwise whether the cache is behind
         // the DB, which stays up until it is rebuilt.
         if (status_left > 0.0f)
-            draw_text(status, col2, iy + 40, 15, (Color){ 120, 220, 160, 255 });
+            draw_text(status, rx, iy + 80, 15, (Color){ 120, 220, 160, 255 });
         else if (newer[0])
-            draw_text(newer, col2, iy + 40, 15, (Color){ 240, 196, 64, 255 });
+            draw_text(newer, rx, iy + 80, 15, (Color){ 240, 196, 64, 255 });
 
         {
             char line[256] = "";
@@ -1846,9 +2045,10 @@ int main(int argc, char **argv)
         }
 
         // help footer
-        draw_text("Up/Down capture   scroll or pinch zoom   drag to move   e equalize   c stretch colours   "
+        draw_text("Up/Down capture   scroll or pinch zoom   drag to move   e equalize   t stretch colours   "
+                  "a brightness   z/x darkest  c/v brightest   "
                   "globe: drag turns, scroll zooms, g resets, p outlines picture   "
-                  "f favourite   v favourites only   o open   s save jpeg   F5 refresh   shift-F5 rebuild   q quit",
+                  "f favourite   F favourites only   o open   s save jpeg   F5 refresh   shift-F5 rebuild   q quit",
                   12, sh - 22, 12, (Color){ 150, 150, 160, 255 });
 
         EndDrawing();
@@ -1860,6 +2060,7 @@ int main(int argc, char **argv)
     globe_free(&globe);
     beacon_attitude_free();
     unload_textures(caps, ncaps);
+    UnloadShader(range_shader);
     if (g_ui_font_loaded) UnloadFont(g_ui_font);
     CloseWindow();
 

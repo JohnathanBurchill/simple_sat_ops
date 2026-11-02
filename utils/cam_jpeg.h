@@ -2,9 +2,10 @@
 
     Simple Satellite Operations  utils/cam_jpeg.h
 
-    Decode the JPEG carried by a boom-camera file, and the two display filters
-    frontiersat_camera_viewer offers on a decoded picture: histogram
-    equalization (e) and stretching its colours to full scale (c).
+    Decode the JPEG carried by a boom-camera file, the two display filters
+    frontiersat_camera_viewer offers on a decoded picture -- histogram
+    equalization (e) and stretching its colours to full scale (t) -- and the
+    brightness range its autoscale (a) shows the picture over.
 
     The flight firmware (CTS-SAT-1, tag sat-1-rc3) writes a captured JPEG to a
     file that begins with the text header "START_CAM:\n" and then a run of fixed
@@ -96,5 +97,14 @@ void cam_jpeg_equalize_rgb8(uint8_t *rgb, long npix);
 // since every colour ends up spanning the same range. A colour holding one
 // value throughout is left as it is.
 void cam_jpeg_stretch_rgb8(uint8_t *rgb, long npix);
+
+// The brightness range to autoscale a decoded picture over: in *lo the 1st
+// percentile of its BT.601 luma and in *hi the 99th, as levels 0..255 -- the
+// values at places (npix - 1) / 100 and (npix - 1) * 99 / 100 of the sorted
+// brightnesses, the same rule mpi_viewer's autoscale uses. Ignoring the
+// darkest and brightest hundredth keeps a few hot pixels or town lights from
+// setting the range. The range is always at least one level wide: a picture
+// of one brightness v gets v to v + 1 (254 to 255 for white).
+void cam_jpeg_luma_window(const uint8_t *rgb, long npix, int *lo, int *hi);
 
 #endif
