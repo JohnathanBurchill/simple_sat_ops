@@ -41,6 +41,14 @@
     fails it (data the firmware lost at the flush, or the last frame of a
     recording, cut short by the stop) is dropped.
 
+    Every other frame is held to its CRC too, and one that fails it is not
+    drawn, in the image or the whereogram. Most of those sit beside a downlink
+    packet that never came down, so part of the frame reads as zeros; the rest
+    carry bytes from a packet whose CSP CRC failed. Drawn, they were the
+    one-column streaks through the whereogram and the image columns that stood
+    hundreds to tens of thousands of DN off their neighbours -- 55 of the 1266
+    frames of the 2026-10-20 19:21 recording.
+
     Each frame carries aux/housekeeping fields then a strip of image pixels, and
     the two are one frame apart: the pixels were integrated during the previous
     frame's slot, while the aux fields are stamped when the frame is packed, by
@@ -70,9 +78,21 @@
     the order it was flown means left to right is earliest to latest, the same
     direction as the whereogram below, so an image reads as the stretch of
     whereogram its playback head is sitting on rather than as a mirror of it,
-    and consecutive images tile that recording with nothing left over. A new
-    image begins one frame past a multiple of the scan period, which the scan
-    index (aux byte 13) counts off. The tool plays the images back like a movie, grayscale, with
+    and consecutive images tile that recording with nothing left over.
+
+    Which image a frame belongs in comes from the frame counter (aux bytes
+    4-5), which steps by exactly one a frame: a frame's counter less its column
+    is the counter of its sweep's first frame, the same for every frame of that
+    sweep, so each frame finds its own image whichever of its neighbours came
+    down. Until 2026-10-21 a new image began only at the frame that starts a
+    sweep, and when that one frame was missing the next sweep -- or ten of them,
+    across a download hole -- ran on into the image before and was drawn over
+    its columns. A counter that steps back starts a new image too: it starts
+    again from zero when the instrument restarts, as it does once near the
+    start of eight of the first thirteen recordings, so no image takes frames
+    from both sides of the restart.
+
+    The tool plays the images back like a movie, grayscale, with
     an adjustable DN range and nearest-neighbour zoom, and shows the aux data
     beside each image -- that aux belonging, as above, to the frame after the
     one the pixels were taken in.
@@ -148,7 +168,13 @@
     from, hence the name. Five times as wide as it is high. Its horizontal axis
     is the file rather than the frames in hand, so a stretch that never came
     down takes its own width instead of being closed up, and is marked by a red
-    rule above the panel. m cycles the colour map, which the image shares.
+    rule above the panel. m cycles the colour map, which the image shares, and
+    the colour scale is the image's too -- whatever DN window the image on
+    screen is drawn with -- so a frame is the same colour in both. Several
+    frames share a pixel once the recording is longer than the panel is wide,
+    and they are averaged; the wheel over the panel zooms in on the playback
+    head, down to three sweeps, and from one pixel a frame on the stretch under
+    the head is the image itself.
 
     Time ruler: a press on the whereogram jumps to that moment in the recording
     and dragging scrubs, and while the button is down the drag also measures.
@@ -202,8 +228,10 @@
     answer to whichever offset field was worst corrupted. One chunk claiming
     offset 2051784 sized the 2026-07-21 experiment at 2051979 bytes, and a file
     that is complete showed as 27% recovered with a re-download list demanding
-    1.5 MB that does not exist. The length is read out of the satellite's own
-    "Bulk downlink complete" log lines instead.
+    1.5 MB that does not exist. The length is read out of what the satellite
+    itself reports instead: its "Bulk downlink complete" log lines, and the
+    JSON replies of the download-start, MPI-analysis and file-map blobs, which
+    name the file and its size even when no download ever reached the end.
 
     An offset field is only as good as the packet carrying it, and the same CSP
     CRC32 covers both, so only CRC-verified chunks are trusted to say where they
@@ -215,17 +243,30 @@
 
     Read-only on the DB. Press F5 to re-read it and rebuild the experiment list.
 
+    The cache: a recording that started more than a week ago is not put
+    together again at every start. It is kept, as built, in
+    ~/.cache/simple_sat_ops/mpi_viewer.cache (utils/viewer_cache.h has the
+    rules), and only the rest is rebuilt, from the last week or so of packets
+    and whatever the DB has gained since the cache was written. A download of
+    an old recording that comes in later -- a re-download of its holes, say --
+    is not folded in by itself: the viewer says, above the help line, how
+    many such downloads it has left out, and shift-F5 (or --rebuild-cache)
+    rebuilds every recording from the whole DB and writes the cache afresh.
+    The attitudes the globe draws keep a cache of their own beside it, by the
+    same rules. A new build of the viewer starts with a full rebuild, and
+    deleting the cache files is always safe.
+
     A single file: given --file <path> to an MPI science-data file (one that
     mpi_reconstruct wrote, or one copied off the satellite) the viewer shows just
     that file as its one experiment, built the same way as one from the DB but
     from a single chunk covering the whole file. F5 then re-reads the file. The
-    DB is still read, if there is one, for the globe's TLEs and attitudes. A file
-    on disk does not record which bytes never arrived -- mpi_reconstruct leaves
-    them as its fill value -- so every byte counts as received and there is
-    nothing for d to re-download.
+    experiment cache is neither read nor written. The DB is still read, if there
+    is one, for the globe's TLEs and attitudes. A file on disk does not record
+    which bytes never arrived -- mpi_reconstruct leaves them as its fill value --
+    so every byte counts as received and there is nothing for d to re-download.
 
     Usage:
-      mpi_viewer [--db=<packet_db.sqlite>] [--file <mpi_file>] [--list]
+      mpi_viewer [--db=<packet_db.sqlite>] [--file <mpi_file>] [--list] [--rebuild-cache]
       mpi_viewer --help
 
     With no --db the default store is used ($SSO_PACKET_DB, else the FrontierSat
@@ -259,6 +300,7 @@
 #include "sat_globe.h"
 #include "sso_paths.h"
 #include "sso_version.h"
+#include "viewer_cache.h"
 
 #include <ctype.h>
 #include <float.h>
@@ -336,7 +378,6 @@ int main(int argc, char **argv)
 #define FRAME_STRIDE   152   // bytes per frame (sync .. last pixel)
 #define PIX_START      20    // first pixel byte within a frame
 #define NPIX           65    // big-endian uint16 pixels per frame
-#define SCAN_IDX_OFF   13    // inner dome scan index byte (the image row)
 #define MAX_FPI        64    // largest scan period we render
 
 // The 0 V background frame's target-voltage setpoint. It carries no ion signal
@@ -345,6 +386,7 @@ int main(int argc, char **argv)
 #define MPI_BACKGROUND_TV  65535
 
 typedef struct {
+    long long id;       // the packet's row in the DB
     double   ts_ms;
     long     off;
     int      rs;
@@ -362,6 +404,7 @@ typedef struct {
     char     src_file[256];  // the local file it was read from, "" when it came from the DB
     double   t_first_recv_ms;// receive time of this experiment's earliest packet
     double   t_last_recv_ms; // receive time of its latest packet
+    long long max_id;        // the newest of its packets' DB rows
     double   t_end_ms;       // last marker time (unix ms); recording end
     uint8_t *buf;            // reconstructed bytes (all passes merged)
     uint8_t *present;        // 1 where a real byte landed
@@ -375,11 +418,10 @@ typedef struct {
     int      nframes;        // number of sync words found
     long    *fr_off;         // byte offset of each frame's sync word
     int     *fr_ctr;         // running counter (bytes 4-5) per frame
-    int     *fr_scan;        // inner dome scan index (byte 13) per frame
     int     *fr_tv;          // inner dome target voltage (bytes 11-12) per frame
     double  *fr_ts;          // capture time (unix ms) per frame, -1 if unknown
     uint8_t *fr_bytes;       // each frame's 152 bytes, any JSON marker spliced into it cut out
-    int     *fr_bad;         // 1 if the frame is dropped: it runs past EOF, or a rejoined frame fails its CRC
+    int     *fr_bad;         // 1 if the frame is dropped: it runs past EOF, or fails its own CRC
     int     *fr_spliced;     // 1 if a JSON marker was cut out of the frame
     int     *fr_unver;       // 1 if any of the frame's bytes came from a failed-CRC packet
     int     *fr_gap;         // 1 if any of the frame's bytes never came down
@@ -392,7 +434,7 @@ static void free_experiment(experiment_t *e)
 {
     free(e->buf); free(e->present); free(e->verified);
     free(e->fr_off); free(e->fr_ctr);
-    free(e->fr_scan); free(e->fr_tv);
+    free(e->fr_tv);
     free(e->fr_ts); free(e->fr_bad); free(e->fr_unver);
     free(e->fr_bytes); free(e->fr_spliced); free(e->fr_gap);
 }
@@ -626,16 +668,28 @@ static double interp_time(const long *off, const double *ts, int n, long x)
 
 // Load every bulk_file chunk with a sane offset, oldest first (mirrors
 // mpi_reconstruct's loader). Returns 0 on success.
-static int load_chunks(sqlite3 *db, chunk_t **out, int *out_n)
+// Every bulk_file packet, or with `since` (an ISO time as ts_received writes
+// it) only those received from then on plus every row newer than after_id --
+// the part a start with a cache has to rebuild.
+static int load_chunks(sqlite3 *db, const char *since, long long after_id,
+                       chunk_t **out, int *out_n)
 {
-    const char *sql =
-        "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, "
-        "       ts_received, payload, rs_errs, crc_status "
-        "FROM packet WHERE packet_type=16 ORDER BY ts_received, id";
+    const char *sql = since == NULL
+        ? "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, "
+          "       ts_received, payload, rs_errs, crc_status, id "
+          "FROM packet WHERE packet_type=16 ORDER BY ts_received, id"
+        : "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, "
+          "       ts_received, payload, rs_errs, crc_status, id "
+          "FROM packet WHERE packet_type=16 AND (ts_received >= ?1 OR id > ?2) "
+          "ORDER BY ts_received, id";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
         fprintf(stderr, "mpi_viewer: query failed: %s\n", sqlite3_errmsg(db));
         return -1;
+    }
+    if (since != NULL) {
+        sqlite3_bind_text(st, 1, since, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, after_id);
     }
 
     chunk_t *cs = NULL;
@@ -663,6 +717,7 @@ static int load_chunks(sqlite3 *db, chunk_t **out, int *out_n)
         }
         chunk_t *c = &cs[n];
         memset(c, 0, sizeof *c);
+        c->id    = sqlite3_column_int64(st, 5);
         c->ts_ms = sqlite3_column_double(st, 0);
         c->off   = off;
         c->rs    = sqlite3_column_int(st, 3);
@@ -698,11 +753,14 @@ fail:
 //   CTS1+exec_blob_from_fs(blobs/bulk_downlink_start_v2.blob,0,mpi_data/...;0;0)@...
 //   CTS1+comms_bulk_file_downlink_start(mpi_data/2026-08-08.mpi,160485,1170)@...
 //
-// so the file on the satellite is just the "mpi_data/....mpi" token in the text,
-// and the command started a recording rather than a download when
-// "mpi_enable_active_mode(" appears. This is best-effort: a download commanded
-// from elsewhere, or a store with no sent_tcmd table, simply leaves an
-// experiment's path blank and the export writes a placeholder instead.
+// so the file on the satellite is just the "....mpi" token in the text, and the
+// command started a recording rather than a download when
+// "mpi_enable_active_mode(" appears. The firmware writes a recording to exactly
+// the path it is given, so the token may or may not have a directory: the
+// 2026-10 recordings were named "2026-10-05_102334Z.mpi" and live at the top of
+// the file system. This is best-effort: a download commanded from elsewhere, or
+// a store with no sent_tcmd table, simply leaves an experiment's path blank and
+// the export writes a placeholder instead.
 
 typedef struct {
     double ts_ms;
@@ -710,20 +768,26 @@ typedef struct {
     int    is_record;
 } mpicmd_t;
 
-// Copy the "mpi_data/....mpi" token out of a command into `path`. Returns 1 on
-// success. The token ends at the argument separator (',' in the direct form,
-// ';' in the blob form) or the closing parenthesis.
+// Copy the "....mpi" token out of a command into `path`. Returns 1 on success.
+// The token is an argument, so it starts after '(' or the separator before it
+// (',' in the direct form, ';' in the blob form) and ends at the next separator
+// or the closing parenthesis.
 static int extract_mpi_path(const char *text, char *path, size_t n)
 {
-    const char *s = strstr(text, "mpi_data/");
-    if (s == NULL) return 0;
-    size_t k = 0;
-    while (s[k] != '\0' && s[k] != ',' && s[k] != ';' && s[k] != ')' && k < n - 1) k++;
-    // s starts with "mpi_data/", so k is at least 9 and this test is in bounds.
-    if (strncmp(s + k - 4, ".mpi", 4) != 0) return 0;   // not a science file
-    memcpy(path, s, k);
-    path[k] = '\0';
-    return 1;
+    for (const char *s = strstr(text, ".mpi"); s != NULL; s = strstr(s + 1, ".mpi")) {
+        const char *end = s + 4;
+        if (*end != ',' && *end != ';' && *end != ')') continue;   // e.g. ".mpi_x"
+        const char *start = s;
+        while (start > text && start[-1] != '(' && start[-1] != ','
+               && start[-1] != ';') start--;
+        size_t k = (size_t) (end - start);
+        // ".mpi" alone is not a file name.
+        if (k <= 4 || k >= n) continue;
+        memcpy(path, start, k);
+        path[k] = '\0';
+        return 1;
+    }
+    return 0;
 }
 
 // Load every MPI-related telecommand, oldest first. Returns the count (0 if the
@@ -734,7 +798,7 @@ static int load_mpi_commands(sqlite3 *db, mpicmd_t **out)
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
             "SELECT ts_sent_ms, command_text FROM sent_tcmd "
-            "WHERE command_text LIKE '%mpi_data/%' ORDER BY ts_sent_ms",
+            "WHERE command_text LIKE '%.mpi%' ORDER BY ts_sent_ms",
             -1, &st, NULL) != SQLITE_OK)
         return 0;
 
@@ -761,35 +825,55 @@ static int load_mpi_commands(sqlite3 *db, mpicmd_t **out)
     return n;
 }
 
-// Read every bulk-downlink log line the satellite sent into the size table, so
-// each experiment's file can be reconstructed against its real length instead
-// of against the largest offset that happened to arrive. Missing or unreadable
-// log packets are not an error: an experiment whose file is not named there
-// falls back to sizing itself from its chunks.
-static void load_bulk_log(sqlite3 *db, bulk_size_table_t *sizes)
+// Feed the payload of every row `sql` selects (reception time in unix ms, then
+// payload) to the size table.
+static void feed_sizes(sqlite3 *db, const char *sql, bulk_size_table_t *sizes)
 {
-    // Log packets are packet_type 3; both lines of interest mention "downl",
-    // which keeps the scan off the rest of the log traffic.
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db,
-            "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload "
-            "FROM packet WHERE packet_type = 3 AND payload LIKE '%downl%' "
-            "ORDER BY ts_received, id", -1, &st, NULL) != SQLITE_OK)
-        return;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return;
 
     while (sqlite3_step(st) == SQLITE_ROW) {
         const void *pl = sqlite3_column_blob(st, 1);
         int pl_len = sqlite3_column_bytes(st, 1);
         if (pl == NULL || pl_len <= 0) continue;
-        // A log payload is raw bytes, not a C string, and holds anything at all
-        // once RS has failed on it, so copy it out NUL-terminated first.
+        // A payload is raw bytes, not a C string: a reply opens with a binary
+        // header full of zero bytes, and a log line holds anything at all once
+        // RS has failed on it. Copy it out with the zeros blanked so the text
+        // after them can still be searched.
         char text[512];
         int m = pl_len < (int) sizeof text - 1 ? pl_len : (int) sizeof text - 1;
         memcpy(text, pl, (size_t) m);
+        for (int i = 0; i < m; i++)
+            if (text[i] == '\0') text[i] = ' ';
         text[m] = '\0';
         bulk_size_feed(sizes, text, sqlite3_column_double(st, 0));
     }
     sqlite3_finalize(st);
+}
+
+// Read everything the satellite said about how long its files are into the size
+// table, so each experiment's file can be reconstructed against its real length
+// instead of against the largest offset that happened to arrive. Missing or
+// unreadable packets are not an error: an experiment whose file is not named
+// there falls back to sizing itself from its chunks.
+static void load_bulk_log(sqlite3 *db, bulk_size_table_t *sizes)
+{
+    // Log packets are packet_type 3; both lines of interest mention "downl",
+    // which keeps the scan off the rest of the log traffic.
+    feed_sizes(db,
+        "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload "
+        "FROM packet WHERE packet_type = 3 AND payload LIKE '%downl%' "
+        "ORDER BY ts_received, id", sizes);
+
+    // Blob replies that name a file and its length (bulk_size.h) are telecommand
+    // responses, packet_type 4. A flipped digit in one reads exactly like a real
+    // length, so only replies whose CRC32 checked out are believed. instr()
+    // rather than LIKE, which would stop at the reply header's first zero byte.
+    feed_sizes(db,
+        "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload "
+        "FROM packet WHERE packet_type = 4 AND crc_status = 1 "
+        "AND instr(payload, CAST('\"file\":\"' AS BLOB)) > 0 "
+        "ORDER BY ts_received, id", sizes);
 }
 
 // Name the file an experiment was written to. The recording command carries the
@@ -956,14 +1040,15 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
     out->nframes = n;
     out->t_first_recv_ms = cs[idx[0]].ts_ms;
     out->t_last_recv_ms  = cs[idx[0]].ts_ms;
+    out->max_id = cs[idx[0]].id;
     for (int j = 1; j < nidx; j++) {
         double t = cs[idx[j]].ts_ms;
         if (t < out->t_first_recv_ms) out->t_first_recv_ms = t;
         if (t > out->t_last_recv_ms)  out->t_last_recv_ms  = t;
+        if (cs[idx[j]].id > out->max_id) out->max_id = cs[idx[j]].id;
     }
     out->fr_off = offs;
     out->fr_ctr  = (int *) malloc((size_t) n * sizeof(int));
-    out->fr_scan = (int *) malloc((size_t) n * sizeof(int));
     out->fr_tv   = (int *) malloc((size_t) n * sizeof(int));
     out->fr_ts   = (double *) malloc((size_t) n * sizeof(double));
     out->fr_bad  = (int *) calloc((size_t) n, sizeof(int));
@@ -971,10 +1056,10 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
     out->fr_gap  = (int *) calloc((size_t) n, sizeof(int));
     out->fr_spliced = (int *) calloc((size_t) n, sizeof(int));
     out->fr_bytes = (uint8_t *) calloc((size_t) n, FRAME_STRIDE);
-    if (out->fr_ctr == NULL || out->fr_scan == NULL || out->fr_tv == NULL
+    if (out->fr_ctr == NULL || out->fr_tv == NULL
         || out->fr_ts == NULL || out->fr_bad == NULL || out->fr_unver == NULL
         || out->fr_gap == NULL || out->fr_spliced == NULL || out->fr_bytes == NULL) {
-        free(out->fr_ctr); free(out->fr_scan); free(out->fr_tv);
+        free(out->fr_ctr); free(out->fr_tv);
         free(out->fr_ts); free(out->fr_bad); free(out->fr_unver);
         free(out->fr_gap); free(out->fr_spliced); free(out->fr_bytes);
         free(offs); free(buf); free(present); free(verified);
@@ -1024,18 +1109,16 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
             else if (!verified[p]) out->fr_unver[k] = 1;
         }
         out->fr_ctr[k]  = be16(f, 4);
-        out->fr_scan[k] = f[SCAN_IDX_OFF];
         out->fr_tv[k]   = be16(f, 11);
         out->fr_ts[k]   = -1.0;
 
-        // The firmware sometimes loses data at a flush, and then the half after
-        // the marker belongs to a later frame (the frame counter jumps across
-        // it); the last frame of a recording is cut short by the stop. Either
-        // way the joined frame fails its own CRC, so a rejoined frame that
-        // came down whole and fails it is dropped. One with bytes missing
-        // cannot be checked and is kept, like any other frame with a gap.
-        if (out->fr_spliced[k] && !out->fr_bad[k] && !out->fr_gap[k]
-            && !frame_crc_ok(out, k))
+        // A frame whose own CRC fails is dropped. Most of these have bytes
+        // that never came down, which read as zeros; others carry bytes from a
+        // packet whose CSP CRC failed. A rejoined frame fails it too when the
+        // firmware lost data at the flush, so that the half after the marker
+        // belongs to a later frame (the frame counter jumps across it), and
+        // the last frame of a recording fails it, being cut short by the stop.
+        if (!out->fr_bad[k] && !frame_crc_ok(out, k))
             out->fr_bad[k] = 1;
     }
     free(ms); free(me);
@@ -1101,13 +1184,15 @@ typedef struct {
     int    exp;      // assigned experiment id, -1 until clustered
 } burst_t;
 
-// Load all experiments from an open DB. Returns the experiment count and fills
+// Load the experiments from an open DB: all of them, or with `since` those the
+// packets load_chunks picks out make. Returns the experiment count and fills
 // *out (caller frees via free_experiments).
-static int load_experiments_from_db(sqlite3 *db, experiment_t **out)
+static int load_experiments_from_db(sqlite3 *db, const char *since, long long after_id,
+                                    experiment_t **out)
 {
     *out = NULL;
     chunk_t *cs = NULL; int n = 0;
-    if (load_chunks(db, &cs, &n) != 0 || n == 0) { free(cs); return 0; }
+    if (load_chunks(db, since, after_id, &cs, &n) != 0 || n == 0) { free(cs); return 0; }
 
     // Newest packet receive time bounds plausible marker timestamps: a capture
     // cannot be downlinked before it happens, so a later timestamp is a bit-flip.
@@ -1291,11 +1376,123 @@ static void free_experiments(experiment_t *exps, int nexp)
     free(exps);
 }
 
-// Open the DB read-only, load experiments, close. Returns the count (0 on any
-// failure). Used at startup and on manual refresh (F5).
-static int reload_experiments(const char *db_path, experiment_t **out)
+// ---- the cache -------------------------------------------------------------
+//
+// Recordings that started more than a week before the cache was written are
+// kept in it, as built, and the rest are rebuilt from the DB at every start
+// (see viewer_cache.h for the policy). An experiment goes into the file as
+// its struct followed by every array it points to; reading one back puts
+// fresh arrays where the writer's pointers were.
+
+#define MPI_CACHE_NAME "mpi_viewer"
+// The attitudes keep a cache of their own (beacon_attitude.h).
+#define MPI_ATTITUDE_CACHE_NAME "mpi_viewer_attitude"
+
+// What a load says about where its experiments came from, for the viewer to
+// pass on.
+typedef struct {
+    int    from_cache;   // experiments read out of the cache
+    int    newer;        // newer downloads of cached recordings left out
+    double cutoff_ms;    // the cache holds recordings started before this
+} load_note_t;
+
+static void write_cache(const char *db_path, const experiment_t *exps, int nexp,
+                        double cutoff_ms, long long max_id)
+{
+    viewer_cache_info_t info = { .cutoff_ms = cutoff_ms, .max_id = max_id };
+    viewer_cache_writer_t w;
+    if (viewer_cache_create(&w, MPI_CACHE_NAME, db_path, &info) != 0) {
+        fprintf(stderr, "mpi_viewer: cannot write the cache; every start will rebuild\n");
+        return;
+    }
+    int n = 0;
+    for (int k = 0; k < nexp; k++) if (exps[k].t_start_ms < cutoff_ms) n++;
+    viewer_cache_write(&w, &n, sizeof n);
+    for (int k = 0; k < nexp; k++) {
+        const experiment_t *e = &exps[k];
+        if (e->t_start_ms >= cutoff_ms) continue;
+        size_t size = (size_t) e->size, nf = (size_t) e->nframes;
+        viewer_cache_write(&w, e, sizeof *e);
+        viewer_cache_write(&w, e->buf, size);
+        viewer_cache_write(&w, e->present, size);
+        viewer_cache_write(&w, e->verified, size);
+        viewer_cache_write(&w, e->fr_off, nf * sizeof *e->fr_off);
+        viewer_cache_write(&w, e->fr_ctr, nf * sizeof *e->fr_ctr);
+        viewer_cache_write(&w, e->fr_tv, nf * sizeof *e->fr_tv);
+        viewer_cache_write(&w, e->fr_ts, nf * sizeof *e->fr_ts);
+        viewer_cache_write(&w, e->fr_bytes, nf * FRAME_STRIDE);
+        viewer_cache_write(&w, e->fr_bad, nf * sizeof *e->fr_bad);
+        viewer_cache_write(&w, e->fr_spliced, nf * sizeof *e->fr_spliced);
+        viewer_cache_write(&w, e->fr_unver, nf * sizeof *e->fr_unver);
+        viewer_cache_write(&w, e->fr_gap, nf * sizeof *e->fr_gap);
+    }
+    if (viewer_cache_commit(&w) != 0)
+        fprintf(stderr, "mpi_viewer: cannot write the cache %s\n", w.path);
+}
+
+// The experiments in an open cache file. Returns the count, or -1 if the file
+// is damaged.
+static int read_cache(FILE *f, experiment_t **out)
 {
     *out = NULL;
+    int n = 0;
+    if (viewer_cache_read(f, &n, sizeof n) != 0 || n < 0 || n > 100000) return -1;
+    experiment_t *exps = (experiment_t *) calloc((size_t) (n > 0 ? n : 1), sizeof *exps);
+    if (exps == NULL) return -1;
+    for (int k = 0; k < n; k++) {
+        experiment_t *e = &exps[k];
+        if (viewer_cache_read(f, e, sizeof *e) != 0 || e->size < 0 || e->nframes < 0) {
+            memset(e, 0, sizeof *e);
+            free_experiments(exps, k);
+            return -1;
+        }
+        size_t size = (size_t) e->size, nf = (size_t) e->nframes;
+        e->buf        = viewer_cache_read_alloc(f, size);
+        e->present    = e->buf ? viewer_cache_read_alloc(f, size) : NULL;
+        e->verified   = e->present ? viewer_cache_read_alloc(f, size) : NULL;
+        e->fr_off     = e->verified ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_off) : NULL;
+        e->fr_ctr     = e->fr_off ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_ctr) : NULL;
+        e->fr_tv      = e->fr_ctr ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_tv) : NULL;
+        e->fr_ts      = e->fr_tv ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_ts) : NULL;
+        e->fr_bytes   = e->fr_ts ? viewer_cache_read_alloc(f, nf * FRAME_STRIDE) : NULL;
+        e->fr_bad     = e->fr_bytes ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_bad) : NULL;
+        e->fr_spliced = e->fr_bad ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_spliced) : NULL;
+        e->fr_unver   = e->fr_spliced ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_unver) : NULL;
+        e->fr_gap     = e->fr_unver ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_gap) : NULL;
+        if (e->fr_gap == NULL) {
+            free_experiments(exps, k + 1);
+            return -1;
+        }
+    }
+    *out = exps;
+    return n;
+}
+
+static int by_newest_start(const void *a, const void *b)
+{
+    double ta = ((const experiment_t *) a)->t_start_ms;
+    double tb = ((const experiment_t *) b)->t_start_ms;
+    return (ta < tb) - (ta > tb);
+}
+
+// A freshly built experiment is the same recording as a cached one when their
+// start times sit closer than the clustering pass ever lets two recordings be.
+static int is_cached(const experiment_t *e, const experiment_t *cached, int nc)
+{
+    for (int k = 0; k < nc; k++)
+        if (fabs(e->t_start_ms - cached[k].t_start_ms) <= MPI_EXP_GAP_MS) return 1;
+    return 0;
+}
+
+// Load the experiments to show: the cached ones and the rest rebuilt from the
+// DB, or with `rebuild` (or no usable cache) every one of them rebuilt, and the
+// cache written afresh. Returns the count (0 on any failure). Used at startup
+// and on F5 (shift-F5 rebuilds).
+static int load_experiments(const char *db_path, int rebuild, experiment_t **out,
+                            load_note_t *note)
+{
+    *out = NULL;
+    memset(note, 0, sizeof *note);
     sqlite3 *db = NULL;
     if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
         fprintf(stderr, "mpi_viewer: cannot open %s: %s\n",
@@ -1303,9 +1500,86 @@ static int reload_experiments(const char *db_path, experiment_t **out)
         if (db) sqlite3_close(db);
         return 0;
     }
-    int nexp = load_experiments_from_db(db, out);
+    // Read before the packets are, so a row that lands during the load is
+    // looked at again next time rather than never.
+    long long max_id = viewer_cache_db_max_id(db);
+    double cutoff = viewer_cache_now_ms() - VIEWER_CACHE_SETTLED_MS;
+
+    viewer_cache_info_t ci = {0};
+    experiment_t *cached = NULL;
+    int nc = -1;
+    FILE *cf = (rebuild || max_id < 0) ? NULL
+             : viewer_cache_open(MPI_CACHE_NAME, db_path, max_id, &ci);
+    if (cf != NULL) {
+        nc = read_cache(cf, &cached);
+        fclose(cf);
+    }
+
+    if (nc < 0) {
+        int n = load_experiments_from_db(db, NULL, 0, out);
+        sqlite3_close(db);
+        if (n > 0 && max_id >= 0) write_cache(db_path, *out, n, cutoff, max_id);
+        return n;
+    }
+
+    char since[32];
+    viewer_cache_iso(ci.cutoff_ms - VIEWER_CACHE_MARGIN_MS, since, sizeof since);
+    experiment_t *fresh = NULL;
+    int nf = load_experiments_from_db(db, since, ci.max_id, &fresh);
     sqlite3_close(db);
-    return nexp;
+
+    // A fresh experiment that started before the cutoff, or that is one of the
+    // cached recordings, is part of one the cache already holds: the
+    // stretch of its download that falls inside the window. Only packets
+    // the cache has not seen make it worth telling the operator about.
+    experiment_t *all = (experiment_t *) malloc((size_t) (nc + nf > 0 ? nc + nf : 1) * sizeof *all);
+    if (all == NULL) {
+        free_experiments(cached, nc);
+        free_experiments(fresh, nf);
+        return 0;
+    }
+    int n = 0;
+    for (int k = 0; k < nc; k++) all[n++] = cached[k];
+    for (int k = 0; k < nf; k++) {
+        if (fresh[k].t_start_ms >= ci.cutoff_ms && !is_cached(&fresh[k], cached, nc)) {
+            all[n++] = fresh[k];
+            continue;
+        }
+        if (fresh[k].max_id > ci.max_id) note->newer++;
+        free_experiment(&fresh[k]);
+    }
+    free(cached);
+    free(fresh);
+    qsort(all, (size_t) n, sizeof *all, by_newest_start);
+    note->from_cache = nc;
+    note->cutoff_ms = ci.cutoff_ms;
+
+    // Move the cutoff up to a week ago once it has fallen a day behind. The
+    // recordings that cross it were rebuilt whole just now, every packet of
+    // theirs having come down after they started. Held back while there are
+    // newer downloads the cache has not taken in, which moving the cutoff
+    // past them would forget.
+    if (note->newer == 0 && cutoff - ci.cutoff_ms >= VIEWER_CACHE_ROLL_MS) {
+        write_cache(db_path, all, n, cutoff, max_id);
+        note->from_cache = 0;
+        for (int k = 0; k < n; k++) if (all[k].t_start_ms < cutoff) note->from_cache++;
+        note->cutoff_ms = cutoff;
+    }
+    *out = all;
+    return n;
+}
+
+// The line that says the DB has downloads of cached recordings the cache has
+// not taken in; "" when it has none.
+static void newer_note(const load_note_t *note, char *out, size_t n)
+{
+    out[0] = '\0';
+    if (note->newer == 0) return;
+    char day[24];
+    fmt_utc_s(note->cutoff_ms, day, sizeof day);
+    day[10] = '\0';
+    snprintf(out, n, "%d newer download%s of recordings from before %s not shown: "
+             "shift-F5 rebuilds them", note->newer, note->newer == 1 ? "" : "s", day);
 }
 
 // Load one MPI science-data file from disk -- a file mpi_reconstruct wrote, or
@@ -1375,12 +1649,16 @@ static int load_experiment_from_file(const char *path, experiment_t **out)
     return n;
 }
 
-// Load from the file when one was named, else from the DB.
-static int load_experiments(const char *file_path, const char *db_path,
-                            experiment_t **out)
+// Load from the file when one was named, else from the DB and its cache. A
+// file never touches the cache, so its note is left empty.
+static int load_file_or_db(const char *file_path, const char *db_path, int rebuild,
+                           experiment_t **out, load_note_t *note)
 {
-    if (file_path != NULL) return load_experiment_from_file(file_path, out);
-    return reload_experiments(db_path, out);
+    if (file_path != NULL) {
+        memset(note, 0, sizeof *note);
+        return load_experiment_from_file(file_path, out);
+    }
+    return load_experiments(db_path, rebuild, out, note);
 }
 
 // ---- target-voltage setpoints ----------------------------------------------
@@ -1510,13 +1788,22 @@ static void apply_scan(view_t *v, const experiment_t *s)
     v->ncols = v->fpi;
 }
 
-// Assign every frame to an image. Frames are in file order; the image boundary
-// comes from the inner-dome scan index (the clean per-frame step counter) -- a
-// new image begins one frame past a multiple of fpi, at the raw frame that
-// carries the 0 V dwell's pixels -- while the column within the image comes
-// from the target voltage (see col_of). Corrupt frames (an off-grid target
-// voltage, a JSON-straddle body, a missing predecessor) and the partial leading
-// sweep are dropped (fr_img < 0).
+// Assign every frame to an image, one image per sweep, in file order. The
+// column within the image comes from the target voltage (see col_of); the
+// sweep comes from the frame counter, which steps by exactly one a frame, so a
+// frame's counter less its column is the counter of its sweep's first frame
+// and names the sweep. Every frame of a sweep works that out for itself, so a
+// sweep whose first frame never came down is still one image, and the next
+// sweep does not run on into it.
+//
+// A counter that steps back also starts a new image, even onto a sweep name
+// already seen. The counter starts again from zero when the instrument
+// restarts, and the sweeps after it reach the counters the sweeps before it
+// had; and the 2026-09-17 recording sends a second, different frame for
+// counters it has already used. Either way the frame is not the one already
+// drawn in that column, and must not be drawn over it.
+//
+// Frames that are dropped, or whose column cannot be told, get fr_img < 0.
 static void rebuild_image_list(view_t *v, const experiment_t *s)
 {
     free(v->fr_img);
@@ -1525,20 +1812,19 @@ static void rebuild_image_list(view_t *v, const experiment_t *s)
     v->fr_img = (int *) malloc((size_t) s->nframes * sizeof(int));
     if (v->fr_img == NULL) return;
 
-    int img = 0, started = 0;
+    int n = 0, prev_ctr = 0, cur_first = 0;
     for (int k = 0; k < s->nframes; k++) {
-        if (s->fr_bad[k] || col_of(v, s, k) < 0) { v->fr_img[k] = -2; continue; }   // corrupt frame
-        int sc = s->fr_scan[k];
-        int boundary = (sc >= 0 && sc < 4 * v->fpi && sc % v->fpi == 1);
-        if (!started) {
-            if (boundary) { started = 1; v->fr_img[k] = 0; }
-            else v->fr_img[k] = -1;      // partial leading sweep, before the first boundary
-            continue;
-        }
-        if (boundary) img++;
-        v->fr_img[k] = img;
+        int col = s->fr_bad[k] ? -1 : col_of(v, s, k);
+        if (col < 0) { v->fr_img[k] = -1; continue; }
+        int ctr = s->fr_ctr[k];
+        int first = (ctr - col) & 0xFFFF;
+        // The step from the frame before, taken round the 16-bit wrap.
+        int step = ((ctr - prev_ctr + 0x8000) & 0xFFFF) - 0x8000;
+        if (n == 0 || step <= 0 || first != cur_first) { n++; cur_first = first; }
+        prev_ctr = ctr;
+        v->fr_img[k] = n - 1;
     }
-    v->n_img = started ? img + 1 : 0;
+    v->n_img = n;
     if (v->img_pos >= v->n_img) v->img_pos = v->n_img ? v->n_img - 1 : 0;
 }
 
@@ -1870,10 +2156,11 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
     free(first);
 
     // Take it off, and put the instrument's own offset back on. A frame the
-    // image list dropped is cleaned too, on the background of the image it sits
-    // in: its aux was corrupt, which says nothing about its pixels, and leaving
-    // it out would open a hole in the whereogram that no gap in the data
-    // accounts for.
+    // image list left out is cleaned too, on the background of the image it
+    // sits in: what it lacks is a column -- the frame before it is missing, or
+    // its voltage is off the grid -- which says nothing about its pixels, and
+    // leaving it out would open a hole in the whereogram that no gap in the
+    // data accounts for.
     int last = -1;
     for (int k = 0; k < nf; k++) {
         if (!ok[k]) continue;
@@ -1917,24 +2204,42 @@ static int frame_shown(const view_t *v, const experiment_t *s, int k)
     return v->clean_pix != NULL && v->clean_ok[k];
 }
 
-// Per-experiment DN extent over all present pixels (for auto-session scaling).
+// The DN window both auto scales use, sorting the n values handed in: their
+// 1st to 99th percentile. The plain minimum and maximum let one pixel set the
+// window for every other: across the images of the 2026-10-20 19:21 recording
+// they put the top anywhere from 2124 to 23421 DN, and over the whole of it
+// they ran 0 .. 65391, which paints every frame one colour. The percentiles
+// step past the few extreme pixels to the range the readings occupy -- about
+// 1740 .. 2420 on that recording cleaned, where the bulk sits at 2000.
+static void auto_window(double *val, long n, int *lo, int *hi)
+{
+    double mn = 0, mx = 1;
+    if (n > 0) {
+        qsort(val, (size_t) n, sizeof *val, cmp_double);
+        mn = val[(n - 1) / 100];
+        mx = val[(n - 1) * 99 / 100];
+    }
+    *lo = (int) floor(mn);
+    *hi = (int) ceil(mx);
+    if (*hi <= *lo) *hi = *lo + 1;
+}
+
+// Per-experiment DN window (for auto-experiment scaling), over the frames that
+// are drawn: a frame that fails its own CRC is in neither the image nor the
+// whereogram, so it has no say in their colours. Its missing bytes read as
+// zeros and its corrupt ones as anything, which is where the 0 .. 65391 came
+// from.
 static void compute_session_extent(view_t *v, const experiment_t *s)
 {
-    double mn = 0, mx = 0;
-    int any = 0;
-    for (int k = 0; k < s->nframes; k++) {
-        if (!frame_shown(v, s, k)) continue;
-        for (int j = 0; j < NPIX; j++) {
-            double p = pix_val(v, s, k, j);
-            if (!any || p < mn) mn = p;
-            if (!any || p > mx) mx = p;
-            any = 1;
+    double *val = (double *) malloc((size_t) s->nframes * NPIX * sizeof *val);
+    long n = 0;
+    if (val != NULL)
+        for (int k = 0; k < s->nframes; k++) {
+            if (s->fr_bad[k] || !frame_shown(v, s, k)) continue;
+            for (int j = 0; j < NPIX; j++) val[n++] = pix_val(v, s, k, j);
         }
-    }
-    if (!any) { mn = 0; mx = 1; }
-    v->sess_min = (int) floor(mn);
-    v->sess_max = (int) ceil(mx);
-    if (v->sess_max <= v->sess_min) v->sess_max = v->sess_min + 1;
+    auto_window(val, n, &v->sess_min, &v->sess_max);
+    free(val);
 }
 
 // Move to a cleaning stage and rebuild what it needs. The manual DN window
@@ -2296,7 +2601,39 @@ static Color cmap_color(int map, unsigned char val)
 // the bracket is the image's own span, not a fixed size.
 #define WG_HEAD_H      5
 #define WG_HEAD_MIN_W  2
-//
+
+// Zooming the whereogram with the wheel: how far one notch goes, and how close
+// it goes -- three sweeps, the image on screen and one either side of it, which
+// on any panel worth drawing is well past one pixel a frame.
+#define WG_ZOOM_RATE     0.25
+#define WG_ZOOM_SWEEPS   3
+
+// The panel columns [*c0, *c1) slot q of the file is drawn across, on a panel w
+// columns wide showing the n slots from q0. A slot gets one column when there
+// are more slots than columns and a run of them when there are fewer, and the
+// runs tile the panel. The whereogram is built through this and the playback
+// head placed through it, so the head brackets exactly the columns the image's
+// frames went into. (They once used two different roundings, and the head sat
+// a pixel left of the image's first frame on up to a third of the images.) A
+// slot left of the stretch maps left of the panel, so keep q >= q0.
+static void wg_cols_of_slot(long q, long q0, long n, int w, int *c0, int *c1)
+{
+    q -= q0;
+    *c0 = (int) (q * w / n);
+    *c1 = (int) ((q + 1) * w / n);
+    if (*c1 <= *c0) *c1 = *c0 + 1;
+}
+
+// The other direction, for turning a pointer position back into an image: the
+// file offset of a slot drawn in column col -- the last of them, when several
+// share it.
+static long wg_byte_of_col(long q0, long n, int w, int col)
+{
+    if (col < 0) col = 0;
+    if (col > w - 1) col = w - 1;
+    return (q0 + ((long) (col + 1) * n - 1) / w) * FRAME_STRIDE;
+}
+
 // The whole recording at a glance: every frame a column of its 65 pixels, time
 // running left to right, arrival direction up the vertical axis. It is the
 // spectrum the MPI actually measured, so it doubles as the map of the file --
@@ -2308,127 +2645,81 @@ static Color cmap_color(int map, unsigned char val)
 // visible at all. Those columns are painted in the background colour -- a
 // colour map has no value that means "no data", and the darkest end of one
 // would read as a real, low measurement -- and are marked instead by the red
-// rule drawn above the panel.
+// rule drawn above the panel. So is a column whose frame came down but was
+// dropped for failing its own CRC, which is blank for the same reason.
 //
-// Several frames share a column once a recording is longer than the panel is
-// wide, and they are averaged. Taking the brightest instead lets the one
-// brightest frame in each column stand for all of them, which at ten frames a
-// column paints a picture of the outliers rather than of the data.
+// Several frames share a column once the stretch on the panel is longer than
+// the panel is wide, and they are averaged. Taking the brightest instead lets
+// the one brightest frame in each column stand for all of them, which at ten
+// frames a column paints a picture of the outliers rather than of the data.
+// Averaged, the whereogram cannot look like the image under its head -- the
+// image's sixteen bias voltages are blended two to twelve at a time, and the
+// columns at its two ends take in frames of the images either side -- which is
+// what the wheel is for: zoomed in to a pixel or more a frame, each frame has
+// columns of its own and the stretch under the head is the image itself.
 //
-// The colour scale works the same way as the image's, but on the whereogram's
-// own terms: auto here means over the whole whereogram, since scaling a picture
-// of the whole recording to one image of it would make it flicker while
-// scrubbing and would leave one column not comparable with the next. Pass
-// lo >= hi to scale automatically; *out_lo / *out_hi report the range used.
+// The panel shows the n slots of the file from slot q0: all of them, or the
+// stretch the wheel has zoomed in on.
+//
+// The colours are the image's: the DN window lo .. hi is the one the image on
+// screen was drawn with, whichever scale picked it, so a frame shows in the
+// same colour in both. Scaling the whereogram on its own terms -- it once took
+// the 1st to 95th percentile of its averaged columns -- left the two never
+// agreeing in either auto mode.
 static void build_whereogram(const view_t *v, const experiment_t *s,
                              int cmap, int lo, int hi,
                              Color *pix, int w, unsigned char *missing,
-                             int *out_lo, int *out_hi)
+                             long q0, long n)
 {
-    long nslot = s->size / FRAME_STRIDE;
-    if (nslot < 1) nslot = 1;
-
-    // Which frame, if any, begins in each frame-sized slice of the file.
-    int *at = (int *) malloc((size_t) nslot * sizeof *at);
-    double *val = (double *) malloc((size_t) w * NPIX * sizeof *val);
-    if (at == NULL || val == NULL) { free(at); free(val); return; }
-    for (long q = 0; q < nslot; q++) at[q] = -1;
+    // Which frame, if any, begins in each frame-sized slice of the stretch.
+    int *at = (int *) malloc((size_t) n * sizeof *at);
+    double *val = (double *) calloc((size_t) w * NPIX, sizeof *val);
+    int *nsum = (int *) calloc((size_t) w, sizeof *nsum);
+    if (at == NULL || val == NULL || nsum == NULL) { free(at); free(val); free(nsum); return; }
+    for (long q = 0; q < n; q++) at[q] = -1;
     for (int k = 0; k < s->nframes; k++) {
-        long q = s->fr_off[k] / FRAME_STRIDE;
-        if (q >= 0 && q < nslot) at[q] = k;
+        long q = s->fr_off[k] / FRAME_STRIDE - q0;
+        if (q >= 0 && q < n) at[q] = k;
     }
+    memset(missing, 0, (size_t) w);
 
-    // First pass: what each column reads, averaged over the frames in it.
-    for (int c = 0; c < w; c++) {
-        long q0 = (long) c * nslot / w;
-        long q1 = (long) (c + 1) * nslot / w;
-        if (q1 <= q0) q1 = q0 + 1;
-        if (q1 > nslot) q1 = nslot;
+    // First pass: add each slice into the columns it is drawn across.
+    for (long q = 0; q < n; q++) {
+        int c0, c1;
+        wg_cols_of_slot(q0 + q, q0, n, w, &c0, &c1);
 
-        double sum[NPIX] = {0};
-        int nsum = 0, gap = 0;
+        int gap = 0;
+        long b0 = (q0 + q) * FRAME_STRIDE, b1 = b0 + FRAME_STRIDE;
+        if (b1 > s->size) b1 = s->size;
+        for (long b = b0; b < b1; b++)
+            if (!s->present[b]) { gap = 1; break; }
 
-        for (long q = q0; q < q1; q++) {
-            long b0 = q * FRAME_STRIDE, b1 = b0 + FRAME_STRIDE;
-            if (b1 > s->size) b1 = s->size;
-            for (long b = b0; b < b1; b++)
-                if (!s->present[b]) { gap = 1; break; }
-
-            int k = at[q];
-            if (k < 0 || s->fr_bad[k] || !frame_shown(v, s, k)) continue;
-            for (int j = 0; j < NPIX; j++) sum[j] += pix_val(v, s, k, j);
-            nsum++;
+        // A frame dropped for failing its own CRC is marked the same way as
+        // bytes that never came down: either way nothing here is drawn.
+        int k = at[q];
+        if (k >= 0 && s->fr_bad[k]) gap = 1;
+        int use = k >= 0 && !s->fr_bad[k] && frame_shown(v, s, k);
+        for (int c = c0; c < c1 && c < w; c++) {
+            if (gap) missing[c] = 1;
+            if (!use) continue;
+            for (int j = 0; j < NPIX; j++) val[(long) j * w + c] += pix_val(v, s, k, j);
+            nsum[c]++;
         }
-
-        missing[c] = (unsigned char) gap;
-        for (int j = 0; j < NPIX; j++)
-            val[(long) j * w + c] = nsum > 0 ? sum[j] / nsum : WG_NONE;
     }
     free(at);
 
-    // Auto scaling is over the whole whereogram -- but over what it holds, not
-    // over its two most extreme samples. Taking the plain minimum and maximum
-    // gave 0 .. 49296 and painted a flat blue rectangle, because a few corrupt
-    // readings reach the ends of the 16-bit range. The 1st and 95th percentile
-    // step past those and leave the range the readings actually occupy. They
-    // are read off the sorted values rather
-    // than a histogram of them, because a cleaned column is a fraction and can
-    // land outside the 16-bit range a histogram would have to cover.
-    if (lo >= hi) {
-        double *sorted = (double *) malloc((size_t) w * NPIX * sizeof *sorted);
-        long n = 0;
-        if (sorted != NULL)
-            for (long i = 0; i < (long) w * NPIX; i++)
-                if (val[i] != WG_NONE) sorted[n++] = val[i];
-        double mn = 0, mx = 1;
-        if (n > 0) {
-            qsort(sorted, (size_t) n, sizeof *sorted, cmp_double);
-            mn = sorted[(n - 1) / 100];
-            mx = sorted[(n - 1) * 95 / 100];
-        }
-        free(sorted);
-        lo = (int) floor(mn);
-        hi = (int) ceil(mx);
-    }
+    // Second pass: average and paint it.
     if (hi <= lo) hi = lo + 1;
-
-    // Second pass: paint it.
-    for (long i = 0; i < (long) w * NPIX; i++) {
-        double p = val[i];
-        if (p == WG_NONE) { pix[i] = MPI_BG; continue; }
-        int g = p <= lo ? 0 : p >= hi ? 255 : (int) (255.0 * (p - lo) / (hi - lo));
-        pix[i] = cmap_color(cmap, (unsigned char) g);
-    }
+    for (int c = 0; c < w; c++)
+        for (int j = 0; j < NPIX; j++) {
+            long i = (long) j * w + c;
+            if (nsum[c] == 0) { pix[i] = MPI_BG; continue; }
+            double p = val[i] / nsum[c];
+            int g = p <= lo ? 0 : p >= hi ? 255 : (int) (255.0 * (p - lo) / (hi - lo));
+            pix[i] = cmap_color(cmap, (unsigned char) g);
+        }
     free(val);
-    *out_lo = lo; *out_hi = hi;
-}
-
-// Where a file offset falls along the whereogram's horizontal axis, and the
-// offset a column stands for -- the two directions of the same mapping, used to
-// place the playback head and to turn a pointer position back into an image.
-//
-// The head is placed in panel pixels rather than in whole columns, so its two
-// ends point at where the image's first and last frames actually sit rather
-// than at the columns that happen to contain them. Nothing is pulled back
-// inside the panel either, so passing the byte one past a span gives that
-// span's exclusive right edge, which is where the head's far upright goes.
-static int wg_x_of_byte(const experiment_t *s, int w, long byte)
-{
-    long nslot = s->size / FRAME_STRIDE;
-    if (nslot < 1) nslot = 1;
-    long q = byte / FRAME_STRIDE;
-    if (q < 0) q = 0;
-    if (q > nslot) q = nslot;
-    return (int) (q * w / nslot);
-}
-
-static long wg_byte_of_col(const experiment_t *s, int w, int col)
-{
-    long nslot = s->size / FRAME_STRIDE;
-    if (nslot < 1) nslot = 1;
-    if (col < 0) col = 0;
-    if (col > w - 1) col = w - 1;
-    return ((long) col * nslot / w) * FRAME_STRIDE;
+    free(nsum);
 }
 
 // The capture time of the frame nearest a byte of the recording, in unix ms,
@@ -2451,22 +2742,21 @@ static double time_at_byte(const experiment_t *s, long byte)
     return best_t;
 }
 
-// The byte range the currently shown image was reconstructed from, so the
-// whereogram can mark where in the recording you are looking. Returns 0 if the
-// image has no frames.
-static int image_byte_span(const view_t *v, const experiment_t *s, int img,
-                           long *out_b0, long *out_b1)
+// The frame-sized slots of the file, first and last, that the currently shown
+// image was reconstructed from, so the whereogram can mark where in the
+// recording you are looking. Returns 0 if the image has no frames.
+static int image_slot_span(const view_t *v, const experiment_t *s, int img,
+                           long *out_q0, long *out_q1)
 {
-    long b0 = -1, b1 = -1;
+    long q0 = -1, q1 = -1;
     for (int k = 0; k < s->nframes; k++) {
         if (v->fr_img == NULL || v->fr_img[k] != img) continue;
-        long o = s->fr_off[k];
-        if (b0 < 0 || o < b0) b0 = o;
-        if (b1 < 0 || o + FRAME_STRIDE > b1) b1 = o + FRAME_STRIDE;
+        long q = s->fr_off[k] / FRAME_STRIDE;
+        if (q0 < 0 || q < q0) q0 = q;
+        if (q1 < 0 || q > q1) q1 = q;
     }
-    if (b0 < 0) return 0;
-    if (b1 > s->size) b1 = s->size;
-    *out_b0 = b0; *out_b1 = b1;
+    if (q0 < 0) return 0;
+    *out_q0 = q0; *out_q1 = q1;
     return 1;
 }
 
@@ -2744,11 +3034,12 @@ typedef struct {
     const char *db_path;    // --db=, else NULL for the default store
     const char *file_path;  // --file, else NULL to list the DB's experiments
     int         list_only;  // --list
+    int         rebuild;    // --rebuild-cache
 } mv_args_t;
 
-// Option column width: the widest label below ("--file <path>") + a small
+// Option column width: the widest label below ("--rebuild-cache") + a small
 // margin. See src/cli/argparse.h for the parse_args convention.
-#define OPTW 15
+#define OPTW 17
 
 // Parse argv into *a (help == HELP_OFF), or print one right-aligned help line
 // per option and return (help != HELP_OFF). Each option is one self-contained
@@ -2799,6 +3090,11 @@ static int parse_args(mv_args_t *a, int argc, char **argv, int help)
             else a->list_only = 1;
             matched = 1;
         }
+        if (strcmp(arg, "--rebuild-cache") == 0 || help) {
+            if (help) parse_help_line(OPTW, "--rebuild-cache", "rebuild the cached older recordings from the whole DB (as shift-F5)");
+            else a->rebuild = 1;
+            matched = 1;
+        }
         if ((strcmp(arg, "-V") == 0 || strcmp(arg, "--version") == 0) || help) {
             if (help) parse_help_line(OPTW, "-V, --version", "print version and exit");
             // -V is handled in main via sso_version_handle before parsing.
@@ -2814,13 +3110,17 @@ static int parse_args(mv_args_t *a, int argc, char **argv, int help)
     if (help) {
         printf("\nInspect MPI science imagery reconstructed from the packet DB. The\n"
                "left panel lists MPI experiments, newest first; F5 re-reads the DB.\n"
+               "Recordings that started more than a week ago come out of a cache in\n"
+               "~/.cache/simple_sat_ops/ and are rebuilt only by shift-F5 or\n"
+               "--rebuild-cache; the viewer says when the DB has newer downloads\n"
+               "of them than the cache.\n"
                "\n"
                "Given --file -- a file mpi_reconstruct wrote, or a science file\n"
                "straight off the satellite -- it shows that one file instead of the\n"
-               "DB's experiments, and F5 re-reads the file. The DB (--db, else the\n"
-               "default) is then only read for the globe's TLEs and attitudes. A\n"
-               "file records no missing bytes, so every byte counts as received and\n"
-               "d has nothing to re-download.\n"
+               "DB's experiments, and F5 re-reads the file; the cache is not used.\n"
+               "The DB (--db, else the default) is then only read for the globe's\n"
+               "TLEs and attitudes. A file records no missing bytes, so every byte\n"
+               "counts as received and d has nothing to re-download.\n"
                "\n"
                "Keys:\n"
                "  b          show the cleaned imagery -- the instrument's own background\n"
@@ -2836,6 +3136,7 @@ static int parse_args(mv_args_t *a, int argc, char **argv, int help)
                "  shift-T    show the favourites only\n"
                "  g          put the globe back to the whole Earth on the whole track\n"
                "  F5         re-read the DB (or the file)\n"
+               "  shift-F5   re-read the DB and rebuild the cached recordings too\n"
                "\n"
                "Under the list is the lit Earth with the recording's ground track on\n"
                "it, from the DB's own TLEs; drag it to turn it and scroll over it to\n"
@@ -2862,6 +3163,7 @@ int main(int argc, char **argv)
     const char *db_arg = args.db_path;
     const char *file_arg = args.file_path;
     int list_only = args.list_only;
+    int rebuild = args.rebuild;
 
     char db_default[1024];
     const char *db_path = db_arg;
@@ -2881,13 +3183,19 @@ int main(int argc, char **argv)
     else
         fprintf(stderr, "mpi_viewer: reconstructing MPI experiments from %s ...\n", db_path);
     experiment_t *exps = NULL;
-    int nexp = load_experiments(file_arg, db_path, &exps);
+    load_note_t note;
+    int nexp = load_file_or_db(file_arg, db_path, rebuild, &exps, &note);
     if (nexp == 0) {
         if (file_arg == NULL)
             fprintf(stderr, "mpi_viewer: no MPI science-data experiments found.\n");
         return 1;
     }
-    fprintf(stderr, "mpi_viewer: %d MPI experiment%s.\n", nexp, nexp == 1 ? "" : "s");
+    fprintf(stderr, "mpi_viewer: %d MPI experiment%s", nexp, nexp == 1 ? "" : "s");
+    if (note.from_cache > 0) fprintf(stderr, ", %d of them from the cache", note.from_cache);
+    fprintf(stderr, ".\n");
+    char newer[160];
+    newer_note(&note, newer, sizeof newer);
+    if (newer[0]) fprintf(stderr, "mpi_viewer: %s.\n", newer);
 
     if (list_only) {
         for (int k = 0; k < nexp; k++) {
@@ -2908,9 +3216,13 @@ int main(int argc, char **argv)
                    e->size - e->recovered);
             printf("  unverified: %ld bytes from packets whose CRC failed\n", e->unverified);
             printf("  frames    : %d", e->nframes);
-            int nunver = 0;
-            for (int f = 0; f < e->nframes; f++) if (e->fr_unver[f]) nunver++;
+            int nunver = 0, nbad = 0;
+            for (int f = 0; f < e->nframes; f++) {
+                if (e->fr_unver[f]) nunver++;
+                if (e->fr_bad[f]) nbad++;
+            }
             if (nunver > 0) printf(" (%d touch unverified bytes)", nunver);
+            if (nbad > 0) printf(", %d dropped (their own CRC fails, or cut short)", nbad);
             printf("\n");
             int nspl = 0, nspl_kept = 0;
             for (int f = 0; f < e->nframes; f++) {
@@ -3005,9 +3317,12 @@ int main(int argc, char **argv)
     if (db_path == NULL || globe_load_tles(db_path) == 0)
         fprintf(stderr, "mpi_viewer: no FrontierSat TLEs in the DB; "
                         "the globe will show no ground track\n");
-    // The attitudes the extended beacons carry, for drawing which way the
-    // satellite was facing as the recording ran.
-    if (db_path != NULL) beacon_attitude_load(db_path);
+    // The attitudes the extended beacons and the ADCS's SD-card logs carry,
+    // for drawing which way the satellite was facing as the recording ran.
+    // The MPI is run out of sight of the ground stations, so a log that
+    // spans the recording is usually the only record of it. With --file and
+    // no DB there are none.
+    if (db_path != NULL) beacon_attitude_load(db_path, MPI_ATTITUDE_CACHE_NAME, rebuild);
 
     // Where the experiment list is scrolled to, in pixels. Scrolling is the
     // reader's, not the selection's: the list is pulled back to the selected
@@ -3025,13 +3340,19 @@ int main(int argc, char **argv)
     float status_left = 0.0f;
 
     // The whereogram: one texture column per run of frames, NPIX rows, rebuilt
-    // when the experiment, the colour map, the scale or the panel width change.
+    // when the experiment, the colour map, the scale, the stretch on show or
+    // the panel width change.
     Color    *cov_pix = NULL;
     Texture2D cov_tex = {0};
     int cov_w = 0, cov_valid = 0;
     unsigned cov_sig = 0;
-    unsigned char *wg_missing = NULL;   // per column: some of its bytes never came down
-    int wg_lo = -1, wg_hi = -1;         // the DN window its colours were built for
+    unsigned char *wg_missing = NULL;   // per column: some of its bytes never came down, or a frame was dropped
+    // How much of the recording the whereogram shows, in frame-sized slots:
+    // 0 for all of it, else the stretch the wheel has zoomed in on, centred on
+    // the playback head from wg_q0. Zooming is per experiment, so picking
+    // another one (wg_sel) goes back out to the whole of it.
+    long wg_span = 0, wg_q0 = 0;
+    int wg_sel = -1;
     // Set while the pointer is scrubbing the whereogram, so a press that
     // began there keeps control until the button is let go -- and a press that
     // began anywhere else never takes it. cov_anchor is the byte the press
@@ -3213,10 +3534,13 @@ int main(int argc, char **argv)
         }
         // F5: re-read the DB and rebuild the experiment list, preserving the
         // current selection, image position and view settings where possible.
+        // Shift-F5 rebuilds the cached recordings too, and the cache with them.
         if (IsKeyPressed(KEY_F5)) {
+            int full = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
             int save_img = v.img_pos, save_play = v.playing;
             experiment_t *ne = NULL;
-            int nn = load_experiments(file_arg, db_path, &ne);
+            load_note_t nnote;
+            int nn = load_file_or_db(file_arg, db_path, full, &ne, &nnote);
             int *nr = nn > 0 ? (int *) realloc(rows, (size_t) nn * sizeof(int)) : NULL;
             if (nr != NULL) {
                 // Stay on the same experiment, found by its start time: a new
@@ -3245,9 +3569,18 @@ int main(int argc, char **argv)
                 cov_valid = 0;   // the reloaded experiment needs a fresh whereogram
                 if (db_path != NULL) {
                     globe_load_tles(db_path);
-                    beacon_attitude_load(db_path);
+                    beacon_attitude_load(db_path, MPI_ATTITUDE_CACHE_NAME, full);
                 }
                 globe.track_key[0] = '\0';   // and a fresh ground track
+                note = nnote;
+                newer_note(&note, newer, sizeof newer);
+                if (file_arg != NULL)
+                    snprintf(status, sizeof status, "re-read %s", GetFileName(file_arg));
+                else
+                    snprintf(status, sizeof status, "%s: %d experiment%s",
+                             full ? "rebuilt from the whole DB" : "reloaded",
+                             nexp, nexp == 1 ? "" : "s");
+                status_left = 6.0f;
             } else if (ne != NULL) {
                 free_experiments(ne, nn);
             }
@@ -3301,21 +3634,15 @@ int main(int argc, char **argv)
         int lo = v.dn_min, hi = v.dn_max;
         if (v.scale_mode == SCALE_AUTO_SESSION) { lo = v.sess_min; hi = v.sess_max; }
         else if (v.scale_mode == SCALE_AUTO_IMAGE) {
-            double mn = 0, mx = 0;
-            int any = 0;
-            for (int k = 0; k < s->nframes; k++) {
+            // An image holds one frame a column, so at most MAX_FPI of them.
+            double vals[MAX_FPI * NPIX];
+            long n = 0;
+            for (int k = 0; k < s->nframes && n + NPIX <= MAX_FPI * NPIX; k++) {
                 if (v.fr_img == NULL || v.fr_img[k] != v.img_pos) continue;
                 if (!frame_shown(&v, s, k)) continue;
-                for (int j = 0; j < NPIX; j++) {
-                    double p = pix_val(&v, s, k, j);
-                    if (!any || p < mn) mn = p;
-                    if (!any || p > mx) mx = p;
-                    any = 1;
-                }
+                for (int j = 0; j < NPIX; j++) vals[n++] = pix_val(&v, s, k, j);
             }
-            if (!any) { mn = 0; mx = 1; }
-            lo = (int) floor(mn); hi = (int) ceil(mx);
-            if (hi <= lo) hi = lo + 1;
+            auto_window(vals, n, &lo, &hi);
         }
 
         // ---- rasterise the image into the grayscale texture ----
@@ -3391,10 +3718,10 @@ int main(int argc, char **argv)
         if (globe_h > 0) {
             double dot_ms = frame_time >= 0 ? frame_time : s->t_start_ms;
             // Which way the satellite was facing at the moment the
-            // playback head is on, from the nearest extended beacon
-            // that carried an attitude. Looked up every frame, since
-            // the head moves through the recording; it is a bisect over
-            // a few thousand moments, so it costs nothing.
+            // playback head is on, from the nearest extended beacon or
+            // log record that carried an attitude. Looked up every frame,
+            // since the head moves through the recording; it is a bisect
+            // over a few tens of thousands of moments, so it costs nothing.
             globe_attitude_t att = {0};
             beacon_attitude_nearest(dot_ms, BEACON_ATTITUDE_MAX_AGE_S, &att);
             globe_set_attitude(&globe, &att);
@@ -3521,41 +3848,71 @@ int main(int argc, char **argv)
         // is time and 65 pixels is all the other one ever has.
         ay += 8;
         draw_text("Whereogram  (arrival direction against time)", ax, ay, 18, RAYWHITE);
-        if (wg_hi > wg_lo) {
-            const char *wr = TextFormat("DN %d .. %d", wg_lo, wg_hi);
-            draw_text(wr, GetScreenWidth() - 20 - text_width(wr, 13), ay + 5, 13, GRAY);
-        }
+        int title_y = ay;
         ay += 24;
         int cw = GetScreenWidth() - ax - 20;
         int avail_h = GetScreenHeight() - 74 - ay;
         if (cw > avail_h * 5) cw = avail_h * 5;
         int ch = cw / 5;
         if (cw >= 80 && ch >= 20) {
-            // Same scale control as the image: a manual window is taken as
-            // given, and either auto mode scales the whereogram over the whole
-            // whereogram. Scaling it to the shown image instead would make it
-            // flicker while scrubbing and stop one column being comparable
-            // with the next.
-            int wlo = v.scale_mode == SCALE_MANUAL ? v.dn_min : 0;
-            int whi = v.scale_mode == SCALE_MANUAL ? v.dn_max : 0;
+            // The stretch on show. The wheel over the panel zooms in and out,
+            // and the stretch stays centred on the playback head -- except
+            // while a scrub is under way, which has to read the pointer against
+            // the panel it pressed on, not one sliding along under it.
+            long nslot = s->size / FRAME_STRIDE;
+            if (nslot < 1) nslot = 1;
+            if (v.sel != wg_sel) { wg_span = 0; wg_sel = v.sel; }
+            {
+                Vector2 m = GetMousePosition();
+                int over = m.x >= ax && m.x < ax + cw && m.y >= ay && m.y < ay + ch;
+                float wheel = over && !cov_drag ? GetMouseWheelMove() : 0.0f;
+                if (wheel != 0.0f) {
+                    long span = wg_span > 0 ? wg_span : nslot;
+                    span = (long) ((double) span * exp(-WG_ZOOM_RATE * (double) wheel));
+                    long closest = (long) WG_ZOOM_SWEEPS * v.ncols;
+                    if (span < closest) span = closest;
+                    wg_span = span >= nslot ? 0 : span;
+                }
+            }
+            long span = wg_span > 0 ? wg_span : nslot;
+            long hq0 = 0, hq1 = 0;
+            int has_head = v.n_img > 0 && image_slot_span(&v, s, v.img_pos, &hq0, &hq1);
+            if (wg_span == 0) wg_q0 = 0;
+            else if (!cov_drag && has_head) wg_q0 = (hq0 + hq1 + 1) / 2 - span / 2;
+            if (wg_q0 > nslot - span) wg_q0 = nslot - span;
+            if (wg_q0 < 0) wg_q0 = 0;
+
+            // How many frames to a pixel: past one, the frames are averaged
+            // and the stretch under the head cannot look like the image.
+            const char *zr = span > cw
+                ? TextFormat("%s%.1f frames per pixel", wg_span ? "zoomed  " : "",
+                             (double) span / cw)
+                : TextFormat("%s%.1f pixels per frame", wg_span ? "zoomed  " : "",
+                             (double) cw / span);
+            draw_text(zr, GetScreenWidth() - 20 - text_width(zr, 13), title_y + 5, 13, GRAY);
+
             // What the built pixels depend on: any change here rebuilds them.
+            // The window is the image's, so in auto-image mode the whereogram
+            // is recoloured with every image -- which is what keeps a frame the
+            // same colour in both.
             unsigned sig = (unsigned) v.sel;
             sig = sig * 31u + (unsigned) v.cmap;
-            sig = sig * 31u + (unsigned) v.scale_mode;
             sig = sig * 31u + (unsigned) v.clean_stage;
             sig = sig * 31u + (unsigned) v.clean_win;
             sig = sig * 31u + (unsigned) v.clean_mean;
             sig = sig * 31u + (unsigned) v.fpi;
-            if (v.scale_mode == SCALE_MANUAL)
-                sig = sig * 31u + (unsigned) (v.dn_min ^ (v.dn_max << 3));
+            sig = sig * 31u + (unsigned) lo;
+            sig = sig * 31u + (unsigned) hi;
+            sig = sig * 31u + (unsigned) wg_q0;
+            sig = sig * 31u + (unsigned) span;
             if (cw != cov_w) {
                 Color *np = (Color *) realloc(cov_pix, (size_t) cw * NPIX * sizeof *cov_pix);
                 unsigned char *nm = (unsigned char *) realloc(wg_missing, (size_t) cw);
                 if (np != NULL && nm != NULL) {
                     cov_pix = np; wg_missing = nm; cov_w = cw;
                     if (cov_tex.id != 0) UnloadTexture(cov_tex);
-                    build_whereogram(&v, s, v.cmap, wlo, whi, cov_pix, cov_w, wg_missing,
-                                     &wg_lo, &wg_hi);
+                    build_whereogram(&v, s, v.cmap, lo, hi, cov_pix, cov_w, wg_missing,
+                                     wg_q0, span);
                     cov_sig = sig; cov_valid = 1;
                     Image ci = { .data = cov_pix, .width = cov_w, .height = NPIX,
                                  .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
@@ -3563,8 +3920,8 @@ int main(int argc, char **argv)
                     SetTextureFilter(cov_tex, TEXTURE_FILTER_POINT);
                 }
             } else if (!cov_valid || cov_sig != sig) {
-                build_whereogram(&v, s, v.cmap, wlo, whi, cov_pix, cov_w, wg_missing,
-                                 &wg_lo, &wg_hi);
+                build_whereogram(&v, s, v.cmap, lo, hi, cov_pix, cov_w, wg_missing,
+                                 wg_q0, span);
                 cov_sig = sig; cov_valid = 1;
                 UpdateTexture(cov_tex, cov_pix);
             }
@@ -3575,9 +3932,10 @@ int main(int argc, char **argv)
                 DrawRectangleLines(ax - 1, ay - 1, cw + 2, ch + 2, (Color){ 70, 70, 80, 255 });
 
                 // A red rule above the panel over every stretch that never came
-                // down. Those columns are painted in the background colour, and
-                // background is not a reading -- without the rule there would be
-                // nothing to tell "no data" from "nothing arriving".
+                // down, or came down but was dropped for failing its CRC. Those
+                // columns are painted in the background colour, and background
+                // is not a reading -- without the rule there would be nothing
+                // to tell "no data" from "nothing arriving".
                 for (int c = 0; c < cov_w; c++) {
                     if (!wg_missing[c]) continue;
                     int x = ax + c * cw / cov_w;
@@ -3595,15 +3953,21 @@ int main(int argc, char **argv)
                 // around the span, which on a panel holding a whole recording
                 // was nearly all outline and covered the little it enclosed.
                 //
-                // Both ends are placed in panel pixels rather than rounded out
-                // to whole columns, so the bracket is as wide as the image
-                // really is and no wider -- a pixel or three on a long
-                // recording. It is only opened out when the span comes to less
-                // than the two uprights need to stand apart at all.
-                long pb0 = 0, pb1 = 0;
-                if (v.n_img > 0 && image_byte_span(&v, s, v.img_pos, &pb0, &pb1)) {
-                    int x0 = ax + wg_x_of_byte(s, cw, pb0);
-                    int x1 = ax + wg_x_of_byte(s, cw, pb1);
+                // The uprights stand under the first and last columns the
+                // image's frames were drawn into -- placed by the same mapping
+                // that drew them -- so the bracket is as wide as the image
+                // really is and no wider: a pixel or three on a long recording.
+                // It is only opened out when the span comes to less than the
+                // two uprights need to stand apart at all, and cut at the
+                // panel's edge when a scrub on a zoomed panel runs the image
+                // part way off it.
+                if (has_head && hq1 >= wg_q0 && hq0 < wg_q0 + span) {
+                    int c0, c1, d0, d1;
+                    wg_cols_of_slot(hq0 < wg_q0 ? wg_q0 : hq0, wg_q0, span, cov_w, &c0, &d0);
+                    wg_cols_of_slot(hq1 >= wg_q0 + span ? wg_q0 + span - 1 : hq1,
+                                    wg_q0, span, cov_w, &d1, &c1);
+                    int x0 = ax + c0 * cw / cov_w;
+                    int x1 = ax + c1 * cw / cov_w - 1;
                     if (x1 - x0 < WG_HEAD_MIN_W) {
                         int mid = (x0 + x1) / 2;
                         x0 = mid - WG_HEAD_MIN_W / 2;
@@ -3638,7 +4002,8 @@ int main(int argc, char **argv)
                 Vector2 m = GetMousePosition();
                 if (m.x >= ax && m.x < ax + cw && m.y >= ay && m.y < ay + ch) {
                     cov_drag = 1;
-                    cov_anchor = wg_byte_of_col(s, cov_w, ((int) m.x - ax) * cov_w / cw);
+                    cov_anchor = wg_byte_of_col(wg_q0, span, cov_w,
+                                                ((int) m.x - ax) * cov_w / cw);
                 }
             }
             if (cov_drag && v.n_img > 0) {
@@ -3646,7 +4011,7 @@ int main(int argc, char **argv)
                 int mx = (int) m.x - ax;
                 if (mx < 0) mx = 0;
                 if (mx > cw - 1) mx = cw - 1;
-                long here = wg_byte_of_col(s, cov_w, mx * cov_w / cw);
+                long here = wg_byte_of_col(wg_q0, span, cov_w, mx * cov_w / cw);
                 int img = image_nearest_byte(&v, s, here);
                 if (img >= 0) { v.img_pos = img; v.playing = 0; }
 
@@ -3657,7 +4022,9 @@ int main(int argc, char **argv)
                 // times of the frames nearest those two bytes -- so a stretch
                 // where nothing came down costs no time, the same way it takes
                 // up no columns.
-                int rx0 = ax + wg_x_of_byte(s, cw, cov_anchor);
+                int ac0, ac1;
+                wg_cols_of_slot(cov_anchor / FRAME_STRIDE, wg_q0, span, cov_w, &ac0, &ac1);
+                int rx0 = ax + ac0 * cw / cov_w;
                 int rx1 = ax + mx;
                 if (rx1 < rx0) { int t = rx0; rx0 = rx1; rx1 = t; }
                 DrawRectangle(rx0, ay, rx1 - rx0 < 1 ? 1 : rx1 - rx0, ch,
@@ -3682,17 +4049,20 @@ int main(int argc, char **argv)
             }
         }
 
-        // the d-export outcome, above the help footer
+        // the d-export or reload outcome, above the help footer; otherwise
+        // whether the cache is behind the DB, which stays up until rebuilt
         if (status_left > 0.0f)
             draw_text(status, 12, GetScreenHeight() - 42, 14, (Color){ 120, 220, 160, 255 });
+        else if (newer[0])
+            draw_text(newer, 12, GetScreenHeight() - 42, 14, (Color){ 240, 196, 64, 255 });
 
         // help footer
         const char *help =
-            "Up/Down experiment   Left/Right image   drag whereogram: scrub + time span"
+            "Up/Down experiment   Left/Right image   drag whereogram: scrub + time span, wheel zooms"
             "   globe: drag turns, two-finger press-drag turns about the satellite, scroll zooms, g resets"
             "   Space play/pause   ,/. speed   f steps/sweep   s zoom   a scale"
             "   z/x min  c/v max   m colour map   b clean  B step   n bg window   e median/mean"
-            "   t favourite  T favourites only   d re-download commands   F5 refresh  q quit";
+            "   t favourite  T favourites only   d re-download commands   F5 refresh  shift-F5 rebuild  q quit";
         draw_text(help, 12, GetScreenHeight() - 22, 12, (Color){ 150, 150, 160, 255 });
 
         EndDrawing();

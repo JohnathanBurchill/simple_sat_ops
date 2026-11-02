@@ -62,6 +62,22 @@
 #define GLOBE_MAP_LEVELS  5
 #define GLOBE_MAP_FILE    "nasa_blue_marble_2048.png"
 
+// Zoomed in past what that map can show, the globe draws from the same Blue
+// Marble at up to 21600 x 10800 instead, which scripts/fetch_globe_tiles.sh
+// downloads and cuts into square JPEG tiles: a level per halving, each in its
+// own directory named for its width, the tiles numbered row by row from the
+// top left -- globe_tiles/21600/0.jpg is the corner at 90 N 180 W. They live
+// in the data directory ($XDG_DATA_HOME/simple_sat_ops/, else
+// ~/.local/share/simple_sat_ops/), and are read only as the view needs them.
+// At most GLOBE_TILE_SLOTS are held at once (110 MB), which is enough for the
+// worst case: a view over a pole, where every column of tiles meets. Without
+// them the globe stays at the map above however far in it is zoomed.
+#define GLOBE_TILE_DIR    "globe_tiles"
+#define GLOBE_TILE_PX     675
+#define GLOBE_TILE_TOP_W  21600
+#define GLOBE_TILE_LEVELS 4         // 2700, 5400, 10800 and 21600 across
+#define GLOBE_TILE_SLOTS  80
+
 // How much of the panel the globe fills at zoom 1, and the zoom limits.
 #define GLOBE_FILL        0.47
 #define GLOBE_ZOOM_MIN    1.0
@@ -131,11 +147,18 @@ Vector2 globe_project_world(const globe_proj_t *pr, const double p[3],
 #define GLOBE_AXIS_KM      500.0
 #define GLOBE_RAY_SAMPLES  24
 
-// The satellite's attitude at the moment on screen, as the extended
-// beacons report it. The caller looks up the beacon nearest the moment
-// and fills this in; a zeroed one means there is nothing to draw, which
-// is the usual case (the ADCS only estimates an attitude in four of its
-// eight modes, and only the extended-beacon blob downlinks it at all).
+// How many pieces each edge of a picture's footprint is drawn in. The
+// edge is a straight line in the picture but a curve on the ground --
+// more so the further off nadir the camera was looking -- so it is
+// traced a ray at a time, the same as the look direction is.
+#define GLOBE_FOV_SAMPLES  16
+
+// The satellite's attitude at the moment on screen, as an extended beacon
+// or the ADCS's own SD-card log reports it. The caller looks up the
+// attitude nearest the moment and fills this in; a zeroed one means there
+// is nothing to draw, which is the usual case (the ADCS only estimates an
+// attitude in four of its eight modes, the beacons are only heard over a
+// ground station, and a log only covers what the team chose to log).
 typedef struct {
     int    have;
 
@@ -143,12 +166,16 @@ typedef struct {
     // respect to the orbit frame.
     double roll_deg, pitch_deg, yaw_deg;
 
-    // How far the beacon that carried them sat from the moment being
-    // drawn, in seconds, and which way. The satellite turns at a
-    // fraction of a degree a second, so a beacon a minute away still
-    // says roughly where it was looking -- but the reader should be
-    // told, so the panel prints it.
+    // How far the beacon or log record that carried them sat from the
+    // moment being drawn, in seconds, and which way. The satellite turns
+    // at a fraction of a degree a second, so one a minute away still says
+    // roughly where it was looking -- but the reader should be told, so
+    // the panel prints it.
     double age_s;
+
+    // 1 if they came from the SD-card log, 0 from a beacon. The caption
+    // names which.
+    int    from_log;
 } globe_attitude_t;
 
 typedef struct {
@@ -206,10 +233,21 @@ typedef struct {
     // so the first track built does not frame itself over it.
     int     keep_view;
 
-    // Where the satellite was looking, when a beacon says so. Drawn
-    // over the track as a ray down to the ground and a small set of
-    // body axes at the dot.
+    // Where the satellite was looking, when a beacon or the ADCS's
+    // SD-card log says so. Drawn over the track as a ray down to the
+    // ground and a small set of body axes at the dot.
     globe_attitude_t att;
+
+    // The camera on the nadir face, for outlining what its picture
+    // covered on the ground: the full field of view across the picture
+    // and down it, in degrees. A viewer with no picture to place
+    // (mpi_viewer) leaves them at zero and nothing is outlined.
+    double fov_across_deg, fov_down_deg;
+
+    // The caller's toggle for that outline. It is drawn only with an
+    // attitude on record: a footprint projected from an assumed
+    // attitude would be a confident box in the wrong place.
+    int    show_fov;
 } globe_t;
 
 // Draw the panel's text with the caller's font. Without this the panel falls
@@ -245,8 +283,8 @@ int globe_subpoint(const globe_t *g, double unix_ms,
 // Tell the panel which way the satellite was facing, so it can draw
 // what the nadir face was looking at. Pass NULL, or a globe_attitude_t
 // with have == 0, to draw nothing -- which is what a moment with no
-// extended beacon near it, or one whose ADCS was not estimating an
-// attitude, should do.
+// extended beacon or log record near it, or one whose ADCS was not
+// estimating an attitude, should do.
 void globe_set_attitude(globe_t *g, const globe_attitude_t *att);
 
 // Drag turns the globe, the wheel (or two fingers) zooms it. Call it with the

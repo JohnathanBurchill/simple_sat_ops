@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`c2b8f7b` (2026-10-01). This is a working draft.
+`9d2b759` (2026-11-01). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -139,6 +139,7 @@ manual can go back on the shelf where it belongs.
     - [`beacon_detect`](#beacon_detect)
     - [`fm_preview`](#fm_preview)
     - [`packet_query` and `packet_browser`](#packet_query-and-packet_browser)
+    - [`packet_refile`](#packet_refile)
     - [`telemetry_browser`](#telemetry_browser)
     - [`cam_reconstruct`](#cam_reconstruct)
     - [`frontiersat_camera_viewer`](#frontiersat_camera_viewer)
@@ -149,7 +150,9 @@ manual can go back on the shelf where it belongs.
     - [`tle_keps`](#tle_keps)
     - [`tle_compare`](#tle_compare)
     - [`conjunction`](#conjunction)
+    - [`region_crossings`](#region_crossings)
     - [`gnss_reports`](#gnss_reports)
+    - [`gnss_ring`](#gnss_ring)
     - [`tle_from_state`](#tle_from_state)
 12. [Uploading the orbit to the space safety database](#uploading-the-orbit-to-the-space-safety-database)
     - [The workflow](#the-workflow)
@@ -752,7 +755,7 @@ Which targets actually build depends on what the host has:
 |------------|---------------------|
 | always | `radio_ctl`, `rs_selftest`, `fm_preview`, `agenda_check` |
 | OpenSSL / libcrypto | `uplink_test`, `rx_decode`, `packet_query`, `packet_browser`, `tcmd_browser`, `satnogs_browser`, `tcmd_import` |
-| SGP4SDP4 | `next_in_queue`, `lifetime`, `tle_keps`, `conjunction`, `prediction_selftest`, `pursuit_selftest` |
+| SGP4SDP4 | `next_in_queue`, `lifetime`, `tle_keps`, `conjunction`, `region_crossings`, `magcoords_selftest`, `prediction_selftest`, `pursuit_selftest` |
 | UHD (B210) | `b210_rx_capture`, `b210_gain_sweep`, `tx_frame_sdr`, `sdr_probe` |
 | librtlsdr | RTL-SDR RX-only backend in `simple_sat_ops` (on by default; auto-disables if absent) |
 | libusb | USB-serial clone detection in the UHD backend (a UHD dependency, so normally already present) |
@@ -957,6 +960,7 @@ review it, or take apart what it recorded.
 | Summarize a TLE's orbital elements (keps) | [`tle_keps`](#tle_keps) |
 | Tell apart two close catalog objects, or build a TLE from a downlinked fix | [`tle_compare`](#tle_compare) / [`tle_from_state`](#tle_from_state) |
 | Screen two satellites for a close approach (conjunction) | [`conjunction`](#conjunction) |
+| See when FrontierSat crosses the cusp, the nightside aurora or the STEVE zone | [`region_crossings`](#region_crossings) |
 | Sanity-check a command list before you send it | [`agenda_check`](#agenda-review-agenda_check) |
 | Plot a telemetry field over days or months | [`telemetry_browser`](#telemetry_browser) |
 | Pull frames out of a recorded capture offline | [Offline analysis tools](#offline-analysis-tools) |
@@ -2246,6 +2250,35 @@ telecommand (`@tssent`) the download began. A download split
 across a long pause, or across separate commands, reconstructs as separate
 bursts; open each from one of its own chunks.
 
+### `packet_refile`
+
+Files the packet DB's `unknown` rows under the packet types the decoder knows
+now. The decoder names a packet's type when it stores the packet. A frame it
+doesn't recognize is stored as type 0, `unknown`, with no decoded text. When
+the ground station learns a new type, the rows stored before that stay
+`unknown`. Decoding the old recordings again doesn't change them either,
+because the DB keeps the first row it stored for each payload. The extended
+beacon (`0x20`, from July 2026) and the GNSS ring samples (`0x30`, from
+August) were both stored this way until the decoder learned them.
+
+`packet_refile` runs the decoder's own classifier over every `unknown` row.
+For each row it now recognizes, it sets what a fresh decode would store: the
+type, its name, the satellite (when empty), and the decoded summary. Rows it
+still can't name stay `unknown`. These include the receiver hearing our own
+uplink, and frames whose type byte or anchor bytes took bit errors. Running
+it again changes nothing, so run it after any update that teaches the
+decoder a new packet type, on every copy of the DB. It writes in short
+transactions, so a decoder writing to the same DB only waits a moment.
+
+```sh
+cp -p /FrontierSat/packet_db.sqlite /FrontierSat/packet_db.sqlite.bak   # optional backup
+packet_refile --dry-run    # how many rows, by type
+packet_refile              # file them
+```
+
+On 2026-10-13 it filed 58,302 of 100,071 `unknown` rows: 23,297 extended
+beacons and 35,005 ring samples, in under two seconds.
+
 ### `telemetry_browser`
 
 The beacons as curves. `packet_query` and `packet_browser` show you one
@@ -2374,6 +2407,17 @@ snapped out to whole 195-byte download chunks and printed as a ready-to-send
 path written into those commands. Missing packets are not an error - the
 tool always writes the best image it has and exits success.
 
+**A lost JPEG header is put back.** The first 21 sentences of a camera file
+hold the JPEG header - the quantization and Huffman tables and the frame and
+scan headers - and without it no decoder will open the picture. Every picture
+the camera has sent has had the same 589-byte header (all 19 downloaded with
+it whole, June 1 to October 22, in all three camera modes), so when a file's
+own header is incomplete or damaged but what did arrive agrees with that
+standard header, the decoder puts the standard one in. The run says so on a
+`jpeg header :` line, and the recovered-byte counts still cover only what
+actually came down. A header that mostly disagrees with the standard one is
+left as it arrived.
+
 Once those chunks come back down they land as new `bulk_file` packets in the
 packet database. **`--patch=<id,id,...>` together with `--db=<packet_db.sqlite>`
 folds them in**: each named `bulk_file` packet's data is laid over the
@@ -2404,6 +2448,7 @@ where the best single pass had left holes.
 ```sh
 frontiersat_camera_viewer                              # default database
 frontiersat_camera_viewer --db=/FrontierSat/packet_db.sqlite
+frontiersat_camera_viewer --rebuild-cache              # rebuild the cached older pictures too
 ```
 
 Camera packets are picked out of the `bulk_file` traffic by the camera file's
@@ -2416,10 +2461,20 @@ the body turned to mush - which the older "does it start with START_CAM"
 check would have accepted.
 
 Those packets are then split into download sessions by reception time, and
-sessions of the same picture are merged. Two sessions are the same picture when
-the bytes they both carry agree: different pictures disagree on about four
-bytes in five, the same picture on at most one in five, its only disagreements
-coming from packets Reed-Solomon could not correct. The ground station's
+sessions of the same picture are merged. A session is also cut where the
+picture's sentence count, which every sentence declares, changes: two
+pictures downloaded back to back arrive with no gap between them, and before
+2026-10-22 the second picture's session swallowed the first one's packets.
+A single damaged packet's wrong count does not cut a session; the next packet
+has to agree with it. Two sessions are the same picture when
+the image-data bytes they both carry agree: different pictures disagree on
+about four bytes in five, the same picture on at most one in five, its only
+disagreements coming from packets Reed-Solomon could not correct. The
+comparison starts at sentence 21 (file offset 1418), where the image data
+begins. Every picture opens with the same JPEG tables, so two different
+pictures agree byte for byte before that point. Until 2026-10-16 the viewer
+compared those bytes too, which merged the Sep 1, Oct 11 09:55 and Oct 16
+pictures into the Jul 23 row. The ground station's
 command log settles the case content cannot - a follow-up pass that re-fetched
 only the ranges the first pass missed shares no bytes at all with it, but both
 commands name the same file on the satellite.
@@ -2428,12 +2483,24 @@ The command log (the `sent_tcmd` table) also supplies the two labels the file
 itself does not carry: the satellite path, shown as the title, and **when the
 picture was taken**, read off the `camera_capture` command that made it and
 shown in green. Both are best-effort - a download commanded from another
-ground station leaves the row labelled by its download time instead.
+ground station leaves the row labelled by its download time instead. The
+times are when each command was set to run on board (its `@tsexec`), not when
+it went up: agendas are uploaded hours ahead, and before 2026-11-01 the
+viewer dated every picture from 2026-10-29 on by its upload, which put the
+globe on the wrong pass and lit it for the wrong hour.
 
 The panel under the picture reports bytes and sentences recovered, whether the
 end marker arrived, the decoded JPEG size and dimensions, and the passes the
 download took. A picture too badly holed to decode says so rather than showing
 a broken image; `s` still saves the partial file for another decoder to try.
+
+A picture whose first sentences never came down still shows: the decoder puts
+in the standard JPEG header every camera picture shares (see `cam_reconstruct`
+above), and the `jpeg` line ends `standard header` when it did. The
+2026-10-22 15:44 picture over Singapore was the first to need it - no clean
+copy of its first 1365 file bytes came down on either download pass. The header only
+covers the tables; when image data right after it is lost too, as in the Oct
+16 picture, the picture opens but is scrambled from the gap onward.
 
 The picture zooms and moves under the mouse: scroll the wheel or pinch the
 trackpad over it to zoom about the pointer, and drag it to move it around.
@@ -2461,25 +2528,64 @@ the globe falls back to **where the satellite was when the picture was first
 downloaded** - a different place on a different pass. The panel's heading says
 which it is showing: `Ground track at capture` or `Ground track at downlink`.
 
-**Which way it was looking.** When an extended beacon near the moment carries an
-attitude, the globe also draws **where the camera was pointed**: a pale green
-ray from the satellite down to the point on the Earth the nadir face was aimed
-at, a cross on that point, and two short spokes at the dot for the body's X and
-Y axes, which say how the satellite was rolled about that look. The caption
-under the disc reads it out - *"looking 34 deg off nadir, 22 deg left, at 51.2 N
-112.8 W"* - and says `past the limb, off the Earth` instead, with the ray
-dashed, when the face was aimed above the horizon. The nadir face is the one the
+**Which way it was looking.** When an attitude is on record near the moment -
+from an extended beacon, or from the ADCS's own SD-card log - the globe also
+draws **where the camera was pointed**: a pale green ray from the satellite down
+to the point on the Earth the nadir face was aimed at, a cross on that point,
+and two short spokes at the dot for the body's X and Y axes, which say how the
+satellite was rolled about that look. The caption under the disc reads it out
+on two lines - *"34 deg off nadir, 22 left"* and *"looking at 51.2 N 112.8 W
+(beacon)"* - and says `looking past the limb` instead, with the ray dashed, when
+the face was aimed above the horizon. The word in brackets says where the
+attitude came from: `beacon` or `ADCS log`. The nadir face is the one the
 ADCS's nadir sensor is on, which is the boom camera itself, so at a level
 attitude the ray goes straight down and the picture is of the ground below.
 
 No ray is drawn when there is no attitude to draw, which is the common case: it
-needs an extended beacon within two minutes of the moment **and** the ADCS to
-have been in an estimation mode that computes an attitude. The satellite turns
-at a few tenths of a degree a second in those modes, so a beacon a minute away
-is still worth using - the caption adds `(beacon +45s)` whenever it was more
-than half a minute off, so you can judge it. The frames the geometry works in,
-and the one assumption in it we have not confirmed against flight data, are
-spelled out at the top of `src/orbit/attitude.h`.
+needs an extended beacon or a log record within two minutes of the moment
+**and** the ADCS to have been in an estimation mode that computes an attitude.
+A beacon is only heard while the satellite is over a ground station; a log
+covers whatever stretch the team asked the ADCS to log, and only once its file
+has been downloaded. The satellite turns at a few tenths of a degree a second in
+those modes, so an attitude a minute away is still worth using - the first line
+adds the offset, `+45s`, whenever it was more than half a minute off, so you can
+judge it. The frames the geometry works in, and the one assumption in it we have
+not confirmed against flight data, are spelled out at the top of
+`src/orbit/attitude.h`.
+
+**Where the log attitudes come from.** The viewers read every ADCS SD-card log
+(`ADCS/log_XXXX.TLM`) in the packet database that records the estimated-angles
+frame. A downloaded chunk does not say which file it belongs to, so a log is put
+back together by its content. Its first chunk holds the log's mask and its first
+record's time, the records are exactly periodic, and a chunk belongs to the log
+when every record time inside it falls on the log's schedule. Only chunks whose
+packet CRC checked out are used, so a log whose first chunk never came down
+cannot be read, and the record that finishes in a file's short last chunk is
+lost. When the log also records the ADCS state frame, a record counts only if
+the estimator was in a mode that computes the angles, as for a beacon; without
+it, a record whose three angles all read exactly zero is taken as not
+estimated. A log record's time is the ADCS's own clock, which the team sets from
+the OBC's.
+
+**What the picture covered.** With an attitude on hand, **`p` outlines the
+picture on the globe**: the camera's 49 x 38 degree field of view (measured
+from the Earth's limb in the 6 August picture) traced out from the satellite
+along the way it was facing, to where it meets the ground. Straight down from
+500 km that is a box about 460 x 350 km centred on the cross; tilted off nadir
+it stretches into a keystone, the far edge much longer than the near one, and
+any part of the picture that looked past the limb is left open. `p` again
+turns it off. A picture with no attitude near it gets no outline, and the
+status line says so - an outline projected from an assumed attitude would be a
+confident box in the wrong place.
+
+The camera frame lies on the body frame: picture right along body +X (the ram
+face), picture down along body +Y, so not mirrored. This was checked against
+the pictures themselves in October 2026: an antenna on the satellite's -X face
+shows at the lower left of every picture, and the ground in them matches the
+map turned, not flipped. That rules out a half turn or a mirror image, though
+not an error of a few degrees. The **top edge is drawn heavier** and **a dot
+marks the top-left corner**, so the outline shows which way the picture is
+turned; the caption adds `heavy edge: picture top` while the outline is up.
 
 **Zoom in and the dot becomes the satellite.** Past about 3x the dot fades out
 and a model of FrontierSat fades in, turned the way the satellite was turned:
@@ -2520,14 +2626,15 @@ oldest at the bottom, ordered by when each was taken (or, with no
 
 **Favourites.** `f` tags the picture on show as a favourite, and `f` again
 untags it; a favourite carries a gold star in the list and after its title.
-`v` switches the list between every picture and **the favourites only** - the
+`shift-F` switches the list between every picture and **the favourites only** - the
 heading then reads `Favourites`, with `3 of 14` beside it, and `Up`/`Down` step
 from favourite to favourite. Untagging a picture while only the favourites are
 showing drops it from the list and moves on to the next one; untagging the last
 goes back to the whole list rather than leaving it empty.
 
 **It remembers where you were.** The favourites, whether the list is showing
-only them, and the picture last looked at are kept in
+only them, the brightness ranges set by hand (below), and the picture last
+looked at are kept in
 `~/.local/state/simple_sat_ops/frontiersat_camera_viewer.state`, written each
 time one of them changes, so the next run opens on the same picture with the
 same list. A picture is remembered by the moment it belongs to - the same stamp
@@ -2535,14 +2642,92 @@ its exported JPEG is named with - not by its place in the list, so a new
 picture arriving at the top moves nothing, and a favourite the open database
 does not hold is kept in the file rather than forgotten.
 
-Keys: `Up`/`Down` change picture, `f` tags a favourite, `v` shows the
-favourites only, **`o` opens the picture in the desktop's
+**Two display filters: `e` equalizes the picture, `t` stretches its
+colours.** One is on at a time, and the same key again goes back to the
+picture as received. While one is on, its name (`histogram equalized` or
+`colours stretched to full scale`) shows in gold above the picture's top right
+corner. The setting stays as you move from picture to picture, and every run
+opens on the pictures as received. Both change only the screen: `s` and `o`
+still hand over the JPEG as received.
+
+- **`e`, histogram equalization.** The brightness is spread so that the
+  darkest level present becomes black, the brightest white, and the levels
+  between take room in proportion to how many pixels hold them. The colour is
+  left alone, because all three channels of a pixel move by the same amount.
+  On the Aug 6 limb it brings out the cloud structure.
+- **`t`, colours stretched to full scale.** Red, green and blue are each
+  stretched on their own, linearly, from their darkest value to 0 and their
+  brightest to 255. Because each colour gets its own stretch, a colour cast
+  goes too: the pink Oct 6 picture (red 67 to 171, green 42 to 117, blue 62
+  to 129) comes out with more natural colour and more contrast. Since it is
+  set by the single darkest and brightest values, a few bright pixels hold
+  it back. On the Sep 4 town-lights picture the lights brighten two and a half
+  to four times and the dark ground stays black. `e` does worse there: 15 % of
+  that picture's pixels sit at level 1, one above black, and equalizing turns
+  them near white, so the compression blocks swamp the lights.
+
+Neither shows much in a dark night-mode frame. The pictures of Sep 5, Jul 23
+and Oct 11 use only 5 to 9 brightness levels between 12 and 20. Either filter
+spreads those few levels across the whole range, so the JPEG's compression
+blocks, a level or two apart, become large squares: grey and white with `e`,
+false colours with `t`. What shows then is the compression, not the scene.
+
+**The brightness range: `a` cycles it, `z` `x` `c` `v` set it by hand.** The
+picture is drawn over a range of brightness levels: the darkest level in the
+range shows as black, the brightest as white, and the levels between are spread
+evenly, with anything outside the range clipped. `a` cycles through three
+ranges, the same way `a` cycles the scale in `mpi_viewer`:
+
+- **full range**, 0 to 255, the picture as received. Every run opens here.
+- **autoscaled**: from the picture's 1st to its 99th percentile of brightness
+  (the BT.601 luma the JPEG codes), so the darkest and brightest hundredth of
+  the pixels, such as a few town lights, do not set the range.
+- **set by hand**: the picture's own range, which `z` `x` `c` `v` set.
+
+`z` and `x` lower and raise the darkest level shown, and `c` and `v` lower and
+raise the brightest: one level a press, eight with shift, repeating while
+held. They start from the range on show and switch to the range set by hand,
+so the first press moves the picture as you see it. **Each picture keeps its
+own range**, in the state file with the favourites, so it comes back when you
+return to that picture, in this run or the next. A picture with no range of its
+own shows its autoscale range while set by hand is selected. The range applies
+on top of `e` or `t`, all three colours alike. The info panel shows the range
+on show (`brightness   : 12 to 31, set by hand`), and while it is anything but
+the full range it is also named in gold above the picture's top right corner.
+Like the filters, it changes only the screen.
+
+Keys: `Up`/`Down` change picture, `e` equalizes, `t` stretches colours, `a`
+cycles the brightness range, `z`/`x` and `c`/`v` move its darkest and brightest
+levels, `f` tags a favourite, `shift-F` shows the favourites only, **`o` opens the picture in the desktop's
 image viewer** (Preview on macOS, the `xdg-open` default on Linux) via a copy
 in the temporary directory - for a look in whatever viewer you already keep
 your pictures in. `s` saves the JPEG to
 the working directory as `fs_boomcam_<capture time>.jpg`, `g` resets the globe,
-**`F5` re-reads the database** and rebuilds the list, and `q` quits. Read-only
-on the database and safe to run while a receiver is filling it.
+`p` outlines the picture on it, **`F5` re-reads the database** and rebuilds
+the list, **`shift-F5` rebuilds the cached pictures too** (below), and `q`
+quits. Read-only on the database and safe to run while a receiver is filling
+it.
+
+**Older pictures come out of a cache.** A picture taken more than a week ago
+(or, with no `camera_capture` command on record, first downloaded more than a
+week ago) is not put together again at every start. It is kept as built in
+`~/.cache/simple_sat_ops/frontiersat_camera_viewer.cache` (under
+`$XDG_CACHE_HOME` when that is set), and each start or `F5` rebuilds only the
+rest. It reads the packets received from a day before the cache's cutoff
+onwards, plus any packet added to the database since the cache was written,
+whatever its time. A later download of an old picture is not folded in by
+itself. The info panel says in gold how many such downloads it has left out,
+for example `1 newer download of pictures from before 2026-10-20 not shown:
+shift-F5 rebuilds them`. `shift-F5`, or starting with `--rebuild-cache`,
+rebuilds every picture from the whole database and writes the cache afresh.
+Once the cutoff is a day behind "a week ago", a start moves it forward and
+rewrites the cache, so the rebuilt stretch stays about a week long. The
+attitudes the globe draws keep their own cache beside it, by the same rules.
+Those are single moments rather than pictures, so a late download of old
+attitudes is simply added. A newly built or installed viewer ignores the old
+cache and starts with a full rebuild, and deleting the cache files is always
+safe. On the 2026-10-26 store a start reads 19 of the 25 pictures from the
+cache.
 
 ### `mpi_reconstruct`
 
@@ -2602,6 +2787,21 @@ cap, or the firmware's own 1,000,000-byte clamp, which binds even when the
 whole file was asked for -- only puts a **floor** under the length, and is
 reported as a minimum and never used to truncate. Whichever way the number was
 arrived at, the printed line says so.
+
+Several blobs also state the length outright in the JSON they reply with - the
+download-start blob itself, the on-board MPI analysis and the file map:
+
+```
+{"action":"bulk_downlink_start_blob","file":"mpi_data/2026-07-21.mpi","file_size":556728,...
+{"action":"analyze_mpi_data_v1","file":"2026-10-05_102334Z.mpi","sha256":"...","size":783449,...
+```
+
+That is the file's exact length when the blob ran, whether or not any download
+ever reached the end, and it is read from every such reply whose CRC checked
+out (a flipped digit in a failed one reads exactly like a real length). It is
+the only statement of the length for a file none of whose downloads' "complete"
+lines came down: the 2026-10-05 recording was otherwise known only as the
+243165 bytes that had arrived, against a real 783449.
 
 **Only CRC-verified packets are trusted with an offset.** A packet's offset
 field is covered by the same CSP CRC32 as its data, so a packet that passed its
@@ -2663,12 +2863,14 @@ being taken.
 mpi_viewer                              # default database
 mpi_viewer --db=/FrontierSat/packet_db.sqlite
 mpi_viewer --list                       # print what each experiment reconstructed to
+mpi_viewer --rebuild-cache              # rebuild the cached older recordings too
 ```
 
 `--list` prints one block per experiment - the on-satellite file, how long the
 recording ran, its length and where that number came from, the recovered and
 missing byte counts, how much rests on packets whose CRC failed, the frame
-count, and how many packets were set aside for a corrupted offset - then exits
+count and how many frames were dropped for failing their own CRC, and how many
+packets were set aside for a corrupted offset - then exits
 without opening a window. It answers "how much of this do we actually have?"
 from a terminal or over ssh, and is the same reconstruction the GUI shows.
 
@@ -2685,8 +2887,8 @@ favourites only** - the heading then reads `Favourites`, with `2 of 5` beside
 it, and `Up`/`Down` step from favourite to favourite. Untagging one while only
 the favourites are showing drops it from the list and moves on to the next;
 untagging the last goes back to the whole list rather than leaving it empty.
-These are `t` rather than the `f` and `v` that `frontiersat_camera_viewer` uses,
-since here `f` and `v` already set the frames per sweep and the manual DN window.
+These are `t` and `shift-T` rather than the `f` and `shift-F` that
+`frontiersat_camera_viewer` uses, since here `f` already sets the frames per sweep.
 
 The grouping and the timing both come from JSON markers the flight firmware
 writes into each science file: a `{"mpi_start":...,"timestamp_ms":N}` header at
@@ -2716,6 +2918,16 @@ at that flush (the frame counter jumps across the footer) and for the last frame
 of a recording, which the stop cuts short. `--list` reports how many frames were
 rejoined, kept and dropped for each experiment.
 
+Every other frame is held to its CRC-16 too, and **a frame that fails it is not
+drawn**, in the image or the whereogram. Most of those sit beside a downlink
+packet that never came down, so part of the frame reads as zeros; the rest
+carry bytes from a packet whose CSP CRC failed. Drawn, they were one-column
+streaks through the whereogram and image columns standing hundreds to tens of
+thousands of DN off their neighbours - 55 of the 1266 frames of the 2026-10-20
+19:21 recording, which was then 72% downloaded. The ones beside a hole come
+back when the hole is filled, which the `d` re-download export already asks
+for.
+
 **What the picture's axes are.** Up the image is the 65 CCD pixels, the
 direction the ions arrived from. Across it is the inner-dome bias in the order
 the sweep was flown: 0 V at the far left, then increasingly negative bias to the
@@ -2736,6 +2948,19 @@ rest of the sweep. The far-right column is the
 other frame of the dwell: 0 V read again with the background taken off it, which
 is the residue the subtraction leaves. Because every frame of the sweep is
 drawn, consecutive images tile the recording with nothing left over.
+
+**Which image a frame goes in** comes from its frame counter (aux bytes 4-5),
+which steps by exactly one a frame. A frame's counter less its column is the
+counter of its sweep's first frame, the same for every frame of the sweep, so
+each frame finds its own image whichever of its neighbours came down, and an
+image with a hole in the download beside it just has columns missing. Until
+2026-10-21 a new image began only at the frame that starts a sweep, so when
+that one frame was missing the next sweep - or ten of them, across a download
+hole - ran on into the image before and was drawn over its columns, which read
+as large jumps between neighbouring columns. A counter that steps back starts a
+new image too: the instrument starts counting again from zero when it
+restarts, which eight of the first thirteen recordings do once, near the start,
+so no image takes frames from both sides of the restart.
 
 Note that a frame's pixels and its aux fields are one frame apart: the pixels
 were integrated during the previous frame's slot, while the aux is stamped when
@@ -2847,14 +3072,26 @@ track round the far side of the globe are drawn faintly rather than dropped, so
 a pass that goes over the horizon still reads as one arc. Under the disc is the
 sub-satellite latitude, longitude and altitude for the image being shown.
 
-**Which way it was facing.** When an extended beacon within two minutes of the
-moment under the playback head carries an attitude, the globe also draws it: a
-pale green ray from the satellite to the point on the Earth the nadir face was
-aimed at, a cross on that point, and short spokes for the body's X and Y axes.
-The caption under the disc reads *"looking 12 deg off nadir, 4 deg right, at
-50.9 N 114.3 W"*, or says the look went past the limb. Because the head moves
-through the recording, the ray moves with it - which is how you see whether the
-satellite held its attitude across the sweep or was still turning.
+**Which way it was facing.** When an extended beacon or an ADCS SD-card log
+record within two minutes of the moment under the playback head carries an
+attitude, the globe also draws it: a pale green ray from the satellite to the
+point on the Earth the nadir face was aimed at, a cross on that point, and short
+spokes for the body's X and Y axes. The caption under the disc reads *"12 deg
+off nadir, 4 right"* and *"looking at 50.9 N 114.3 W (ADCS log)"*, or says the
+look went past the limb; the word in brackets names the source. Because the head
+moves through the recording, the ray moves with it - which is how you see
+whether the satellite held its attitude across the sweep or was still turning.
+
+The MPI is run out of sight of the ground stations, so a beacon almost never
+falls within two minutes of a recording, and **an SD-card log spanning the
+recording is the only way to get its attitude**. Of the recordings to date only
+the 2026-10-05 10:23 run has one: the team's 08:01-10:30 UTC log, every 10 s,
+covers all of it. For future runs, have the agenda start a log a minute before
+the run and stop it a minute after, then download it; a mask with the estimated
+angles, estimated rates, ADCS state, measured field and model field
+(`00 02 00 58 08 00 00 00 00 00`) at one record a second is about 6.5 KB for a
+3-minute window. How the viewer reads the logs is described under
+[`frontiersat_camera_viewer`](#frontiersat_camera_viewer).
 
 Zoomed past about 3x the dot becomes a model of FrontierSat, turned the way the
 satellite was turned; for an MPI recording the face to watch is the **ram face**,
@@ -2915,6 +3152,18 @@ track and lighting still work. The disc is ray-cast on the CPU rather than drawn
 as a 3D model, coarse while you are turning it and at the screen's own
 resolution once it settles.
 
+**Sharper zoomed in.** The 2048-pixel map has just the detail the whole-Earth
+view needs; zoomed in, each of its pixels is a blocky 20 km square. Run
+`scripts/fetch_globe_tiles.sh` once and the globe switches, as you zoom, to the
+same Blue Marble at up to 21600 x 10800 (about 1.9 km to the pixel), so the
+colours carry straight on and only the detail changes. The script downloads
+NASA's 182 MB TIFF, cuts it into square JPEG tiles at four sizes, and puts them
+in `~/.local/share/simple_sat_ops/globe_tiles/` (or under `$XDG_DATA_HOME`),
+where both viewers look; it needs `curl` and ImageMagick. Only the tiles the
+view needs are read, as it needs them, and at most 110 MB of them are held at
+once. Without the tiles the viewer says so on the terminal at startup and the
+globe stays at the 2048-pixel map however far in you go.
+
 **What it remembers between sessions.** On exit the viewer writes
 `~/.local/state/simple_sat_ops/mpi_viewer.state` - which experiment was open,
 where the playhead sat in it, the favourites and whether the list shows only
@@ -2934,7 +3183,7 @@ not carry keeps its built-in default, so a file written by another build is
 still worth reading.
 
 Keys: `Up`/`Down` change experiment, `Left`/`Right` scrub images (or click or
-drag the whereogram to scrub, which also rules off the time it spans), `Space` plays/pauses, `,`/`.`
+drag the whereogram to scrub, which also rules off the time it spans, and scroll over it to zoom), `Space` plays/pauses, `,`/`.`
 set the playback speed, `f` cycles frames-per-image (auto/8/16), `s` zoom, `a` cycles the colour scale (auto-image / auto-experiment
 / manual), `r` resets it to auto-image, `z`/`x` and `c`/`v` move the manual DN
 window (hold `Shift` for coarse steps), `m` cycles the colour map, `b` toggles
@@ -2945,11 +3194,33 @@ mean,
 `d` writes
 the re-download
 telecommands (below), **`F5` re-reads the database** and rebuilds the
-list (keeping your selection and view settings), and `q` quits.
+list (keeping your selection and view settings), **`shift-F5` rebuilds the
+cached recordings too** (below), and `q` quits.
 The experiment list scrolls with the wheel and a row can be clicked to select
 it; dragging the globe below it turns it, `g` puts its view back to the whole
 Earth, and scrolling over the globe zooms it rather than scrolling the list.
 Read-only on the database and safe to run while a receiver is filling it.
+
+**Older recordings come out of a cache.** A recording that started more than a
+week ago is not put together again at every start. It is kept as built in
+`~/.cache/simple_sat_ops/mpi_viewer.cache` (under `$XDG_CACHE_HOME` when that
+is set), and each start or `F5` rebuilds only the rest. It reads the packets
+received from a day before the cache's cutoff onwards, plus any packet added
+to the database since the cache was written, whatever its time. A later
+download of an old recording, such as a re-download of its holes from a `d`
+export, is not folded in by itself. A gold line above the help footer says
+how many such downloads it has left out, for example `1 newer download of
+recordings from before 2026-10-20 not shown: shift-F5 rebuilds them`.
+`shift-F5`, or starting with `--rebuild-cache` (which `--list` honours too),
+rebuilds every recording from the whole database and writes the cache
+afresh. Once the cutoff is a day behind "a week ago", a start moves it
+forward and rewrites the cache, so the rebuilt stretch stays about a week
+long. The attitudes keep their own cache beside it, by the same rules. Those
+are single moments rather than recordings, so a late download of old
+attitudes is simply added. A newly built or installed viewer ignores the old
+cache and starts with a full rebuild, and deleting the cache files is always
+safe. On the 2026-10-26 store a start reads 11 of the 14 recordings from the
+cache, which is about 20 MB.
 
 **Where the pixels sit in a frame.** The 152-byte frame is 20 bytes of aux, then
 the 65 pixels as big-endian `uint16` in bytes 20..149, then a CCITT CRC-16 over
@@ -2976,26 +3247,41 @@ for a fixed run of frame-sized slices, so a stretch that never came down takes u
 its own width instead of being closed up. Those columns are painted in the
 window's background colour - a colour map has no value meaning "no data", and its
 darkest end would read as a real, low measurement - and a **red rule above the
-panel** marks them. Several frames share a column once a recording is longer
-than the panel is wide, and they are averaged.
+panel** marks them. The rule also marks a column whose frame came down but was
+dropped for failing its own CRC, which is blank for the same reason. Several
+frames share a column once a recording is longer
+than the panel is wide, and they are averaged - so on a whole recording the
+whereogram cannot look like the image under its head: at a 780-pixel panel the
+2026-10-20 recordings put 2.3 frames in each pixel, 2026-07-21 4.7 and
+2026-08-09 12, which blends the image's sixteen bias voltages two to twelve at a
+time and folds frames of the images either side into its end columns.
+**Scrolling over the whereogram zooms it** in and out about the playback head,
+as far as three sweeps - the image on screen and one either side of it - and
+while zoomed the stretch on show stays centred on the head as you play or step.
+From one pixel a frame the stretch under the head is the image itself, colour
+for colour. The panel's top right says how many frames go into each pixel, or
+how many pixels each frame gets. Choosing another experiment goes back out to
+the whole recording.
 
 The line beneath gives the received percentage, how much is still missing, and
 where the file's length came from - the satellite's own byte count for that file,
-a satellite-reported minimum, or (when the log never named it) the largest offset
-received. That last case is the only one where the percentage is measured against
+a satellite-reported minimum, or (when nothing the satellite sent named it) the
+largest offset received. That last case is the only one where the percentage is measured against
 a guess; see `mpi_reconstruct` above for how the length is established.
 
 A **small white bracket** just under the whereogram - an upright at each end of
 the image's bytes and a rule joining them, open at the top - marks the stretch
 of recording the image on screen was built from, so you can see where in the
-recording you are as you scrub or play. The two uprights point up at the first
-and last frames, placed to the pixel rather than rounded out to whole columns,
-and sitting below the panel the bracket hides no columns at all - unlike the box
-this once was, drawn around the same span, which at that width was nearly all
-outline and covered the little it enclosed. The bracket is as wide as the image
-really is and no wider - a pixel or three on a long recording - and is only
-opened out when the span comes to less than the two uprights need to stand apart
-at all.
+recording you are as you scrub or play. The two uprights stand under the first
+and last columns the image's frames were drawn into, placed by the same mapping
+that drew them, so the bracket holds the image's columns exactly. (Until
+2026-10-22 the two used different roundings, and the left upright sat a pixel
+early on up to a third of the images.) Sitting below the panel, the bracket
+hides no columns at all - unlike the box this once was, drawn around the same
+span, which at that width was nearly all outline and covered the little it
+enclosed. The bracket is as wide as the image really is and no wider - a pixel
+or three on a long recording - and is only opened out when the span comes to
+less than the two uprights need to stand apart at all.
 **Clicking jumps to the image at that moment**, and **dragging scrubs** - the
 picture follows the pointer for as long as the button is held, so you can run
 through an experiment by hand and stop where something looks interesting. Either
@@ -3008,16 +3294,19 @@ that data - but nothing vouches for them.
 
 **`m` cycles the colour map** - grey, ion (the blue-to-orange these spectra are
 usually shown in), viridis, inferno - and applies to both the image and the
-whereogram. (`c` was already taken by the manual DN maximum.) The colour scale
-control is the same `a` as the image's, but auto means something different for
-each: the image scales to the image, while the whereogram scales over the whole
-whereogram, since scaling a picture of the entire recording to one image of it
-would flicker while scrubbing and leave one column not comparable with the next.
-The range used is printed at the panel's right, and it is a 1st-to-95th
-percentile rather than the plain extremes - a handful of corrupt readings reach
-the ends of the 16-bit range, and pixel 64 of every frame carries something
-around 32000 where the other 64 sit near 2010, so the extremes flatten the whole
-picture into a featureless rectangle.
+whereogram. (`c` was already taken by the manual DN maximum.) **The whereogram
+uses the image's colour scale**, whatever `a` has it on - the DN window the aux
+panel prints - so a frame is the same colour in both. In auto-image mode that
+means the whereogram is recoloured with every image; auto-experiment holds it
+steady. Both auto modes take the **1st to 99th percentile** of the pixels
+rather than the plain extremes, which let one pixel set the window for all the
+rest: across the images of the 2026-10-20 19:21 recording the extremes put the
+top anywhere from 2124 to 23421 DN. Auto-experiment counts only the frames that
+are drawn; a frame that fails its own CRC used to count too, and its zeros and
+corrupt words stretched the window to 0 .. 65391 and painted the whole recording
+one colour. (Until 2026-10-22 the whereogram scaled on its own terms, the 1st to
+95th percentile of its averaged columns, so in neither auto mode did its colours
+agree with the image's.)
 
 **Press `d` to write the re-download telecommands** for the selected
 experiment. An experiment is only as complete as the passes that carried it, and
@@ -3042,9 +3331,11 @@ firmware's 1,000,000-byte per-command limit is split. The commands carry no
 pass plan needs it.
 
 The name of the file on the satellite comes from the `sent_tcmd` command log:
-the `mpi_enable_active_mode(mpi_data/...)` sent when the recording started,
-falling back to whatever download command was flown while the experiment's
-packets were coming down. When neither is in the log the commands still carry
+the `mpi_enable_active_mode(...)` sent when the recording started, falling back
+to whatever download command was flown while the experiment's packets were
+coming down. The firmware writes a recording to exactly the path it is given,
+so the name may sit under `mpi_data/` or at the top of the file system, as the
+2026-10 recordings (`2026-10-05_102334Z.mpi`) do. When neither is in the log the commands still carry
 the right offsets but the path is written as `<file_path>` for you to fill in,
 and the viewer says so. The aux panel shows the resolved name as `satellite
 file`.
@@ -3264,6 +3555,92 @@ to render `conjunction.png`; if gnuplot is not installed it leaves the script
 and data so you can render them by hand. `--plot-out=<path>` sets the output
 base, `--plot-window-sec=<s>` the half-window shown (default 90 s).
 
+### `region_crossings`
+
+Lists the UTC intervals when FrontierSat is predicted to cross three regions
+of interest to space physics: the dayside **cusp**, the nightside **auroral**
+oval, and the pre-midnight **subauroral** zone where STEVE is seen. Each region
+is a band of magnetic latitude, in either hemisphere, inside a window of
+magnetic local time (MLT):
+
+| Region | \|Magnetic latitude\| | MLT | Why |
+|--------|-----------------------|-----|-----|
+| `cusp` | 70-80 deg | 09-15 | the cusp proper peaks at noon; the window takes in the cleft and tilt or IMF-driven shifts |
+| `aurora` | 62-72 deg | 18-06 | the quiet-to-moderate nightside oval |
+| `STEVE` | 55-62 deg | 18-24 | STEVE sits near 60 deg, pre-midnight, about an hour after substorm onset (Gallardo-Lacourt et al., 2018) |
+
+These are typical edges, not a model of the day's activity: the oval and the
+subauroral zone move equatorward as activity rises. Every edge is an option.
+
+```sh
+# The next 24 hours
+region_crossings
+
+# One UTC day, past or future
+region_crossings --day=2026-10-06
+
+# An explicit range, and a wider dayside window for the cusp
+region_crossings --start=2026-10-08T06:00 --stop=2026-10-08T18:00 --cusp-mlt=8,16
+
+# A storm-time oval and subauroral zone
+region_crossings --aurora-mlat=58,70 --steve-mlat=50,58
+
+# Any satellite in a TLE file
+region_crossings $TLES/science.tle --sat="SWARM A"
+```
+
+Each row is one crossing:
+
+```
+Start (UTC)          Stop        Dur  Region  Hemi  Alt km   LT h  MLT h  Lat start/end  MLat start/end
+2026-10-06 06:43:01  06:45:53   2:52  cusp    N        506    8.3    9.6    73.1   81.4    70.0   80.0
+2026-10-06 06:53:15  06:55:54   2:39  aurora  N        507   23.8   23.2    65.4   55.7    72.0   62.0
+2026-10-06 06:55:54  06:57:43   1:49  STEVE   N        506   23.5   23.0    55.7   48.9    62.0   55.0
+```
+
+The altitude, local time and MLT are means over the crossing (the times as
+circular means, so a crossing that spans midnight averages correctly). The
+latitude and magnetic latitude are the values at the start and the end. A
+crossing that starts or stops part-way through a band entered or left it
+through the MLT window instead; one already under way at the window's edge is
+cut there. Local time is local solar time from the subsolar point.
+
+**Magnetic coordinates.** Magnetic latitude is quasi-dipole (QD) latitude at
+the satellite's own altitude, and MLT is computed from the apex longitude --
+the coordinates apexpy and the Swarm products use. Both come from tracing the
+IGRF-14 field line from the satellite up to its apex (`src/orbit/magcoords.c`),
+so the lopsided real field is handled properly. A centred dipole would put the
+55-80 deg band edges up to 6 deg off in the north and 7 deg in the south. IGRF-14
+is defined for 2025-2030; outside that the tool says so and extrapolates.
+
+**Which TLE.** With no file, it takes the FrontierSat TLE (catalog 69015) from
+the packet database whose epoch is nearest the middle of the window, so a past
+day uses that day's elements and a forecast uses the newest. The second line
+of the output gives the TLE epoch and how far it lies from the window. A
+warning follows when any part of the window is more than 7 days from the
+epoch, forward or back, since SGP4 accuracy falls off with a TLE's age:
+
+```
+FrontierSat region crossings, 2026-10-06 13:13:44 to 2026-10-16 13:13:44 UTC
+TLE epoch: 2026-10-05 22:30:27 UTC, 0.6 days before the window starts (packet database tle id 428)
+WARNING: the window reaches 10.6 days from the TLE epoch (more than 7); crossing times lose accuracy as a TLE ages.
+```
+
+**Scan step.** The orbit is sampled every `--step` seconds (default 10) and
+each region edge is refined to half a second. A visit shorter than the step can
+be missed, which matters only for brief grazes of an MLT edge. A day takes a
+few seconds.
+
+**Validation.** `magcoords_selftest` checks the IGRF field against IRI-2026's
+independent Fortran IGRF (within 0.02 nT), the tracer against the closed-form
+apex of a pure dipole (within 0.001 deg), and QD latitude, apex longitude and
+MLT against apexpy 2.1.1. apexpy's own tracer takes fixed steps of about
+1000 km and lands 0.1 percent high on a pure dipole, so the agreement there is
+a few hundredths of a degree. Over one day of crossings (6 October 2026, 160
+start and stop points) the tool's QD latitude matched apexpy's fitted
+coordinates to 0.035 deg on average, at worst 0.11 deg (where apexpy's fit,
+not the trace, is off), and MLT to 18 s on average, at worst one minute.
+
 ### `gnss_reports`
 
 Reassembles the satellite's GNSS telecommand responses out of the packet
@@ -3291,6 +3668,56 @@ gnss_reports --since=7d
 A `BESTXYZA` whose status reads `SOL_COMPUTED` is a real position fix;
 `INSUFFICIENT_OBS` means the receiver could not see enough satellites to
 solve. Those computed fixes are what feed the orbit upload below.
+
+### `gnss_ring`
+
+Lists the GNSS fixes that the ring blob (`gnss_bestxyzb_ring_v2`) sends
+down, and compares each with the TLE. While the blob runs, it samples the
+receiver about every 10 s whenever the receiver is on, keeps the latest 500
+samples on the satellite, and on every run sends a random run of them down
+as packet type `0x30`, one binary `BESTXYZB` log per packet. Since the blob
+started, most of FrontierSat's fixes have arrived this way. The packet DB
+files them as `gnss_ring`, but `gnss_reports` and `gnss_opm` read only
+telecommand responses and firehose files, so they don't see them. Rows
+stored before the decoder knew this type are `unknown` until
+[`packet_refile`](#packet_refile) has been run, so `gnss_ring` finds the
+packets by their first byte, whatever type they were filed under. It checks
+each log's NovAtel CRC. It keeps one copy of each fix, because the blob sends the same
+sample many times and several stations hear it. It prints one line per fix,
+in time order.
+
+Each line gives:
+
+- the fix time (UTC), and the GPS week and seconds;
+- the receiver's time status and solution status;
+- the Earth-fixed position, its 1-sigma, and the velocity;
+- the number of satellites tracked and used;
+- a comparison with SGP4, in the last four columns.
+
+The comparison uses the newest TLE in the DB's `tle` table whose epoch is at
+or before the fix. The four columns are the TLE's age in hours, then the fix
+minus SGP4 in radial, along-track and cross-track metres. A short tally goes
+to stderr, including the median distance from SGP4. The columns are
+space-separated under a `#` header line, so the output goes straight into
+gnuplot or awk.
+
+The options:
+
+- By default only `SOL_COMPUTED` fixes are listed. `--all` adds the samples
+  taken just after the receiver was switched on, before it had a solution.
+- `--since` and `--until` select by fix time.
+- `--catalog=<n>` compares with another object's TLEs, and `--no-tle` skips
+  the comparison.
+
+```sh
+gnss_ring --since=24h
+gnss_ring --since=2026-10-13 --all
+gnss_ring --no-tle > fixes.txt
+```
+
+The distance from SGP4 is mostly the TLE's own error, which grows with its
+age: a few hundred metres for a TLE less than a day old. It does not measure
+the receiver.
 
 ### `mag_reports`
 
@@ -3840,6 +4267,66 @@ cron; on a dev host you run them by hand against `$FRONTIERSAT_ROOT`.
   before and after. It sets
   its own `umask` to 0002, since the archive is a shared setgid tree
   that cron writes as another user.
+* **`satnogs_passes`** — a quick look at whether the satellite is still
+  transmitting and whether the SatNOGS network is still scheduled to
+  listen. It shows when the satellite's SatNOGS observations either side
+  of now start, five minutes to a cell: each cell is the start of a
+  five-minute slot, UTC and local side by side, how many stations, and
+  how many observations begin in it. Slots with none are left out. The
+  cells read down and then across like a timetable, in only as many
+  columns as they need. The window is the last 6 hours and the next 6
+  (`--back=` and `--ahead=`, in hours, up to 48 between them). A `now`
+  rule cuts in where the past ends; a slot already under way counts as
+  past. Behind the rule the `stations` column is how many stations got
+  at least one frame out of the slot (SatNOGS's own count of what it
+  demodulated), so a past slot booked by twenty stations that none of
+  them heard reads `stations 0`, `obs 20`. Ahead of the rule it is how
+  many stations have booked the slot; a station books one observation
+  per pass, so the observation count is left blank there rather than
+  repeat it. A station with two observations in one slot counts once.
+  Green is a slot in which some station received a frame, white a past
+  slot in which none did, and cyan one still to come. The counts in a
+  slot just gone climb for a while as stations upload. It reads nothing
+  from this station's
+  packet database. It opens scrolled so the `now` rule is in view;
+  `h`/`l` scroll a column, `n` comes back to now, and `r` re-lists the
+  whole window from SatNOGS.
+
+  It lists an hour at a time through `satnogs_list_hour.sh`, starting
+  with the hour holding now and working outward, so the passes
+  nearest now are on screen within a few seconds. Hours rather than
+  days because FrontierSat draws about 600 observations a day across
+  the network: a day is 23 listing requests at nearly three seconds
+  each, an hour one to three. The second line of the screen says how
+  many hours are listed and how old the oldest listing is. An hour
+  listed more than 12 hours after it ended is final and is never asked
+  about again. The hour holding now and the one before it are re-listed
+  every 15 minutes, because SatNOGS's frame counts climb while stations
+  upload; any other hour is re-listed once its listing is older than
+  `--ttl` (default 120 minutes).
+
+  `satnogs_list_hour.sh` is a separate script so that `satnogs_pull.sh`,
+  which the cron job runs, stays untouched. It still shares that
+  script's archive: it takes the same lock, so the two never run at
+  once, and writes each request to the same `.api_stats.txt`, so there
+  is one count of what this address has spent. Its query reaches 20
+  minutes past the hour and keeps only the passes that start inside it,
+  because the API's `end` filter keeps only observations that have
+  ended by then, and a pass running over the top of the hour would
+  otherwise fall out of both hours. A `satnogs_pull.sh --cache-day`
+  listing has the same gap at midnight. `--list-script=` points
+  `satnogs_passes` at a copy that isn't on the PATH, such as the one in
+  the repository's `scripts/`.
+
+  A listing only starts when it fits inside half the hour's request
+  ceiling, counting what the cron run and anything else has already
+  spent from the archive's tally, and the screen says `waiting for
+  request budget` when it doesn't. A re-list you ask for with `r` may go
+  up to 90% of the ceiling. A listing that fails, or that the cron run's
+  lock turns away, is left for 10 minutes before it is tried again. With
+  the archive's API token the ceiling is 240 an hour and the window
+  fills in a minute or two; without one it is 60, and the window can
+  take more than an hour to fill.
 * **`decode_passes.sh`** — walk a directory tree, find every `.wav` and
   `.ogg`, run `rx_replay` on each (resampling `.ogg` first), and
   summarize what decoded. Beacons print as readable telemetry; anything
@@ -3961,6 +4448,11 @@ also [First-run setup](#first-run-setup).
   of that bootstrap: `setup` installs the `/etc/` tmpfiles/udev/logrotate
   snippets, `add-operator` creates a Unix account in `sso-ops` and drops
   in an SSH key, and `verify` smoke-tests an account.
+* **`fetch_globe_tiles.sh`** — once on any machine that runs
+  `mpi_viewer` or `frontiersat_camera_viewer`: download NASA's Blue
+  Marble at 21600 x 10800 and cut it into the tiles the globe draws from
+  when it is zoomed in (see [`mpi_viewer`](#mpi_viewer)). Needs `curl`
+  and ImageMagick; the tiles go in `~/.local/share/simple_sat_ops/`.
 
 ## Testing and validation
 
@@ -4070,7 +4562,7 @@ build/pursuit_selftest          # no extra deps
 build/unit_test_runner          # optional ncurses aggregator
 ```
 
-(That is a representative subset; the build produces all 49.)
+(That is a representative subset; the build produces all 50.)
 `unit_test_runner` discovers every `*_selftest` binary under `build/`
 and renders a collapsible group view of the TAP output, so a single
 launch runs the whole suite. It is skipped if ncurses is absent, in

@@ -1088,6 +1088,107 @@ static void test_ext_summary(void)
            "ext summary: an uncorrectable frame is marked, not parsed");
 }
 
+// ------------------------------------------------------------------
+// GNSS ring-blob samples (type 0x30) and cts1_classify, which files
+// every packet the decoder stores and every row packet_refile re-files.
+// ------------------------------------------------------------------
+
+// A ring sample as received on 2026-10-13 (also in bestxyz_selftest):
+// sequence 0x1502, ring position 9, the fix taken at 21:03:08 UTC.
+static const char RING_HEX[] =
+    "3002150900AA44121CF10000207000000097B48809306DD10E00000002CF44FA"
+    "430000000010000000D997697AC2644BC1C0DAEC89545A42C1697CE5EABB6854"
+    "C1C623833F97588A3F02A7F53F00000000080000005DC71782DFDAB6C0BB3B6F"
+    "DF8C0D9AC0141EF516DE4CB24025D7123D7C01033DAC536E3D00000000000000"
+    "000000000000000000271F1F1E00063533FD56DDC6";
+
+static void test_gnss_ring_is(void)
+{
+    uint8_t buf[256];
+    size_t n = unhex(RING_HEX, buf, sizeof buf);
+    tap_okf(n == COMMS_GNSS_RING_PACKET_LEN, "ring fixture: %zu bytes", n);
+    tap_ok(gnss_ring_is(buf, n), "ring: real sample recognized");
+    memset(buf + n, 0xEE, COMMS_CSP_CRC32_TRAILER_BYTES);
+    tap_ok(gnss_ring_is(buf, n + COMMS_CSP_CRC32_TRAILER_BYTES),
+           "ring: recognized with the CSP CRC32 trailer left on");
+    tap_ok(!gnss_ring_is(buf, n + 1), "ring: any other length rejected");
+
+    // One anchor is enough: break the sync, keep header length + ID.
+    buf[5] ^= 0xFF;
+    tap_ok(gnss_ring_is(buf, n), "ring: sync broken, message ID intact -> recognized");
+    // Neither anchor: what a bit-flipped bulk-file chunk looks like.
+    buf[9] ^= 0xFF;
+    tap_ok(!gnss_ring_is(buf, n), "ring: both anchors broken -> rejected");
+    buf[5] ^= 0xFF;
+    buf[9] ^= 0xFF;
+
+    // The same bytes with the bulk-file type byte are a bulk-file chunk.
+    buf[0] = COMMS_PACKET_TYPE_BULK_FILE_DOWNLINK;
+    tap_ok(!gnss_ring_is(buf, n), "ring: type byte 0x10 rejected");
+    const char *name = NULL;
+    tap_ok(cts1_classify(buf, n, &name, NULL) == COMMS_PACKET_TYPE_BULK_FILE_DOWNLINK
+           && strcmp(name, "bulk_file") == 0, "classify: 0x10 at ring length -> bulk_file");
+}
+
+static void test_cts1_classify(void)
+{
+    uint8_t buf[256];
+    const char *name = NULL, *sat = NULL;
+
+    size_t n = unhex(RING_HEX, buf, sizeof buf);
+    tap_ok(cts1_classify(buf, n, &name, &sat) == COMMS_PACKET_TYPE_GNSS_BESTXYZB_SAMPLE
+           && name && strcmp(name, "gnss_ring") == 0 && sat == NULL,
+           "classify: ring sample -> 0x30 gnss_ring, no satellite");
+
+    n = ext_fixture(buf, sizeof buf);
+    tap_ok(cts1_classify(buf, n, &name, &sat) == COMMS_PACKET_TYPE_BEACON_EXTENDED
+           && name && strcmp(name, "beacon_ext") == 0 && sat && strcmp(sat, "CTS1") == 0,
+           "classify: extended beacon -> 0x20 beacon_ext, CTS1");
+
+    make_beacon_fixture(buf);
+    tap_ok(cts1_classify(buf, 130, &name, &sat) == COMMS_PACKET_TYPE_BEACON_BASIC
+           && name && strcmp(name, "beacon") == 0 && sat && strcmp(sat, "CTS1") == 0,
+           "classify: basic beacon -> 0x01 beacon, CTS1");
+
+    // Our own uplink as the receiver hears it: "CTS1+..." text.
+    memset(buf, 0, sizeof buf);
+    memcpy(buf, "CTS1+mpi_disable_active_mode()", 30);
+    tap_ok(cts1_classify(buf, 77, &name, &sat) == 0 && name == NULL && sat == NULL,
+           "classify: uplink echo -> unknown");
+    char out[64];
+    tap_ok(cts1_packet_summary(out, sizeof out, buf, 77) == 0 && out[0] == '\0',
+           "summary: empty for an unknown packet");
+}
+
+static void test_gnss_ring_summary(void)
+{
+    uint8_t buf[256];
+    size_t n = unhex(RING_HEX, buf, sizeof buf);
+    char out[1024];
+    size_t len = cts1_packet_summary(out, sizeof out, buf, n);
+    tap_ok(len > 0 && len == strlen(out), "ring summary: written, length returned");
+    tap_okf(strstr(out, "gnss_ring: seq=5378 ring=9 fix=2026-10-13T21:03:08.000Z "
+                        "FINESTEERING SOL_COMPUTED/SINGLE sv=31/39 crc=ok\n") == out,
+            "ring summary: first line '%.90s'", out);
+    tap_ok(strstr(out, "ecef=-3590532.956 -2405545.078 -5350127.670 m") != NULL,
+           "ring summary: Earth-fixed position");
+    tap_ok(strstr(out, "vel=-5850.8731 -1667.3876 4684.8675 m/s") != NULL,
+           "ring summary: velocity");
+
+    // A body byte hit after the anchors: still filed, flagged.
+    buf[60] ^= 0x01;
+    cts1_packet_summary(out, sizeof out, buf, n);
+    tap_ok(strstr(out, "crc=BAD") != NULL, "ring summary: damaged body -> crc=BAD");
+    buf[60] ^= 0x01;
+
+    // Sync broken but the ID intact: filed as a ring sample, though the
+    // log itself can't be read.
+    buf[5] ^= 0xFF;
+    cts1_packet_summary(out, sizeof out, buf, n);
+    tap_ok(strstr(out, "gnss_ring: seq=5378 ring=9 BESTXYZB unreadable") == out,
+           "ring summary: unreadable log says so");
+}
+
 int main(void)
 {
     test_beacon_is_basic_length_gates();
@@ -1110,5 +1211,8 @@ int main(void)
     test_ext_print_fields();
     test_ext_print_faults_and_sentinels();
     test_ext_summary();
+    test_gnss_ring_is();
+    test_cts1_classify();
+    test_gnss_ring_summary();
     return tap_done();
 }

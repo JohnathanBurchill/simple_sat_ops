@@ -310,11 +310,187 @@ static void map_sample(const globe_t *g, int lv, double u, double v, double out[
     }
 }
 
+// ---- the detail tiles ------------------------------------------------------
+//
+// The zoomed-in map (see GLOBE_TILE_DIR in sat_globe.h): one process has one
+// set of tiles, so like the TLE table they are kept here rather than in each
+// globe_t. A tile is read the first time a render needs one of its texels,
+// into whichever slot was read longest ago.
+
+typedef struct {
+    int            level, index;   // the tile it holds; level -1 when empty
+    unsigned char *rgb;            // GLOBE_TILE_PX square, RGB
+    unsigned       used;           // the render that last read it
+} tileslot_t;
+
+static char       g_tile_dir[1024];
+static int        g_tile_have[GLOBE_TILE_LEVELS];
+// Per level, per tile: the slot holding it, -1 when it is not in memory, -2
+// when it would not load (so a missing file is tried once, not once a pixel).
+static short     *g_tile_slot[GLOBE_TILE_LEVELS];
+static tileslot_t g_slots[GLOBE_TILE_SLOTS];
+static unsigned   g_render_id;
+
+// Width of tiled level k; level 0 is the coarsest.
+static int tile_level_w(int k)
+{
+    return GLOBE_TILE_TOP_W >> (GLOBE_TILE_LEVELS - 1 - k);
+}
+
+static void tiles_free(void)
+{
+    for (int k = 0; k < GLOBE_TILE_LEVELS; k++) {
+        free(g_tile_slot[k]);
+        g_tile_slot[k] = NULL;
+        g_tile_have[k] = 0;
+    }
+    for (int s = 0; s < GLOBE_TILE_SLOTS; s++) {
+        free(g_slots[s].rgb);
+        g_slots[s].rgb = NULL;
+        g_slots[s].level = -1;
+    }
+}
+
+// Find the tiles: the first data directory with any level in it, a level
+// counting when its first and last tiles are both there. Returns how many
+// levels were found.
+static int tiles_find(const char *tool)
+{
+    tiles_free();
+    const char *home = getenv("HOME");
+    const char *xdg = getenv("XDG_DATA_HOME");
+    char xdg_dir[1024] = "", home_dir[1024] = "";
+    if (xdg != NULL && xdg[0] != '\0')
+        snprintf(xdg_dir, sizeof xdg_dir, "%s/simple_sat_ops/%s", xdg, GLOBE_TILE_DIR);
+    if (home != NULL && home[0] != '\0')
+        snprintf(home_dir, sizeof home_dir, "%s/.local/share/simple_sat_ops/%s", home, GLOBE_TILE_DIR);
+    const char *cands[2] = { xdg_dir, home_dir };
+
+    for (int i = 0; i < 2; i++) {
+        if (cands[i][0] == '\0') continue;
+        int found = 0;
+        for (int k = 0; k < GLOBE_TILE_LEVELS; k++) {
+            const int cols = tile_level_w(k) / GLOBE_TILE_PX;
+            const int ntiles = cols * (cols / 2);
+            char first[1100], last[1100];
+            snprintf(first, sizeof first, "%s/%d/0.jpg", cands[i], tile_level_w(k));
+            snprintf(last, sizeof last, "%s/%d/%d.jpg", cands[i], tile_level_w(k), ntiles - 1);
+            if (!FileExists(first) || !FileExists(last)) continue;
+            g_tile_slot[k] = malloc((size_t) ntiles * sizeof *g_tile_slot[k]);
+            if (g_tile_slot[k] == NULL) continue;
+            for (int t = 0; t < ntiles; t++) g_tile_slot[k][t] = -1;
+            g_tile_have[k] = 1;
+            found++;
+        }
+        if (found > 0) {
+            snprintf(g_tile_dir, sizeof g_tile_dir, "%s", cands[i]);
+            return found;
+        }
+    }
+    fprintf(stderr, "%s: no globe detail tiles; zoomed in, the globe stays at "
+                    "the %s map (scripts/fetch_globe_tiles.sh fetches them)\n",
+            tool, GLOBE_MAP_FILE);
+    return 0;
+}
+
+// The tiled level to draw from when 360 degrees of longitude spans need
+// pixels: the coarsest with a texel to the pixel, else the finest there is.
+// -1 when there are no tiles.
+static int tiles_level_for(double need)
+{
+    int best = -1;
+    for (int k = 0; k < GLOBE_TILE_LEVELS; k++) {
+        if (!g_tile_have[k]) continue;
+        best = k;
+        if ((double) tile_level_w(k) >= need) break;
+    }
+    return best;
+}
+
+// Read tile idx of level k into a slot. Returns the slot, or -1 when it
+// cannot: the file would not load, or every slot holds a tile this same
+// render has already read -- evicting one of those would have the render
+// reload tiles in a circle, so the pixel falls back to the whole-Earth map.
+static int tile_load(int k, int idx)
+{
+    int s = -1;
+    for (int i = 0; i < GLOBE_TILE_SLOTS; i++) {
+        if (g_slots[i].level < 0) { s = i; break; }
+        if (g_slots[i].used == g_render_id) continue;
+        if (s < 0 || g_slots[i].used < g_slots[s].used) s = i;
+    }
+    if (s < 0) return -1;
+
+    char path[1100];
+    snprintf(path, sizeof path, "%s/%d/%d.jpg", g_tile_dir, tile_level_w(k), idx);
+    Image im = LoadImage(path);
+    if (im.data == NULL || im.width != GLOBE_TILE_PX || im.height != GLOBE_TILE_PX) {
+        UnloadImage(im);
+        g_tile_slot[k][idx] = -2;
+        return -1;
+    }
+    ImageFormat(&im, PIXELFORMAT_UNCOMPRESSED_R8G8B8);
+    const size_t bytes = (size_t) GLOBE_TILE_PX * GLOBE_TILE_PX * 3;
+    if (g_slots[s].rgb == NULL) g_slots[s].rgb = malloc(bytes);
+    if (g_slots[s].rgb == NULL) { UnloadImage(im); return -1; }
+    memcpy(g_slots[s].rgb, im.data, bytes);
+    UnloadImage(im);
+
+    if (g_slots[s].level >= 0) g_tile_slot[g_slots[s].level][g_slots[s].index] = -1;
+    g_slots[s].level = k;
+    g_slots[s].index = idx;
+    g_tile_slot[k][idx] = (short) s;
+    return s;
+}
+
+// One texel of tiled level k, its tile read in if need be. NULL when the tile
+// cannot be had.
+static const unsigned char *tile_texel(int k, int x, int y)
+{
+    const int T = GLOBE_TILE_PX;
+    const int idx = (y / T) * (tile_level_w(k) / T) + x / T;
+    int s = g_tile_slot[k][idx];
+    if (s == -2) return NULL;
+    if (s < 0 && (s = tile_load(k, idx)) < 0) return NULL;
+    g_slots[s].used = g_render_id;
+    return g_slots[s].rgb + ((size_t) (y % T) * T + (size_t) (x % T)) * 3;
+}
+
+// map_sample's bilinear lookup on tiled level k, the four texels fetched one
+// at a time since they can straddle a tile edge. Returns 0 when one of them
+// cannot be had, for the caller to fall back on the whole-Earth map.
+static int tile_sample(int k, double u, double v, double out[3])
+{
+    const int W = tile_level_w(k), H = W / 2;
+    double fx = u * W - 0.5, fy = v * H - 0.5;
+    int x0 = (int) floor(fx), y0 = (int) floor(fy);
+    double tx = fx - x0, ty = fy - y0;
+    int x1 = ((x0 + 1) % W + W) % W;
+    x0 = (x0 % W + W) % W;
+    int y1 = y0 + 1;
+    if (y0 < 0) y0 = 0; else if (y0 > H - 1) y0 = H - 1;
+    if (y1 < 0) y1 = 0; else if (y1 > H - 1) y1 = H - 1;
+    const unsigned char *p00 = tile_texel(k, x0, y0);
+    const unsigned char *p10 = tile_texel(k, x1, y0);
+    const unsigned char *p01 = tile_texel(k, x0, y1);
+    const unsigned char *p11 = tile_texel(k, x1, y1);
+    if (p00 == NULL || p10 == NULL || p01 == NULL || p11 == NULL) return 0;
+    for (int c = 0; c < 3; c++) {
+        double top = p00[c] + (p10[c] - p00[c]) * tx;
+        double bot = p01[c] + (p11[c] - p01[c]) * tx;
+        out[c] = top + (bot - top) * ty;
+    }
+    return 1;
+}
+
 // Load the equirectangular world map and halve it a few times over. Looked for
 // the same places as the bundled font. Returns 0 if none of them had it, which
 // leaves the globe drawn as a plain sphere rather than not drawn at all.
+// The detail tiles for zooming in are looked for here too.
 int globe_load_map(globe_t *g, const char *tool)
 {
+    tiles_find(tool);
+
     const char *home = getenv("HOME");
     const char *xdg = getenv("XDG_DATA_HOME");
     char cands[5][1024];
@@ -550,16 +726,16 @@ static double model_strength(double zoom)
 
 // The satellite itself, over the track: the model of it turned the way
 // it was turned, once the view is close enough in to make room, and --
-// when a beacon says which way it was facing -- the ray from it down to
-// the point on the ground its nadir face was aimed at. Writes the
-// caption the panel prints under the disc into note.
+// when a beacon or log record says which way it was facing -- the ray
+// from it down to the point on the ground its nadir face was aimed at.
+// Writes the caption the panel prints under the disc into note.
 //
 // The ray is a straight line through space, so it is sampled and drawn
 // piecewise -- a single line between the two end points would cut
 // through the Earth on a zoomed-in view instead of lying on it.
 //
 // Two ways the body frame can be arrived at, and they are never drawn
-// alike. With an attitude from a beacon, the model is solid and the ray
+// alike. With an attitude on record, the model is solid and the ray
 // is drawn. Without one, the satellite's own orbit still says where it
 // is and which way it is going, so the model is drawn in the orbit frame
 // -- nadir down, ram forward -- as an outline, and the caption says the
@@ -691,17 +867,73 @@ static void draw_satellite(const globe_t *g, const globe_proj_t *pr,
         DrawCircleLines((int) pt.x, (int) pt.y, 9.0f,
                         (Color){ 150, 240, 170, 140 });
     }
+
+    // What the picture covered, when the caller asks: the edge of the
+    // camera's field of view traced out to where it meets the Earth.
+    // Each point of the edge is one ray through a pinhole camera looking
+    // along body +Z, so an off-nadir look comes out as the stretched,
+    // keystoned shape the picture really covered. Where a ray passes the
+    // limb that piece of the edge is sky, and is left out.
+    //
+    // The camera frame lies on the body frame: picture right along body
+    // +X, picture down along body +Y, out through the lens along +Z --
+    // the usual right-handed camera frame, so the picture is not
+    // mirrored. Checked against the pictures in October 2026: an antenna
+    // on the -X face shows at the lower left of every one, and the ground
+    // in them matches the map turned, not flipped. That rules out a half
+    // turn or a mirror image, though not an error of a few degrees. The
+    // top edge is drawn heavier and a dot marks the top left corner,
+    // which together say how the picture is turned.
+    const int footprint = g->show_fov && g->fov_across_deg > 0.0
+                          && g->fov_down_deg > 0.0;
+    if (footprint) {
+        const double tu = tan(0.5 * g->fov_across_deg * (M_PI / 180.0));
+        const double tv = tan(0.5 * g->fov_down_deg   * (M_PI / 180.0));
+        // The corners in picture coordinates, right and down, going round
+        // from the top left; edge 0 is the top.
+        static const double cu[5] = { -1.0,  1.0, 1.0, -1.0, -1.0 };
+        static const double cv[5] = { -1.0, -1.0, 1.0,  1.0, -1.0 };
+        for (int e = 0; e < 4; e++) {
+            Vector2 last = {0};
+            int last_ok = 0;
+            for (int i = 0; i <= GLOBE_FOV_SAMPLES; i++) {
+                const double s = (double) i / (double) GLOBE_FOV_SAMPLES;
+                const double right = (cu[e] + s * (cu[e + 1] - cu[e])) * tu;
+                const double down  = (cv[e] + s * (cv[e + 1] - cv[e])) * tv;
+                double d[3];
+                for (int k = 0; k < 3; k++)
+                    d[k] = f.bz[k] + right * f.bx[k] + down * f.by[k];
+                const double dn = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                for (int k = 0; k < 3; k++) d[k] /= dn;
+                double t = 0.0;
+                const int ok = attitude_ray_sphere(r, d, ATTITUDE_EARTH_MEAN_KM, &t);
+                if (ok) {
+                    double p[3];
+                    for (int k = 0; k < 3; k++) p[k] = r[k] + t * d[k];
+                    PROJECT(p);
+                    if (last_ok)
+                        DrawLineEx(last, pt, e == 0 ? 3.0f : 1.5f,
+                                   hidden ? (Color){ 150, 240, 170, 70 } : GLOBE_POINT_C);
+                    if (e == 0 && i == 0 && !hidden)
+                        DrawCircleV(pt, 3.5f, GLOBE_POINT_C);
+                    last = pt;
+                }
+                last_ok = ok;
+            }
+        }
+    }
     #undef PROJECT
 
-    // The caption, as two lines: the panel is only as wide as the column
-    // it sits in (270 px in both viewers), and one line of this runs
-    // half as wide again as that. Off-nadir leads, since it is the
-    // number that says whether the picture is of the ground below or of
-    // the horizon, then which side of the track it was looking, then
-    // where that landed.
+    // The caption, as two lines (three with the footprint): the panel
+    // is only as wide as the column it sits in (270 px in both viewers),
+    // and one line of this runs half as wide again as that. Off-nadir
+    // leads, since it is the number that says whether the picture is of
+    // the ground below or of the horizon, then which side of the track it
+    // was looking, then where that landed.
     //
-    // The age is worth a word only when the beacon was not close to the
-    // moment; inside half a minute the satellite has barely turned.
+    // The age is worth a word only when the beacon or log record was not
+    // close to the moment; inside half a minute the satellite has barely
+    // turned. Which of the two it was always is, on the second line.
     char age[24] = "";
     if (fabs(g->att.age_s) >= 30.0) {
         snprintf(age, sizeof age, "  %+.0fs", g->att.age_s);
@@ -716,10 +948,12 @@ static void draw_satellite(const globe_t *g, const globe_proj_t *pr,
     } else {
         snprintf(where, sizeof where, "looking past the limb");
     }
-    snprintf(note, note_n, "%.0f deg off nadir, %.0f %s%s\n%s",
+    // With the footprint up, a third line says how to read it.
+    snprintf(note, note_n, "%.0f deg off nadir, %.0f %s%s\n%s  (%s)%s",
              f.off_nadir_deg, fabs(f.cross_track_deg),
              f.cross_track_deg >= 0.0 ? "left" : "right",
-             age, where);
+             age, where, g->att.from_log ? "ADCS log" : "beacon",
+             footprint ? "\nheavy edge: picture top" : "");
 }
 
 // Ray-cast the lit sphere into g->pix and hand it to the texture. One ray per
@@ -755,6 +989,13 @@ static void globe_render(globe_t *g, int w, int h, int ss)
     int lv = 0;
     while (lv + 1 < g->nlv && (double) g->lv[lv + 1].w >= 2.0 * M_PI * R) lv++;
 
+    // Closer in than that map has texels for, the detail tiles take over.
+    // Any pixel whose tile cannot be had still gets the map.
+    int tk = -1;
+    if (2.0 * M_PI * R > (g->nlv > 0 ? (double) g->lv[0].w : 0.0))
+        tk = tiles_level_for(2.0 * M_PI * R);
+    g_render_id++;
+
     double e[3], n[3], o[3], sun[3];
     globe_basis(g->lat0, g->lon0, e, n, o);
     ll_vec(g->sun_lat, g->sun_lon, sun);
@@ -777,7 +1018,8 @@ static void globe_render(globe_t *g, int w, int h, int ss)
             double vv = 0.5 - asin(pz) / M_PI;
 
             double rgb[3];
-            map_sample(g, lv, u, vv, rgb);
+            if (tk < 0 || !tile_sample(tk, u, vv, rgb))
+                map_sample(g, lv, u, vv, rgb);
 
             // Lambert, but with the terminator softened over a few degrees so
             // it does not come out as a hard line the way a bare dot product
@@ -892,10 +1134,10 @@ void globe_draw(globe_t *g, int x, int y, int w, int h, double now_ms,
         }
     }
     // The satellite itself: the model of it when the view is close
-    // enough in, and the ray to what it was looking at when a beacon
-    // says which way it was facing. Inside the scissor with the track,
-    // since the ray can run well off the disc.
-    char att_note[130] = "";
+    // enough in, and the ray to what it was looking at when a beacon or
+    // log record says which way it was facing. Inside the scissor with
+    // the track, since the ray can run well off the disc.
+    char att_note[176] = "";
     if (have_now) {
         globe_proj_t pr = { .R = R, .ox = g->ox, .oy = g->oy,
                             .x = x, .y = dy, .w = w, .h = dh };
@@ -919,10 +1161,13 @@ void globe_draw(globe_t *g, int x, int y, int w, int h, double now_ms,
     // The attitude caption, its lines stacked upward from just above the
     // sub-satellite point so they read down the panel in order.
     if (att_note[0] != '\0') {
-        const char *line[2] = { att_note, NULL };
-        char *nl = strchr(att_note, '\n');
-        if (nl != NULL) { *nl = '\0'; line[1] = nl + 1; }
-        const int nlines = (line[1] != NULL) ? 2 : 1;
+        const char *line[3] = { att_note, NULL, NULL };
+        int nlines = 1;
+        for (char *nl = strchr(att_note, '\n'); nl != NULL && nlines < 3;
+             nl = strchr(nl + 1, '\n')) {
+            *nl = '\0';
+            line[nlines++] = nl + 1;
+        }
         for (int i = 0; i < nlines; i++) {
             const int ly = y + h - 24 - (nlines - i) * 21;
             const int tw = text_width(line[i], 12);
@@ -1026,5 +1271,6 @@ void globe_free(globe_t *g)
     g->pix = NULL;
     if (g->tex.id != 0) UnloadTexture(g->tex);
     free_tle_rows();
+    tiles_free();
 }
 

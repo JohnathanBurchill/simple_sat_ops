@@ -24,7 +24,10 @@
     "START_CAM:" header survived but whose body is mush.
 
     Grouping (captures, not downloads): the camera packets are first split into
-    download sessions by reception time, then sessions of the SAME picture are
+    download sessions by reception time, and again wherever the sentence count
+    the packets declare changes -- one picture's download straight after
+    another's, as on 2026-10-22 at 23:22, when the 15:07 picture's packets were
+    filed under the 15:44 picture's. Then sessions of the SAME picture are
     merged. Two sessions are the same picture when the bytes they both carry
     agree -- different pictures disagree on about four bytes in five, the same
     picture on at most one in five (its only disagreements come from packets
@@ -36,15 +39,33 @@
     Merging matters: on the current store it takes seven of the nine pictures
     to every byte recovered, where the best single pass had left holes.
 
+    A picture whose first sentences never arrived has no JPEG header, but
+    every picture so far has had the same one, so the decoder (cam_jpeg.c)
+    puts that standard header in and the picture still shows. The info line
+    under the picture then reads "standard header". The 2026-10-22 15:44
+    picture was the first that needed it.
+
     The command log (the sent_tcmd table) also names the file on the satellite
     and, through the camera_capture command that made it, when the picture was
     taken -- which the file itself does not record. Both are best-effort: a
     download commanded from another ground station leaves the row unlabelled.
+    The times are when each command was set to run on board (its @tsexec), not
+    when it went up: from 2026-10-29 the agendas went up hours ahead, and
+    dating pictures by the upload put the globe on the wrong side of the
+    Earth, lit for the wrong hour.
 
     Looking at the picture: scroll or pinch over it to zoom, and drag it to
     move it around. Zoom starts at -- and never goes below -- the whole picture
     fitted to the pane, so scrolling back out always lands on the whole picture
     again, and a picture bigger than the pane cannot be dragged off the edge.
+
+    Brightness: a cycles the range of levels the picture is drawn over --
+    the full 0 to 255 as received, autoscaled to the picture's own 1st to
+    99th brightness percentiles, or set by hand. z and x lower and raise the
+    darkest level shown, c and v the brightest (shift for eight levels at a
+    time); they switch to the range set by hand, starting from the one on
+    show. Each picture keeps its own hand-set range, in the state file below.
+    A GPU shader does the mapping, so a change shows at once.
 
     Where it was taken: under the capture list is the Earth (utils/sat_globe.c,
     the same panel mpi_viewer carries), NASA's Blue Marble wrapped on a sphere
@@ -56,11 +77,16 @@
     no camera_capture command is on record the capture time is not known, and
     the globe falls back to where the satellite was when the picture was first
     downloaded -- a different place entirely, which the panel's heading says.
+    When an extended beacon or ADCS log record near the moment carries an
+    attitude, p outlines on the globe the patch of ground the picture
+    covered: the camera's field of view projected from the satellite along
+    the way it was facing.
 
     The list runs newest picture first. f tags the picture on show as a
-    favourite (a gold star in the list and after the title), and v switches the
-    list between every picture and the favourites alone. The favourites, that
-    switch, and the picture last looked at are kept in
+    favourite (a gold star in the list and after the title), and shift-F
+    switches the list between every picture and the favourites alone. The
+    favourites, that switch, the hand-set brightness ranges, and the picture
+    last looked at are kept in
     ~/.local/state/simple_sat_ops/frontiersat_camera_viewer.state, so the next
     run opens where this one left off. Pictures are remembered by the moment
     they belong to (the stamp their exported JPEG is named with), not by their
@@ -68,8 +94,21 @@
 
     Read-only on the DB. Press F5 to re-read it and rebuild the capture list.
 
+    The cache: a picture taken (or, with no capture command on record, first
+    downloaded) more than a week ago is not put together again at every
+    start. It is kept, as built, in
+    ~/.cache/simple_sat_ops/frontiersat_camera_viewer.cache
+    (utils/viewer_cache.h has the rules), and only the rest is rebuilt, from
+    the last week or so of packets and whatever the DB has gained since the
+    cache was written. A download of an old picture that comes in later is
+    not folded in by itself: the info panel says how many such downloads it
+    has left out, and shift-F5 (or --rebuild-cache) rebuilds every picture
+    from the whole DB and writes the cache afresh. The attitudes keep a cache
+    of their own beside it, by the same rules. A new build of the viewer
+    starts with a full rebuild, and deleting the cache files is always safe.
+
     Usage:
-      frontiersat_camera_viewer [--db=<packet_db.sqlite>]
+      frontiersat_camera_viewer [--db=<packet_db.sqlite>] [--rebuild-cache]
 
     With no --db the default store is used ($SSO_PACKET_DB, else the
     FrontierSat root's packet_db.sqlite).
@@ -92,6 +131,7 @@
 */
 
 #include <raylib.h>
+#include <rlgl.h>
 
 #include "beacon_attitude.h"
 #include "cam_jpeg.h"
@@ -99,6 +139,7 @@
 #include "sat_globe.h"
 #include "sso_paths.h"
 #include "sso_version.h"
+#include "viewer_cache.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -154,7 +195,9 @@ extern void  sso_install_pinch_monitor(void);
 // The firmware paces a download at about four packets a second, so a five
 // minute hole means the download stopped and (usually) a later pass restarted
 // it; sessions are merged back into pictures below anyway, so splitting too
-// eagerly here costs nothing.
+// eagerly here costs nothing. A run is also cut where the declared sentence
+// count changes (confirmed_total), since a gap alone does not separate two
+// pictures downloaded back to back.
 #define SESSION_GAP_MS  (5.0 * 60.0 * 1000.0)
 
 // Same-picture test. Two sessions are compared over the bytes they both
@@ -164,8 +207,16 @@ extern void  sso_install_pinch_monitor(void);
 #define MATCH_MIN_BYTES      256
 #define MATCH_MAX_MISMATCH   0.35
 
-// How far back of a session's start a bulk-download command may sit and still
-// be taken as the command that triggered it.
+// The test only looks at the image data, from sentence 21 on. Every picture
+// opens with the same JPEG tables -- in all 16 pictures from 2026-06-01 to
+// 2026-10-11 the image data starts at JPEG byte 589, inside sentence 21 -- so
+// two different pictures agree there. A 2026-10-16 download whose only bytes
+// in common with the 2026-07-23 one lay in the tables (95% agreement over 390
+// bytes) was merged into it before this cut-off existed.
+#define MATCH_FIRST_OFFSET   (CAM_HEADER_LEN + 21 * CAM_SENTENCE_LEN)
+
+// How far back of a session's start a bulk-download command may have run and
+// still be taken as the command that triggered it.
 #define CMD_LOOKBACK_MS (3.0 * 60.0 * 60.0 * 1000.0)
 
 // A merged capture must have at least this many camera sentences to be worth
@@ -182,16 +233,34 @@ extern void  sso_install_pinch_monitor(void);
 // it had come from without wrapping the arc round the whole Earth.
 #define CAM_TRACK_HALF_MS (5.0 * 60.0 * 1000.0)
 
+// The camera's field of view across the picture and down it, for the outline
+// of what it covered that p draws on the globe. Measured from the curve of the
+// Earth's limb in the 2026-08-06 picture: a focal length of about 705 pixels
+// over the 640 x 480 frame. No lens distortion is allowed for.
+#define CAM_FOV_ACROSS_DEG 49.0
+#define CAM_FOV_DOWN_DEG   38.0
+
 // The help line along the bottom of the window runs the full width, so the
 // left column stops above it.
 #define FOOTER_H 28
 
+// How the picture is shown: as received, histogram-equalized (e) or with its
+// colours stretched (t).
+enum { SHOW_AS_RECEIVED, SHOW_EQUALIZED, SHOW_STRETCHED, SHOW_N };
+
+// The range of levels the picture is drawn over, which a cycles: the full
+// 0..255 as received, the picture's autoscale range, or its range set by hand
+// with z x c v.
+enum { RANGE_FIXED, RANGE_AUTO, RANGE_MANUAL, RANGE_N };
+
 typedef struct {
+    long long id;               // the packet's row in the DB
     double   ts_ms;
     long     off;
     int      rs;
     long     dlen;
     uint8_t *data;
+    long     total;             // sentence count its sentences declare, -1 if unreadable
 } chunk_t;
 
 // One download session: the camera packets received in one uninterrupted run,
@@ -222,6 +291,7 @@ typedef struct {
     int      n_sessions;
     double   sess_ms[MAX_SESSIONS_SHOWN];
     int      chunks;
+    long long max_id;                  // the newest of its packets' DB rows
     uint8_t *buf;
     uint8_t *present;
     long     size;
@@ -230,6 +300,12 @@ typedef struct {
     uint8_t *jpg;
     long     jpg_len;
     Texture2D tex;
+    // The same picture histogram-equalized (e) and with its colours
+    // stretched to full scale (t).
+    Texture2D tex_eq;
+    Texture2D tex_st;
+    // The autoscale range of each of the three, indexed by SHOW_*.
+    int      auto_lo[SHOW_N], auto_hi[SHOW_N];
     int      tex_ok;
     int      img_w, img_h;
 } capture_t;
@@ -300,19 +376,65 @@ static int chunk_is_camera(long off, const uint8_t *d, long n)
            && (double) plausible / (double) n >= CAM_MIN_HEX_FRACTION;
 }
 
+// The picture's sentence count, as declared by the sentences that start in a
+// camera packet: the TTTT after each on-grid '@'. Every sentence of a picture
+// carries the same count, so it tells two pictures apart (unless they happen
+// to be the same length). A packet that failed its checksum can carry a
+// wrong count, so the packet's sentences vote; with no clear winner, or no
+// count readable at all, the result is -1.
+static long chunk_declared_total(long off, const uint8_t *d, long n)
+{
+    long vals[4];
+    int nv = 0;
+    for (long j = 0; j + 9 <= n && nv < 4; j++) {
+        if (d[j] != '@') continue;
+        long phase = ((off + j - CAM_HEADER_LEN) % CAM_SENTENCE_LEN + CAM_SENTENCE_LEN)
+                     % CAM_SENTENCE_LEN;
+        if (phase != 0) continue;
+        long v = 0;
+        int ok = 1;
+        for (int k = 5; k < 9 && ok; k++) {
+            int c = d[j + k];
+            if (!is_hex_digit(c)) ok = 0;
+            else v = v * 16 + (c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10);
+        }
+        if (ok) vals[nv++] = v;
+    }
+    long best = -1;
+    int best_n = 0, tied = 0;
+    for (int a = 0; a < nv; a++) {
+        int c = 0;
+        for (int b = 0; b < nv; b++) if (vals[b] == vals[a]) c++;
+        if (c > best_n) { best_n = c; best = vals[a]; tied = 0; }
+        else if (c == best_n && vals[a] != best) tied = 1;
+    }
+    return tied ? -1 : best;
+}
+
 // ---- DB load / reassembly --------------------------------------------------
 
 // Load every bulk_file packet that looks like camera data, oldest first.
 // Returns 0 on success; the caller frees each chunk's data and the array.
-static int load_camera_chunks(sqlite3 *db, chunk_t **out, int *out_n)
+// The camera packets among every bulk_file packet, or with `since` (an ISO
+// time as ts_received writes it) among those received from then on plus every
+// row newer than after_id -- the part a start with a cache has to rebuild.
+static int load_camera_chunks(sqlite3 *db, const char *since, long long after_id,
+                              chunk_t **out, int *out_n)
 {
-    const char *sql =
-        "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload, rs_errs "
-        "FROM packet WHERE packet_type=16 ORDER BY ts_received, id";
+    const char *sql = since == NULL
+        ? "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload, rs_errs, id "
+          "FROM packet WHERE packet_type=16 ORDER BY ts_received, id"
+        : "SELECT (julianday(ts_received) - 2440587.5) * 86400000.0, payload, rs_errs, id "
+          "FROM packet WHERE packet_type=16 AND (ts_received >= ?1 OR id > ?2) "
+          "ORDER BY ts_received, id";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
         fprintf(stderr, "frontiersat_camera_viewer: query failed: %s\n", sqlite3_errmsg(db));
         return -1;
+    }
+    if (since != NULL) {
+        sqlite3_bind_text(st, 1, since, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, after_id);
     }
 
     chunk_t *cs = NULL;
@@ -336,10 +458,12 @@ static int load_camera_chunks(sqlite3 *db, chunk_t **out, int *out_n)
         }
         chunk_t *c = &cs[n];
         memset(c, 0, sizeof *c);
+        c->id    = sqlite3_column_int64(st, 3);
         c->ts_ms = sqlite3_column_double(st, 0);
         c->off   = off;
         c->rs    = sqlite3_column_int(st, 2);
         c->dlen  = dlen;
+        c->total = chunk_declared_total(off, pl + BULK_FILE_HEADER_SIZE, dlen);
         c->data  = (uint8_t *) malloc((size_t) dlen);
         if (c->data == NULL) { fprintf(stderr, "out of memory\n"); goto fail; }
         memcpy(c->data, pl + BULK_FILE_HEADER_SIZE, (size_t) dlen);
@@ -392,19 +516,39 @@ static long reassemble(const chunk_t *cs, const int *idx, int nidx,
     return size;
 }
 
-// Compare two sessions over the bytes both recovered. Fills *n_compared and
-// *n_differ.
-static void compare_sessions(const session_t *a, const session_t *b,
-                             long *n_compared, long *n_differ)
+// Compare two downloads over the image-data bytes both recovered. Fills
+// *n_compared and *n_differ.
+static void compare_bytes(const uint8_t *abuf, const uint8_t *apresent, long asize,
+                          const uint8_t *bbuf, const uint8_t *bpresent, long bsize,
+                          long *n_compared, long *n_differ)
 {
-    long lim = a->size < b->size ? a->size : b->size;
+    long lim = asize < bsize ? asize : bsize;
     long cmp = 0, differ = 0;
-    for (long k = 0; k < lim; k++) {
-        if (!a->present[k] || !b->present[k]) continue;
+    for (long k = MATCH_FIRST_OFFSET; k < lim; k++) {
+        if (!apresent[k] || !bpresent[k]) continue;
         cmp++;
-        if (a->buf[k] != b->buf[k]) differ++;
+        if (abuf[k] != bbuf[k]) differ++;
     }
     *n_compared = cmp; *n_differ = differ;
+}
+
+// Whether two downloads are of the same picture. Content decides when the two
+// share enough bytes to judge; otherwise the satellite file path from the
+// command log does, which is the only evidence for a follow-up pass that
+// fetched exactly the ranges the first pass missed. Content also has a veto:
+// if the shared bytes disagree these are different pictures, whatever the log
+// says.
+static int same_picture(const uint8_t *abuf, const uint8_t *apresent, long asize,
+                        const char *apath,
+                        const uint8_t *bbuf, const uint8_t *bpresent, long bsize,
+                        const char *bpath)
+{
+    long cmp = 0, differ = 0;
+    compare_bytes(abuf, apresent, asize, bbuf, bpresent, bsize, &cmp, &differ);
+    int judged = cmp >= MATCH_MIN_BYTES;
+    int contradicts = judged && (double) differ / (double) cmp > MATCH_MAX_MISMATCH;
+    int same_path = apath[0] != '\0' && strcmp(apath, bpath) == 0;
+    return !contradicts && (judged || same_path);
 }
 
 // ---- the ground station's command log --------------------------------------
@@ -420,9 +564,15 @@ static void compare_sessions(const session_t *a, const session_t *b,
 // and the command is a capture rather than a download when "camera_capture("
 // appears. Everything here is best-effort: a download commanded elsewhere, or
 // a store with no sent_tcmd table at all, simply leaves the labels blank.
+//
+// Each command's time is when it ran on board: its @tsexec (tsexec_ms), or
+// the send time when it had none and so ran on arrival. Until 2026-10-26 the
+// agendas stamped @tssent with the run time too, so the send time served; from
+// 2026-10-29 @tssent is the real upload, and pictures are taken and fetched
+// one to ten hours after it.
 
 typedef struct {
-    double ts_ms;
+    double ts_ms;               // when the command ran on board (unix ms)
     char   path[MAX_PATH_LEN];
     int    is_capture;
 } camcmd_t;
@@ -442,15 +592,15 @@ static int extract_camera_path(const char *text, char *path, size_t n)
     return 1;
 }
 
-// Load every camera-related telecommand, oldest first. Returns the count (0 if
-// the table is absent, which is not an error).
+// Load every camera-related telecommand, in the order they ran. Returns the
+// count (0 if the table is absent, which is not an error).
 static int load_camera_commands(sqlite3 *db, camcmd_t **out)
 {
     *out = NULL;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
-            "SELECT ts_sent_ms, command_text FROM sent_tcmd "
-            "WHERE command_text LIKE '%camera/%' ORDER BY ts_sent_ms",
+            "SELECT COALESCE(tsexec_ms, ts_sent_ms) AS t_run, command_text FROM sent_tcmd "
+            "WHERE command_text LIKE '%camera/%' ORDER BY t_run",
             -1, &st, NULL) != SQLITE_OK)
         return 0;
 
@@ -477,7 +627,7 @@ static int load_camera_commands(sqlite3 *db, camcmd_t **out)
     return n;
 }
 
-// The file this session was downloading, from the last download command sent
+// The file this session was downloading, from the last download command run
 // before the session ended (and no longer than CMD_LOOKBACK_MS before it
 // started). Leaves sat_path empty when nothing matches.
 static void label_session(session_t *s, const camcmd_t *cmds, int ncmds)
@@ -493,8 +643,8 @@ static void label_session(session_t *s, const camcmd_t *cmds, int ncmds)
     if (best < 0) s->sat_path[0] = '\0';
 }
 
-// When the camera took `path`, from the camera_capture command that made it.
-// Returns -1 if the command log doesn't have it.
+// When the camera took `path`: when the camera_capture command that made it
+// ran. Returns -1 if the command log doesn't have it.
 static double capture_time_of(const char *path, const camcmd_t *cmds, int ncmds)
 {
     if (path == NULL || path[0] == '\0') return -1;
@@ -536,6 +686,17 @@ static int by_newest_first(const void *a, const void *b)
     return (ta < tb) - (ta > tb);
 }
 
+// Packet k's declared sentence count, when the next packet in the same run
+// that declares one agrees with it; otherwise -1. One damaged packet's wrong
+// count is never confirmed, so it cannot split a session on its own.
+static long confirmed_total(const chunk_t *cs, int n, int k)
+{
+    if (cs[k].total < 0) return -1;
+    for (int m = k + 1; m < n && cs[m].ts_ms - cs[m - 1].ts_ms <= SESSION_GAP_MS; m++)
+        if (cs[m].total >= 0) return cs[m].total == cs[k].total ? cs[k].total : -1;
+    return -1;
+}
+
 // Split the camera packets into download sessions, merge the sessions that
 // downloaded the same picture, and build one capture per picture. Returns the
 // capture count and fills *out (caller frees via free_captures).
@@ -545,12 +706,20 @@ static int build_captures(const chunk_t *cs, int n, const camcmd_t *cmds, int nc
     *out = NULL;
     if (n == 0) return 0;
 
-    // Sessions: runs of packets no more than SESSION_GAP_MS apart.
+    // Sessions: runs of packets no more than SESSION_GAP_MS apart, cut again
+    // where the picture's declared sentence count changes -- one picture's
+    // download following straight on from another's.
     session_t *ss = NULL;
     int ns = 0;
     for (int i = 0; i < n; ) {
         int j = i;
-        while (j + 1 < n && cs[j + 1].ts_ms - cs[j].ts_ms <= SESSION_GAP_MS) j++;
+        long picture = confirmed_total(cs, n, i);
+        while (j + 1 < n && cs[j + 1].ts_ms - cs[j].ts_ms <= SESSION_GAP_MS) {
+            long t = confirmed_total(cs, n, j + 1);
+            if (t >= 0 && picture >= 0 && t != picture) break;
+            if (picture < 0) picture = t;
+            j++;
+        }
         session_t *t = (session_t *) realloc(ss, (size_t) (ns + 1) * sizeof *ss);
         if (t == NULL) { free_sessions(ss, ns); return 0; }
         ss = t;
@@ -569,21 +738,12 @@ static int build_captures(const chunk_t *cs, int n, const camcmd_t *cmds, int nc
         i = j + 1;
     }
 
-    // Merge sessions of the same picture. Content decides when the two share
-    // enough bytes to judge; otherwise the satellite file path from the command
-    // log does, which is the only evidence for a follow-up pass that fetched
-    // exactly the ranges the first pass missed. Content also has a veto: if the
-    // shared bytes disagree these are different pictures, whatever the log says.
+    // Merge sessions of the same picture (same_picture says how that is told).
     for (int a = 0; a < ns; a++) {
         for (int b = a + 1; b < ns; b++) {
-            long cmp = 0, differ = 0;
-            compare_sessions(&ss[a], &ss[b], &cmp, &differ);
-            int judged = cmp >= MATCH_MIN_BYTES;
-            int contradicts = judged && (double) differ / (double) cmp > MATCH_MAX_MISMATCH;
-            int same_path = ss[a].sat_path[0] != '\0'
-                            && strcmp(ss[a].sat_path, ss[b].sat_path) == 0;
-            int same = !contradicts && (judged || same_path);
-            if (!same) continue;
+            if (!same_picture(ss[a].buf, ss[a].present, ss[a].size, ss[a].sat_path,
+                              ss[b].buf, ss[b].present, ss[b].size, ss[b].sat_path))
+                continue;
             int ga = ss[a].grp, gb = ss[b].grp;
             int lo = ga < gb ? ga : gb, hi = ga < gb ? gb : ga;
             for (int k = 0; k < ns; k++) if (ss[k].grp == hi) ss[k].grp = lo;
@@ -615,6 +775,8 @@ static int build_captures(const chunk_t *cs, int n, const camcmd_t *cmds, int nc
 
         c.n_sessions = nsess;
         c.chunks = nidx;
+        for (int q = 0; q < nidx; q++)
+            if (cs[idx[q]].id > c.max_id) c.max_id = cs[idx[q]].id;
         c.size = reassemble(cs, idx, nidx, &c.buf, &c.present);
         if (c.size <= 0) { free(c.buf); free(c.present); continue; }
         for (long b = 0; b < c.size; b++) if (c.present[b]) c.recovered++;
@@ -640,21 +802,15 @@ static int build_captures(const chunk_t *cs, int n, const camcmd_t *cmds, int nc
     return nout;
 }
 
-// Open the DB read-only, build the capture list, close. Returns the count (0 on
-// any failure). Used at startup and on manual refresh (F5).
-static int reload_captures(const char *db_path, capture_t **out)
+// Build the capture list from an open DB: every picture, or with `since` the
+// ones the packets load_camera_chunks picks out make. Returns the count.
+static int captures_from_db(sqlite3 *db, const char *since, long long after_id,
+                            capture_t **out)
 {
     *out = NULL;
-    sqlite3 *db = NULL;
-    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-        fprintf(stderr, "frontiersat_camera_viewer: cannot open %s: %s\n",
-                db_path, db ? sqlite3_errmsg(db) : "open failed");
-        if (db) sqlite3_close(db);
-        return 0;
-    }
     chunk_t *cs = NULL;
     int n = 0, ncaps = 0;
-    if (load_camera_chunks(db, &cs, &n) == 0 && n > 0) {
+    if (load_camera_chunks(db, since, after_id, &cs, &n) == 0 && n > 0) {
         camcmd_t *cmds = NULL;
         int ncmds = load_camera_commands(db, &cmds);
         ncaps = build_captures(cs, n, cmds, ncmds, out);
@@ -662,15 +818,198 @@ static int reload_captures(const char *db_path, capture_t **out)
     }
     for (int k = 0; k < n; k++) free(cs[k].data);
     free(cs);
-    sqlite3_close(db);
     return ncaps;
+}
+
+// ---- the cache -------------------------------------------------------------
+//
+// Pictures taken (or, with no capture command on record, first downloaded)
+// more than a week before the cache was written are kept in it, as built,
+// and the rest are rebuilt from the DB at every start (see viewer_cache.h for
+// the policy). A capture goes into the file as its struct followed by its
+// file bytes, which of them arrived, and its JPEG; the textures are made
+// from the JPEG once the window is up, as for a capture built from the DB.
+
+#define CAM_CACHE_NAME "frontiersat_camera_viewer"
+// The attitudes keep a cache of their own (beacon_attitude.h).
+#define CAM_ATTITUDE_CACHE_NAME "frontiersat_camera_viewer_attitude"
+
+// What a load says about where its captures came from, for the viewer to
+// pass on.
+typedef struct {
+    int    from_cache;   // captures read out of the cache
+    int    newer;        // newer downloads of cached pictures left out
+    double cutoff_ms;    // the cache holds pictures from before this
+} load_note_t;
+
+static void write_cache(const char *db_path, const capture_t *caps, int n,
+                        double cutoff_ms, long long max_id)
+{
+    viewer_cache_info_t info = { .cutoff_ms = cutoff_ms, .max_id = max_id };
+    viewer_cache_writer_t w;
+    if (viewer_cache_create(&w, CAM_CACHE_NAME, db_path, &info) != 0) {
+        fprintf(stderr, "frontiersat_camera_viewer: cannot write the cache; "
+                        "every start will rebuild\n");
+        return;
+    }
+    int nc = 0;
+    for (int k = 0; k < n; k++) if (capture_moment(&caps[k]) < cutoff_ms) nc++;
+    viewer_cache_write(&w, &nc, sizeof nc);
+    for (int k = 0; k < n; k++) {
+        const capture_t *c = &caps[k];
+        if (capture_moment(c) >= cutoff_ms) continue;
+        viewer_cache_write(&w, c, sizeof *c);
+        viewer_cache_write(&w, c->buf, (size_t) c->size);
+        viewer_cache_write(&w, c->present, (size_t) c->size);
+        viewer_cache_write(&w, c->jpg, (size_t) c->jpg_len);
+    }
+    if (viewer_cache_commit(&w) != 0)
+        fprintf(stderr, "frontiersat_camera_viewer: cannot write the cache %s\n", w.path);
+}
+
+// The captures in an open cache file. Returns the count, or -1 if the file is
+// damaged.
+static int read_cache(FILE *f, capture_t **out)
+{
+    *out = NULL;
+    int n = 0;
+    if (viewer_cache_read(f, &n, sizeof n) != 0 || n < 0 || n > 100000) return -1;
+    capture_t *caps = (capture_t *) calloc((size_t) (n > 0 ? n : 1), sizeof *caps);
+    if (caps == NULL) return -1;
+    for (int k = 0; k < n; k++) {
+        capture_t *c = &caps[k];
+        if (viewer_cache_read(f, c, sizeof *c) != 0 || c->size < 0 || c->jpg_len < 0) {
+            memset(c, 0, sizeof *c);
+            free_captures(caps, k);
+            return -1;
+        }
+        // The writer's pointers and textures mean nothing here.
+        c->tex_ok = 0;
+        c->fav = 0;
+        c->buf = viewer_cache_read_alloc(f, (size_t) c->size);
+        c->present = c->buf ? viewer_cache_read_alloc(f, (size_t) c->size) : NULL;
+        c->jpg = c->present ? viewer_cache_read_alloc(f, (size_t) c->jpg_len) : NULL;
+        if (c->jpg == NULL) {
+            free_captures(caps, k + 1);
+            return -1;
+        }
+    }
+    *out = caps;
+    return n;
+}
+
+// Load the captures to show: the cached ones and the rest rebuilt from the
+// DB, or with `rebuild` (or no usable cache) every one of them rebuilt, and
+// the cache written afresh. Returns the count (0 on any failure). Used at
+// startup and on F5 (shift-F5 rebuilds).
+static int load_captures(const char *db_path, int rebuild, capture_t **out,
+                         load_note_t *note)
+{
+    *out = NULL;
+    memset(note, 0, sizeof *note);
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        fprintf(stderr, "frontiersat_camera_viewer: cannot open %s: %s\n",
+                db_path, db ? sqlite3_errmsg(db) : "open failed");
+        if (db) sqlite3_close(db);
+        return 0;
+    }
+    // Read before the packets are, so a row that lands during the load is
+    // looked at again next time rather than never.
+    long long max_id = viewer_cache_db_max_id(db);
+    double cutoff = viewer_cache_now_ms() - VIEWER_CACHE_SETTLED_MS;
+
+    viewer_cache_info_t ci = {0};
+    capture_t *cached = NULL;
+    int nc = -1;
+    FILE *cf = (rebuild || max_id < 0) ? NULL
+             : viewer_cache_open(CAM_CACHE_NAME, db_path, max_id, &ci);
+    if (cf != NULL) {
+        nc = read_cache(cf, &cached);
+        fclose(cf);
+    }
+
+    if (nc < 0) {
+        int n = captures_from_db(db, NULL, 0, out);
+        sqlite3_close(db);
+        if (n > 0 && max_id >= 0) write_cache(db_path, *out, n, cutoff, max_id);
+        return n;
+    }
+
+    char since[32];
+    viewer_cache_iso(ci.cutoff_ms - VIEWER_CACHE_MARGIN_MS, since, sizeof since);
+    capture_t *fresh = NULL;
+    int nf = captures_from_db(db, since, ci.max_id, &fresh);
+    sqlite3_close(db);
+
+    // A fresh capture from before the cutoff, or that is one of the cached
+    // pictures, is part of one the cache already holds: the stretch of its
+    // download that falls inside the window. Only packets the cache has not
+    // seen make it worth telling the operator about.
+    capture_t *all = (capture_t *) malloc((size_t) (nc + nf > 0 ? nc + nf : 1) * sizeof *all);
+    if (all == NULL) {
+        free_captures(cached, nc);
+        free_captures(fresh, nf);
+        return 0;
+    }
+    int n = 0;
+    for (int k = 0; k < nc; k++) all[n++] = cached[k];
+    for (int k = 0; k < nf; k++) {
+        capture_t *c = &fresh[k];
+        int known = 0;
+        for (int j = 0; j < nc && !known; j++)
+            known = same_picture(c->buf, c->present, c->size, c->sat_path,
+                                 cached[j].buf, cached[j].present, cached[j].size,
+                                 cached[j].sat_path);
+        if (!known && capture_moment(c) >= ci.cutoff_ms) {
+            all[n++] = *c;
+            continue;
+        }
+        if (c->max_id > ci.max_id) note->newer++;
+        free(c->buf); free(c->present); free(c->jpg);
+    }
+    free(cached);
+    free(fresh);
+    qsort(all, (size_t) n, sizeof *all, by_newest_first);
+    note->from_cache = nc;
+    note->cutoff_ms = ci.cutoff_ms;
+
+    // Move the cutoff up to a week ago once it has fallen a day behind. The
+    // pictures that cross it were rebuilt whole just now, every packet of
+    // theirs having come down after the picture was taken. Held back while
+    // there are newer downloads the cache has not taken in, which moving the
+    // cutoff past them would forget.
+    if (note->newer == 0 && cutoff - ci.cutoff_ms >= VIEWER_CACHE_ROLL_MS) {
+        write_cache(db_path, all, n, cutoff, max_id);
+        note->from_cache = 0;
+        for (int k = 0; k < n; k++) if (capture_moment(&all[k]) < cutoff) note->from_cache++;
+        note->cutoff_ms = cutoff;
+    }
+    *out = all;
+    return n;
+}
+
+// The line that says the DB has downloads of cached pictures the cache has not
+// taken in; "" when it has none.
+static void newer_note(const load_note_t *note, char *out, size_t n)
+{
+    out[0] = '\0';
+    if (note->newer == 0) return;
+    char day[24];
+    fmt_utc_s(note->cutoff_ms, day, sizeof day);
+    day[10] = '\0';
+    snprintf(out, n, "%d newer download%s of pictures from before %s not shown: "
+             "shift-F5 rebuilds them", note->newer, note->newer == 1 ? "" : "s", day);
 }
 
 // ---- textures --------------------------------------------------------------
 
-// Decode each capture's JPEG into a texture. A picture with too many missing
-// bytes can fail to decode; that capture keeps tex_ok = 0 and the viewer says
-// so instead of drawing it. Must run after InitWindow.
+// Decode each capture's JPEG into a texture, with a histogram-equalized and a
+// colour-stretched copy beside it, so that e and t switch between them at no
+// cost, and the autoscale range of each. A picture with too many missing
+// bytes can fail to decode; that capture
+// keeps tex_ok = 0 and the viewer says so instead of drawing it. Must run
+// after InitWindow.
 static void build_textures(capture_t *caps, int n)
 {
     for (int k = 0; k < n; k++) {
@@ -681,6 +1020,22 @@ static void build_textures(capture_t *caps, int n)
         if (im.width > 0 && im.height > 0) {
             c->tex = LoadTextureFromImage(im);
             SetTextureFilter(c->tex, TEXTURE_FILTER_BILINEAR);
+            ImageFormat(&im, PIXELFORMAT_UNCOMPRESSED_R8G8B8);
+            long npix = (long) im.width * im.height;
+            cam_jpeg_luma_window((const uint8_t *) im.data, npix,
+                                 &c->auto_lo[SHOW_AS_RECEIVED], &c->auto_hi[SHOW_AS_RECEIVED]);
+            Image st = ImageCopy(im);
+            cam_jpeg_stretch_rgb8((uint8_t *) st.data, npix);
+            cam_jpeg_luma_window((const uint8_t *) st.data, npix,
+                                 &c->auto_lo[SHOW_STRETCHED], &c->auto_hi[SHOW_STRETCHED]);
+            c->tex_st = LoadTextureFromImage(st);
+            SetTextureFilter(c->tex_st, TEXTURE_FILTER_BILINEAR);
+            UnloadImage(st);
+            cam_jpeg_equalize_rgb8((uint8_t *) im.data, npix);
+            cam_jpeg_luma_window((const uint8_t *) im.data, npix,
+                                 &c->auto_lo[SHOW_EQUALIZED], &c->auto_hi[SHOW_EQUALIZED]);
+            c->tex_eq = LoadTextureFromImage(im);
+            SetTextureFilter(c->tex_eq, TEXTURE_FILTER_BILINEAR);
             c->tex_ok = 1;
             c->img_w = im.width;
             c->img_h = im.height;
@@ -691,8 +1046,13 @@ static void build_textures(capture_t *caps, int n)
 
 static void unload_textures(capture_t *caps, int n)
 {
-    for (int k = 0; k < n; k++)
-        if (caps[k].tex_ok) { UnloadTexture(caps[k].tex); caps[k].tex_ok = 0; }
+    for (int k = 0; k < n; k++) {
+        if (!caps[k].tex_ok) continue;
+        UnloadTexture(caps[k].tex);
+        UnloadTexture(caps[k].tex_eq);
+        UnloadTexture(caps[k].tex_st);
+        caps[k].tex_ok = 0;
+    }
 }
 
 // ---- TTF font (pattern from mpi_viewer.c / decode_inspector.c) --------------
@@ -897,21 +1257,33 @@ static void open_in_system_viewer(const capture_t *c, char *status, size_t nstat
 //   favourites_only=1
 //   favourite=20260601_181502
 //   favourite=20260820_072204
+//   brightness=20260904_051230 12 31
+//
+// A brightness line is a picture's range set by hand with z x c v: the
+// darkest and brightest levels shown, 0 <= low < high <= 255.
 //
 // Pictures are named by their id (see capture_t), so the file means the same
 // thing whichever database is open and however the list is ordered. The
-// favourites are kept as names, not as flags on the open list, so a favourite
-// that this database does not hold is carried over untouched rather than
+// favourites and ranges are kept as names, not as flags on the open list, so
+// one that this database does not hold is carried over untouched rather than
 // forgotten the next time the file is written.
 
 #define STATE_RELPATH ".local/state/simple_sat_ops/frontiersat_camera_viewer.state"
 #define MAX_FAVOURITES 512
+#define MAX_RANGES 512
+
+typedef struct {
+    char id[24];
+    int  lo, hi;
+} pic_range_t;
 
 typedef struct {
     char selected[24];
     int  favourites_only;
     char fav[MAX_FAVOURITES][24];
     int  nfav;
+    pic_range_t range[MAX_RANGES];
+    int  nrange;
 } viewer_state_t;
 
 static int state_path(char *out, size_t n)
@@ -926,6 +1298,13 @@ static int state_find_fav(const viewer_state_t *s, const char *id)
 {
     for (int k = 0; k < s->nfav; k++)
         if (strcmp(s->fav[k], id) == 0) return k;
+    return -1;
+}
+
+static int state_find_range(const viewer_state_t *s, const char *id)
+{
+    for (int k = 0; k < s->nrange; k++)
+        if (strcmp(s->range[k].id, id) == 0) return k;
     return -1;
 }
 
@@ -951,6 +1330,13 @@ static void state_load(viewer_state_t *s)
         else if (strcmp(line, "favourite") == 0 && val[0] != '\0'
                  && s->nfav < MAX_FAVOURITES && state_find_fav(s, val) < 0)
             snprintf(s->fav[s->nfav++], sizeof s->fav[0], "%s", val);
+        else if (strcmp(line, "brightness") == 0 && s->nrange < MAX_RANGES) {
+            pic_range_t r = {0};
+            if (sscanf(val, "%23s %d %d", r.id, &r.lo, &r.hi) == 3
+                && r.lo >= 0 && r.lo < r.hi && r.hi <= 255
+                && state_find_range(s, r.id) < 0)
+                s->range[s->nrange++] = r;
+        }
     }
     fclose(f);
 }
@@ -966,10 +1352,13 @@ static int state_save(const viewer_state_t *s)
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "w");
     if (f == NULL) return -1;
-    fprintf(f, "# frontiersat_camera_viewer: the last picture looked at and the favourites\n");
+    fprintf(f, "# frontiersat_camera_viewer: the last picture looked at, the favourites\n"
+               "# and the brightness ranges set by hand\n");
     fprintf(f, "selected=%s\n", s->selected);
     fprintf(f, "favourites_only=%d\n", s->favourites_only);
     for (int k = 0; k < s->nfav; k++) fprintf(f, "favourite=%s\n", s->fav[k]);
+    for (int k = 0; k < s->nrange; k++)
+        fprintf(f, "brightness=%s %d %d\n", s->range[k].id, s->range[k].lo, s->range[k].hi);
     int bad = ferror(f);
     if (fclose(f) != 0) bad = 1;
     if (bad || rename(tmp, path) != 0) { remove(tmp); return -1; }
@@ -1004,6 +1393,54 @@ static int capture_by_id(const capture_t *caps, int n, const char *id)
     return -1;
 }
 
+// ---- brightness range ------------------------------------------------------
+
+// The range of levels picture c is drawn over, shown as `show`: 0..255 when
+// fixed, its autoscale range when auto, and its range set by hand when
+// manual -- or, until z x c v have set one, its autoscale range.
+static void shown_range(const capture_t *c, int show, int mode,
+                        const viewer_state_t *vs, int *lo, int *hi)
+{
+    *lo = 0;
+    *hi = 255;
+    if (mode == RANGE_FIXED) return;
+    int k = mode == RANGE_MANUAL ? state_find_range(vs, c->id) : -1;
+    *lo = k >= 0 ? vs->range[k].lo : c->auto_lo[show];
+    *hi = k >= 0 ? vs->range[k].hi : c->auto_hi[show];
+}
+
+// The shader that maps each colour linearly from the range's darkest level
+// (lo) to black and its brightest (hi) to white, clipping beyond. lo and hi
+// are in the texture's 0..1 units. GLSL 120 for a GL 2.1 context, 330
+// otherwise, as decode_inspector does.
+static Shader load_range_shader(void)
+{
+    static const char *FRAG_330 =
+        "#version 330\n"
+        "in vec2 fragTexCoord;\n"
+        "in vec4 fragColor;\n"
+        "uniform sampler2D texture0;\n"
+        "uniform float lo;\n"
+        "uniform float hi;\n"
+        "out vec4 finalColor;\n"
+        "void main() {\n"
+        "    vec4 t = texture(texture0, fragTexCoord);\n"
+        "    finalColor = vec4(clamp((t.rgb - lo) / (hi - lo), 0.0, 1.0), t.a) * fragColor;\n"
+        "}\n";
+    static const char *FRAG_120 =
+        "#version 120\n"
+        "varying vec2 fragTexCoord;\n"
+        "varying vec4 fragColor;\n"
+        "uniform sampler2D texture0;\n"
+        "uniform float lo;\n"
+        "uniform float hi;\n"
+        "void main() {\n"
+        "    vec4 t = texture2D(texture0, fragTexCoord);\n"
+        "    gl_FragColor = vec4(clamp((t.rgb - lo) / (hi - lo), 0.0, 1.0), t.a) * fragColor;\n"
+        "}\n";
+    return LoadShaderFromMemory(NULL, rlGetVersion() == RL_OPENGL_21 ? FRAG_120 : FRAG_330);
+}
+
 // ---- main ------------------------------------------------------------------
 
 int main(int argc, char **argv)
@@ -1011,14 +1448,26 @@ int main(int argc, char **argv)
     if (sso_version_handle(argc, argv, "frontiersat_camera_viewer")) return 0;
 
     const char *db_arg = NULL;
+    int rebuild = 0;
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--db=", 5) == 0) db_arg = argv[i] + 5;
+        else if (strcmp(argv[i], "--rebuild-cache") == 0) rebuild = 1;
         else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: frontiersat_camera_viewer [--db=<packet_db.sqlite>]\n"
+            printf("Usage: frontiersat_camera_viewer [--db=<packet_db.sqlite>] [--rebuild-cache]\n"
                    "Look at FrontierSat's boom-camera pictures rebuilt from the packet DB.\n"
                    "The left panel lists captures, newest first, one row per picture; F5 re-reads the DB.\n"
-                   "f tags a favourite, v shows the favourites only. Favourites, that choice\n"
-                   "and the last picture viewed are kept in ~/" STATE_RELPATH ".\n");
+                   "Pictures taken more than a week ago come out of a cache in\n"
+                   "~/.cache/simple_sat_ops/ and are rebuilt only by shift-F5 or\n"
+                   "--rebuild-cache; the viewer says when the DB has newer downloads\n"
+                   "of them than the cache.\n"
+                   "e shows the picture histogram-equalized, t with its colours stretched to\n"
+                   "full scale; the same key again shows it as received.\n"
+                   "a cycles the brightness range: full (as received), autoscaled, set by hand.\n"
+                   "z/x lower/raise the darkest level shown, c/v the brightest (shift: 8 levels);\n"
+                   "they set this picture's own range and switch to it.\n"
+                   "f tags a favourite, shift-F shows the favourites only. Favourites, that\n"
+                   "choice, the hand-set ranges and the last picture viewed are kept in\n"
+                   "~/" STATE_RELPATH ".\n");
             return 0;
         } else {
             fprintf(stderr, "frontiersat_camera_viewer: unknown option '%s' (try --help)\n", argv[i]);
@@ -1039,13 +1488,19 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "frontiersat_camera_viewer: rebuilding camera captures from %s ...\n", db_path);
     capture_t *caps = NULL;
-    int ncaps = reload_captures(db_path, &caps);
+    load_note_t note;
+    int ncaps = load_captures(db_path, rebuild, &caps, &note);
     if (ncaps == 0) {
         fprintf(stderr, "frontiersat_camera_viewer: no boom-camera captures found.\n");
         return 1;
     }
-    fprintf(stderr, "frontiersat_camera_viewer: %d capture%s.\n",
+    fprintf(stderr, "frontiersat_camera_viewer: %d capture%s",
             ncaps, ncaps == 1 ? "" : "s");
+    if (note.from_cache > 0) fprintf(stderr, ", %d of them from the cache", note.from_cache);
+    fprintf(stderr, ".\n");
+    char newer[160];
+    newer_note(&note, newer, sizeof newer);
+    if (newer[0]) fprintf(stderr, "frontiersat_camera_viewer: %s.\n", newer);
 
     SetTraceLogLevel(LOG_NONE);
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
@@ -1053,20 +1508,25 @@ int main(int argc, char **argv)
     SetTargetFPS(60);
     g_ui_font_loaded = load_ui_font();
     build_textures(caps, ncaps);
+    Shader range_shader = load_range_shader();
+    int loc_lo = GetShaderLocation(range_shader, "lo");
+    int loc_hi = GetShaderLocation(range_shader, "hi");
 
     // The globe under the capture list. The map and the element sets are read
     // once here; the track itself is built the first time round the loop.
     globe_t globe = {0};
     globe.zoom = GLOBE_ZOOM_MIN;
+    globe.fov_across_deg = CAM_FOV_ACROSS_DEG;
+    globe.fov_down_deg   = CAM_FOV_DOWN_DEG;
     globe_set_font(g_ui_font, g_ui_font_loaded, g_ui_font_spacing);
     globe_load_map(&globe, "frontiersat_camera_viewer");
     if (globe_load_tles(db_path) == 0)
         fprintf(stderr, "frontiersat_camera_viewer: no FrontierSat TLEs in the "
                         "DB; the globe will show no ground track\n");
-    // The attitudes the extended beacons carry, for drawing which way
-    // the camera was facing. A mission whose blob has never run has
-    // none, and the globe then shows the ground track on its own.
-    beacon_attitude_load(db_path);
+    // The attitudes the extended beacons and the ADCS's SD-card logs
+    // carry, for drawing which way the camera was facing. With neither
+    // near the moment, the globe shows the ground track on its own.
+    beacon_attitude_load(db_path, CAM_ATTITUDE_CACHE_NAME, rebuild);
 
 #ifdef __APPLE__
     sso_install_pinch_monitor();
@@ -1095,9 +1555,19 @@ int main(int argc, char **argv)
     float zoom = 1.0f;
     Vector2 pan = { 0, 0 };
     int dragging = 0;
+    // How the picture is shown: as received, histogram-equalized (e) or with
+    // its colours stretched (t), and over which brightness range (a). Both
+    // stay as set from one picture to the next, and every run opens on the
+    // pictures as received.
+    int show = SHOW_AS_RECEIVED;
+    int range_mode = RANGE_FIXED;
+    // A range set by hand is written to the state file once z x c v are
+    // let go, not at every step while one is held.
+    int range_unsaved = 0;
     char status[160] = "";
     float status_left = 0.0f;
     float rep_up = 0, rep_down = 0;
+    float rep_z = 0, rep_x = 0, rep_c = 0, rep_v = 0;
     // Where the capture list is scrolled to, in pixels. The reader's, not
     // the selection's: it is pulled back only far enough to keep the
     // selected picture in view, so scrolling away to look at the rest of
@@ -1161,7 +1631,8 @@ int main(int argc, char **argv)
         // on show, untagging one takes it off the list, so the selection
         // moves to the row that slid into its place -- and untagging the
         // last one goes back to the whole list rather than to an empty one.
-        if (IsKeyPressed(KEY_F)) {
+        int shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+        if (IsKeyPressed(KEY_F) && !shift) {
             int k = state_find_fav(&vs, caps[sel].id);
             if (k >= 0) {
                 memmove(vs.fav[k], vs.fav[k + 1], (size_t) (vs.nfav - k - 1) * sizeof vs.fav[0]);
@@ -1188,8 +1659,8 @@ int main(int argc, char **argv)
             if (state_save(&vs) != 0) snprintf(status, sizeof status, "could not write the state file");
             status_left = 6.0f;
         }
-        // v switches between every picture and only the favourites.
-        if (IsKeyPressed(KEY_V)) {
+        // shift-F switches between every picture and only the favourites.
+        if (IsKeyPressed(KEY_F) && shift) {
             int want = !vs.favourites_only;
             if (want && build_rows(caps, ncaps, 1, rows) == 0) {
                 snprintf(status, sizeof status, "no favourites yet -- f tags the picture on show");
@@ -1227,11 +1698,85 @@ int main(int argc, char **argv)
             }
         }
 
+        // e: the picture histogram-equalized; t: its colours stretched to
+        // full scale. One filter at a time, and the same key again goes back
+        // to the picture as received. Only the screen changes; s and o still
+        // hand over the JPEG as received.
+        if (IsKeyPressed(KEY_E) || IsKeyPressed(KEY_T)) {
+            int want = IsKeyPressed(KEY_E) ? SHOW_EQUALIZED : SHOW_STRETCHED;
+            show = show == want ? SHOW_AS_RECEIVED : want;
+            snprintf(status, sizeof status, "%s",
+                     show == SHOW_EQUALIZED ? "showing the picture histogram-equalized"
+                     : show == SHOW_STRETCHED ? "showing the picture with its colours stretched"
+                     : "showing the picture as received");
+            status_left = 6.0f;
+        }
+        // a: the brightness range, full -> autoscaled -> set by hand -> full.
+        if (IsKeyPressed(KEY_A)) {
+            range_mode = (range_mode + 1) % RANGE_N;
+            snprintf(status, sizeof status, "%s",
+                     range_mode == RANGE_AUTO ? "brightness autoscaled, 1st to 99th percentile"
+                     : range_mode == RANGE_MANUAL ? "brightness set by hand: z/x darkest, c/v brightest"
+                     : "brightness over the full range, as received");
+            status_left = 6.0f;
+        }
+        // z and x lower and raise the darkest level shown, c and v the
+        // brightest, one level a step or eight with shift. They work on this
+        // picture's own range, starting from whatever range is on show, and
+        // switch to it.
+        {
+            int dz = key_repeat(KEY_Z, &rep_z), dx = key_repeat(KEY_X, &rep_x);
+            int dc = key_repeat(KEY_C, &rep_c), dv = key_repeat(KEY_V, &rep_v);
+            if ((dz || dx || dc || dv) && c->tex_ok) {
+                int lo, hi;
+                shown_range(c, show, range_mode, &vs, &lo, &hi);
+                int k = state_find_range(&vs, c->id);
+                if (k < 0 && vs.nrange < MAX_RANGES) {
+                    k = vs.nrange++;
+                    snprintf(vs.range[k].id, sizeof vs.range[k].id, "%s", c->id);
+                }
+                if (k < 0) {
+                    snprintf(status, sizeof status, "brightness ranges full (%d)", MAX_RANGES);
+                    status_left = 6.0f;
+                } else {
+                    pic_range_t *r = &vs.range[k];
+                    r->lo = lo;
+                    r->hi = hi;
+                    int step = shift ? 8 : 1;
+                    if (dz) r->lo -= step;
+                    if (dx) r->lo += step;
+                    if (r->lo < 0) r->lo = 0;
+                    if (r->lo > r->hi - 1) r->lo = r->hi - 1;
+                    if (dc) r->hi -= step;
+                    if (dv) r->hi += step;
+                    if (r->hi > 255) r->hi = 255;
+                    if (r->hi < r->lo + 1) r->hi = r->lo + 1;
+                    if (range_mode != RANGE_MANUAL) {
+                        snprintf(status, sizeof status, "brightness set by hand for this picture");
+                        status_left = 6.0f;
+                    }
+                    range_mode = RANGE_MANUAL;
+                    range_unsaved = 1;
+                }
+            }
+        }
+        if (range_unsaved && !IsKeyDown(KEY_Z) && !IsKeyDown(KEY_X)
+            && !IsKeyDown(KEY_C) && !IsKeyDown(KEY_V)) {
+            if (state_save(&vs) != 0) {
+                snprintf(status, sizeof status, "could not write the state file");
+                status_left = 6.0f;
+            }
+            range_unsaved = 0;
+        }
         if (IsKeyPressed(KEY_S)) { save_jpeg(c, status, sizeof status); status_left = 6.0f; }
         if (IsKeyPressed(KEY_O)) { open_in_system_viewer(c, status, sizeof status); status_left = 6.0f; }
+        // F5 re-reads the DB; shift-F5 rebuilds the cached pictures too, and
+        // the cache with them.
         if (IsKeyPressed(KEY_F5)) {
+            int full = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
             capture_t *nc = NULL;
-            int nn = reload_captures(db_path, &nc);
+            load_note_t nnote;
+            int nn = load_captures(db_path, full, &nc, &nnote);
             int *nr = nn > 0 ? (int *) realloc(rows, (size_t) nn * sizeof(int)) : NULL;
             if (nr != NULL) {
                 // Stay on the same picture, found by name: a new picture at
@@ -1256,9 +1801,12 @@ int main(int argc, char **argv)
                 zoom = 1.0f;
                 pan = (Vector2){ 0, 0 };
                 globe_load_tles(db_path);
-                beacon_attitude_load(db_path);
+                beacon_attitude_load(db_path, CAM_ATTITUDE_CACHE_NAME, full);
                 globe.track_key[0] = 0;      // and a fresh ground track
-                snprintf(status, sizeof status, "reloaded: %d capture%s",
+                note = nnote;
+                newer_note(&note, newer, sizeof newer);
+                snprintf(status, sizeof status, "%s: %d capture%s",
+                         full ? "rebuilt from the whole DB" : "reloaded",
                          ncaps, ncaps == 1 ? "" : "s");
             } else {
                 if (nc != NULL) free_captures(nc, nn);
@@ -1269,6 +1817,19 @@ int main(int argc, char **argv)
         // g: the globe back to how it opens -- the whole Earth, framed on the
         // track -- from wherever turning and zooming left it.
         if (IsKeyPressed(KEY_G)) globe_reset_view(&globe);
+        // p: the outline of what the picture covered, on the globe or off.
+        // It needs an attitude to project, so say when this picture has none.
+        if (IsKeyPressed(KEY_P)) {
+            globe.show_fov = !globe.show_fov;
+            if (!globe.show_fov)
+                snprintf(status, sizeof status, "picture outline off");
+            else if (globe.att.have)
+                snprintf(status, sizeof status, "picture outline on");
+            else
+                snprintf(status, sizeof status,
+                         "picture outline on -- no attitude on record for this one");
+            status_left = 6.0f;
+        }
         if (IsKeyPressed(KEY_Q)) break;
         if (status_left > 0.0f) status_left -= GetFrameTime();
 
@@ -1305,8 +1866,9 @@ int main(int argc, char **argv)
             globe_set_track(&globe, track_key,
                             dot_ms - CAM_TRACK_HALF_MS, dot_ms + CAM_TRACK_HALF_MS);
             // Which way it was facing when the shutter went, from the
-            // nearest extended beacon that carried an attitude. Most
-            // pictures have none -- the blob has to have been running,
+            // nearest extended beacon or log record that carried an
+            // attitude. Most pictures have none -- the blob has to have
+            // been running, or a log covering the moment been downloaded,
             // and the ADCS has to have been estimating -- and then the
             // globe draws the track without a pointing direction.
             globe_attitude_t att = {0};
@@ -1385,13 +1947,42 @@ int main(int argc, char **argv)
         // the picture, in the pane above the info panel
         DrawRectangleLines(px - 1, py - 1, pw + 2, ph + 2, (Color){ 70, 70, 80, 255 });
         float shown_scale = 0.0f;
+        int range_lo, range_hi;
+        shown_range(c, show, range_mode, &vs, &range_lo, &range_hi);
+        int range_by_hand = range_mode == RANGE_MANUAL && state_find_range(&vs, c->id) >= 0;
         if (c->tex_ok) {
             Rectangle src = { 0, 0, (float) c->img_w, (float) c->img_h };
             Rectangle dst = picture_dst(c, px, py, pw, ph, zoom, &pan);
             shown_scale = dst.width / (float) c->img_w;
             BeginScissorMode(px, py, pw, ph);
-            DrawTexturePro(c->tex, src, dst, (Vector2){ 0, 0 }, 0.0f, WHITE);
+            Texture2D pic = show == SHOW_EQUALIZED ? c->tex_eq
+                          : show == SHOW_STRETCHED ? c->tex_st : c->tex;
+            if (range_mode != RANGE_FIXED) {
+                float flo = (float) range_lo / 255.0f, fhi = (float) range_hi / 255.0f;
+                SetShaderValue(range_shader, loc_lo, &flo, SHADER_UNIFORM_FLOAT);
+                SetShaderValue(range_shader, loc_hi, &fhi, SHADER_UNIFORM_FLOAT);
+                BeginShaderMode(range_shader);
+            }
+            DrawTexturePro(pic, src, dst, (Vector2){ 0, 0 }, 0.0f, WHITE);
+            if (range_mode != RANGE_FIXED) EndShaderMode();
             EndScissorMode();
+            // Said above the corner of the pane for as long as a filter or
+            // a brightness range is on, since the picture on show is not
+            // what the camera recorded.
+            char label[96] = "";
+            if (show != SHOW_AS_RECEIVED)
+                snprintf(label, sizeof label, "%s", show == SHOW_EQUALIZED ? "histogram equalized"
+                                                    : "colours stretched to full scale");
+            if (range_mode != RANGE_FIXED)
+                snprintf(label + strlen(label), sizeof label - strlen(label),
+                         "%sbrightness %d to %d%s", label[0] ? ", " : "", range_lo, range_hi,
+                         range_by_hand ? " (by hand)" : " (auto)");
+            if (label[0]) {
+                int lw = g_ui_font_loaded
+                       ? (int) MeasureTextEx(g_ui_font, label, 15, g_ui_font_spacing).x
+                       : MeasureText(label, 15);
+                draw_text(label, px + pw - lw, 42, 15, FAV_GOLD);
+            }
         } else {
             draw_text("JPEG will not decode -- too many bytes missing.",
                       px + 16, py + ph / 2 - 20, 18, (Color){ 220, 140, 140, 255 });
@@ -1412,9 +2003,10 @@ int main(int argc, char **argv)
                                                                  c->st.partial_sentences) : "",
                              c->st.saw_end_sentinel ? ", end marker" : ""),
                   rx, iy + 20, 15, LIGHTGRAY);
-        draw_text(TextFormat("jpeg         : %ld bytes%s", c->jpg_len,
+        draw_text(TextFormat("jpeg         : %ld bytes%s%s", c->jpg_len,
                              c->tex_ok ? TextFormat("  %d x %d", c->img_w, c->img_h)
-                                       : "  (does not decode)"),
+                                       : "  (does not decode)",
+                             c->st.header_supplied ? ", standard header" : ""),
                   rx, iy + 40, 15, LIGHTGRAY);
 
         draw_text(TextFormat("packets      : %d", c->chunks), col2, iy, 15, LIGHTGRAY);
@@ -1422,8 +2014,18 @@ int main(int argc, char **argv)
                                          zoom <= 1.0f ? "  (whole picture)" : "")
                             : "zoom         : -",
                   col2, iy + 20, 15, LIGHTGRAY);
+        draw_text(TextFormat("brightness   : %d to %d, %s", range_lo, range_hi,
+                             range_mode == RANGE_FIXED ? "full range"
+                             : range_by_hand ? "set by hand"
+                             : range_mode == RANGE_AUTO ? "autoscaled"
+                             : "autoscaled until z x c v set it"),
+                  col2, iy + 40, 15, LIGHTGRAY);
+        // The last action's outcome; otherwise whether the cache is behind
+        // the DB, which stays up until it is rebuilt.
         if (status_left > 0.0f)
-            draw_text(status, col2, iy + 40, 15, (Color){ 120, 220, 160, 255 });
+            draw_text(status, rx, iy + 80, 15, (Color){ 120, 220, 160, 255 });
+        else if (newer[0])
+            draw_text(newer, rx, iy + 80, 15, (Color){ 240, 196, 64, 255 });
 
         {
             char line[256] = "";
@@ -1443,9 +2045,10 @@ int main(int argc, char **argv)
         }
 
         // help footer
-        draw_text("Up/Down capture   scroll or pinch zoom   drag to move   "
-                  "globe: drag turns, scroll zooms, g resets   "
-                  "f favourite   v favourites only   o open   s save jpeg   F5 refresh   q quit",
+        draw_text("Up/Down capture   scroll or pinch zoom   drag to move   e equalize   t stretch colours   "
+                  "a brightness   z/x darkest  c/v brightest   "
+                  "globe: drag turns, scroll zooms, g resets, p outlines picture   "
+                  "f favourite   F favourites only   o open   s save jpeg   F5 refresh   shift-F5 rebuild   q quit",
                   12, sh - 22, 12, (Color){ 150, 150, 160, 255 });
 
         EndDrawing();
@@ -1457,6 +2060,7 @@ int main(int argc, char **argv)
     globe_free(&globe);
     beacon_attitude_free();
     unload_textures(caps, ncaps);
+    UnloadShader(range_shader);
     if (g_ui_font_loaded) UnloadFont(g_ui_font);
     CloseWindow();
 

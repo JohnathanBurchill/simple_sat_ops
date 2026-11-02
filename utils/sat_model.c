@@ -157,10 +157,13 @@ static void build_frontiersat(mesh_t *m)
     // carrying the camera.
     add_box(m, origin, HX, HY, HZ, C_STRUCTURE, C_CELLS, C_NADIR);
 
-    // The MPI's entrance slit, standing vertically across the ram face.
+    // The MPI's entrance slit, lying across the ram face parallel to the
+    // nadir face, so it runs cross-track when the camera looks down. The
+    // team's photos of the flight unit show it that way: slit horizontal
+    // on the end plate, camera barrel on the top face.
     const double xface[3] = { HX, 0, 0 };
     const double nx[3] = { 1, 0, 0 }, ny[3] = { 0, 1, 0 }, nz[3] = { 0, 0, 1 };
-    add_patch(m, C_SLIT, xface, nx, ny, nz, 0.008, HZ * 0.78);
+    add_patch(m, C_SLIT, xface, nx, ny, nz, HY * 0.78, 0.008);
 
     // The colour camera on the nadir face, a barrel standing off it,
     // with a dark lens on its outer end. Placed toward the ram end,

@@ -351,6 +351,15 @@ add_executable(bulk_size_selftest
 target_include_directories(bulk_size_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 list(APPEND SSO_TARGETS bulk_size_selftest)
 
+# ADCS SD-card log self-test: reading a log's header, frame layout and record
+# times, and telling a chunk of a log from a chunk of anything else by its
+# record schedule. Feeds the attitudes the viewers' globe draws.
+add_executable(adcs_sdlog_selftest
+               unit_tests/adcs_sdlog_selftest.c src/proto/adcs_sdlog.c)
+target_include_directories(adcs_sdlog_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+target_link_libraries(adcs_sdlog_selftest PRIVATE m)
+list(APPEND SSO_TARGETS adcs_sdlog_selftest)
+
 # Boom-camera JPEG decode self-test: sentence parsing, gap/partial recovery,
 # retransmit dedup, out-of-order placement (shared by cam_reconstruct and
 # packet_browser's "save camera JPEG").
@@ -501,10 +510,10 @@ if (RAYLIB_FOUND)
     target_include_directories(live_waterfall PRIVATE ${RAYLIB_INCLUDE_DIRS})
     target_link_directories(live_waterfall PRIVATE ${RAYLIB_LIBRARY_DIRS})
     target_link_libraries(live_waterfall PRIVATE waterfall_core ${RAYLIB_LIBRARIES} m)
-    # Homebrew's raylib.pc on macOS doesn't list the Cocoa / OpenGL /
-    # IOKit frameworks the static lib pulls in (and the dylib variant
-    # isn't always installed). Add them explicitly on Darwin; harmless
-    # on Linux where these frameworks don't exist (the find_library
+    # raylib.pc on macOS doesn't list the Cocoa / OpenGL / IOKit /
+    # QuartzCore frameworks the static lib pulls in (QuartzCore since
+    # raylib 6.0's GLFW). Add them explicitly on Darwin; harmless on
+    # Linux where these frameworks don't exist (the find_library
     # below returns NOTFOUND-suffixed strings which we filter out).
     if (APPLE)
         target_link_libraries(live_waterfall PRIVATE
@@ -512,7 +521,8 @@ if (RAYLIB_FOUND)
             "-framework OpenGL"
             "-framework IOKit"
             "-framework CoreVideo"
-            "-framework Foundation")
+            "-framework Foundation"
+            "-framework QuartzCore")
     endif()
     list(APPEND SSO_TARGETS live_waterfall)
 
@@ -541,7 +551,8 @@ if (RAYLIB_FOUND)
             "-framework OpenGL"
             "-framework IOKit"
             "-framework CoreVideo"
-            "-framework Foundation")
+            "-framework Foundation"
+            "-framework QuartzCore")
     endif()
     list(APPEND SSO_TARGETS decode_inspector)
 
@@ -555,10 +566,10 @@ if (RAYLIB_FOUND)
     # sgp4sdp4 where the Sun was, hence prediction.c (and oem.c, which it calls
     # into) and the vendored library.
     add_executable(mpi_viewer utils/mpi_viewer.c utils/sat_globe.c
-                   utils/sat_model.c
-                   utils/beacon_attitude.c src/proto/bulk_size.c
+                   utils/sat_model.c utils/viewer_cache.c
+                   utils/beacon_attitude.c src/proto/adcs_sdlog.c src/proto/bulk_size.c
                    src/proto/adcs_mag.c src/orbit/prediction.c src/orbit/oem.c
-                   src/orbit/attitude.c src/beacon/beacon_cts1.c)
+                   src/orbit/attitude.c src/beacon/beacon_cts1.c src/orbit/bestxyz.c)
     target_include_directories(mpi_viewer PRIVATE ${RAYLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(mpi_viewer PRIVATE ${RAYLIB_LIBRARY_DIRS} ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(mpi_viewer PRIVATE ${RAYLIB_LIBRARIES} ${OPENSSL_LIBRARIES}
@@ -571,7 +582,8 @@ if (RAYLIB_FOUND)
             "-framework OpenGL"
             "-framework IOKit"
             "-framework CoreVideo"
-            "-framework Foundation")
+            "-framework Foundation"
+            "-framework QuartzCore")
     endif()
     list(APPEND SSO_TARGETS mpi_viewer)
 
@@ -585,11 +597,11 @@ if (RAYLIB_FOUND)
     # where the Sun was, hence prediction.c (and oem.c, which it calls into),
     # adcs_mag.c for the TLE epochs, and the vendored library.
     set(CAMERA_VIEWER_SRCS utils/frontiersat_camera_viewer.c utils/cam_jpeg.c
-                           utils/sat_globe.c utils/sat_model.c
-                           utils/beacon_attitude.c
+                           utils/sat_globe.c utils/sat_model.c utils/viewer_cache.c
+                           utils/beacon_attitude.c src/proto/adcs_sdlog.c
                            src/proto/adcs_mag.c
                            src/orbit/prediction.c src/orbit/oem.c
-                           src/orbit/attitude.c src/beacon/beacon_cts1.c)
+                           src/orbit/attitude.c src/beacon/beacon_cts1.c src/orbit/bestxyz.c)
     if (APPLE)
         # Same trackpad-pinch shim decode_inspector uses: raylib/GLFW drop
         # NSEventTypeMagnify, so an NSEvent monitor collects it for us.
@@ -609,7 +621,8 @@ if (RAYLIB_FOUND)
             "-framework OpenGL"
             "-framework IOKit"
             "-framework CoreVideo"
-            "-framework Foundation")
+            "-framework Foundation"
+            "-framework QuartzCore")
     endif()
     list(APPEND SSO_TARGETS frontiersat_camera_viewer)
 
@@ -619,7 +632,7 @@ if (RAYLIB_FOUND)
     # field sits where in a beacon; beacon_cts1.c reads the packets.
     # Needs sqlite3 via packet_db, and no orbit maths at all.
     add_executable(telemetry_browser utils/telemetry_browser.c
-                   src/beacon/beacon_cts1.c src/beacon/beacon_series.c)
+                   src/beacon/beacon_cts1.c src/orbit/bestxyz.c src/beacon/beacon_series.c)
     target_include_directories(telemetry_browser PRIVATE
         ${RAYLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(telemetry_browser PRIVATE
@@ -635,7 +648,8 @@ if (RAYLIB_FOUND)
             "-framework OpenGL"
             "-framework IOKit"
             "-framework CoreVideo"
-            "-framework Foundation")
+            "-framework Foundation"
+            "-framework QuartzCore")
     endif()
     list(APPEND SSO_TARGETS telemetry_browser)
 else()
@@ -706,7 +720,7 @@ list(APPEND SSO_TARGETS resample_selftest)
 # pinned at sat-1-rc3; a silent regression here shows up as wrong
 # fields on the operator panel during a pass.
 add_executable(beacon_cts1_selftest unit_tests/beacon_cts1_selftest.c
-               src/beacon/beacon_cts1.c)
+               src/beacon/beacon_cts1.c src/orbit/bestxyz.c)
 target_include_directories(beacon_cts1_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(beacon_cts1_selftest PRIVATE m)
 list(APPEND SSO_TARGETS beacon_cts1_selftest)
@@ -717,7 +731,7 @@ list(APPEND SSO_TARGETS beacon_cts1_selftest)
 # says, so a wrong offset draws a wrong curve with nothing to give it
 # away. Checked against the same real extended beacon.
 add_executable(beacon_series_selftest unit_tests/beacon_series_selftest.c
-               src/beacon/beacon_series.c src/beacon/beacon_cts1.c)
+               src/beacon/beacon_series.c src/beacon/beacon_cts1.c src/orbit/bestxyz.c)
 target_include_directories(beacon_series_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
 target_link_libraries(beacon_series_selftest PRIVATE m)
 list(APPEND SSO_TARGETS beacon_series_selftest)
@@ -894,6 +908,20 @@ if (OPENSSL_FOUND AND SQLITE3_FOUND)
     list(APPEND SSO_TARGETS packet_db_selftest)
 endif()
 
+# viewer_cache selftest: the cache file mpi_viewer and
+# frontiersat_camera_viewer keep -- above all, that a cache for another
+# database, a replaced database, a damaged file or an unfinished write never
+# reads as a good cache.
+if (SQLITE3_FOUND)
+    add_executable(viewer_cache_selftest unit_tests/viewer_cache_selftest.c
+                   utils/viewer_cache.c src/ipc/sso_paths.c)
+    target_include_directories(viewer_cache_selftest PRIVATE
+        ${UNIT_TESTS_INCLUDE} ${CMAKE_SOURCE_DIR}/utils ${SQLITE3_INCLUDE_DIRS})
+    target_link_directories(viewer_cache_selftest PRIVATE ${SQLITE3_LIBRARY_DIRS})
+    target_link_libraries(viewer_cache_selftest PRIVATE ${SQLITE3_LIBRARIES})
+    list(APPEND SSO_TARGETS viewer_cache_selftest)
+endif()
+
 # ----- Optional: OpenSSL-dependent (libcrypto) ------------------------------
 
 if (OPENSSL_FOUND)
@@ -912,7 +940,7 @@ if (OPENSSL_FOUND)
                    src/dsp/modem_iq.c src/dsp/modem_viterbi.c
                    src/proto/ax100.c src/proto/rs.c src/proto/golay24.c
                    src/proto/csp.c src/proto/hmac_keyfile.c
-                   src/beacon/beacon_cts1.c src/pipeline/decode_loop.c)
+                   src/beacon/beacon_cts1.c src/orbit/bestxyz.c src/pipeline/decode_loop.c)
     target_include_directories(rx_decode PRIVATE ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(rx_decode PRIVATE ${OPENSSL_LIBRARY_DIRS})
     target_link_libraries(rx_decode PRIVATE ${OPENSSL_LIBRARIES} m)
@@ -929,6 +957,17 @@ if (OPENSSL_FOUND)
     target_link_sso_core(packet_query)
     list(APPEND SSO_TARGETS packet_query)
 
+    # File the DB's "unknown" rows under the packet types the decoder knows
+    # now (cts1_classify), since re-decoding never replaces a stored row.
+    add_executable(packet_refile utils/packet_refile.c src/beacon/beacon_cts1.c
+                   src/orbit/bestxyz.c src/proto/gnss_frag.c)
+    target_include_directories(packet_refile PRIVATE ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(packet_refile PRIVATE ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(packet_refile PRIVATE ${OPENSSL_LIBRARIES} m)
+    target_link_packet_db(packet_refile)
+    target_link_sso_core(packet_refile)
+    list(APPEND SSO_TARGETS packet_refile)
+
     # Reassemble + CRC-check the GNSS telecommand responses (NovAtel logs).
     add_executable(gnss_reports utils/gnss_reports.c src/orbit/bestxyz.c src/proto/gnss_frag.c)
     target_include_directories(gnss_reports PRIVATE ${OPENSSL_INCLUDE_DIRS})
@@ -937,6 +976,17 @@ if (OPENSSL_FOUND)
     target_link_packet_db(gnss_reports)
     target_link_sso_core(gnss_reports)
     list(APPEND SSO_TARGETS gnss_reports)
+
+    # List the GNSS ring blob's downlinked BESTXYZB fixes (packet type 0x30)
+    # and compare each with SGP4 from the TLE in force.
+    add_executable(gnss_ring utils/gnss_ring.c src/orbit/bestxyz.c src/proto/gnss_frag.c
+                   src/orbit/prediction.c src/orbit/oem.c)
+    target_include_directories(gnss_ring PRIVATE ${OPENSSL_INCLUDE_DIRS})
+    target_link_directories(gnss_ring PRIVATE ${OPENSSL_LIBRARY_DIRS})
+    target_link_libraries(gnss_ring PRIVATE ${OPENSSL_LIBRARIES} ${SGP4SDP4_LIB} m)
+    target_link_packet_db(gnss_ring)
+    target_link_sso_core(gnss_ring)
+    list(APPEND SSO_TARGETS gnss_ring)
 
     # Reassemble an MPI science-data file from its bulk_file packets, the MPI
     # counterpart to cam_reconstruct and gnss_reports. gnss_frag.c is reused for
@@ -993,7 +1043,7 @@ if (OPENSSL_FOUND)
     # never writes to the database, so it decodes them as it loads them.
     if (NCURSES_FOUND)
         add_executable(packet_browser utils/packet_browser.c utils/cam_jpeg.c
-                       src/beacon/beacon_cts1.c
+                       src/beacon/beacon_cts1.c src/orbit/bestxyz.c
                        src/ui/ui_textfield.c)
         target_compile_definitions(packet_browser PRIVATE
             PACKET_BROWSER_HAVE_NCURSES)
@@ -1010,7 +1060,7 @@ if (OPENSSL_FOUND)
         # Command explorer over the sent_tcmd table (mirror of
         # packet_browser). Links beacon_cts1 for tcmd_response decoding.
         add_executable(tcmd_browser utils/tcmd_browser.c
-                       src/beacon/beacon_cts1.c
+                       src/beacon/beacon_cts1.c src/orbit/bestxyz.c
                        src/ui/ui_textfield.c)
         target_compile_definitions(tcmd_browser PRIVATE
             TCMD_BROWSER_HAVE_NCURSES)
@@ -1053,7 +1103,7 @@ if (OPENSSL_FOUND)
                    src/dsp/sw_nco.c src/dsp/iq_burst.c src/dsp/frame_rssi.c
                    src/proto/ax100.c src/proto/rs.c src/proto/golay24.c
                    src/proto/csp.c src/proto/hmac_keyfile.c
-                   src/beacon/beacon_cts1.c src/pipeline/rx_tui.c
+                   src/beacon/beacon_cts1.c src/orbit/bestxyz.c src/pipeline/rx_tui.c
                    src/orbit/tle_csv.c)
     target_include_directories(rx_replay PRIVATE ${OPENSSL_INCLUDE_DIRS})
     target_link_directories(rx_replay PRIVATE ${OPENSSL_LIBRARY_DIRS})
@@ -1264,6 +1314,21 @@ else()
     message(STATUS "libcrypto not found; uplink_test and rx_decode will not be built.")
 endif()
 
+# When the satellite's SatNOGS observations either side of now start,
+# coloured by whether stations received frames from them. Lists an hour
+# at a time and, like satnogs_browser, reaches the network only through a
+# script: scripts/satnogs_list_hour.sh. Needs nothing but ncurses.
+if (NCURSES_FOUND)
+    add_executable(satnogs_passes utils/satnogs_passes.c)
+    target_compile_definitions(satnogs_passes PRIVATE
+        SATNOGS_PASSES_HAVE_NCURSES)
+    target_include_directories(satnogs_passes PRIVATE ${NCURSES_INCLUDE_DIRS})
+    target_link_directories(satnogs_passes PRIVATE ${NCURSES_LIBRARY_DIRS})
+    target_link_libraries(satnogs_passes PRIVATE ${NCURSES_LIBRARIES})
+    target_link_sso_core(satnogs_passes)
+    list(APPEND SSO_TARGETS satnogs_passes)
+endif()
+
 # ----- SDR pre-flight probe (no OpenSSL / ncurses needed) --------------------
 #
 # `sdr_probe` reports which UHD device and antenna ports simple_sat_ops
@@ -1313,6 +1378,30 @@ if (SGP4SDP4_LIB)
     add_executable(tle_keps apps/tle_keps.c src/ipc/sso_paths.c)
     target_link_libraries(tle_keps PRIVATE ${SGP4SDP4_LIB} m)
     list(APPEND SSO_TARGETS tle_keps)
+
+    # When FrontierSat crosses the cusp, the nightside auroral oval and the
+    # subauroral (STEVE) zone: SGP4 positions turned into quasi-dipole
+    # latitude and MLT by tracing IGRF-14 field lines (magcoords.c). The
+    # default TLE comes from the packet database when sqlite3 is present.
+    add_executable(region_crossings apps/region_crossings.c
+                   src/orbit/magcoords.c src/orbit/prediction.c
+                   src/orbit/oem.c src/orbit/tle_csv.c src/ipc/sso_paths.c)
+    target_link_libraries(region_crossings PRIVATE ${SGP4SDP4_LIB} m)
+    if (SQLITE3_FOUND)
+        target_compile_definitions(region_crossings PRIVATE WITH_SQLITE3)
+        target_include_directories(region_crossings PRIVATE ${SQLITE3_INCLUDE_DIRS})
+        target_link_directories(region_crossings PRIVATE ${SQLITE3_LIBRARY_DIRS})
+        target_link_libraries(region_crossings PRIVATE ${SQLITE3_LIBRARIES})
+    endif()
+    list(APPEND SSO_TARGETS region_crossings)
+
+    # IGRF-14 field, quasi-dipole coordinates and MLT against IRI's IGRF,
+    # apexpy and a dipole-only closed form. Pure math; no SGP4.
+    add_executable(magcoords_selftest
+                   unit_tests/magcoords_selftest.c src/orbit/magcoords.c)
+    target_include_directories(magcoords_selftest PRIVATE ${UNIT_TESTS_INCLUDE})
+    target_link_libraries(magcoords_selftest PRIVATE m)
+    list(APPEND SSO_TARGETS magcoords_selftest)
 
     # TLE from a single GNSS position/velocity state vector. ECEF->inertial,
     # a two-body solve for a guess, then an SGP4 differential correction so
@@ -1407,7 +1496,7 @@ if (NCURSES_FOUND AND SGP4SDP4_LIB AND OPENSSL_FOUND)
                    src/proto/agenda_line.c
                    src/proto/tcmd_lint.c src/proto/tcmd_spec.c
                    src/proto/sso_pseudo.c
-                   src/beacon/beacon_cts1.c
+                   src/beacon/beacon_cts1.c src/orbit/bestxyz.c
                    src/orbit/tle_csv.c
                    src/dsp/biquad.c src/dsp/monitor_squelch.c)
     target_include_directories(simple_sat_ops PRIVATE
@@ -1547,6 +1636,7 @@ set(SSO_OPERATOR_SCRIPTS
     scripts/plot_sky_pass.py
     scripts/plot_sky_pass.sh
     scripts/rx_record.sh
+    scripts/satnogs_list_hour.sh
     scripts/satnogs_pull.sh
     scripts/scan_iq.py
     scripts/sso_admin.sh

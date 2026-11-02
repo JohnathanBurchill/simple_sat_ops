@@ -19,6 +19,7 @@
 */
 
 #include "beacon_cts1.h"
+#include "bestxyz.h"
 
 #include <limits.h>
 #include <math.h>
@@ -1095,35 +1096,116 @@ int beacon_ext_summary(const uint8_t *payload, size_t len,
     return (n < (int) out_size) ? n : (int) out_size - 1;
 }
 
+// ---- the GNSS ring blob's samples -----------------------------------------
+
+int gnss_ring_is(const uint8_t *payload, size_t len)
+{
+    if (payload == NULL) return 0;
+    // 149 is the bare packet; 153 is the same with the 4-byte CSP CRC32
+    // trailer left on.
+    if (len != COMMS_GNSS_RING_PACKET_LEN
+     && len != COMMS_GNSS_RING_PACKET_LEN + COMMS_CSP_CRC32_TRAILER_BYTES) return 0;
+    if (payload[0] != COMMS_PACKET_TYPE_GNSS_BESTXYZB_SAMPLE) return 0;
+    // As with the extended beacon, one of two anchors has to be intact:
+    // the BESTXYZB sync bytes, or its header length (28) and message ID
+    // (241). The last chunk of a bulk-file download whose type byte took
+    // a bit flip (0x10 -> 0x30) can have this length but carries neither.
+    const uint8_t *m = payload + COMMS_GNSS_RING_HEADER_LEN;
+    const int sync_ok = (m[0] == 0xAA && m[1] == 0x44 && m[2] == 0x12);
+    const int id_ok = (m[3] == 28 && m[4] == 241 && m[5] == 0);
+    return sync_ok || id_ok;
+}
+
+void gnss_ring_print(FILE *fp, const char *ts,
+                     const uint8_t *payload, size_t len)
+{
+    char prefix[64];
+    if (ts != NULL) snprintf(prefix, sizeof prefix, "[%s] ", ts);
+    else prefix[0] = '\0';
+
+    unsigned seq = (unsigned) payload[1] | (unsigned) payload[2] << 8;
+    unsigned ring = (unsigned) payload[3] | (unsigned) payload[4] << 8;
+    bestxyz_t b;
+    char err[96];
+    if (bestxyzb_parse(payload + COMMS_GNSS_RING_HEADER_LEN,
+                       len - COMMS_GNSS_RING_HEADER_LEN, &b, err, sizeof err) != 0) {
+        fprintf(fp, "%sgnss_ring: seq=%u ring=%u BESTXYZB unreadable (%s)\n",
+                prefix, seq, ring, err);
+        return;
+    }
+    int y, mo, d, h, mi;
+    double s;
+    bestxyz_gps_to_utc(b.gps_week, b.gps_sow, BESTXYZ_DEFAULT_LEAP_SECONDS,
+                       &y, &mo, &d, &h, &mi, &s);
+    fprintf(fp, "%sgnss_ring: seq=%u ring=%u fix=%04d-%02d-%02dT%02d:%02d:%06.3fZ"
+                " %s %s/%s sv=%d/%d crc=%s\n",
+            prefix, seq, ring, y, mo, d, h, mi, s, b.time_status,
+            b.pos_sol_status, b.pos_type, b.num_sol_sv, b.num_sv,
+            b.crc_ok ? "ok" : "BAD");
+    fprintf(fp, "%sgnss_ring: ecef=%.3f %.3f %.3f m sigma=%.2f %.2f %.2f m\n",
+            prefix, b.pos[0], b.pos[1], b.pos[2],
+            b.pos_sigma[0], b.pos_sigma[1], b.pos_sigma[2]);
+    fprintf(fp, "%sgnss_ring: vel=%.4f %.4f %.4f m/s\n",
+            prefix, b.vel[0], b.vel[1], b.vel[2]);
+}
+
+int cts1_classify(const uint8_t *payload, size_t len,
+                  const char **name, const char **satellite)
+{
+    int type = 0;
+    const char *n = NULL, *sat = NULL;
+    if (payload == NULL || len == 0) {
+        // Nothing to classify.
+    } else if (beacon_is_basic(payload, len)) {
+        type = COMMS_PACKET_TYPE_BEACON_BASIC; n = "beacon"; sat = "CTS1";
+    } else if (beacon_is_extended(payload, len)) {
+        type = COMMS_PACKET_TYPE_BEACON_EXTENDED; n = "beacon_ext"; sat = "CTS1";
+    } else if (tcmd_response_is(payload, len)) {
+        type = COMMS_PACKET_TYPE_TCMD_RESPONSE; n = "tcmd_response";
+    } else if (log_message_is(payload, len)) {
+        // log_message and bulk_file go by the packet_type byte: their
+        // lengths overlap with each other and with arbitrary noise.
+        type = COMMS_PACKET_TYPE_LOG_MESSAGE; n = "log";
+    } else if (bulk_file_is(payload, len)) {
+        type = COMMS_PACKET_TYPE_BULK_FILE_DOWNLINK; n = "bulk_file";
+    } else if (gnss_ring_is(payload, len)) {
+        type = COMMS_PACKET_TYPE_GNSS_BESTXYZB_SAMPLE; n = "gnss_ring";
+    }
+    if (name != NULL) *name = n;
+    if (satellite != NULL) *satellite = sat;
+    return type;
+}
+
 void cts1_packet_print(FILE *fp, const char *ts,
                        const uint8_t *payload, size_t len)
 {
-    if (payload == NULL || len == 0) return;
-    // Length-anchored sniffs first: beacon at 130/134 and tcmd_response
-    // both survive a corrupted packet_type byte because their other
-    // anchors (length, seq/max_seq) are strong enough.
-    if (beacon_is_basic(payload, len)) {
-        beacon_print(fp, ts, payload, len);
-        return;
+    switch (cts1_classify(payload, len, NULL, NULL)) {
+        case COMMS_PACKET_TYPE_BEACON_BASIC:   beacon_print(fp, ts, payload, len);        break;
+        case COMMS_PACKET_TYPE_BEACON_EXTENDED: beacon_ext_print(fp, ts, payload, len);   break;
+        case COMMS_PACKET_TYPE_TCMD_RESPONSE:  tcmd_response_print(fp, ts, payload, len); break;
+        case COMMS_PACKET_TYPE_LOG_MESSAGE:    log_message_print(fp, ts, payload, len);   break;
+        case COMMS_PACKET_TYPE_BULK_FILE_DOWNLINK: bulk_file_print(fp, ts, payload, len); break;
+        case COMMS_PACKET_TYPE_GNSS_BESTXYZB_SAMPLE: gnss_ring_print(fp, ts, payload, len); break;
+        default:
+            // Unknown type — caller's hex/ascii dump (when packetheaders
+            // is on) is the only output. Stay silent here.
+            break;
     }
-    if (beacon_is_extended(payload, len)) {
-        beacon_ext_print(fp, ts, payload, len);
-        return;
-    }
-    if (tcmd_response_is(payload, len)) {
-        tcmd_response_print(fp, ts, payload, len);
-        return;
-    }
-    // Fall through to packet_type for the two types whose lengths
-    // overlap with each other and with arbitrary noise.
-    if (log_message_is(payload, len)) {
-        log_message_print(fp, ts, payload, len);
-        return;
-    }
-    if (bulk_file_is(payload, len)) {
-        bulk_file_print(fp, ts, payload, len);
-        return;
-    }
-    // Unknown type — caller's hex/ascii dump (when packetheaders is on)
-    // is the only output. Stay silent here.
+}
+
+size_t cts1_packet_summary(char *buf, size_t cap,
+                           const uint8_t *payload, size_t len)
+{
+    if (buf == NULL || cap == 0) return 0;
+    buf[0] = '\0';
+    FILE *mem = fmemopen(buf, cap, "w");
+    if (mem == NULL) return 0;
+    cts1_packet_print(mem, NULL, payload, len);
+    fflush(mem);
+    long pos = ftell(mem);
+    if (pos < 0) pos = 0;
+    if ((size_t) pos >= cap) pos = (long) cap - 1;
+    buf[pos] = '\0';
+    fclose(mem);
+    return (size_t) pos;
 }
