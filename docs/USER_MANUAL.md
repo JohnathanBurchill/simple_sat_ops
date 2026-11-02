@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`9d2b759` (2026-11-01). This is a working draft.
+`277d736` (2026-11-02). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2885,6 +2885,7 @@ mpi_viewer                              # default database
 mpi_viewer --db=/FrontierSat/packet_db.sqlite
 mpi_viewer --list                       # print what each experiment reconstructed to
 mpi_viewer --rebuild-cache              # rebuild the cached older recordings too
+mpi_viewer --file MPI_20260721T203957.bin   # one file from disk instead of the database
 ```
 
 `--list` prints one block per experiment - the on-satellite file, how long the
@@ -2894,6 +2895,24 @@ count and how many frames were dropped for failing their own CRC, and how many
 packets were set aside for a corrupted offset - then exits
 without opening a window. It answers "how much of this do we actually have?"
 from a terminal or over ssh, and is the same reconstruction the GUI shows.
+
+**One file instead of the database.** `--file <path>` shows a single MPI
+science-data file from disk - a `.bin` that `mpi_reconstruct` wrote, or a file
+copied off the satellite - as the only experiment in the list. It is built the
+same way as a recording from the database, with the same frame finding, marker
+timing and frame checksums; the aux panel names the local file where it would
+name the one on the satellite. The path goes after a space so the shell can
+expand `~` and complete it; `--file=<path>` is refused with a hint. `F5`
+re-reads the file, and the cache below is neither read nor written. The
+database (the default, or `--db=`) is still read, if there is one, for the
+globe's ground track and attitudes. A file does not say which bytes never
+arrived - `mpi_reconstruct` fills them with zeros - so every byte counts as
+received, the frames resting on the fill fail their own checksum and are
+dropped, and `d` has nothing to export. Mind that `mpi_reconstruct` writes one
+file per download pass, so a file of its holds only that pass's share of a
+recording: the 07-21 recording's first-pass file shows 906 frames, where the
+database view, which merges every pass, has 3638. For a whole recording, use
+the database.
 
 **The list runs newest first**, the most recent recording at the top. Each row
 carries the recording's **duration in minutes**, right-justified on the date
@@ -3214,7 +3233,8 @@ mean,
 `t` tags a favourite and `shift-T` shows the favourites only,
 `d` writes
 the re-download
-telecommands (below), **`F5` re-reads the database** and rebuilds the
+telecommands (below), **`F5` re-reads the database** (or the file, with
+`--file`) and rebuilds the
 list (keeping your selection and view settings), **`shift-F5` rebuilds the
 cached recordings too** (below), and `q` quits.
 The experiment list scrolls with the wheel and a row can be clicked to select
