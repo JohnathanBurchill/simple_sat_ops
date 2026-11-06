@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`679f9ca` (2026-11-02). This is a working draft.
+`3dec72e` (2026-11-02). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -2914,6 +2914,28 @@ recording: the 07-21 recording's first-pass file shows 906 frames, where the
 database view, which merges every pass, has 3638. For a whole recording, use
 the database.
 
+**Bench recordings.** `--file` also reads what the MPI's ground-support
+equipment recorded on the bench, the `FrontierSat_<time>Z.bin` files. Each
+frame there sits behind a 12-byte header of the bench's own (sync
+`0A 0B 0C 0D`, a record counter, and the time it was logged in milliseconds),
+and the viewer recognises a file by the header it opens on. A frame takes its
+capture time from that header, so a bench recording needs none of the JSON
+markers, and is not held to the satellite's download limit. The globe draws no
+orbit for it, the recording having been made on the ground.
+
+**The pixel range is commanded,** 48..112 (65 pixels) by default, and a frame
+is 20 aux bytes, its pixels and a checksum, so its length goes with the range.
+Every frame names its first and last pixel in aux bytes 16 and 17, and the
+viewer takes a recording's frame length from what most of its frames say (a
+bench file's from the spacing of its records), then draws the image and the
+whereogram that many pixels high. `--list` prints the range on a `pixels`
+line. Among the 2025 bench files are 65-, 133- (0..132) and 16-pixel (70..85)
+recordings; every recording from the satellite so far is 65. The bench files
+from instrument firmware 13, March to mid-May 2025, use an older frame layout
+whose frames fail their own checksum, and are refused with a message saying so.
+With 133 pixels an image is 133 rows high, so `s` (zoom) is how to fit it on
+screen.
+
 **The list runs newest first**, the most recent recording at the top. Each row
 carries the recording's **duration in minutes**, right-justified on the date
 line - the span from the `mpi_start` marker to the last marker inside the
@@ -3009,6 +3031,20 @@ next setpoint. The viewer places a frame by the target voltage the frame before
 it reported, which is why the raw 0 V frame lands at the left edge even though
 its own aux reads 57343. The aux panel shows that frame's aux as it was sent, so
 its `dome target V` is one setpoint ahead of the column it is drawn in.
+
+**Dome voltage per frame.** Between the image and the aux panel is a table of
+the dome voltage each frame of the image was taken at, one row per column:
+frame 1 at the top is the image's left column, frame N at the bottom its right.
+`set` is the commanded setpoint (aux bytes 11-12) and `meas` the instrument's
+own measurement of the dome voltage (aux bytes 14-15), both in raw counts.
+Both come from the frame before the one in the column, by the same one-frame
+lag that places the frame, so each row is the voltage that column's pixels were
+integrated at; a column with no frame reads `--`. On the July and August
+recordings `meas` sits at about 3953 in both 0 V columns and about 3921 at every
+negative setpoint from 57343 down to 4095: it tells 0 V from not-0 V but does
+not follow the sweep. On the bench in May 2025 it did, about 246 counts a step,
+from 435 at setpoint 4095 to 3640 at 57343, and about 3960 at 0 V - so in
+flight it reads close to its 0 V level at every setpoint.
 
 **Cleaned imagery (`b`).** The MPI subtracts a background of its own in the
 FPGA, and `b` undoes that and puts a better one in its place, for the image and

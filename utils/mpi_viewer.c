@@ -95,7 +95,15 @@
     The tool plays the images back like a movie, grayscale, with
     an adjustable DN range and nearest-neighbour zoom, and shows the aux data
     beside each image -- that aux belonging, as above, to the frame after the
-    one the pixels were taken in.
+    one the pixels were taken in. Between the image and the aux panel is the
+    dome voltage of every frame of the image, 1 to N down the table being
+    the image's columns left to right: the commanded setpoint and the
+    instrument's measurement of it (aux bytes 11-12 and 14-15), both read
+    from the frame before, by that same lag, so each row is the voltage its
+    column's pixels were taken at. In flight the measurement reads about 3953
+    at 0 V and about 3921 at every negative setpoint, raw counts; on the bench
+    it follows the sweep, from about 435 at setpoint 4095 to 3640 at 57343
+    and 3960 at 0 V.
 
     Aux frame layout (authoritative, from the MPI storeTelemetryAuxData packer):
         0..3   sync word 0C FF FF 0C
@@ -111,6 +119,9 @@
         18..19 integration period            (big-endian uint16)
         20..149 pixels, 65 big-endian uint16
         150..151 checksum                    (not a pixel)
+    That is the default pixel range, 48..112. The range is commanded, so a
+    recording's frames are 20 aux bytes, last - first + 1 pixels and the
+    checksum, as long as most of its frames' bytes 16 and 17 say.
 
     The pixels start at byte 20, not 22, and the last two bytes are a checksum.
     Both fit the 152 bytes exactly -- 65 words from 20 leaves the last two over,
@@ -265,6 +276,14 @@
     which bytes never arrived -- mpi_reconstruct leaves them as its fill value --
     so every byte counts as received and there is nothing for d to re-download.
 
+    The file can also be a bench recording from the MPI's ground-support
+    equipment (FrontierSat_<time>Z.bin), recognised by the GSE record header it
+    opens on. Each frame then takes its time from the GSE's own clock, its
+    length from the record spacing (the pixel range set that day: 65, 133 or
+    16 pixels in the 2025 files), and the globe draws no orbit, the recording
+    having been made on the ground. Bench files from instrument firmware 13
+    (March to mid-May 2025) use an older frame layout and are refused.
+
     Usage:
       mpi_viewer [--db=<packet_db.sqlite>] [--file <mpi_file>] [--list] [--rebuild-cache]
       mpi_viewer --help
@@ -373,11 +392,15 @@ int main(int argc, char **argv)
 // as the command that started that download.
 #define MPI_CMD_LOOKBACK_MS  (30.0 * 60.0 * 1000.0)
 
-// On-wire MPI data frame geometry (measured; matches the aux packer above and
-// the First Light notebook's pixel slice).
-#define FRAME_STRIDE   152   // bytes per frame (sync .. last pixel)
+// On-wire MPI data frame geometry (measured; matches the aux packer above).
+// The pixel range is commanded, so these are only the default: a frame is 20
+// aux bytes, its pixels and a CRC, each recording's frames as long as their
+// pixel indexes say (frame_geometry), and everything past the build reads the
+// experiment's own stride and npix.
+#define FRAME_STRIDE   152   // bytes per frame at the default 65 pixels (sync .. CRC)
 #define PIX_START      20    // first pixel byte within a frame
-#define NPIX           65    // big-endian uint16 pixels per frame
+#define NPIX           65    // big-endian uint16 pixels per frame, 48..112 by default
+#define MAX_NPIX       256   // most pixels a frame can carry (8-bit pixel indexes)
 #define MAX_FPI        64    // largest scan period we render
 
 // The 0 V background frame's target-voltage setpoint. It carries no ion signal
@@ -416,11 +439,14 @@ typedef struct {
     long     recovered;      // present bytes
     long     unverified;     // present bytes that no CRC vouches for
     int      nframes;        // number of sync words found
+    int      stride;         // bytes per frame: as its frames say (FRAME_STRIDE by default)
+    int      npix;           // pixels per frame: as its frames say (NPIX by default)
+    int      bench;          // a ground-support-equipment recording, made on the ground
     long    *fr_off;         // byte offset of each frame's sync word
     int     *fr_ctr;         // running counter (bytes 4-5) per frame
     int     *fr_tv;          // inner dome target voltage (bytes 11-12) per frame
     double  *fr_ts;          // capture time (unix ms) per frame, -1 if unknown
-    uint8_t *fr_bytes;       // each frame's 152 bytes, any JSON marker spliced into it cut out
+    uint8_t *fr_bytes;       // each frame's stride bytes, any JSON marker spliced into it cut out
     int     *fr_bad;         // 1 if the frame is dropped: it runs past EOF, or fails its own CRC
     int     *fr_spliced;     // 1 if a JSON marker was cut out of the frame
     int     *fr_unver;       // 1 if any of the frame's bytes came from a failed-CRC packet
@@ -452,16 +478,16 @@ static int be16(const uint8_t *buf, long i)
     return (buf[i] << 8) | buf[i + 1];
 }
 
-// Frame k's 152 bytes, read with any JSON marker the firmware wrote into the
+// Frame k's stride bytes, read with any JSON marker the firmware wrote into the
 // middle of it cut out -- so read a frame's contents through this, not
 // straight out of the file buffer at its offset.
 static const uint8_t *frame_at(const experiment_t *s, int k)
 {
-    return s->fr_bytes + (long) k * FRAME_STRIDE;
+    return s->fr_bytes + (long) k * s->stride;
 }
 
 // The CCITT CRC-16 the instrument puts in the last two bytes of every frame,
-// over the 150 bytes before them (avr-libc's _crc_ccitt_update seeded 0xFFFF,
+// over every byte before them (avr-libc's _crc_ccitt_update seeded 0xFFFF,
 // most significant byte first -- calculateTelemetryCrc in the flight
 // MPITelemetry.c). This is the instrument's own word on whether the frame
 // arrived intact, and it covers exactly the bytes being read -- which the CSP
@@ -472,13 +498,13 @@ static int frame_crc_ok(const experiment_t *s, int k)
 {
     const uint8_t *f = frame_at(s, k);
     uint16_t crc = 0xFFFF;
-    for (int i = 0; i < FRAME_STRIDE - 2; i++) {
+    for (int i = 0; i < s->stride - 2; i++) {
         uint8_t t = f[i] ^ (uint8_t) (crc & 0xFF);
         t ^= (uint8_t) (t << 4);
         crc = (uint16_t) ((crc >> 8) ^ ((uint16_t) t << 8)
                           ^ ((uint16_t) t << 3) ^ ((uint16_t) t >> 4));
     }
-    return crc == (uint16_t) be16(f, FRAME_STRIDE - 2);
+    return crc == (uint16_t) be16(f, s->stride - 2);
 }
 
 // "2026-08-09 22:08:04.123" (UTC) from a unix-ms timestamp.
@@ -1000,6 +1026,30 @@ static long count_sync(const uint8_t *buf, long size)
     return n;
 }
 
+// How many pixels a recording's frames carry, and so how long they are. The
+// first and last pixel indexes are commanded -- 48..112, 65 pixels, by default
+// -- and every frame says what they were in its aux bytes 16 and 17, so the
+// recording's frames are the length most of its frames say they are. A frame
+// with a byte that never came down reads zeros there, and is left out of the
+// vote. A frame of some other length (the range commanded anew mid-recording,
+// or a flipped index byte) then fails its own CRC and is dropped.
+static void frame_geometry(const uint8_t *buf, const uint8_t *present, long size,
+                           int *stride, int *npix)
+{
+    int votes[MAX_NPIX + 1] = {0};
+    for (long o = 0; o + PIX_START <= size; o++) {
+        if (memcmp(buf + o, MPI_SYNC_WORD, MPI_SYNC_WORD_LEN) != 0) continue;
+        if (!present[o + 16] || !present[o + 17]) continue;
+        int np = buf[o + 17] - buf[o + 16] + 1;
+        if (np >= 1) votes[np]++;
+    }
+    int best = NPIX;
+    for (int np = 1; np <= MAX_NPIX; np++)
+        if (votes[np] > votes[best]) best = np;
+    *npix = best;
+    *stride = PIX_START + 2 * best + 2;
+}
+
 // Build one experiment from the union of its passes' chunks (idx[0..nidx)).
 // start_hint is the experiment's approximate start (unix ms) from the clustering
 // pass; max_ts is the newest packet time (upper bound on plausible markers).
@@ -1018,11 +1068,13 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
         return 0;
     }
 
-    // Find every sync word; each one starts a 152-byte frame (drop any whose
-    // frame would run past EOF).
+    // Find every sync word; each one starts a frame of the recording's own
+    // length (drop any whose frame would run past EOF).
+    int stride = FRAME_STRIDE, npix = NPIX;
+    frame_geometry(buf, present, size, &stride, &npix);
     long *offs = NULL;
     int n = 0, cap = 0;
-    for (long o = 0; o + FRAME_STRIDE <= size; o++) {
+    for (long o = 0; o + stride <= size; o++) {
         if (buf[o] == 0x0C && buf[o + 1] == 0xFF && buf[o + 2] == 0xFF && buf[o + 3] == 0x0C) {
             if (n == cap) {
                 cap = cap ? cap * 2 : 1024;
@@ -1038,6 +1090,8 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
     out->size = size;
     out->dropped = dropped;
     out->nframes = n;
+    out->stride = stride;
+    out->npix = npix;
     out->t_first_recv_ms = cs[idx[0]].ts_ms;
     out->t_last_recv_ms  = cs[idx[0]].ts_ms;
     out->max_id = cs[idx[0]].id;
@@ -1055,7 +1109,7 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
     out->fr_unver = (int *) calloc((size_t) n, sizeof(int));
     out->fr_gap  = (int *) calloc((size_t) n, sizeof(int));
     out->fr_spliced = (int *) calloc((size_t) n, sizeof(int));
-    out->fr_bytes = (uint8_t *) calloc((size_t) n, FRAME_STRIDE);
+    out->fr_bytes = (uint8_t *) calloc((size_t) n, (size_t) stride);
     if (out->fr_ctr == NULL || out->fr_tv == NULL
         || out->fr_ts == NULL || out->fr_bad == NULL || out->fr_unver == NULL
         || out->fr_gap == NULL || out->fr_spliced == NULL || out->fr_bytes == NULL) {
@@ -1084,7 +1138,7 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
     if (ms == NULL || me == NULL) nm = 0;
     for (int m = 0; m < nm; m++) marker_span(buf, size, mo[m], &ms[m], &me[m]);
 
-    // Read each frame's 152 bytes. The 20480-byte flush is not frame-aligned,
+    // Read each frame's bytes. The 20480-byte flush is not frame-aligned,
     // so once per ~20 KB the firmware writes a JSON marker into the middle of a
     // frame -- but it writes the whole frame either side of it, so cutting the
     // marker out and joining the two halves gives the frame back intact. A frame
@@ -1095,10 +1149,10 @@ static int build_experiment(const chunk_t *cs, const int *idx, int nidx,
     for (int k = 0; k < n; k++) {
         long o = offs[k];
         while (m0 < nm && me[m0] <= o) m0++;
-        uint8_t *f = out->fr_bytes + (long) k * FRAME_STRIDE;
+        uint8_t *f = out->fr_bytes + (long) k * stride;
         long p = o;
         int m = m0;
-        for (int i = 0; i < FRAME_STRIDE; i++, p++) {
+        for (int i = 0; i < stride; i++, p++) {
             for (; m < nm && ms[m] <= p; m++)
                 if (p < me[m]) { p = me[m]; out->fr_spliced[k] = 1; }
             if (p >= size) { out->fr_bad[k] = 1; break; }
@@ -1420,7 +1474,7 @@ static void write_cache(const char *db_path, const experiment_t *exps, int nexp,
         viewer_cache_write(&w, e->fr_ctr, nf * sizeof *e->fr_ctr);
         viewer_cache_write(&w, e->fr_tv, nf * sizeof *e->fr_tv);
         viewer_cache_write(&w, e->fr_ts, nf * sizeof *e->fr_ts);
-        viewer_cache_write(&w, e->fr_bytes, nf * FRAME_STRIDE);
+        viewer_cache_write(&w, e->fr_bytes, nf * (size_t) e->stride);
         viewer_cache_write(&w, e->fr_bad, nf * sizeof *e->fr_bad);
         viewer_cache_write(&w, e->fr_spliced, nf * sizeof *e->fr_spliced);
         viewer_cache_write(&w, e->fr_unver, nf * sizeof *e->fr_unver);
@@ -1441,7 +1495,9 @@ static int read_cache(FILE *f, experiment_t **out)
     if (exps == NULL) return -1;
     for (int k = 0; k < n; k++) {
         experiment_t *e = &exps[k];
-        if (viewer_cache_read(f, e, sizeof *e) != 0 || e->size < 0 || e->nframes < 0) {
+        if (viewer_cache_read(f, e, sizeof *e) != 0 || e->size < 0 || e->nframes < 0
+            || e->npix < 1 || e->npix > MAX_NPIX
+            || e->stride != PIX_START + 2 * e->npix + 2) {
             memset(e, 0, sizeof *e);
             free_experiments(exps, k);
             return -1;
@@ -1454,7 +1510,7 @@ static int read_cache(FILE *f, experiment_t **out)
         e->fr_ctr     = e->fr_off ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_ctr) : NULL;
         e->fr_tv      = e->fr_ctr ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_tv) : NULL;
         e->fr_ts      = e->fr_tv ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_ts) : NULL;
-        e->fr_bytes   = e->fr_ts ? viewer_cache_read_alloc(f, nf * FRAME_STRIDE) : NULL;
+        e->fr_bytes   = e->fr_ts ? viewer_cache_read_alloc(f, nf * (size_t) e->stride) : NULL;
         e->fr_bad     = e->fr_bytes ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_bad) : NULL;
         e->fr_spliced = e->fr_bad ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_spliced) : NULL;
         e->fr_unver   = e->fr_spliced ? viewer_cache_read_alloc(f, nf * sizeof *e->fr_unver) : NULL;
@@ -1582,6 +1638,160 @@ static void newer_note(const load_note_t *note, char *out, size_t n)
              "shift-F5 rebuilds them", note->newer, note->newer == 1 ? "" : "s", day);
 }
 
+// ---- bench recordings ------------------------------------------------------
+//
+// On the bench the MPI's ground-support equipment records the instrument as a
+// run of records, each a 12-byte header and then one MPI frame:
+//     0..3   sync 0A 0B 0C 0D
+//     4..5   record counter                       (big-endian uint16)
+//     6..11  when the GSE logged it, unix ms      (big-endian, 48 bits)
+//     12..   the frame, 0C FF FF 0C first
+// The frame is laid out as on the satellite -- 20 aux bytes, the pixels, the
+// CRC-16 -- but its pixel range is whatever the instrument was set to that day:
+// 65 pixels (48..112) as in flight, 133 (0..132), or 16 (70..85) among the 2025
+// files. So the frame's length is read off the spacing of the records rather
+// than assumed, the same in every record of a file. Frames from instrument
+// firmware 15 and 17 pass their own CRC; firmware 13's, in the files from
+// March to mid-May 2025, are an older layout and do not.
+#define GSE_SYNC        "\x0A\x0B\x0C\x0D"
+#define GSE_SYNC_LEN    4
+#define GSE_HEADER_LEN  12
+
+// Whether a GSE record carrying an MPI frame starts at byte p.
+static int gse_record_at(const uint8_t *d, long size, long p)
+{
+    return p + GSE_HEADER_LEN + MPI_SYNC_WORD_LEN <= size
+        && memcmp(d + p, GSE_SYNC, GSE_SYNC_LEN) == 0
+        && memcmp(d + p + GSE_HEADER_LEN, MPI_SYNC_WORD, MPI_SYNC_WORD_LEN) == 0;
+}
+
+// Build a bench recording as one experiment, its frames laid end to end as the
+// file the rest of the viewer reads, timed by the GSE's own clock. Returns 1, or
+// 0 having said why on stderr.
+static int build_gse_experiment(const char *path, const uint8_t *d, long size,
+                                experiment_t *out)
+{
+    // Every record start, and the length most records are apart: the record
+    // length. A record header can also turn up by chance inside pixel data, so
+    // the length is the commonest spacing, not the first one seen.
+    long *rec = NULL;
+    int nrec = 0, cap = 0;
+    for (long p = 0; p + GSE_HEADER_LEN + MPI_SYNC_WORD_LEN <= size; p++) {
+        if (!gse_record_at(d, size, p)) continue;
+        if (nrec == cap) {
+            cap = cap ? cap * 2 : 1024;
+            long *nr = (long *) realloc(rec, (size_t) cap * sizeof *rec);
+            if (nr == NULL) { free(rec); return 0; }
+            rec = nr;
+        }
+        rec[nrec++] = p;
+    }
+    long len_val[16] = {0};
+    int len_cnt[16] = {0}, nlen = 0;
+    for (int i = 1; i < nrec; i++) {
+        long L = rec[i] - rec[i - 1];
+        int j = 0;
+        while (j < nlen && len_val[j] != L) j++;
+        if (j == nlen) {
+            if (nlen == 16) continue;
+            len_val[nlen++] = L;
+        }
+        len_cnt[j]++;
+    }
+    long reclen = 0;
+    int best = 0;
+    for (int j = 0; j < nlen; j++)
+        if (len_cnt[j] > best) { best = len_cnt[j]; reclen = len_val[j]; }
+    if (nrec < MPI_MIN_SYNC || reclen == 0) {
+        fprintf(stderr, "mpi_viewer: %s holds %d bench record%s, too few to show\n",
+                path, nrec, nrec == 1 ? "" : "s");
+        free(rec);
+        return 0;
+    }
+    int flen = (int) (reclen - GSE_HEADER_LEN);
+    int npix = (flen - PIX_START - 2) / 2;
+    if (npix < 1 || npix > MAX_NPIX || PIX_START + 2 * npix + 2 != flen) {
+        fprintf(stderr, "mpi_viewer: %s: its bench records are %ld bytes apart, "
+                        "which holds no MPI frame\n", path, reclen);
+        free(rec);
+        return 0;
+    }
+
+    // The records that hold a whole frame, skipping any start that falls
+    // inside the record before it (a header seen in pixel data).
+    int n = 0;
+    long next = 0;
+    for (int i = 0; i < nrec; i++) {
+        if (rec[i] < next || rec[i] + reclen > size) continue;
+        rec[n++] = rec[i];
+        next = rec[i] + reclen;
+    }
+
+    memset(out, 0, sizeof *out);
+    out->stride = flen;
+    out->npix = npix;
+    out->bench = 1;
+    out->nframes = n;
+    out->size = (long) n * flen;
+    out->buf      = (uint8_t *) malloc((size_t) out->size);
+    out->present  = (uint8_t *) malloc((size_t) out->size);
+    out->verified = (uint8_t *) malloc((size_t) out->size);
+    out->fr_off   = (long *) malloc((size_t) n * sizeof(long));
+    out->fr_ctr   = (int *) malloc((size_t) n * sizeof(int));
+    out->fr_tv    = (int *) malloc((size_t) n * sizeof(int));
+    out->fr_ts    = (double *) malloc((size_t) n * sizeof(double));
+    out->fr_bad   = (int *) calloc((size_t) n, sizeof(int));
+    out->fr_unver = (int *) calloc((size_t) n, sizeof(int));
+    out->fr_gap   = (int *) calloc((size_t) n, sizeof(int));
+    out->fr_spliced = (int *) calloc((size_t) n, sizeof(int));
+    out->fr_bytes = (uint8_t *) malloc((size_t) out->size);
+    if (out->buf == NULL || out->present == NULL || out->verified == NULL
+        || out->fr_off == NULL || out->fr_ctr == NULL || out->fr_tv == NULL
+        || out->fr_ts == NULL || out->fr_bad == NULL || out->fr_unver == NULL
+        || out->fr_gap == NULL || out->fr_spliced == NULL || out->fr_bytes == NULL) {
+        fprintf(stderr, "mpi_viewer: out of memory reading %s\n", path);
+        free_experiment(out);
+        free(rec);
+        return 0;
+    }
+    // Read off disk, so every byte is there and none came from a failed packet.
+    memset(out->present, 1, (size_t) out->size);
+    memset(out->verified, 1, (size_t) out->size);
+
+    int good = 0;
+    for (int k = 0; k < n; k++) {
+        const uint8_t *h = d + rec[k];
+        memcpy(out->buf + (long) k * flen, h + GSE_HEADER_LEN, (size_t) flen);
+        memcpy(out->fr_bytes + (long) k * flen, h + GSE_HEADER_LEN, (size_t) flen);
+        out->fr_off[k] = (long) k * flen;
+        const uint8_t *f = frame_at(out, k);
+        out->fr_ctr[k] = be16(f, 4);
+        out->fr_tv[k]  = be16(f, 11);
+        double ms = 0.0;
+        for (int i = 6; i < GSE_HEADER_LEN; i++) ms = ms * 256.0 + h[i];
+        out->fr_ts[k] = ms;
+        out->fr_bad[k] = !frame_crc_ok(out, k);
+        if (!out->fr_bad[k]) good++;
+    }
+    if (good == 0) {
+        fprintf(stderr, "mpi_viewer: %s: none of its %d bench frames passes its own "
+                        "checksum -- instrument firmware %d, an older frame layout "
+                        "than this viewer reads\n", path, n, out->fr_bytes[8]);
+        free_experiment(out);
+        free(rec);
+        return 0;
+    }
+
+    out->t_start_ms = out->fr_ts[0];
+    out->t_end_ms = out->fr_ts[n - 1];
+    fmt_utc_s(out->t_start_ms, out->utc, sizeof out->utc);
+    out->recovered = out->size;
+    out->t_first_recv_ms = out->t_last_recv_ms = (double) time(NULL) * 1000.0;
+    snprintf(out->src_file, sizeof out->src_file, "%s", path);
+    free(rec);
+    return 1;
+}
+
 // Load one MPI science-data file from disk -- a file mpi_reconstruct wrote, or
 // one copied straight off the satellite -- as a single experiment. It goes
 // through the same build as a DB experiment, as one verified chunk spanning the
@@ -1604,12 +1814,6 @@ static int load_experiment_from_file(const char *path, experiment_t **out)
         fclose(f);
         return 0;
     }
-    if (size > BULK_FILE_MAX_PLAUSIBLE) {
-        fprintf(stderr, "mpi_viewer: %s is %ld bytes, larger than any MPI file "
-                        "the satellite can send\n", path, size);
-        fclose(f);
-        return 0;
-    }
     uint8_t *data = (uint8_t *) malloc((size_t) (size > 0 ? size : 1));
     if (data == NULL || (long) fread(data, 1, (size_t) size, f) != size) {
         fprintf(stderr, "mpi_viewer: cannot read %s\n", path);
@@ -1617,6 +1821,23 @@ static int load_experiment_from_file(const char *path, experiment_t **out)
         return 0;
     }
     fclose(f);
+
+    // A bench recording opens on a GSE record, and runs as long as the bench
+    // session did: the satellite's download limit has nothing to say about it.
+    if (gse_record_at(data, size, 0)) {
+        experiment_t *e = (experiment_t *) malloc(sizeof *e);
+        int ok = e != NULL && build_gse_experiment(path, data, size, e);
+        free(data);
+        if (!ok) { free(e); return 0; }
+        *out = e;
+        return 1;
+    }
+    if (size > BULK_FILE_MAX_PLAUSIBLE) {
+        fprintf(stderr, "mpi_viewer: %s is %ld bytes, larger than any MPI file "
+                        "the satellite can send\n", path, size);
+        free(data);
+        return 0;
+    }
 
     // There is no receive time to bound the markers with, so the clock does:
     // a recording cannot have been made after the file holding it was read.
@@ -1724,7 +1945,7 @@ typedef struct {
     int    clean_step;     // the step b comes back on at, and shift-B moves
     int    clean_win;      // images in the sliding background window (odd)
     int    clean_mean;     // background estimator: 0 = median, 1 = mean
-    float *clean_pix;      // nframes * NPIX cleaned counts, NULL until built
+    float *clean_pix;      // nframes * npix cleaned counts, NULL until built
     unsigned char *clean_ok;  // per frame: a cleaned value exists
     int   *key_fr;         // the frames that carried a background estimate
     int    n_key;
@@ -1947,10 +2168,10 @@ static double estimate_bg(double *v, int n, int use_mean)
 // read a couple of thousand, and one value in 65 does not move a median.
 static int frame_level(const experiment_t *s, int k)
 {
-    int p[NPIX];
+    int p[MAX_NPIX];
     const uint8_t *f = frame_at(s, k);
-    for (int j = 0; j < NPIX; j++) p[j] = be16(f, PIX_START + j * 2);
-    return median_int(p, NPIX);
+    for (int j = 0; j < s->npix; j++) p[j] = be16(f, PIX_START + j * 2);
+    return median_int(p, s->npix);
 }
 
 // Whether frame k is fit to stand as a background sample. Every byte of it has
@@ -2025,7 +2246,7 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
     if (s == NULL || s->nframes == 0 || v->fr_img == NULL || v->n_img == 0) return 0;
 
     int nf = s->nframes;
-    float *pix = (float *) malloc((size_t) nf * NPIX * sizeof *pix);
+    float *pix = (float *) malloc((size_t) nf * s->npix * sizeof *pix);
     unsigned char *ok = (unsigned char *) calloc((size_t) nf, 1);
     int *lvl = (int *) malloc((size_t) nf * sizeof *lvl);
     int *keys = (int *) malloc((size_t) nf * sizeof *keys);
@@ -2050,11 +2271,11 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
         if (s->fr_bad[k]) continue;
         const uint8_t *src = frame_at(s, k);
         const uint8_t *bg = cur >= 0 ? frame_at(s, cur) : NULL;
-        for (int j = 0; j < NPIX; j++) {
+        for (int j = 0; j < s->npix; j++) {
             double p = be16(src, PIX_START + j * 2);
             if (bg != NULL && cur != k)
                 p += (double) be16(bg, PIX_START + j * 2) - CLEAN_PEDESTAL;
-            pix[(long) k * NPIX + j] = (float) p;
+            pix[(long) k * s->npix + j] = (float) p;
         }
         ok[k] = 1;
         if (cur < 0) {
@@ -2083,11 +2304,11 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
     // estimate that never had one, come in a few hundred DN off the ranges
     // either side of them, which the whereogram shows as blocks that begin and
     // end where the estimates do.
-    if (v->clean_stage >= CLEAN_STEP2) {
-        const int ex[4] = { 0, 1, NPIX - 2, NPIX - 1 };
+    if (v->clean_stage >= CLEAN_STEP2 && s->npix >= 4) {
+        const int ex[4] = { 0, 1, s->npix - 2, s->npix - 1 };
         for (int k = 0; k < nf; k++) {
             if (!ok[k]) continue;
-            float *p = pix + (long) k * NPIX;
+            float *p = pix + (long) k * s->npix;
             double sx = 0.0, sy = 0.0;
             for (int i = 0; i < 4; i++) { sx += ex[i]; sy += (double) p[ex[i]]; }
             double mx = sx / 4.0, my = sy / 4.0;
@@ -2098,7 +2319,7 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
                 den += dx * dx;
             }
             double slope = num / den;
-            for (int j = 0; j < NPIX; j++) {
+            for (int j = 0; j < s->npix; j++) {
                 double fit = my + slope * ((double) j - mx);
                 p[j] = (float) ((double) p[j] - fit + CLEAN_PEDESTAL);
             }
@@ -2121,7 +2342,7 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
     // the 0 V dwell read back, which is the background measured with no ion
     // signal on it.
     int *first = (int *) malloc((size_t) v->n_img * sizeof *first);
-    double *bgest = (double *) malloc((size_t) v->n_img * NPIX * sizeof *bgest);
+    double *bgest = (double *) malloc((size_t) v->n_img * s->npix * sizeof *bgest);
     unsigned char *have = (unsigned char *) calloc((size_t) v->n_img, 1);
     if (first == NULL || bgest == NULL || have == NULL) {
         free(first); free(bgest); free(have); free(pix); free(ok); free(keys);
@@ -2148,9 +2369,9 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
         have[i] = ns > 0;
         if (ns < width) v->bg_short++;
         double win[CLEAN_WIN_MAX];
-        for (int j = 0; j < NPIX; j++) {
-            for (int q = 0; q < ns; q++) win[q] = pix[(long) src[q] * NPIX + j];
-            bgest[(long) i * NPIX + j] = ns > 0 ? estimate_bg(win, ns, v->clean_mean) : 0.0;
+        for (int j = 0; j < s->npix; j++) {
+            for (int q = 0; q < ns; q++) win[q] = pix[(long) src[q] * s->npix + j];
+            bgest[(long) i * s->npix + j] = ns > 0 ? estimate_bg(win, ns, v->clean_mean) : 0.0;
         }
     }
     free(first);
@@ -2169,10 +2390,10 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
         int use = im;
         if (use < 0 || use >= v->n_img) use = last < 0 ? 0 : last;
         if (!have[use]) { ok[k] = 0; continue; }
-        for (int j = 0; j < NPIX; j++) {
-            double p = (double) pix[(long) k * NPIX + j]
-                     - bgest[(long) use * NPIX + j] + CLEAN_PEDESTAL;
-            pix[(long) k * NPIX + j] = (float) p;
+        for (int j = 0; j < s->npix; j++) {
+            double p = (double) pix[(long) k * s->npix + j]
+                     - bgest[(long) use * s->npix + j] + CLEAN_PEDESTAL;
+            pix[(long) k * s->npix + j] = (float) p;
         }
         v->clean_frames++;
     }
@@ -2189,7 +2410,7 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
 // frame_shown() has passed -- that is what says there is a cleaned value here.
 static double pix_val(const view_t *v, const experiment_t *s, int k, int j)
 {
-    if (v->clean_stage != CLEAN_OFF) return v->clean_pix[(long) k * NPIX + j];
+    if (v->clean_stage != CLEAN_OFF) return v->clean_pix[(long) k * s->npix + j];
     return be16(frame_at(s, k), PIX_START + j * 2);
 }
 
@@ -2231,12 +2452,12 @@ static void auto_window(double *val, long n, int *lo, int *hi)
 // from.
 static void compute_session_extent(view_t *v, const experiment_t *s)
 {
-    double *val = (double *) malloc((size_t) s->nframes * NPIX * sizeof *val);
+    double *val = (double *) malloc((size_t) s->nframes * s->npix * sizeof *val);
     long n = 0;
     if (val != NULL)
         for (int k = 0; k < s->nframes; k++) {
             if (s->fr_bad[k] || !frame_shown(v, s, k)) continue;
-            for (int j = 0; j < NPIX; j++) val[n++] = pix_val(v, s, k, j);
+            for (int j = 0; j < s->npix; j++) val[n++] = pix_val(v, s, k, j);
         }
     auto_window(val, n, &v->sess_min, &v->sess_max);
     free(val);
@@ -2627,11 +2848,11 @@ static void wg_cols_of_slot(long q, long q0, long n, int w, int *c0, int *c1)
 // The other direction, for turning a pointer position back into an image: the
 // file offset of a slot drawn in column col -- the last of them, when several
 // share it.
-static long wg_byte_of_col(long q0, long n, int w, int col)
+static long wg_byte_of_col(long q0, long n, int w, int col, int stride)
 {
     if (col < 0) col = 0;
     if (col > w - 1) col = w - 1;
-    return (q0 + ((long) (col + 1) * n - 1) / w) * FRAME_STRIDE;
+    return (q0 + ((long) (col + 1) * n - 1) / w) * stride;
 }
 
 // The whole recording at a glance: every frame a column of its 65 pixels, time
@@ -2673,12 +2894,12 @@ static void build_whereogram(const view_t *v, const experiment_t *s,
 {
     // Which frame, if any, begins in each frame-sized slice of the stretch.
     int *at = (int *) malloc((size_t) n * sizeof *at);
-    double *val = (double *) calloc((size_t) w * NPIX, sizeof *val);
+    double *val = (double *) calloc((size_t) w * s->npix, sizeof *val);
     int *nsum = (int *) calloc((size_t) w, sizeof *nsum);
     if (at == NULL || val == NULL || nsum == NULL) { free(at); free(val); free(nsum); return; }
     for (long q = 0; q < n; q++) at[q] = -1;
     for (int k = 0; k < s->nframes; k++) {
-        long q = s->fr_off[k] / FRAME_STRIDE - q0;
+        long q = s->fr_off[k] / s->stride - q0;
         if (q >= 0 && q < n) at[q] = k;
     }
     memset(missing, 0, (size_t) w);
@@ -2689,7 +2910,7 @@ static void build_whereogram(const view_t *v, const experiment_t *s,
         wg_cols_of_slot(q0 + q, q0, n, w, &c0, &c1);
 
         int gap = 0;
-        long b0 = (q0 + q) * FRAME_STRIDE, b1 = b0 + FRAME_STRIDE;
+        long b0 = (q0 + q) * s->stride, b1 = b0 + s->stride;
         if (b1 > s->size) b1 = s->size;
         for (long b = b0; b < b1; b++)
             if (!s->present[b]) { gap = 1; break; }
@@ -2702,7 +2923,7 @@ static void build_whereogram(const view_t *v, const experiment_t *s,
         for (int c = c0; c < c1 && c < w; c++) {
             if (gap) missing[c] = 1;
             if (!use) continue;
-            for (int j = 0; j < NPIX; j++) val[(long) j * w + c] += pix_val(v, s, k, j);
+            for (int j = 0; j < s->npix; j++) val[(long) j * w + c] += pix_val(v, s, k, j);
             nsum[c]++;
         }
     }
@@ -2711,7 +2932,7 @@ static void build_whereogram(const view_t *v, const experiment_t *s,
     // Second pass: average and paint it.
     if (hi <= lo) hi = lo + 1;
     for (int c = 0; c < w; c++)
-        for (int j = 0; j < NPIX; j++) {
+        for (int j = 0; j < s->npix; j++) {
             long i = (long) j * w + c;
             if (nsum[c] == 0) { pix[i] = MPI_BG; continue; }
             double p = val[i] / nsum[c];
@@ -2751,7 +2972,7 @@ static int image_slot_span(const view_t *v, const experiment_t *s, int img,
     long q0 = -1, q1 = -1;
     for (int k = 0; k < s->nframes; k++) {
         if (v->fr_img == NULL || v->fr_img[k] != img) continue;
-        long q = s->fr_off[k] / FRAME_STRIDE;
+        long q = s->fr_off[k] / s->stride;
         if (q0 < 0 || q < q0) q0 = q;
         if (q1 < 0 || q > q1) q1 = q;
     }
@@ -2770,7 +2991,7 @@ static int image_nearest_byte(const view_t *v, const experiment_t *s, long byte)
         if (v->fr_img == NULL || v->fr_img[k] < 0) continue;
         long o = s->fr_off[k];
         long d = byte < o ? o - byte
-               : byte >= o + FRAME_STRIDE ? byte - (o + FRAME_STRIDE - 1) : 0;
+               : byte >= o + s->stride ? byte - (o + s->stride - 1) : 0;
         if (best < 0 || d < best_d) { best = v->fr_img[k]; best_d = d; }
         if (d == 0) break;
     }
@@ -3066,7 +3287,7 @@ static int parse_args(mv_args_t *a, int argc, char **argv, int help)
         // expands ~ and TAB-completes the path; the --file=<path> spelling is
         // rejected with a hint, as simple_sat_ops does for its own.
         if (strcmp(arg, "--file") == 0 || help) {
-            if (help) parse_help_line(OPTW, "--file <path>", "show this one MPI science-data file instead of the DB's experiments");
+            if (help) parse_help_line(OPTW, "--file <path>", "show this one MPI science-data file (or bench recording) instead of the DB's experiments");
             else {
                 // arg is argv[t + 1]; its value is the next token,
                 // argv[t + 2]. Consume it and step t past it.
@@ -3120,7 +3341,10 @@ static int parse_args(mv_args_t *a, int argc, char **argv, int help)
                "DB's experiments, and F5 re-reads the file; the cache is not used.\n"
                "The DB (--db, else the default) is then only read for the globe's\n"
                "TLEs and attitudes. A file records no missing bytes, so every byte\n"
-               "counts as received and d has nothing to re-download.\n"
+               "counts as received and d has nothing to re-download. A bench\n"
+               "recording from the MPI's ground-support equipment\n"
+               "(FrontierSat_<time>Z.bin) works too, at whatever pixel range it\n"
+               "was taken with, timed by the bench clock and with no orbit drawn.\n"
                "\n"
                "Keys:\n"
                "  b          show the cleaned imagery -- the instrument's own background\n"
@@ -3206,7 +3430,8 @@ int main(int argc, char **argv)
                    (e->t_end_ms - e->t_start_ms) / 60000.0);
             if (e->src_file[0] != '\0') printf("  read from : %s\n", e->src_file);
             printf("  file      : %ld bytes (%s)\n", e->size,
-                   e->src_file[0] != '\0' ? "length of the file on disk"
+                   e->bench ? "its frames, bench record headers taken out"
+                   : e->src_file[0] != '\0' ? "length of the file on disk"
                    : e->size_from_log
                        ? (e->size_exact ? "satellite-reported length"
                                         : "satellite-reported minimum")
@@ -3215,6 +3440,17 @@ int main(int argc, char **argv)
                    e->recovered, 100.0 * (double) e->recovered / (double) e->size,
                    e->size - e->recovered);
             printf("  unverified: %ld bytes from packets whose CRC failed\n", e->unverified);
+            // The pixel range is commanded, so say what this recording's was.
+            {
+                int first = -1;
+                for (int f = 0; f < e->nframes && first < 0; f++)
+                    if (!e->fr_bad[f]) first = e->fr_bytes[(long) f * e->stride + 16];
+                if (first >= 0)
+                    printf("  pixels    : %d a frame, %d .. %d (%d-byte frames)\n",
+                           e->npix, first, first + e->npix - 1, e->stride);
+                else
+                    printf("  pixels    : %d a frame (%d-byte frames)\n", e->npix, e->stride);
+            }
             printf("  frames    : %d", e->nframes);
             int nunver = 0, nbad = 0;
             for (int f = 0; f < e->nframes; f++) {
@@ -3297,12 +3533,12 @@ int main(int argc, char **argv)
     globe_set_font(g_ui_font, g_ui_font_loaded, g_ui_font_spacing);
 
     // A fixed texture holding the image rotated 90 CW: the scan rows become
-    // columns (width MAX_FPI) and the 65 pixels become rows (height NPIX). We
-    // fill the top-left fpi x NPIX region and let raylib scale it with
+    // columns (width MAX_FPI) and the pixels become rows (height MAX_NPIX). We
+    // fill the top-left fpi x npix region and let raylib scale it with
     // nearest-neighbour (POINT) filtering. Full colour rather than grey so the
     // colour map applies here as well as to the whereogram.
-    Color imgbuf[MAX_FPI * NPIX] = {0};
-    Image gimg = { .data = imgbuf, .width = MAX_FPI, .height = NPIX,
+    Color imgbuf[MAX_FPI * MAX_NPIX] = {0};
+    Image gimg = { .data = imgbuf, .width = MAX_FPI, .height = MAX_NPIX,
                    .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
     Texture2D tex = LoadTextureFromImage(gimg);
     SetTextureFilter(tex, TEXTURE_FILTER_POINT);
@@ -3339,12 +3575,13 @@ int main(int argc, char **argv)
     char  status[200] = "";
     float status_left = 0.0f;
 
-    // The whereogram: one texture column per run of frames, NPIX rows, rebuilt
+    // The whereogram: one texture column per run of frames, npix rows, rebuilt
     // when the experiment, the colour map, the scale, the stretch on show or
     // the panel width change.
     Color    *cov_pix = NULL;
     Texture2D cov_tex = {0};
-    int cov_w = 0, cov_valid = 0;
+    // cov_h is the pixel rows it was built for, which a bench file can change.
+    int cov_w = 0, cov_h = 0, cov_valid = 0;
     unsigned cov_sig = 0;
     unsigned char *wg_missing = NULL;   // per column: some of its bytes never came down, or a frame was dropped
     // How much of the recording the whereogram shows, in frame-sized slots:
@@ -3603,8 +3840,16 @@ int main(int argc, char **argv)
 
         // A different experiment is a different orbit, a different piece of
         // ground track and a different Sun.
-        if (strcmp(globe.track_key, s->utc) != 0)
+        // A bench recording was made on the ground, so it has no track: any
+        // element set would be propagated to a time the satellite was not up.
+        if (strcmp(globe.track_key, s->utc) != 0) {
             globe_set_track(&globe, s->utc, s->t_start_ms, s->t_end_ms);
+            if (s->bench) {
+                globe.ntrk = 0;
+                globe.have_tle = 0;
+                snprintf(globe.tle_note, sizeof globe.tle_note, "bench recording: no orbit");
+            }
+        }
 
         // Pull the list back to the selected row when the selection moves, and
         // keep whatever the reader scrolled to when it does not.
@@ -3635,29 +3880,33 @@ int main(int argc, char **argv)
         if (v.scale_mode == SCALE_AUTO_SESSION) { lo = v.sess_min; hi = v.sess_max; }
         else if (v.scale_mode == SCALE_AUTO_IMAGE) {
             // An image holds one frame a column, so at most MAX_FPI of them.
-            double vals[MAX_FPI * NPIX];
+            double vals[MAX_FPI * MAX_NPIX];
             long n = 0;
-            for (int k = 0; k < s->nframes && n + NPIX <= MAX_FPI * NPIX; k++) {
+            for (int k = 0; k < s->nframes && n + s->npix <= MAX_FPI * MAX_NPIX; k++) {
                 if (v.fr_img == NULL || v.fr_img[k] != v.img_pos) continue;
                 if (!frame_shown(&v, s, k)) continue;
-                for (int j = 0; j < NPIX; j++) vals[n++] = pix_val(&v, s, k, j);
+                for (int j = 0; j < s->npix; j++) vals[n++] = pix_val(&v, s, k, j);
             }
             auto_window(vals, n, &lo, &hi);
         }
 
         // ---- rasterise the image into the grayscale texture ----
-        for (int q = 0; q < MAX_FPI * NPIX; q++) imgbuf[q] = MPI_BG;
+        for (int q = 0; q < MAX_FPI * MAX_NPIX; q++) imgbuf[q] = MPI_BG;
         double frame_time = -1.0;
         int rep_frame = -1, cols_present = 0;
+        // The frame in each column, for the dome-voltage table; -1 = none.
+        int col_frame[MAX_FPI];
+        for (int c = 0; c < MAX_FPI; c++) col_frame[c] = -1;
         for (int k = 0; k < s->nframes; k++) {
             if (v.fr_img == NULL || v.fr_img[k] != v.img_pos) continue;
             int col = col_of(&v, s, k);
             if (col < 0 || col >= v.ncols) continue;
             if (rep_frame < 0) rep_frame = k;
+            if (col_frame[col] < 0) col_frame[col] = k;
             if (s->fr_ts[k] >= 0 && (frame_time < 0 || s->fr_ts[k] < frame_time)) frame_time = s->fr_ts[k];
             if (!frame_shown(&v, s, k)) continue;
             cols_present++;
-            for (int j = 0; j < NPIX; j++) {
+            for (int j = 0; j < s->npix; j++) {
                 double p = pix_val(&v, s, k, j);
                 int g = p <= lo ? 0 : p >= hi ? 255 : (int) (255.0 * (p - lo) / (hi - lo));
                 // Column = bias voltage (background left, most negative right); pixel -> row.
@@ -3746,19 +3995,55 @@ int main(int argc, char **argv)
         // the image
         int iy = ry + 64;
         // On screen the width is the bias-voltage columns, the height the pixels.
-        int dw = v.ncols * v.zoom, dh = NPIX * v.zoom;
-        Rectangle src = { 0, 0, (float) v.ncols, (float) NPIX };
+        int dw = v.ncols * v.zoom, dh = s->npix * v.zoom;
+        Rectangle src = { 0, 0, (float) v.ncols, (float) s->npix };
         Rectangle dst = { (float) rx, (float) iy, (float) dw, (float) dh };
         DrawRectangleLines(rx - 1, iy - 1, dw + 2, dh + 2,
                            img_unver ? (Color){ 206, 150, 42, 255 } : (Color){ 70, 70, 80, 255 });
         DrawTexturePro(tex, src, dst, (Vector2){ 0, 0 }, 0.0f, WHITE);
+
+        // Beside the image, the dome voltage each of its frames was taken at,
+        // one row per column, frame 1 at the top being the image's left
+        // column: the commanded setpoint and the instrument's own measurement
+        // of it (aux bytes 11-12 and 14-15). Both are read from the frame
+        // BEFORE the one in the column, the same one-frame lag col_of places
+        // the frame by: the measurement is stamped with the aux, by which time
+        // the dome has moved on to the next setpoint, and it follows that
+        // setpoint -- it reads about 3953 in every frame whose own aux says
+        // 0 V and about 3921 at every other setpoint (07-21 and 08-09). col_of
+        // has already checked that frame before is there and sound.
+        int tx = rx + dw + 24, ty = iy;
+        int tw_num = text_width("00", 13), tw_val = text_width("00000", 13);
+        int tx_set = tx + tw_num + 16, tx_meas = tx_set + tw_val + 16;
+        int tab_w = tx_meas + tw_val - tx;
+        draw_text("Dome voltage", tx, ty, 15, RAYWHITE); ty += 20;
+        draw_text("#", tx + tw_num - text_width("#", 12), ty, 12, GRAY);
+        draw_text("set", tx_set + tw_val - text_width("set", 12), ty, 12, GRAY);
+        draw_text("meas", tx_meas + tw_val - text_width("meas", 12), ty, 12, GRAY);
+        ty += 17;
+        for (int c = 0; c < v.ncols; c++, ty += 16) {
+            const char *num = TextFormat("%d", c + 1);
+            draw_text(num, tx + tw_num - text_width(num, 13), ty, 13, GRAY);
+            if (col_frame[c] < 1) {
+                draw_text("--", tx_set + tw_val - text_width("--", 13), ty, 13, GRAY);
+                draw_text("--", tx_meas + tw_val - text_width("--", 13), ty, 13, GRAY);
+                continue;
+            }
+            const uint8_t *pf = frame_at(s, col_frame[c] - 1);
+            const char *set = TextFormat("%d", be16(pf, 11));
+            draw_text(set, tx_set + tw_val - text_width(set, 13), ty, 13, LIGHTGRAY);
+            const char *meas = TextFormat("%d", be16(pf, 14));
+            draw_text(meas, tx_meas + tw_val - text_width(meas, 13), ty, 13, RAYWHITE);
+        }
+
+        // Under the image, or under the table when that runs longer.
         if (img_unver)
             draw_text(TextFormat("UNVERIFIED  %d of %d frames rest on packets whose CRC failed",
                                  img_unver_frames, img_frames),
-                      rx, iy + dh + 8, 14, (Color){ 206, 150, 42, 255 });
+                      rx, (iy + dh > ty ? iy + dh : ty) + 8, 14, (Color){ 206, 150, 42, 255 });
 
-        // aux panel to the right of the image
-        int ax = rx + dw + 30;
+        // aux panel to the right of the image and its table
+        int ax = tx + tab_w + 30;
         if (ax < LEFT_W + 360) ax = LEFT_W + 360;
         int ay = iy;
         draw_text("Aux data", ax, ay, 18, RAYWHITE); ay += 26;
@@ -3859,7 +4144,7 @@ int main(int argc, char **argv)
             // and the stretch stays centred on the playback head -- except
             // while a scrub is under way, which has to read the pointer against
             // the panel it pressed on, not one sliding along under it.
-            long nslot = s->size / FRAME_STRIDE;
+            long nslot = s->size / s->stride;
             if (nslot < 1) nslot = 1;
             if (v.sel != wg_sel) { wg_span = 0; wg_sel = v.sel; }
             {
@@ -3905,16 +4190,16 @@ int main(int argc, char **argv)
             sig = sig * 31u + (unsigned) hi;
             sig = sig * 31u + (unsigned) wg_q0;
             sig = sig * 31u + (unsigned) span;
-            if (cw != cov_w) {
-                Color *np = (Color *) realloc(cov_pix, (size_t) cw * NPIX * sizeof *cov_pix);
+            if (cw != cov_w || s->npix != cov_h) {
+                Color *np = (Color *) realloc(cov_pix, (size_t) cw * s->npix * sizeof *cov_pix);
                 unsigned char *nm = (unsigned char *) realloc(wg_missing, (size_t) cw);
                 if (np != NULL && nm != NULL) {
-                    cov_pix = np; wg_missing = nm; cov_w = cw;
+                    cov_pix = np; wg_missing = nm; cov_w = cw; cov_h = s->npix;
                     if (cov_tex.id != 0) UnloadTexture(cov_tex);
                     build_whereogram(&v, s, v.cmap, lo, hi, cov_pix, cov_w, wg_missing,
                                      wg_q0, span);
                     cov_sig = sig; cov_valid = 1;
-                    Image ci = { .data = cov_pix, .width = cov_w, .height = NPIX,
+                    Image ci = { .data = cov_pix, .width = cov_w, .height = s->npix,
                                  .mipmaps = 1, .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
                     cov_tex = LoadTextureFromImage(ci);
                     SetTextureFilter(cov_tex, TEXTURE_FILTER_POINT);
@@ -3926,7 +4211,7 @@ int main(int argc, char **argv)
                 UpdateTexture(cov_tex, cov_pix);
             }
             if (cov_tex.id != 0) {
-                Rectangle wsrc = { 0, 0, (float) cov_w, (float) NPIX };
+                Rectangle wsrc = { 0, 0, (float) cov_w, (float) s->npix };
                 Rectangle wdst = { (float) ax, (float) ay, (float) cw, (float) ch };
                 DrawTexturePro(cov_tex, wsrc, wdst, (Vector2){ 0, 0 }, 0.0f, WHITE);
                 DrawRectangleLines(ax - 1, ay - 1, cw + 2, ch + 2, (Color){ 70, 70, 80, 255 });
@@ -4003,7 +4288,7 @@ int main(int argc, char **argv)
                 if (m.x >= ax && m.x < ax + cw && m.y >= ay && m.y < ay + ch) {
                     cov_drag = 1;
                     cov_anchor = wg_byte_of_col(wg_q0, span, cov_w,
-                                                ((int) m.x - ax) * cov_w / cw);
+                                                ((int) m.x - ax) * cov_w / cw, s->stride);
                 }
             }
             if (cov_drag && v.n_img > 0) {
@@ -4011,7 +4296,7 @@ int main(int argc, char **argv)
                 int mx = (int) m.x - ax;
                 if (mx < 0) mx = 0;
                 if (mx > cw - 1) mx = cw - 1;
-                long here = wg_byte_of_col(wg_q0, span, cov_w, mx * cov_w / cw);
+                long here = wg_byte_of_col(wg_q0, span, cov_w, mx * cov_w / cw, s->stride);
                 int img = image_nearest_byte(&v, s, here);
                 if (img >= 0) { v.img_pos = img; v.playing = 0; }
 
@@ -4023,7 +4308,7 @@ int main(int argc, char **argv)
                 // where nothing came down costs no time, the same way it takes
                 // up no columns.
                 int ac0, ac1;
-                wg_cols_of_slot(cov_anchor / FRAME_STRIDE, wg_q0, span, cov_w, &ac0, &ac1);
+                wg_cols_of_slot(cov_anchor / s->stride, wg_q0, span, cov_w, &ac0, &ac1);
                 int rx0 = ax + ac0 * cw / cov_w;
                 int rx1 = ax + mx;
                 if (rx1 < rx0) { int t = rx0; rx0 = rx1; rx1 = t; }
