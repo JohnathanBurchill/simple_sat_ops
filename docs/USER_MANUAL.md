@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`3dec72e` (2026-11-02). This is a working draft.
+`36e1cff` (2026-11-05). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -3046,6 +3046,20 @@ not follow the sweep. On the bench in May 2025 it did, about 246 counts a step,
 from 435 at setpoint 4095 to 3640 at 57343, and about 3960 at 0 V - so in
 flight it reads close to its 0 V level at every setpoint.
 
+**Frame by frame (`shift-Left`/`shift-Right`, `F2`).** `shift-Right` and
+`shift-Left` step one frame - one column - at a time instead of one image,
+running on into the next image past the last column, and `shift-Space` plays
+that way, the `,`/`.` speed then counting frames a second instead of images.
+`F2` turns fine stepping on, so the arrows and `Space` go a frame at a time
+without `Shift`. The frame you are on stands out: every other column of the
+image is dimmed, a caret over the image marks its column, its row in the
+dome-voltage table is lit, the title reads `frame n / N`, and the time, the
+globe's dot and the aux panel are that frame's own. The steps go through
+columns rather than only the frames that came down, so playback keeps the
+recording's pace and a missing frame takes its turn as an empty column (the
+aux panel says `no frame in this column`). With fine stepping off, a plain
+arrow or `Space` goes back to whole images.
+
 **Cleaned imagery (`b`).** The MPI subtracts a background of its own in the
 FPGA, and `b` undoes that and puts a better one in its place, for the image and
 the whereogram together. `b` turns it on and off; **`shift-B`, while it is on,
@@ -3242,7 +3256,8 @@ globe stays at the 2048-pixel map however far in you go.
 
 **What it remembers between sessions.** On exit the viewer writes
 `~/.local/state/simple_sat_ops/mpi_viewer.state` - which experiment was open,
-where the playhead sat in it, the favourites and whether the list shows only
+where the playhead sat in it (and the frame it was on, stepping a frame at a
+time, and whether fine stepping was on), the favourites and whether the list shows only
 them, the cleaning stage and its window and estimator, the colour map, the colour scale and its manual DN window, the playback speed,
 the frames-per-sweep override, the zoom, the globe's view (where it faces, its
 zoom and where the disc sits), and the size and place of the window -
@@ -3259,7 +3274,9 @@ not carry keeps its built-in default, so a file written by another build is
 still worth reading.
 
 Keys: `Up`/`Down` change experiment, `Left`/`Right` scrub images (or click or
-drag the whereogram to scrub, which also rules off the time it spans, and scroll over it to zoom), `Space` plays/pauses, `,`/`.`
+drag the whereogram to scrub, which also rules off the time it spans, and scroll over it to zoom), `Space` plays/pauses,
+`shift-Left`/`shift-Right` step a frame at a time and `shift-Space` plays that
+way, `F2` turns fine stepping on for the plain keys, `,`/`.`
 set the playback speed, `f` cycles frames-per-image (auto/8/16), `s` zoom, `a` cycles the colour scale (auto-image / auto-experiment
 / manual), `r` resets it to auto-image, `z`/`x` and `c`/`v` move the manual DN
 window (hold `Shift` for coarse steps), `m` cycles the colour map, `b` toggles

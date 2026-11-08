@@ -105,6 +105,18 @@
     it follows the sweep, from about 435 at setpoint 4095 to 3640 at 57343
     and 3960 at 0 V.
 
+    Frame by frame: shift-Left and shift-Right step one frame -- one column --
+    at a time instead of one image, running on into the next image past the
+    last column, and shift-Space plays that way, at the same speed setting
+    read as frames a second. F2 turns fine stepping on so the arrows and Space
+    do it without shift. The frame stepped to stands out: every other column
+    of the image is dimmed, a caret over the image marks its column, its row
+    in the dome-voltage table is lit, and the time, the globe's dot and the
+    aux panel are that frame's own. Steps go through columns, not only the
+    frames that came down, so a missing frame takes its turn as an empty
+    column. A plain arrow or Space with fine stepping off goes back to whole
+    images.
+
     Aux frame layout (authoritative, from the MPI storeTelemetryAuxData packer):
         0..3   sync word 0C FF FF 0C
         4..5   frame counter                 (big-endian uint16)
@@ -1941,6 +1953,8 @@ typedef struct {
     int    playing;
     float  ips;
     float  accum;
+    int    fine;           // fine stepping on (F2): the arrows and playback go a frame at a time
+    int    cur_col;        // the column a frame at a time is on, -1 when stepping whole images
     int    clean_stage;    // how much of the cleaning to apply (see the stage enum)
     int    clean_step;     // the step b comes back on at, and shift-B moves
     int    clean_win;      // images in the sliding background window (odd)
@@ -2490,10 +2504,34 @@ static void select_experiment(view_t *v, const experiment_t *s)
 {
     v->img_pos = 0;
     v->playing = 0;
+    v->cur_col = v->fine ? 0 : -1;
     apply_scan(v, s);
     rebuild_image_list(v, s);
     if (v->clean_stage == CLEAN_OFF) compute_session_extent(v, s);
     else set_clean(v, s, v->clean_stage);
+}
+
+// One frame on (dir +1) or back (-1): the next column of the image, and past
+// its last column the first of the next image. It steps through columns, not
+// only the frames that came down, so playing a frame at a time keeps the
+// recording's own pace and a missing frame is passed over in its turn. The
+// first step from a whole image picks out its first column (or its last,
+// stepping back) rather than moving. wrap goes from the last frame of the
+// recording back to the first, for playback; stepping by hand stops there.
+static void step_frame(view_t *v, int dir, int wrap)
+{
+    if (v->n_img == 0) return;
+    if (v->cur_col < 0) { v->cur_col = dir > 0 ? 0 : v->ncols - 1; return; }
+    int c = v->cur_col + dir;
+    if (c >= v->ncols) {
+        if (v->img_pos < v->n_img - 1) { v->img_pos++; c = 0; }
+        else if (wrap)                 { v->img_pos = 0; c = 0; }
+        else c = v->ncols - 1;
+    } else if (c < 0) {
+        if (v->img_pos > 0) { v->img_pos--; c = v->ncols - 1; }
+        else c = 0;
+    }
+    v->cur_col = c;
 }
 
 // ---- TTF font (pattern from decode_inspector.c / ~/src/ved) ----------------
@@ -3113,6 +3151,11 @@ static void load_state(view_t *v, char *sel_utc, size_t utc_cap, geom_t *g,
             v->img_pos = n < 0 ? 0 : n;
         else if (strcmp(key, "playing") == 0)
             v->playing = n != 0;
+        else if (strcmp(key, "fine_step") == 0)
+            v->fine = n != 0;
+        // Checked against the image width once the experiment is open.
+        else if (strcmp(key, "frame_column") == 0)
+            v->cur_col = n < 0 ? -1 : n;
         else if (strcmp(key, "images_per_second") == 0) {
             double r = atof(val);
             v->ips = (float) (r < 1.0 ? 1.0 : r > 60.0 ? 60.0 : r);
@@ -3192,6 +3235,8 @@ static int save_state(const view_t *v, const experiment_t *s, const geom_t *g,
     fprintf(f, "experiment = %s\n", s->utc);
     fprintf(f, "image = %d\n", v->img_pos);
     fprintf(f, "playing = %d\n", v->playing);
+    fprintf(f, "fine_step = %d\n", v->fine);
+    fprintf(f, "frame_column = %d\n", v->cur_col);
     fprintf(f, "images_per_second = %g\n", (double) v->ips);
     fprintf(f, "frames_per_sweep = %d\n", v->fpi_override);
     fprintf(f, "zoom = %d\n", v->zoom);
@@ -3347,6 +3392,10 @@ static int parse_args(mv_args_t *a, int argc, char **argv, int help)
                "was taken with, timed by the bench clock and with no orbit drawn.\n"
                "\n"
                "Keys:\n"
+               "  shift-Left/Right  step a frame at a time instead of an image,\n"
+               "             dimming the rest of the image; shift-Space plays that way\n"
+               "  F2         fine stepping: the arrows and Space go a frame at a time\n"
+               "             without shift\n"
                "  b          show the cleaned imagery -- the instrument's own background\n"
                "             subtraction undone, every frame detrended across its own\n"
                "             edge pixels, and a sliding local background put in place\n"
@@ -3484,6 +3533,7 @@ int main(int argc, char **argv)
     v.dn_min = 1800; v.dn_max = 2300;
     v.clean_win = 5;
     v.clean_step = CLEAN_FULL;
+    v.cur_col = -1;
 
     // What the last session left, over those defaults. The view settings have
     // to be in place before the experiment is selected, since the scan period
@@ -3497,7 +3547,7 @@ int main(int argc, char **argv)
     favs_t fv;
     memset(&fv, 0, sizeof fv);
     load_state(&v, sel_utc, sizeof sel_utc, &geom, &globe, &fv);
-    int saved_img = v.img_pos, saved_play = v.playing;
+    int saved_img = v.img_pos, saved_play = v.playing, saved_col = v.cur_col;
     // The rows the list shows: every experiment, or only the favourites. A
     // favourites-only list with none of them in this database shows them all.
     int *rows = (int *) malloc((size_t) nexp * sizeof(int));
@@ -3518,6 +3568,7 @@ int main(int argc, char **argv)
     if (resumed >= 0) {
         v.img_pos = saved_img >= v.n_img ? (v.n_img ? v.n_img - 1 : 0) : saved_img;
         v.playing = saved_play;
+        if (saved_col >= 0) v.cur_col = saved_col < v.ncols ? saved_col : v.ncols - 1;
         fprintf(stderr, "mpi_viewer: resuming %s UTC at image %d of %d.\n",
                 exps[v.sel].utc, v.img_pos + 1, v.n_img);
     }
@@ -3644,15 +3695,41 @@ int main(int argc, char **argv)
         int srow = row_of(rows, nrows, v.sel);
         if (key_repeat(KEY_DOWN, &rep_down) && srow < nrows - 1) { v.sel = rows[srow + 1]; select_experiment(&v, &exps[v.sel]); s = &exps[v.sel]; }
         if (key_repeat(KEY_UP, &rep_up)     && srow > 0)         { v.sel = rows[srow - 1]; select_experiment(&v, &exps[v.sel]); s = &exps[v.sel]; }
-        if (key_repeat(KEY_RIGHT, &rep_right) && v.img_pos < v.n_img - 1) v.img_pos++;
-        if (key_repeat(KEY_LEFT, &rep_left)   && v.img_pos > 0)           v.img_pos--;
-        if (IsKeyPressed(KEY_SPACE)) v.playing = !v.playing;
+        // Left and Right step an image at a time. With shift held, or with
+        // fine stepping on (F2), they step a frame at a time instead, and the
+        // frame they are on stands out in the image. Stepping a whole image
+        // again lets go of the frame.
+        int shifted_lr = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+        int by_frame = v.fine || shifted_lr;
+        if (key_repeat(KEY_RIGHT, &rep_right)) {
+            if (by_frame) step_frame(&v, +1, 0);
+            else { if (v.img_pos < v.n_img - 1) v.img_pos++; v.cur_col = -1; }
+        }
+        if (key_repeat(KEY_LEFT, &rep_left)) {
+            if (by_frame) step_frame(&v, -1, 0);
+            else { if (v.img_pos > 0) v.img_pos--; v.cur_col = -1; }
+        }
+        // Space starts playback the same way: a frame at a time with shift or
+        // fine stepping, else an image at a time. Pausing leaves the frame
+        // where it stopped.
+        if (IsKeyPressed(KEY_SPACE)) {
+            v.playing = !v.playing;
+            if (v.playing) {
+                if (!by_frame) v.cur_col = -1;
+                else if (v.cur_col < 0) v.cur_col = 0;
+            }
+        }
+        if (IsKeyPressed(KEY_F2)) {
+            v.fine = !v.fine;
+            v.cur_col = !v.fine ? -1 : v.cur_col >= 0 ? v.cur_col : 0;
+        }
         if (IsKeyPressed(KEY_COMMA)  && v.ips > 1.0f)  v.ips -= 1.0f;
         if (IsKeyPressed(KEY_PERIOD) && v.ips < 60.0f) v.ips += 1.0f;
         if (IsKeyPressed(KEY_F)) {
             v.fpi_override = v.fpi_override == 0 ? 8 : v.fpi_override == 8 ? 16 : 0;
             apply_scan(&v, s);
             rebuild_image_list(&v, s);
+            if (v.cur_col >= v.ncols) v.cur_col = v.ncols - 1;
             // Cleaning is built on the images and on which frame of each is the
             // 0 V one, so a different scan period rebuilds it.
             if (v.clean_stage != CLEAN_OFF) set_clean(&v, s, v.clean_stage);
@@ -3774,7 +3851,7 @@ int main(int argc, char **argv)
         // Shift-F5 rebuilds the cached recordings too, and the cache with them.
         if (IsKeyPressed(KEY_F5)) {
             int full = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
-            int save_img = v.img_pos, save_play = v.playing;
+            int save_img = v.img_pos, save_play = v.playing, save_col = v.cur_col;
             experiment_t *ne = NULL;
             load_note_t nnote;
             int nn = load_file_or_db(file_arg, db_path, full, &ne, &nnote);
@@ -3801,6 +3878,7 @@ int main(int argc, char **argv)
                     if (save_img >= v.n_img) save_img = v.n_img ? v.n_img - 1 : 0;
                     v.img_pos = save_img;
                     v.playing = save_play;
+                    v.cur_col = save_col < v.ncols ? save_col : v.ncols - 1;
                 }
                 s = &exps[v.sel];
                 cov_valid = 0;   // the reloaded experiment needs a fresh whereogram
@@ -3870,8 +3948,13 @@ int main(int argc, char **argv)
             v.accum += GetFrameTime();
             if (v.accum >= 1.0f / v.ips) {
                 v.accum = 0;
-                v.img_pos++;
-                if (v.img_pos >= v.n_img) v.img_pos = 0;   // loop
+                // With a frame picked out it plays a frame at a time, and the
+                // speed is frames a second rather than images.
+                if (v.cur_col >= 0) step_frame(&v, +1, 1);
+                else {
+                    v.img_pos++;
+                    if (v.img_pos >= v.n_img) v.img_pos = 0;   // loop
+                }
             }
         }
 
@@ -3914,6 +3997,10 @@ int main(int argc, char **argv)
             }
         }
         UpdateTexture(tex, imgbuf);
+        // Stepping a frame at a time, the time on show and the globe's dot are
+        // that frame's own, and the aux panel shows its aux.
+        int cur_frame = v.cur_col >= 0 && v.cur_col < v.ncols ? col_frame[v.cur_col] : -1;
+        if (cur_frame >= 0 && s->fr_ts[cur_frame] >= 0) frame_time = s->fr_ts[cur_frame];
 
         // ---- draw ----
         BeginDrawing();
@@ -3987,7 +4074,11 @@ int main(int argc, char **argv)
 
         // right: title / time
         int rx = LEFT_W + 20, ry = 14;
-        draw_text(TextFormat("Image %d / %d", v.n_img ? v.img_pos + 1 : 0, v.n_img), rx, ry, 20, RAYWHITE);
+        if (v.cur_col >= 0)
+            draw_text(TextFormat("Image %d / %d   frame %d / %d", v.n_img ? v.img_pos + 1 : 0,
+                                 v.n_img, v.cur_col + 1, v.ncols), rx, ry, 20, RAYWHITE);
+        else
+            draw_text(TextFormat("Image %d / %d", v.n_img ? v.img_pos + 1 : 0, v.n_img), rx, ry, 20, RAYWHITE);
         char tstr[48] = "no timestamp";
         if (frame_time >= 0) fmt_utc_ms(frame_time, tstr, sizeof tstr);
         draw_text(TextFormat("%s UTC", tstr), rx, ry + 26, 20, (Color){ 120, 220, 160, 255 });
@@ -4001,6 +4092,22 @@ int main(int argc, char **argv)
         DrawRectangleLines(rx - 1, iy - 1, dw + 2, dh + 2,
                            img_unver ? (Color){ 206, 150, 42, 255 } : (Color){ 70, 70, 80, 255 });
         DrawTexturePro(tex, src, dst, (Vector2){ 0, 0 }, 0.0f, WHITE);
+        // Stepping a frame at a time, every column but the frame's own is
+        // dimmed, so that one stands out, and a caret over the image marks it
+        // -- the only mark when no frame came down for that column. Dimmed
+        // rather than boxed, since a box at x2 zoom would hide half of each
+        // neighbour.
+        if (v.cur_col >= 0 && v.cur_col < v.ncols) {
+            Color dim = { 18, 18, 22, 170 };
+            int cx0 = rx + v.cur_col * v.zoom, cx1 = cx0 + v.zoom;
+            if (cx0 > rx)      DrawRectangle(rx, iy, cx0 - rx, dh, dim);
+            if (cx1 < rx + dw) DrawRectangle(cx1, iy, rx + dw - cx1, dh, dim);
+            Vector2 tip = { (float) (cx0 + cx1) / 2.0f, (float) (iy - 3) };
+            Vector2 tl = { tip.x - 5.0f, (float) (iy - 10) }, tr = { tip.x + 5.0f, (float) (iy - 10) };
+            // Both windings, as draw_star does: raylib culls one of them.
+            DrawTriangle(tip, tl, tr, RAYWHITE);
+            DrawTriangle(tip, tr, tl, RAYWHITE);
+        }
 
         // Beside the image, the dome voltage each of its frames was taken at,
         // one row per column, frame 1 at the top being the image's left
@@ -4022,6 +4129,7 @@ int main(int argc, char **argv)
         draw_text("meas", tx_meas + tw_val - text_width("meas", 12), ty, 12, GRAY);
         ty += 17;
         for (int c = 0; c < v.ncols; c++, ty += 16) {
+            if (c == v.cur_col) DrawRectangle(tx - 4, ty - 1, tab_w + 8, 16, (Color){ 44, 70, 110, 255 });
             const char *num = TextFormat("%d", c + 1);
             draw_text(num, tx + tw_num - text_width(num, 13), ty, 13, GRAY);
             if (col_frame[c] < 1) {
@@ -4047,8 +4155,9 @@ int main(int argc, char **argv)
         if (ax < LEFT_W + 360) ax = LEFT_W + 360;
         int ay = iy;
         draw_text("Aux data", ax, ay, 18, RAYWHITE); ay += 26;
-        if (rep_frame >= 0) {
-            const uint8_t *f = frame_at(s, rep_frame);
+        int aux_frame = v.cur_col >= 0 ? cur_frame : rep_frame;
+        if (aux_frame >= 0) {
+            const uint8_t *f = frame_at(s, aux_frame);
             draw_text(TextFormat("frame counter : %d", be16(f, 4)),  ax, ay, 15, LIGHTGRAY); ay += 20;
             draw_text(TextFormat("temperature   : %d (raw ADC)", be16(f, 6)), ax, ay, 15, LIGHTGRAY); ay += 20;
             draw_text(TextFormat("firmware ver  : %d", f[8]),        ax, ay, 15, LIGHTGRAY); ay += 20;
@@ -4058,6 +4167,11 @@ int main(int argc, char **argv)
             draw_text(TextFormat("dome ADC read : %d", be16(f, 14)), ax, ay, 15, LIGHTGRAY); ay += 20;
             draw_text(TextFormat("pixels        : %d .. %d", f[16], f[17]), ax, ay, 15, LIGHTGRAY); ay += 20;
             draw_text(TextFormat("integration   : %d", be16(f, 18)), ax, ay, 15, LIGHTGRAY); ay += 26;
+        } else if (v.cur_col >= 0) {
+            // As tall as the lines it stands in for, so the whereogram below
+            // holds still while the frames are played through.
+            draw_text("no frame in this column", ax, ay, 15, GRAY);
+            ay += 8 * 20 + 26;
         } else { ay += 20; }
         draw_text(TextFormat("experiment    : %s UTC", s->utc), ax, ay, 15, LIGHTGRAY);
         if (fav_find(&fv, s->utc) >= 0) {
@@ -4081,7 +4195,8 @@ int main(int argc, char **argv)
                        : v.scale_mode == SCALE_AUTO_SESSION ? "auto (experiment)" : "manual";
         draw_text(TextFormat("color scale   : %s", sm), ax, ay, 15, LIGHTGRAY); ay += 20;
         draw_text(TextFormat("DN window     : %d .. %d", lo, hi), ax, ay, 15, LIGHTGRAY); ay += 20;
-        draw_text(TextFormat("playback      : %s  %.0f img/s", v.playing ? "PLAY" : "paused", v.ips),
+        draw_text(TextFormat("playback      : %s  %.0f %s/s%s", v.playing ? "PLAY" : "paused", v.ips,
+                             v.cur_col >= 0 ? "frames" : "img", v.fine ? "  (fine stepping, F2)" : ""),
                   ax, ay, 15, v.playing ? (Color){ 120, 220, 160, 255 } : GRAY); ay += 20;
 
         draw_text(TextFormat("colour map    : %s  (%d/%d)",
@@ -4343,7 +4458,7 @@ int main(int argc, char **argv)
 
         // help footer
         const char *help =
-            "Up/Down experiment   Left/Right image   drag whereogram: scrub + time span, wheel zooms"
+            "Up/Down experiment   Left/Right image  shift: frame   F2 fine stepping   drag whereogram: scrub + time span, wheel zooms"
             "   globe: drag turns, two-finger press-drag turns about the satellite, scroll zooms, g resets"
             "   Space play/pause   ,/. speed   f steps/sweep   s zoom   a scale"
             "   z/x min  c/v max   m colour map   b clean  B step   n bg window   e median/mean"
