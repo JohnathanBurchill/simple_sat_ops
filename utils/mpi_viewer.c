@@ -120,7 +120,7 @@
     Aux frame layout (authoritative, from the MPI storeTelemetryAuxData packer):
         0..3   sync word 0C FF FF 0C
         4..5   frame counter                 (big-endian uint16)
-        6..7   temperature (raw ADC)         (big-endian uint16)
+        6..7   temperature (raw ADC)         (big-endian int16, signed)
         8      firmware version              (uint8)
         9..10  camera board CCD ADC          (big-endian uint16)
         11..12 inner dome target voltage     (big-endian uint16)
@@ -184,6 +184,26 @@
     The toggle applies to the image and the whereogram together. shift-B, while
     cleaning is on, stops after step 1 or step 2 instead of running all three,
     which is how you see what each step did rather than only the end of it.
+
+    Night reference (k): the inner dome does not sweep in flight, so the MPI
+    is a fixed-voltage analyser, and both the instrument's subtraction and
+    steps 2 and 3 take a steady ion signal off along with the background. k
+    puts a background measured in the dark in place of steps 2 and 3, one for
+    each integration period flown. At 1000: frames from the night side, in the
+    Earth's shadow, with the MPI face at least 80 degrees off ram (the
+    2026-11-05 and 2026-11-06 recordings, flown backward and pitched round). At
+    260: every frame in the Earth's shadow of the ten night recordings, whatever
+    the attitude, none of them showing ions. Each is the pattern across the
+    strip as a straight line in the aux temperature, plus a slow drift of the
+    whole strip with the frame counter, taken off step 1's raw counts; the level
+    each 256-frame range jumps to is matched across the estimate to the range
+    before it, and the recording is set on its edge pixels. The frames ahead of
+    the first estimate, and ranges whose own estimate was lost, are put back
+    too, by matching across where the estimate fell. A frame at a pixel range
+    or integration period with no reference is not cleaned, and the status line
+    says which it was. shift-B moves
+    between step 1 and the reference. The section on the night reference
+    background below has the measurements behind each of those choices.
 
     Whereogram: under the aux panel sits the whole recording as one spectrum,
     every frame a column of its 65 intensities, time left to right and arrival
@@ -488,6 +508,15 @@ static long bulk_offset(const uint8_t *pl)
 static int be16(const uint8_t *buf, long i)
 {
     return (buf[i] << 8) | buf[i + 1];
+}
+
+// A frame's temperature reading (aux bytes 6-7). It is signed: on the coldest
+// runs it goes below zero and, read unsigned, comes back as 65000 and up --
+// 65060 climbing to 65282 over the first minute of 2026-10-20 15:29, which is
+// -476 warming to -254, the way every other recording warms.
+static int frame_temp(const uint8_t *f)
+{
+    return (int16_t) be16(f, 6);
 }
 
 // Frame k's stride bytes, read with any JSON marker the firmware wrote into the
@@ -1936,6 +1965,29 @@ static int detect_n_targets(const experiment_t *s)
 
 enum { SCALE_AUTO_IMAGE, SCALE_AUTO_SESSION, SCALE_MANUAL };
 
+// A night reference background (see build_reference): pixel by pixel, the
+// dark pattern less its own mean, a[j] + b[j] * (temperature - t0), for one
+// pixel range and integration period.
+typedef struct {
+    int    nframes;            // reference frames it was fitted to, 0 = none
+    int    nrec;               // reference recordings they came from
+    int    npix, first_px;     // the pixel range it covers
+    int    intper;             // and the integration period
+    int    any_attitude;       // its frames were taken whatever the attitude, in shadow
+    double t0, tmin, tmax;     // temperature it is centred on, and the range seen
+    double a[MAX_NPIX], b[MAX_NPIX];
+    double worst_rms;          // worst 30 s of a reference recording off the fit, DN rms
+    double level_per_frame;    // the whole strip's drift, DN per frame counted since a start
+} refbg_t;
+
+// The night reference backgrounds, one for each integration period the MPI
+// has been flown at.
+#define REF_MAX_MODELS 4
+typedef struct {
+    int     n;
+    refbg_t m[REF_MAX_MODELS];
+} refset_t;
+
 typedef struct {
     int    sel;            // selected experiment
     int    img_pos;        // position within the selected experiment's image list
@@ -1959,6 +2011,8 @@ typedef struct {
     int    clean_step;     // the step b comes back on at, and shift-B moves
     int    clean_win;      // images in the sliding background window (odd)
     int    clean_mean;     // background estimator: 0 = median, 1 = mean
+    int    clean_ref;      // after step 1: 0 = steps 2 and 3, 1 = the night reference (k)
+    const refset_t *ref;   // the night reference backgrounds
     float *clean_pix;      // nframes * npix cleaned counts, NULL until built
     unsigned char *clean_ok;  // per frame: a cleaned value exists
     int   *key_fr;         // the frames that carried a background estimate
@@ -2215,12 +2269,18 @@ static void free_clean(view_t *v)
 // the last word: the estimates run at a fixed interval, so take that interval
 // to be the median spacing of the candidates and keep only the beat most of
 // them share. Fills keys[] (room for nframes) and returns how many.
+//
+// A frame whose column cannot be told is a candidate too. Its column comes
+// from the frame before it, and when that one failed its CRC the estimate was
+// passed over and its whole range of 256 frames was put back with the range
+// before's background instead: the 2026-11-14 recording lost the one at
+// counter 450 that way, and the frames after it came out a few hundred DN off.
 static int find_background_frames(view_t *v, const experiment_t *s,
                                   const int *lvl, int *keys)
 {
     int nkey = 0;
     for (int k = 0; k < s->nframes; k++) {
-        if (lvl[k] < 0 || col_of(v, s, k) != 0) continue;
+        if (lvl[k] < 0 || col_of(v, s, k) > 0) continue;
         int ref[CLEAN_REF_FRAMES], nr = 0;
         for (int m = k + 1; m < s->nframes && nr < CLEAN_REF_FRAMES; m++)
             if (lvl[m] >= 0) ref[nr++] = lvl[m];
@@ -2252,33 +2312,166 @@ static int find_background_frames(view_t *v, const experiment_t *s,
     return w;
 }
 
-// Build the cleaned pixels for the selected experiment. Returns 0 if there is
-// nothing to show, in which case the buffers are left free.
-static int rebuild_clean(view_t *v, const experiment_t *s)
-{
-    free_clean(v);
-    if (s == NULL || s->nframes == 0 || v->fr_img == NULL || v->n_img == 0) return 0;
+// What step 1 does with the frames ahead of the first estimate, which have
+// nothing to be added back and are still on the instrument's own scale rather
+// than at raw counts: keep them as they are, since step 2 puts them on the
+// same footing as everything else, a fit through a frame's own edges caring
+// nothing for the scale it came in on; hide them, when step 1 is all there is,
+// since beside corrected frames they would read as a tenfold depression that
+// never happened; or put them back on raw counts by matching across the first
+// estimate (bridge_pre_key), which the reference background needs. The
+// bridging mode puts back ranges whose own estimate was lost the same way
+// (bridge_lost_keys), and PRE_OWN, for measuring the reference itself, keeps
+// only the frames undone with their own range's estimate.
+enum { PRE_KEEP, PRE_HIDE, PRE_BRIDGE, PRE_OWN };
 
-    int nf = s->nframes;
-    float *pix = (float *) malloc((size_t) nf * s->npix * sizeof *pix);
-    unsigned char *ok = (unsigned char *) calloc((size_t) nf, 1);
-    int *lvl = (int *) malloc((size_t) nf * sizeof *lvl);
-    int *keys = (int *) malloc((size_t) nf * sizeof *keys);
-    if (pix == NULL || ok == NULL || lvl == NULL || keys == NULL) {
-        free(pix); free(ok); free(lvl); free(keys);
-        return 0;
+// Frames either side of a background estimate that the levels on the two
+// sides of it are matched over: about a second, short enough that what the
+// instrument sees has not changed, long enough to beat the 40 DN a pixel reads
+// from frame to frame down to about 13.
+#define CLEAN_MATCH_FRAMES  10
+
+// Frames between the instrument's background estimates, where a recording has
+// too few of them to measure it: the flight default.
+#define CLEAN_KEY_STEP_DEFAULT  256
+
+// Put the frames ahead of the first estimate back on raw counts. The
+// instrument was taking a background off them too -- they arrive at its 2000 DN
+// offset like any other -- but one it never sent. It can still be had from the
+// frames either side of the first estimate it did send: the counts do not jump
+// in the second across it, so the frames before it, with the unknown
+// background added back, read what the frames after it read with the known one
+// added back. That gives the unknown one pixel by pixel, as the estimate sent
+// plus the difference between the two sets of frames. On 2026-11-14 this is
+// the first 23 s of the recording, the only stretch of it facing ram.
+// It reaches back one range, span frames by the counter: anything further back
+// was taken off a background of its own -- the frames ahead of an instrument
+// restart, whose counter sits far above the first estimate's -- and is hidden.
+// The counter rather than the order in the file says which frames those are,
+// since a few recordings carry frames a few counts out of order.
+static void bridge_pre_key(const experiment_t *s, float *pix, unsigned char *ok,
+                           const int *keys, int nkey, int span)
+{
+    int k1 = nkey > 0 ? keys[0] : s->nframes;
+    int c1 = nkey > 0 ? s->fr_ctr[k1] : 0;
+    double before[MAX_NPIX] = {0}, after[MAX_NPIX] = {0};
+    int nb = 0, na = 0;
+    if (nkey > 0) {
+        for (int k = k1 - 1; k >= 0 && nb < CLEAN_MATCH_FRAMES; k--) {
+            int back = (c1 - s->fr_ctr[k]) & 0xFFFF;
+            if (s->fr_bad[k] || back == 0 || back > span) continue;
+            for (int j = 0; j < s->npix; j++) before[j] += be16(frame_at(s, k), PIX_START + j * 2);
+            nb++;
+        }
+        for (int k = k1 + 1; k < s->nframes && na < CLEAN_MATCH_FRAMES; k++) {
+            int on = (s->fr_ctr[k] - c1) & 0xFFFF;
+            if (s->fr_bad[k] || on == 0 || on >= span) continue;
+            for (int j = 0; j < s->npix; j++) after[j] += be16(frame_at(s, k), PIX_START + j * 2);
+            na++;
+        }
     }
+    for (int k = 0; k < k1 && k < s->nframes; k++) {
+        if (!ok[k]) continue;
+        int back = (c1 - s->fr_ctr[k]) & 0xFFFF;
+        if (nb == 0 || na == 0 || back == 0 || back > span) { ok[k] = 0; continue; }
+        float *p = pix + (long) k * s->npix;
+        for (int j = 0; j < s->npix; j++)
+            p[j] += (float) ((double) be16(frame_at(s, k1), PIX_START + j * 2)
+                             + after[j] / na - before[j] / nb - CLEAN_PEDESTAL);
+    }
+}
+
+// The ranges whose own background estimate never came down. Step 1 undoes such
+// a frame with the last estimate before it, which is off from the one the
+// instrument really took off it by that one frame's noise -- about 40 DN a
+// pixel, the same on every frame of the range, a stripe pattern nothing after
+// it can tell from the sky -- and by a level step where the lost estimate fell.
+// 7% of 2026-10-22 and 20% of 2026-10-05 10:23 came out that way. The
+// instrument takes an estimate every key_step frames, so where each lost one
+// fell is known from the counter, and the background it took is the one
+// before it plus the difference across that spot, as for the frames ahead of
+// the first estimate (bridge_pre_key): a chain of them, if several in a row
+// were lost. A frame at the very spot is the lost estimate itself if it came
+// down at all and is hidden, as is a frame whose counter sits behind the
+// range's estimate -- after an instrument restart, which takes the counter
+// back to zero and starts a background of its own -- and anything past a spot
+// with no frames on one side of it to match. The counter rather than the order
+// in the file says which range a frame is in, since a few recordings carry
+// frames a few counts out of order. With hide set the ranges
+// are hidden instead of put back, which is what measuring the reference wants.
+static void bridge_lost_keys(const view_t *v, const experiment_t *s, float *pix,
+                             unsigned char *ok, const int *keys, int nkey, int hide)
+{
+    int step = v->key_step, np = s->npix;
+    if (step < 2) return;
+    for (int r = 0; r < nkey; r++) {
+        int k0 = keys[r], k1 = r + 1 < nkey ? keys[r + 1] : s->nframes;
+        int c0 = s->fr_ctr[k0];
+
+        // The frames of the range: those whose counter is at or after its
+        // estimate's. One behind it is after a restart, and is hidden.
+        int maxm = 0;
+        for (int k = k0 + 1; k < k1; k++) {
+            int d = (s->fr_ctr[k] - c0) & 0xFFFF;
+            if (d >= 0x8000) { ok[k] = 0; continue; }
+            if (!s->fr_bad[k] && d / step > maxm) maxm = d / step;
+        }
+        if (maxm == 0) continue;
+
+        // Each lost estimate in turn, as the last one plus the step across it.
+        double corr[MAX_NPIX] = {0};
+        int broken = hide;
+        for (int m = 1; m <= maxm; m++) {
+            double before[MAX_NPIX] = {0}, after[MAX_NPIX] = {0};
+            int nb = 0, na = 0;
+            for (int k = k1 - 1; k > k0 && nb < CLEAN_MATCH_FRAMES && !broken; k--) {
+                int d = (s->fr_ctr[k] - c0) & 0xFFFF;
+                if (s->fr_bad[k] || d / step != m - 1 || d % step == 0) continue;
+                for (int j = 0; j < np; j++) before[j] += be16(frame_at(s, k), PIX_START + j * 2);
+                nb++;
+            }
+            for (int k = k0 + 1; k < k1 && na < CLEAN_MATCH_FRAMES && !broken; k++) {
+                int d = (s->fr_ctr[k] - c0) & 0xFFFF;
+                if (s->fr_bad[k] || d / step != m || d % step == 0) continue;
+                for (int j = 0; j < np; j++) after[j] += be16(frame_at(s, k), PIX_START + j * 2);
+                na++;
+            }
+            if (nb == 0 || na == 0) broken = 1;
+            for (int j = 0; j < np && !broken; j++) corr[j] += before[j] / nb - after[j] / na;
+            for (int k = k0 + 1; k < k1; k++) {
+                int d = (s->fr_ctr[k] - c0) & 0xFFFF;
+                if (!ok[k] || d / step != m) continue;
+                if (broken || d % step == 0) { ok[k] = 0; continue; }
+                float *p = pix + (long) k * np;
+                for (int j = 0; j < np; j++) p[j] += (float) corr[j];
+            }
+        }
+    }
+}
+
+// Step 1, for experiment s seen through v (whose scan period col_of needs):
+// undo the instrument's subtraction. Fills pix (nframes * npix) with raw
+// counts and ok[] where there are some, and keys[] (room for nframes) with the
+// background estimates, returning how many there are, or -1 if out of
+// memory. The frames ahead of the first estimate are counted into v and dealt
+// with as pre says.
+static int undo_onboard(view_t *v, const experiment_t *s, float *pix,
+                        unsigned char *ok, int *keys, int pre)
+{
+    int nf = s->nframes;
+    int *lvl = (int *) malloc((size_t) nf * sizeof *lvl);
+    if (lvl == NULL) return -1;
     for (int k = 0; k < nf; k++) lvl[k] = s->fr_bad[k] ? -1 : frame_level(s, k);
     int nkey = find_background_frames(v, s, lvl, keys);
     free(lvl);
 
-    // Step 1: undo the instrument's subtraction. A frame belongs to the last
-    // background frame at or before it in the file, so a range whose own
-    // estimate never came down carries the one before it instead of going
-    // uncorrected -- the background drifts only a few hundred DN across a
-    // range, and step 3 takes off whatever is left of it either way. The frame
-    // the instrument kept is already raw counts and is left alone; every other
-    // frame gets its background back and the 2000 DN offset taken off.
+    // A frame belongs to the last background frame at or before it in the
+    // file, so a range whose own estimate never came down carries the one
+    // before it instead of going uncorrected -- the background drifts only a
+    // few hundred DN across a range, and step 3 takes off whatever is left of
+    // it either way. The frame the instrument kept is already raw counts and is
+    // left alone; every other frame gets its background back and the 2000 DN
+    // offset taken off.
     int cur = -1, nx = 0;
     for (int k = 0; k < nf; k++) {
         if (nx < nkey && keys[nx] == k) { cur = k; nx++; }
@@ -2294,15 +2487,494 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
         ok[k] = 1;
         if (cur < 0) {
             v->n_pre_key++;
-            // Ahead of the first estimate, so there is nothing to add back and
-            // the frame is still on the instrument's own scale rather than at
-            // raw counts. Step 2 puts it on the same footing as everything
-            // else, a fit through a frame's own edges caring nothing for the
-            // scale it came in on, but step 1 alone has no answer for it, and
-            // showing it beside corrected frames would read as a tenfold
-            // depression that never happened.
-            if (v->clean_stage == CLEAN_STEP1) ok[k] = 0;
+            if (pre == PRE_HIDE || pre == PRE_OWN) ok[k] = 0;
         }
+    }
+    if (pre == PRE_BRIDGE)
+        bridge_pre_key(s, pix, ok, keys, nkey,
+                       v->key_step > 0 ? v->key_step : CLEAN_KEY_STEP_DEFAULT);
+    if (pre == PRE_BRIDGE || pre == PRE_OWN)
+        bridge_lost_keys(v, s, pix, ok, keys, nkey, pre == PRE_OWN);
+    return nkey;
+}
+
+// ---- the night reference background ------------------------------------------
+//
+// The inner dome does not sweep in flight -- its monitor reads the same at
+// every setpoint -- so the MPI is a fixed-voltage analyser, and what it is good
+// for is how the ions it does see change: where across the strip they land
+// (their arrival direction along the slit, cross-track when the face is on
+// ram) and how wide they spread. The instrument's own subtraction hides
+// exactly that. Its background is a frame it takes every 256, ions and all,
+// so every frame comes down as the change since that one, and a steady ion
+// signal subtracts itself away. Steps 2 and 3 of the local cleaning do the same
+// again in their own way.
+//
+// The reference background is measured where there can be no ions and no
+// sunlight instead: on the night side, in the Earth's shadow, with the MPI face
+// turned at least 80 degrees off ram -- the satellite flown backward on
+// 2026-11-05 (yaw 180) and pitched -90, over through 180 and on to +90 on
+// 2026-11-06. Those frames, after step 1, are the dark counts alone.
+//
+// What they show. The pattern across the strip -- the counts less the frame's
+// own mean, which runs from about -2400 to +2300 DN pixel to pixel -- holds to
+// within 2 to 11 DN over each 30 s of a recording, against 40 DN of noise on
+// one pixel of one frame. It does drift, though, and with the aux temperature:
+// 15 DN rms from the start of 2026-11-05 to its end as the temperature reading
+// climbed from 2400 to 2850, and 72 DN rms between the two nights, which sat
+// about 1400 counts apart (2300..2900 against 3880..4070). So the model is the
+// average pattern plus a straight line in temperature, pixel by pixel, fitted
+// by least squares over every reference frame. Every 30 s of both nights then
+// sits within 3 to 13 DN of it, against 16 to 53 DN off a plain average of the
+// two; fitted only on the warmer frames it still predicts the colder third of
+// 2026-11-05 to 8 to 24 DN.
+//
+// The level of the whole strip is another matter. It jumps by up to 600 DN at
+// every background estimate the instrument takes, the same at every pixel,
+// while the instrument's own output does not jump at all -- an offset of the
+// instrument's, nothing on the sky. So each range of 256 frames is matched to
+// the one before it across the estimate between them (CLEAN_MATCH_FRAMES
+// either side), and the recording as a whole is set so that its median
+// frame's first and last REF_EDGE_PX pixels sit on the 2000 DN pedestal, those
+// being the pixels the ions reach least in every recording so far. Between
+// the jumps the level drifts down by about the same amount a frame on both
+// nights -- 0.045 and 0.044 DN at the edges, 0.040 over the whole strip as
+// fitted -- counted from when the instrument last started (the frame
+// counter), and not with the temperature, which climbed three times faster on
+// 2026-11-05: about 130 DN over that recording. That slope is part of the
+// model, fitted over the dark frames once the pattern is off them.
+//
+// All of that is for the integration period of 1000 the MPI has been run at
+// since 2026-10-21. Every recording before that, and those of 2026-10-22, -29
+// and -30, ran at 260, and each period has a reference of its own. The dark
+// pattern barely depends on the period -- every night recording at 260 matches
+// the 1000 reference's pattern with a gain of 0.98 to 1.00, so it is an offset
+// the CCD carries, not dark current growing with the exposure -- but what is
+// left is 16 to 29 DN pixel to pixel and 8 to 16 DN of a gentle ramp across the
+// strip, the same in every one of them, and worth taking out. The strict rule
+// finds only one recording at 260, 2026-10-22, flown with roll 90 so the face
+// sat 81 to 89 degrees off ram once in shadow; its frames cover temperatures
+// 2080 to 2840 and predict the other nights, which ran as cold as 660, to only
+// 8 to 92 DN. So the 260 reference takes every frame at 260 in the Earth's
+// shadow, whatever the attitude, from the ten night recordings there are.
+// That brings ram-facing frames in, and the case for it is that none of them
+// shows ions: each night's pattern is off the 1000 reference by the same small
+// ramp and no more (8 to 16 DN broad), where the ions on 2026-11-14 stand 135
+// DN broad above it, with the analyser stuck near -15 V needing a strong flow
+// to let any through. And it predicts each night left out of the fit to 5 to
+// 16 DN, as good as the 1000 reference does its own.
+//
+// A reference is measured only on frames undone with their own range's
+// estimate (PRE_OWN). Two of the 260 nights lost some of theirs -- 7% of
+// 2026-10-22 and 20% of 2026-10-05 10:23 -- and step 1 had undone those ranges
+// with the estimate before, which drew 30 to 43 DN of stripes into them and
+// put the 260 reference 67 DN off its own worst 30 s; without them it is 24.
+// When cleaning, those ranges are put back instead (bridge_lost_keys).
+//
+// A reference belongs to its pixel range (48..112 for both) and integration
+// period: a frame of any other is not cleaned. Nor is a frame from before the
+// instrument last restarted ahead of its first estimate. The temperature
+// reading is signed and is not a plain thermometer -- it jumps at an
+// instrument restart, up 550 counts on 2026-11-06 and down 1400 on 2026-10-28,
+// and the coldest recordings read below zero -- so a frame whose reading falls
+// outside its reference's range is being cleaned on an extrapolation, and the
+// aux panel says so.
+
+#define REF_MIN_RAM_DEG  80.0     // the MPI face turned at least this far off ram
+#define REF_ATT_AGE_S    10.0     // the attitude record nearest a frame, at most this far
+#define REF_GROUP_MS     30000.0  // stretch the stability check averages over
+#define REF_GROUP_MIN    50       // frames a stretch needs to count
+#define REF_MAX_GROUPS   128
+#define REF_EDGE_PX      10       // pixels at each end the recording's level is set on
+
+// The recordings the references are measured on: by start time, the
+// integration period whose frames are taken from it, and whether those are
+// taken whatever the attitude (in the Earth's shadow either way).
+typedef struct {
+    const char *utc;
+    int         intper;
+    int         any_attitude;
+} refsrc_t;
+static const refsrc_t g_ref_recordings[] = {
+    // 1000: the face at least REF_MIN_RAM_DEG off ram
+    { "2026-11-05 19:57:00", 1000, 0 },   // yaw turned to 180 within the first 100 s
+    { "2026-11-06 18:01:30", 1000, 0 },   // pitched -90, over through 180 to +90
+    // 260: every frame in shadow (see above)
+    { "2026-08-09 06:33:10", 260, 1 },
+    { "2026-09-17 07:12:33", 260, 1 },
+    { "2026-10-05 10:23:34", 260, 1 },
+    { "2026-10-05 11:58:10", 260, 1 },
+    { "2026-10-05 13:33:27", 260, 1 },
+    { "2026-10-16 19:08:41", 260, 1 },
+    { "2026-10-18 10:33:57", 260, 1 },
+    { "2026-10-20 19:21:00", 260, 1 },
+    { "2026-10-22 16:55:00", 260, 1 },
+    { "2026-10-29 17:59:00", 260, 1 },
+};
+#define N_REF_RECORDINGS ((int) (sizeof g_ref_recordings / sizeof g_ref_recordings[0]))
+
+// The reference for a frame's pixel range and integration period, or NULL if
+// there is none.
+static const refbg_t *ref_model_for(const refset_t *rs, const experiment_t *s,
+                                    const uint8_t *f)
+{
+    for (int i = 0; rs != NULL && i < rs->n; i++) {
+        const refbg_t *m = &rs->m[i];
+        if (m->nframes > 0 && m->npix == s->npix && m->first_px == f[16]
+            && m->intper == be16(f, 18)) return m;
+    }
+    return NULL;
+}
+
+// How far the MPI face (+X body) was turned from ram, degrees. Under the 3-2-1
+// sequence (attitude.h) the body X axis is (cos p cos y, cos p sin y, -sin p)
+// in the orbit frame, whose X is very nearly the direction of flight; roll
+// turns about that axis and does not enter.
+static double face_from_ram_deg(const globe_attitude_t *a)
+{
+    double c = cos(a->pitch_deg * M_PI / 180.0) * cos(a->yaw_deg * M_PI / 180.0);
+    if (c > 1.0) c = 1.0;
+    if (c < -1.0) c = -1.0;
+    return acos(c) * 180.0 / M_PI;
+}
+
+// Whether a satellite over (lat, lon) at alt_km is in the Earth's shadow, the
+// Sun being over (sun_lat, sun_lon): inside the cylinder the Earth casts,
+// penumbra ignored.
+static int in_earth_shadow(double lat, double lon, double alt_km,
+                           double sun_lat, double sun_lon)
+{
+    double la = lat * M_PI / 180.0, lo = lon * M_PI / 180.0;
+    double sa = sun_lat * M_PI / 180.0, so = sun_lon * M_PI / 180.0;
+    double r = GLOBE_EARTH_KM + alt_km;
+    double p[3] = { r * cos(la) * cos(lo), r * cos(la) * sin(lo), r * sin(la) };
+    double u[3] = { cos(sa) * cos(so), cos(sa) * sin(so), sin(sa) };
+    double d = p[0] * u[0] + p[1] * u[1] + p[2] * u[2];
+    if (d >= 0.0) return 0;
+    return r * r - d * d < GLOBE_EARTH_KM * GLOBE_EARTH_KM;
+}
+
+// The reference step: take its reference off every frame of step 1's raw
+// counts, match each range's level to the one before it, and set the
+// recording's level on its edge pixels (see the section comment above). A
+// frame with no reference for its pixel range and integration period loses its
+// ok. Returns 0 if nothing is left.
+static int subtract_reference(const refset_t *rs, const experiment_t *s, float *pix,
+                              unsigned char *ok, const int *keys, int nkey)
+{
+    if (rs == NULL || rs->n == 0 || nkey == 0) return 0;
+    int nf = s->nframes, np = s->npix;
+    double *cm = (double *) malloc((size_t) nf * sizeof *cm);
+    double *off = (double *) calloc((size_t) nkey + 1, sizeof *off);
+    double *edge = (double *) malloc((size_t) nf * sizeof *edge);
+    int *rng = (int *) malloc((size_t) nf * sizeof *rng);
+    if (cm == NULL || off == NULL || edge == NULL || rng == NULL) {
+        free(cm); free(off); free(edge); free(rng);
+        return 0;
+    }
+
+    // Each frame's reference off, at its own temperature and frame count; and
+    // the range each frame is in, 0 being ahead of the first estimate.
+    int n_ok = 0;
+    for (int k = 0, r = 0; k < nf; k++) {
+        while (r < nkey && keys[r] <= k) r++;
+        rng[k] = r;
+        if (!ok[k]) continue;
+        const uint8_t *f = frame_at(s, k);
+        const refbg_t *m = ref_model_for(rs, s, f);
+        if (m == NULL) { ok[k] = 0; continue; }
+        double dt = (double) frame_temp(f) - m->t0, mean = 0.0;
+        double drift = m->level_per_frame * s->fr_ctr[k];
+        float *p = pix + (long) k * np;
+        for (int j = 0; j < np; j++) {
+            p[j] = (float) ((double) p[j] - m->a[j] - m->b[j] * dt - drift);
+            mean += p[j];
+        }
+        cm[k] = mean / np;
+        n_ok++;
+    }
+
+    // Each range's level matched to the one before it across the estimate
+    // between them.
+    for (int r = 1; r <= nkey && n_ok > 0; r++) {
+        int kk = keys[r - 1], nb = 0, na = 0;
+        double mb = 0.0, ma = 0.0;
+        for (int k = kk - 1; k >= 0 && rng[k] == r - 1 && nb < CLEAN_MATCH_FRAMES; k--)
+            if (ok[k]) { mb += cm[k]; nb++; }
+        for (int k = kk + 1; k < nf && rng[k] == r && na < CLEAN_MATCH_FRAMES; k++)
+            if (ok[k]) { ma += cm[k]; na++; }
+        off[r] = off[r - 1] + (nb > 0 && na > 0 ? ma / na - mb / nb : 0.0);
+    }
+
+    // The recording's level: its median frame's edge pixels on the pedestal.
+    int ne = 0;
+    for (int k = 0; k < nf; k++) {
+        if (!ok[k]) continue;
+        const float *p = pix + (long) k * np;
+        double e = 0.0;
+        for (int j = 0; j < REF_EDGE_PX; j++) e += p[j] + p[np - 1 - j];
+        edge[ne++] = e / (2 * REF_EDGE_PX) - off[rng[k]];
+    }
+    double anchor = 0.0;
+    if (ne > 0) {
+        qsort(edge, (size_t) ne, sizeof *edge, cmp_double);
+        anchor = edge[ne / 2];
+    }
+    for (int k = 0; k < nf; k++) {
+        if (!ok[k]) continue;
+        float *p = pix + (long) k * np;
+        for (int j = 0; j < np; j++)
+            p[j] = (float) ((double) p[j] - off[rng[k]] - anchor + CLEAN_PEDESTAL);
+    }
+    free(cm); free(off); free(edge); free(rng);
+    return n_ok > 0;
+}
+
+// Why the night reference cannot clean experiment s, for the status line:
+// its recordings are not loaded, it has no reference for this recording's
+// integration period or pixel range (named, against what it does have), or,
+// when there is a reference for the frames, that the instrument's own
+// background frames -- which step 1 needs -- were not found.
+static void reference_refusal(const refset_t *rs, const experiment_t *s,
+                              char *out, size_t n)
+{
+    if (rs == NULL || rs->n == 0) {
+        snprintf(out, n, "no night reference: its recordings are not loaded");
+        return;
+    }
+    int ip = -1, fp = -1;
+    for (int k = 0; k < s->nframes; k++) {
+        if (s->fr_bad[k]) continue;
+        const uint8_t *f = frame_at(s, k);
+        if (ref_model_for(rs, s, f) != NULL) {
+            snprintf(out, n, "nothing to clean: the instrument's own background "
+                             "frames were not found in this experiment");
+            return;
+        }
+        ip = be16(f, 18); fp = f[16];
+    }
+    char have[64] = "";
+    int ip_known = 0;
+    for (int i = 0; i < rs->n; i++) {
+        if (rs->m[i].nframes == 0) continue;
+        if (rs->m[i].intper == ip) ip_known = 1;
+        size_t l = strlen(have);
+        snprintf(have + l, sizeof have - l, "%s%d", l ? " and " : "", rs->m[i].intper);
+    }
+    if (ip < 0)
+        snprintf(out, n, "nothing to clean: no frame of this experiment passed its CRC");
+    else if (!ip_known)
+        snprintf(out, n, "this recording's integration period is %d; the night "
+                         "reference has backgrounds for %s only", ip, have);
+    else
+        snprintf(out, n, "this recording's pixels are %d..%d; the night reference "
+                         "has none for that range", fp, fp + s->npix - 1);
+}
+
+// One reference recording as build_reference works through it: its step 1
+// counts, and which of its frames are dark ones (the model's index + 1).
+typedef struct {
+    const experiment_t *s;
+    float         *pix;
+    unsigned char *ok;
+    unsigned char *dark;
+    int           *keys;
+    int            nkey;
+} refrec_t;
+
+// Measure the night reference backgrounds from whichever reference recordings
+// are loaded, one for each pixel range and integration period they hold.
+// Needs the attitudes (beacon_attitude_load) and the element sets
+// (globe_load_tles) in already. Leaves rs->n 0 if there is nothing to fit,
+// which is the case with --file.
+static void build_reference(refset_t *rs, const experiment_t *exps, int nexp)
+{
+    memset(rs, 0, sizeof *rs);
+    typedef struct { int n; double st; double sp[MAX_NPIX]; } refgrp_t;
+    typedef struct {
+        double n, st, stt, sp[MAX_NPIX], stp[MAX_NPIX];
+        int    base;
+    } refacc_t;
+    refacc_t *acc = (refacc_t *) calloc(REF_MAX_MODELS, sizeof *acc);
+    refgrp_t *grp = (refgrp_t *) calloc((size_t) REF_MAX_MODELS * REF_MAX_GROUPS, sizeof *grp);
+    refrec_t rec[N_REF_RECORDINGS];
+    memset(rec, 0, sizeof rec);
+    if (acc == NULL || grp == NULL) { free(acc); free(grp); return; }
+
+    // The pattern: every dark frame, less its own mean, against temperature.
+    for (int r = 0; r < N_REF_RECORDINGS; r++) {
+        const refsrc_t *src = &g_ref_recordings[r];
+        const experiment_t *s = NULL;
+        for (int e = 0; e < nexp; e++)
+            if (strcmp(exps[e].utc, src->utc) == 0) s = &exps[e];
+        if (s == NULL || s->nframes == 0) continue;
+        globe_t g;
+        memset(&g, 0, sizeof g);
+        g.zoom = 1.0;
+        globe_set_track(&g, s->utc, s->t_start_ms, s->t_end_ms);
+        if (!g.have_tle) continue;   // no orbit, so no telling it was in shadow
+
+        int nf = s->nframes;
+        refrec_t *rc = &rec[r];
+        rc->s = s;
+        rc->pix = (float *) malloc((size_t) nf * s->npix * sizeof *rc->pix);
+        rc->ok = (unsigned char *) calloc((size_t) nf, 1);
+        rc->dark = (unsigned char *) calloc((size_t) nf, 1);
+        rc->keys = (int *) malloc((size_t) nf * sizeof *rc->keys);
+        view_t tv = {0};
+        apply_scan(&tv, s);
+        rc->nkey = (rc->pix && rc->ok && rc->dark && rc->keys)
+                 ? undo_onboard(&tv, s, rc->pix, rc->ok, rc->keys, PRE_OWN) : -1;
+        int used[REF_MAX_MODELS] = {0}, last_bin[REF_MAX_MODELS];
+        for (int i = 0; i < REF_MAX_MODELS; i++) last_bin[i] = -1;
+        for (int k = 0, nx = 0; k < nf && rc->nkey > 0; k++) {
+            while (nx < rc->nkey && rc->keys[nx] < k) nx++;
+            if (!rc->ok[k] || (nx < rc->nkey && rc->keys[nx] == k) || !bg_sample_ok(s, k))
+                continue;
+            const uint8_t *f = frame_at(s, k);
+            if (be16(f, 18) != src->intper) continue;
+            if (!src->any_attitude) {
+                globe_attitude_t att = {0};
+                if (!beacon_attitude_nearest(s->fr_ts[k], REF_ATT_AGE_S, &att)
+                    || face_from_ram_deg(&att) < REF_MIN_RAM_DEG) continue;
+            }
+            double lat, lon, alt;
+            if (!globe_subpoint(&g, s->fr_ts[k], &lat, &lon, &alt)
+                || !in_earth_shadow(lat, lon, alt, g.sun_lat, g.sun_lon)) continue;
+
+            // The reference this frame belongs to, started if it is the first.
+            int mi = -1;
+            for (int i = 0; i < rs->n; i++)
+                if (rs->m[i].npix == s->npix && rs->m[i].first_px == f[16]
+                    && rs->m[i].intper == src->intper) mi = i;
+            if (mi < 0) {
+                if (rs->n == REF_MAX_MODELS) continue;
+                mi = rs->n++;
+                rs->m[mi].npix = s->npix;
+                rs->m[mi].first_px = f[16];
+                rs->m[mi].intper = src->intper;
+                rs->m[mi].any_attitude = src->any_attitude;
+            }
+            refbg_t *m = &rs->m[mi];
+            refacc_t *ac = &acc[mi];
+
+            const float *p = rc->pix + (long) k * s->npix;
+            double t = frame_temp(f), mean = 0.0;
+            for (int j = 0; j < s->npix; j++) mean += p[j];
+            mean /= s->npix;
+            int bin = (int) ((s->fr_ts[k] - s->t_start_ms) / REF_GROUP_MS);
+            if (bin < 0) bin = 0;
+            refgrp_t *gp = ac->base + bin < REF_MAX_GROUPS
+                         ? &grp[mi * REF_MAX_GROUPS + ac->base + bin] : NULL;
+            ac->n += 1.0; ac->st += t; ac->stt += t * t;
+            for (int j = 0; j < s->npix; j++) {
+                ac->sp[j] += p[j] - mean;
+                ac->stp[j] += t * (p[j] - mean);
+                if (gp != NULL) gp->sp[j] += p[j] - mean;
+            }
+            if (gp != NULL) { gp->n++; gp->st += t; }
+            if (ac->n == 1.0 || t < m->tmin) m->tmin = t;
+            if (ac->n == 1.0 || t > m->tmax) m->tmax = t;
+            if (bin > last_bin[mi]) last_bin[mi] = bin;
+            rc->dark[k] = (unsigned char) (mi + 1);
+            used[mi]++;
+        }
+        for (int i = 0; i < rs->n; i++)
+            if (used[i] > 0) { rs->m[i].nrec++; acc[i].base += last_bin[i] + 1; }
+    }
+
+    for (int i = 0; i < rs->n; i++) {
+        refbg_t *m = &rs->m[i];
+        refacc_t *ac = &acc[i];
+        if (ac->n < 2.0) continue;
+        m->nframes = (int) ac->n;
+        m->t0 = ac->st / ac->n;
+        double vt = ac->stt / ac->n - m->t0 * m->t0;
+        for (int j = 0; j < m->npix; j++) {
+            m->a[j] = ac->sp[j] / ac->n;
+            m->b[j] = vt > 0.0 ? (ac->stp[j] / ac->n - m->t0 * m->a[j]) / vt : 0.0;
+        }
+        // The check that the background holds still: every 30 s of every
+        // recording it was measured on, the mean pattern against the model.
+        for (int gi = 0; gi < REF_MAX_GROUPS; gi++) {
+            const refgrp_t *gr = &grp[i * REF_MAX_GROUPS + gi];
+            if (gr->n < REF_GROUP_MIN) continue;
+            double tm = gr->st / gr->n, ss = 0.0;
+            for (int j = 0; j < m->npix; j++) {
+                double d = gr->sp[j] / gr->n - m->a[j] - m->b[j] * (tm - m->t0);
+                ss += d * d;
+            }
+            double rms = sqrt(ss / m->npix);
+            if (rms > m->worst_rms) m->worst_rms = rms;
+        }
+    }
+
+    // The level: each recording cleaned with the patterns alone, and the slope
+    // of its dark frames' mean against the frame counter, pooled over the
+    // recordings of each reference, each about its own mean (a recording's
+    // level as a whole is set on its edges, so only the slope carries over).
+    double sxy[REF_MAX_MODELS] = {0}, sxx[REF_MAX_MODELS] = {0};
+    for (int r = 0; r < N_REF_RECORDINGS; r++) {
+        refrec_t *rc = &rec[r];
+        if (rc->s == NULL || rc->nkey <= 0
+            || !subtract_reference(rs, rc->s, rc->pix, rc->ok, rc->keys, rc->nkey))
+            continue;
+        const experiment_t *s = rc->s;
+        double sc[REF_MAX_MODELS] = {0}, sl[REF_MAX_MODELS] = {0}, nn[REF_MAX_MODELS] = {0};
+        for (int pass = 0; pass < 2; pass++)
+            for (int k = 0; k < s->nframes; k++) {
+                int mi = rc->dark[k] - 1;
+                if (!rc->ok[k] || mi < 0) continue;
+                const float *p = rc->pix + (long) k * s->npix;
+                double mean = 0.0;
+                for (int j = 0; j < s->npix; j++) mean += p[j];
+                mean /= s->npix;
+                if (pass == 0) { sc[mi] += s->fr_ctr[k]; sl[mi] += mean; nn[mi] += 1.0; continue; }
+                double dc = s->fr_ctr[k] - sc[mi] / nn[mi];
+                sxy[mi] += dc * (mean - sl[mi] / nn[mi]);
+                sxx[mi] += dc * dc;
+            }
+    }
+    for (int i = 0; i < rs->n; i++)
+        rs->m[i].level_per_frame = sxx[i] > 0.0 ? sxy[i] / sxx[i] : 0.0;
+
+    for (int r = 0; r < N_REF_RECORDINGS; r++) {
+        free(rec[r].pix); free(rec[r].ok); free(rec[r].dark); free(rec[r].keys);
+    }
+    free(acc); free(grp);
+}
+
+// Build the cleaned pixels for the selected experiment. Returns 0 if there is
+// nothing to show, in which case the buffers are left free.
+static int rebuild_clean(view_t *v, const experiment_t *s)
+{
+    free_clean(v);
+    if (s == NULL || s->nframes == 0 || v->fr_img == NULL || v->n_img == 0) return 0;
+
+    int nf = s->nframes;
+    float *pix = (float *) malloc((size_t) nf * s->npix * sizeof *pix);
+    unsigned char *ok = (unsigned char *) calloc((size_t) nf, 1);
+    int *keys = (int *) malloc((size_t) nf * sizeof *keys);
+    if (pix == NULL || ok == NULL || keys == NULL) {
+        free(pix); free(ok); free(keys);
+        return 0;
+    }
+
+    // Step 1: undo the instrument's subtraction.
+    int pre = v->clean_ref ? PRE_BRIDGE
+            : v->clean_stage == CLEAN_STEP1 ? PRE_HIDE : PRE_KEEP;
+    int nkey = undo_onboard(v, s, pix, ok, keys, pre);
+    if (nkey < 0) {
+        free(pix); free(ok); free(keys);
+        return 0;
+    }
+
+    // The reference background in place of steps 2 and 3, when that is the
+    // cleaning asked for.
+    if (v->clean_ref && v->clean_stage >= CLEAN_STEP2
+        && !subtract_reference(v->ref, s, pix, ok, keys, nkey)) {
+        free(pix); free(ok); free(keys);
+        return 0;
     }
 
     // Step 2: detrend every frame across its own strip. A straight line is
@@ -2318,7 +2990,7 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
     // estimate that never had one, come in a few hundred DN off the ranges
     // either side of them, which the whereogram shows as blocks that begin and
     // end where the estimates do.
-    if (v->clean_stage >= CLEAN_STEP2 && s->npix >= 4) {
+    if (!v->clean_ref && v->clean_stage >= CLEAN_STEP2 && s->npix >= 4) {
         const int ex[4] = { 0, 1, s->npix - 2, s->npix - 1 };
         for (int k = 0; k < nf; k++) {
             if (!ok[k]) continue;
@@ -2344,7 +3016,8 @@ static int rebuild_clean(view_t *v, const experiment_t *s)
     // recording at its raw level, which is what says whether the instrument's
     // own subtraction was all that stood between it and being flat, and step 2
     // on top of it says whether the block shifts have gone with it.
-    if (v->clean_stage < CLEAN_FULL) {
+    // The reference background is finished by this point too.
+    if (v->clean_stage < CLEAN_FULL || v->clean_ref) {
         for (int k = 0; k < nf; k++) if (ok[k]) v->clean_frames++;
         v->clean_pix = pix; v->clean_ok = ok;
         v->key_fr = keys; v->n_key = nkey;
@@ -3180,6 +3853,8 @@ static void load_state(view_t *v, char *sel_utc, size_t utc_cap, geom_t *g,
             v->clean_win = clamp_int(n, 1, CLEAN_WIN_MAX) | 1;
         else if (strcmp(key, "clean_mean") == 0)
             v->clean_mean = n != 0;
+        else if (strcmp(key, "clean_reference") == 0)
+            v->clean_ref = n != 0;
         // The globe's view. keep_view says the file carried one at all, which
         // is what stops the resumed experiment framing itself over the top of
         // it; the caller drops it again if the experiment is not the same one.
@@ -3248,6 +3923,7 @@ static int save_state(const view_t *v, const experiment_t *s, const geom_t *g,
     fprintf(f, "clean_step = %d\n", v->clean_step);
     fprintf(f, "clean_window = %d\n", v->clean_win);
     fprintf(f, "clean_mean = %d\n", v->clean_mean);
+    fprintf(f, "clean_reference = %d\n", v->clean_ref);
     fprintf(f, "globe_zoom = %g\n", gl->zoom);
     fprintf(f, "globe_lat = %g\n", gl->lat0);
     fprintf(f, "globe_lon = %g\n", gl->lon0);
@@ -3401,6 +4077,9 @@ static int parse_args(mv_args_t *a, int argc, char **argv, int help)
                "             edge pixels, and a sliding local background put in place\n"
                "             of the instrument's\n"
                "  shift-B    while cleaning is on, stop after an earlier one of those steps\n"
+               "  k          after the first step, take off the night reference background\n"
+               "             (dark frames in the Earth's shadow, one per integration period)\n"
+               "             instead of the local one; turns cleaning on if it was off\n"
                "  n          how many images the sliding background is taken over\n"
                "  e          combine those images by median or mean\n"
                "  d          write the selected experiment's missing data as re-download\n"
@@ -3564,6 +4243,30 @@ int main(int argc, char **argv)
     // A saved globe view belongs to the experiment it was saved for. Opening on
     // a different one frames that one's own track instead.
     else globe.keep_view = 0;
+
+    // The element sets the globe propagates, and the attitudes the extended
+    // beacons and the ADCS's SD-card logs carry, for drawing which way the
+    // satellite was facing as the recording ran. The MPI is run out of sight
+    // of the ground stations, so a log that spans the recording is usually the
+    // only record of it. With --file and no DB there are none. Both are read
+    // ahead of the experiment being selected: the night reference background
+    // is measured with them, and cleaning may already be asking for it.
+    if (db_path == NULL || globe_load_tles(db_path) == 0)
+        fprintf(stderr, "mpi_viewer: no FrontierSat TLEs in the DB; "
+                        "the globe will show no ground track\n");
+    if (db_path != NULL) beacon_attitude_load(db_path, MPI_ATTITUDE_CACHE_NAME, rebuild);
+    refset_t ref;
+    build_reference(&ref, exps, nexp);
+    v.ref = &ref;
+    for (int i = 0; i < ref.n; i++) {
+        const refbg_t *m = &ref.m[i];
+        if (m->nframes == 0) continue;
+        fprintf(stderr, "mpi_viewer: night reference background, integration period %d: "
+                        "%d frames from %d recording%s, temperature %.0f .. %.0f, worst "
+                        "30 s %.1f DN rms off the fit, level drift %.4f DN a frame.\n",
+                m->intper, m->nframes, m->nrec, m->nrec == 1 ? "" : "s",
+                m->tmin, m->tmax, m->worst_rms, m->level_per_frame);
+    }
     select_experiment(&v, &exps[v.sel]);
     if (resumed >= 0) {
         v.img_pos = saved_img >= v.n_img ? (v.n_img ? v.n_img - 1 : 0) : saved_img;
@@ -3601,15 +4304,6 @@ int main(int argc, char **argv)
     // read once here; the track itself is built the first time round the loop,
     // when the experiment on screen is settled.
     globe_load_map(&globe, "mpi_viewer");
-    if (db_path == NULL || globe_load_tles(db_path) == 0)
-        fprintf(stderr, "mpi_viewer: no FrontierSat TLEs in the DB; "
-                        "the globe will show no ground track\n");
-    // The attitudes the extended beacons and the ADCS's SD-card logs carry,
-    // for drawing which way the satellite was facing as the recording ran.
-    // The MPI is run out of sight of the ground stations, so a log that
-    // spans the recording is usually the only record of it. With --file and
-    // no DB there are none.
-    if (db_path != NULL) beacon_attitude_load(db_path, MPI_ATTITUDE_CACHE_NAME, rebuild);
 
     // Where the experiment list is scrolled to, in pixels. Scrolling is the
     // reader's, not the selection's: the list is pulled back to the selected
@@ -3746,18 +4440,51 @@ int main(int argc, char **argv)
             if (!shifted) {
                 want = v.clean_stage == CLEAN_OFF ? v.clean_step : CLEAN_OFF;
             } else if (v.clean_stage != CLEAN_OFF) {
-                v.clean_step = v.clean_step + 1 >= CLEAN_STAGES ? CLEAN_STEP1
-                                                               : v.clean_step + 1;
+                // The reference background is one step after step 1, not two.
+                if (v.clean_ref)
+                    v.clean_step = v.clean_step == CLEAN_STEP1 ? CLEAN_FULL : CLEAN_STEP1;
+                else
+                    v.clean_step = v.clean_step + 1 >= CLEAN_STAGES ? CLEAN_STEP1
+                                                                   : v.clean_step + 1;
                 want = v.clean_step;
             }
             if (want >= 0) {
                 if (!set_clean(&v, s, want)) {
-                    snprintf(status, sizeof status,
-                             "nothing to clean: no background frames in this experiment");
+                    if (v.clean_ref)
+                        reference_refusal(v.ref, s, status, sizeof status);
+                    else
+                        snprintf(status, sizeof status,
+                                 "nothing to clean: no background frames in this experiment");
                     status_left = 6.0f;
                 }
                 cov_valid = 0;
             }
+        }
+        // k switches what follows step 1: the local cleaning (steps 2 and 3)
+        // or the night reference background, and turns cleaning on if it was
+        // off. An experiment the reference does not cover stays as it was, and
+        // the status line says why: no reference for its integration period or
+        // pixel range (naming them), or its recordings not loaded.
+        if (IsKeyPressed(KEY_K)) {
+            int was_ref = v.clean_ref, was_stage = v.clean_stage;
+            v.clean_ref = !v.clean_ref;
+            int want = v.clean_stage == CLEAN_OFF ? v.clean_step : v.clean_stage;
+            if (v.clean_ref && want == CLEAN_STEP2) want = CLEAN_FULL;
+            if (set_clean(&v, s, want)) {
+                snprintf(status, sizeof status, "%s",
+                         v.clean_ref ? "cleaning: step 1 + the night reference background"
+                                     : "cleaning: steps 1-3, the local background");
+            } else {
+                if (v.clean_ref)
+                    reference_refusal(v.ref, s, status, sizeof status);
+                else
+                    snprintf(status, sizeof status,
+                             "nothing to clean: no background frames in this experiment");
+                v.clean_ref = was_ref;
+                set_clean(&v, s, was_stage);
+            }
+            status_left = 6.0f;
+            cov_valid = 0;
         }
         // n: how many images the sliding background is taken over.
         if (IsKeyPressed(KEY_N)) {
@@ -3873,6 +4600,13 @@ int main(int argc, char **argv)
                 int same = v.sel >= 0 && row_of(rows, nrows, v.sel) >= 0;
                 if (!same) v.sel = rows[0];
                 last_sel = -1;
+                // The element sets, the attitudes and the night reference
+                // measured with them, ahead of the cleaning that uses it.
+                if (db_path != NULL) {
+                    globe_load_tles(db_path);
+                    beacon_attitude_load(db_path, MPI_ATTITUDE_CACHE_NAME, full);
+                }
+                build_reference(&ref, exps, nexp);
                 select_experiment(&v, &exps[v.sel]);
                 if (same) {
                     if (save_img >= v.n_img) save_img = v.n_img ? v.n_img - 1 : 0;
@@ -3882,10 +4616,6 @@ int main(int argc, char **argv)
                 }
                 s = &exps[v.sel];
                 cov_valid = 0;   // the reloaded experiment needs a fresh whereogram
-                if (db_path != NULL) {
-                    globe_load_tles(db_path);
-                    beacon_attitude_load(db_path, MPI_ATTITUDE_CACHE_NAME, full);
-                }
                 globe.track_key[0] = '\0';   // and a fresh ground track
                 note = nnote;
                 newer_note(&note, newer, sizeof newer);
@@ -4159,7 +4889,7 @@ int main(int argc, char **argv)
         if (aux_frame >= 0) {
             const uint8_t *f = frame_at(s, aux_frame);
             draw_text(TextFormat("frame counter : %d", be16(f, 4)),  ax, ay, 15, LIGHTGRAY); ay += 20;
-            draw_text(TextFormat("temperature   : %d (raw ADC)", be16(f, 6)), ax, ay, 15, LIGHTGRAY); ay += 20;
+            draw_text(TextFormat("temperature   : %d (raw ADC, signed)", frame_temp(f)), ax, ay, 15, LIGHTGRAY); ay += 20;
             draw_text(TextFormat("firmware ver  : %d", f[8]),        ax, ay, 15, LIGHTGRAY); ay += 20;
             draw_text(TextFormat("camera CCD ADC: %d", be16(f, 9)),  ax, ay, 15, LIGHTGRAY); ay += 20;
             draw_text(TextFormat("dome target V : %d", be16(f, 11)), ax, ay, 15, LIGHTGRAY); ay += 20;
@@ -4209,6 +4939,43 @@ int main(int argc, char **argv)
         if (v.clean_stage == CLEAN_OFF) {
             draw_text("cleaning      : off  (counts as they came down)", ax, ay, 15, GRAY);
             ay += 20;
+        } else if (v.clean_ref) {
+            // The night reference: what it was measured on, and whether this
+            // frame's temperature is inside what it saw or extrapolated from it.
+            const char *what = v.clean_stage == CLEAN_STEP1
+                ? "cleaning      : step 1  (night reference off with shift-B)"
+                : "cleaning      : step 1 + night reference background  (k)";
+            draw_text(what, ax, ay, 15, (Color){ 120, 220, 160, 255 }); ay += 20;
+            // The reference for the frame on show, which goes by its own
+            // integration period.
+            const uint8_t *af = aux_frame >= 0 ? frame_at(s, aux_frame) : NULL;
+            const refbg_t *rm = af != NULL ? ref_model_for(v.ref, s, af) : NULL;
+            if (rm != NULL) {
+                draw_text(TextFormat("reference     : period %d, %d dark frames from %d "
+                                     "night recording%s, %s",
+                                     rm->intper, rm->nframes, rm->nrec,
+                                     rm->nrec == 1 ? "" : "s",
+                                     rm->any_attitude ? "any attitude"
+                                     : TextFormat("face >= %.0f deg off ram",
+                                                  REF_MIN_RAM_DEG)),
+                          ax, ay, 15, LIGHTGRAY); ay += 20;
+                int tf = frame_temp(af);
+                int outside = tf < rm->tmin || tf > rm->tmax;
+                draw_text(TextFormat("                temperature %.0f..%.0f%s, worst 30 s "
+                                     "%.0f DN off the fit",
+                                     rm->tmin, rm->tmax,
+                                     outside ? "  -- this frame outside: extrapolated" : "",
+                                     rm->worst_rms),
+                          ax, ay, 15, outside ? (Color){ 206, 150, 42, 255 } : LIGHTGRAY);
+                ay += 20;
+            } else if (af != NULL) {
+                draw_text(TextFormat("reference     : none for this frame (period %d)",
+                                     be16(af, 18)),
+                          ax, ay, 15, (Color){ 206, 150, 42, 255 }); ay += 20;
+            }
+            draw_text(TextFormat("bg estimates  : %d frames%s", v.n_key,
+                                 v.key_step > 0 ? TextFormat(", every %d", v.key_step) : ""),
+                      ax, ay, 15, LIGHTGRAY); ay += 20;
         } else {
             if (v.clean_stage == CLEAN_STEP1)
                 draw_text("cleaning      : step 1  (the instrument's own subtraction undone)",
@@ -4461,7 +5228,7 @@ int main(int argc, char **argv)
             "Up/Down experiment   Left/Right image  shift: frame   F2 fine stepping   drag whereogram: scrub + time span, wheel zooms"
             "   globe: drag turns, two-finger press-drag turns about the satellite, scroll zooms, g resets"
             "   Space play/pause   ,/. speed   f steps/sweep   s zoom   a scale"
-            "   z/x min  c/v max   m colour map   b clean  B step   n bg window   e median/mean"
+            "   z/x min  c/v max   m colour map   b clean  B step   k night-reference bg   n bg window   e median/mean"
             "   t favourite  T favourites only   d re-download commands   F5 refresh  shift-F5 rebuild  q quit";
         draw_text(help, 12, GetScreenHeight() - 22, 12, (Color){ 150, 150, 160, 255 });
 

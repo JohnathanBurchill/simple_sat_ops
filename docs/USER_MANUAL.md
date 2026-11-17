@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`36e1cff` (2026-11-05). This is a working draft.
+`1b1cad5` (2026-11-08). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -3139,6 +3139,82 @@ many frames came before the first estimate. Those frames precede any estimate,
 so step 1 has nothing to add back for them and does not show them; from step 2
 on they are detrended onto the same footing as the rest and are shown.
 
+**Night reference background (`k`).** The inner dome does not sweep in flight -
+its monitor reads the same at every setpoint - so the MPI is a fixed-voltage
+analyser, and both the instrument's subtraction and steps 2 and 3 work against
+it: the instrument's background is a frame taken every 256, ions and all, so a
+steady ion signal subtracts itself away. **`k` puts a background measured in the
+dark in place of steps 2 and 3**, one for each integration period the MPI has
+flown at, each frame taking the one for its own period. `k` turns cleaning on if
+it was off, and `shift-B` then moves between step 1 and the reference.
+
+**At integration period 1000** (since 2026-10-21) the background is measured on
+frames on the night side, in the Earth's shadow, with the MPI face at least 80°
+off ram by the nearest ADCS attitude (within 10 s). They come from the
+2026-11-05 19:57 recording, flown backward (yaw 180), and the 2026-11-06 18:01
+one, pitched -90, over through 180 and on to +90; 4337 frames qualify.
+
+Within a recording the dark pattern across the strip holds to 2-11 DN over each
+30 s (one pixel of one frame scatters by 40 DN), but it drifts with the aux
+temperature reading: 15 DN rms across 2026-11-05 and 72 DN between the two
+nights, which sat about 1400 counts apart. So **the reference is the mean pattern
+plus a straight line in temperature, pixel by pixel**. Every 30 s of both nights
+sits within 13 DN of it, against 16-53 DN off a plain average of the two, and
+fitted on the warmer frames alone it predicts the colder third of 2026-11-05 to
+8-24 DN. The level of the whole strip behaves differently. It **jumps by up to
+600 DN at every background estimate the instrument takes**, the same at every
+pixel, while the instrument's own output does not jump - an offset of the
+instrument's, not anything on the sky - so each 256-frame range is matched to the
+one before it over the 10 frames either side of the estimate between them. And it
+drifts down about 0.04 DN a frame from when the instrument last started (the
+frame counter), the same on both nights although the temperature reading climbed
+three times faster on one of them; that slope is part of the reference. The
+recording as a whole is set so that its median frame's ten pixels at each end
+sit at 2000 DN, on the same scale as the other modes.
+
+**At integration period 260** (every recording before 2026-10-21, and those of
+2026-10-22, -29 and -30) the dark pattern is nearly the same: every night
+recording at 260 matches the 1000 background's pattern with a gain of 0.98-1.00,
+so it is an offset the CCD carries rather than dark current that grows with the
+exposure. What differs is 16-29 DN pixel to pixel and an 8-16 DN ramp across the
+strip, the same in every recording, and worth taking out. Only one recording at
+260 meets the rule above (2026-10-22, flown with roll 90), and on its own it
+predicts the colder nights badly (8-92 DN). So **the 260 background takes every
+frame at 260 in the Earth's shadow, whatever the attitude**, from the ten night
+recordings: 19834 frames, temperatures 370-2850. That lets ram-facing frames in;
+the case for it is that none of those nights shows ions - each sits off the 1000
+pattern by the same small ramp and no more, where the ions of 2026-11-14 stand
+135 DN above it - and that, fitted without one night, it predicts that night to
+5-16 DN, as well as the 1000 background does its own.
+
+Either background is measured only on frames undone with their own range's
+estimate. Two of the 260 nights had lost some estimates (7% of 2026-10-22 and
+20% of 2026-10-05 10:23), and those ranges, undone with the estimate before,
+carried 30-43 DN of stripes that put the 260 background 67 DN off its own worst
+30 s; left out, it is 24.
+
+The reference also **puts back the frames ahead of the first estimate**, which
+the local cleaning cannot: the instrument took a background off them that it
+never sent, and the frames either side of the first one it did send give it
+back. On 2026-11-14 that is the first 23 s, the only stretch of that recording
+facing ram. **Ranges whose own estimate was lost** are put back the same way:
+the instrument takes one every 256 frames, so the counter says where each lost
+one fell, and the frames either side of that spot give it back. Frames from
+before an instrument restart (the counter behind the range's estimate), frames
+more than one range ahead of the first estimate, and ranges beyond a hole with
+nothing on one side to match stay hidden.
+
+Both backgrounds cover pixels 48..112. A frame at a pixel range or integration
+period with no background is left uncleaned, and `k` or `b` says which it was -
+"this recording's integration period is 260; the night reference has backgrounds
+for 1000 only", say. The temperature reading is signed (the coldest recordings
+read below zero, which unsigned came back as 65000 and up) and is not a plain
+thermometer - it jumps at an instrument restart, by +550 counts on 2026-11-06 and
+-1400 on 2026-10-28 - so a frame outside its background's range is cleaned on an
+extrapolation: the aux panel names the period, the range and how far the worst
+30 s sat off the fit, and turns amber on such a frame. The startup lines print
+the same for each background, with its level drift.
+
 **The time ruler (drag the whereogram).** A press on the whereogram jumps to the
 image at that moment in the recording and dragging scrubs, as before. While the
 button is down the drag is also a ruler: the stretch between where the press
@@ -3258,7 +3334,7 @@ globe stays at the 2048-pixel map however far in you go.
 `~/.local/state/simple_sat_ops/mpi_viewer.state` - which experiment was open,
 where the playhead sat in it (and the frame it was on, stepping a frame at a
 time, and whether fine stepping was on), the favourites and whether the list shows only
-them, the cleaning stage and its window and estimator, the colour map, the colour scale and its manual DN window, the playback speed,
+them, the cleaning stage and its window and estimator, whether the night reference is on, the colour map, the colour scale and its manual DN window, the playback speed,
 the frames-per-sweep override, the zoom, the globe's view (where it faces, its
 zoom and where the disc sits), and the size and place of the window -
 and reads it back at startup, printing a line naming what it resumed. The
@@ -3280,7 +3356,8 @@ way, `F2` turns fine stepping on for the plain keys, `,`/`.`
 set the playback speed, `f` cycles frames-per-image (auto/8/16), `s` zoom, `a` cycles the colour scale (auto-image / auto-experiment
 / manual), `r` resets it to auto-image, `z`/`x` and `c`/`v` move the manual DN
 window (hold `Shift` for coarse steps), `m` cycles the colour map, `b` toggles
-the cleaned imagery and `shift-B` moves between its steps, `n` sets how many
+the cleaned imagery and `shift-B` moves between its steps, `k` switches it to
+the night reference background, `n` sets how many
 images its background is taken over and `e` switches that between median and
 mean,
 `t` tags a favourite and `shift-T` shows the favourites only,
