@@ -10,7 +10,7 @@ and talking to a satellite that only answers when you ask politely.*
 Version: 3 (working draft)
 
 Applies to `simple_sat_ops` and friends on `main`, commit
-`1b1cad5` (2026-11-08). This is a working draft.
+`9629e12` (2026-11-17). This is a working draft.
 
 Prepared by Johnathan K. Burchill and Claude Opus 4.8 at the University
 of Calgary.
@@ -3343,7 +3343,26 @@ rather than closed still keeps them. The open experiment and the favourites are
 matched by start time, so a new experiment arriving at the top of the list moves
 nothing, a favourite this database does not hold stays in the file, and a
 database that no longer holds the open experiment opens on the newest one with
-the view settings still restored. It is plain
+the view settings still restored.
+
+**Each recording keeps its own look.** Change the colour map, the colour scale
+or its manual DN window, the zoom, the frames-per-sweep override or anything
+about the cleaning (on or off, the step, the window, median or mean, the night
+reference) while a recording is on show, and that recording keeps all of them:
+going back to it, in this session or the next, brings them back. A bench file at
+133 pixels and a flight recording cleaned against the night reference want
+different DN windows, and each now holds its own. A recording that keeps none
+opens with whatever the one you were looking at before it was shown with, so a new colour map or the
+night reference still carries on down the list until you change something on a
+recording. Only changing a setting gives a recording its own: stepping through
+the list with `Up`/`Down` leaves the ones you only passed over as they were. A
+recording whose cleaning cannot be applied this session (the night reference
+needs the DB, say) opens uncleaned but keeps asking for it. Playback speed, fine
+stepping, the globe and the window stay one setting for the whole viewer. The
+recordings are kept by start time, one `recording = ` line each at the foot of
+the state file.
+
+The state file is plain
 `key = value` text: edit it by hand, or delete it to come back up on the
 defaults. Every value is range-checked on the way in, and a key the file does
 not carry keeps its built-in default, so a file written by another build is

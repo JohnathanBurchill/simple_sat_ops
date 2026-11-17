@@ -260,6 +260,12 @@
     startup. Plain key = value text, checked on the way in; delete it to come
     back up on the defaults.
 
+    Each recording keeps its own colour map, colour scale and manual DN window,
+    zoom, frames-per-sweep override and cleaning, once one of them is changed
+    while it is on show; going back to it brings them back, in this session or
+    the next. A recording that keeps none opens with whatever the one before it
+    was shown with.
+
     Re-download export: press d to write the telecommands that fetch whatever of
     the selected experiment never came down -- the holes snapped out to the
     file's 195-byte downlink packet grid and merged into the fewest commands, as
@@ -3774,6 +3780,99 @@ static int row_of(const int *rows, int nrows, int e)
     return -1;
 }
 
+// How a recording is looked at -- its colour map, colour scale and manual DN
+// window, the zoom, the frames-per-sweep override and the cleaning -- is kept
+// against that recording, by start time like the favourites, so going back to
+// one brings back the window and the cleaning it was left with. A bench file
+// at 133 pixels and a flight recording cleaned against the night reference do
+// not want the same DN window. A recording gets settings of its own only once
+// one of them is changed while it is on show; until then it opens with
+// whatever the recording before it was shown with, which is how a new colour
+// map or the night reference carries on down the list.
+typedef struct {
+    int cmap, zoom, scale_mode, dn_min, dn_max, fpi_override;
+    int clean_stage, clean_step, clean_win, clean_mean, clean_ref;
+} rec_view_t;
+
+typedef struct {
+    char       utc[24];   // experiment_t.utc
+    rec_view_t rv;
+} rec_entry_t;
+
+typedef struct {
+    rec_entry_t *e;
+    int          n, cap;
+} rec_views_t;
+
+static void rec_view_get(const view_t *v, rec_view_t *o)
+{
+    rec_view_t r = {0};
+    r.cmap = v->cmap; r.zoom = v->zoom; r.scale_mode = v->scale_mode;
+    r.dn_min = v->dn_min; r.dn_max = v->dn_max; r.fpi_override = v->fpi_override;
+    r.clean_stage = v->clean_stage; r.clean_step = v->clean_step;
+    r.clean_win = v->clean_win; r.clean_mean = v->clean_mean; r.clean_ref = v->clean_ref;
+    *o = r;
+}
+
+static void rec_view_put(view_t *v, const rec_view_t *r)
+{
+    v->cmap = r->cmap; v->zoom = r->zoom; v->scale_mode = r->scale_mode;
+    v->dn_min = r->dn_min; v->dn_max = r->dn_max; v->fpi_override = r->fpi_override;
+    v->clean_stage = r->clean_stage; v->clean_step = r->clean_step;
+    v->clean_win = r->clean_win; v->clean_mean = r->clean_mean; v->clean_ref = r->clean_ref;
+}
+
+static int rec_view_find(const rec_views_t *t, const char *utc)
+{
+    for (int k = 0; k < t->n; k++)
+        if (strcmp(t->e[k].utc, utc) == 0) return k;
+    return -1;
+}
+
+// Set the settings kept for the recording starting at utc, adding it if it has
+// none yet. Out of memory, the recording simply keeps none.
+static void rec_view_keep(rec_views_t *t, const char *utc, const rec_view_t *r)
+{
+    int k = rec_view_find(t, utc);
+    if (k < 0) {
+        if (t->n == t->cap) {
+            int cap = t->cap ? 2 * t->cap : 64;
+            rec_entry_t *ne = (rec_entry_t *) realloc(t->e, (size_t) cap * sizeof *ne);
+            if (ne == NULL) return;
+            t->e = ne; t->cap = cap;
+        }
+        k = t->n++;
+        snprintf(t->e[k].utc, sizeof t->e[k].utc, "%s", utc);
+    }
+    t->e[k].rv = *r;
+}
+
+// Keep what the recording s is on show with, if it has changed since s was
+// opened (opened) or last kept. Settings a recording came back with and that
+// were left alone are not written over: one whose cleaning this session could
+// not apply -- no night reference without the DB, say -- keeps asking for it.
+static void rec_view_remember(rec_views_t *t, const view_t *v, const experiment_t *s,
+                              rec_view_t *opened)
+{
+    rec_view_t now;
+    rec_view_get(v, &now);
+    if (memcmp(&now, opened, sizeof now) == 0) return;
+    rec_view_keep(t, s->utc, &now);
+    *opened = now;
+}
+
+// Leave the recording from (NULL for none), keeping whatever was changed on
+// it, and open to with its own settings if it has any.
+static void switch_experiment(view_t *v, rec_views_t *t, rec_view_t *opened,
+                              const experiment_t *from, const experiment_t *to)
+{
+    if (from != NULL) rec_view_remember(t, v, from, opened);
+    int k = rec_view_find(t, to->utc);
+    if (k >= 0) rec_view_put(v, &t->e[k].rv);
+    select_experiment(v, to);
+    rec_view_get(v, opened);
+}
+
 static int state_path(char *out, size_t cap)
 {
     const char *home = getenv("HOME");
@@ -3797,15 +3896,72 @@ static int clamp_int(int x, int lo, int hi)
     return x < lo ? lo : x > hi ? hi : x;
 }
 
-// Read the saved state into v, sel_utc (the experiment that was open), g and fv.
-// Anything the file does not carry is left as the caller set it.
+// One of the settings a recording keeps, checked on the way in. Returns 0 for a
+// key that is not one of them.
+static int rec_view_key(rec_view_t *r, const char *key, int n)
+{
+    if (strcmp(key, "frames_per_sweep") == 0)
+        r->fpi_override = (n == 8 || n == 16) ? n : 0;
+    else if (strcmp(key, "zoom") == 0)
+        r->zoom = (n == 2 || n == 4 || n == 8 || n == 16) ? n : 8;
+    else if (strcmp(key, "colour_map") == 0)
+        r->cmap = clamp_int(n, 0, N_CMAPS - 1);
+    else if (strcmp(key, "scale_mode") == 0)
+        r->scale_mode = clamp_int(n, SCALE_AUTO_IMAGE, SCALE_MANUAL);
+    else if (strcmp(key, "dn_min") == 0)
+        r->dn_min = clamp_int(n, 0, 65535);
+    else if (strcmp(key, "dn_max") == 0)
+        r->dn_max = clamp_int(n, 0, 65535);
+    else if (strcmp(key, "clean_stage") == 0)
+        r->clean_stage = clamp_int(n, CLEAN_OFF, CLEAN_STAGES - 1);
+    else if (strcmp(key, "clean_step") == 0)
+        r->clean_step = clamp_int(n, CLEAN_STEP1, CLEAN_STAGES - 1);
+    else if (strcmp(key, "clean_window") == 0)
+        // Odd widths only: the window is the images either side of this one.
+        r->clean_win = clamp_int(n, 1, CLEAN_WIN_MAX) | 1;
+    else if (strcmp(key, "clean_mean") == 0)
+        r->clean_mean = n != 0;
+    else if (strcmp(key, "clean_reference") == 0)
+        r->clean_ref = n != 0;
+    else
+        return 0;
+    return 1;
+}
+
+// One recording's settings: "recording = <start time>; colour_map=1 zoom=8 ...".
+// A setting the line leaves out takes the value the file gave it above.
+static void read_recording(char *val, const rec_view_t *base, rec_views_t *t)
+{
+    char *semi = strchr(val, ';');
+    if (semi == NULL) return;
+    *semi = '\0';
+    char *utc = trim(val);
+    if (utc[0] == '\0' || strlen(utc) >= sizeof t->e[0].utc) return;
+    rec_view_t r = *base;
+    for (char *tok = strtok(semi + 1, " \t\r\n"); tok != NULL; tok = strtok(NULL, " \t\r\n")) {
+        char *eq = strchr(tok, '=');
+        if (eq == NULL) continue;
+        *eq = '\0';
+        rec_view_key(&r, tok, atoi(eq + 1));
+    }
+    if (r.dn_max <= r.dn_min) r.dn_max = r.dn_min + 1;
+    rec_view_keep(t, utc, &r);
+}
+
+// Read the saved state into v, sel_utc (the experiment that was open), g, fv
+// and the settings each recording keeps (t). Anything the file does not carry
+// is left as the caller set it. The settings outside any recording's line are
+// the ones the last session was showing, which a recording that keeps none of
+// its own opens with.
 static void load_state(view_t *v, char *sel_utc, size_t utc_cap, geom_t *g,
-                       globe_t *gl, favs_t *fv)
+                       globe_t *gl, favs_t *fv, rec_views_t *t)
 {
     char path[1024];
     if (state_path(path, sizeof path) != 0) return;
     FILE *f = fopen(path, "r");
     if (f == NULL) return;
+    rec_view_t shown;
+    rec_view_get(v, &shown);
     char line[512];
     while (fgets(line, sizeof line, f) != NULL) {
         char *eq = strchr(line, '=');
@@ -3813,7 +3969,10 @@ static void load_state(view_t *v, char *sel_utc, size_t utc_cap, geom_t *g,
         *eq = '\0';
         char *key = trim(line), *val = trim(eq + 1);
         int n = atoi(val);
-        if (strcmp(key, "experiment") == 0)
+        if (rec_view_key(&shown, key, n)) continue;
+        if (strcmp(key, "recording") == 0)
+            read_recording(val, &shown, t);
+        else if (strcmp(key, "experiment") == 0)
             snprintf(sel_utc, utc_cap, "%s", val);
         else if (strcmp(key, "favourite") == 0 && val[0] != '\0'
                  && fv->nfav < MAX_FAVOURITES && fav_find(fv, val) < 0)
@@ -3832,29 +3991,7 @@ static void load_state(view_t *v, char *sel_utc, size_t utc_cap, geom_t *g,
         else if (strcmp(key, "images_per_second") == 0) {
             double r = atof(val);
             v->ips = (float) (r < 1.0 ? 1.0 : r > 60.0 ? 60.0 : r);
-        } else if (strcmp(key, "frames_per_sweep") == 0)
-            v->fpi_override = (n == 8 || n == 16) ? n : 0;
-        else if (strcmp(key, "zoom") == 0)
-            v->zoom = (n == 2 || n == 4 || n == 8 || n == 16) ? n : 8;
-        else if (strcmp(key, "colour_map") == 0)
-            v->cmap = clamp_int(n, 0, N_CMAPS - 1);
-        else if (strcmp(key, "scale_mode") == 0)
-            v->scale_mode = clamp_int(n, SCALE_AUTO_IMAGE, SCALE_MANUAL);
-        else if (strcmp(key, "dn_min") == 0)
-            v->dn_min = clamp_int(n, 0, 65535);
-        else if (strcmp(key, "dn_max") == 0)
-            v->dn_max = clamp_int(n, 0, 65535);
-        else if (strcmp(key, "clean_stage") == 0)
-            v->clean_stage = clamp_int(n, CLEAN_OFF, CLEAN_STAGES - 1);
-        else if (strcmp(key, "clean_step") == 0)
-            v->clean_step = clamp_int(n, CLEAN_STEP1, CLEAN_STAGES - 1);
-        else if (strcmp(key, "clean_window") == 0)
-            // Odd widths only: the window is the images either side of this one.
-            v->clean_win = clamp_int(n, 1, CLEAN_WIN_MAX) | 1;
-        else if (strcmp(key, "clean_mean") == 0)
-            v->clean_mean = n != 0;
-        else if (strcmp(key, "clean_reference") == 0)
-            v->clean_ref = n != 0;
+        }
         // The globe's view. keep_view says the file carried one at all, which
         // is what stops the resumed experiment framing itself over the top of
         // it; the caller drops it again if the experiment is not the same one.
@@ -3886,7 +4023,8 @@ static void load_state(view_t *v, char *sel_utc, size_t utc_cap, geom_t *g,
         else if (strcmp(key, "window_y") == 0) g->y = n;
     }
     fclose(f);
-    if (v->dn_max <= v->dn_min) v->dn_max = v->dn_min + 1;
+    if (shown.dn_max <= shown.dn_min) shown.dn_max = shown.dn_min + 1;
+    rec_view_put(v, &shown);
 }
 
 // Write the state back: on exit, and whenever the favourites change, so a
@@ -3895,7 +4033,7 @@ static void load_state(view_t *v, char *sel_utc, size_t utc_cap, geom_t *g,
 // Returns 0, or -1 when the file could not be written; the caller decides
 // whether that is worth saying.
 static int save_state(const view_t *v, const experiment_t *s, const geom_t *g,
-                      const globe_t *gl, const favs_t *fv)
+                      const globe_t *gl, const favs_t *fv, const rec_views_t *t)
 {
     char path[1024], tmp[1100];
     if (state_path(path, sizeof path) != 0) return -1;
@@ -3935,6 +4073,19 @@ static int save_state(const view_t *v, const experiment_t *s, const geom_t *g,
     fprintf(f, "window_y = %d\n", g->y);
     fprintf(f, "favourites_only = %d\n", fv->only);
     for (int k = 0; k < fv->nfav; k++) fprintf(f, "favourite = %s\n", fv->fav[k]);
+    if (t->n > 0) {
+        fprintf(f, "# The settings each recording keeps, by start time. The view settings\n");
+        fprintf(f, "# above are what was on show, which a recording not listed opens with.\n");
+    }
+    for (int k = 0; k < t->n; k++) {
+        const rec_view_t *r = &t->e[k].rv;
+        fprintf(f, "recording = %s; colour_map=%d scale_mode=%d dn_min=%d dn_max=%d "
+                   "zoom=%d frames_per_sweep=%d clean_stage=%d clean_step=%d "
+                   "clean_window=%d clean_mean=%d clean_reference=%d\n",
+                t->e[k].utc, r->cmap, r->scale_mode, r->dn_min, r->dn_max, r->zoom,
+                r->fpi_override, r->clean_stage, r->clean_step, r->clean_win,
+                r->clean_mean, r->clean_ref);
+    }
     int bad = ferror(f);
     if (fclose(f) != 0) bad = 1;
     if (bad || rename(tmp, path) != 0) { remove(tmp); return -1; }
@@ -4098,7 +4249,9 @@ static int parse_args(mv_args_t *a, int argc, char **argv, int help)
                "Which experiment was open, where the playhead sat, every view\n"
                "setting and the favourites are kept in\n"
                "~/.local/state/simple_sat_ops/mpi_viewer.state and picked up next\n"
-               "time; delete that file to come back up on the defaults.\n");
+               "time; delete that file to come back up on the defaults. A recording\n"
+               "whose colour map, scale, DN window, zoom, steps/sweep or cleaning\n"
+               "was changed keeps them, and gets them back when it is opened again.\n");
     }
     return help ? PARSE_HELP : PARSE_OK;
 }
@@ -4225,7 +4378,11 @@ int main(int argc, char **argv)
     char sel_utc[24] = "";
     favs_t fv;
     memset(&fv, 0, sizeof fv);
-    load_state(&v, sel_utc, sizeof sel_utc, &geom, &globe, &fv);
+    // The settings each recording keeps, and those the one on show opened with,
+    // which is how a change made to it is noticed.
+    rec_views_t recs = {0};
+    rec_view_t opened = {0};
+    load_state(&v, sel_utc, sizeof sel_utc, &geom, &globe, &fv, &recs);
     int saved_img = v.img_pos, saved_play = v.playing, saved_col = v.cur_col;
     // The rows the list shows: every experiment, or only the favourites. A
     // favourites-only list with none of them in this database shows them all.
@@ -4267,7 +4424,7 @@ int main(int argc, char **argv)
                 m->intper, m->nframes, m->nrec, m->nrec == 1 ? "" : "s",
                 m->tmin, m->tmax, m->worst_rms, m->level_per_frame);
     }
-    select_experiment(&v, &exps[v.sel]);
+    switch_experiment(&v, &recs, &opened, NULL, &exps[v.sel]);
     if (resumed >= 0) {
         v.img_pos = saved_img >= v.n_img ? (v.n_img ? v.n_img - 1 : 0) : saved_img;
         v.playing = saved_play;
@@ -4378,7 +4535,7 @@ int main(int argc, char **argv)
                 int r = (int) ((m.y - (float) list_top + list_px) / (float) row_h);
                 if (r >= 0 && r < nrows && rows[r] != v.sel) {
                     v.sel = rows[r];
-                    select_experiment(&v, &exps[v.sel]);
+                    switch_experiment(&v, &recs, &opened, s, &exps[v.sel]);
                     s = &exps[v.sel];
                 }
             }
@@ -4387,8 +4544,8 @@ int main(int argc, char **argv)
         // Up and Down step through the rows on show, so with only the
         // favourites showing they skip from favourite to favourite.
         int srow = row_of(rows, nrows, v.sel);
-        if (key_repeat(KEY_DOWN, &rep_down) && srow < nrows - 1) { v.sel = rows[srow + 1]; select_experiment(&v, &exps[v.sel]); s = &exps[v.sel]; }
-        if (key_repeat(KEY_UP, &rep_up)     && srow > 0)         { v.sel = rows[srow - 1]; select_experiment(&v, &exps[v.sel]); s = &exps[v.sel]; }
+        if (key_repeat(KEY_DOWN, &rep_down) && srow < nrows - 1) { v.sel = rows[srow + 1]; switch_experiment(&v, &recs, &opened, s, &exps[v.sel]); s = &exps[v.sel]; }
+        if (key_repeat(KEY_UP, &rep_up)     && srow > 0)         { v.sel = rows[srow - 1]; switch_experiment(&v, &recs, &opened, s, &exps[v.sel]); s = &exps[v.sel]; }
         // Left and Right step an image at a time. With shift held, or with
         // fine stepping on (F2), they step a frame at a time instead, and the
         // frame they are on stands out in the image. Stepping a whole image
@@ -4545,7 +4702,7 @@ int main(int argc, char **argv)
             // newest of them; untagging moves to the row below.
             if (row_of(rows, nrows, v.sel) < 0) {
                 v.sel = rows[shifted ? 0 : srow < nrows ? srow : nrows - 1];
-                select_experiment(&v, &exps[v.sel]);
+                switch_experiment(&v, &recs, &opened, s, &exps[v.sel]);
                 s = &exps[v.sel];
             }
             last_sel = -1;
@@ -4588,6 +4745,7 @@ int main(int argc, char **argv)
                 // one at the top of the list moves every row below it down one.
                 char keep[24];
                 snprintf(keep, sizeof keep, "%s", exps[v.sel].utc);
+                rec_view_remember(&recs, &v, &exps[v.sel], &opened);
                 free_experiments(exps, nexp);
                 exps = ne; nexp = nn;
                 rows = nr;
@@ -4607,7 +4765,7 @@ int main(int argc, char **argv)
                     beacon_attitude_load(db_path, MPI_ATTITUDE_CACHE_NAME, full);
                 }
                 build_reference(&ref, exps, nexp);
-                select_experiment(&v, &exps[v.sel]);
+                switch_experiment(&v, &recs, &opened, NULL, &exps[v.sel]);
                 if (same) {
                     if (save_img >= v.n_img) save_img = v.n_img ? v.n_img - 1 : 0;
                     v.img_pos = save_img;
@@ -4636,7 +4794,8 @@ int main(int argc, char **argv)
             Vector2 wp = GetWindowPosition();
             geom.x = (int) wp.x; geom.y = (int) wp.y;
             geom.w = GetScreenWidth(); geom.h = GetScreenHeight();
-            if (save_state(&v, s, &geom, &globe, &fv) != 0)
+            rec_view_remember(&recs, &v, s, &opened);
+            if (save_state(&v, s, &geom, &globe, &fv, &recs) != 0)
                 snprintf(status, sizeof status, "could not write the state file");
         }
         if (IsKeyPressed(KEY_M)) v.cmap = (v.cmap + 1) % N_CMAPS;
@@ -5240,7 +5399,8 @@ int main(int argc, char **argv)
     Vector2 wpos = GetWindowPosition();
     geom.x = (int) wpos.x; geom.y = (int) wpos.y;
     geom.w = GetScreenWidth(); geom.h = GetScreenHeight();
-    save_state(&v, &exps[v.sel], &geom, &globe, &fv);
+    rec_view_remember(&recs, &v, &exps[v.sel], &opened);
+    save_state(&v, &exps[v.sel], &geom, &globe, &fv, &recs);
 
     UnloadTexture(tex);
     globe_free(&globe);
@@ -5250,6 +5410,7 @@ int main(int argc, char **argv)
     CloseWindow();
 
     free(rows);
+    free(recs.e);
     free_experiments(exps, nexp);
     free(v.fr_img);
     free_clean(&v);
