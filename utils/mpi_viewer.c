@@ -2789,9 +2789,7 @@ static void export_redownload(const experiment_t *s, const char *db_path,
             s->dropped);
 
     fprintf(f,
-        "# Run this through agenda_check before flying it. exec_blob_from_fs is\n"
-        "# marked recovery/expert in the firmware, so every line draws a readiness\n"
-        "# warning; warnings never block startup.\n"
+        "# Run this through agenda_check before flying it.\n"
         "\n");
 
     long m2 = 0, d2 = 0, c2 = 0;
