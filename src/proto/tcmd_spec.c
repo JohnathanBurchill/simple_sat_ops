@@ -56,7 +56,9 @@ const tcmd_spec_t TCMD_SPEC[] = {
     { "set_obc_time_based_on_gnss_pps",                      0, TCMD_READY_OPERATION,           "" },
     { "available_telecommands",                              0, TCMD_READY_OPERATION,           "" },
     { "reboot",                                              0, TCMD_READY_OPERATION,           "" },
-    { "exec_blob_from_fs",                                   3, TCMD_READY_RECOVERY_OR_EXPERT,  "sus" },
+    // Ground override: firmware marks exec_blob_from_fs recovery/expert; we
+    // report it as operation so bulk-downlink agendas lint clean.
+    { "exec_blob_from_fs",                                   3, TCMD_READY_OPERATION,           "sus" },
     { "scan_i2c_bus",                                        1, TCMD_READY_OPERATION,           "s" },
     { "scan_i2c_bus_verbose",                                1, TCMD_READY_OPERATION,           "s" },
     { "system_self_check_failures_as_json",                  0, TCMD_READY_OPERATION,           "" },

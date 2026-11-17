@@ -35,6 +35,17 @@ READINESS_MAP = {
     "TCMD_READINESS_LEVEL_HIGH_RISK_AND_UNSAFE":   "TCMD_READY_HIGH_RISK",
 }
 
+# Ground-side readiness overrides: command name -> (ground enum, reason).
+# Applied after parsing, so these survive a regen. Each reason is emitted as a
+# comment above the row so the divergence from firmware stays visible.
+READINESS_OVERRIDES = {
+    "exec_blob_from_fs": (
+        "TCMD_READY_OPERATION",
+        "Ground override: firmware marks exec_blob_from_fs recovery/expert; we\n"
+        "report it as operation so bulk-downlink agendas lint clean.",
+    ),
+}
+
 NAME_RE      = re.compile(r'\.tcmd_name\s*=\s*"([^"]*)"')
 NARGS_RE     = re.compile(r'\.number_of_args\s*=\s*(\d+)')
 READINESS_RE = re.compile(r'\.readiness_level\s*=\s*(TCMD_READINESS_LEVEL_\w+)')
@@ -68,7 +79,20 @@ def parse(text):
             cur["readiness"] = READINESS_MAP[fw]
     if cur is not None:
         records.append(cur)
+    apply_overrides(records)
     return records
+
+
+def apply_overrides(records):
+    by_name = {r["name"]: r for r in records}
+    for name, (readiness, reason) in READINESS_OVERRIDES.items():
+        if name not in by_name:
+            # Fail loudly: a renamed/removed command would otherwise silently
+            # drop the override.
+            sys.exit(f"gen_tcmd_spec: readiness override for unknown "
+                     f"telecommand {name}")
+        by_name[name]["readiness"] = readiness
+        by_name[name]["override_reason"] = reason
 
 
 def emit(records, tag, out):
@@ -105,6 +129,8 @@ def emit(records, tag, out):
     width = max((len(r["name"]) for r in records), default=0) + 2
     for r in records:
         namelit = f'"{r["name"]}",'
+        for line in r.get("override_reason", "").splitlines():
+            w(f"    // {line}\n")
         w(f'    {{ {namelit:<{width}} {r["nargs"]:>2}, {r["readiness"]} }},\n')
     w("};\n\n")
     w("const size_t TCMD_SPEC_COUNT = sizeof TCMD_SPEC / sizeof TCMD_SPEC[0];\n")

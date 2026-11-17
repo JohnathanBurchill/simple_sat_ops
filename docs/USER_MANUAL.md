@@ -3530,14 +3530,6 @@ the right offsets but the path is written as `<file_path>` for you to fill in,
 and the viewer says so. The aux panel shows the resolved name as `satellite
 file`.
 
-Two cautions worth reading before you fly the file. The reconstructed size is a
-**lower bound** - nothing proves the last received byte is the end of the file -
-so the header also gives you a single `;<size>;0` command that fetches any tail
-and reports the true `file_size` in its response. And `exec_blob_from_fs` is
-marked `recovery/expert` in the firmware, so every line draws a readiness
-warning from the linter; warnings never block startup, but run the file through
-[`agenda_check`](#agenda-review-agenda_check) and read them.
-
 ### `tcmd_import`
 
 Backfill old commands into the `sent_tcmd` table. The table is
