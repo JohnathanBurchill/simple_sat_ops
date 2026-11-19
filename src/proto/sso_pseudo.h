@@ -19,6 +19,12 @@
     context struct so this stays a pure function of (cmd, ctx) -- the live
     transmit path passes real clocks; the linter passes placeholders.
 
+    Two more directives send raw CSP instead of a CTS1+ telecommand (the
+    expansion is a hex payload plus a CSP header, see sso_pseudo_route_t):
+
+        SSO+ping_ax100()!   ->  CSP ping (port 1, from port 9) to the AX100 node
+        SSO+raw_csp(<dst>,<dport>,<sport>,<hex>)!  ->  arbitrary CSP packet
+
     The command set is a table (sso_pseudo.c), mirroring tcmd_spec.c: a future
     SSO+ command is one expander function plus one row.
 
@@ -39,6 +45,8 @@
 #define SSO_PSEUDO_H
 
 #include <stddef.h>
+
+#include "csp.h"
 
 #define SSO_PSEUDO_PREFIX     "SSO+"
 #define SSO_PSEUDO_PREFIX_LEN 4
@@ -65,6 +73,14 @@ typedef struct {
     long long tssent_ms;
 } sso_pseudo_ctx_t;
 
+// Where the expansion goes. sso_pseudo_expand always fills it (also on
+// NOT_PSEUDO) with the default: the OBC telecommand port, ASCII payload. A
+// directive aimed elsewhere (e.g. the AX100) overrides it.
+typedef struct {
+    csp_v1_header_t hdr;
+    int is_hex;   // 1: `out` is a hex string of a binary CSP payload
+} sso_pseudo_route_t;
+
 // Cheap probe: 1 if `cmd` (already trimmed, inline comment stripped) begins
 // with "SSO+". Does not validate the rest of the line.
 int sso_pseudo_is_directed(const char *cmd);
@@ -75,8 +91,10 @@ int sso_pseudo_is_directed(const char *cmd);
 // use `out` unconditionally and key behaviour off the returned status. On any
 // error status the caller must NOT transmit. `err`/`err_cap` (NULL/0 to skip)
 // receive a human message on a non-OK, non-NOT_PSEUDO status.
+// `route` (NULL to skip) receives the CSP header and payload kind to send with.
 sso_pseudo_status_t sso_pseudo_expand(const char *cmd, const sso_pseudo_ctx_t *ctx,
                                       char *out, size_t out_cap,
+                                      sso_pseudo_route_t *route,
                                       char *err, size_t err_cap);
 
 // Human label for a status (for messages / diagnostics).

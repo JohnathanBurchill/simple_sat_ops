@@ -210,12 +210,15 @@ tcmd_lint_severity_t tcmd_lint_command(const char *cmd, char *msg, size_t msg_ca
         char e[160];
         sso_pseudo_ctx_t pc = { .now_ms    = 1700000000000LL,
                                 .tssent_ms = 1700000000000LL / 60000LL * 60000LL };
+        sso_pseudo_route_t route;
         sso_pseudo_status_t st =
-            sso_pseudo_expand(cmd, &pc, expanded, sizeof expanded, e, sizeof e);
+            sso_pseudo_expand(cmd, &pc, expanded, sizeof expanded, &route, e, sizeof e);
         if (st != SSO_PSEUDO_OK) {
             flag(msg, msg_cap, &len, &worst, TCMD_LINT_ERROR, e);
             return worst;
         }
+        // Raw CSP: no CTS1+ text to lint; the expander already checked it.
+        if (route.is_hex) return TCMD_LINT_OK;
         return tcmd_lint_command(expanded, msg, msg_cap);
     }
 

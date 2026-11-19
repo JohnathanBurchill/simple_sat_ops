@@ -436,24 +436,31 @@ static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, s
                             .tssent_ms = state->tx.sso_pass_tssent_ms };
     char wire[512];
     char sso_err[160];
+    sso_pseudo_route_t route;
     sso_pseudo_status_t pst =
-        sso_pseudo_expand(c->payload, &pc, wire, sizeof wire, sso_err, sizeof sso_err);
+        sso_pseudo_expand(c->payload, &pc, wire, sizeof wire, &route,
+                          sso_err, sizeof sso_err);
     if (pst != SSO_PSEUDO_OK && pst != SSO_PSEUDO_NOT_PSEUDO) {
         snprintf(err, err_size, "SSO+ expansion failed: %s", sso_err);
         return -1;
     }
-    size_t n = strlen(wire);
-    if (n == 0) {
+    ssize_t n;
+    if (route.is_hex) {
+        n = tx_burst_parse_hex(wire, state->tx.tx_request.payload,
+                               sizeof state->tx.tx_request.payload);
+    } else {
+        n = (ssize_t) strlen(wire);
+        if ((size_t) n > sizeof state->tx.tx_request.payload)
+            n = (ssize_t) sizeof state->tx.tx_request.payload;
+        memcpy(state->tx.tx_request.payload, wire, (size_t) n);
+    }
+    if (n <= 0) {
         snprintf(err, err_size, "empty payload");
         return -1;
     }
-    if (n > sizeof state->tx.tx_request.payload) n = sizeof state->tx.tx_request.payload;
-    memcpy(state->tx.tx_request.payload, wire, n);
-    state->tx.tx_request.payload_len  = n;
-    state->tx.tx_request.is_hex       = 0;  // always ascii in the simplified modal
-    state->tx.tx_request.csp_hdr      = (csp_v1_header_t){
-        .prio  = 2, .src = 10, .dst = 1, .dport = 7, .sport = 16, .flags = 0,
-    };
+    state->tx.tx_request.payload_len  = (size_t) n;
+    state->tx.tx_request.is_hex       = route.is_hex;
+    state->tx.tx_request.csp_hdr      = route.hdr;
     state->tx.tx_request.tx_freq_hz       = state->tx.tx_freq_hz_doppler;
     state->tx.tx_request.tx_gain_db       = atof(c->power);
     state->tx.tx_request.repeat           = 1;
@@ -470,7 +477,8 @@ static int tx_compose_commit(state_t *state, const tx_compose_t *c, char *err, s
         snprintf(state->tx.tx_request.sso_origin, sizeof state->tx.tx_request.sso_origin,
                  "%s", c->payload);
         snprintf(state->tx.tx_request.summary, sizeof state->tx.tx_request.summary,
-                 "ascii:%.150s (replaced '%.80s')", wire, c->payload);
+                 "%s:%.150s (replaced '%.80s')",
+                 route.is_hex ? "hex" : "ascii", wire, c->payload);
     } else {
         state->tx.tx_request.sso_origin[0] = '\0';
         tx_compose_summary(c, state->tx.tx_request.summary, sizeof state->tx.tx_request.summary);

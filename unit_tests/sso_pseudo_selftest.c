@@ -42,7 +42,7 @@ static sso_pseudo_status_t expand(const char *cmd, long long now_ms,
 {
     sso_pseudo_ctx_t ctx = { .now_ms = now_ms, .tssent_ms = TEST_TSSENT_MS };
     char err[160];
-    return sso_pseudo_expand(cmd, &ctx, out, out_cap, err, sizeof err);
+    return sso_pseudo_expand(cmd, &ctx, out, out_cap, NULL, err, sizeof err);
 }
 
 static void test_is_directed(void)
@@ -101,7 +101,7 @@ static void test_unknown_command(void)
     char err[160];
     sso_pseudo_ctx_t ctx = { .now_ms = TEST_NOW_MS, .tssent_ms = TEST_TSSENT_MS };
     sso_pseudo_status_t st =
-        sso_pseudo_expand("SSO+frobnicate()!", &ctx, out, sizeof out, err, sizeof err);
+        sso_pseudo_expand("SSO+frobnicate()!", &ctx, out, sizeof out, NULL, err, sizeof err);
     tap_okf(st == SSO_PSEUDO_UNKNOWN_CMD, "status UNKNOWN_CMD (got %d)", (int) st);
     tap_okf(strstr(err, "unknown SSO+ command") != NULL,
             "err mentions unknown SSO+ command (got \"%s\")", err);
@@ -145,8 +145,49 @@ static void test_lint_round_trip(void)
                == TCMD_LINT_ERROR, "linter rejects malformed SSO+ line");
 }
 
+static void test_raw_csp(void)
+{
+    fprintf(stderr, "sso_pseudo: ping_ax100 / raw_csp route raw CSP\n");
+    sso_pseudo_ctx_t ctx = { .now_ms = TEST_NOW_MS, .tssent_ms = TEST_TSSENT_MS };
+    char out[512], err[160];
+    sso_pseudo_route_t r;
+
+    sso_pseudo_expand("CTS1+hello_world()!", &ctx, out, sizeof out, &r, err, sizeof err);
+    tap_ok(r.is_hex == 0 && r.hdr.dst == 1 && r.hdr.dport == 7 && r.hdr.src == 10,
+           "plain telecommand gets the OBC default route");
+
+    sso_pseudo_status_t st =
+        sso_pseudo_expand("SSO+ping_ax100()!", &ctx, out, sizeof out, &r, err, sizeof err);
+    tap_okf(st == SSO_PSEUDO_OK, "ping_ax100 OK (err: %s)", err);
+    tap_okf(strcmp(out, "50494e47") == 0, "ping payload is ASCII PING (got %s)", out);
+    tap_okf(r.is_hex == 1 && r.hdr.dst == 5 && r.hdr.dport == 1 && r.hdr.sport == 9,
+            "ping goes to node 5 port 1 from port 9 as hex (dst=%u dport=%u sport=%u)",
+            r.hdr.dst, r.hdr.dport, r.hdr.sport);
+
+    st = sso_pseudo_expand("SSO+raw_csp(5,7,20,0A0b)!", &ctx, out, sizeof out, &r, err, sizeof err);
+    tap_okf(st == SSO_PSEUDO_OK && strcmp(out, "0A0b") == 0
+            && r.hdr.dst == 5 && r.hdr.dport == 7 && r.hdr.sport == 20 && r.is_hex,
+            "raw_csp(5,7,20,0A0b) routes the hex payload (out=\"%s\")", out);
+
+    const char *bad[] = { "SSO+raw_csp(32,7,16,00)!", "SSO+raw_csp(5,64,16,00)!",
+                          "SSO+raw_csp(5,7,64,00)!", "SSO+raw_csp(5,7,x,00)!",
+                          "SSO+raw_csp(5,7,16,0)!", "SSO+raw_csp(5,7,16,zz)!",
+                          "SSO+raw_csp(x,7,16,00)!", "SSO+raw_csp(5,7,16,)!",
+                          "SSO+raw_csp(5,7,00)!" };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; ++i)
+        tap_okf(sso_pseudo_expand(bad[i], &ctx, out, sizeof out, &r, err, sizeof err)
+                    == SSO_PSEUDO_BAD_SYNTAX, "%s rejected", bad[i]);
+
+    char msg[512];
+    tap_ok(tcmd_lint_command("SSO+ping_ax100()!", msg, sizeof msg) == TCMD_LINT_OK,
+           "linter accepts SSO+ping_ax100()!");
+    tap_ok(tcmd_lint_command("SSO+raw_csp(5,7,16,zz)!", msg, sizeof msg) == TCMD_LINT_ERROR,
+           "linter rejects bad SSO+raw_csp hex");
+}
+
 int main(void)
 {
+    test_raw_csp();
     test_is_directed();
     test_passthrough();
     test_time_sync_expansion();

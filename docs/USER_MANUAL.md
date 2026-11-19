@@ -1432,6 +1432,34 @@ malformed `CTS1+` line does, see [Telecommand
 linting](#telecommand-linting)), and they behave identically from the `A`
 auto-telecommand modal and the `t` compose modal.
 
+Two more directives send raw CSP instead of a `CTS1+` telecommand:
+
+```
+SSO+ping_ax100()!
+SSO+raw_csp(5,7,16,0a0b0c)!
+```
+
+`SSO+ping_ax100()!` sends a CSP ping (port 1, payload ASCII `PING`, hex
+`50494e47`) to the AX100 radio at CSP node 5, from source port 9 so its reply
+is easy to tell apart from telecommand traffic.
+`SSO+raw_csp(<dst node>,<dst port>,<src port>,<hex payload>)!` sends any CSP
+packet, for example a parameter write to reconfigure the AX100. The source port
+is where the reply comes back to (normal telecommands use 16). Ports are
+0..63, and the payload is an even-length hex string, at most 215 bytes. Both go
+out from node 10 at normal priority, HMAC-signed like every uplink, and the TX
+log records them as `hex:...`.
+
+`SSO+ping_ax100()!` is shorthand for a `SSO+raw_csp` line. These two lines send
+the same packet:
+
+```
+SSO+ping_ax100()!
+SSO+raw_csp(5,1,9,50494e47)!
+```
+
+Here `5` is the AX100's CSP node, `1` is the CSP ping port, `9` is the source
+port and `50494e47` is ASCII `PING`.
+
 ### Finding telecommands and their arguments
 
 `simple_sat_ops` only carries telecommands to the satellite - it does
