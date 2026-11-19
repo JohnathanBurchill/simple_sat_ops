@@ -1077,8 +1077,9 @@ void auto_tcmd_tick(state_t *state) {
                             .tssent_ms = state->tx.sso_pass_tssent_ms };
     char wire[512];
     char sso_err[160];
+    sso_pseudo_route_t route;
     sso_pseudo_status_t pst =
-        sso_pseudo_expand(raw, &pc, wire, sizeof wire, sso_err, sizeof sso_err);
+        sso_pseudo_expand(raw, &pc, wire, sizeof wire, &route, sso_err, sizeof sso_err);
     if (pst != SSO_PSEUDO_OK && pst != SSO_PSEUDO_NOT_PSEUDO) {
         snprintf(a->status_msg, sizeof a->status_msg,
                  "skipped SSO+ line %d: %.120s", a->cmd_idx + 1, sso_err);
@@ -1098,7 +1099,7 @@ void auto_tcmd_tick(state_t *state) {
     // over-long command into a corrupt frame rather than reject it. Reload
     // lint catches over-long raw lines, but an SSO+ line only reaches its
     // final length after expansion here, so this is the authoritative gate.
-    if (n > (size_t) TCMD_RF_MAX_LEN) {
+    if (!route.is_hex && n > (size_t) TCMD_RF_MAX_LEN) {
         snprintf(a->status_msg, sizeof a->status_msg,
                  "skipped line %d: %zu chars over the %d-char RF limit",
                  a->cmd_idx + 1, n, TCMD_RF_MAX_LEN);
@@ -1111,13 +1112,19 @@ void auto_tcmd_tick(state_t *state) {
         auto_tcmd_draw(state);
         return;
     }
-    if (n > sizeof state->tx.tx_request.payload) n = sizeof state->tx.tx_request.payload;
-    memcpy(state->tx.tx_request.payload, wire, n);
+    if (route.is_hex) {
+        // The expander validated the hex and its byte count, so this parse
+        // cannot fail; the hex text is 2x the bytes, hence the RF gate above
+        // is skipped for it.
+        n = (size_t) tx_burst_parse_hex(wire, state->tx.tx_request.payload,
+                                        sizeof state->tx.tx_request.payload);
+    } else {
+        if (n > sizeof state->tx.tx_request.payload) n = sizeof state->tx.tx_request.payload;
+        memcpy(state->tx.tx_request.payload, wire, n);
+    }
     state->tx.tx_request.payload_len  = n;
-    state->tx.tx_request.is_hex       = 0;
-    state->tx.tx_request.csp_hdr      = (csp_v1_header_t){
-        .prio  = 2, .src = 10, .dst = 1, .dport = 7, .sport = 16, .flags = 0,
-    };
+    state->tx.tx_request.is_hex       = route.is_hex;
+    state->tx.tx_request.csp_hdr      = route.hdr;
     state->tx.tx_request.tx_freq_hz       = state->tx.tx_freq_hz_doppler;
     state->tx.tx_request.tx_gain_db       = atof(a->power);
     state->tx.tx_request.repeat           = 1;

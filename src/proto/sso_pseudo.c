@@ -21,9 +21,11 @@
 */
 
 #include "sso_pseudo.h"
+#include "tcmd_lint.h"   // TCMD_RF_MAX_LEN
 
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // 250 ms TX lag + 250 ms average on-board execution lag. Added to the
@@ -36,9 +38,12 @@
 // (the raw text between the parens, possibly empty) is rarely needed. Returns
 // SSO_PSEUDO_OK on success (writes a NUL-terminated CTS1+ string into `out`),
 // or SSO_PSEUDO_TRUNCATED / SSO_PSEUDO_BAD_SYNTAX on failure.
+// `route` arrives pre-filled with the OBC telecommand default; an expander
+// aimed elsewhere overwrites it.
 typedef sso_pseudo_status_t (*sso_pseudo_expand_fn)(
     const char *args, size_t args_len, const sso_pseudo_ctx_t *ctx,
-    char *out, size_t out_cap, char *err, size_t err_cap);
+    char *out, size_t out_cap, sso_pseudo_route_t *route,
+    char *err, size_t err_cap);
 
 typedef struct {
     const char           *name;      // exact, case-sensitive SSO+ command name
@@ -56,10 +61,12 @@ typedef struct {
 // session re-runs it. See sso_pseudo.h.
 static sso_pseudo_status_t expand_sync_sat_time_to_ground(
     const char *args, size_t args_len, const sso_pseudo_ctx_t *ctx,
-    char *out, size_t out_cap, char *err, size_t err_cap)
+    char *out, size_t out_cap, sso_pseudo_route_t *route,
+    char *err, size_t err_cap)
 {
     (void) args;
     (void) args_len;
+    (void) route;
     (void) err;
     (void) err_cap;
     long long arg = ctx->now_ms + SSO_TIME_SYNC_BUDGET_MS;
@@ -69,10 +76,90 @@ static sso_pseudo_status_t expand_sync_sat_time_to_ground(
     return SSO_PSEUDO_OK;
 }
 
+static sso_pseudo_status_t fail(char *err, size_t err_cap,
+                                sso_pseudo_status_t st, const char *text);
+
+// Raw CSP to an arbitrary node/port: args are
+// "<dst>,<dport>,<sport>,<hex payload>". The reply comes back to ground node
+// 10 on <sport>. The hex is validated here so lint catches a bad line.
+static sso_pseudo_status_t expand_raw_csp(
+    const char *args, size_t args_len, const sso_pseudo_ctx_t *ctx,
+    char *out, size_t out_cap, sso_pseudo_route_t *route,
+    char *err, size_t err_cap)
+{
+    (void) ctx;
+    char buf[512];
+    if (args_len >= sizeof buf)
+        return fail(err, err_cap, SSO_PSEUDO_BAD_SYNTAX, "SSO+raw_csp arguments too long");
+    memcpy(buf, args, args_len);
+    buf[args_len] = '\0';
+
+    char *end;
+    long dst = strtol(buf, &end, 10);
+    if (end == buf || *end != ',' || dst < 0 || dst > 31)
+        return fail(err, err_cap, SSO_PSEUDO_BAD_SYNTAX,
+                    "SSO+raw_csp dst must be a CSP node 0..31");
+    char *p = end + 1;
+    long dport = strtol(p, &end, 10);
+    if (end == p || *end != ',' || dport < 0 || dport > 63)
+        return fail(err, err_cap, SSO_PSEUDO_BAD_SYNTAX,
+                    "SSO+raw_csp dport must be a CSP port 0..63");
+    p = end + 1;
+    long sport = strtol(p, &end, 10);
+    if (end == p || *end != ',' || sport < 0 || sport > 63)
+        return fail(err, err_cap, SSO_PSEUDO_BAD_SYNTAX,
+                    "SSO+raw_csp sport must be a CSP port 0..63");
+    const char *hex = end + 1;
+    size_t hex_len = strlen(hex);
+    if (hex_len == 0 || hex_len % 2 != 0)
+        return fail(err, err_cap, SSO_PSEUDO_BAD_SYNTAX,
+                    "SSO+raw_csp payload must be a non-empty, even-length hex string");
+    for (size_t k = 0; k < hex_len; ++k)
+        if (!isxdigit((unsigned char) hex[k]))
+            return fail(err, err_cap, SSO_PSEUDO_BAD_SYNTAX,
+                        "SSO+raw_csp payload has a non-hex character");
+    // Same RS-block capacity as an ASCII telecommand: one byte per char.
+    if (hex_len / 2 > (size_t) TCMD_RF_MAX_LEN)
+        return fail(err, err_cap, SSO_PSEUDO_BAD_SYNTAX,
+                    "SSO+raw_csp payload over the RF uplink limit");
+
+    int n = snprintf(out, out_cap, "%s", hex);
+    if (n < 0 || (size_t) n >= out_cap) return SSO_PSEUDO_TRUNCATED;
+    if (route) {
+        route->hdr.dst   = (uint8_t) dst;
+        route->hdr.dport = (uint8_t) dport;
+        route->hdr.sport = (uint8_t) sport;
+        route->is_hex    = 1;
+    }
+    return SSO_PSEUDO_OK;
+}
+
+#define SSO_AX100_CSP_NODE 5   // FrontierSat's AX100 CSP node
+#define CSP_PORT_PING      1   // libcsp service port: echoes the payload back
+#define SSO_PING_SPORT     9   // not 16, so ping replies stand out from telecommand traffic
+
+static sso_pseudo_status_t expand_ping_ax100(
+    const char *args, size_t args_len, const sso_pseudo_ctx_t *ctx,
+    char *out, size_t out_cap, sso_pseudo_route_t *route,
+    char *err, size_t err_cap)
+{
+    (void) args;
+    (void) args_len;
+    char a[32];
+    // Payload is ASCII "PING".
+    snprintf(a, sizeof a, "%d,%d,%d,50494e47",
+             SSO_AX100_CSP_NODE, CSP_PORT_PING, SSO_PING_SPORT);
+    return expand_raw_csp(a, strlen(a), ctx, out, out_cap, route, err, err_cap);
+}
+
 // The registry. A future SSO+ command is one expander above + one row here.
 static const sso_pseudo_spec_t SSO_PSEUDO_SPEC[] = {
     { "sync_sat_time_to_ground", 0, expand_sync_sat_time_to_ground,
       "set the satellite clock to ground UTC at TX time (+500 ms lag budget)" },
+    { "ping_ax100", 0, expand_ping_ax100,
+      "CSP ping (port 1, from port 9) to the AX100 radio" },
+    { "raw_csp", 4, expand_raw_csp,
+      "raw CSP packet: raw_csp(<dst node>,<dst port>,<src port>,<hex payload>)" },
 };
 static const size_t SSO_PSEUDO_SPEC_COUNT =
     sizeof SSO_PSEUDO_SPEC / sizeof SSO_PSEUDO_SPEC[0];
@@ -108,10 +195,16 @@ int sso_pseudo_is_directed(const char *cmd)
 
 sso_pseudo_status_t sso_pseudo_expand(const char *cmd, const sso_pseudo_ctx_t *ctx,
                                       char *out, size_t out_cap,
+                                      sso_pseudo_route_t *route,
                                       char *err, size_t err_cap)
 {
     if (err && err_cap) err[0] = '\0';
     if (out_cap) out[0] = '\0';
+    if (route) *route = (sso_pseudo_route_t){
+        .hdr = { .prio = CSP_PRIO_NORM, .src = 10, .dst = 1,
+                 .dport = 7, .sport = 16, .flags = 0 },
+        .is_hex = 0,
+    };
     if (cmd == NULL || ctx == NULL || out == NULL || out_cap == 0)
         return fail(err, err_cap, SSO_PSEUDO_BAD_SYNTAX, "null argument");
 
@@ -182,7 +275,7 @@ sso_pseudo_status_t sso_pseudo_expand(const char *cmd, const sso_pseudo_ctx_t *c
         return fail(err, err_cap, SSO_PSEUDO_BAD_SYNTAX, m);
     }
 
-    return spec->expand(args, args_len, ctx, out, out_cap, err, err_cap);
+    return spec->expand(args, args_len, ctx, out, out_cap, route, err, err_cap);
 }
 
 const char *sso_pseudo_status_label(sso_pseudo_status_t st)
